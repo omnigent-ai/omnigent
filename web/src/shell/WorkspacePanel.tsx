@@ -1,4 +1,4 @@
-import type { FilePosition, OpenFileOptions } from "./FileViewerContext";
+import { type FilePosition, FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
 import {
   BotIcon,
   CheckIcon,
@@ -27,6 +27,7 @@ import {
   memo,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useRef,
   useState,
@@ -38,9 +39,13 @@ import {
   ARIA_MOD_KEY,
   CompactShortcutKeys,
   MOD_KEY,
+  NEW_BROWSER_TAB_KEYS,
+  NEW_TERMINAL_KEYS,
   SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import {
   type DefaultWorkspaceTab,
   defaultWorkspaceTabs,
@@ -103,7 +108,6 @@ const TerminalView = lazy(() =>
 );
 const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
-const NEW_SHELL_KEYS = [MOD_KEY, ALT_KEY, "T"] as const;
 const workspacePanels = {
   "content-search": { label: "Content search", icon: SearchIcon },
   files: { label: "Files", icon: FolderTreeIcon },
@@ -296,7 +300,7 @@ function NewTabMenu({
         {connectState === "offline" && (
           <span className="text-sm text-muted-foreground">Offline</span>
         )}
-        <WorkspaceMenuShortcut keys={NEW_SHELL_KEYS} />
+        <WorkspaceMenuShortcut keys={NEW_TERMINAL_KEYS} />
       </span>
     </>
   );
@@ -351,7 +355,10 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
-            <WorkspaceMenuShortcut keys={NEW_BROWSER_KEYS} className="ml-auto pl-4" />
+            <WorkspaceMenuShortcut
+              keys={supportsDesktopCommands() ? NEW_BROWSER_TAB_KEYS : NEW_BROWSER_KEYS}
+              className="ml-auto pl-4"
+            />
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -718,6 +725,8 @@ interface WorkspacePanelProps {
   showBrowserTab: boolean;
   /** Reveal the workspace when a global shortcut opens a tab. */
   onReveal?: () => void;
+  /** Hide the rail; desktop Close uses it when no tab on screen can close. */
+  onHide?: () => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -839,6 +848,7 @@ function WorkspacePanelImpl({
   showGithubTab,
   showBrowserTab,
   onReveal,
+  onHide,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -876,6 +886,8 @@ function WorkspacePanelImpl({
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
+  const railRef = useRef<HTMLElement | null>(null);
+  const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
@@ -896,6 +908,10 @@ function WorkspacePanelImpl({
     onReveal?.();
   };
   useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
+  useDesktopCommand(
+    "new-browser-tab",
+    showBrowserTab && !pending && !contained ? addBrowser : null,
+  );
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
@@ -1090,7 +1106,7 @@ function WorkspacePanelImpl({
   for (const tabId of sideChats.tabs) {
     chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${++sideChatNumber}`;
   }
-  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false, railRef);
   const selectedSideChat = sideChats.selected;
   const selectedSubagentId =
     selectedSideChat === null ? null : subagentSessionIdFromTab(selectedSideChat);
@@ -1150,12 +1166,25 @@ function WorkspacePanelImpl({
     sideChats.close(childId);
   };
 
+  // Closing the file on screen asks its viewer first, which confirms before
+  // dropping edits it hasn't saved. Other file tabs have no mounted editor.
+  const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  const closeFile = useCallback(
+    (path: string) => {
+      if (path === selectedFilePath && guardFileNavigation) {
+        guardFileNavigation(null, undefined, () => onCloseFile(path));
+      } else {
+        onCloseFile(path);
+      }
+    },
+    [guardFileNavigation, onCloseFile, selectedFilePath],
+  );
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
   const handleCloseTab = useCallback(() => {
-    if (selectedFilePath !== null) onCloseFile(selectedFilePath);
-  }, [onCloseFile, selectedFilePath]);
+    if (selectedFilePath !== null) closeFile(selectedFilePath);
+  }, [closeFile, selectedFilePath]);
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
@@ -1430,6 +1459,41 @@ function WorkspacePanelImpl({
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
+  // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
+  // has focus: close the tab on screen, or hide the rail on a fixed page.
+  // Otherwise AppShell's handler leaves the session.
+  useDesktopCommand(
+    "close",
+    (event) => {
+      const browserFocused =
+        event.browserViewId !== null && event.browserViewId === browsers.viewId;
+      if (!browserFocused && !railRef.current?.contains(document.activeElement)) return false;
+      if (pending) return true;
+      const openPanel = visibleOpenPanels.find((tab) => tab === rightRailTab);
+      if (terminalShown && selectedTerminalKey !== null) {
+        // Viewers can't close shells; the tab shows no close button for them either.
+        if (!isEditorLevel(permissionLevel)) return true;
+        onCloseTerminal(selectedTerminalKey);
+      } else if (selectedFilePath !== null) {
+        handleCloseTab();
+      } else if (scopeView === "sidechat" && sideChats.selected !== null) {
+        void closeSideChat(sideChats.selected);
+      } else if (scopeView === "browser" && browsers.selected !== null) {
+        void closeBrowserTab(browsers.selected);
+      } else if (openPanel !== undefined) {
+        onClosePanel(openPanel);
+      } else if (onHide) {
+        onHide();
+        return true;
+      } else {
+        return false;
+      }
+      // Keep focus in the rail, so the next Close closes the tab shown next.
+      railContentRef.current?.focus({ preventScroll: true });
+      return true;
+    },
+    { priority: 10 },
+  );
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1587,7 +1651,7 @@ function WorkspacePanelImpl({
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
                   onFileSelect={openFileViewer}
-                  onCloseFile={onCloseFile}
+                  onCloseFile={closeFile}
                 />
                 <TerminalTabsStrip
                   openTerminals={openTerminals}
@@ -1769,8 +1833,11 @@ function WorkspacePanelImpl({
         </div>
         {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
         <div
+          ref={railContentRef}
           data-workspace-panel-content
-          className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+          // A click on any part of a tab focuses the rail, so Close (⌘W) closes that tab.
+          tabIndex={-1}
+          className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
           {showContentSearch && showFilesPanel && !pending && (
             <div

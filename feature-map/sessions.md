@@ -267,6 +267,12 @@ unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions.
 
+**Desktop Session menu:** in the desktop app, Session → Pin (⌥⌘P), Archive
+(⇧⌘A) and Fork Session… (⌥⌘F) act on the open session (Ctrl+Alt+P,
+Ctrl+Shift+A and Ctrl+Alt+F on Windows/Linux). They are enabled only while the
+session's header menu offers the action, and the open session's sidebar row
+shows the same chords on its pin button and in its row menu.
+
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
 The header title becomes an input with its text selected. Enter or blur saves;

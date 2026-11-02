@@ -25,6 +25,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import {
+  ARCHIVE_SESSION_KEYS,
+  FORK_SESSION_KEYS,
+  CompactShortcutKeys,
+  PIN_SESSION_KEYS,
+} from "@/components/KeyboardShortcut";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
@@ -63,6 +69,8 @@ import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useDesktopCommand } from "@/lib/desktopCommands";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
@@ -226,6 +234,17 @@ export function HeaderConversationMenu({
     showArchiveUndoToast(queryClient, [conversation], navigate);
   };
 
+  const togglePin = () =>
+    isPinned
+      ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+      : togglePinned.mutate({ id: conversation.id, pinned: true });
+  // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
+  // Like the menu item, Pin waits out a pending pin write (from any row).
+  useDesktopCommand("toggle-pin-session", pinSaving ? null : togglePin, { active: isPinned });
+  useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
+  useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
+  const desktopShortcuts = supportsDesktopCommands();
+
   const mainItems = (
     <>
       {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
@@ -235,14 +254,13 @@ export function HeaderConversationMenu({
         data-testid="header-pin-conversation"
         className={itemClass}
         disabled={pinSaving}
-        onSelect={() =>
-          isPinned
-            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
-            : togglePinned.mutate({ id: conversation.id, pinned: true })
-        }
+        onSelect={togglePin}
       >
         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
         {isPinned ? "Unpin" : "Pin"}
+        {desktopShortcuts && (
+          <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+        )}
       </DropdownMenuItem>
       {canShare && (
         <DropdownMenuItem
@@ -272,6 +290,9 @@ export function HeaderConversationMenu({
         >
           <GitForkIcon className="size-3.5" />
           Fork
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
         </SessionActionMenuItem>
       )}
       <DropdownMenuItem
@@ -365,6 +386,9 @@ export function HeaderConversationMenu({
           <ArchiveIcon className="size-3.5" />
         )}
         {isArchived ? "Unarchive" : "Archive"}
+        {desktopShortcuts && (
+          <CompactShortcutKeys keys={ARCHIVE_SESSION_KEYS} className="ml-auto pl-4" />
+        )}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"

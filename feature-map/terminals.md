@@ -65,6 +65,9 @@ with their own terminal retain the switcher.
 - Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
+- In the desktop app, Control+` or File → New Terminal does the same, also
+  while an embedded browser tab has focus. The menu item is disabled whenever
+  the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick

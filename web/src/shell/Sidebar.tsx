@@ -217,6 +217,7 @@ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
@@ -311,9 +312,12 @@ import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/c
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
 import {
+  ARCHIVE_SESSION_KEYS,
   CompactShortcutKeys,
+  FORK_SESSION_KEYS,
   newSessionAriaShortcut,
   newSessionShortcutKeys,
+  PIN_SESSION_KEYS,
 } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
@@ -4055,6 +4059,9 @@ const contextBundle: MenuComponents = {
   SubContent: ContextMenuSubContent,
 };
 
+// The row menu of a session that isn't open lists no Session chords.
+const NO_DESKTOP_COMMANDS: ReadonlySet<DesktopCommand> = new Set();
+
 /**
  * The conversation row's action menu body — authored once and rendered under
  * both the kebab {@link DropdownMenu} and the row's right-click {@link ContextMenu}
@@ -4067,6 +4074,7 @@ const contextBundle: MenuComponents = {
 function ConversationMenuItems({
   components: C,
   conversation,
+  sessionShortcuts,
   isPinned,
   isArchived,
   isOwner,
@@ -4091,6 +4099,8 @@ function ConversationMenuItems({
 }: {
   components: MenuComponents;
   conversation: Conversation;
+  /** Session menu commands whose chords to list (the open session's row only). */
+  sessionShortcuts: ReadonlySet<DesktopCommand>;
   isPinned: boolean;
   isArchived: boolean;
   isOwner: boolean;
@@ -4261,6 +4271,9 @@ function ConversationMenuItems({
       >
         <GitForkIcon className="size-3.5" />
         Fork
+        {sessionShortcuts.has("fork-session") && (
+          <CompactShortcutKeys keys={FORK_SESSION_KEYS} className="ml-auto pl-4" />
+        )}
       </SessionActionMenuItem>
       {isOwner ? (
         <C.Item
@@ -4392,6 +4405,9 @@ function ConversationMenuItems({
             <ArchiveIcon className="size-3.5" />
           )}
           {isArchived ? "Unarchive" : "Archive"}
+          {sessionShortcuts.has("archive-session") && (
+            <CompactShortcutKeys keys={ARCHIVE_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
         </C.Item>
       ) : (
         <Tooltip>
@@ -4800,6 +4816,10 @@ function ConversationRowImpl({
   let pinTooltip = isPinned ? "Unpin" : "Pin";
   if (pinSaving) pinTooltip = "Saving pins…";
   else if (!isPinned && atPinCap) pinTooltip = "Unpin a session first";
+  // The desktop Session menu's chords act on the open session, so only its row lists
+  // them, and only while the session's header handles them (not for a child or shared view).
+  const desktopCommands = useAvailableDesktopCommands();
+  const sessionShortcuts = isActive ? desktopCommands : NO_DESKTOP_COMMANDS;
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
   // A client-only `temp:` row (navigate-first create window): no server session
@@ -5172,6 +5192,7 @@ function ConversationRowImpl({
   // no-op — Radix closes it on select).
   const menuItemProps = {
     conversation,
+    sessionShortcuts,
     isPinned,
     isArchived,
     isOwner,
@@ -5504,7 +5525,11 @@ function ConversationRowImpl({
               (archive outranks pin), so there's no pin action even on hover. */}
               {!isArchived && (
                 <Tooltip disableHoverableContent>
-                  <TooltipContent>
+                  <TooltipContent
+                    shortcut={
+                      sessionShortcuts.has("toggle-pin-session") ? PIN_SESSION_KEYS : undefined
+                    }
+                  >
                     <TooltipArrow />
                     {pinTooltip}
                   </TooltipContent>
@@ -5557,7 +5582,11 @@ function ConversationRowImpl({
               with an explanation. */}
               {isOwner && (
                 <Tooltip disableHoverableContent>
-                  <TooltipContent>
+                  <TooltipContent
+                    shortcut={
+                      sessionShortcuts.has("archive-session") ? ARCHIVE_SESSION_KEYS : undefined
+                    }
+                  >
                     <TooltipArrow />
                     {isArchived ? "Unarchive" : "Archive"}
                   </TooltipContent>

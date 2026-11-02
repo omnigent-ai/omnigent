@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -11,9 +11,10 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -98,10 +99,12 @@ const SECOND_CONVERSATION: Conversation = {
   git_branch: "feature/release-planning",
 };
 
-function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
+function menuTree(
+  overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
   // the post-archive Undo toast a client for unarchiving.
-  const queryClient = new QueryClient();
+  queryClient = new QueryClient(),
+) {
   return (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
@@ -121,8 +124,11 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
   );
 }
 
-function renderMenu(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
-  return render(menuTree(overrides));
+function renderMenu(
+  overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
+  queryClient?: QueryClient,
+) {
+  return render(menuTree(overrides, queryClient));
 }
 
 function openMenu() {
@@ -682,5 +688,113 @@ describe("HeaderConversationMenu", () => {
     const share = screen.getByRole("menuitem", { name: "Share" });
     expect(share).toHaveAttribute("data-disabled");
     expect(share).toHaveAttribute("title", "Sharing is unavailable from a local server.");
+  });
+});
+
+describe("HeaderConversationMenu desktop menu commands", () => {
+  type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
+  let sendCommand: CommandListener = () => {};
+  const setDesktopCommandState = vi.fn();
+
+  beforeEach(() => {
+    Object.assign(window, {
+      omnigentDesktop: {
+        kind: "electron",
+        onDesktopCommand: (callback: CommandListener) => {
+          sendCommand = callback;
+          return () => {};
+        },
+        setDesktopCommandState,
+      },
+    });
+  });
+
+  afterEach(() => {
+    resetDesktopCommandsForTests();
+    Reflect.deleteProperty(window, "omnigentDesktop");
+  });
+
+  it("pins the shown session from Session → Pin and reports its pinned state", async () => {
+    const view = renderMenu();
+    sendCommand({ command: "toggle-pin-session", browserViewId: null });
+    expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true });
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sessionPinned: false, sessionArchived: false }),
+      ),
+    );
+
+    view.rerender(
+      menuTree({ conversation: { ...CONVERSATION, labels: { [PINNED_LABEL_KEY]: "1" } } }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          commands: ["archive-session", "fork-session", "toggle-pin-session"],
+          sessionPinned: true,
+        }),
+      ),
+    );
+  });
+
+  it("disables Session → Pin while a pin write is pending", async () => {
+    const queryClient = new QueryClient();
+    renderMenu({}, queryClient);
+    const reportsPin = (reported: boolean) =>
+      waitFor(() =>
+        expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            commands: [
+              "archive-session",
+              "fork-session",
+              ...(reported ? ["toggle-pin-session"] : []),
+            ],
+          }),
+        ),
+      );
+    await reportsPin(true);
+
+    let finishWrite = () => {};
+    const write = queryClient.getMutationCache().build(queryClient, {
+      mutationKey: PIN_WRITE_MUTATION_KEY,
+      mutationFn: () =>
+        new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        }),
+    });
+    act(() => void write.execute(undefined));
+    await reportsPin(false);
+
+    await act(async () => finishWrite());
+    await reportsPin(true);
+  });
+
+  it("archives through the same worktree prompt as the menu item", () => {
+    renderMenu();
+    act(() => sendCommand({ command: "archive-session", browserViewId: null }));
+    expect(mocks.archive).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
+    expect(mocks.archive).toHaveBeenCalledWith({
+      id: "conv-1",
+      archived: true,
+      deleteWorktree: true,
+    });
+  });
+
+  it("shows the desktop chords on Pin, Archive and Fork", () => {
+    renderMenu();
+    openMenu();
+    const keycaps = (item: HTMLElement) =>
+      Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
+    expect(keycaps(screen.getByRole("menuitem", { name: "Pin" }))).toEqual(["Ctrl", "Alt", "P"]);
+    expect(keycaps(screen.getByRole("menuitem", { name: "Archive" }))).toEqual(["Ctrl", "⇧", "A"]);
+    expect(keycaps(screen.getByRole("menuitem", { name: "Fork" }))).toEqual(["Ctrl", "Alt", "F"]);
+  });
+
+  it("opens the fork dialog from Session → Fork Session", () => {
+    const onFork = vi.fn();
+    renderMenu({ onFork });
+    act(() => sendCommand({ command: "fork-session", browserViewId: null }));
+    expect(onFork).toHaveBeenCalledTimes(1);
   });
 });

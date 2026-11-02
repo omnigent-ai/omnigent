@@ -2568,6 +2568,50 @@ describe("file position navigation", () => {
     expect(unregister).toHaveBeenCalled();
   });
 
+  it("asks before a closing tab or a session exit drops unsaved edits", () => {
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return () => {};
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "file1.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    render(<GuardedViewer />);
+    const close = vi.fn();
+    // A clean editor lets the tab close straight away.
+    act(() => guard!(null, undefined, close));
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    act(() => guard!(null, undefined, close));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(draft).toHaveValue("Unsaved draft");
+
+    act(() => guard!(null, undefined, close));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
   it.each([false, true])(
     "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
     (diffActive) => {
