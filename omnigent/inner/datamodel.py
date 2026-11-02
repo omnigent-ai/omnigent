@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -826,6 +827,9 @@ class OSEnvSpec:
         project files via absolute paths. Requires an active
         sandbox (rejected for ``type='none'``). Mutually exclusive
         with :attr:`fork`. Default ``False``.
+    :param shell_yield_after: Opt-in foreground wait in seconds for runner
+        shell tools. Slow calls continue once and return an inbox handle.
+        ``None`` keeps synchronous results.
     """
 
     type: str = "caller_process"
@@ -833,8 +837,16 @@ class OSEnvSpec:
     sandbox: OSEnvSandboxSpec | None = None
     fork: bool = False
     start_in_scratch: bool = False
+    shell_yield_after: float | None = None
 
     def __post_init__(self) -> None:
+        if self.shell_yield_after is not None and (
+            isinstance(self.shell_yield_after, bool)
+            or not isinstance(self.shell_yield_after, (int, float))
+            or not math.isfinite(self.shell_yield_after)
+            or self.shell_yield_after <= 0
+        ):
+            raise ValueError("os_env.shell_yield_after must be a positive finite number")
         if (
             self.fork
             and self.sandbox is not None

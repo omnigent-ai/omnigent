@@ -1,9 +1,15 @@
 """The general gateway retains authenticated session permissions."""
 
+import asyncio
+import json
+from contextlib import suppress
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import yaml
+from fastapi import Request
 from mcp.types import Tool
 
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
@@ -14,6 +20,193 @@ from tests.server.integration.test_session_agent_owner import auth_app as auth_a
 @pytest.fixture(autouse=True)
 def multi_user(monkeypatch):
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "ab" * 32)
+
+
+@pytest.mark.asyncio
+async def test_delayed_shell_result_keeps_original_turn_actor(
+    auth_app, auth_client, monkeypatch, tmp_path
+):
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
+    from omnigent.spec.parser import parse
+    from tests._helpers.runner_mcp import RunnerMcpHarness
+    from tests._helpers.session import bundle_files, post_session_bundle
+    from tests.server.integration.test_session_agent_owner import _share_editor
+
+    owner, first = "owner@example.test", "first@example.test"
+    expression = (
+        'event.type == "tool_result" && event.target == "sys_os_shell" '
+        f'&& event.context.actor.run_as != "{owner}" '
+        '? {"result": "DENY", "reason": event.context.actor.run_as} '
+        ': {"result": "ALLOW"}'
+    )
+    config = yaml.safe_dump(
+        {
+            "spec_version": 1,
+            "name": "delayed-attribution",
+            "executor": {"config": {"harness": "claude-sdk"}},
+            "os_env": {"shell_yield_after": 0.001},
+            "guardrails": {
+                "policies": {
+                    "owner_only": {
+                        "type": "function",
+                        "function": {
+                            "path": "omnigent.policies.builtins.cel.cel_policy",
+                            "arguments": {"expression": expression},
+                        },
+                    }
+                }
+            },
+        }
+    ).encode()
+    (tmp_path / "config.yaml").write_bytes(config)
+    created = await post_session_bundle(
+        auth_client.post,
+        "/v1/sessions",
+        bundle_files({"config.yaml": config}),
+        headers={"X-Forwarded-Email": owner},
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["session_id"]
+    await _share_editor(auth_client, sid, owner, first)
+    binding = "test-delayed-shell-binding"
+    store = get_conversation_store()
+    store.set_runner_id(sid, token_bound_runner_id(binding))
+    auth_client.headers.update({"X-Forwarded-Email": owner, RUNNER_TUNNEL_TOKEN_HEADER: binding})
+    runner = RunnerMcpHarness(session_id=sid, workspace=tmp_path, server_client=auth_client)
+    runner.spec_cache[sid] = parse(tmp_path)
+    runner.inboxes[sid], runner.async_tasks[sid] = asyncio.Queue(), {}
+    release = asyncio.Event()
+    execute = tool_dispatch.execute_tool
+
+    async def blocked_shell(**kwargs):
+        if kwargs["tool_name"] == "sys_os_shell":
+            await release.wait()
+            return "private shell output"
+        return await execute(**kwargs)
+
+    @runner.app.post("/{path:path}", status_code=202)
+    async def accept_message(path: str):
+        return {"ok": True}
+
+    async def send_as(user):
+        event = await auth_client.post(
+            f"/v1/sessions/{sid}/events",
+            headers={"X-Forwarded-Email": user},
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Use the tool"}],
+                },
+            },
+        )
+        assert event.status_code == 202, event.text
+        assert store.get_conversation(sid).labels[_TURN_ACTOR_LABEL] == user
+
+    async def call_tool(name):
+        return await auth_client.post(
+            f"/v1/sessions/{sid}/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            },
+        )
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", blocked_shell)
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", AsyncMock())
+    async with runner.client() as runner_client:
+        monkeypatch.setattr(
+            sessions_mod, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        try:
+            await send_as(first)
+            response = await asyncio.wait_for(call_tool("sys_os_shell"), timeout=5)
+            handle = json.loads(response.json()["result"]["content"][0]["text"])["handle_id"]
+            collection = runner.async_tasks[sid][handle][0]
+            await send_as(owner)
+            release.set()
+            await asyncio.wait_for(collection, timeout=5)
+            delivered = await call_tool("sys_read_inbox")
+            assert "private shell output" not in delivered.text
+            assert f"Result suppressed by policy: {first}" in delivered.text
+            assert runner.inboxes[sid].empty()
+        finally:
+            release.set()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(task for task, _ in runner.async_tasks[sid].values()),
+                        return_exceptions=True,
+                    ),
+                    timeout=5,
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid_context", [False, True])
+async def test_delayed_shell_context_is_verified_without_policies(
+    auth_app, auth_client, monkeypatch, valid_context
+):
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.mcp_identity import shell_result_context
+    from omnigent.server.routes import sessions as sessions_mod
+
+    owner = "owner@example.test"
+    agent = await create_test_agent(auth_client, user=owner)
+    sid = agent["_session_id"]
+    binding = "test-delayed-shell-binding"
+    store = get_conversation_store()
+    store.set_runner_id(sid, token_bound_runner_id(binding))
+    request_data = {"name": "sys_os_shell", "arguments": {}}
+    context = shell_result_context(
+        Request(
+            {
+                "type": "http",
+                "app": auth_app,
+                "headers": [(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), binding.encode())],
+            }
+        ),
+        store.get_conversation(sid),
+        {"run_as": owner},
+        request_data,
+    )
+    assert context is not None
+    caps = replace(sessions_mod.get_caps(), native_hook_allow_cache_seconds=lambda: 30.0)
+    monkeypatch.setattr(sessions_mod, "get_caps", lambda: caps)
+    response = await auth_client.post(
+        f"/v1/sessions/{sid}/policies/evaluate",
+        headers={"X-Forwarded-Email": owner, RUNNER_TUNNEL_TOKEN_HEADER: binding},
+        json={
+            "_omnigent_shell_result_context": context if valid_context else None,
+            "_omnigent_shell_result_handle": context["handle_id"],
+            "event": {
+                "type": "PHASE_TOOL_RESULT",
+                "request_data": request_data,
+                "data": {
+                    "name": "sys_os_shell",
+                    "result": "private output",
+                },
+            },
+        },
+    )
+    if valid_context:
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "result": "POLICY_ACTION_ALLOW",
+            "allow_cache_seconds": 30.0,
+            "_omnigent_shell_result_handle": context["handle_id"],
+        }
+    else:
+        assert response.status_code == 400
+        assert "Unverified shell result context" in response.text
 
 
 @pytest.mark.asyncio

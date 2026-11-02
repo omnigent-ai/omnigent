@@ -2122,7 +2122,8 @@ def test_parse_os_env_absent_yields_none(agent_dir: Path) -> None:
     assert spec.os_env is None
 
 
-def test_parse_os_env_caller_process(tmp_path: Path) -> None:
+@pytest.mark.parametrize("yield_after", [None, 30, 0.25])
+def test_parse_os_env_caller_process(tmp_path: Path, yield_after: float | None) -> None:
     """A native YAML ``os_env:`` mapping parses into a real
     :class:`OSEnvSpec` with the declared ``type`` and ``cwd``.
 
@@ -2137,6 +2138,7 @@ def test_parse_os_env_caller_process(tmp_path: Path) -> None:
         "os_env": {
             "type": "caller_process",
             "cwd": ".",
+            "shell_yield_after": yield_after,
         },
     }
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
@@ -2150,6 +2152,21 @@ def test_parse_os_env_caller_process(tmp_path: Path) -> None:
     # Sandbox absent → None (the wrap then defaults appropriately).
     assert spec.os_env.sandbox is None
     assert spec.os_env.fork is False
+    assert spec.os_env.shell_yield_after == yield_after
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "30", [], float("nan"), float("inf")])
+def test_parse_shell_yield_after_rejects_invalid_values(tmp_path: Path, value: object) -> None:
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "os_env": {"shell_yield_after": value},
+            }
+        )
+    )
+    with pytest.raises(OmnigentError, match="shell_yield_after must be a positive finite number"):
+        parse(tmp_path)
 
 
 def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:

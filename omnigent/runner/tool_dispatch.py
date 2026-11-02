@@ -198,9 +198,9 @@ def _string_mapping(value: object) -> dict[str, str] | None:
 _INBOX_OUTPUT_MAX_CHARS = 12000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
 _RUNNER_EXECUTION_TIMEOUT_S = 7200.0
-_SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
+_INBOX_POLICY_STATUSES = frozenset({"completed", "failed"})
 _SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-_SUBAGENT_POLICY_FAILURE_OUTPUT = "[Result suppressed by policy: policy evaluation failed]"
+_INBOX_POLICY_FAILURE_OUTPUT = "[Result suppressed by policy: policy evaluation failed]"
 _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # Read budget for runner→server message-send POSTs that are gated at the
 # recipient's REQUEST phase, which can PARK behind a human-approval ASK gate
@@ -237,9 +237,9 @@ class _CancelAsyncToolResult:
 
 
 @dataclass(frozen=True)
-class _SubagentInboxEvaluation:
+class _InboxOutputEvaluation:
     """
-    Result of delayed sub-agent output policy evaluation.
+    Result of delayed tool or sub-agent output policy evaluation.
 
     :param payload: Payload safe to format for ``sys_read_inbox``.
         On fail-closed paths this contains a policy-failure sentinel
@@ -8324,7 +8324,13 @@ def _format_async_task_item(payload: _JsonObject) -> str:
     # A sub-agent's full result persists in its own session transcript,
     # so a truncated delivery can point the parent at the retrieval path.
     retrieval_id = _subagent_child_id(payload) if payload.get("type") == "sub_agent" else None
-    output = _truncate_inbox_output(payload.get("output", ""), source_session_id=retrieval_id)
+    raw_output = payload.get("output", "")
+    # Automatic shell yielding preserves the shell's existing output limits.
+    output = (
+        str(raw_output)
+        if payload.get("type") == "tool_result"
+        else _truncate_inbox_output(raw_output, source_session_id=retrieval_id)
+    )
     # An empty completion (e.g. a native child that idled with no assistant
     # text — the runner delivers "" rather than fabricating from stale
     # history) must read as "produced no output", not a dangling
@@ -8378,28 +8384,38 @@ def _subagent_child_id(payload: _JsonObject) -> str | None:
     return None
 
 
-def _subagent_policy_failure_payload(payload: _JsonObject) -> _JsonObject:
+def _inbox_policy_failure_payload(payload: _JsonObject) -> _JsonObject:
     """
-    Return a fail-closed copy of a sub-agent inbox payload.
+    Return a fail-closed copy of an inbox payload.
 
     :param payload: Original inbox payload.
     :returns: Payload with output replaced by a policy-failure
         sentinel.
     """
-    return {**payload, "output": _SUBAGENT_POLICY_FAILURE_OUTPUT}
+    return {**payload, "output": _INBOX_POLICY_FAILURE_OUTPUT}
 
 
-def _subagent_tool_result_policy_request(
+def _inbox_tool_result_policy_request(
     payload: _JsonObject,
     output: str,
 ) -> _JsonObject:
     """
-    Build the Omnigent policy-evaluation request for delayed child output.
+    Build a TOOL_RESULT policy request for delayed output.
 
-    :param payload: Completed sub-agent inbox payload.
-    :param output: Raw child output text.
+    :param payload: Completed tool or sub-agent inbox payload.
+    :param output: Raw output text.
     :returns: JSON body for ``POST /policies/evaluate``.
     """
+    if payload.get("type") == "tool_result":
+        return {
+            "_omnigent_shell_result_context": payload.get("result_context"),
+            "_omnigent_shell_result_handle": payload.get("handle_id"),
+            "event": {
+                "type": "PHASE_TOOL_RESULT",
+                "data": {"name": payload.get("tool_name"), "result": output},
+                "request_data": payload.get("request_data"),
+            },
+        }
     return {
         "event": {
             "type": "PHASE_TOOL_RESULT",
@@ -8417,7 +8433,7 @@ def _subagent_tool_result_policy_request(
     }
 
 
-async def _post_subagent_policy_verdict(
+async def _post_inbox_policy_verdict(
     *,
     server_client: httpx.AsyncClient,
     conversation_id: str,
@@ -8425,24 +8441,24 @@ async def _post_subagent_policy_verdict(
     output: str,
 ) -> _JsonObject | None:
     """
-    POST delayed sub-agent output to Omnigent policy evaluation.
+    POST delayed output to Omnigent policy evaluation.
 
     :param server_client: HTTP client pointed at Omnigent server.
     :param conversation_id: Parent session id, e.g.
         ``"conv_parent123"``.
-    :param payload: Completed sub-agent inbox payload.
-    :param output: Raw child output text.
+    :param payload: Completed tool or sub-agent inbox payload.
+    :param output: Raw output text.
     :returns: Parsed policy verdict, or ``None`` on failure.
     """
     try:
         resp = await server_client.post(
             f"{_session_url(conversation_id)}/policies/evaluate",
-            json=_subagent_tool_result_policy_request(payload, output),
+            json=_inbox_tool_result_policy_request(payload, output),
             timeout=30.0,
         )
     except (httpx.HTTPError, ValueError):
         _logger.exception(
-            "Sub-agent inbox TOOL_RESULT policy evaluation failed for parent=%s child=%s",
+            "Inbox TOOL_RESULT policy evaluation failed for parent=%s child=%s",
             conversation_id,
             _subagent_child_id(payload),
             extra={"session_id": conversation_id},
@@ -8450,8 +8466,7 @@ async def _post_subagent_policy_verdict(
         return None
     if resp.status_code >= 400:
         _logger.warning(
-            "Sub-agent inbox TOOL_RESULT policy evaluation rejected for "
-            "parent=%s status=%s body=%s",
+            "Inbox TOOL_RESULT policy evaluation rejected for parent=%s status=%s body=%s",
             conversation_id,
             resp.status_code,
             resp.text,
@@ -8459,24 +8474,35 @@ async def _post_subagent_policy_verdict(
         )
         return None
     try:
-        return _string_object_dict(resp.json())
+        verdict = _string_object_dict(resp.json())
     except (json.JSONDecodeError, ValueError):
         _logger.warning(
-            "Sub-agent inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
+            "Inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
             conversation_id,
             extra={"session_id": conversation_id},
         )
         return None
+    if verdict is None:
+        return None
+    if payload.get("type") == "tool_result" and (
+        not isinstance(payload.get("handle_id"), str)
+        or verdict.get("_omnigent_shell_result_handle") != payload["handle_id"]
+    ):
+        _logger.warning(
+            "Inbox shell result context was not verified for session=%s", conversation_id
+        )
+        return None
+    return verdict
 
 
-def _apply_subagent_policy_verdict(
+def _apply_inbox_policy_verdict(
     payload: _JsonObject,
     verdict: _JsonObject,
-) -> _SubagentInboxEvaluation:
+) -> _InboxOutputEvaluation:
     """
-    Apply an Omnigent policy verdict to a sub-agent inbox payload.
+    Apply an Omnigent policy verdict to an inbox payload.
 
-    :param payload: Original completed sub-agent payload.
+    :param payload: Original completed payload.
     :param verdict: Parsed Omnigent policy response, e.g.
         ``{"result": "POLICY_ACTION_ALLOW"}``.
     :returns: Evaluation result for ``sys_read_inbox`` formatting.
@@ -8484,46 +8510,46 @@ def _apply_subagent_policy_verdict(
     result = verdict.get("result")
     if result in {"POLICY_ACTION_DENY", "POLICY_ACTION_ASK"}:
         reason = verdict.get("reason") or "no reason given"
-        return _SubagentInboxEvaluation(
+        return _InboxOutputEvaluation(
             {**payload, "output": f"[Result suppressed by policy: {reason}]"}
         )
     if result in {"POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"}:
         transformed = verdict.get("data")
         if transformed is None:
-            return _SubagentInboxEvaluation(payload)
+            return _InboxOutputEvaluation(payload)
         if not isinstance(transformed, str):
             _logger.warning(
-                "Sub-agent inbox TOOL_RESULT policy data must be str; got %s",
+                "Inbox TOOL_RESULT policy data must be str; got %s",
                 type(transformed).__name__,
                 extra={"session_id": runner_primary_session_id()},
             )
-        return _SubagentInboxEvaluation(
+        return _InboxOutputEvaluation(
             {
                 **payload,
                 "output": transformed if isinstance(transformed, str) else str(transformed),
             }
         )
     _logger.warning(
-        "Sub-agent inbox TOOL_RESULT policy evaluation returned unknown result=%r",
+        "Inbox TOOL_RESULT policy evaluation returned unknown result=%r",
         result,
         extra={"session_id": runner_primary_session_id()},
     )
-    return _SubagentInboxEvaluation(
-        _subagent_policy_failure_payload(payload),
+    return _InboxOutputEvaluation(
+        _inbox_policy_failure_payload(payload),
         retry_original=True,
     )
 
 
-async def _evaluate_subagent_inbox_output(
+async def _evaluate_inbox_output_policy(
     payload: _JsonObject,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None,
-) -> _SubagentInboxEvaluation:
+) -> _InboxOutputEvaluation:
     """
-    Apply parent TOOL_RESULT policy to a delayed sub-agent payload.
+    Apply TOOL_RESULT policy to delayed tool or sub-agent output.
 
-    :param payload: Inbox payload for a completed sub-agent task.
+    :param payload: Inbox payload for a completed tool or sub-agent task.
     :param server_client: HTTP client pointed at Omnigent server.
     :param conversation_id: Parent session id, e.g.
         ``"conv_parent123"``.
@@ -8531,28 +8557,28 @@ async def _evaluate_subagent_inbox_output(
         metadata for transient evaluation failures.
     """
     if (
-        payload.get("type") != "sub_agent"
-        or payload.get("status") not in _SUBAGENT_POLICY_STATUSES
+        payload.get("type") not in {"sub_agent", "tool_result"}
+        or payload.get("status") not in _INBOX_POLICY_STATUSES
     ):
-        return _SubagentInboxEvaluation(payload)
+        return _InboxOutputEvaluation(payload)
     output = payload.get("output")
     if not isinstance(output, str) or server_client is None or conversation_id is None:
-        return _SubagentInboxEvaluation(
-            _subagent_policy_failure_payload(payload),
+        return _InboxOutputEvaluation(
+            _inbox_policy_failure_payload(payload),
             retry_original=True,
         )
-    verdict = await _post_subagent_policy_verdict(
+    verdict = await _post_inbox_policy_verdict(
         server_client=server_client,
         conversation_id=conversation_id,
         payload=payload,
         output=output,
     )
     if verdict is None:
-        return _SubagentInboxEvaluation(
-            _subagent_policy_failure_payload(payload),
+        return _InboxOutputEvaluation(
+            _inbox_policy_failure_payload(payload),
             retry_original=True,
         )
-    return _apply_subagent_policy_verdict(payload, verdict)
+    return _apply_inbox_policy_verdict(payload, verdict)
 
 
 async def _cleanup_drained_subagent_work(
@@ -8639,7 +8665,7 @@ async def _drain_inbox(
                 )
                 items.append(f"[System: malformed terminal_idle inbox item ignored — {exc}]")
             continue
-        evaluation = await _evaluate_subagent_inbox_output(
+        evaluation = await _evaluate_inbox_output_policy(
             payload,
             server_client=server_client,
             conversation_id=conversation_id,
