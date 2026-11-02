@@ -337,8 +337,8 @@ UNATTENDED_RUN_NOTE = (
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
     "request permission. When something is unclear, make a reasonable choice and keep "
-    "going. If an action is blocked or needs approval, skip it or find another way. End "
-    "with a reply that says what you did, what you assumed and anything you couldn't do."
+    "going. If an action needs approval or is denied, skip it and say so in your reply. "
+    "End with a reply that says what you did, what you assumed and anything you couldn't do."
 )
 
 
