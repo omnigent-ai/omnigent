@@ -1,0 +1,115 @@
+name: Update GitHub CLI pins
+
+on:
+  schedule:
+    - cron: "23 8 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify the candidate without changing files or opening a PR"
+        type: boolean
+        default: true
+      bypass_cooldown:
+        description: "Allow releases younger than seven days (urgent security fixes)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-gh-cli
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'omnigent-ai/omnigent' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BRANCH: bot/update-gh-cli
+      BASE: ${{ github.event.repository.default_branch }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+
+      - name: Keep an existing updater PR intact
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          if [ -n "$number" ]; then
+            echo "::notice::PR #$number is still open; preserving its review and any author edits."
+          fi
+
+      - name: Verify official archives and prepare pins
+        if: steps.existing.outputs.number == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BYPASS_COOLDOWN: ${{ github.event_name == 'workflow_dispatch' && inputs.bypass_cooldown }}
+        run: |
+          args=()
+          if [ "$BYPASS_COOLDOWN" = true ]; then
+            args+=(--min-age-days 0)
+          fi
+          if [ "$DRY_RUN" != true ]; then
+            args+=(--write --body-file "$RUNNER_TEMP/gh-cli-pr.md")
+          fi
+          python .github/scripts/update_gh_cli.py "${args[@]}"
+
+      - name: Detect pin changes
+        id: changes
+        run: |
+          if ! git diff --quiet -- deploy/docker/Dockerfile deploy/docker/Dockerfile.ubi; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GITHUB_TOKEN-created PRs do not trigger normal CI. Require the existing App.
+      - name: Require CI-capable credentials
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          APP_ID: ${{ vars.OMNIGENT_BOT_APP_ID }}
+        run: |
+          if [ -z "$APP_ID" ]; then
+            echo "::error::Configure OMNIGENT_BOT_APP_ID and OMNIGENT_BOT_APP_KEY; no PR will be opened with GITHUB_TOKEN."
+            exit 1
+          fi
+
+      - name: Mint scoped bot token
+        if: steps.changes.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+
+      - name: Open normal dependency PR
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          previous="$(git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f1)"
+          git switch -c "$BRANCH"
+          git add -- deploy/docker/Dockerfile deploy/docker/Dockerfile.ubi
+          version="$(awk -F= '/^ARG GH_VERSION=/ { print $2 }' deploy/docker/Dockerfile)"
+          git commit -s -m "chore(deps): bump GitHub CLI to $version"
+          git push --force-with-lease="refs/heads/$BRANCH:$previous" origin "HEAD:refs/heads/$BRANCH"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$BRANCH" \
+            --title "chore(deps): bump GitHub CLI to $version" \
+            --body-file "$RUNNER_TEMP/gh-cli-pr.md"
