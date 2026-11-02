@@ -62,8 +62,12 @@ class _SandboxWakeRecorder:
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
-        self.asleep = True
+        self.host_online = {"online": False}
         self.events: list[Any] = []
+
+    @property
+    def asleep(self) -> bool:
+        return not self.host_online["online"]
 
     def _is_event_post(self, request: Request) -> bool:
         return (
@@ -78,7 +82,8 @@ class _SandboxWakeRecorder:
     def on_response(self, response: Response) -> None:
         request = response.request
         if response.ok and self._is_event_post(request):
-            self.asleep = self.asleep and request.post_data_json != _RETRY_SESSION
+            if request.post_data_json == _RETRY_SESSION:
+                self.host_online["online"] = True
 
 
 def _fail_workspace_reads_while_asleep(page: Page, recorder: _SandboxWakeRecorder) -> None:
@@ -103,7 +108,7 @@ def _open_asleep_session(
     """Create the recorded page after setup and patch the session asleep."""
     recorder = _SandboxWakeRecorder(session_id)
     page: Page = request.getfixturevalue("page")
-    force_host_asleep(page, session_id, asleep=lambda: recorder.asleep)
+    force_host_asleep(page, session_id, host_online=recorder.host_online)
     _fail_workspace_reads_while_asleep(page, recorder)
     page.on("request", recorder.on_request)
     page.on("response", recorder.on_response)

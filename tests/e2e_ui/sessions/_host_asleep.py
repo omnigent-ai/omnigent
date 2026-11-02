@@ -9,9 +9,11 @@ need a dormant resumable sandbox host patch what the SPA sees instead:
 - ``GET /v1/sessions?...`` (sidebar list) → the session is dropped from the
   list so the open-session row resolves off-sidebar straight from the patched
   snapshot (host-bound), instead of the real runner-bound sidebar row.
-- ``GET /health`` → while ``asleep()`` holds, the session reports
-  ``runner_online=false`` + ``host_online=false``; afterwards it reports both
-  online. The open-session poll overrides the WS stream.
+- ``GET /v1/hosts`` → adds an Arclet sandbox host record so the chip reads
+  "Arclet Sandbox".
+- ``GET /health`` → the session reports ``runner_online`` and ``host_online``
+  from the caller's ``host_online`` switch (offline by default). The
+  open-session poll overrides the WS stream.
 - ``WS /v1/sessions/updates`` → blocked so a stream push can't re-add the
   session to the sidebar or revert its liveness to the real values.
 
@@ -23,7 +25,6 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
 from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route
@@ -31,6 +32,13 @@ from playwright.sync_api import Page, Route
 from tests.e2e_ui.conftest import fetch_with_retry
 
 FAKE_HOST_ID = "host_test_managed"
+FAKE_HOST = {
+    "host_id": FAKE_HOST_ID,
+    "name": "omnigent-arclet-1234",
+    "owner": "local",
+    "status": "offline",
+    "sandbox_provider": "arclet",
+}
 # Unix seconds well before now so the session is outside the startup grace
 # (STARTING_GRACE_S) — see useSessionLiveness row 2.
 OLD_CREATED_AT = 1_700_000_000
@@ -40,15 +48,22 @@ def force_host_asleep(
     page: Page,
     session_id: str,
     *,
-    asleep: Callable[[], bool] = lambda: True,
+    host_online: dict[str, bool] | None = None,
+    sandbox_status: dict[str, object] | None = None,
 ) -> None:
-    """Register the host_asleep route patches on ``page`` before navigation.
+    """Patch the browser's view of ``session_id`` into the host_asleep state.
+
+    Registered before navigation: four HTTP route patches plus one WS block.
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
-    :param asleep: Read on every ``/health`` poll; return ``False`` once the
-        test wants the sandbox to read as back online.
+    :param host_online: Mutable ``{"online": bool}`` the ``/health`` patch reads
+        on every poll, so a test can bring the host online mid-journey.
+        Defaults to always offline.
+    :param sandbox_status: Wake stage to report in the snapshot, e.g.
+        ``{"stage": "provisioning", "provider": "arclet", "error": None}``.
     """
+    liveness = host_online if host_online is not None else {"online": False}
 
     def _patch_snapshot(route: Route) -> None:
         request = route.request
@@ -59,7 +74,12 @@ def force_host_asleep(
         payload = response.json()
         payload["host_id"] = payload.get("host_id") or FAKE_HOST_ID
         payload["host_resumable"] = True
+        # Age the session out of the startup grace (STARTING_GRACE_S): a
+        # freshly-created session whose runner has never been seen online reads
+        # as `starting` (cold-boot) and would mask the host_asleep row.
         payload["created_at"] = OLD_CREATED_AT
+        if sandbox_status is not None:
+            payload["sandbox_status"] = sandbox_status
         route.fulfill(
             status=200,
             headers={**response.headers, "content-type": "application/json"},
@@ -84,6 +104,21 @@ def force_host_asleep(
             body=json.dumps(payload),
         )
 
+    def _patch_hosts(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or urlparse(request.url).path != "/v1/hosts":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        status = "online" if liveness["online"] else "offline"
+        payload["hosts"] = [*payload.get("hosts", []), {**FAKE_HOST, "status": status}]
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
     def _patch_health(route: Route) -> None:
         request = route.request
         if request.method != "GET" or urlparse(request.url).path != "/health":
@@ -91,15 +126,15 @@ def force_host_asleep(
             return
         response = fetch_with_retry(route)
         payload = response.json()
-        online = not asleep()
-        liveness = {"runner_online": online, "host_online": online}
+        online = liveness["online"]
+        reported = {"runner_online": online, "host_online": online}
         # Plural shape used by the open-session fallback poll:
         # {"sessions": {"<id>": {...}}}.
         if isinstance(payload.get("sessions"), dict):
-            payload["sessions"][session_id] = liveness
+            payload["sessions"][session_id] = reported
         # Singular shape ({"session": {...}}) for the session_id= variant.
         if isinstance(payload.get("session"), dict):
-            payload["session"] = {**payload["session"], **liveness}
+            payload["session"] = {**payload["session"], **reported}
         route.fulfill(
             status=200,
             headers={**response.headers, "content-type": "application/json"},
@@ -110,6 +145,7 @@ def force_host_asleep(
     # matches most-recently-registered first); the list/health handlers fall
     # through via continue_() for anything they don't own.
     page.route(re.compile(r"/v1/sessions(\?|$)"), _patch_list)
+    page.route(re.compile(r"/v1/hosts(\?|$)"), _patch_hosts)
     page.route(re.compile(r"/health(\?|$)"), _patch_health)
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
