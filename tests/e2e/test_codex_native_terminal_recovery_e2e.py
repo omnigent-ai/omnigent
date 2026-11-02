@@ -29,9 +29,9 @@ from omnigent._wrapper_labels import (
 from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id, read_bridge_state
 from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 from tests._helpers.operator_agents import post_operator_session
-from tests._helpers.session import bundle_files
+from tests._helpers.session import bundle_files, send_user_text
 from tests.e2e.conftest import configure_mock_llm, release_mock_gate
-from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
+from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker
 
 _SYSTEM_CODEX_CONFIG = Path("/etc/codex/managed_config.toml")
 pytestmark = [
@@ -161,7 +161,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
         # Persist the thread before testing recovery.
         marker = f"READY_{uuid.uuid4().hex}"
         configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
-        _send_user_text(http_client, session_id=session_id, text="Reply with the ready marker")
+        send_user_text(http_client, session_id=session_id, text="Reply with the ready marker")
         _poll_for_assistant_marker(http_client, session_id=session_id, marker=marker, timeout=60)
         previous_reply = marker
 
@@ -173,7 +173,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
             configure_mock_llm(
                 mock_llm_server_url, [{"text": marker, "block": True}], match=prompt
             )
-            _send_user_text(http_client, session_id=session_id, text=prompt)
+            send_user_text(http_client, session_id=session_id, text=prompt)
             _wait_for(
                 lambda: httpx.get(
                     f"{mock_llm_server_url}/gate/pending", timeout=5, trust_env=False

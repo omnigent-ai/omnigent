@@ -63,7 +63,9 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import (
+    _forget_remembered_profile,
     _read_databrickscfg,
+    _remember_profile,
     _ReusedDatabricksTokenSource,
 )
 from omnigent.models.model_catalog import resolve_catalog_model
@@ -87,6 +89,7 @@ from omnigent.util.server_url import display_server_url
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
 
 console = Console()
 
@@ -755,8 +758,75 @@ def _remote_headers(
     return headers
 
 
-# Reuse the SDK's in-memory token cache for each server.
+# One token source per server, shared by every client in the process, so a
+# launch walks ~/.databrickscfg once instead of once per client.
 _databricks_auth_cache: dict[str, _ReusedDatabricksTokenSource] = {}
+
+
+def _shared_token_source(server_url: str | None) -> _ReusedDatabricksTokenSource:
+    """Return this process's Databricks token source for *server_url*.
+
+    :param server_url: The remote server URL, e.g.
+        ``"https://myapp-123.aws.databricksapps.com"``, or ``None`` for
+        ambient credentials, which get an unshared source.
+    :returns: The shared source, created on first use.
+    """
+    if server_url is None:
+        return _ReusedDatabricksTokenSource()
+    key = server_url.rstrip("/")
+    source = _databricks_auth_cache.get(key)
+    if source is None:
+        source = _databricks_auth_cache[key] = _ReusedDatabricksTokenSource(server_url)
+    return source
+
+
+def _remember_accepted_credential(server_url: str, authorization: str | None) -> None:
+    """Remember the profile behind *authorization* once the server accepted it.
+
+    Only a bearer minted by the shared source counts; an env-var or OIDC
+    token says nothing about which profile works.
+
+    :param server_url: The remote server URL the token was accepted by.
+    :param authorization: The ``Authorization`` header the server accepted.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    source = _databricks_auth_cache.get(server_url.rstrip("/"))
+    if source is None or source.profile_name is None or authorization is None:
+        return
+    if authorization != f"Bearer {source.current_token()}":
+        return
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        _remember_profile(workspace_host, source.profile_name)
+
+
+def _forget_refused_credential(server_url: str) -> None:
+    """Forget the credential the server just refused for *server_url*.
+
+    The next client resolves again, and the profile walk goes back to its
+    default order instead of preferring the refused profile.
+
+    :param server_url: The remote server URL that refused the credential.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    _databricks_auth_cache.pop(server_url.rstrip("/"), None)
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        _forget_remembered_profile(workspace_host)
+
+
+def _adopt_verified_credential(server_url: str, auth: _DatabricksBearerAuth) -> None:
+    """Serve later clients of *server_url* from *auth*, whose token the server accepted.
+
+    A recovery resolves credentials outside the shared source; without this the
+    next client would walk ``~/.databrickscfg`` and mint again.
+
+    :param server_url: The remote server URL that accepted the token.
+    :param auth: The resolved auth that minted the accepted token.
+    """
+    _shared_token_source(server_url).adopt(auth)
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -775,14 +845,9 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     """
     from omnigent.cli_auth import load_databricks_workspace_host
 
-    workspace_host = load_databricks_workspace_host(server_url)
-    if workspace_host is None:
+    if load_databricks_workspace_host(server_url) is None:
         return None
-    source = _databricks_auth_cache.get(server_url)
-    if source is None:
-        source = _ReusedDatabricksTokenSource(host=workspace_host)
-        _databricks_auth_cache[server_url] = source
-    return source.current_token()
+    return _shared_token_source(server_url).current_token()
 
 
 class _DatabricksTokenAuth(httpx.Auth):
@@ -818,7 +883,7 @@ class _DatabricksTokenAuth(httpx.Auth):
         # cache). Resolving per request rebuilt Config and shelled out to
         # the Databricks CLI (~0.5s) every time — a heavy tax on the
         # long-lived transcript-forwarder client that posts reply items.
-        self._sdk_token_source = _ReusedDatabricksTokenSource(server_url)
+        self._sdk_token_source = _shared_token_source(server_url)
 
     def pin_session(self, session_id: str | None) -> None:
         """Repoint this auth at a different session's host.
@@ -1920,7 +1985,7 @@ def _stop_headless_session(*, base_url: str, session_id: str) -> None:
     # Teardown must never turn a completed run into a failed one.
     try:
         _stop_session_on_server(base_url=base_url, session_id=session_id)
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -2657,7 +2722,7 @@ async def _stop_launched_session(client: OmnigentClient, session_id: str) -> Non
     # Teardown must never turn a completed run into a failed one.
     try:
         await client.sessions.post_event(session_id, {"type": "stop_session", "data": {}})
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -3308,6 +3373,15 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
+        if source.is_file() and isinstance(raw.get("instructions"), str):
+            from omnigent.inner.loader import _resolve_instructions
+
+            instructions = _resolve_instructions(raw["instructions"], source.parent)
+            if instructions is not None and instructions != raw["instructions"]:
+                # A newline marks one-line file contents as inline text on reload.
+                if instructions and "\n" not in instructions:
+                    instructions += "\n"
+                raw["instructions"] = instructions
         _apply_overrides_to_raw(raw, overrides)
         target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent

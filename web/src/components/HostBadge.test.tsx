@@ -342,6 +342,30 @@ describe("HostBadge", () => {
     },
   );
 
+  it("names an Arclet in the composer tooltip by its own host name", async () => {
+    useHostsMock.mockReturnValue({
+      data: [host({ name: "omnigent-arclet-1234567890", sandbox_provider: "arclet" })],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: Arclet Sandbox");
+    expect(tooltip).toHaveTextContent("Name: omnigent-arclet-1234567890");
+    expect(tooltip).toHaveTextContent("Status: Connected");
+  });
+
+  it("keeps another sandbox's managed-* name out of the composer tooltip", async () => {
+    useHostsMock.mockReturnValue({
+      data: [host({ name: "managed-abc123", sandbox_provider: "lakebox" })],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: Databricks Sandbox");
+    expect(tooltip).not.toHaveTextContent("Name:");
+    expect(tooltip).not.toHaveTextContent("managed-abc123");
+  });
+
   it("names no host in the composer tooltip for an unbound session", async () => {
     useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
@@ -507,9 +531,9 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
   });
 
-  it("stays passive for a dormant resumable managed host", () => {
-    // A resumable sandbox host reads offline while idle-stopped, but the next
-    // message wakes it — offering `omnigent host` there would be wrong.
+  it("offers reconnect for a dormant resumable managed host", () => {
+    // A resumable sandbox host reads offline while idle-stopped; reconnecting
+    // asks the server to wake it, as the next message would.
     useSessionMock.mockReturnValue({
       session: { hostId: "host_a1b2", hostResumable: true },
       isLoading: false,
@@ -519,11 +543,27 @@ describe("HostBadge", () => {
     const onReconnect = vi.fn();
     render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
     const badge = screen.getByTestId("host-badge");
-    expect(badge.textContent).toBe("mac-laptop, offline");
-    // `omnigent host` is the wrong instruction here, so the click must not
-    // reach reconnect — it opens the switch dialog like any non-reconnect host.
+    expect(badge.textContent).toBe("mac-laptop, offline — click to reconnect");
     fireEvent.click(badge);
-    expect(onReconnect).not.toHaveBeenCalled();
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("switch-host-dialog")).toBeNull();
+  });
+
+  it.each([
+    ["a disconnected", false],
+    ["an asleep", true],
+  ])("offers Reconnect host in the composer menu for %s host", (_state, hostResumable) => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_a1b2", hostResumable },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={onReconnect} />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
+    expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
   it("renders nothing when onReconnect is set but the session isn't host-bound", () => {

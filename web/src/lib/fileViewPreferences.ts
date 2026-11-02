@@ -21,7 +21,7 @@ export interface FileViewPreferences {
   previewableViewMode: "editor" | "preview" | "source";
   /** Whether whitespace-only changes are hidden in the diff view. */
   hideWhitespace: boolean;
-  /** Whether long lines soft-wrap in the diff view (no horizontal scroll). */
+  /** Whether long lines soft-wrap in the code editor and diff view (no horizontal scroll). */
   wrapLines: boolean;
 }
 

@@ -475,3 +475,58 @@ def test_page_never_labels_concurrent_rows_with_an_old_revision(store):
     finally:
         event.remove(store._engine, "after_cursor_execute", concurrent_write)
     assert store.read(user_id="alice").entries[0].value == "newer"
+
+
+def test_configuration_snapshot_is_atomic_bounded_and_isolated(store, db_uri):
+    from omnigent.configuration_profile import ConfigurationSave, PortableConfiguration
+
+    initial = store.read_configuration(user_id="alice")
+    assert initial.configuration is None and initial.revision == 0
+    operation = ConfigurationSave(
+        identity=initial.identity,
+        expected_revision=0,
+        configuration=PortableConfiguration(model="a"),
+    )
+    alternatives = [
+        operation,
+        operation.model_copy(update={"configuration": PortableConfiguration(model="b")}),
+    ]
+
+    def save(edit):
+        try:
+            return store.save_configuration(edit, user_id="alice")
+        except OmnigentError as error:
+            assert error.code == ErrorCode.CONFLICT
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(save, alternatives))
+    assert len([result for result in results if result is not None]) == 1
+    winner = next(result for result in results if result is not None)
+    accepted = next(edit for edit in alternatives if edit.configuration == winner.configuration)
+    assert store.save_configuration(accepted, user_id="alice") == winner
+    assert store.read_configuration(user_id="bob").configuration is None
+    with workspace_scope(19):
+        assert store.read_configuration(user_id="alice").configuration is None
+    with pytest.raises(OmnigentError, match="identity"):
+        store.save_configuration(accepted, user_id="bob")
+    reopened = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
+    assert reopened.read_configuration(user_id="alice") == winner
+    with pytest.raises(OmnigentError, match="identity"):
+        SqlAlchemyPreferenceStore(db_uri, authority_id="different").read_configuration(
+            user_id="alice"
+        )
+    updated = reopened.save_configuration(
+        ConfigurationSave(
+            identity=initial.identity,
+            expected_revision=1,
+            configuration=PortableConfiguration(model="c"),
+        ),
+        user_id="alice",
+    )
+    with pytest.raises(OmnigentError, match="changed"):
+        store.save_configuration(accepted, user_id="alice")
+    assert store.read_configuration(user_id="alice") == updated
+    with store._session("count_configuration_rows") as session:
+        assert session.scalar(select(func.count()).select_from(SqlPreference)) == 1
+    assert store.read(user_id="alice").revision == 0

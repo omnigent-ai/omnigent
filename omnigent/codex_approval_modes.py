@@ -142,6 +142,8 @@ def codex_permission_preset_from_thread_settings(settings: object) -> str | None
     reviewer = settings.get("approvalsReviewer")
     sandbox = settings.get("sandboxPolicy")
     sandbox_type = sandbox.get("type") if isinstance(sandbox, Mapping) else None
+    if not isinstance(sandbox_type, str):
+        sandbox_type = None
     profile = settings.get("activePermissionProfile")
     profile_id = profile.get("id") if isinstance(profile, Mapping) else None
     if (

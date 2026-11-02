@@ -190,6 +190,42 @@ def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
     ) in unit
 
 
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_service_persists_explicit_host_credentials_privately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
+) -> None:
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.setattr(
+        service.os,
+        "environ",
+        {
+            "HOME": str(tmp_path),
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "state"),
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "MY_GATEWAY_TOKEN",
+            "MY_GATEWAY_TOKEN": "synthetic-provider-key",
+            "UNRELATED_SHELL_SECRET": "unrelated-secret",
+        },
+    )
+    monkeypatch.setattr(service.platform, "system", lambda: system)
+    _capture_runs(monkeypatch)
+    installed = service.enable_user_host_service(
+        "https://example.com",
+        environment=_build_host_daemon_env(server_url="https://example.com"),
+    )
+
+    contents = installed.path.read_bytes()
+    if system == "Darwin":
+        assert plistlib.loads(contents)["EnvironmentVariables"]["MY_GATEWAY_TOKEN"] == (
+            "synthetic-provider-key"
+        )
+    else:
+        assert b'Environment="MY_GATEWAY_TOKEN=synthetic-provider-key"' in contents
+    assert b"unrelated-secret" not in contents
+    assert installed.path.stat().st_mode & 0o777 == 0o600
+
+
 def test_disable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))

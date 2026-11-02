@@ -194,7 +194,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             # A wedged provider is not model-specific; retrying on the
             # session model would only double the worst-case wait.
             raise
-        except Exception:  # noqa: BLE001 - any economy-tier provider failure earns the retry
+        except Exception:  # any economy-tier provider failure earns the retry
             _logger.info(
                 "economy title model %s failed on harness %s; retrying with the session model",
                 title_model,

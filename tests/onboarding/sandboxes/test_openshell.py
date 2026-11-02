@@ -689,8 +689,46 @@ def test_client_create_sandbox(sdk: _SDKState) -> None:
     assert name == "petname-new"
     assert sdk.created_spec.template.image == "ghcr.io/x/host:1"
     assert sdk.created_spec.environment == {"A": "1"}
+    assert not hasattr(sdk.created_spec.template, "driver_config")
     assert sdk.created_workspace == "default"
     assert sdk.waited == ("petname-new", 300)
+
+
+def test_client_create_sandbox_sets_kubernetes_placement(sdk: _SDKState) -> None:
+    """Kubernetes placement is forwarded through the template driver config."""
+    client = _OpenShellClient(
+        node_selector={"kata-install": "true"}, runtime_class="kata-containers"
+    )
+    client.create_sandbox(image="img", env={})
+
+    assert sdk.created_spec.template.driver_config == {
+        "kubernetes": {
+            "pod": {
+                "node_selector": {"kata-install": "true"},
+                "runtime_class_name": "kata-containers",
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("node_selector", "runtime_class", "expected_pod"),
+    [
+        ({"pool": "sandboxes"}, None, {"node_selector": {"pool": "sandboxes"}}),
+        (None, "kata-containers", {"runtime_class_name": "kata-containers"}),
+    ],
+)
+def test_client_create_sandbox_sets_partial_kubernetes_placement(
+    sdk: _SDKState,
+    node_selector: dict[str, str] | None,
+    runtime_class: str | None,
+    expected_pod: dict[str, str],
+) -> None:
+    """Each placement field reaches the driver config independently."""
+    client = _OpenShellClient(node_selector=node_selector, runtime_class=runtime_class)
+    client.create_sandbox(image="img", env={})
+
+    assert sdk.created_spec.template.driver_config == {"kubernetes": {"pod": expected_pod}}
 
 
 def test_client_create_sandbox_custom_workspace(sdk: _SDKState) -> None:

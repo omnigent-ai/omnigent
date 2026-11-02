@@ -124,6 +124,8 @@ def _pr_data() -> dict[str, object]:
             {"id": "LA_1", "name": "size/XS", "color": "EDEDED", "description": "Tiny"},
             {"id": "LA_2", "name": "bug", "color": "d73a4a", "description": ""},
         ],
+        "mergeStateStatus": "CLEAN",
+        "autoMergeRequest": None,
     }
 
 
@@ -265,6 +267,8 @@ def test_reviewer_field_failure_preserves_pr(lookup: str, error: str) -> None:
         "passing": 1,
         "failing": 0,
         "pending": 0,
+        "cancelled": 0,
+        "skipped": 0,
         "total": 1,
         "runs": [{"name": "unit", "bucket": "passing", "url": "https://example.com/check"}],
     }

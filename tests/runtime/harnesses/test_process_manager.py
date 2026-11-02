@@ -301,8 +301,10 @@ async def _ping_health(client) -> None:  # type: ignore[no-untyped-def]
     assert response.json() == {"status": "ok"}
 
 
+@pytest.mark.parametrize("removed_directory", [None, "instance", "root"])
 async def test_get_client_spawns_and_serves(
     manager: HarnessProcessManager,
+    removed_directory: str | None,
 ) -> None:
     """First get_client spawns the runner; /health round-trips.
 
@@ -314,8 +316,19 @@ async def test_get_client_spawns_and_serves(
     """
     await manager.start()
     try:
+        if removed_directory is not None:
+            shutil.rmtree(
+                manager.instance_dir
+                if removed_directory == "instance"
+                else manager.instance_dir.parent
+            )
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         await _ping_health(client)
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None and claim.pid == os.getpid()
+        if removed_directory is not None and os.name == "posix":
+            assert manager.instance_dir.stat().st_mode & 0o777 == 0o700
+            assert manager.socket_path("conv_a").stat().st_mode & 0o777 == 0o600
         # The runner stashed the conversation id on app.state per
         # the contract; verify the round-trip works.
         cid_resp = await client.get("/conversation-id")
@@ -718,10 +731,12 @@ async def test_get_client_respawns_after_crash(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("response_id", [None, "resp_socket_lost"])
+@pytest.mark.parametrize("removed_path", ["socket", "instance", "root"])
 async def test_get_client_respawns_when_socket_pathname_vanishes(
     manager: HarnessProcessManager,
     caplog: pytest.LogCaptureFixture,
     response_id: str | None,
+    removed_path: str,
 ) -> None:
     """A live harness whose socket file was removed is replaced on the next turn.
 
@@ -746,7 +761,12 @@ async def test_get_client_respawns_when_socket_pathname_vanishes(
             manager.mark_in_flight("conv_a", response_id)
         socket_path = manager.socket_path("conv_a")
         assert socket_path.exists()
-        socket_path.unlink()
+        if removed_path == "socket":
+            socket_path.unlink()
+        else:
+            shutil.rmtree(
+                manager.instance_dir if removed_path == "instance" else manager.instance_dir.parent
+            )
         assert _pid_alive(original_pid)
 
         await asyncio.sleep(httpx.Limits().keepalive_expiry + 1.0)
@@ -761,6 +781,8 @@ async def test_get_client_respawns_when_socket_pathname_vanishes(
         assert new_pid != original_pid
         assert _pid_alive(new_pid)
         assert socket_path.exists()
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None and claim.pid == os.getpid()
         assert not _pid_alive(original_pid)
         assert not manager.has_active_turn("conv_a")
         if response_id is None:

@@ -688,11 +688,7 @@ class HarnessProcessManager:
             # Sweep BEFORE creating our own dir, so a crashed prior instance
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
-        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can tell our
-        # dir is live. The PID-namespace-qualified claim keeps a sweep that
-        # cannot see our PID (e.g. inside an agent sandbox) from deleting it.
-        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+        self._ensure_instance_dir()
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1247,6 +1243,13 @@ class HarnessProcessManager:
                 self._spawn_locks[conversation_id] = lock
             return lock
 
+    def _ensure_instance_dir(self) -> None:
+        # Temporary-file cleanup may remove either directory after start().
+        # Recreated state needs the same private modes and live-owner claim.
+        self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+
     async def _spawn_entry(
         self,
         conversation_id: str,
@@ -1273,6 +1276,7 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        self._ensure_instance_dir()
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)

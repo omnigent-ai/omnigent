@@ -89,6 +89,10 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+# The session stream has no replay, so the REPL waits for the server's
+# subscription heartbeat before posting; the cap covers servers without one.
+_STREAM_READY_TIMEOUT_S: float = 5.0
+
 
 def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
     """Return ``True`` when *exc* is a transient SSE transport interruption.
@@ -768,6 +772,29 @@ def _parse_approval_input(text: str) -> _ApprovalVerdict:
     return _ApprovalVerdict.REFUSE
 
 
+# How another client's verdict settles the ASK this REPL is prompting for,
+# paired with the transcript line that reports it.
+_RESOLVED_ELSEWHERE: dict[str, tuple[_ApprovalVerdict, str]] = {
+    "accept": (_ApprovalVerdict.APPROVE_ONCE, "approved elsewhere"),
+    "decline": (_ApprovalVerdict.REFUSE, "declined elsewhere"),
+    "cancel": (_ApprovalVerdict.REFUSE, "cancelled elsewhere"),
+}
+
+
+def _resolved_elsewhere_verdict(action: str | None) -> _ApprovalVerdict:
+    """Verdict for an external resolution; anything but ``accept`` refuses."""
+    return _RESOLVED_ELSEWHERE.get(action or "", (_ApprovalVerdict.REFUSE, ""))[0]
+
+
+def _resolved_elsewhere_label(action: str | None, reason: str | None) -> str:
+    """Transcript line for an ASK another client settled, e.g. ``"declined elsewhere"``."""
+    if action in _RESOLVED_ELSEWHERE:
+        return _RESOLVED_ELSEWHERE[action][1]
+    if reason == "unanswered":
+        return "expired unanswered · refused"
+    return "resolved elsewhere · no verdict recorded · refused"
+
+
 class _ApprovalState:
     """
     Per-REPL holder for pending approvals and the session
@@ -802,6 +829,9 @@ class _ApprovalState:
         # ctx fields.
         self._current_policy: str | None = None
         self._current_phase: str | None = None
+        # Server id of the current ASK, so a resolved event from another
+        # client only settles the prompt when it is for this elicitation.
+        self._current_elicitation_id: str | None = None
         # When True, the current approval is URL-mode-only and
         # keyboard input (y/a/n) should be rejected.
         self._url_mode: bool = False
@@ -852,7 +882,12 @@ class _ApprovalState:
         self._always.add((policy_name, phase))
 
     def begin(
-        self, policy_name: str, phase: str, *, url_mode: bool = False
+        self,
+        policy_name: str,
+        phase: str,
+        *,
+        elicitation_id: str | None = None,
+        url_mode: bool = False,
     ) -> asyncio.Future[bool]:
         """
         Start a new approval — create the future the hook awaits.
@@ -860,7 +895,9 @@ class _ApprovalState:
         Records the identity of the ASK so
         :meth:`resolve_verdict` can cache an "always" decision
         against the right ``(policy_name, phase)`` pair
-        without the caller having to re-pass them.
+        without the caller having to re-pass them, and so
+        :meth:`resolve_elsewhere` can tell this elicitation's
+        resolved event apart from any other's.
 
         If a previous approval's future is still open (the user
         never answered before a new ASK arrived), refuse the
@@ -871,6 +908,9 @@ class _ApprovalState:
         :param policy_name: Deciding policy's name from the
             :class:`ElicitationRequestCtx`.
         :param phase: Phase string from the ctx.
+        :param elicitation_id: Server-assigned id of this ASK,
+            e.g. ``"elicit_abc123"``. ``None`` when unknown; the
+            prompt then only settles through keyboard input.
         :returns: The future to await. Resolves to ``True`` on
             approve (one or always) and ``False`` on refuse.
         """
@@ -878,6 +918,7 @@ class _ApprovalState:
             self._future.set_result(False)
         self._current_policy = policy_name
         self._current_phase = phase
+        self._current_elicitation_id = elicitation_id or None
         self._url_mode = url_mode
         self._future = asyncio.get_running_loop().create_future()
         return self._future
@@ -909,7 +950,29 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
         return True
+
+    def resolve_elsewhere(self, elicitation_id: str, action: str | None) -> bool:
+        """
+        Settle the pending approval from another client's resolution of
+        the same elicitation.
+
+        The server publishes ``elicitation_resolved`` for every elicitation
+        in the session, so only an event carrying this ASK's id may release
+        the gate. ``accept`` approves once; a decline, cancel, or
+        verdict-less clear refuses fail-closed.
+
+        :param elicitation_id: Id carried by the resolved event.
+        :param action: MCP verdict carried by the event, or ``None``.
+        :returns: ``True`` iff the pending approval was for this
+            elicitation and has now been resolved.
+        """
+        if not self.pending or not elicitation_id:
+            return False
+        if elicitation_id != self._current_elicitation_id:
+            return False
+        return self.resolve_verdict(_resolved_elsewhere_verdict(action))
 
     def cancel(self) -> None:
         """
@@ -925,6 +988,7 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
 
 
 class _FieldInputState:
@@ -1126,7 +1190,12 @@ def _make_elicitation_prompt(
                     f"n = refuse[/{fmt.accent}]",
                 ),
             )
-        future = state.begin(ctx.policy_name, ctx.phase, url_mode=bool(_is_external_url))
+        future = state.begin(
+            ctx.policy_name,
+            ctx.phase,
+            elicitation_id=ctx.elicitation_id,
+            url_mode=bool(_is_external_url),
+        )
         return await future
 
     return _on_elicitation_request
@@ -1401,6 +1470,8 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        # Set once the current stream subscription registers or its attempt ends.
+        self._stream_ready = asyncio.Event()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -1729,10 +1800,7 @@ class _SessionsChatReplAdapter:
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
             if self._stream_task is None:
-                self._stream_task = asyncio.create_task(
-                    self._stream_pump(),
-                    name=f"sessions-adapter-stream-{self._session_id}",
-                )
+                await self._start_stream_pump()
             if self._runner_recover is not None and self._recover_task is None:
                 self._recover_task = asyncio.create_task(
                     self._runner_recover_watch(),
@@ -2163,7 +2231,7 @@ class _SessionsChatReplAdapter:
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def view_session(
@@ -2212,7 +2280,7 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def aclose(self) -> None:
@@ -2239,6 +2307,28 @@ class _SessionsChatReplAdapter:
                 return_exceptions=True,
             )
             self._pending_local_tasks.clear()
+
+    async def _start_stream_pump(self) -> None:
+        """Start the persistent stream and wait until the server has registered it.
+
+        Events published before registration are never delivered, which would
+        lose e.g. the approval prompt for the message posted right after this.
+        """
+        self._stream_ready.clear()
+        self._stream_task = asyncio.create_task(
+            self._stream_pump(),
+            name=f"sessions-adapter-stream-{self._session_id}",
+        )
+        ready = asyncio.ensure_future(self._stream_ready.wait())
+        try:
+            # A pump that exits early will never register; stop waiting on it.
+            await asyncio.wait(
+                {ready, self._stream_task},
+                timeout=_STREAM_READY_TIMEOUT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready.cancel()
 
     async def _stream_pump(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
@@ -2272,6 +2362,7 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    self._stream_ready.set()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2283,11 +2374,14 @@ class _SessionsChatReplAdapter:
                     if self._on_event is not None:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
+                self._stream_ready.set()
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                # A failed attempt will not register; don't hold up the post.
+                self._stream_ready.set()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
@@ -3663,22 +3757,17 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-        # When an elicitation is resolved externally (via the standalone
-        # approval page), the server publishes ``elicitation_resolved``.
-        # Wake the parked ``_ApprovalState`` future so the REPL unblocks.
-        # The ``elicitation_resolved`` event doesn't carry the verdict
-        # (accept/decline), but ``_handle_elicitation`` will POST a
-        # redundant resolve that the server silently ignores (already
-        # resolved). We approve here so the REPL unblocks; the actual
-        # outcome is whatever the user chose on the page.
+        # ``elicitation_resolved`` fans out for every elicitation in the
+        # session, from any client; release the parked approval only for the
+        # ASK this REPL is prompting for, with the verdict the event carries.
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            if approval_state.pending:
-                approval_state.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
+            if approval_state.resolve_elsewhere(event.elicitation_id, event.action):
+                label = _resolved_elsewhere_label(event.action, event.reason)
                 host.output(
                     Text.from_markup(
-                        f"   [{fmt.muted}]› resolved via approval page[/{fmt.muted}]",
+                        f"   [{fmt.muted}]› {label}[/{fmt.muted}]",
                     ),
                 )
             if tape_entry is not None:

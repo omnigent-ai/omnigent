@@ -3181,6 +3181,71 @@ def test_materialize_bundle_overrides_brain_harness(
         _cleanup_materialized_override_bundle(materialized)
 
 
+@pytest.mark.parametrize("source_kind", ["file", "directory"])
+@pytest.mark.parametrize(
+    "instruction_kind",
+    ["sibling", "nested", "single-line", "empty", "inline", "missing", "outside"],
+)
+def test_materialize_override_bundle_preserves_instructions(
+    tmp_path: Path, source_kind: str, instruction_kind: str
+) -> None:
+    import yaml
+
+    root = tmp_path / "agent"
+    root.mkdir()
+    (root / "prompts").mkdir()
+    marker = {
+        "single-line": "agent.yaml",
+        "empty": "",
+    }.get(instruction_kind, "Resolved instructions from the source directory.\n")
+    (root / "AGENTS.md").write_text(marker)
+    (root / "prompts" / "system.md").write_text(marker)
+    (tmp_path / "outside.md").write_text("Do not read outside the agent directory.")
+    instructions = {
+        "sibling": "AGENTS.md",
+        "nested": "prompts/system.md",
+        "single-line": "AGENTS.md",
+        "empty": "AGENTS.md",
+        "inline": "Inline instructions.\nSecond line.",
+        "missing": "missing.md",
+        "outside": "../outside.md",
+    }[instruction_kind]
+    raw = {
+        "name": "instruction-materialization",
+        "instructions": instructions,
+        "executor": {"harness": "openai-agents", "model": "mock-model"},
+    }
+    if source_kind == "directory":
+        raw["spec_version"] = 1
+        raw["executor"] = {
+            "type": "omnigent",
+            "model": "mock-model",
+            "config": {"harness": "openai-agents"},
+        }
+    else:
+        raw["prompt"] = "Instructions must take precedence over this placeholder."
+    source_file = root / ("agent.yaml" if source_kind == "file" else "config.yaml")
+    original = yaml.safe_dump(raw)
+    source_file.write_text(original)
+    source = source_file if source_kind == "file" else root
+
+    materialized = _materialize_override_bundle(source, ChatOverrides(model="mock-overridden"))
+    try:
+        spec = load_spec(materialized)
+        expected = (
+            marker
+            if instruction_kind in ("sibling", "nested", "single-line", "empty")
+            else instructions
+        )
+        if source_kind == "file" and instruction_kind == "single-line":
+            expected += "\n"
+        assert spec.instructions == expected
+        assert spec.executor.model == "mock-overridden"
+        assert source_file.read_text() == original
+    finally:
+        _cleanup_materialized_override_bundle(materialized)
+
+
 def test_materialize_override_bundle_bakes_openai_env_auth_for_daemon_runner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4070,6 +4135,45 @@ def test_databricks_token_auth_re_resolves_when_reused_sdk_auth_goes_stale(
         "request after a CLI upgrade goes out unauthenticated"
     )
     assert len(cfgs) == 2
+
+
+def test_databricks_clients_share_the_preflight_token_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-flight headers and every later client for a server resolve credentials once."""
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer tok"}
+
+    resolved: list[str | None] = []
+
+    def _fake_resolve(
+        profile: str | None = None, *, host: str | None = None
+    ) -> tuple[object, str]:
+        resolved.append(host)
+        return dbx._DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.databricks.com"
+
+    server = "https://ex.databricks.com/api/2.0/omnigent"
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://ex.databricks.com",
+    )
+
+    assert chat_module._stored_databricks_record_token(server) == "tok"
+    for _ in range(3):
+        auth = chat_module._DatabricksTokenAuth(server_url=server)
+        assert _first_auth_header(auth, f"{server}/v1/sessions") == "Bearer tok"
+    assert resolved == ["https://ex.databricks.com"]
+
+    chat_module._forget_refused_credential(server)
+    auth = chat_module._DatabricksTokenAuth(server_url=server)
+    assert _first_auth_header(auth, f"{server}/v1/sessions") == "Bearer tok"
+    assert len(resolved) == 2
 
 
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -942,18 +942,24 @@ def test_summarize_checks_mixed() -> None:
         {"context": "legacy-ok", "state": "SUCCESS", "targetUrl": "t"},
         {"context": "legacy-wait", "state": "PENDING"},
         {"context": "legacy-err", "state": "ERROR"},
+        {"name": "cancelled job", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"name": "skipped job", "status": "COMPLETED", "conclusion": "SKIPPED"},
     ]
     result = _summarize_checks(rollup)
     assert result["passing"] == 2
     assert result["failing"] == 2
     assert result["pending"] == 2
-    assert result["total"] == 6
+    assert result["cancelled"] == 1
+    assert result["skipped"] == 1
+    assert result["total"] == 8
     # Per-check details carry the job name, bucket, and link (name falls back to
     # context / workflowName; url falls back to targetUrl).
     assert {"name": "unit", "bucket": "passing", "url": "u"} in result["runs"]
     assert {"name": "e2e", "bucket": "failing", "url": None} in result["runs"]
     assert {"name": "bench", "bucket": "pending", "url": None} in result["runs"]
     assert {"name": "legacy-ok", "bucket": "passing", "url": "t"} in result["runs"]
+    assert {"name": "cancelled job", "bucket": "cancelled", "url": None} in result["runs"]
+    assert {"name": "skipped job", "bucket": "skipped", "url": None} in result["runs"]
 
 
 def test_summarize_checks_empty() -> None:
@@ -962,6 +968,8 @@ def test_summarize_checks_empty() -> None:
         "passing": 0,
         "failing": 0,
         "pending": 0,
+        "cancelled": 0,
+        "skipped": 0,
         "total": 0,
         "runs": [],
     }
@@ -1346,3 +1354,54 @@ def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
         github_resource._PR_VIEW_FIELDS,
         github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
     ]
+
+
+@pytest.mark.parametrize("failure", [None, "api", "enterprise_auth"])
+def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatch, failure):
+    old = [{"body": f"old-{i}", "createdAt": "2026-01-01"} for i in range(100)]
+    latest = [{"body": f"new-{i}", "createdAt": "2026-10-26"} for i in range(100)]
+    calls = []
+    host = "ghe.example.com" if failure == "enterprise_auth" else "github.com"
+    monkeypatch.setattr(github_resource, "_list_accounts", lambda _root: (False, []))
+
+    def gh(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[:2] == ["pr", "view"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "url": f"https://{host}/acme/widgets/pull/17",
+                        "comments": old,
+                        "reviews": [],
+                    }
+                ),
+                "",
+            )
+        if failure:
+            return 1, "", "rate limited"
+        return (
+            0,
+            json.dumps({"data": {"repository": {"pullRequest": {"comments": {"nodes": latest}}}}}),
+            "",
+        )
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    data = github_resource._gh_pr_view(
+        ["17", "-R", "acme/widgets"],
+        "url,comments,reviews",
+        cwd="/workspace",
+        token="selected-token",
+    )
+    assert data is not None
+    assert data["comments"] == (old if failure else latest)
+    assert len(calls) == (1 if failure == "enterprise_auth" else 2)
+    if failure == "enterprise_auth":
+        return
+    assert calls[1][0][:4] == ["api", "--hostname", "github.com", "graphql"]
+    assert "number=17" in calls[1][0]
+    assert calls[1][1]["token"] == "selected-token"
+    assert github_resource._comments_payload(data)["comments_partial"] is True
+    shaped = github_resource._shape_comments(old + latest)
+    assert len(shaped) == 100
+    assert shaped[-1]["body"] == "new-99"

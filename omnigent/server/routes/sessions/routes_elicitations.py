@@ -199,9 +199,9 @@ def register_elicitations_routes(
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),
             "content_preview": params.get("content_preview", ""),
-            **(
-                {"native_delivery": params["native_delivery"]}
-                if "native_delivery" in params
-                else {}
-            ),
+            **{
+                key: params[key]
+                for key in ("native_delivery", "permission_directories")
+                if key in params
+            },
         }

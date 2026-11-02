@@ -234,7 +234,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                     host.sandbox_id,
                 )
     # Keepalive is best effort: it must never disrupt the runner tunnel.
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning("managed sandbox keepalive failed for runner %s", runner_id, exc_info=True)
     finally:
         with _inflight_lock:

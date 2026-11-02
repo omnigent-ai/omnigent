@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from tests.harnesses.codex_native.session._support import (
     _elicitation_tracker,
     _expected_status_data,
     _FakeCodexAppServerClient,
+    _forwarder_context,
     _recording_forwarder_client,
     _usage_coalescer,
     _write_forwarder_bridge,
@@ -375,6 +377,145 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
 
 @pytest.mark.parametrize(
+    ("failure_source", "close_fails"),
+    [
+        ("subscriber", False),
+        ("side_chat", False),
+        ("mcp_timer", False),
+        ("event_stream", False),
+        ("cancellation", False),
+        ("event_stream", True),
+        ("cancellation", True),
+        ("subscriber", True),
+        ("none", True),
+    ],
+)
+async def test_supervise_forwarder_finishes_cleanup_after_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_source: str, close_fails: bool
+) -> None:
+    """Shutdown drains resources without replacing the original failure or cancellation."""
+    failure = (
+        asyncio.CancelledError("synthetic cancellation")
+        if failure_source == "cancellation"
+        else TypeError("synthetic forwarder failure")
+    )
+    background_failure = ValueError("synthetic secondary background failure")
+    close_failure = RuntimeError("synthetic close failure")
+    child_ready = asyncio.Event()
+    side_chat_started = asyncio.Event()
+    timer_started = asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    states: list[codex_native_forwarder._CodexForwarderState] = []
+    http_clients: list[httpx.AsyncClient] = []
+
+    async def subscribe(
+        _client: object,
+        ap_client: httpx.AsyncClient,
+        *,
+        forwarder_state: codex_native_forwarder._CodexForwarderState,
+        **_kwargs: object,
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        states.append(forwarder_state)
+        http_clients.append(ap_client)
+        stream = forwarder_state.child_stream(ap_client, "thread_child", "conv_child")
+        await stream.delta_coalescer.append("synthetic child output", message_id="child-message")
+        worker = stream.delta_coalescer._worker_task
+        assert worker is not None
+        tasks.append(worker)
+        child_ready.set()
+        if failure_source == "subscriber":
+            raise failure
+        if failure_source in {"event_stream", "cancellation"}:
+            raise background_failure
+        await asyncio.Event().wait()
+
+    async def drive_side_chat(*_args: object, **_kwargs: object) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await child_ready.wait()
+        side_chat_started.set()
+        if failure_source == "side_chat":
+            raise failure
+        await asyncio.Event().wait()
+
+    async def settle_mcp() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await side_chat_started.wait()
+        timer_started.set()
+        if failure_source == "mcp_timer":
+            raise failure
+        await asyncio.Event().wait()
+
+    async def seed_mcp(*_args: object, **_kwargs: object) -> asyncio.Task[None]:
+        return asyncio.create_task(settle_mcp())
+
+    class Client(_FakeCodexAppServerClient):
+        async def iter_events(self) -> Any:
+            await timer_started.wait()
+            if failure_source in {"event_stream", "cancellation"}:
+                raise failure
+            for event in self.events:
+                yield event
+
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(codex_native_forwarder, "_subscribe_until_ready", subscribe)
+    monkeypatch.setattr(codex_native_forwarder, "_drive_side_chat_requests", drive_side_chat)
+    monkeypatch.setattr(codex_native_forwarder, "_seed_mcp_startup_round", seed_mcp)
+    if close_fails:
+        usage_close = codex_native_forwarder._SessionUsageCoalescer.close
+
+        async def fail_usage_close(
+            coalescer: codex_native_forwarder._SessionUsageCoalescer,
+        ) -> None:
+            await usage_close(coalescer)
+            raise close_failure
+
+        monkeypatch.setattr(
+            codex_native_forwarder._SessionUsageCoalescer, "close", fail_usage_close
+        )
+    client = Client()
+    expected_failure = close_failure if failure_source == "none" else failure
+    try:
+        with pytest.raises(type(expected_failure)) as raised:
+            await codex_native_forwarder.supervise_forwarder(
+                base_url="http://127.0.0.1:1",
+                headers={},
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                client=client,  # type: ignore[arg-type]
+                ap_transport=httpx.MockTransport(handler),
+            )
+
+        assert raised.value is expected_failure
+        assert all(task.done() for task in tasks)
+        assert not states[0].child_streams
+        assert client.closed
+        assert http_clients[0].is_closed
+        assert any(
+            event["type"] == "external_output_text_delta"
+            and event["data"]["delta"] == "synthetic child output"
+            for event in posted
+        )
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
     ("message", "expected"),
     [
         # Rollout file missing — the first transient fresh-thread state.
@@ -412,13 +553,16 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
     Fresh TUI threads can reject ``thread/resume`` until the first
     rollout exists; the forwarder retries and backfills resume items.
     """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
     fake_client = _FakeCodexAppServerClient(
         response={
             "result": {
                 "thread": {
+                    "id": "thread_123",
                     "turns": [
                         {
                             "id": "turn_123",
+                            "status": "inProgress",
                             "items": [
                                 {
                                     "type": "userMessage",
@@ -432,7 +576,7 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
                                 },
                             ],
                         }
-                    ]
+                    ],
                 }
             }
         },
@@ -478,10 +622,63 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_123"}),
     ]
-    assert [payload["data"]["item_data"]["role"] for payload in posted] == [
+    assert [payload["data"]["item_data"]["role"] for payload in posted[:2]] == [
         "user",
         "assistant",
     ]
+
+    assert posted[2]["data"] == _expected_status_data("running", "turn_123")
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "active_turn_id", "turn", "expected_status", "expected_active"),
+    [
+        ("thread_123", None, {"id": "turn_123", "status": "inProgress"}, "running", "turn_123"),
+        (
+            "thread_123",
+            "turn_123",
+            {"id": "turn_123", "status": {"type": "inProgress"}},
+            "running",
+            "turn_123",
+        ),
+        ("thread_other", None, {"id": "turn_123", "status": "inProgress"}, None, None),
+        (
+            "thread_123",
+            "turn_newer",
+            {"id": "turn_123", "status": "inProgress"},
+            None,
+            "turn_newer",
+        ),
+        ("thread_123", None, {"id": "turn_123", "items": []}, None, None),
+        ("thread_123", None, {"id": "turn_123", "status": "unknown"}, None, None),
+        ("thread_123", None, {"status": "inProgress"}, None, None),
+        (
+            "thread_123",
+            None,
+            {"id": "turn_123", "status": "inProgress", "error": {"message": "request failed"}},
+            "failed",
+            None,
+        ),
+    ],
+)
+def test_resume_turn_status_requires_current_explicit_state(
+    tmp_path: Path,
+    thread_id: str,
+    active_turn_id: str | None,
+    turn: dict[str, Any],
+    expected_status: str | None,
+    expected_active: str | None,
+) -> None:
+    """Authoritative active state must not overwrite a different thread or newer turn."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=active_turn_id)
+    edge = codex_native_forwarder._resume_turn_status_edge_for_latest_turn(
+        tmp_path, thread_id, [turn]
+    )
+    assert (edge.status if edge is not None else None) == expected_status
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == expected_active
 
 
 def test_subscribe_until_ready_replays_completed_turn_status(
@@ -577,6 +774,172 @@ def test_subscribe_until_ready_replays_completed_turn_status(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None
+
+
+def _user_message_item(item_id: str, text: str) -> dict[str, Any]:
+    return {"type": "userMessage", "id": item_id, "content": [{"type": "text", "text": text}]}
+
+
+def _replay_then_live_user_posts(
+    tmp_path: Path, *, replayed_text: str, live_text: str, live_first: bool
+) -> list[dict[str, Any]]:
+    """Subscribe after ``turn/start``, deliver its user input live, and return user posts."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient(
+        response={
+            "result": {
+                "thread": {
+                    "id": "thread_123",
+                    "turns": [
+                        {"id": "turn_123", "items": [_user_message_item("item-1", replayed_text)]}
+                    ],
+                }
+            }
+        }
+    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_123",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    live_event = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "item": _user_message_item("0b6f1c2e-live-user", live_text),
+        },
+    }
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+
+            async def deliver_live() -> None:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=live_event,
+                    expected_thread_id="thread_123",
+                    forwarder_state=forwarder_state,
+                )
+
+            if live_first:
+                await deliver_live()
+            await codex_native_forwarder._subscribe_until_ready(
+                fake_client,  # type: ignore[arg-type]
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                thread_id="thread_123",
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                forwarder_state=forwarder_state,
+            )
+            if not live_first:
+                await deliver_live()
+
+    asyncio.run(run())
+
+    assert fake_client.requests == [("thread/resume", {"threadId": "thread_123"})]
+    return [
+        payload
+        for payload in posted
+        if payload["type"] == "external_conversation_item"
+        and payload["data"]["item_data"]["role"] == "user"
+    ]
+
+
+@pytest.mark.parametrize("live_first", [False, True], ids=["replay_first", "live_first"])
+def test_resume_replay_and_live_delivery_post_one_user_input_once(
+    tmp_path: Path, live_first: bool
+) -> None:
+    user_posts = _replay_then_live_user_posts(
+        tmp_path,
+        replayed_text="Can you check if linear tickets are up-to-date?",
+        live_text="Can you check if linear tickets are up-to-date?",
+        live_first=live_first,
+    )
+
+    assert [payload["data"]["item_data"]["content"][0]["text"] for payload in user_posts] == [
+        "Can you check if linear tickets are up-to-date?"
+    ], [payload["data"]["source_id"] for payload in user_posts]
+
+
+def test_resume_replay_and_live_delivery_keep_distinct_user_inputs(tmp_path: Path) -> None:
+    user_posts = _replay_then_live_user_posts(
+        tmp_path,
+        replayed_text="Can you check if linear tickets are up-to-date?",
+        live_text="Also list the stale ones.",
+        live_first=False,
+    )
+
+    assert [payload["data"]["item_data"]["content"][0]["text"] for payload in user_posts] == [
+        "Can you check if linear tickets are up-to-date?",
+        "Also list the stale ones.",
+    ]
+
+
+def test_late_resume_keeps_identical_live_user_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection that resumes late missed the snapshot's live copy, so a later match is new."""
+    monkeypatch.setattr(
+        _FakeCodexAppServerClient, "is_subscribed_to_thread", lambda _self, _thread_id: False
+    )
+
+    user_posts = _replay_then_live_user_posts(
+        tmp_path,
+        replayed_text="Run the tests again.",
+        live_text="Run the tests again.",
+        live_first=False,
+    )
+
+    assert [payload["data"]["item_data"]["content"][0]["text"] for payload in user_posts] == [
+        "Run the tests again.",
+        "Run the tests again.",
+    ]
+
+
+def test_turn_completion_drops_unmatched_live_user_message_copy(tmp_path: Path) -> None:
+    """A live user input is retained by digest only until its turn ends."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_123")
+    text = "Run the tests again."
+    retained: list[dict[tuple[str, str, str], int]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client([]) as client:
+            for event in (
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": _user_message_item("0b6f1c2e-live-user", text),
+                    },
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turn": {"id": "turn_123", "status": "completed"},
+                    },
+                },
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=event,
+                    expected_thread_id="thread_123",
+                    forwarder_state=forwarder_state,
+                )
+                retained.append(dict(forwarder_state.user_message_copy_balance))
+
+    asyncio.run(run())
+
+    content = json.dumps([{"type": "text", "text": text}], sort_keys=True)
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    assert retained == [{("thread_123", "turn_123", digest): 1}, {}]
 
 
 @pytest.mark.parametrize(

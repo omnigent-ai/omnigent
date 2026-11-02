@@ -54,7 +54,7 @@ jobs:
         || github.event.comment.author_association == 'COLLABORATOR'
         || github.event.comment.user.login == github.event.issue.user.login
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # The job `if` startsWith() also matches `/rerunfoo`; re-validate `/rerun`
