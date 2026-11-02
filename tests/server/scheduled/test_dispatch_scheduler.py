@@ -544,6 +544,9 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
         await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
         assert exited.is_set()
         assert all(startup.cancelled() or startup.exception() is None for startup in startups)
+        # gather can return without yielding when startups are already done, so yield once
+        # to run the scheduler's done callback that forgets each finished startup.
+        await asyncio.sleep(0)
         assert scheduler._startups == {}
         run = store.list_runs(task.id)[0][0]
         expected_status = (
