@@ -6235,18 +6235,26 @@ class TestAskUserQuestionHook(unittest.TestCase):
 
         return ClaudeSDKExecutor()
 
-    def test_no_matcher_registered_without_handler(self):
-        ex = self._make_executor()  # _ask_question_handler is None
-        opts = SimpleNamespace(hooks=None)
-        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
-        self.assertIsNone(self._aq_matcher(opts))
-
-    def test_no_op_when_sdk_lacks_hook_matcher(self):
-        ex = self._make_executor()
-        ex._ask_question_handler = AsyncMock(return_value={"answers": {"q1": "a"}})
-        opts = SimpleNamespace(hooks=None)
-        ex._install_ask_user_question_hook(SimpleNamespace(), opts)  # no HookMatcher
-        self.assertIsNone(self._aq_matcher(opts))
+    def test_tool_and_hook_are_enabled_together(self):
+        # Exposure and hook install share one predicate: the tool without its
+        # intercept would hang on a headless picker.
+        cases = [
+            ("no-handler", False, True),
+            ("no-hook-matcher", True, False),
+            ("neither", False, False),
+            ("handler-and-hook-matcher", True, True),
+        ]
+        for name, has_handler, has_hook_matcher in cases:
+            with self.subTest(name):
+                ex = self._make_executor()
+                if has_handler:
+                    ex._ask_question_handler = AsyncMock(return_value="unused")
+                sdk = self._fake_sdk() if has_hook_matcher else SimpleNamespace()
+                opts = SimpleNamespace(hooks=None)
+                ex._install_ask_user_question_hook(sdk, opts)
+                enabled = has_handler and has_hook_matcher
+                self.assertEqual("AskUserQuestion" in ex._base_tools(sdk), enabled)
+                self.assertEqual(self._aq_matcher(opts) is not None, enabled)
 
     def test_registers_matcher_with_long_human_timeout(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -6320,24 +6328,44 @@ class TestAskUserQuestionHook(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         ex._ask_question_handler.assert_not_awaited()
 
-    def test_base_tools_excludes_ask_user_question_without_handler(self):
-        # No bridge wired -> the tool must NOT be exposed (it would hang
-        # headless without the intercept hook).
-        ex = self._make_executor()
-        self.assertEqual(ex._base_tools(self._fake_sdk()), ["Skill", "ToolSearch"])
+    def test_hook_denies_when_policy_or_handler_raises(self):
+        # A raised hook reaches the CLI as "no opinion" and falls back to
+        # native handling, so failures must become an explicit deny.
+        from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
-    def test_base_tools_includes_ask_user_question_with_handler(self):
-        ex = self._make_executor()
-        ex._ask_question_handler = AsyncMock(return_value=None)
-        self.assertIn("AskUserQuestion", ex._base_tools(self._fake_sdk()))
+        allow = PolicyVerdictPayload(action="POLICY_ACTION_ALLOW", reason="")
+        cases = [
+            ("policy-raises", AsyncMock(side_effect=RuntimeError("policy down")), None),
+            ("handler-raises", AsyncMock(return_value=allow), RuntimeError("bridge down")),
+        ]
+        for name, policy_evaluator, handler_error in cases:
+            with self.subTest(name):
+                ex = self._make_executor()
+                ex._policy_evaluator = policy_evaluator
+                ex._ask_question_handler = AsyncMock(
+                    side_effect=handler_error, return_value={"answers": {"q1": "a"}}
+                )
+                opts = SimpleNamespace(hooks=None)
+                ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+                cb = self._aq_matcher(opts).hooks[0]
+                with self.assertLogs("omnigent.inner.claude_sdk_executor", "ERROR"):
+                    out = _run(cb({"tool_input": {"questions": []}}, None, {}))
+                hso = out["hookSpecificOutput"]
+                self.assertEqual(hso["permissionDecision"], "deny")
+                self.assertEqual(
+                    hso["permissionDecisionReason"],
+                    "AskUserQuestion failed in Omnigent; ask in plain text instead.",
+                )
 
-    def test_base_tools_excludes_ask_user_question_when_hook_matcher_missing(self):
-        # Handler wired, but the SDK exposes no HookMatcher -> exposing the
-        # tool would leave it without an intercept. _base_tools must gate on
-        # the SAME predicate as the hook install (handler AND HookMatcher).
+    def test_hook_lets_cancellation_propagate(self):
+        # Turn cancellation must unwind the hook, not be swallowed as a deny.
         ex = self._make_executor()
-        ex._ask_question_handler = AsyncMock(return_value=None)
-        self.assertNotIn("AskUserQuestion", ex._base_tools(SimpleNamespace()))
+        ex._ask_question_handler = AsyncMock(side_effect=asyncio.CancelledError())
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        cb = self._aq_matcher(opts).hooks[0]
+        with self.assertRaises(asyncio.CancelledError):
+            _run(cb({"tool_input": {"questions": []}}, None, {}))
 
 
 @pytest.mark.parametrize("bridge_wired", [False, True], ids=["no-bridge", "bridge"])
