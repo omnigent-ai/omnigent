@@ -31,11 +31,13 @@ function revealCaretLine(textarea: HTMLTextAreaElement) {
   const probe = document.createElement("textarea");
   probe.className = textarea.className;
   probe.style.cssText = `position:absolute;visibility:hidden;height:0;min-height:0;width:${getComputedStyle(textarea).width}`;
-  probe.value = textarea.value.slice(0, textarea.selectionEnd);
   textarea.after(probe);
+  const firstLineBottom = probe.scrollHeight;
+  probe.value = textarea.value.slice(0, textarea.selectionEnd);
   const caretBottom = probe.scrollHeight;
   probe.remove();
-  textarea.scrollTop = Math.max(textarea.scrollTop, caretBottom - textarea.clientHeight);
+  const scrollTop = Math.max(textarea.scrollTop, caretBottom - textarea.clientHeight);
+  textarea.scrollTop = Math.min(scrollTop, caretBottom - firstLineBottom);
 }
 
 // Longer pastes stay native: the insertText command handles each line

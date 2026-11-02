@@ -862,22 +862,32 @@ def test_list_continuation_keeps_the_new_item_in_view(
 
     composer.press("Shift+Enter")
     expect(composer).to_have_value(re.compile(r"  - item 12\n  - $"))
-    line_height = composer.evaluate("el => parseFloat(getComputedStyle(el).lineHeight)")
 
     def hidden_below_caret() -> float:
         return composer.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight")
 
     try:
-        poll_until(lambda: hidden_below_caret() < line_height / 2, timeout_s=2, interval_s=0.05)
+        poll_until(lambda: hidden_below_caret() <= TOLERANCE, timeout_s=2, interval_s=0.05)
     except AssertionError:
-        pytest.fail(
-            f"new list item is {hidden_below_caret():.0f}px below the visible box "
-            f"(line height {line_height}px)"
-        )
+        pytest.fail(f"new list item is {hidden_below_caret():.0f}px below the visible box")
 
 
 _ITEMS = "\n".join(f"  - item {index}" for index in range(1, 13))
 _TEXT_BELOW = "\n\nmore\ntext\nbelow"
+
+
+def _line_in_view(composer: Locator, line: int) -> bool:
+    """Whether unwrapped ``line`` (0-based) is fully inside the box's scrolled view."""
+    return composer.evaluate(
+        """(el, [line, tolerance]) => {
+          const style = getComputedStyle(el);
+          const lineHeight = parseFloat(style.lineHeight);
+          const top = parseFloat(style.paddingTop) + line * lineHeight;
+          return el.scrollTop <= top + tolerance
+            && top + lineHeight <= el.scrollTop + el.clientHeight + tolerance;
+        }""",
+        [line, TOLERANCE],
+    )
 
 
 @pytest.mark.parametrize(
@@ -910,13 +920,13 @@ def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
             }""",
             _TEXT_BELOW,
         )
-    line_height = composer.evaluate("el => parseFloat(getComputedStyle(el).lineHeight)")
 
     def hidden_below() -> float:
         return composer.evaluate("el => el.scrollHeight - el.scrollTop - el.clientHeight")
 
     hidden_before = hidden_below()
     assert composer.evaluate("el => el.scrollTop") > 0
+    assert _line_in_view(composer, _ITEMS.count("\n"))
     if edit == "paste":
         page.evaluate("text => navigator.clipboard.writeText(text)", "\nalpha\nbeta")
         page.keyboard.press("ControlOrMeta+V")
@@ -926,14 +936,54 @@ def test_inserted_lines_scroll_in_without_jumping_past_the_caret(
 
     try:
         poll_until(
-            lambda: abs(hidden_below() - hidden_before) < line_height / 2,
+            lambda: abs(hidden_below() - hidden_before) <= TOLERANCE,
             timeout_s=2,
             interval_s=0.05,
         )
     except AssertionError:
         pytest.fail(
-            f"{hidden_below():.0f}px is below the box after {edit}, "
-            f"{hidden_before:.0f}px before (line height {line_height}px)"
+            f"{hidden_below():.0f}px is below the box after {edit}, {hidden_before:.0f}px before"
+        )
+
+
+@pytest.mark.parametrize(
+    ("caret_line", "caret_in_view"),
+    [
+        pytest.param(0, False, id="caret-above-the-box"),
+        pytest.param(11, True, id="caret-in-view"),
+    ],
+)
+def test_alt_enter_scrolls_only_as_far_as_the_caret_line(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    caret_line: int,
+    caret_in_view: bool,
+) -> None:
+    _surface(page, chat_session_contract, "landing", DESKTOP)
+    composer = _input(page, "landing")
+    composer.click()
+    draft = _ITEMS + _TEXT_BELOW
+    composer.fill(draft)
+    caret = len("\n".join(draft.split("\n")[: caret_line + 1]))
+    composer.evaluate(
+        "(el, caret) => { el.setSelectionRange(caret, caret); el.scrollTop = el.scrollHeight; }",
+        caret,
+    )
+    scroll_before = composer.evaluate("el => el.scrollTop")
+    assert _line_in_view(composer, caret_line) is caret_in_view
+
+    composer.press("Alt+Enter")
+    expect(composer).to_have_value(draft[:caret] + "\n" + draft[caret:])
+    try:
+        poll_until(lambda: _line_in_view(composer, caret_line + 1), timeout_s=2, interval_s=0.05)
+    except AssertionError:
+        pytest.fail(
+            f"new line {caret_line + 1} is outside the box at scrollTop "
+            f"{composer.evaluate('el => el.scrollTop')} ({scroll_before} before)"
+        )
+    if caret_in_view:
+        assert composer.evaluate("el => el.scrollTop") == pytest.approx(
+            scroll_before, abs=TOLERANCE
         )
 
 
