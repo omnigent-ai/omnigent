@@ -54,11 +54,12 @@ const FEED_YML = [
 /** Serve FEED_YML for any *.yml request; 404 otherwise. */
 function startFeed() {
   return new Promise((resolve) => {
+    let version = FEED_VERSION;
     const feed = http.createServer((req, res) => {
       const pathname = new URL(req.url, "http://feed.invalid").pathname;
       if (pathname.endsWith(".yml")) {
         res.writeHead(200, { "content-type": "text/yaml" });
-        res.end(FEED_YML);
+        res.end(FEED_YML.replaceAll(FEED_VERSION, version));
       } else {
         res.writeHead(404);
         res.end();
@@ -67,6 +68,9 @@ function startFeed() {
     feed.listen(0, "127.0.0.1", () => {
       resolve({
         url: `http://127.0.0.1:${feed.address().port}/`,
+        setVersion: (nextVersion) => {
+          version = nextVersion;
+        },
         close: () =>
           new Promise((r) => {
             feed.close(r);
@@ -74,6 +78,18 @@ function startFeed() {
       });
     });
   });
+}
+
+async function waitForOverlayVisibility(electronApp, window, expected, attempts = 50) {
+  const visible = await electronApp.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()
+      .find((w) => w.webContents.getURL().includes("update-overlay"))
+      ?.isVisible(),
+  );
+  if (visible === expected) return;
+  assert.ok(attempts > 0, `expected update window visibility ${expected}, got ${visible}`);
+  await window.waitForTimeout(100);
+  await waitForOverlayVisibility(electronApp, window, expected, attempts - 1);
 }
 
 describe(
@@ -205,25 +221,18 @@ describe(
           );
         }
 
-        // 5. The macOS first-mouse option and the existing click-through state
-        //    must leave real card controls actionable. Dismiss through
-        //    Playwright's Electron input path, then require the React card to
-        //    disappear and the shell window to collapse back to its 1px sliver.
+        // Dismiss must hide the native helper too, so window sharing cannot
+        // include an empty transparent child in the capture bounds.
         await overlayPage.getByRole("button", { name: "Dismiss" }).click();
         await overlayPage.getByText("is available").waitFor({ state: "hidden", timeout: 5_000 });
-        let collapsedHeight = overlayWindows[0].bounds.height;
-        /* oxlint-disable no-await-in-loop */
-        for (let i = 0; i < 50 && collapsedHeight !== 1; i++) {
-          collapsedHeight = await electronApp.evaluate(({ BrowserWindow }) => {
-            const overlay = BrowserWindow.getAllWindows().find((w) =>
-              w.webContents.getURL().includes("update-overlay"),
-            );
-            return overlay?.getBounds().height ?? 0;
-          });
-          if (collapsedHeight !== 1) await window.waitForTimeout(100);
-        }
-        /* oxlint-enable no-await-in-loop */
-        assert.equal(collapsedHeight, 1, "Dismiss did not collapse the update prompt");
+        await waitForOverlayVisibility(electronApp, window, false);
+
+        // A hidden renderer must still lay out the next notice and report its
+        // height, allowing the shell to show the helper again.
+        feed.setVersion("9999.0.1");
+        await overlayPage.evaluate(() => window.omnigentDesktop.updates.check());
+        await overlayPage.getByText("is available").waitFor({ state: "visible", timeout: 15_000 });
+        await waitForOverlayVisibility(electronApp, window, true);
       } finally {
         // Close FIRST (flushes the videos), then name the clips — the failing
         // path (the reproduction) must still produce the before-fix footage.
