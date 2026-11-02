@@ -1,6 +1,7 @@
 import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
@@ -167,6 +168,16 @@ export function isOwnedByViewer(conversation: Conversation, viewerId: string | n
   const owner = conversation.owner ?? null;
   if (owner === null) return true;
   return owner === viewerId;
+}
+
+/** Owner-level access (admins get it on every session); unlike isOwnedByViewer, not used for list placement. */
+export function canManageSessionLifecycle(
+  conversation: Conversation,
+  viewerId: string | null,
+): boolean {
+  if (isOwnedByViewer(conversation, viewerId)) return true;
+  const level = conversation.permission_level ?? null;
+  return level !== null && level >= LEVEL_OWNER;
 }
 
 /**

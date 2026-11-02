@@ -176,4 +176,32 @@ describe("sidebar Stop session item", () => {
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");
   });
+
+  it("is enabled for an owner-level viewer (admin) who doesn't own the session", () => {
+    mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com", permission_level: 4 }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    openKebab();
+    fireEvent.click(screen.getByTestId("stop-conversation"));
+    fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
+    expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays disabled for a level-2 share", () => {
+    mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com", permission_level: 2 }]);
+    renderSidebar();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    openKebab();
+    expect(screen.getByTestId("stop-conversation")).toHaveAttribute("data-disabled");
+  });
 });
