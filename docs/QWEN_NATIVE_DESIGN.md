@@ -355,8 +355,10 @@ before its first append, the executor blocks until qwen's first `system` event
 *after* the watcher's constructor has run, so its presence guarantees the offset
 was taken on the still-empty input file — a subsequent append is reliably
 detected. The wait is latched (once-per-session); warm turns don't re-block.
-A side benefit: once qwen is watching, *any* later append lands beyond the
-offset, so even a session that lost its first message recovers on the next one.
+If the event does not appear within `READY_TIMEOUT_S` (30 s), the turn fails with
+"qwen did not become ready within 30s; the message was not sent" and nothing is
+appended, so the message is never silently lost; the next turn re-checks
+readiness, and once qwen is watching any later append is read.
 
 Schema note: `qwen` v0.18.1-preview.1 renamed the first system event
 `subtype` from `init` → `session_start` (and wraps payload in `data`). The
