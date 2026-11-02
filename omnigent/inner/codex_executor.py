@@ -5024,16 +5024,12 @@ class CodexExecutor(Executor):
             self._brokered_version_identity = validated_identity
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
-        # cfg.model (per-request /model override) wins over the spec default.
-        # An unresolved default comes from the active provider catalog.
-        # On the cli-config path (model_provider_override set) the codex binary
-        # owns its own model list via its config.toml — omnigent does not pass a
-        # model override to thread/create, letting the binary use its configured
-        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
-        # binary to call UC and get a validation error.
+        # cfg.model (per-request /model override) wins; unresolved defaults come from the catalog.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
-            model = None
+            # Custom config.toml providers reject unknown aliases; built-in openai keeps the model.
+            if self._model_provider_override != "openai":
+                model = None
         elif model is None:
             if self._gateway_uses_databricks_profile:
                 resolution = await run_sync_on_thread(
