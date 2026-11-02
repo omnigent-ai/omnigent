@@ -12,7 +12,7 @@ const files: WorkspaceFile[] = [
   { path: "src/main.ts", name: "main.ts", type: "file", bytes: 10, modified_at: null },
 ];
 
-function contextFor(sessionHostId: string) {
+function contextFor(sessionHostId: string | null) {
   return {
     openFile: vi.fn(),
     registerNavigationGuard: () => () => {},
@@ -28,7 +28,7 @@ function contextFor(sessionHostId: string) {
 async function renderTree({
   sessionHostId = HOST,
   browseLocation,
-}: { sessionHostId?: string; browseLocation?: string } = {}) {
+}: { sessionHostId?: string | null; browseLocation?: string } = {}) {
   // Fresh modules per test: the desktop host id is shared window-wide.
   const { FileViewerContext } = await import("./FileViewerContext");
   const { FolderTree } = await import("./FolderTree");
@@ -88,6 +88,22 @@ it("reveals a local file selected in its folder", async () => {
   fireEvent.contextMenu(screen.getByText("main.ts"));
   fireEvent.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
   expect(revealFile).toHaveBeenCalledWith(HOST, "/Users/me/project/src/main.ts");
+});
+
+it.each([HOST, "other-host"])("gates reveal on an inherited host %s", async (parentHostId) => {
+  const { setSessionHost, setSessionParent } = await import("@/lib/sessionHost");
+  setSessionParent("conv_1", "parent");
+  await renderTree({ sessionHostId: null });
+  await act(() => setSessionHost("parent", parentHostId));
+  const allowed = parentHostId === HOST;
+  expect(fireEvent.contextMenu(screen.getByText("main.ts"))).toBe(!allowed);
+  if (allowed) {
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Show in Finder" }));
+    expect(revealFile).toHaveBeenCalledWith(HOST, "/Users/me/project/src/main.ts");
+  } else {
+    expect(screen.queryByRole("menuitem")).toBeNull();
+    expect(revealFile).not.toHaveBeenCalled();
+  }
 });
 
 it("opens a local folder without toggling it", async () => {

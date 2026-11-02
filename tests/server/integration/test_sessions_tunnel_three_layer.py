@@ -2450,6 +2450,7 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         "reconnect",
         "expired",
         "host_back_without_runner",
+        "host_back_relaunched",
         "unreadable",
         "host_online",
         "host_flaps_reconnect",
@@ -2472,6 +2473,8 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     runner. An unreadable host row mid-hold keeps holding. A host that stayed
     online fails the turn at the grace, as before.
     """
+    from types import SimpleNamespace
+
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
 
@@ -2501,6 +2504,23 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             await asyncio.sleep(0.01)
 
     monkeypatch.setattr(sessions_module, "_host_row_offline", scripted_host_row_offline)
+    relaunched_session_ids: list[str] = []
+    host_registered = [False]
+    if scenario == "host_back_relaunched":
+        # The returned host is registered on this replica only after its return is detected.
+        monkeypatch.setattr(
+            ap_app.state.host_registry,
+            "get",
+            lambda registered_host_id: object() if host_registered[0] else None,
+        )
+
+        async def fake_launch(conv: object, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            relaunched_session_ids.append(conv.id)  # type: ignore[attr-defined]
+            return SimpleNamespace(
+                runner_id="runner-relaunched", acknowledged=True, error=None, error_code=None
+            )
+
+        monkeypatch.setattr(sessions_module, "_launch_runner_on_host", fake_launch)
 
     response = await tunnel_three_layer_stack.ap_client.post(
         "/v1/sessions",
@@ -2576,9 +2596,14 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             host_row[0] = None
             await asyncio.wait_for(_host_checked(10), timeout=budget(5.0))
             assert sessions_module._session_status_cache.get(session_id) == "running"
-        if scenario in ("host_back_without_runner", "host_flaps_back_without_runner"):
+        if scenario in (
+            "host_back_without_runner",
+            "host_flaps_back_without_runner",
+            "host_back_relaunched",
+        ):
             host_row[0] = False
             await asyncio.wait_for(_host_checked(1), timeout=budget(5.0))
+            host_registered[0] = True
             await asyncio.sleep(grace / 2)
             assert sessions_module._session_status_cache.get(session_id) == "running"
         if scenario in ("reconnect", "unreadable", "host_flaps_reconnect", "host_back_unreadable"):
@@ -2596,6 +2621,13 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             assert first_host_check is not None
             timeout = first_host_check + hold + 0.3 - asyncio.get_running_loop().time()
         error = await asyncio.wait_for(_failed(), timeout=timeout)
+        if scenario == "host_back_relaunched":
+            # The turn is not redelivered; its runner is relaunched and the failure is not
+            # runner_disconnected, which a passive reconnect would clear to idle.
+            assert error["code"] == "runner_interrupted"
+            assert "restarted during this turn" in error["message"]
+            assert relaunched_session_ids == [session_id]
+            return
         assert error["code"] == "runner_disconnected"
         assert ("did not come back within" in error["message"]) == (
             scenario in ("expired", "host_flaps_expired")

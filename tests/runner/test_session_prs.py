@@ -373,6 +373,17 @@ def test_creation_metadata_preserves_other_write_identities() -> None:
     assert created
 
 
+def test_single_creation_ignores_other_printed_prs() -> None:
+    """A printed old PR URL stays out until the deferred lookup verifies it."""
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"printf '%s\\n' {A} && gh pr create --fill"},
+        {"stdout": f"{A}\n{B}\n", "gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert created
+
+
 @pytest.mark.parametrize(
     "command",
     [

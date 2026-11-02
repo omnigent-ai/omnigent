@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
@@ -35,6 +36,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    read_transcript_path,
 )
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
@@ -72,6 +74,14 @@ _AUTH_COMMAND_GUIDANCE_MANAGED_SANDBOX = (
 # 600 s pending-input lifetime, so a message still held at the end is reported.
 _ANSWER_HOLD_S = 8 * 60.0
 _ANSWER_POLL_S = 1.0
+
+# Below this much free space Claude Code fails to append its transcript
+# ("Transcript write failed (ENOSPC)"), so a message would run unseen by the web.
+_MIN_TRANSCRIPT_FREE_BYTES = 1024 * 1024
+_HOST_DISK_FULL_MESSAGE = (
+    "The host's disk is full, so Claude Code can't save this conversation and the "
+    "message was not sent."
+)
 
 
 class ClaudeNativeExecutor(Executor):
@@ -276,6 +286,19 @@ class ClaudeNativeExecutor(Executor):
                     if in_managed_sandbox()
                     else _AUTH_COMMAND_GUIDANCE
                 ),
+                undelivered=True,
+            )
+            return
+        if await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+            _logger.warning(
+                "claude-native: host disk is full; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(
+                message=_HOST_DISK_FULL_MESSAGE,
+                code="host_disk_full",
+                title="Host storage is full",
+                remediation="Free up disk space on the host, then send your message again.",
                 undelivered=True,
             )
             return
@@ -580,6 +603,23 @@ def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool
         return True
     active_session_id = read_active_session_id(bridge_dir)
     return active_session_id is None or active_session_id == request_session_id
+
+
+def _transcript_disk_full(bridge_dir: Path) -> bool:
+    """
+    Whether the filesystem holding Claude's transcript has no room left.
+
+    :param bridge_dir: Native bridge directory, which records the transcript path.
+    :returns: ``True`` when free space is below :data:`_MIN_TRANSCRIPT_FREE_BYTES`;
+        ``False`` when it is not, or the transcript is not known yet.
+    """
+    transcript_path = read_transcript_path(bridge_dir)
+    if transcript_path is None:
+        return False
+    try:
+        return shutil.disk_usage(transcript_path.parent).free < _MIN_TRANSCRIPT_FREE_BYTES
+    except OSError:
+        return False
 
 
 def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:

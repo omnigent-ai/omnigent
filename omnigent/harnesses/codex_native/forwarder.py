@@ -7088,9 +7088,18 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
 
 def _post_file_change_observer(url: str, token: str, payload: _JsonObject) -> None:
     """POST one observer payload without the server client's auth middleware."""
+    encoded = json.dumps(payload).encode("utf-8")
+    if len(encoded) > 1_048_576:
+        # Preserve paths when original evidence exceeds the relay body limit.
+        tool_input = payload.get("tool_input")
+        changes = tool_input.get("changes") if isinstance(tool_input, dict) else None
+        for change in changes if isinstance(changes, list) else []:
+            if isinstance(change, dict):
+                change.pop("diff", None)
+        encoded = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
+        data=encoded,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -7105,13 +7114,13 @@ async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> No
     """Send a completed Codex fileChange through the runner's file observer."""
     if bridge_dir is None:
         return
-    if item.get("status") in {"failed", "declined"}:
+    if item.get("status") != "completed":
         return
     changes = item.get("changes")
     if not isinstance(changes, list):
         return
     observed_changes = [
-        {"path": change.get("path"), "kind": change.get("kind")}
+        {key: change[key] for key in ("path", "kind", "diff") if key in change}
         for change in changes
         if isinstance(change, dict) and isinstance(change.get("path"), str)
     ]

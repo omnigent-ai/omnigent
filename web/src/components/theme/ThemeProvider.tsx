@@ -25,10 +25,18 @@ function NativeThemeSync() {
  * @param children React tree that should inherit theme context.
  * @returns React provider wrapping the app.
  */
-export function ThemeProvider({ children }: { children: ReactNode }) {
+export function ThemeProvider({
+  children,
+  embedded = false,
+}: {
+  children: ReactNode;
+  embedded?: boolean;
+}) {
   return (
     <NextThemesProvider
-      attribute="class"
+      // Embedded CSS is scoped to its portal root, never the host document.
+      attribute={embedded ? [] : "class"}
+      enableColorScheme={!embedded}
       defaultTheme="system"
       enableSystem
       disableTransitionOnChange
