@@ -191,9 +191,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const hostLabel = useMemo(() => {
     if (!task) return "";
     if (task.executionTarget === "managed_sandbox") return sandboxLabel;
-    // Null hostId = the server resolves the connected host at fire time. Same
-    // wording as the edit dialog's host picker.
-    if (task.hostId == null) return "Resolve at fire time";
+    // Null hostId = the server picks the owner's live host when the task fires.
+    // Same wording as the edit dialog's host picker.
+    if (task.hostId == null) return "Most recently active host";
     return hosts?.find((h) => h.host_id === task.hostId)?.name ?? task.hostId;
   }, [hosts, sandboxLabel, task]);
 

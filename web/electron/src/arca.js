@@ -965,8 +965,10 @@ module.exports = {
   connectArcaHost,
   describeConnectFailure,
   isExecutableFile,
+  lastLine,
   resolveArcaPath,
   resolveArcaPathAsync,
+  SAFE_URL_RE,
   startArcaConnect,
   startArcaLogin,
 };

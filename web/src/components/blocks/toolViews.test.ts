@@ -18,7 +18,7 @@ describe("toolViewFor", () => {
     expect(toolViewFor("linear__manage_todo_list", views)).toBeUndefined();
   });
 
-  it("registers one edit view under every harness's edit tool name", () => {
+  it("registers one edit view under every harness's edit and write tool name", () => {
     const editView = toolViewFor("Edit");
     expect(editView?.bodyLabel).toBe("Diff");
     for (const name of [
@@ -27,12 +27,13 @@ describe("toolViewFor", () => {
       "sys_os_edit",
       "mcp__omnigent__sys_os_edit",
       "edit",
+      "Write",
+      "sys_os_write",
+      "mcp__omnigent__sys_os_write",
+      "write",
     ]) {
       expect(toolViewFor(name)).toBe(editView);
     }
-    // WHY: full-file writes carry no before side to diff, so they keep the generic view.
-    expect(toolViewFor("Write")).toBeUndefined();
-    expect(toolViewFor("sys_os_write")).toBeUndefined();
     expect(toolViewFor("manage_todo_list")).toBeUndefined();
   });
 });
