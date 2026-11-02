@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import logging
+import os
 import re
+import subprocess
+import sys
+import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +43,42 @@ _PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
 )
 _PNG_DATA_URI = f"data:image/png;base64,{_PNG_B64}"
+
+_WINDOWS_ABSENT_OS_NAMES = frozenset({"O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK", "fchmod"})
+_WINDOWS_PATH_FUNCTIONS = frozenset(
+    {"open", "mkdir", "unlink", "remove", "rmdir", "rename", "replace", "stat", "lstat", "chmod"}
+)
+
+
+def _without_dir_fd(function: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(function)
+    def call(*args: Any, dir_fd: int | None = None, **kwargs: Any) -> Any:
+        if dir_fd is not None:
+            raise NotImplementedError("dir_fd unavailable on this platform")
+        if function is os.chmod and kwargs.get("follow_symlinks") is False:
+            raise NotImplementedError("chmod: follow_symlinks unavailable on this platform")
+        return function(*args, **kwargs)
+
+    return call
+
+
+class _WindowsOsApi(types.ModuleType):
+    """The ``os`` API CPython 3.12 provides on Windows, backed by the host's file system."""
+
+    supports_dir_fd: set[Callable[..., Any]] = set()
+
+    def __getattr__(self, name: str) -> Any:
+        if name in _WINDOWS_ABSENT_OS_NAMES:
+            raise AttributeError(f"module 'os' has no attribute {name!r}")
+        value = getattr(os, name)
+        return _without_dir_fd(value) if name in _WINDOWS_PATH_FUNCTIONS else value
+
+
+@pytest.fixture(params=["host", "windows"])
+def os_api(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the attachment cache against the host ``os`` and the Windows ``os`` API."""
+    if request.param == "windows":
+        monkeypatch.setattr("omnigent.inner.native_attachments.os", _WindowsOsApi("os"))
 
 
 def test_resize_alias_copy_failure_leaves_no_partial_cache(
@@ -86,6 +128,7 @@ def test_parse_data_uri_without_comma_raises() -> None:
         parse_data_uri("data:image/png;base64")
 
 
+@pytest.mark.usefixtures("os_api")
 def test_materialize_attachment_writes_decoded_bytes(tmp_path: Path) -> None:
     """
     An image block is decoded and written into the session cache.
@@ -218,6 +261,7 @@ def test_unresolved_attachment_marker_sanitizes_bracketed_names() -> None:
     assert re.fullmatch(UNRESOLVED_ATTACHMENT_MARKER_PATTERN, multiline)
 
 
+@pytest.mark.usefixtures("os_api")
 def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -> None:
     """
     Re-materializing identical bytes returns the existing file.
@@ -365,6 +409,7 @@ def test_materialize_cache_contains_path_traversal(tmp_path: Path) -> None:
     assert not (tmp_path.parent / "escaped.zip").exists()
 
 
+@pytest.mark.usefixtures("os_api")
 @pytest.mark.parametrize("collision", [False, True])
 @pytest.mark.parametrize("outside_exists", [False, True])
 def test_materialize_cache_refuses_symlinked_destination(
@@ -390,6 +435,7 @@ def test_materialize_cache_refuses_symlinked_destination(
         assert not outside.exists()
 
 
+@pytest.mark.usefixtures("os_api")
 def test_materialize_cache_refuses_symlinked_attachments_dir(tmp_path: Path) -> None:
     """A symlinked attachments directory is refused rather than written through."""
     elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
@@ -399,6 +445,105 @@ def test_materialize_cache_refuses_symlinked_attachments_dir(tmp_path: Path) -> 
 
     assert materialize_attachment(_zip_block(), tmp_path) is None
     assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.usefixtures("os_api")
+@pytest.mark.parametrize(
+    ("linked", "link"),
+    [
+        pytest.param(
+            "attachments",
+            "symlink",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory symlinks"),
+        ),
+        *(
+            pytest.param(
+                linked,
+                "junction",
+                marks=pytest.mark.skipif(
+                    sys.platform != "win32", reason="junctions are a Windows link"
+                ),
+            )
+            for linked in ("attachments", "session")
+        ),
+    ],
+)
+def test_materialize_cache_refuses_linked_cache_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: str, link: str
+) -> None:
+    """A link at the attachments root or session cache receives nothing, not even a directory."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent"))
+    bridge = tmp_path / "bridge"
+    linked_dir = attachment_cache_dir(bridge)
+    if linked == "attachments":
+        linked_dir = linked_dir.parent
+    linked_dir.parent.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if link == "symlink":
+        linked_dir.symlink_to(elsewhere, target_is_directory=True)
+    else:
+        # A junction needs no symlink privilege on Windows.
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked_dir), str(elsewhere)],
+            check=True,
+            capture_output=True,
+        )
+
+    assert materialize_attachment(_zip_block(), bridge) is None
+    assert list(elsewhere.iterdir()) == []
+
+
+class _WindowsBinaryModeOsApi(_WindowsOsApi):
+    """The Windows ``os`` API, recording the flags of every descriptor it opens."""
+
+    O_BINARY = getattr(os, "O_BINARY", 1 << 30)
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.open_flags: list[int] = []
+
+    def open(self, path: Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if dir_fd is not None:
+            raise NotImplementedError("dir_fd unavailable on this platform")
+        self.open_flags.append(flags)
+        host_flags = flags if hasattr(os, "O_BINARY") else flags & ~self.O_BINARY
+        return os.open(path, host_flags, mode)
+
+
+def test_materialize_cache_opens_windows_descriptors_in_binary_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Creating and reusing a file open binary descriptors, so a PNG's CRLF and Ctrl-Z survive."""
+    windows_os = _WindowsBinaryModeOsApi("os")
+    monkeypatch.setattr("omnigent.inner.native_attachments.os", windows_os)
+    block = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": "photo.png"}
+
+    created = materialize_attachment(block, tmp_path)
+    reused = materialize_attachment(block, tmp_path)
+
+    assert created is not None and reused == created
+    assert created.read_bytes() == base64.b64decode(_PNG_B64)
+    assert len(windows_os.open_flags) == 2
+    assert all(flags & windows_os.O_BINARY for flags in windows_os.open_flags)
+
+
+class _WindowsFullDiskOsApi(_WindowsOsApi):
+    """The Windows ``os`` API on a disk that fills after a few bytes."""
+
+    def write(self, fd: int, data: memoryview) -> int:
+        os.write(fd, data[:8])
+        raise OSError("disk full")
+
+
+def test_materialize_cache_removes_partial_windows_file_when_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that fails part-way leaves no truncated attachment to reuse later."""
+    monkeypatch.setattr("omnigent.inner.native_attachments.os", _WindowsFullDiskOsApi("os"))
+
+    assert materialize_attachment(_zip_block(), tmp_path) is None
+    assert list(attachment_cache_dir(tmp_path).iterdir()) == []
 
 
 def test_materialize_cache_does_not_overwrite_when_both_names_taken(

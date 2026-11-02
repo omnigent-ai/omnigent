@@ -293,18 +293,7 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
 
     attachments_dir = attachment_cache_dir(bridge_dir)
     try:
-        attachments_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        root_fd = os.open(attachments_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            with contextlib.suppress(FileExistsError):
-                os.mkdir(attachments_dir.name, mode=0o700, dir_fd=root_fd)
-            dir_fd = os.open(
-                attachments_dir.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=root_fd,
-            )
-        finally:
-            os.close(root_fd)
+        directory = _open_cache_dir(attachments_dir)
     except OSError:
         _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
         return None
@@ -312,7 +301,10 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         stem, suffix = os.path.splitext(filename)
         digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
         for name in (filename, f"{stem}_{digest}{suffix}"):
-            outcome = _place_no_follow(dir_fd, name, raw_bytes)
+            if isinstance(directory, int):
+                outcome = _place_no_follow(directory, name, raw_bytes)
+            else:
+                outcome = _place_by_path(directory / name, raw_bytes)
             if outcome == "symlink":
                 _logger.warning("Refusing to write through symlink %s", attachments_dir / name)
                 return None
@@ -324,7 +316,66 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
         return None
     finally:
-        os.close(dir_fd)
+        if isinstance(directory, int):
+            os.close(directory)
+
+
+def _open_cache_dir(attachments_dir: Path) -> int | Path:
+    """
+    Create the session's attachment cache and open it without following a link.
+
+    :param attachments_dir: The cache directory, see :func:`attachment_cache_dir`.
+    :returns: A no-follow descriptor for the directory, or on platforms without
+        ``dir_fd`` (Windows) the directory's path once neither it nor its
+        parent is a link.
+    :raises OSError: When the directory cannot be created or is a link.
+    """
+    attachments_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not _dir_fd_supported():
+        # Check the parent first so a pre-existing linked parent gets no new directory.
+        _require_unlinked_dir(attachments_dir.parent)
+        with contextlib.suppress(FileExistsError):
+            attachments_dir.mkdir(mode=0o700)
+        _require_unlinked_dir(attachments_dir)
+        return attachments_dir
+    root_fd = os.open(attachments_dir.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(attachments_dir.name, mode=0o700, dir_fd=root_fd)
+        return os.open(
+            attachments_dir.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _dir_fd_supported() -> bool:
+    """Whether the cache can open through no-follow directory descriptors (not on Windows)."""
+    return (
+        all(function in os.supports_dir_fd for function in (os.open, os.mkdir, os.unlink))
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+    )
+
+
+def _file_open_flags() -> int:
+    """Flags for attachment files: no-follow where available, binary on Windows."""
+    return getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+
+
+def _require_unlinked_dir(path: Path) -> None:
+    """Raise unless *path* is a directory rather than a link or reparse point."""
+    info = os.lstat(path)
+    if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.ELOOP, "Attachment cache is a link", str(path))
+
+
+def _is_link(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a symlink, junction or other reparse point."""
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISLNK(info.st_mode) or bool(reparse)
 
 
 def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] | None:
@@ -404,14 +455,43 @@ def _place_no_follow(
         os.close(fd)
 
 
+def _place_by_path(path: Path, raw_bytes: bytes) -> Literal["placed", "taken", "symlink"]:
+    """
+    Windows form of :func:`_place_no_follow`, for platforms without ``dir_fd``.
+
+    The entry is checked with ``lstat`` first, and a reused file must be that
+    same entry once opened. Windows files carry no execute bits to clear.
+
+    :param path: Cache path for the attachment.
+    :param raw_bytes: Decoded attachment payload.
+    :returns: As for :func:`_place_no_follow`.
+    :raises OSError: When writing a new file fails part-way.
+    """
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        return _create_no_follow(None, path, raw_bytes)
+    if _is_link(entry):
+        return "symlink"
+    if not stat.S_ISREG(entry.st_mode) or entry.st_size != len(raw_bytes):
+        return "taken"
+    fd = os.open(path, os.O_RDONLY | _file_open_flags())
+    try:
+        same = os.path.samestat(entry, os.fstat(fd)) and _read_fd(fd, entry.st_size) == raw_bytes
+    finally:
+        os.close(fd)
+    return "placed" if same else "taken"
+
+
 def _create_no_follow(
-    dir_fd: int, name: str, raw_bytes: bytes
+    dir_fd: int | None, name: str | Path, raw_bytes: bytes
 ) -> Literal["placed", "taken", "symlink"]:
     """
     Create *name* exclusively under *dir_fd* and write *raw_bytes* to it.
 
-    :param dir_fd: No-follow descriptor for the attachments directory.
-    :param name: Base filename, no directory components.
+    :param dir_fd: No-follow descriptor for the attachments directory, or
+        ``None`` when *name* is the full path.
+    :param name: Base filename, no directory components, or the full path.
     :param raw_bytes: Decoded attachment payload.
     :returns: ``"placed"`` on success; ``"taken"`` when something appeared at
         the name first; ``"symlink"`` when that something is a symlink.
@@ -420,7 +500,7 @@ def _create_no_follow(
     try:
         # Private, non-executable files; existing entries are never overwritten.
         fd = os.open(
-            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _file_open_flags(), 0o600, dir_fd=dir_fd
         )
     except FileExistsError:
         return "taken"
