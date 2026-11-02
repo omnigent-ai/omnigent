@@ -15,6 +15,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 vi.mock("@/lib/serverOrigin", () => ({
   isCurrentServerLocal: () => false,
@@ -234,5 +235,165 @@ describe("mobile sidebar drawer keyboard inset", () => {
     expect(screen.getByRole("complementary", { name: "Conversations" }).style.paddingBottom).toBe(
       "",
     );
+  });
+});
+
+/** Dispatch a touch event with `fingers` touches down on `target` at `time` ms. */
+function touch(target: Element, type: string, x: number, time: number, fingers = 1): void {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "touches", {
+    value:
+      type === "touchend"
+        ? []
+        : Array.from({ length: fingers }, () => ({ clientX: x, clientY: 300 })),
+  });
+  Object.defineProperty(event, "timeStamp", { value: time });
+  act(() => {
+    target.dispatchEvent(event);
+  });
+}
+
+function stubMobileLayout(mobile: boolean): void {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: mobile && query.includes("max-width"),
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
+}
+
+// A leftward swipe on the open drawer slides it shut under the finger, the
+// reverse of the iOS shell's left-edge swipe that opens it.
+describe("mobile sidebar drawer swipe to close", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderDrawer(props: { route?: string; dragProgress?: number } = {}) {
+    const onClose = vi.fn();
+    const { setOpen } = renderSidebar({ onClose, ...props });
+    const drawer = screen.getByRole("complementary", { name: "Conversations" });
+    drawer.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
+    return { onClose, drawer, setOpen };
+  }
+
+  it("follows the finger and closes once released past a third of its width", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 60);
+    touch(drawer, "touchmove", 100, 120);
+
+    expect(drawer.style.transform).toBe("translateX(-50%)");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("0.5");
+    expect(onClose).not.toHaveBeenCalled();
+
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(drawer.style.transform).toBe("");
+  });
+
+  it("springs back open without closing after a short drag", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 270, 80);
+    touch(drawer, "touchmove", 250, 160);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(drawer.style.transform).toBe("");
+  });
+
+  it("drops the drag when a second finger lands, so the drawer can still close", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer, setOpen } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 270, 80);
+    touch(drawer, "touchmove", 250, 160);
+    expect(drawer.style.transform).toBe("translateX(-12.5%)");
+
+    touch(drawer, "touchstart", 250, 200, 2);
+    touch(drawer, "touchend", 0, 260);
+
+    expect(drawer.style.transform).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+
+    setOpen(false);
+
+    expect(drawer).toHaveAttribute("data-collapsed", "true");
+    expect(drawer.style.transform).toBe("");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
+  });
+
+  it("clears a drag cut off by the drawer closing, so reopening shows no stale offset", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer, setOpen } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 80);
+    touch(drawer, "touchmove", 200, 160);
+    expect(drawer.style.transform).toBe("translateX(-25%)");
+
+    setOpen(false);
+    expect(drawer).toHaveAttribute("data-collapsed", "true");
+    expect(drawer.style.transform).toBe("");
+
+    touch(drawer, "touchmove", 100, 200);
+    touch(drawer, "touchend", 0, 240);
+    setOpen(true);
+
+    expect(drawer.style.transform).toBe("");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("leaves a row long-press to drag-to-reorder", async () => {
+    stubMobileLayout(true);
+    vi.useFakeTimers();
+    const { onClose, drawer } = renderDrawer();
+    const row = screen.getByRole("link", { name: "conv_a" }).closest("li")!;
+    const dragPreview = () => document.body.querySelector('[class*="max-w-[16rem]"]');
+
+    try {
+      touch(row, "touchstart", 300, 0);
+      await act(() => vi.advanceTimersByTimeAsync(300));
+      expect(dragPreview()).not.toBeNull();
+
+      touch(row, "touchmove", 250, 300);
+      touch(row, "touchmove", 100, 360);
+      expect(drawer.style.transform).toBe("");
+      touch(row, "touchend", 0, 400);
+
+      expect(drawer.style.transform).toBe("");
+      expect(onClose).not.toHaveBeenCalled();
+    } finally {
+      // dnd-kit defers removing its document listeners by 50 ms.
+      await act(() => vi.advanceTimersByTimeAsync(50));
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["the desktop layout", { mobile: false }, ""],
+    ["Settings", { mobile: true, route: "/settings" }, ""],
+    // The native edge swipe owns the drawer while its progress is live.
+    ["a native edge swipe", { mobile: true, dragProgress: 0.5 }, "translateX(-50%)"],
+  ])("ignores the swipe during %s", (_label, { mobile, ...props }, transform) => {
+    stubMobileLayout(mobile);
+    const { onClose, drawer } = renderDrawer(props);
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 80);
+    touch(drawer, "touchmove", 100, 160);
+    expect(drawer.style.transform).toBe(transform);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(drawer.style.transform).toBe(transform);
+    expect(onClose).not.toHaveBeenCalled();
   });
 });
