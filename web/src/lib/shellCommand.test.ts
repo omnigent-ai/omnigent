@@ -72,6 +72,9 @@ describe("shellCommandFromCodeBlock", () => {
     // it is output, and pasting it would run it on Enter.
     expect(shellCommandFromCodeBlock("$ ls\nfile.txt\n> quoted output\n")).toBe("ls");
     expect(shellCommandFromCodeBlock("$ cat notes.md\n> rm -rf build\n")).toBe("cat notes.md");
+    expect(
+      shellCommandFromCodeBlock("$ printf '%s\\n' '> echo UNINTENDED'\n> echo UNINTENDED\n"),
+    ).toBe("printf '%s\\n' '> echo UNINTENDED'");
     expect(shellCommandFromCodeBlock("$ cat <<EOF\n> one\n> EOF\n> quoted\n")).toBe(
       "cat <<EOF\none\nEOF",
     );

@@ -2063,6 +2063,10 @@ function AppShellImpl() {
     !createTerminal.isPending &&
     liveness?.kind !== "host_offline" &&
     liveness?.kind !== "local_stranded";
+  // A create that finishes after the user moved to another session must not
+  // reveal its shell over that session.
+  const currentConversationIdRef = useRef(conversationId);
+  currentConversationIdRef.current = conversationId;
   // ``initialCommand`` comes from a chat code block's "Open in shell": the new
   // shell gets it pasted at its first prompt, and on a phone it opens in the
   // full-screen terminal panel because the rail is hidden there.
@@ -2077,6 +2081,7 @@ function AppShellImpl() {
           if (initialCommand !== undefined) {
             queuePendingShellInput(conversationId, info.id, initialCommand);
           }
+          if (currentConversationIdRef.current !== conversationId) return;
           if (inMobilePanel) openTerminalsPanel(terminalTabKey(info));
           else openTerminalTab(terminalTabKey(info));
         },

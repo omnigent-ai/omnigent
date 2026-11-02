@@ -1399,6 +1399,40 @@ async def test_failed_shell_paste_deletes_its_buffer(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "flags", "payload"),
+    [
+        # tmux >= 3.7 reports the shell's mode; tmux wraps the text itself.
+        (_pane_state("1"), ("-p",), b"ls\npwd"),
+        (_pane_state(""), ("-r",), b"ls\x16\npwd"),
+    ],
+)
+async def test_shell_paste_flags_follow_the_paste_method(
+    monkeypatch: pytest.MonkeyPatch,
+    state: _PastePaneState,
+    flags: tuple[str, ...],
+    payload: bytes,
+) -> None:
+    """Bracketed pastes use ``paste-buffer -p``; quoted keystrokes use ``-r``."""
+    calls: list[tuple[tuple[str, ...], bytes | None]] = []
+
+    async def fake_state(*_args: object) -> _PastePaneState:
+        return state
+
+    async def fake_tmux(_tmux: str, _socket: str, *args: str, stdin: bytes | None = None) -> bytes:
+        calls.append((args, stdin))
+        return b""
+
+    monkeypatch.setattr(control_bridge, "_read_paste_pane_state", fake_state)
+    monkeypatch.setattr(control_bridge, "_run_tmux_command", fake_tmux)
+    assert await _paste_shell_command("tmux", "sock", "main", "ls\npwd") is None
+    [(args, stdin)] = calls
+    paste_args = args[args.index("paste-buffer") + 1 :]
+    assert paste_args[: len(flags) + 1] == (*flags, "-d")
+    assert stdin == payload
+
+
+@pytest.mark.asyncio
 async def test_cancelled_shell_paste_never_reaches_the_pane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

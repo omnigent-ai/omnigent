@@ -5938,16 +5938,24 @@ describe("new-session browser shortcut", () => {
 describe("AppShell open in shell", () => {
   function ShellOpenerProbe() {
     const openShellCommand = useShellCommandOpener();
+    const location = useLocation();
     if (openShellCommand === null) return <div>no shell opener</div>;
     return (
-      <button type="button" onClick={() => openShellCommand("npm test")}>
-        open command
-      </button>
+      <>
+        <button type="button" onClick={() => openShellCommand("npm test")}>
+          open command
+        </button>
+        <Link to="/c/conv_other">other session</Link>
+        <div data-testid="probe-path">{location.pathname}</div>
+      </>
     );
   }
 
   function renderOpenerProbe(permissionLevel: number, terminals = ["zsh"]) {
-    mockConversations([{ id: "conv_sdk", permission_level: permissionLevel }]);
+    mockConversations([
+      { id: "conv_sdk", permission_level: permissionLevel },
+      { id: "conv_other", permission_level: permissionLevel },
+    ]);
     useSessionAgentMock.mockReturnValue({
       data: { id: "ag_x", name: "polly", terminals },
     } as ReturnType<typeof useSessionAgent>);
@@ -5960,17 +5968,42 @@ describe("AppShell open in shell", () => {
     vi.unstubAllGlobals();
   });
 
-  it("creates the default shell and queues the command for its first prompt", async () => {
-    const fetchMock = vi.fn(
-      async () =>
-        new Response(
-          JSON.stringify({
-            id: "terminal_zsh_u1",
-            metadata: { terminal_name: "zsh", session_key: "u1", running: true },
-          }),
-          { status: 201, headers: { "Content-Type": "application/json" } },
-        ),
+  function createdShellResponse() {
+    return new Response(
+      JSON.stringify({
+        id: "terminal_zsh_u1",
+        metadata: { terminal_name: "zsh", session_key: "u1", running: true },
+      }),
+      { status: 201, headers: { "Content-Type": "application/json" } },
     );
+  }
+
+  function stubPhoneViewport() {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: false,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+  }
+
+  /** Stub fetch so the create POST waits for the returned ``finish``. */
+  function deferShellCreate() {
+    let finishCreate: (response: Response) => void = () => {};
+    const fetchMock = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          if (init?.method === "POST") finishCreate = resolve;
+          else resolve(new Response("{}", { status: 200 }));
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const posts = () => fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    return { posts, finish: (response: Response) => finishCreate(response) };
+  }
+
+  it("creates the default shell and queues the command for its first prompt", async () => {
+    const fetchMock = vi.fn(async () => createdShellResponse());
     vi.stubGlobal("fetch", fetchMock);
     renderOpenerProbe(4);
 
@@ -5985,25 +6018,10 @@ describe("AppShell open in shell", () => {
     expect(claimPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe("npm test");
   });
 
-  function createdShellResponse() {
-    return new Response(
-      JSON.stringify({
-        id: "terminal_zsh_u1",
-        metadata: { terminal_name: "zsh", session_key: "u1", running: true },
-      }),
-      { status: 201, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
   it("opens the new shell full screen on a phone", async () => {
     // WHY: the Workspace rail is hidden below md, so a rail tab would leave
     // the pasted command out of sight.
-    const baseMatchMedia = window.matchMedia;
-    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
-      ...baseMatchMedia(query),
-      matches: false,
-    }));
-    onTestFinished(() => matchMedia.mockRestore());
+    stubPhoneViewport();
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => createdShellResponse()),
@@ -6044,28 +6062,38 @@ describe("AppShell open in shell", () => {
   it("doesn't start a second shell while one is still being created", async () => {
     const infoToast = vi.spyOn(toast, "info");
     onTestFinished(() => infoToast.mockRestore());
-    let finishCreate: (response: Response) => void = () => {};
-    const fetchMock = vi.fn(
-      (_url: string, init?: RequestInit) =>
-        new Promise<Response>((resolve) => {
-          if (init?.method === "POST") finishCreate = resolve;
-          else resolve(new Response("{}", { status: 200 }));
-        }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
+    const create = deferShellCreate();
     renderOpenerProbe(4);
     const button = screen.getByRole("button", { name: "open command" });
 
     fireEvent.click(button);
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(true),
-    );
+    await waitFor(() => expect(create.posts()).toHaveLength(1));
     fireEvent.click(button);
 
     expect(infoToast).toHaveBeenCalledWith("A shell is already opening", expect.anything());
-    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
-    finishCreate(createdShellResponse());
+    expect(create.posts()).toHaveLength(1);
+    create.finish(createdShellResponse());
     await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+  });
+
+  it("leaves the session the user moved to alone when a phone create finishes", async () => {
+    // WHY: the shell belongs to the first session; revealing it would take
+    // over the second session's screen.
+    stubPhoneViewport();
+    const create = deferShellCreate();
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+    await waitFor(() => expect(create.posts()).toHaveLength(1));
+    fireEvent.click(screen.getByRole("link", { name: "other session" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other"),
+    );
+    create.finish(createdShellResponse());
+
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+    expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other");
+    expect(screen.queryByTestId("terminals-panel")).not.toHaveAttribute("data-state", "open");
   });
 
   it("offers no opener to a viewer who would attach read-only", () => {
