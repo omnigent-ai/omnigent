@@ -495,7 +495,7 @@ async def test_terminal_only_native_work_idle_accounting(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+@pytest.mark.parametrize("status_source", ["forwarder", "pane", "pane_detail"])
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -507,22 +507,39 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
-        if status_source == "pane":
+        if status_source.startswith("pane"):
             from omnigent.runner.app import _session_event_queues_ref
 
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
-            publish = app.state.session_resource_registry._session_status_publisher
-            assert publish is not None
-            publish(conv_id, "failed", None)
+            if status_source == "pane_detail":
+                publish_failure = app.state.session_resource_registry._session_failure_publisher
+                assert publish_failure is not None
+                publish_failure(
+                    conv_id, "API Error: 499 Authorization: Bearer synthetic-secret-token"
+                )
+            else:
+                publish = app.state.session_resource_registry._session_status_publisher
+                assert publish is not None
+                publish(conv_id, "failed", None)
             events = []
             while not queue.empty():
                 events.append(queue.get_nowait())
             failures = [event for event in events if event and event.get("status") == "failed"]
             assert len(failures) == 1
-            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
-            assert "Open the terminal" in failures[0]["error"]["message"]
+            if status_source == "pane_detail":
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"].startswith("API Error: 499")
+                assert "synthetic-secret-token" not in str(failures)
+                context = failures[0]["failure_context"]
+                assert context["http_status"] == 499
+                assert context["failure_source"] == "claude_program_status"
+                assert context["detail_source"] == "program_status_error"
+                assert "native_hook_event" not in context
+            else:
+                assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+                assert "Open the terminal" in failures[0]["error"]["message"]
         else:
             await _post_status(client, conv_id, "failed")
         assert app.state.has_active_work() is False
