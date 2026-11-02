@@ -201,6 +201,9 @@ def test_load_follows_a_bundle_another_process_replaced(
 
     # The installing process swaps the shared disk entry; this one only sees the new row.
     AgentCache(artifact_store, cache_dir).replace("agent-r", new_location, new_bytes)
+    restored = stale.load("agent-r", old_location)
+    assert restored.spec.name == "test-agent"
+    assert (restored.workdir / "config.yaml").read_text() == _MINIMAL_CONFIG
     assert stale.load("agent-r", new_location).spec.name == "reinstalled"
 
     # A process with its own disk tier rebuilds from the artifact store.
@@ -209,16 +212,20 @@ def test_load_follows_a_bundle_another_process_replaced(
     assert separate.load("agent-r", new_location).spec.name == "reinstalled"
 
 
+@pytest.mark.parametrize("marker", [None, b"\xff", b"another-bundle"])
 def test_load_rebuilds_a_disk_entry_without_a_location_marker(
     artifact_store: LocalArtifactStore,
     cache_dir: Path,
+    marker: bytes | None,
 ) -> None:
-    """An entry extracted before markers existed may hold any bundle, so it is rebuilt."""
+    """An unknown or unreadable publication marker must not keep a stale disk entry."""
     location = "agent-legacy/abc123"
     _store_bundle(artifact_store, location)
     legacy = cache_dir / "agent-legacy"
     legacy.mkdir(parents=True)
     (legacy / "config.yaml").write_text(_MINIMAL_CONFIG.replace("test-agent", "stale"))
+    if marker is not None:
+        (legacy / ".omnigent-bundle-location").write_bytes(marker)
 
     loaded = AgentCache(artifact_store, cache_dir).load("agent-legacy", location)
 
@@ -228,10 +235,12 @@ def test_load_rebuilds_a_disk_entry_without_a_location_marker(
     )
 
 
+@pytest.mark.parametrize("memory_cache_warm", [False, True])
 def test_load_reextracts_when_disk_entry_lost_config(
     artifact_store: LocalArtifactStore,
     cache_dir: Path,
     caplog: pytest.LogCaptureFixture,
+    memory_cache_warm: bool,
 ) -> None:
     """A wiped ``config.yaml`` is a cache miss: ``load()`` re-extracts the stored bundle."""
     loc = "agent-wiped/abc123"
@@ -246,9 +255,11 @@ def test_load_reextracts_when_disk_entry_lost_config(
     (workdir / "config.yaml").unlink()
     (workdir / "stale-leftover").write_text("junk", encoding="utf-8")
 
-    # New cache instance simulates a server restart — empty memory tier,
-    # so the next load hits the poisoned disk tier.
-    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_2 = (
+        cache_1
+        if memory_cache_warm
+        else AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    )
     with caplog.at_level(logging.INFO, logger=agent_cache_module.__name__):
         loaded = cache_2.load("agent-wiped", loc)
 

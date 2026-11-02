@@ -38,7 +38,7 @@ def _published_location(workdir: Path) -> str | None:
     """Return the bundle location a cache directory holds, or ``None`` if unknown."""
     try:
         return (workdir / _LOCATION_MARKER).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
         return None
 
 
@@ -54,6 +54,9 @@ class AgentCache:
     caller naming a newer location (a reinstall or edit made by another
     process sharing the cache directory) rebuilds instead of reading a
     stale spec.
+
+    Memory hits require a matching disk marker and an existing config;
+    evicted disk entries are rebuilt before returning bundle-relative paths.
 
     On cache miss the bundle is downloaded from the ArtifactStore,
     extracted to disk, parsed, validated, and stored in both tiers.
@@ -142,7 +145,12 @@ class AgentCache:
         # derived from the agent's immutable provenance, which never
         # changes for a given ``agent_id``.
         cached = self._specs.get(agent_id)
-        if cached is not None and cached[0] == bundle_location:
+        if (
+            cached is not None
+            and cached[0] == bundle_location
+            and (workdir / "config.yaml").is_file()
+            and _published_location(workdir) == bundle_location
+        ):
             return LoadedAgent(spec=cached[1], workdir=workdir)
 
         # Tier 2: rebuild stale, missing, or corrupt extracted specs from the stored bundle.
