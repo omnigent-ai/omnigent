@@ -1452,6 +1452,92 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).toHaveBeenCalledWith("/not-a-real-skill", undefined);
   });
 
+  it("shows /help output in the floating panel and clears the draft", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("/help — Show available slash commands");
+    expect(output).toHaveTextContent("/deslop — Remove AI slop");
+    expect(ta.value).toBe("");
+  });
+
+  it("shows the bare /model hint in the floating panel and clears the draft", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // Trailing space closes the slash menu so Enter submits (see /model tests).
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("Usage: /model <name> | default");
+    expect(ta.value).toBe("");
+  });
+
+  it("shows /context output in the floating panel and clears the draft", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/context" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("Items in context:");
+    expect(ta.value).toBe("");
+  });
+
+  it("dismisses floating command output on Escape without stopping an in-flight turn", () => {
+    const onStop = vi.fn();
+    render(
+      <Composer {...composerProps({ onSendSlashCommand: vi.fn(), isWorking: true, onStop })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(screen.getByTestId("composer-command-output")).toBeInTheDocument();
+
+    // Escape dismisses the overlay and must not reach the turn-stop branch.
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(onStop).not.toHaveBeenCalled();
+
+    // With the overlay gone, Escape resumes interrupting the running turn.
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses floating command output when Escape fires inside the focused panel", () => {
+    const onStop = vi.fn();
+    render(
+      <Composer {...composerProps({ onSendSlashCommand: vi.fn(), isWorking: true, onStop })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const panel = screen.getByTestId("composer-command-output");
+
+    // A keyboard user can focus the scrollable panel; Escape there dismisses it
+    // and returns focus to the composer without stopping the running turn.
+    panel.focus();
+    fireEvent.keyDown(panel, { key: "Escape" });
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(onStop).not.toHaveBeenCalled();
+    expect(ta).toHaveFocus();
+  });
+
+  it("dismisses floating command output from its close button", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(screen.getByTestId("composer-command-output")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss command output" }));
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(ta).toHaveFocus();
+  });
+
   it("treats /effort as plaintext when effort controls are hidden", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
