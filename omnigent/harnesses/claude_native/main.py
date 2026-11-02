@@ -224,6 +224,9 @@ _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
 _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
+#: Kill-switch for Claude Code's server-side advisor tool, which runs only when the
+#: user sets an advisor model in their own Claude settings.
+_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
 #: Kill-switch Claude Code treats as covering nonessential startup traffic;
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
@@ -2503,7 +2506,7 @@ def _fetch_external_session_id_for_redirect(
         if resp.status_code >= 400:
             return None
         payload = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001 - Redirect lookup is best-effort.
         _logger.warning(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
@@ -3084,7 +3087,7 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Cached models remain usable.
             # Recoverable fallback; frames are debug-only so a TTY-mirrored
             # host console stays concise.
             _logger.warning(
@@ -3122,6 +3125,9 @@ def _ucode_config_for_profile(
         # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
         # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        # The gateway rejects the advisor tool on the Opus route, and Omnigent
+        # does not offer one, so a user-set advisor model would fail every turn.
+        _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
             _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
         ),
@@ -3299,10 +3305,11 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
             pin_env.setdefault(default_env_var, family.default_model)
-    attribution_env: dict[str, str] = {}
+    gateway_env: dict[str, str] = {}
     if is_databricks_ai_gateway_url(family.base_url):
+        gateway_env[_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV] = "1"
         # Keep any headers the user already sends; the config env replaces theirs.
-        attribution_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+        gateway_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
             os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(family.base_url),
@@ -3311,7 +3318,7 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
-            **attribution_env,
+            **gateway_env,
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(
@@ -3577,6 +3584,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     env = {
         _UCODE_CLAUDE_BASE_URL_ENV: f"{workspace_host}/ai-gateway/anthropic",
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     model = _connect_broker_default_model()
@@ -3844,7 +3852,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:
+    except Exception:  # noqa: BLE001 - Invalid wrapper specs cannot block launch.
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -4157,7 +4165,7 @@ async def _attach_direct_tmux(
                 await watcher
             except asyncio.CancelledError:
                 pass
-            except Exception:  # watcher failure is secondary to attach outcome
+            except Exception:  # noqa: BLE001 - Watcher failure must not mask attach outcome.
                 _logger.warning(
                     "direct-tmux pane watcher failed during attach cleanup", exc_info=True
                 )
@@ -4280,7 +4288,7 @@ async def _attach_with_transcript_forwarder(
                 await forwarder
             except asyncio.CancelledError:
                 pass
-            except Exception:
+            except Exception:  # noqa: BLE001 - Mirroring failure must not terminate the TUI.
                 # The forwarder is best-effort mirroring. A bug there
                 # (corrupt transcript JSONL, file-system error, anything
                 # uncaught in the parser) must not skip the Omnigent terminal
@@ -4378,7 +4386,7 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:
+            except Exception:  # noqa: BLE001 - Callback failure cannot prevent reattachment.
                 _logger.warning(
                     "%s-native reconnect recovery callback raised; retrying attach anyway",
                     session_name.lower(),
@@ -5619,7 +5627,7 @@ def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> s
     """
     try:
         holder = find_background_holder(external_session_id)
-    except Exception:  # A registry probe must not change how a resume launches.
+    except Exception:  # noqa: BLE001 - Registry lookup cannot block resume.
         _logger.warning(
             "Could not check Claude's session registry for %s; resuming it in place",
             external_session_id,
