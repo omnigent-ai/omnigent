@@ -18,7 +18,6 @@ import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
-import { withoutControlCharacters } from "@/lib/shellCommand";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
@@ -622,7 +621,7 @@ export function touchScrollPayload(
 
 /**
  * How long the bridge gets to acknowledge a ``paste`` frame before the browser
- * pastes through xterm instead. Runners that predate the frame ignore it; a
+ * gives up as ``unsupported``. Runners that predate the frame ignore it; a
  * current bridge sends ``paste-accepted`` at once and then waits for the prompt.
  */
 export const SHELL_PASTE_ACK_TIMEOUT_MS = 10_000;
@@ -639,22 +638,22 @@ const BRIDGE_PASTE_REFUSALS = [
 ] as const;
 
 /**
- * Why a command was not pasted: a bridge reason, ``unsafe`` (a paste would run
- * lines), ``interrupted`` (the socket closed before the answer), ``duplicated``
- * or ``late`` (the bridge pasted after the xterm fallback typed or refused it).
+ * Why a command was not pasted: a bridge reason, ``unsupported`` (the runner
+ * never acknowledged the frame), ``interrupted`` (the socket closed before the
+ * answer), or ``late`` (the bridge pasted after the browser gave up).
  */
 export type ShellPasteRefusal =
-  (typeof BRIDGE_PASTE_REFUSALS)[number] | "interrupted" | "duplicated" | "late";
+  (typeof BRIDGE_PASTE_REFUSALS)[number] | "unsupported" | "interrupted" | "late";
 
 /**
- * How long after the xterm fallback a slow bridge's answer still counts. A
+ * How long after giving up the browser still heeds a slow bridge's answer. A
  * current bridge gives up on the prompt well within this.
  */
 export const SHELL_PASTE_LATE_RESULT_MS = 30_000;
 
 /**
  * Called with a command that was not pasted and why, or that may be at the
- * prompt despite an earlier answer (``duplicated``, ``late``, ``interrupted``).
+ * prompt despite an earlier answer (``late``, ``interrupted``).
  */
 export type ShellPasteRefusedHandler = (text: string, reason: ShellPasteRefusal) => void;
 
@@ -673,12 +672,10 @@ interface InFlightShellPaste {
   ackTimer: ReturnType<typeof setTimeout> | null;
 }
 
-/** A paste the bridge may still answer after the browser's fallback. */
-interface FallenBackShellPaste {
+/** A paste the browser gave up on that a slow bridge may still answer. */
+interface AbandonedShellPaste {
   text: string;
   onRefused?: ShellPasteRefusedHandler;
-  /** Whether the fallback pasted through xterm (otherwise it refused). */
-  typed: boolean;
   expiry: ReturnType<typeof setTimeout>;
 }
 
@@ -768,7 +765,7 @@ export class TerminalSession {
   /** The ``paste`` frame awaiting the bridge's answer, or null. */
   private inFlightPaste: InFlightShellPaste | null = null;
   /** Pastes the bridge didn't acknowledge in time, by id, until it answers. */
-  private readonly fallenBackPastes = new Map<number, FallenBackShellPaste>();
+  private readonly abandonedPastes = new Map<number, AbandonedShellPaste>();
   private pasteIdleWaiters: (() => void)[] = [];
   private nextPasteId = 1;
 
@@ -1108,8 +1105,8 @@ export class TerminalSession {
    * Paste a command at the shell's prompt without running it.
    *
    * The bridge pastes once the prompt is ready, or refuses. A runner that
-   * doesn't acknowledge within {@link SHELL_PASTE_ACK_TIMEOUT_MS} gets an
-   * xterm paste, only when that can't run a line.
+   * doesn't acknowledge within {@link SHELL_PASTE_ACK_TIMEOUT_MS} is refused
+   * as ``unsupported``: the browser can't tell what is reading the pane.
    *
    * @param claim Takes the command; null means another view already pasted it.
    *   Called once, when the WebSocket is open.
@@ -1135,17 +1132,15 @@ export class TerminalSession {
       id,
       text,
       onRefused: pending.onRefused,
-      ackTimer: setTimeout(() => this.pasteWithoutBridge(id), SHELL_PASTE_ACK_TIMEOUT_MS),
+      ackTimer: setTimeout(() => this.abandonUnacknowledgedPaste(id), SHELL_PASTE_ACK_TIMEOUT_MS),
     };
   }
 
   private settleInFlightPaste(frame: TerminalPasteFrame): void {
-    const fallenBack =
-      typeof frame.id === "number" ? this.fallenBackPastes.get(frame.id) : undefined;
-    if (fallenBack !== undefined && frame.kind === "result") {
-      this.forgetFallenBackPaste(frame.id as number);
-      if (frame.pasted)
-        fallenBack.onRefused?.(fallenBack.text, fallenBack.typed ? "duplicated" : "late");
+    const abandoned = typeof frame.id === "number" ? this.abandonedPastes.get(frame.id) : undefined;
+    if (abandoned !== undefined && frame.kind === "result") {
+      this.forgetAbandonedPaste(frame.id as number);
+      if (frame.pasted) abandoned.onRefused?.(abandoned.text, "late");
       return;
     }
     const inFlight = this.inFlightPaste;
@@ -1161,7 +1156,7 @@ export class TerminalSession {
     this.resolvePasteIdleWaiters();
   }
 
-  private pasteWithoutBridge(id: number): void {
+  private abandonUnacknowledgedPaste(id: number): void {
     const inFlight = this.inFlightPaste;
     if (inFlight === null || inFlight.id !== id) return;
     this.dropInFlightPaste();
@@ -1170,49 +1165,40 @@ export class TerminalSession {
       // for this paste any more.
       inFlight.onRefused?.(inFlight.text, "interrupted");
     } else {
-      // A slow current bridge may still be waiting for the prompt; stop it.
+      // Typing it through xterm could reach an editor or a startup question,
+      // so refuse; a slow current bridge is told to stop too.
       this.ws.send(JSON.stringify({ type: "paste-cancel", id }));
-      // Strip what the bridge would: ESC could end a bracketed paste early.
-      const text = withoutControlCharacters(inFlight.text.replace(/\r\n?/g, "\n"));
-      // Unbracketed, a line break is Enter and a tab is a keystroke (completion,
-      // or whatever readline binds it to), so only plain text is typed.
-      const typed = this.term.modes.bracketedPasteMode || !/[\n\t]/.test(text);
-      if (typed) {
-        this.term.paste(text);
-      } else {
-        inFlight.onRefused?.(inFlight.text, "unsafe");
-      }
-      this.fallenBackPastes.set(id, {
+      inFlight.onRefused?.(inFlight.text, "unsupported");
+      this.abandonedPastes.set(id, {
         text: inFlight.text,
         onRefused: inFlight.onRefused,
-        typed,
-        expiry: setTimeout(() => this.forgetFallenBackPaste(id), SHELL_PASTE_LATE_RESULT_MS),
+        expiry: setTimeout(() => this.forgetAbandonedPaste(id), SHELL_PASTE_LATE_RESULT_MS),
       });
       this.sendPendingPaste();
     }
     this.resolvePasteIdleWaiters();
   }
 
-  private forgetFallenBackPaste(id: number): void {
-    const fallenBack = this.fallenBackPastes.get(id);
-    if (fallenBack === undefined) return;
-    clearTimeout(fallenBack.expiry);
-    this.fallenBackPastes.delete(id);
+  private forgetAbandonedPaste(id: number): void {
+    const abandoned = this.abandonedPastes.get(id);
+    if (abandoned === undefined) return;
+    clearTimeout(abandoned.expiry);
+    this.abandonedPastes.delete(id);
   }
 
   /**
    * Report every paste whose outcome the socket's end leaves unknown.
    *
-   * @param reportFallenBack Whether the connection dropped, so a slow bridge's
-   *   answer to an xterm fallback is lost; a planned teardown forgets them.
+   * @param reportAbandoned Whether the connection dropped, so a slow bridge's
+   *   answer to an abandoned paste is lost; a planned teardown forgets them.
    */
-  private interruptUnsettledPastes(reportFallenBack: boolean): void {
+  private interruptUnsettledPastes(reportAbandoned: boolean): void {
     const inFlight = this.inFlightPaste;
     this.dropInFlightPaste();
     inFlight?.onRefused?.(inFlight.text, "interrupted");
-    for (const [id, fallenBack] of this.fallenBackPastes) {
-      this.forgetFallenBackPaste(id);
-      if (reportFallenBack) fallenBack.onRefused?.(fallenBack.text, "interrupted");
+    for (const [id, abandoned] of this.abandonedPastes) {
+      this.forgetAbandonedPaste(id);
+      if (reportAbandoned) abandoned.onRefused?.(abandoned.text, "interrupted");
     }
     this.resolvePasteIdleWaiters();
   }

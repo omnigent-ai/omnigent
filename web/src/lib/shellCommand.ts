@@ -57,7 +57,7 @@ const SECONDARY_PROMPT_LINE = /^\s*>(?:\s|$)/;
 // A here-document (not a ``<<<`` here-string), or a line ending in a pipe,
 // ``&&`` or ``||``: the command goes on past its first line.
 const HEREDOC_OPERATOR = /(?<!<)<<(?!<)/;
-const TRAILING_OPERATOR = /(?:\||&&)\s*$/;
+const TRAILING_OPERATOR = /(?:\|&?|&&)\s*$/;
 // A compound command whose body would be on the next lines.
 const TRAILING_KEYWORD = /(?:^|[\s;&|()])(?:do|then|else|elif|in)\s*$/;
 // ANSI-C quoting, where ``\'`` doesn't end the string.
@@ -162,7 +162,7 @@ function isDroppedControl(code: number): boolean {
 
 // ESC would let a block end the shell's bracketed paste early (``ESC[201~``)
 // and run whatever follows; the bridge strips the same characters.
-export function withoutControlCharacters(text: string): string {
+function withoutControlCharacters(text: string): string {
   let kept = "";
   for (const char of text) {
     if (!isDroppedControl(char.charCodeAt(0))) kept += char;

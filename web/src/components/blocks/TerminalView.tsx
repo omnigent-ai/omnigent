@@ -123,10 +123,10 @@ export function shellPasteRefusalMessage(reason: ShellPasteRefusal): {
         title: "Command not pasted",
         description: `This shell is attached read-only. ${copyHint}`,
       };
-    case "duplicated":
+    case "unsupported":
       return {
-        title: "Command may have been pasted twice",
-        description: "The shell answered late. Check the prompt before pressing Enter.",
+        title: "Command not pasted",
+        description: `This host's runner can't paste into a shell yet; update Omnigent there. ${copyHint}`,
       };
     case "late":
       return {

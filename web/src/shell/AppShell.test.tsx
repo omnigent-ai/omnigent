@@ -44,6 +44,7 @@ import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
+  hostOnline: true as boolean | null,
 }));
 const realUseSession = vi.hoisted(() => ({
   hook: null as unknown as typeof UseSessionModule.useSession,
@@ -57,7 +58,7 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   // replaced so tests can pin runner/host liveness directly.
   ...(await importOriginal<typeof RunnerHealthModule>()),
   useSessionRunnerOnline: () => runnerHealthState.runnerOnline,
-  useSessionHostOnline: () => true,
+  useSessionHostOnline: () => runnerHealthState.hostOnline,
 }));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
@@ -681,6 +682,7 @@ function withWindowOrigin(origin: string, run: () => void) {
 
 beforeEach(() => {
   runnerHealthState.runnerOnline = undefined;
+  runnerHealthState.hostOnline = true;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
   useTerminalsMock.mockReturnValue({
@@ -5951,9 +5953,13 @@ describe("AppShell open in shell", () => {
     );
   }
 
-  function renderOpenerProbe(permissionLevel: number, terminals = ["zsh"]) {
+  function renderOpenerProbe(
+    permissionLevel: number,
+    terminals = ["zsh"],
+    binding: { host_id?: string | null; created_at?: number } = {},
+  ) {
     mockConversations([
-      { id: "conv_sdk", permission_level: permissionLevel },
+      { id: "conv_sdk", permission_level: permissionLevel, ...binding },
       { id: "conv_other", permission_level: permissionLevel },
     ]);
     useSessionAgentMock.mockReturnValue({
@@ -6125,6 +6131,22 @@ describe("AppShell open in shell", () => {
 
   it("offers no opener when the agent declares no shells", () => {
     renderOpenerProbe(4, []);
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
+  });
+
+  it("offers no opener while the session's host is offline", () => {
+    runnerHealthState.hostOnline = false;
+    runnerHealthState.runnerOnline = false;
+    renderOpenerProbe(4, ["zsh"], { host_id: "host_laptop" });
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
+  });
+
+  it("offers no opener for a local session whose runner is gone", () => {
+    runnerHealthState.hostOnline = null;
+    runnerHealthState.runnerOnline = false;
+    renderOpenerProbe(4, ["zsh"], { host_id: null, created_at: 0 });
 
     expect(screen.getByText("no shell opener")).toBeInTheDocument();
   });

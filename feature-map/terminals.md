@@ -69,8 +69,9 @@ with their own terminal retain the switcher.
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
-- Hover a `bash`/`sh`/`zsh`/`shell`/`console` code block in an agent reply and
-  choose "Open in shell". On desktop the shell opens as a rail tab; on a phone
+- Hover a shell code block (`bash`, `sh`, `shell`, `shellscript`, `zsh`, `ksh`,
+  `fish`, `console`, `shellsession`) in any rendered chat message, usually an
+  agent reply, and choose "Open in shell". On desktop the shell opens as a rail tab; on a phone
   it opens in the full-screen terminal view. A `$ ` transcript offers only its
   prompt lines, and a `console` block without a `$ ` prompt offers nothing. The
   button is also hidden when output can't be told apart from a command:
@@ -130,7 +131,7 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_open_in_shell.py` (desktop and a 390 px phone
   viewport) checks the pasted command waits for Enter. The bridge's readiness
   and refusal paths are in `tests/terminals/test_control_bridge.py`; the
-  browser fallback for runners without paste support is in
+  browser's refusal for runners without paste support is in
   `web/src/components/blocks/TerminalSession.test.ts`.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
@@ -213,6 +214,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   only a command without a newline or tab goes to fish until tmux can confirm
   the mode. Only bash, zsh or fish in the foreground get the command, even when
   tmux reports bracketed paste on. With no prompt within 5 s it is refused, so it never
-  reaches a pager, an editor or a shell that is still starting.
+  reaches a pager, an editor or a shell that is still starting. A runner that
+  predates the paste frame never answers it; after 10 s the browser refuses
+  with a toast rather than typing the command.
 - Tests that need a harness-specific or opt-in environment skip quietly without
   it. Check that the test ran, not only that the suite passed.

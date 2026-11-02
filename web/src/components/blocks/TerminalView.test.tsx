@@ -292,7 +292,7 @@ describe("pending shell input", () => {
     ["unsafe", "Command not pasted", /couldn't take this command without running it/],
     ["not-ready", "Command not pasted", /didn't reach an empty prompt/],
     ["interrupted", "Command may not have been pasted", /Check the prompt before pressing Enter/],
-    ["duplicated", "Command may have been pasted twice", /Check the prompt before pressing Enter/],
+    ["unsupported", "Command not pasted", /update Omnigent there/],
     ["late", "Command pasted after all", /Check the prompt before pressing Enter/],
     ["failed", "Command not pasted", /couldn't paste this command/],
   ] as const)("explains a %s refusal", async (reason, title, description) => {

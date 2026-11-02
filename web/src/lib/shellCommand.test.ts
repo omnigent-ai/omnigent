@@ -108,6 +108,7 @@ describe("shellCommandFromCodeBlock", () => {
     ["a here-string", "$ cat <<<'x'\n> rm -rf build\n"],
     ["a pipeline", "$ printf 'one\\n' |\n> sed 's/one/two/'\ntwo\n"],
     ["a trailing &&", "$ make build &&\nmake test\n"],
+    ["a trailing |&", "$ make |&\ntee build.log\n"],
     ["a loop", '$ for f in a b; do\n> echo "$f"\n> done\na\nb\n'],
     ["an open quote", '$ git commit -m "first\n> second"\n[main 1a2b3c] first\n'],
     ["an unterminated quote", '$ echo "unterminated\n'],
