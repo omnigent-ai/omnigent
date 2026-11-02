@@ -12,6 +12,7 @@
 import { Fragment, useEffect, useState } from "react";
 
 import {
+  ADDRESS_BAR_KEYS,
   ALT_KEY,
   ARCHIVE_SESSION_KEYS,
   CLOSE_KEYS,
@@ -33,6 +34,7 @@ import {
   PIN_SESSION_KEYS,
   sessionNumberShortcutKeys,
   QUIT_KEYS,
+  RELOAD_KEYS,
   settingsShortcutKeys,
   SHIFT_KEY,
   SPLIT_TERMINAL_KEYS,
@@ -182,6 +184,12 @@ const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
   { label: "Quit Omnigent", keys: [...QUIT_KEYS] },
 ];
 
+// Desktop menu chords that act on the browser tab in the workspace rail.
+const DESKTOP_BROWSER_SHORTCUTS: Shortcut[] = [
+  { label: "Reload the browser tab", keys: [...RELOAD_KEYS] },
+  { label: "Focus the browser address bar", keys: [...ADDRESS_BAR_KEYS] },
+];
+
 // Numbered sidebar-session jump. The chord is platform-aware (see
 // useSessionNumberHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
 // Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
@@ -273,7 +281,8 @@ function shortcutGroupsFor(
               return { ...item, keys: [...NEW_BROWSER_TAB_KEYS], alternateKeys: item.keys };
             }
             return item;
-          }),
+          })
+          .concat(desktopCommands && browser ? DESKTOP_BROWSER_SHORTCUTS : []),
       };
     }
     if (group.title === "Panes") {

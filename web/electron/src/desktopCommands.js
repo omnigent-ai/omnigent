@@ -17,6 +17,8 @@ const DESKTOP_COMMANDS = Object.freeze([
   "fork-session",
   "go-back",
   "go-forward",
+  "reload",
+  "focus-address-bar",
 ]);
 
 /**

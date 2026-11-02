@@ -25,6 +25,12 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import {
+  ADDRESS_BAR_KEYS,
+  MOD_KEY,
+  RELOAD_KEYS,
+  shortcutText,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,10 +48,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
   getDesktopFeatures,
   navigationHostOptions,
   supportsBrowser,
+  supportsDesktopCommands,
   type BrowserHostOptions,
   type ChromeCookieImportResult,
   type ChromeCookiePreviewResult,
@@ -168,6 +176,8 @@ export function BrowserPane({
   active = true,
 }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const addressBarRef = useRef<HTMLInputElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
   // A detached view still exists; only `active` controls its attachment.
@@ -326,6 +336,32 @@ export function BrowserPane({
     const bridge = getBridge();
     void bridge?.browserReload?.(conversationId);
   }, [conversationId]);
+
+  // Desktop Reload (⌘R) from this toolbar reloads the page rather than the app;
+  // Focus Address Bar (⌘L) selects the address. (A focused page reloads itself in the shell.)
+  useDesktopCommand(
+    "reload",
+    active
+      ? () => {
+          if (!toolbarRef.current?.contains(document.activeElement)) return false;
+          handleReload();
+          return true;
+        }
+      : null,
+    { priority: 10 },
+  );
+  useDesktopCommand(
+    "focus-address-bar",
+    active
+      ? () => {
+          addressBarRef.current?.focus();
+          addressBarRef.current?.select();
+        }
+      : null,
+  );
+  // Chords in the toolbar's native titles; DOM tooltips here could sit under the page.
+  const chord = (label: string, keys: readonly string[]) =>
+    supportsDesktopCommands() ? `${label} (${shortcutText(keys)})` : label;
 
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
@@ -593,13 +629,16 @@ export function BrowserPane({
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
       data-browser-pane-conversation={conversationId}
     >
-      <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">
+      <div
+        ref={toolbarRef}
+        className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5"
+      >
         <button
           type="button"
           onClick={handleBack}
           disabled={!canGoBack}
           aria-label="Go back"
-          title="Back"
+          title={chord("Back", [MOD_KEY, "["])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronLeftIcon className="size-4" />
@@ -609,7 +648,7 @@ export function BrowserPane({
           onClick={handleForward}
           disabled={!canGoForward}
           aria-label="Go forward"
-          title="Forward"
+          title={chord("Forward", [MOD_KEY, "]"])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronRightIcon className="size-4" />
@@ -619,7 +658,7 @@ export function BrowserPane({
           onClick={handleReload}
           disabled={!hasView}
           aria-label="Reload"
-          title="Reload"
+          title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <RotateCwIcon className="size-4" />
@@ -630,8 +669,10 @@ export function BrowserPane({
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
+          ref={addressBarRef}
           placeholder="Enter a URL"
           aria-label="Address bar"
+          title={chord("Address bar", ADDRESS_BAR_KEYS)}
           onChange={(e) => setCurrentUrl(e.target.value)}
           onFocus={() => {
             urlEditingRef.current = true;
