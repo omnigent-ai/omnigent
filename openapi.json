@@ -6170,6 +6170,11 @@
             "title": "Sandbox Providers",
             "type": "array"
           },
+          "scheduled_task_harness_settings": {
+            "default": true,
+            "title": "Scheduled Task Harness Settings",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
