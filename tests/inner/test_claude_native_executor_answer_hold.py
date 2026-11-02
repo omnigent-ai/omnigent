@@ -77,8 +77,8 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
     return fake
 
 
-async def _run(tmp_path: Path) -> list[object]:
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+async def _run(tmp_path: Path, executor: ClaudeNativeExecutor | None = None) -> list[object]:
+    executor = executor or ClaudeNativeExecutor(tmp_path / "bridge")
     return [
         event
         async for event in executor.run_turn(
@@ -155,10 +155,16 @@ async def test_the_hold_ends_with_the_refusal_when_nobody_answers(
 
 
 @pytest.mark.asyncio
-async def test_stopping_a_held_turn_keeps_the_pane(
-    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("interruption", ["cancel", "clear_pending", "clear_answered"])
+async def test_interrupting_a_held_turn_keeps_the_pane_and_input(
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interruption: str
 ) -> None:
-    """Stop during the hold cancels the wait; it neither types nor reaps the pane."""
+    """Stopping or changing the conversation ends old work without touching the pane."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = bridge_dir / "bridge.json"
+    state.write_text('{"active_session_id": "session-original"}')
+    monkeypatch.setenv(claude_native_executor.REQUEST_SESSION_ID_ENV_VAR, "session-original")
     monkeypatch.setattr(claude_native_executor, "_ANSWER_POLL_S", 0.01, raising=False)
     pane.pending_polls = 10**6
     turn = asyncio.create_task(_run(tmp_path))
@@ -168,10 +174,79 @@ async def test_stopping_a_held_turn_keeps_the_pane(
         await asyncio.sleep(0.01)
     assert not turn.done(), "The turn must still be waiting for the answer."
 
-    turn.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await turn
+    try:
+        if interruption == "cancel":
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await turn
+        else:
+            state.write_text('{"active_session_id": "session-replacement"}')
+            if interruption == "clear_answered":
+                pane.pending_polls = 0
+            events = await asyncio.wait_for(turn, 1)
+            assert len(events) == 1 and isinstance(events[0], ExecutorError)
+            assert events[0].undelivered is True
+            assert "no longer active after /clear" in events[0].message
+    finally:
+        if not turn.done():
+            turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
 
     assert pane.kills == 0
     assert pane.deliveries == 1
     assert pane.delivered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["message", "steering", "model"])
+async def test_conversation_changes_while_input_waits_for_the_injection_lock(
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = bridge_dir / "bridge.json"
+    state.write_text('{"active_session_id": "session-original"}')
+    monkeypatch.setenv(claude_native_executor.REQUEST_SESSION_ID_ENV_VAR, "session-original")
+    executor = ClaudeNativeExecutor(bridge_dir)
+    monkeypatch.setattr(
+        executor, "_model_command_arg", lambda _model: "sonnet" if delivery == "model" else None
+    )
+    model_commands: list[str] = []
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_slash_command",
+        lambda _bridge, *, command, **_kwargs: model_commands.append(command),
+    )
+    checked = asyncio.Event()
+    original_check = claude_native_executor._session_is_active
+
+    def check(*args) -> bool:
+        result = original_check(*args)
+        checked.set()
+        return result
+
+    monkeypatch.setattr(claude_native_executor, "_session_is_active", check)
+    pane.refusals = []
+    async with executor._inject_lock:
+        task = asyncio.create_task(
+            executor.enqueue_session_message("main", "old steering")
+            if delivery == "steering"
+            else _run(tmp_path, executor)
+        )
+        await asyncio.wait_for(checked.wait(), 1)
+        assert not task.done()
+        state.write_text('{"active_session_id": "session-replacement"}')
+        context = bridge_dir / claude_native_executor.CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context.write_text("replacement context")
+    result = await asyncio.wait_for(task, 1)
+
+    if delivery == "steering":
+        assert result is False
+    else:
+        assert len(result) == 1 and isinstance(result[0], ExecutorError)
+        assert result[0].undelivered is True
+    assert pane.deliveries == 0
+    assert pane.delivered == []
+    assert model_commands == []
+    assert context.read_text() == "replacement context"
+    assert pane.kills == 0

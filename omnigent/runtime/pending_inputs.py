@@ -619,7 +619,12 @@ def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
     return replace(entry, cause_class="unknown", reason_code=reason_code)
 
 
-def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
+def resolve(
+    conversation_id: str,
+    pending_id: str,
+    *,
+    delivery_attempt_id: str | None = None,
+) -> DrainedInput | None:
     """
     Drop a pending entry by id and return it.
 
@@ -632,12 +637,18 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         ``"conv_abc123"``.
     :param pending_id: The id returned by :func:`record`, e.g.
         ``"pending_a1b2c3"``.
+    :param delivery_attempt_id: When supplied, only drain this attempt; a late
+        failure must not consume a newer retry with the same pending id.
     :returns: The dropped entry, or ``None`` when no entry had that id.
     """
     with _lock:
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
+        if delivery_attempt_id is not None:
+            entry = entries.get(pending_id)
+            if entry is None or entry.delivery_attempt_id != delivery_attempt_id:
+                return None
         entry = entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)

@@ -955,12 +955,18 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
 
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
     """
-    Persist shared native Antigravity state atomically.
+    Persist shared native Antigravity state while excluding cleanup.
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param state: State payload to persist.
     :returns: None.
     """
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        _write_bridge_state_unlocked(bridge_dir, state)
+
+
+def _write_bridge_state_unlocked(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
+    """Publish state while the caller holds the stable directory lock."""
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = bridge_dir / _STATE_FILE
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
@@ -999,9 +1005,10 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: None.
     """
-    for runtime_file in (_STATE_FILE, _TMUX_FILE):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / runtime_file).unlink()
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        for runtime_file in (_STATE_FILE, _TMUX_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / runtime_file).unlink()
 
 
 def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
@@ -1072,23 +1079,24 @@ def update_conversation_id(
     :returns: ``True`` when the new id was written, ``False`` when there was no
         existing state to update (the id was dropped; a WARNING was logged).
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        _logger.warning(
-            "Antigravity bridge: no existing state at %s to update; dropping "
-            "conversation_id=%s (the reader will stay on the placeholder id)",
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            _logger.warning(
+                "Antigravity bridge: no existing state at %s to update; dropping "
+                "conversation_id=%s (the reader will stay on the placeholder id)",
+                bridge_dir,
+                conversation_id,
+            )
+            return False
+        _write_bridge_state_unlocked(
             bridge_dir,
-            conversation_id,
+            AntigravityNativeBridgeState(
+                session_id=state.session_id,
+                conversation_id=conversation_id,
+                active_turn_id=active_turn_id,
+            ),
         )
-        return False
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=conversation_id,
-            active_turn_id=active_turn_id,
-        ),
-    )
     return True
 
 
