@@ -449,7 +449,9 @@ def _redact_log_tail(tail: str) -> str:
     return redact_log_text(tail, include_whitespace_credentials=True)
 
 
-def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
+def _runner_exit_error(
+    exit_code: int | None, log_path: Path, *, parent_exit_cause: str | None = None
+) -> str:
     """Compose the human-readable error for a runner that died.
 
     Carries the actual cause to the user: exit code, the host-side log
@@ -463,6 +465,8 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     :param exit_code: The runner process's exit code, e.g. ``1``.
         ``None`` when unknown.
     :param log_path: The runner's captured stdout/stderr log file.
+    :param parent_exit_cause: How the runner's zygote parent exited when the
+        runner was lost with it, e.g. ``"... was killed by SIGHUP."``.
     :returns: A multi-line error message ready to surface verbatim in
         a CLI error or API ``error`` field.
     """
@@ -470,6 +474,8 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     if exit_code is not None:
         message += f" with code {exit_code}"
     message += f" (log on host: {display_log_path(log_path)})"
+    if parent_exit_cause:
+        message += f"\n{parent_exit_cause}"
     tail = _read_log_tail(log_path)
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
@@ -2650,7 +2656,11 @@ class HostProcess:
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
             return
-        error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+        error = _runner_exit_error(
+            handle.proc.returncode,
+            handle.log_path,
+            parent_exit_cause=getattr(handle.proc, "parent_exit_cause", None),
+        )
         # A credential refusal before connecting needs renewed sign-in.
         # Other exits remain runner faults; the log tail carries the cause.
         auth_rejected = (
