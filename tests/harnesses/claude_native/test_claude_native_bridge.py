@@ -4249,22 +4249,44 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+@pytest.mark.parametrize(
+    ("user_args", "expected_prompt_args"),
+    [
+        ((), ["--append-system-prompt", "Keep framework metadata separate."]),
+        (
+            ("--append-system-prompt", "--- Reviewer profile ---"),
+            [
+                "--append-system-prompt",
+                "--- Reviewer profile ---\n\nKeep framework metadata separate.",
+            ],
+        ),
+        (
+            ("--append-system-prompt=Review carefully.",),
+            ["--append-system-prompt=Review carefully.\n\nKeep framework metadata separate."],
+        ),
+    ],
+    ids=["no-user-prompt", "user-prompt-separate-value", "user-prompt-joined-value"],
+)
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
+    user_args: tuple[str, ...],
+    expected_prompt_args: list[str],
 ) -> None:
-    """Claude native appends framework instructions supplied by its launcher."""
-    framework_instruction = "Keep framework metadata separate."
-
+    """Launcher instructions follow the user's prompt in Claude's one effective flag."""
     args = augment_claude_args(
-        (),
+        user_args,
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt=framework_instruction,
+        append_system_prompt="Keep framework metadata separate.",
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    prompt_args = [
+        arg
+        for index, arg in enumerate(args)
+        if arg.startswith("--append-system-prompt")
+        or (index > 0 and args[index - 1] == "--append-system-prompt")
+    ]
+    assert prompt_args == expected_prompt_args
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:

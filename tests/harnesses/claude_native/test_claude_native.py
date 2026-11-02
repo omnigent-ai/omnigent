@@ -261,15 +261,22 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
-        ("--resume", "s"),
+        ("--resume", "s", "--append-system-prompt", "Review like a staff engineer."),
         command="claude",
         bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        append_system_prompt="Claude Code is running in the session terminal.",
     )
     spec = body["spec"]
     assert spec["command"] == "isaac"
     # Claude's argv is now passed through isaac after the ``--`` separator.
     assert spec["args"][0] == "--"
     assert spec["args"][1:3] == ["--resume", "s"]
+    # Claude keeps only the last prompt flag, so both prompts must share one.
+    assert spec["args"].count("--append-system-prompt") == 1
+    assert spec["args"][3:5] == [
+        "--append-system-prompt",
+        "Review like a staff engineer.\n\nClaude Code is running in the session terminal.",
+    ]
     # The bridge MCP + hook injection still rides along.
     assert "--mcp-config" in spec["args"]
     assert "--settings" in spec["args"]

@@ -2836,7 +2836,8 @@ def augment_claude_args(
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+        Code's native ``--append-system-prompt`` flag, merged after a
+        caller-supplied value instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2879,8 +2880,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+    args = _merge_append_system_prompt(args, append_system_prompt)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -2965,6 +2965,41 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
         return args
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
+    return args
+
+
+def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+    """Append ``extra`` to the caller's ``--append-system-prompt`` value.
+
+    Claude Code keeps only the last ``--append-system-prompt``, so adding a
+    second flag would silently drop the caller's prompt.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
+    :returns: ``args`` with a single effective prompt flag carrying both values.
+    """
+    if not extra:
+        return args
+    flag = "--append-system-prompt"
+    joined_prefix = f"{flag}="
+    effective: tuple[int, bool] | None = None
+    idx = 0
+    while idx < len(args):
+        if args[idx] == flag and idx + 1 < len(args):
+            # Claude takes the next token as the value even when it starts with a dash.
+            effective = (idx + 1, False)
+            idx += 2
+            continue
+        if args[idx].startswith(joined_prefix):
+            effective = (idx, True)
+        idx += 1
+    if effective is None:
+        args.extend([flag, extra])
+        return args
+    value_idx, joined = effective
+    existing = args[value_idx][len(joined_prefix) :] if joined else args[value_idx]
+    merged = f"{existing}\n\n{extra}" if existing else extra
+    args[value_idx] = f"{joined_prefix}{merged}" if joined else merged
     return args
 
 
