@@ -591,6 +591,23 @@ describe("useIdleNotifications badge (native shell)", () => {
     expect(setBadgeMock).toHaveBeenLastCalledWith(0);
   });
 
+  it("drops a session from the badge when a list refresh carries a newer read from another device", () => {
+    // Baseline from the list seed (t=50), activity at t=100: unread here.
+    seedReadState([{ id: "a", viewer_last_seen: 50 }]);
+    setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
+    renderHook(() => useIdleNotifications());
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
+
+    // The user read 'a' on another device; the next list refresh carries the
+    // server's raised viewer_last_seen, which AppShell seeds into the mirror.
+    // The badge must follow from that write alone, without a new data tick.
+    act(() => seedReadState([{ id: "a", viewer_last_seen: 200, viewer_unread: false }]));
+    expect(setBadgeMock).toHaveBeenLastCalledWith(0);
+  });
+
   it("suppresses the actively-viewed session while the window is focused", () => {
     setWindowFocused(true);
     // 'a' is unseen by the baseline, but the user is looking right at it.
