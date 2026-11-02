@@ -38,15 +38,19 @@ import json
 import logging
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import anyio
 import httpx
+from anyio.from_thread import start_blocking_portal
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.inner import _proc
 
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
@@ -54,6 +58,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _TIMEOUT_S = 15.0
+_WORKER_CLEANUP_S = 1.0
 
 # The profile our host section is written under. Distinct from any ambient
 # profile so merging never clobbers an operator's existing sections.
@@ -84,29 +89,86 @@ def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
     single attempt the harness's helper timeout was sized for.
     """
     deadline = time.monotonic() + _TIMEOUT_S
-    for attempt in range(len(_RETRY_BACKOFF_S) + 1):
-        if attempt:
-            pause = _RETRY_BACKOFF_S[attempt - 1]
-            if time.monotonic() + pause >= deadline:
-                return None
-            time.sleep(pause)
-        try:
-            resp = httpx.get(
-                _credential_url(server, host_id),
-                headers={MANAGED_HOST_TOKEN_HEADER: host_token},
-                timeout=max(deadline - time.monotonic(), 0.1),
-            )
-        except httpx.TransportError:
-            continue
-        except httpx.HTTPError:
+    cleanup_s = min(_WORKER_CLEANUP_S, _TIMEOUT_S / 5)
+    process = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-P", "-m", "omnigent.host.databricks_credential", "fetch"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            **_proc.spawn_kwargs(),
+        )
+        _proc.remember_process_group(process)
+        # Credentials travel only through private pipes, never argv or logs.
+        payload = json.dumps([server, host_id, host_token, deadline - cleanup_s])
+        output, _ = process.communicate(
+            payload, timeout=max(0, deadline - cleanup_s - time.monotonic())
+        )
+        if process.returncode != 0:
             return None
-        if resp.status_code == 429 or resp.status_code >= 500:
-            continue
-        if resp.status_code != 200:
-            return None
+        result = json.loads(output)
+        return result if isinstance(result, dict) else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        if process is not None:
+            # System DNS cannot be cancelled inside a thread; own its process instead.
+            _proc.kill_tree(process)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    stream.close()
+
+
+def _fetch_in_worker(
+    server: str, host_id: str, host_token: str, deadline: float | None = None
+) -> dict | None:
+    """Run HTTP and retry policy inside the caller-owned killable process."""
+    if deadline is None:
+        deadline = time.monotonic() + _TIMEOUT_S
+    with start_blocking_portal() as portal:
+        return portal.call(_fetch_before_deadline, server, host_id, host_token, deadline)
+
+
+async def _fetch_before_deadline(
+    server: str, host_id: str, host_token: str, deadline: float
+) -> dict | None:
+    """Cancel request I/O at the shared deadline and close it before returning."""
+    async with httpx.AsyncClient() as client:
         try:
-            return resp.json()
-        except ValueError:
+            # HTTPX timeouts bound inactivity; a total scope also bounds a slow body.
+            with anyio.fail_after(max(deadline - time.monotonic(), 0)):
+                for attempt in range(len(_RETRY_BACKOFF_S) + 1):
+                    if attempt:
+                        pause = _RETRY_BACKOFF_S[attempt - 1]
+                        if time.monotonic() + pause >= deadline:
+                            return None
+                        await anyio.sleep(pause)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    try:
+                        resp = await client.get(
+                            _credential_url(server, host_id),
+                            headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+                            timeout=remaining,
+                        )
+                    except httpx.TransportError:
+                        continue
+                    except httpx.HTTPError:
+                        return None
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        continue
+                    if resp.status_code != 200:
+                        return None
+                    try:
+                        return resp.json()
+                    except ValueError:
+                        return None
+        except TimeoutError:
             return None
     return None
 
@@ -344,6 +406,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace")
     parser.add_argument("operation", nargs="?", default="token")
     args, _ = parser.parse_known_args(argv)
+    if args.operation == "fetch":
+        try:
+            server, host_id, host_token, deadline = json.load(sys.stdin)
+            result = _fetch_in_worker(server, host_id, host_token, deadline)
+        except (OSError, TypeError, ValueError):
+            result = None
+        sys.stdout.write(json.dumps(result))
+        return 0
     if args.operation != "token":
         return 0
     coords = _read_sidecar(Path(args.coords) if args.coords else _sidecar_path())
