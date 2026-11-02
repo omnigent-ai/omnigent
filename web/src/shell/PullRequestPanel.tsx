@@ -36,7 +36,7 @@ import {
   type ReviewThread,
 } from "@/lib/pullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -1500,6 +1500,14 @@ function PullRequestListRow({
   );
 }
 
+interface PullRequestPanelView {
+  selected?: string;
+  showingDetails: boolean;
+  subtab: PullRequestSubtab;
+}
+
+const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1510,30 +1518,52 @@ export function PullRequestPanel({
 }) {
   const mobileHeaderTarget = useMobilePanelHeaderTarget();
   const inMobileDrawer = mobileHeaderTarget !== undefined;
-  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [detailsSession, setDetailsSession] = useState<string>();
-  const showingDetails = detailsSession === conversationId;
+  const queryClient = useQueryClient();
+  const viewKey = ["pull-request-panel-view", conversationId];
+  const { data: cachedView = DEFAULT_PANEL_VIEW } = useQuery<PullRequestPanelView>({
+    queryKey: viewKey,
+    queryFn: skipToken,
+    initialData: DEFAULT_PANEL_VIEW,
+    gcTime: 30 * 60_000,
+  });
+  // Keep interactions synchronous; the shared entry restores the view on navigation.
+  const [localView, setLocalView] = useState({ conversationId, view: cachedView });
+  if (localView.conversationId !== conversationId) {
+    setLocalView({ conversationId, view: cachedView });
+  }
+  const view = localView.conversationId === conversationId ? localView.view : cachedView;
+  const selected = view.selected;
+  const showingDetails = view.showingDetails;
+  const activeTab = view.subtab;
+  const updateView = useCallback(
+    (update: Partial<typeof view>) => {
+      const next = queryClient.setQueryData<typeof view>(
+        ["pull-request-panel-view", conversationId],
+        (current) => ({
+          showingDetails: false,
+          subtab: "summary",
+          ...current,
+          ...update,
+        }),
+      );
+      setLocalView({ conversationId, view: next! });
+    },
+    [queryClient, conversationId],
+  );
+  const changeSelection = useCallback(
+    (next?: string) => updateView({ selected: next, subtab: "summary" }),
+    [updateView],
+  );
+  const setActiveTab = (value: PullRequestSubtab) => updateView({ subtab: value });
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const [subtab, setSubtab] = useState<{
-    sessionId: string;
-    prUrl?: string;
-    value: PullRequestSubtab;
-  }>();
-  const activeTab =
-    subtab?.sessionId === conversationId && subtab.prUrl === selected ? subtab.value : "summary";
-  const setActiveTab = (value: PullRequestSubtab) =>
-    setSubtab({ sessionId: conversationId, prUrl: selected, value });
   const info = usePullRequestInfo(conversationId, {
     poll: active ? (selected && !showingDetails ? "list" : true) : false,
     prUrl: selected,
   });
   const showPullRequestList = () => {
-    setDetailsSession(undefined);
-    setActiveTab("summary");
+    updateView({ showingDetails: false, subtab: "summary" });
   };
-  const queryClient = useQueryClient();
   // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
   const wasActive = useRef(active);
   useEffect(() => {
@@ -1624,13 +1654,15 @@ export function PullRequestPanel({
   const unlink = useUnlinkSessionPr(conversationId);
   useEffect(() => {
     if (linked !== undefined && selected && !linked.some((pr) => pr.url === selected)) {
-      setSelection({ sessionId: conversationId, url: associations?.selected_pr_url });
+      changeSelection(associations?.selected_pr_url);
     } else if (!selected && associations?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: associations.selected_pr_url });
+      changeSelection(associations.selected_pr_url);
     }
-  }, [conversationId, selected, associations?.selected_pr_url, linked]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  }, [selected, associations?.selected_pr_url, linked, changeSelection]);
   const prs = associations?.prs ?? [];
+  useEffect(() => {
+    if (prs.length === 1) updateView({ showingDetails: true });
+  }, [updateView, prs.length]);
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const detailsInfo =
     linked?.length === 0 && info.data
@@ -1758,7 +1790,7 @@ export function PullRequestPanel({
       {mobileHeaderTarget?.actions && createPortal(headerActions, mobileHeaderTarget.actions)}
       {mobileHeaderTarget?.title &&
         showingDetails &&
-        prs.length > 0 &&
+        prs.length > 1 &&
         createPortal(
           <div data-mobile-panel-title>
             <Button
@@ -1776,9 +1808,9 @@ export function PullRequestPanel({
       {showTrackingControls ? (
         !inMobileDrawer && (
           <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails || prs.length <= 1} />}
             <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-              {prs.length > 0 && showingDetails && (
+              {prs.length > 1 && showingDetails && (
                 <Button variant="ghost" size="sm" onClick={showPullRequestList}>
                   <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
                 </Button>
@@ -1814,7 +1846,7 @@ export function PullRequestPanel({
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
-        {prs.length > 0 && !showingDetails ? (
+        {prs.length > 1 && !showingDetails ? (
           <ul aria-label="Pull requests" className="h-full overflow-y-auto">
             {prs.map((pr) => (
               <PullRequestListRow
@@ -1832,8 +1864,7 @@ export function PullRequestPanel({
                 unlinkPending={unlink.isPending}
                 onUnlink={associations?.tracking_available ? () => unlinkPr(pr.url) : undefined}
                 onSelect={() => {
-                  changeSelection(pr.url);
-                  setDetailsSession(conversationId);
+                  updateView({ selected: pr.url, showingDetails: true, subtab: "summary" });
                 }}
               />
             ))}
