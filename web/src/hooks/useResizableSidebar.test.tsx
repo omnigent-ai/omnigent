@@ -72,16 +72,16 @@ describe("useResizableSidebar", () => {
     expect(readPanelSizePreference("sidebarWidthPx")).toBe(320);
   });
 
-  it("clamps between 220px and half the viewport", () => {
+  it("clamps between 250px and half the viewport", () => {
     const { result } = renderHook(() => useResizableSidebar());
 
     // Drag far past the right edge — capped at half of the 2000px viewport.
     dragTo(result, 1500);
     expect(result.current.width).toBe(1000);
 
-    // Drag below the floor — held at 220, not 50.
+    // Drag below the floor — held at 250, not 50.
     dragTo(result, 50);
-    expect(result.current.width).toBe(220);
+    expect(result.current.width).toBe(250);
   });
 
   it("persists a drag and restores it after a store reset (reload)", () => {
