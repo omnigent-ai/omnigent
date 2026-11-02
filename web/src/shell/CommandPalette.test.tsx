@@ -12,12 +12,14 @@ vi.mock("@/lib/routing", () => ({
 const useConversations = vi.fn();
 const useSessionSearch = vi.fn();
 const serverInfo = vi.fn();
+const createProject = vi.fn();
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => serverInfo(),
 }));
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
+  useCreateProject: () => ({ mutate: createProject, isPending: false, isError: false }),
 }));
 
 function conv(
@@ -78,6 +80,7 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
 
 beforeEach(() => {
   navigate.mockClear();
+  createProject.mockReset();
   useConversations.mockReset();
   useSessionSearch.mockReset();
   serverInfo.mockReturnValue({ session_search_scope: true });
@@ -855,6 +858,61 @@ describe("CommandPalette — actions", () => {
 
     expect(screen.getByText("Go to Settings")).toBeTruthy();
     expect(screen.queryByText("New chat")).toBeNull();
+  });
+});
+
+describe("CommandPalette — new project", () => {
+  function typeAndSettle(value: string) {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+  }
+
+  it("closes the palette and opens the empty create-project modal", () => {
+    const { onOpenChange } = renderPalette();
+
+    fireEvent.click(screen.getByText("New project"));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(screen.getByRole("dialog", { name: "New project" })).toBeTruthy();
+    expect(screen.getByPlaceholderText("Project name…")).toHaveProperty("value", "");
+  });
+
+  it("offers to create a project named after a query that matches no session", () => {
+    vi.useFakeTimers();
+    try {
+      renderPalette();
+      typeAndSettle("  Billing revamp ");
+
+      fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+
+      const nameInput = screen.getByPlaceholderText("Project name…");
+      expect(nameInput).toHaveProperty("value", "Billing revamp");
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      expect(createProject).toHaveBeenCalledWith(
+        { name: "Billing revamp", icon: undefined },
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not offer a named project while sessions match or the search is pending", () => {
+    vi.useFakeTimers();
+    try {
+      setSearchGroups({ title: searchPages([conv("c1", "Billing revamp")]) });
+      renderPalette();
+      typeAndSettle("Billing");
+      expect(screen.queryByText(/New project “/)).toBeNull();
+
+      setSearchGroups({ title: { isFetching: true } });
+      typeAndSettle("Payroll");
+      expect(screen.queryByText(/New project “/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

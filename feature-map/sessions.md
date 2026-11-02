@@ -61,6 +61,10 @@ the header menu), and each place is a separate entry point.
   in the sidebar.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+- `project-create`: New project opens the create-project dialog from the
+  Projects header's + button or the command palette's **New project** action.
+  A palette query that matches no session also offers **New project "<query>"**,
+  which opens the dialog with that name filled in.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
 - `project-show-more`: an expanded project folder lists its five newest
@@ -611,6 +615,11 @@ plain `uv run pytest`, which starts a private server for the test.
   regroup under that project.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
+- **`project-create`, command palette:**
+  `web/src/shell/CommandPalette.test.tsx` (`CommandPalette — new project`).
+  By hand: ⌘K / Ctrl+K, choose New project, create one, and expect it in the
+  sidebar's Projects; then type an unused name and press Enter on
+  New project "<name>" to find the dialog prefilled.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
