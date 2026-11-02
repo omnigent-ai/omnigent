@@ -80,7 +80,7 @@ def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> 
     engine = _crdb_engine(db_uri)
     version = _crdb_server_version(engine)
     head = _get_head_db_revision(db_uri)
-    index_name = "ix_agents_created_at"
+    index_name = "ix_agents_name"
     with engine.connect() as connection:
         _prepare_crdb_schema_transaction(connection, version)
         connection.execute(
