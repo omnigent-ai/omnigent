@@ -29,6 +29,9 @@ also enqueues a row write here. Writes are:
   replica.
 - **deduplicated** — re-publishing an unchanged status / count is a
   no-op, so chatty relays don't turn into row churn.
+- **coalesced** — periodic runner-liveness refreshes from every tunnel's
+  ping loop are batched into one ``UPDATE`` per workspace per
+  :data:`LIVENESS_REFRESH_WINDOW_S` (see :func:`refresh_runner_liveness`).
 
 No-op until :func:`configure` wires a store (the server app does this at
 startup); the runner process and unit tests that never configure it are
@@ -39,10 +42,12 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 
@@ -78,6 +83,22 @@ _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
 _last_liveness_stamp: dict[str, int] = {}
 
+# How long ping-loop refreshes accumulate before one batched write. A stamp
+# lands at most this late and up to this much older than its ping, so the
+# worst-case age a reader sees is ``PING_INTERVAL_S + 2 * window`` (40s),
+# well inside ``RUNNER_LIVENESS_TTL_S`` (90s).
+LIVENESS_REFRESH_WINDOW_S = 5.0
+# Guards the open refresh window. Its flush submits to the ordered worker
+# while holding this lock, as do the clears and immediate touches that
+# withdraw a runner from it, so their writes apply in decision order.
+_refresh_lock = threading.Lock()
+# Stamp shared by every refresh in the open window; ``None`` = no window.
+_refresh_stamp: int | None = None
+# Runner ids awaiting the open window's flush, grouped by workspace.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by workspace id itself
+_refresh_pending: dict[int, set[str]] = {}
+_refresh_timer: threading.Timer | None = None
+
 
 def configure(
     store: ConversationStore | None,
@@ -92,12 +113,18 @@ def configure(
         the event-driven run-completion hook
         (:func:`persist_scheduled_run_completion`); ``None`` disables it.
     """
-    global _store, _scheduled_task_store
+    global _store, _scheduled_task_store, _refresh_stamp, _refresh_timer
     _store = store
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
     _last_liveness_stamp.clear()
+    with _refresh_lock:
+        if _refresh_timer is not None:
+            _refresh_timer.cancel()
+        _refresh_timer = None
+        _refresh_stamp = None
+        _refresh_pending.clear()
 
 
 def conversation_store() -> ConversationStore | None:
@@ -292,14 +319,12 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     """
     Stamp ``runner_last_seen`` (now) for sessions bound to live runners.
 
-    Called on the tunnel-holding replica: once on runner-tunnel connect,
-    then every ping interval from that tunnel's own ping loop
-    (``runner_tunnel._ping_loop``). Re-stamping from the per-connection
-    ping loop — rather than a central lifespan sweep over the whole
-    registry — keeps the write inside the tunnel handler's
-    ``workspace_scope``, so the row's ``workspace_id`` filter resolves to
-    the owning workspace on a multi-tenant replica. It mirrors how the
-    host tunnel refreshes ``host_store.heartbeat`` from its ping loop.
+    Called on the tunnel-holding replica when other replicas must see the
+    stamp at once: on runner-tunnel connect, and on a disconnect the runner
+    survives (server shutdown or handoff). The tunnel's ping loop re-stamps
+    through the batched :func:`refresh_runner_liveness` instead. The write
+    runs in the caller's ``workspace_scope``, so the row's ``workspace_id``
+    filter resolves to the owning workspace on a multi-tenant replica.
 
     Also records the stamp in :func:`last_liveness_stamp`, so a later
     disconnect on this same replica can tell its own writes apart from a
@@ -310,9 +335,89 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     if _store is None or not runner_ids:
         return
     now = int(time.time())
-    for runner_id in runner_ids:
-        _last_liveness_stamp[runner_id] = now
-    submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+    with _refresh_lock:
+        # This stamp is newer than the open window's; a later flush must
+        # not roll the row back to the window's older value.
+        _withdraw_pending_refresh(runner_ids)
+        for runner_id in runner_ids:
+            _last_liveness_stamp[runner_id] = now
+        submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+def refresh_runner_liveness(runner_id: str) -> None:
+    """
+    Re-stamp a live runner's ``runner_last_seen`` from its ping loop.
+
+    The periodic counterpart of :func:`touch_runner_liveness`. Every
+    tunnel pings on its own phase, so stamping each one separately costs
+    one ``UPDATE`` per runner per ping interval. Instead the runner joins
+    the open refresh window, whose single stamp (the window's start) is
+    written for all its runners in one ``UPDATE`` per workspace when the
+    window closes, :data:`LIVENESS_REFRESH_WINDOW_S` later. The stamp is
+    recorded for :func:`last_liveness_stamp` now, exactly as the row will
+    hold it. The workspace is captured from the caller's
+    ``workspace_scope`` (the tunnel handler's), as :func:`submit` does.
+
+    :param runner_id: Runner id with a live tunnel.
+    """
+    global _refresh_stamp, _refresh_timer
+    if _store is None:
+        return
+    with _refresh_lock:
+        if _refresh_stamp is None:
+            _refresh_stamp = int(time.time())
+            _refresh_timer = threading.Timer(LIVENESS_REFRESH_WINDOW_S, flush_runner_liveness)
+            _refresh_timer.daemon = True
+            _refresh_timer.start()
+        own_stamp = _last_liveness_stamp.get(runner_id)
+        if own_stamp is not None and own_stamp >= _refresh_stamp:
+            # Already in this window, or stamped immediately since it opened.
+            return
+        _last_liveness_stamp[runner_id] = _refresh_stamp
+        _refresh_pending.setdefault(current_workspace_id(), set()).add(runner_id)
+
+
+def flush_runner_liveness() -> None:
+    """
+    Close the open refresh window and enqueue its batched writes.
+
+    Runs from the window's timer; tests call it directly. A no-op when
+    no window is open.
+    """
+    global _refresh_stamp, _refresh_timer
+    with _refresh_lock:
+        store, stamp = _store, _refresh_stamp
+        pending = dict(_refresh_pending)
+        _refresh_pending.clear()
+        _refresh_stamp = None
+        _refresh_timer = None
+        if store is None or stamp is None:
+            return
+        for workspace_id, runner_ids in pending.items():
+            if runner_ids:
+                submit(
+                    "runner_liveness_refresh",
+                    _touch_in_workspace,
+                    store,
+                    workspace_id,
+                    sorted(runner_ids),
+                    stamp,
+                )
+
+
+def _touch_in_workspace(
+    store: ConversationStore, workspace_id: int, runner_ids: list[str], stamp: int
+) -> None:
+    """Stamp *runner_ids* under *workspace_id*; the timer thread has no scope of its own."""
+    with workspace_scope(workspace_id):
+        store.touch_runner_liveness(runner_ids, stamp)
+
+
+def _withdraw_pending_refresh(runner_ids: list[str]) -> None:
+    """Drop *runner_ids* from the open refresh window. Caller holds ``_refresh_lock``."""
+    runner_set = set(runner_ids)
+    for pending in _refresh_pending.values():
+        pending -= runner_set
 
 
 def last_liveness_stamp(runner_id: str) -> int | None:
@@ -346,9 +451,13 @@ def clear_runner_liveness(runner_id: str) -> None:
     """
     if _store is None:
         return
-    submit(
-        "runner_liveness_clear",
-        _store.clear_runner_liveness,
-        runner_id,
-        last_liveness_stamp(runner_id),
-    )
+    with _refresh_lock:
+        # A refresh still waiting in the open window would re-stamp the
+        # runner after this clear and resurrect it.
+        _withdraw_pending_refresh([runner_id])
+        submit(
+            "runner_liveness_clear",
+            _store.clear_runner_liveness,
+            runner_id,
+            last_liveness_stamp(runner_id),
+        )
