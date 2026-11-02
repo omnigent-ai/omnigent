@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -95,6 +95,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.creation_logging import record_creation_failure
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
     Feature,
@@ -2626,6 +2627,7 @@ def create_app(
         client_audit = request_client_audit_attributes(request.headers)
         add_audit_attrs(**client_audit)
         if operation == "create_session":
+            add_audit_attrs(creation_phase="request_validation")
             _logger.info(
                 "Session creation requested",
                 extra=debug_event("session_creation_started", operation="create"),
@@ -2656,6 +2658,7 @@ def create_app(
         except RuntimeError as exc:
             if str(exc) != _NO_RESPONSE_RETURNED:
                 failed = True
+                record_creation_failure(exc)
                 raise
             # The downstream app was cancelled mid-flight (client disconnect /
             # request teardown) before sending anything: BaseHTTPMiddleware
@@ -2664,6 +2667,7 @@ def create_app(
             # a server fault — book a benign 499 instead of letting the
             # catch-all log it as an unhandled UNKNOWN 500.
             status_code = _HTTP_CLIENT_CLOSED_REQUEST
+            record_creation_failure(exc)
             _logger.info(
                 "Request cancelled before a response was sent "
                 "(client disconnect / request teardown): %s %s",
@@ -2674,8 +2678,12 @@ def create_app(
                 status_code=_HTTP_CLIENT_CLOSED_REQUEST,
                 headers={"X-Request-Id": request_id},
             )
-        except Exception:
+        except Exception as exc:
             failed = True
+            record_creation_failure(exc)
+            raise
+        except BaseException as exc:
+            record_creation_failure(exc)
             raise
         finally:
             request_failed = failed or (status_code is not None and status_code >= 500)
@@ -2712,6 +2720,15 @@ def create_app(
                         create_persistence_ms=_bag.get("create_persistence_ms"),
                         create_identity_ms=_bag.get("create_identity_ms"),
                         create_acl_ms=_bag.get("create_acl_ms"),
+                        creation_phase=_bag.get("creation_phase"),
+                        failure_phase=_bag.get("creation_failure_phase"),
+                        failure_site=_bag.get("creation_failure_site"),
+                        exception_type=_bag.get("creation_exception_type"),
+                        cause_type=_bag.get("creation_cause_type"),
+                        validation_fields=_bag.get("creation_validation_fields"),
+                        validation_types=_bag.get("creation_validation_types"),
+                        validation_count=_bag.get("creation_validation_count"),
+                        session_persisted=bool(_bag.get("session_id")),
                         stage="create_request",
                         status_code=status_code,
                         error_code=(
@@ -2794,6 +2811,7 @@ def create_app(
             error_impact=exc.impact.value,
             error_phase=exc.phase.value,
         )
+        record_creation_failure(exc)
         if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
             # A session state, not a fault: the user's machine is asleep or
             # the host disconnected, and clients render it as a reconnect
@@ -2847,6 +2865,17 @@ def create_app(
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _handle_http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        """Retain creation failures while preserving FastAPI's HTTP error response."""
+        validation_errors = (
+            [error for error in exc.detail if isinstance(error, dict)]
+            if exc.status_code == 422 and isinstance(exc.detail, list)
+            else []
+        )
+        record_creation_failure(exc, validation_errors=validation_errors)
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
         request: Request,
@@ -2870,6 +2899,7 @@ def create_app(
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
         )
+        record_creation_failure(exc, validation_errors=exc.errors())
         return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(ConversationNotFoundError)
@@ -2898,6 +2928,7 @@ def create_app(
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
         )
+        record_creation_failure(exc)
         # Keep a trace: usually a caller referencing a deleted row, but this
         # branch would otherwise mask a server-side id-threading defect. The
         # audit extra carries the operation and session id, so a 404 that is
@@ -2937,6 +2968,7 @@ def create_app(
         :param exc: The SQLAlchemy statement error.
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
+        record_creation_failure(exc)
         if isinstance(exc.orig, InvalidUuidError):
             # A malformed id is caller-side input (a value no row can ever
             # address), not a human referencing a real-but-gone one.
