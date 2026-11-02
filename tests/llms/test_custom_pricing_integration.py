@@ -98,8 +98,14 @@ def test_parse_family_pricing_missing_fields():
         _parse_family("provider", "openai", raw)
 
 
-def test_fetch_pricing_with_custom_provider():
+def test_fetch_pricing_with_custom_provider(monkeypatch: pytest.MonkeyPatch):
     """Test that custom provider pricing takes precedence over catalog."""
+    from omnigent.llms.context_window import ModelPricing
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda _: ModelPricing(2e-6, 10e-6, long_context=((272_000, ModelPricing(4e-6, 15e-6)),)),
+    )
     # Create a mock provider config
     provider_config = {
         "providers": {
@@ -120,13 +126,21 @@ def test_fetch_pricing_with_custom_provider():
 
     # Fetch pricing for a codex harness (uses openai family)
     pricing = fetch_model_pricing_with_provider(
-        model="llama3.2:latest", provider_config=provider_config, harness="codex"
+        model="gpt-6-sol", provider_config=provider_config, harness="codex"
     )
 
     # Should get the custom pricing
     assert pricing is not None
     assert pricing.input_per_token == 0.0
     assert pricing.output_per_token == 0.0
+    assert pricing.long_context == ()
+    assert (
+        compute_llm_cost(
+            {"input_tokens": 300_000, "output_tokens": 100, "request_input_tokens": 300_000},
+            pricing,
+        )
+        == 0
+    )
 
 
 def test_fetch_pricing_fallback_to_catalog(monkeypatch: pytest.MonkeyPatch):

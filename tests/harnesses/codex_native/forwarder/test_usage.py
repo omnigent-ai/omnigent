@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
@@ -84,6 +86,34 @@ _PARENT_AFTER_FORK = _usage_event("thread_parent", (4500, 2000, 160), (2000, 100
                 "conv_sibling": [(1000, 0, 100), (3000, 1000, 150)],
             },
             id="codex-0.153-fresh-children-match-parent-and-sibling-totals",
+        ),
+        pytest.param(
+            [
+                None,
+                _usage_event("thread_parent", (500_000, 280_000, 200), (500_000, 280_000, 200)),
+                _usage_event("thread_child", (800_000, 560_000, 300), (300_000, 280_000, 100)),
+                _usage_event(
+                    "thread_child", (300_000, 280_000, 100), (300_000, 280_000, 100), "reset"
+                ),
+                _usage_event(
+                    "thread_child", (600_000, 560_000, 200), (300_000, 280_000, 100), "next"
+                ),
+                _usage_event(
+                    "thread_child", (300_000, 280_000, 100), (300_000, 280_000, 100), "reset"
+                ),
+                _usage_event(
+                    "thread_child", (900_000, 840_000, 300), (300_000, 280_000, 100), "last"
+                ),
+            ],
+            {
+                "conv_child": [
+                    (300_000, 280_000, 100),
+                    (300_000, 280_000, 100),
+                    (600_000, 560_000, 200),
+                    (900_000, 840_000, 300),
+                ]
+            },
+            id="child-reset-keeps-epoch-through-real-routing",
         ),
     ],
 )
@@ -205,3 +235,48 @@ async def test_usage_coalescer_unseeded_omits_model() -> None:
     assert len(client.posts) == 1
     _url, body = client.posts[0]
     assert "model" not in body["data"]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_flushes_preserve_request_recorded_during_post(monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    posted = []
+
+    async def post(client, session_id, *, event_type, data):
+        posted.append(data)
+        entered.set()
+        await release.wait()
+        return httpx.Response(200)
+
+    monkeypatch.setattr(fwd, "_post_session_event", post)
+    coalescer = fwd._SessionUsageCoalescer(_RecordingClient(), "conv", model="gpt-6-sol")
+    coalescer.record(_usage_event("thread", (200_000, 0, 100), (200_000, 0, 100))["params"])
+    first = asyncio.create_task(coalescer.flush())
+    await entered.wait()
+    second = asyncio.create_task(coalescer.flush())
+    await asyncio.sleep(0)
+    coalescer.record(_usage_event("thread", (500_000, 0, 200), (300_000, 0, 100))["params"])
+    release.set()
+    await asyncio.gather(first, second)
+    assert [[item["sequence"] for item in data["codex_pricing_updates"]] for data in posted] == [
+        [1],
+        [2],
+    ]
+    assert posted[-1]["cumulative_input_tokens"] == 500_000
+
+
+def test_old_child_replay_does_not_replace_reset_checkpoint(tmp_path: Path) -> None:
+    state = fwd._CodexForwarderState(child_usage_baseline_dir=tmp_path)
+    parent = _usage_event("parent", (1000, 0, 100), (1000, 0, 100))["params"]
+    first = _usage_event("child", (1300, 0, 130), (300, 0, 30))["params"]
+    second = _usage_event("child", (1600, 0, 160), (300, 0, 30))["params"]
+    for frame in (parent, first, second, first):
+        state.note_usage_frame(frame, "parent")
+    restarted = fwd._CodexForwarderState(child_usage_baseline_dir=tmp_path)
+    assert restarted.child_usage_baselines["child"] == (1000, 0, 100)
+    state.note_usage_frame(
+        _usage_event("child", (1400, 0, 140), (1400, 0, 140), "reset")["params"], "parent"
+    )
+    restarted = fwd._CodexForwarderState(child_usage_baseline_dir=tmp_path)
+    assert restarted.child_usage_baselines["child"] == (0, 0, 0)

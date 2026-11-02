@@ -1057,6 +1057,14 @@ async def test_scaffold_response_completed_preserves_cache_tokens(
 
     completed = next(e for e in events if e.event == "response.completed")
     usage = completed.data["response"]["usage"]
+    assert usage["pricing_requests"] == [
+        {
+            "input_tokens": 10_300,
+            "cache_read_input_tokens": 8_000,
+            "output_tokens": 500,
+            "request_input_tokens": 18_300,
+        }
+    ]
     # The fixture's provider_usage carries 8_000 cache-read + 2_000
     # cache-creation tokens. A missing key (KeyError) or a 0 would mean
     # the scaffold's Usage construction dropped the cache breakdown,
