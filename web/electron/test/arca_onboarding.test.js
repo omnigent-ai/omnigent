@@ -42,7 +42,7 @@ describe("Arca onboarding setup", () => {
       buildConnectArgs(url).filter((arg) => arg !== "--non-interactive"),
     );
     assert.equal(SETUP_TIMEOUT_MS, 15 * 60 * 1000);
-    assert.equal(CONNECT_TIMEOUT_MS, 5 * 60 * 1000);
+    assert.equal(CONNECT_TIMEOUT_MS, 10 * 60 * 1000);
   });
 
   it("rejects invalid targets before spawning", async () => {

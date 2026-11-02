@@ -40,7 +40,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   loginCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
  * }} deps
- * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
+ * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect", signInFirst?: boolean }) => Promise<object> }}
  */
 function createArcaConnectFlow({
   BrowserWindow,
@@ -102,7 +102,9 @@ function createArcaConnectFlow({
    *
    * @param {unknown} parentWin
    * @param {string} serverUrl
-   * @param {{ reason?: "preview-reconnect" }} [options]
+   * @param {{ reason?: "preview-reconnect", signInFirst?: boolean }} [options]
+   *   `signInFirst`: a connect already failed for sign-in, so Confirm runs
+   *   the sign-in before the connect instead of repeating the failed connect.
    */
   function run(parentWin, serverUrl, options = {}) {
     // Re-attach: an in-flight console survives an SPA refresh (it's a shell
@@ -153,7 +155,8 @@ function createArcaConnectFlow({
       // and the closed handler needs the id to unregister the console.
       const consoleId = win.webContents.id;
       let phase = "asking";
-      let loginAttempted = false;
+      const signInFirst = options.signInFirst === true;
+      let loginAttempted = signInFirst;
       let connect = null;
       let settled = false;
       const sendInit = (reason) => {
@@ -222,7 +225,7 @@ function createArcaConnectFlow({
         onConfirm: () => {
           if (phase !== "asking") return;
           log(`arca connect: user confirmed; running against ${serverUrl}`);
-          runCommand();
+          runCommand(signInFirst);
         },
         onCancel: () => {
           // Cancel button (or Close after a run) — just close; the close
