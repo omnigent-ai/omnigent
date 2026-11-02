@@ -17,8 +17,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from omnigent.install_ledger import atomic_write_json
 from omnigent.native import native_bridge_common
 from omnigent.process_logging import DATA_DIR_ENV_VAR
 
@@ -503,34 +504,29 @@ def build_mcp_config(
         defaults to the current interpreter (``sys.executable``).
     :returns: The ``mcp_config.json`` payload as a dict.
     """
-    return {
-        "mcpServers": {
-            _MCP_SERVER_NAME: _build_relay_server(bridge_dir, python_executable=python_executable)
-        }
-    }
-
-
-def _build_relay_server(bridge_dir: Path, *, python_executable: str | None) -> dict[str, object]:
-    """Return the ``mcpServers`` entry for this session's Omnigent relay."""
     python = python_executable or sys.executable
     return {
-        "command": python,
-        "args": [
-            "-I",
-            "-m",
-            "omnigent.harnesses.claude_native.bridge",
-            "serve-mcp",
-            "--bridge-dir",
-            str(bridge_dir),
-        ],
-        "enabledTools": list(_AGY_ENABLED_TOOLS),
-        "env": {
-            "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-            # Pin the relay to the RUNNER's real home and data dir so its bridge-root
-            # validation matches where the bridge dir lives. See :func:`build_mcp_config`.
-            "HOME": str(Path.home()),
-            DATA_DIR_ENV_VAR: str(native_bridge_common.native_bridge_data_dir()),
-        },
+        "mcpServers": {
+            _MCP_SERVER_NAME: {
+                "command": python,
+                "args": [
+                    "-I",
+                    "-m",
+                    "omnigent.harnesses.claude_native.bridge",
+                    "serve-mcp",
+                    "--bridge-dir",
+                    str(bridge_dir),
+                ],
+                "enabledTools": list(_AGY_ENABLED_TOOLS),
+                "env": {
+                    "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+                    # Pin the relay to the RUNNER's real home and data dir so its
+                    # bridge-root validation matches where the bridge dir lives. See docstring.
+                    "HOME": str(Path.home()),
+                    DATA_DIR_ENV_VAR: str(native_bridge_common.native_bridge_data_dir()),
+                },
+            }
+        }
     }
 
 
@@ -585,22 +581,10 @@ def write_mcp_config(
     config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
-    servers = dict(_load_user_mcp_servers(Path.home()))
-    servers[_MCP_SERVER_NAME] = _build_relay_server(
-        bridge_dir, python_executable=python_executable
-    )
-    payload = {"mcpServers": servers}
-    # Inherited server definitions may carry credentials in their env blocks, so
-    # the file is created owner-only rather than reusing a stale temp file's mode.
-    fd, tmp_name = tempfile.mkstemp(prefix=_MCP_CONFIG_FILE + ".", dir=config_dir)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp_name, path)
-    finally:
-        Path(tmp_name).unlink(missing_ok=True)
-    # Earlier releases staged this write at a fixed name with a looser mode.
-    path.with_suffix(path.suffix + ".tmp").unlink(missing_ok=True)
+    relay = build_mcp_config(bridge_dir, python_executable=python_executable)["mcpServers"]
+    servers = {**_load_user_mcp_servers(Path.home()), **cast("dict[str, object]", relay)}
+    # Inherited server env blocks can hold credentials; this writes owner-only.
+    atomic_write_json(path, {"mcpServers": servers})
     return path
 
 
@@ -611,7 +595,7 @@ def _load_user_mcp_servers(real_home: Path) -> dict[str, object]:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError):
         _logger.warning(
             "Could not read the user's agy MCP config at %s; seeding only the Omnigent relay",
             path,
