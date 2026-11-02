@@ -4,7 +4,7 @@
 // `--desktop-ui-font-size`. index.css maps that value directly into Tailwind's
 // typography tokens while keeping the root rem grid fixed at 16px, so text
 // changes without resizing icons, controls, or spacing. With no saved choice,
-// CSS supplies a 13px desktop default and a 14px mobile default.
+// CSS supplies a 14px default on desktop and mobile.
 //
 // Font family works the analogous way with `--ui-font-family`. Note it can't
 // reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
@@ -23,7 +23,7 @@ import { getStyleRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
-export const UI_FONT_SIZE_DEFAULT = 13;
+export const UI_FONT_SIZE_DEFAULT = 14;
 export const UI_FONT_SIZE_MOBILE_DEFAULT = 14;
 export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
@@ -66,8 +66,8 @@ function readStoredUiFontSizePx(): number | null {
 /**
  * Read the persisted UI font size in px.
  *
- * Returns the viewport default when nothing valid is stored: 13px on desktop
- * and 14px on mobile. A stored value applies directly on either viewport.
+ * Returns the 14px default when nothing valid is stored. A stored value applies
+ * directly on either viewport.
  */
 export function readUiFontSizePx(): number {
   return readStoredUiFontSizePx() ?? defaultUiFontSizePx();
@@ -96,7 +96,7 @@ export function applyDesktopUiFontSize(px: number): void {
   root.style.setProperty("--desktop-ui-font-size", `${clampUiFontSizePx(px)}px`);
 }
 
-/** Apply a saved choice, or let CSS choose the viewport-specific default. */
+/** Apply a saved choice, or let CSS use the 14px default. */
 export function applyStoredUiFontSize(): void {
   const root = getStyleRoot();
   if (!root) return;

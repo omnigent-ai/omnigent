@@ -1937,7 +1937,7 @@ function DefaultBaseBranchControl() {
  * UI font size stepper. Maps one of the supported discrete px values into
  * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
  * without resizing layout or icons. The chosen value applies directly on
- * every viewport; only the unset default differs between desktop and mobile.
+ * every viewport; both desktop and mobile default to 14px when unset.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.

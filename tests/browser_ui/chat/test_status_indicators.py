@@ -75,6 +75,11 @@ def test_bare_idle_clears_the_live_working_indicator(
 
     chat.emit_busy("browser-turn")
     expect(working).to_be_visible(timeout=10_000)
+    working_font = working.locator(".text-shimmer").evaluate(
+        "element => getComputedStyle(element).fontFamily"
+    )
+    body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
+    assert working_font == body_font
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)

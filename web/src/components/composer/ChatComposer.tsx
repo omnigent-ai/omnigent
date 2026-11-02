@@ -431,7 +431,7 @@ export const ComposerActionGroup = forwardRef<
       ref={ref}
       className={cn(
         "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink-0",
+        side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink",
         className,
       )}
       {...props}

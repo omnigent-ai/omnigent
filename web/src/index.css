@@ -157,7 +157,7 @@
   /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
    * runtime on documentElement. It feeds typography tokens only. */
-  --desktop-ui-font-size: 13px;
+  --desktop-ui-font-size: 14px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
@@ -381,7 +381,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 2px 6px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -390,7 +390,7 @@
   gap: 4px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -426,7 +426,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -1339,13 +1339,12 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (width >= 48rem) {
   :root {
     /* The step factors below are Tailwind's rem ratios against a 16px base, so
-     * they need the preference on that scale. Multiplying the raw 13px shrinks
-     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
-    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
+     * they need the preference on that scale. The default 14px body maps to
+     * the 16px title grid without resizing the fixed rem layout. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 14));
     /* Body and caption tiers come off the raw preference, not the anchor: the
-     * anchor is the 16px-equivalent grid the title ratios need, and running the
-     * caption factor through it put text-sm at 14.4px against a 13px body —
-     * a caption step larger than the text it captions. */
+     * anchor is the 16px-equivalent grid the title ratios need. Routing
+     * captions through it could make them larger than the body text. */
     --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);

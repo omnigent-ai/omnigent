@@ -6,6 +6,7 @@ import { SubagentPanelOpenerContext } from "@/shell/subagentPanelOpener";
 import { BubbleView } from "@/pages/ChatPage";
 import { useChatStore } from "@/store/chatStore";
 import { buildBubbles } from "@/lib/renderItems";
+import type { Bubble } from "@/lib/renderItems";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { parseEvent } from "@/lib/sse";
@@ -17,11 +18,49 @@ afterEach(() => {
 beforeEach(() => useChatStore.setState({ sessionStatus: "idle" }));
 
 describe("sub-agent activity", () => {
+  it("places a trailing notice after its assistant actions", () => {
+    const bubble: Extract<Bubble, { kind: "assistant" }> = {
+      kind: "assistant",
+      responseId: "activity_turn",
+      stableId: "reply",
+      lifecycle: "completed",
+      error: null,
+      items: [
+        { kind: "text", itemId: "reply", text: "I started the review.", final: true },
+        {
+          kind: "subagent_activity",
+          itemId: "activity",
+          data: {
+            type: "resource_event",
+            event_type: "session.subagent.delegated",
+            resource_type: "session",
+            resource_id: "conv_child",
+            resource: { title: "Parfit" },
+          },
+        },
+      ],
+    };
+    render(
+      <MemoryRouter>
+        <BubbleView bubble={bubble} />
+      </MemoryRouter>,
+    );
+
+    const children = screen.getByTestId("message-bubble").children;
+    expect(children).toHaveLength(3);
+    expect(children[0]).toContainElement(screen.getByTestId("assistant-text-section"));
+    expect(children[1]).toContainElement(screen.getByRole("button", { name: "Copy" }));
+    expect(children[2]).toContainElement(screen.getByTestId("subagent-activity"));
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
+      "[@media(pointer:coarse)]:size-8",
+    );
+  });
+
   it.each([
-    ["delegated", undefined, "Started"],
-    ["returned", undefined, "Completed"],
-    ["returned", "failed", "Failed"],
-    ["returned", "cancelled", "Stopped"],
+    ["delegated", undefined, "started working"],
+    ["returned", undefined, "finished working"],
+    ["returned", "failed", "failed"],
+    ["returned", "cancelled", "stopped"],
   ] as const)("renders %s/%s live and after reload as %s", (phase, status, label) => {
     const item = {
       id: "activity",
@@ -45,9 +84,9 @@ describe("sub-agent activity", () => {
         <BubbleView bubble={live[0]!} />
       </MemoryRouter>,
     );
-    expect(screen.getByTestId("subagent-activity")).toHaveTextContent(
-      `${label} Research public positioning`,
-    );
+    const activity = screen.getByTestId("subagent-activity");
+    expect(activity).toHaveTextContent(`Research public positioning ${label}`);
+    expect(activity.querySelector(".border-dashed")).toBeNull();
     expect(screen.getByRole("link")).toHaveAttribute("href", "/c/conv_child?debug=1&panel=agents");
     expect(screen.queryByTestId("message-bubble")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();

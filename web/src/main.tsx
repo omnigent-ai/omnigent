@@ -94,7 +94,7 @@ applyMobileAppTargetAttribute();
 hideNativeChatTerminalBar();
 
 // Apply saved font preferences before first paint. Without a saved size, CSS
-// keeps its viewport-specific default.
+// keeps its 14px default.
 applyStoredUiFontSize();
 applyUiFontFamily(readUiFontFamily());
 

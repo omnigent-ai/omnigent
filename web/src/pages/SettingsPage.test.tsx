@@ -969,16 +969,16 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default.
-    expect(input.value).toBe("13");
+    // No stored preference uses the 14px interface default.
+    expect(input.value).toBe("14");
     expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    expect(input.value).toBe("14");
+    expect(input.value).toBe("15");
     // The choice is persisted so it survives a refresh.
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     // The discrete desktop size is applied live to the document root.
-    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("15px");
   });
 
   it("disables the steppers at the min and max bounds", () => {
@@ -1070,7 +1070,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("16");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBe("true");
@@ -1087,7 +1087,7 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("system");
 
     // Fonts are back to their defaults.
-    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("14");
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
@@ -1182,7 +1182,7 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default, matching the interface default.
+    // The code font keeps its own 13px default.
     expect(input.value).toBe("13");
 
     fireEvent.click(screen.getByTestId("code-font-size-inc"));

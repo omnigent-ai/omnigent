@@ -15,35 +15,31 @@ export function SubagentActivityMessage({ data }: { data: Record<string, unknown
     pathname: `/c/${encodeURIComponent(activity.sessionId)}`,
     search: `?${params.toString()}`,
   };
-  let label = activity.phase === "delegated" ? "Started" : "Completed";
+  let label = activity.phase === "delegated" ? "started working" : "finished working";
   if (activity.phase === "returned") {
-    if (activity.status === "failed") label = "Failed";
-    if (["cancelled", "killed", "stopped"].includes(activity.status ?? "")) label = "Stopped";
+    if (activity.status === "failed") label = "failed";
+    if (["cancelled", "killed", "stopped"].includes(activity.status ?? "")) label = "stopped";
   }
   return (
     <div
-      className="not-prose flex w-full items-center gap-2 py-2 text-sm text-muted-foreground"
+      className="not-prose flex min-w-0 items-start gap-2 py-0.5 text-ui text-muted-foreground"
       data-testid="subagent-activity"
       data-phase={activity.phase}
       data-child-session-id={activity.sessionId}
     >
-      <span aria-hidden="true" className="min-w-0 flex-1 border-t border-dashed border-border" />
-      <div className="flex min-w-0 max-w-[85%] items-center gap-1.5 rounded-full border border-transparent px-3 py-1 text-center transition-colors hover:border-border focus-within:border-border">
-        <BotIcon aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 break-words">
-          {label}{" "}
-          <Link
-            to={to}
-            onClick={(event) => {
-              openInPanel(activity.sessionId, event);
-            }}
-            className="rounded-sm font-semibold text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {activity.title}
-          </Link>
-        </span>
-      </div>
-      <span aria-hidden="true" className="min-w-0 flex-1 border-t border-dashed border-border" />
+      <BotIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-brand-accent" />
+      <span className="min-w-0 break-words">
+        <Link
+          to={to}
+          onClick={(event) => {
+            openInPanel(activity.sessionId, event);
+          }}
+          className="rounded-sm font-medium text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {activity.title}
+        </Link>{" "}
+        {label}
+      </span>
     </div>
   );
 }

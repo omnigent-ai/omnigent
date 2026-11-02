@@ -879,9 +879,8 @@ describe("index.css composer and menu surfaces", () => {
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
- * parent's step. Anchoring the title ratios to the raw 13px preference instead
- * of a 16px-equivalent shrank every step ~19%, dragging the <code> under them
- * down to 9.75px.
+ * parent's step. Anchoring title ratios to the raw body preference instead of
+ * a 16px-equivalent shrinks every step, including nested code.
  */
 describe("index.css desktop typography ramp", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
@@ -950,8 +949,8 @@ describe("index.css body text tokens", () => {
     expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
 
-  /* Contract: mobile gets its own unset default, while a saved Appearance
-   * value applies directly instead of being silently rescaled. */
+  /* Contract: a saved Appearance value applies directly on mobile instead of
+   * being silently rescaled. */
   describe("mobile branch consumes the font-size preference", () => {
     it("uses the mobile default and aliases the effective body size to the preference", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
@@ -960,8 +959,8 @@ describe("index.css body text tokens", () => {
       expect(mobileMap).not.toContain("--mobile-ui-font-size: calc(");
     });
 
-    it("keeps the desktop and mobile defaults distinct", () => {
-      expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+    it("uses a 14px default on desktop and mobile", () => {
+      expect(UI_FONT_SIZE_DEFAULT).toBe(14);
       expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
     });
 
@@ -998,7 +997,7 @@ describe("index.css body text tokens", () => {
 
   it("gives both steps a unitless line height so the rhythm scales", () => {
     // Unitless, not px: a fixed pair would re-freeze the line box at the
-    // larger settings. 1.6 puts the 13px default on ~21px.
+    // larger settings. 1.6 puts the 14px default on ~22px.
     const themeBlock = cssSource.match(/@theme \{[^}]*--text-ui:[^}]*\}/)?.[0];
     expect(themeBlock).toContain(`--text-ui--line-height: ${LINE_HEIGHT_RATIO}`);
     expect(themeBlock).toContain(`--text-sm--line-height: ${LINE_HEIGHT_RATIO}`);

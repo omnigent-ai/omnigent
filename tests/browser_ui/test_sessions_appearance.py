@@ -225,13 +225,13 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
     terminal_dark = page.get_by_test_id("terminal-theme-dark")
 
     # Fresh context: the defaults are applied and nothing is persisted yet.
-    expect(font_size_input).to_have_value("13")
+    expect(font_size_input).to_have_value("14")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     stored_font_size = page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')")
     assert stored_font_size is None, "expected no persisted font size on a fresh load"
 
     # Change two unrelated appearance preferences away from their defaults.
-    for _ in range(5):
+    for _ in range(4):
         font_size_inc.click()
     expect(font_size_input).to_have_value("18")
     terminal_dark.click()
@@ -247,7 +247,7 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
     page.get_by_test_id("reset-appearance-confirm").click()
 
     # Both choices are back to the product defaults.
-    expect(font_size_input).to_have_value("13")
+    expect(font_size_input).to_have_value("14")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     assert page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')") is None
     assert page.evaluate("() => window.localStorage.getItem('omnigent:terminal-theme')") is None
@@ -315,7 +315,7 @@ def test_ui_font_family_reset_restores_system_default(page: Page, appearance_url
 def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> None:
     """Stepping the size updates the token + value live and survives a reload.
 
-    A fresh context has no stored preference → default 13px. Increasing the
+    A fresh context has no stored preference and uses the 14px default. Increasing the
     size updates ``--desktop-ui-font-size`` and persists the px value; a page
     reload restores it (no reset, no flash back to the default).
     """
@@ -325,13 +325,13 @@ def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> No
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context → default 13px token, nothing stored.
-    expect(value).to_have_value("13")
+    # Fresh context uses the 14px token, with nothing stored.
+    expect(value).to_have_value("14")
     assert _stored_size(page) is None, "expected no persisted size on a fresh load"
-    assert _desktop_ui_font_size(page) == "13px", "fresh load should apply the default size"
+    assert _desktop_ui_font_size(page) == "14px", "fresh load should apply the default size"
 
-    # → 18px: five steps up. The value, applied token, and storage all move.
-    for _ in range(5):
+    # Four steps reach 18px. The value, applied token, and storage all move.
+    for _ in range(4):
         increase.click()
     expect(value).to_have_value("18")
     assert _stored_size(page) == "18"
@@ -394,8 +394,7 @@ def test_ui_font_size_input_allows_free_editing(page: Page, appearance_url: str)
 
     # Backspace to "1": the box holds the partial value; nothing clamps or
     # re-persists while the draft is out of range.
-    value.click()
-    value.press("End")
+    value.fill("13")
     value.press("Backspace")
     expect(value).to_have_value("1")
     assert _stored_size(page) == "13", "a mid-edit below-min draft must not persist"
