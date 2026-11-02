@@ -301,6 +301,7 @@ class _ConversationStore:
             key: value
             for key, value in src.labels.items()
             if key not in (_FORK_ONLY_DROPPED_LABEL_KEYS | dropped_label_keys)
+            and not key.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
         }
         fork_labels.update(extra_labels or {})
         fork = Conversation(
@@ -1460,9 +1461,10 @@ async def test_fork_codex_bypass_stamps_label_on_codex_target(
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
     extra = conv_store.fork_calls[0]["extra_labels"]
-    assert extra == {"omnigent.codex_native.bypass_sandbox": "1"}, (
-        f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
-    )
+    assert extra == {
+        "omnigent.codex_native.bypass_sandbox": "1",
+        "omnigent.client_surface": "web",
+    }, f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
 
 
 @pytest.mark.asyncio
@@ -1807,6 +1809,48 @@ async def test_fork_cursor_pi_native_carry_gating(
 
 
 @pytest.mark.parametrize(
+    "harness,expect_resume_source",
+    [
+        # cursor's conversation is server-backed: it can never clone the source.
+        ("cursor-native", False),
+        # opencode clones the source session natively when the source DB is
+        # reachable, so the route keeps the source-session directive for it.
+        ("opencode-native", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fork_preamble_harness_source_directive(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expect_resume_source: bool,
+) -> None:
+    """A same-agent opencode fork keeps the source native session directive."""
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": harness}),
+    )
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["carry_history_into_native"] is True
+    assert fork_call["resume_source_native_session"] is expect_resume_source, (
+        f"A {harness} fork should pass resume_source_native_session={expect_resume_source}."
+    )
+
+
+@pytest.mark.parametrize(
     "harness,expect_carry",
     [
         # Reversed native spellings ("native-claude" / "native-codex") are
@@ -1980,7 +2024,10 @@ async def test_fork_managed_launches_its_requested_host_id(
     assert body["labels"][REQUESTED_HOST_ID_LABEL_KEY] == host_id
     # Born with the row (not patched onto the response): a list read racing the
     # fork can't return the row without the id the caller routes it by.
-    assert conv_store.fork_calls[0]["extra_labels"] == {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+    assert conv_store.fork_calls[0]["extra_labels"] == {
+        REQUESTED_HOST_ID_LABEL_KEY: host_id,
+        "omnigent.client_surface": "web",
+    }
     assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
 
 
@@ -2159,6 +2206,78 @@ async def test_fork_managed_inherits_all_source_repositories(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_count", [1, 2])
+async def test_fork_managed_explicit_workspaces_replace_source_repositories(
+    monkeypatch: pytest.MonkeyPatch, selected_count: int
+) -> None:
+    """The fork launches every chosen ref and records that selection for relaunch."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/old-web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(
+        app, monkeypatch, provider="modal" if selected_count == 1 else "kubernetes"
+    )
+    client = TestClient(app)
+    selected = [
+        "https://github.com/org/api#fix-auth",
+        "https://github.com/org/web#update-login",
+    ][:selected_count]
+
+    resp = client.post(
+        f"/v1/sessions/{conv.id}/fork",
+        json={"host_type": "managed", "workspaces": selected},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(launches) == 1
+    assert [(r.url, r.branch) for r in launches[0]["repos"]] == [
+        ("https://github.com/org/api", "fix-auth"),
+        ("https://github.com/org/web", "update-login"),
+    ][:selected_count]
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == selected[0]
+    if selected_count == 2:
+        assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.1"] == selected[1]
+    else:
+        assert f"{MANAGED_REPO_LABEL_KEY}.1" not in fork.labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspaces", [[], None])
+async def test_fork_managed_explicit_empty_workspaces_clear_source_repositories(
+    monkeypatch: pytest.MonkeyPatch, workspaces: list[str] | None
+) -> None:
+    """Removing every repo produces an empty sandbox instead of inheriting the source."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        f"/v1/sessions/{conv.id}/fork", json={"host_type": "managed", "workspaces": workspaces}
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert launches[0]["repos"] == []
+    assert conv_store.label_writes == []
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert not any(key.startswith(MANAGED_REPO_LABEL_KEY) for key in fork.labels)
+
+
+@pytest.mark.asyncio
 async def test_fork_managed_explicit_workspace_overrides_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2318,8 +2437,9 @@ async def test_fork_managed_rejects_unoffered_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_selection", [False, True])
 async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, explicit_selection: bool
 ) -> None:
     """A multi-repo source forked onto a single-repo provider fails the POST with
     a clear 400 (modal is exec-model → single-repo), rather than a background
@@ -2337,7 +2457,14 @@ async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+        json={
+            "host_type": "managed",
+            **(
+                {"workspaces": ["https://github.com/org/other-api", "https://github.com/org/web"]}
+                if explicit_selection
+                else {}
+            ),
+        },
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"

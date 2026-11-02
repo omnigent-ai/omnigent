@@ -22,6 +22,24 @@ it.each([
   { kind: "claude", requested: "request", reported: "report", expected: "report" },
   { kind: "codex", requested: "request", reported: "", expected: "request" },
   { kind: "claude", requested: "request", reported: "wire-model", expected: "catalog-row" },
+  {
+    kind: "claude",
+    requested: "opus",
+    reported: "system.ai.claude-opus-4-8[1m]",
+    expected: "opus[1m]",
+  },
+  {
+    kind: "codex",
+    requested: "opus",
+    reported: "SYSTEM.AI.CLAUDE-OPUS-4-8[1M]",
+    expected: "opus[1m]",
+  },
+  {
+    kind: "claude",
+    requested: "opus",
+    reported: "system.ai.claude-sonnet-5[1m]",
+    expected: "system.ai.claude-sonnet-5[1m]",
+  },
   { kind: "configured", requested: null, reported: "report", expected: "report" },
 ] as const)(
   "resolves the selected model from $kind request=$requested report=$reported",
@@ -29,7 +47,12 @@ it.each([
     expect(
       selectedModelForPicker(
         kind,
-        [{ id: "catalog-row", model: "wire-model" }],
+        [
+          { id: "catalog-row", model: "wire-model" },
+          { id: "opus", model: "claude-opus-4-8" },
+          { id: "opus[1m]", model: "claude-opus-4-8[1m]" },
+          { id: "sonnet", model: "claude-sonnet-5" },
+        ],
         requested,
         reported,
       ),

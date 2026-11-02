@@ -763,6 +763,7 @@ def _import_session_queue_payload(total: int, session: HostImportedLocalSession)
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 

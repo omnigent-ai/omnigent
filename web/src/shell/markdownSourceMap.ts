@@ -1,6 +1,7 @@
 import { decodeHtmlEntities, type MarkdownToken } from "@tiptap/core";
 import type { MarkdownManager } from "@tiptap/markdown";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
+import { definedFootnoteLabels, withFootnoteLabels } from "./TipTapFootnotes";
 import { ALERT_MARKER } from "./TipTapGitHubAlert";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 
@@ -56,7 +57,10 @@ function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken
   const marked = manager.instance;
   let tokens: MarkdownToken[] | null = null;
   try {
-    tokens = new marked.Lexer(marked.defaults).lex(source);
+    // Match the editor's parse, which reads references against the definitions.
+    tokens = withFootnoteLabels(definedFootnoteLabels(marked, source), () =>
+      new marked.Lexer(marked.defaults).lex(source),
+    );
   } finally {
     tokenCache.set(manager, { source, tokens });
   }
@@ -175,6 +179,9 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): TokenBlock[]
   function visit(token: MarkdownToken, view: Source) {
     switch (token.type) {
       case "def":
+      case "footnoteDefinitions":
+      case "linkDefinitions":
+      case "footnoteReference":
       case "space":
       case "hr":
       case "image":
