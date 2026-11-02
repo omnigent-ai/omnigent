@@ -243,6 +243,8 @@ async def test_model_change_heals_before_read_model_env(
     tmp_path: Path,
 ) -> None:
     """Picker vocabulary must come from the recreated pane, not the stale one."""
+    from tests.debug_log_helpers import capture_debug_rows
+
     conv_id = "c3d4e5f60718293a4b5c6d7e8f901a2b"
     auto_create_calls: list[str] = []
     order: list[str] = []
@@ -320,13 +322,21 @@ async def test_model_change_heals_before_read_model_env(
         lambda _bridge_dir: bool(auto_create_calls),
     )
 
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
-        )
+    with capture_debug_rows("runner") as rows:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "claude-opus-4-7"},
+            )
 
     assert resp.status_code == 204, resp.text
+    resolution = [
+        row["attributes"] for row in rows if row["event_name"] == "claude_model_resolution"
+    ]
+    assert len(resolution) == 1
+    assert resolution[0]["phase"] == "native_model_change"
+    assert resolution[0]["selection_source"] == "session_override"
+    assert resolution[0]["selected_model_sha256"] == resolution[0]["resolved_model_sha256"]
     assert order[:2] == ["heal", "read_model_env"], (
         f"model handler must heal before read_model_env; got {order!r}"
     )
