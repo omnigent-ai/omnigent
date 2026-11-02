@@ -19,7 +19,6 @@ import {
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   Link2Icon,
   Loader2Icon,
   SplitIcon,
@@ -81,7 +80,7 @@ import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
-import { InlineImage, SessionImage } from "@/components/SessionImage";
+import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
@@ -790,9 +789,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
-        {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-            immediately left of the right-aligned bubble. */}
-        <div className="flex w-fit max-w-full items-center gap-1.5">
+        {/* Keep the avatar beside the attachments and text as one aligned message. */}
+        <div className="flex w-fit max-w-full items-end gap-1.5">
           {showAuthorBadge && author && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -813,20 +811,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <TooltipContent>{author}</TooltipContent>
             </Tooltip>
           )}
-          <MessageContent
-            className={flashing ? "animate-message-highlight" : undefined}
-            // Another contributor's bubble takes their avatar color at low
-            // alpha instead of the default bg-muted.
-            style={
-              showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
-            }
-          >
-            {/* Inline image previews. Wrap rather than scroll horizontally:
-                a landscape image fills the bubble width, so a second one in a
-                non-wrapping strip would sit off-screen in the overflow and
-                look like it never rendered. */}
+          <div className="flex min-w-0 max-w-full flex-col items-end gap-1.5">
             {images.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap items-start gap-2">
+              <div
+                data-testid="user-image-attachments"
+                className={cn(
+                  "flex max-w-full flex-wrap justify-end gap-1.5",
+                  flashing && "animate-message-highlight rounded-lg",
+                )}
+              >
                 {keyedAttachments(
                   images,
                   (img) => img.file_id ?? img.image_url ?? img.filename,
@@ -842,7 +835,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                             : undefined
                         }
                         alt={preview.alt}
-                        className="rounded-md object-contain"
+                        variant="userAttachment"
                       />
                     );
                   }
@@ -852,92 +845,113 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         key={key}
                         src={preview.src}
                         alt={preview.alt}
-                        className="rounded-md object-contain"
+                        variant="userAttachment"
                       />
                     );
                   }
-                  // In-flight upload, or a block with nothing renderable on it.
-                  return <AttachmentChip key={key} icon={ImageIcon} label={preview.label} />;
+                  return (
+                    <ImageAttachmentPlaceholder
+                      key={key}
+                      label={preview.label}
+                      pending={preview.kind === "pending"}
+                    />
+                  );
                 })}
               </div>
             )}
-            {/* Non-image file chips */}
-            {fileChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                  ({ key, item: att }) => (
-                    <AttachmentChip key={key} icon={FileTextIcon} label={attachmentLabel(att)} />
-                  ),
+            {(text || fileChips.length > 0 || mentionedChips.length > 0) && (
+              <MessageContent
+                data-testid="user-message-content"
+                className={flashing ? "animate-message-highlight" : undefined}
+                // Another contributor's bubble takes their avatar color at low
+                // alpha instead of the default bg-muted.
+                style={
+                  showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
+                }
+              >
+                {/* Non-image file chips */}
+                {fileChips.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
+                      ({ key, item: att }) => (
+                        <AttachmentChip
+                          key={key}
+                          icon={FileTextIcon}
+                          label={attachmentLabel(att)}
+                        />
+                      ),
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
-            {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-            {mentionedChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {mentionedChips.map((item) => (
-                  <span
-                    key={mentionItemPath(item)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {item.isDir ? (
-                      <FolderIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
-                    )}
-                    <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                      @{item.path}
-                      {item.isDir ? "/" : ""}
-                    </span>
-                    {item.lineRange && (
-                      <span className="shrink-0">
-                        :{item.lineRange.start}-{item.lineRange.end}
+                {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
+                {mentionedChips.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {mentionedChips.map((item) => (
+                      <span
+                        key={mentionItemPath(item)}
+                        className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                      >
+                        {item.isDir ? (
+                          <FolderIcon className="size-3 shrink-0" />
+                        ) : (
+                          <FileTextIcon className="size-3 shrink-0" />
+                        )}
+                        <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
+                          @{item.path}
+                          {item.isDir ? "/" : ""}
+                        </span>
+                        {item.lineRange && (
+                          <span className="shrink-0">
+                            :{item.lineRange.start}-{item.lineRange.end}
+                          </span>
+                        )}
                       </span>
-                    )}
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* Render user text as markdown, matching the assistant bubble.
+                    ))}
+                  </div>
+                )}
+                {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
               nothing rather than an empty markdown block.
               For long prompts, only the visible slice is passed to the renderer
               so the Markdown parser never processes hidden text. */}
-            {text && (
-              <>
-                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                  {isShellCommand ? (
-                    <pre className="whitespace-pre-wrap break-words font-mono text-sm">
-                      <code>{visibleText}</code>
-                    </pre>
-                  ) : (
-                    <FilePathAwareMessageResponse
-                      breaks
-                      mode="static"
-                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                    >
-                      {visibleText}
-                    </FilePathAwareMessageResponse>
-                  )}
-                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                {text && (
+                  <>
+                    <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                      {isShellCommand ? (
+                        <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                          <code>{visibleText}</code>
+                        </pre>
+                      ) : (
+                        <FilePathAwareMessageResponse
+                          breaks
+                          mode="static"
+                          remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                        >
+                          {visibleText}
+                        </FilePathAwareMessageResponse>
+                      )}
+                      {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
-                  {isCollapsed && isLong && (
-                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
-                  )}
-                </div>
-                {isLong && (
-                  <button
-                    type="button"
-                    onClick={() => setIsCollapsed((c) => !c)}
-                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    {isCollapsed
-                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
-                      : "Collapse prompt"}
-                  </button>
+                      {isCollapsed && isLong && (
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                      )}
+                    </div>
+                    {isLong && (
+                      <button
+                        type="button"
+                        onClick={() => setIsCollapsed((c) => !c)}
+                        className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        {isCollapsed
+                          ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                          : "Collapse prompt"}
+                      </button>
+                    )}
+                  </>
                 )}
-              </>
+              </MessageContent>
             )}
-          </MessageContent>
+          </div>
         </div>
         {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
         {bubble.pending && bubble.awaitingAgent && (
