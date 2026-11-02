@@ -1,7 +1,18 @@
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
 import type { ComponentProps, ReactNode, RefObject } from "react";
-import { cloneElement, isValidElement, useCallback, useEffect, useRef, useState } from "react";
+import {
+  cloneElement,
+  createContext,
+  isValidElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 
 // Streamdown portals fullscreen to document.body, outside the embed's scoped CSS.
@@ -27,69 +38,149 @@ export function isMermaidPre(children: ReactNode): boolean {
   );
 }
 
-// Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
-function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
-  const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
-  const close = useCallback(() => setSvgMarkup(null), []);
+// The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
+// we don't clone a toolbar/zoom-control icon (all 16×16 <svg>s in the block).
+const DIAGRAM_SVG = 'svg[id^="mermaid-"]';
+// A click while Mermaid is still drawing (e.g. as a reply settles) opens once it finishes.
+export const DIAGRAM_WAIT_MS = 5_000;
 
-  const openFullscreen = useCallback(() => {
-    // The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
-    // we don't clone a toolbar/zoom-control icon (all 16×16 <svg>s in the block).
-    const svg = blockRef.current?.querySelector('svg[id^="mermaid-"]');
+interface MermaidFullscreenControls {
+  open: (block: HTMLElement) => void;
+  close: () => void;
+}
+
+// Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
+function useMermaidFullscreenState(resetKey?: string) {
+  const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
+  const [pendingBlock, setPendingBlock] = useState<HTMLElement | null>(null);
+  const [stateKey, setStateKey] = useState(resetKey);
+  if (stateKey !== resetKey) {
+    setStateKey(resetKey);
+    setSvgMarkup(null);
+    setPendingBlock(null);
+  }
+
+  const open = useCallback((block: HTMLElement) => {
+    const svg = block.querySelector(DIAGRAM_SVG);
     setSvgMarkup(svg ? svg.outerHTML : null);
-  }, [blockRef]);
+    setPendingBlock(svg ? null : block);
+  }, []);
+  const close = useCallback(() => {
+    setSvgMarkup(null);
+    setPendingBlock(null);
+  }, []);
 
   useEffect(() => {
-    if (svgMarkup == null) return;
+    if (pendingBlock === null) return;
+    const showWhenDrawn = () => {
+      const svg = pendingBlock.isConnected ? pendingBlock.querySelector(DIAGRAM_SVG) : null;
+      if (!svg) return;
+      setSvgMarkup(svg.outerHTML);
+      setPendingBlock(null);
+    };
+    const observer = new MutationObserver(showWhenDrawn);
+    observer.observe(pendingBlock, { childList: true, subtree: true });
+    const timer = window.setTimeout(() => setPendingBlock(null), DIAGRAM_WAIT_MS);
+    showWhenDrawn();
+    return () => {
+      observer.disconnect();
+      window.clearTimeout(timer);
+    };
+  }, [pendingBlock]);
+
+  const active = svgMarkup !== null || pendingBlock !== null;
+  useEffect(() => {
+    if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [svgMarkup, close]);
+  }, [active, close]);
 
-  const overlay =
-    svgMarkup != null
-      ? createPortal(
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 text-foreground backdrop-blur-sm"
-            // Clicking the diagram must not dismiss it.
-            onClick={(e) => {
-              if (e.target === e.currentTarget) close();
-            }}
-            role="presentation"
-          >
-            <Button
-              aria-label="Exit fullscreen"
-              className="absolute top-4 right-4"
-              onClick={close}
-              size="icon-sm"
-              title="Exit fullscreen"
-              type="button"
-              variant="ghost"
-            >
-              <FullscreenIcon />
-            </Button>
-            <div
-              className="flex size-full items-center justify-center p-8 [&>svg]:h-auto [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:max-w-full"
-              // The cloned SVG is Mermaid's own trusted, already-sanitized render.
-              dangerouslySetInnerHTML={{ __html: svgMarkup }}
-              onClick={(e) => {
-                if (e.target === e.currentTarget) close();
-              }}
-              role="presentation"
-            />
-          </div>,
-          getEmbedRoot() ?? document.body,
-        )
-      : null;
+  return { svgMarkup, open, close };
+}
+
+function MermaidFullscreenOverlay({
+  svgMarkup,
+  onClose,
+}: {
+  svgMarkup: string | null;
+  onClose: () => void;
+}) {
+  if (svgMarkup === null) return null;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 text-foreground backdrop-blur-sm"
+      // Clicking the diagram must not dismiss it.
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      role="presentation"
+    >
+      <Button
+        aria-label="Exit fullscreen"
+        className="absolute top-4 right-4"
+        onClick={onClose}
+        size="icon-sm"
+        title="Exit fullscreen"
+        type="button"
+        variant="ghost"
+      >
+        <FullscreenIcon />
+      </Button>
+      <div
+        className="flex size-full items-center justify-center p-8 [&>svg]:h-auto [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:max-w-full"
+        // The cloned SVG is Mermaid's own trusted, already-sanitized render.
+        dangerouslySetInnerHTML={{ __html: svgMarkup }}
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose();
+        }}
+        role="presentation"
+      />
+    </div>,
+    getEmbedRoot() ?? document.body,
+  );
+}
+
+const MermaidFullscreenContext = createContext<MermaidFullscreenControls | null>(null);
+
+/**
+ * Owns the open diagram above the chat so it survives the block remount when a
+ * streamed reply settles. Closes on `resetKey` or theme change, as an unmount did.
+ */
+export function MermaidFullscreenProvider({
+  children,
+  resetKey,
+}: {
+  children: ReactNode;
+  resetKey: string;
+}) {
+  const themeMode = useResolvedThemeMode();
+  const { svgMarkup, open, close } = useMermaidFullscreenState(`${resetKey}:${themeMode}`);
+  const controls = useMemo(() => ({ open, close }), [open, close]);
+  return (
+    <MermaidFullscreenContext.Provider value={controls}>
+      {children}
+      <MermaidFullscreenOverlay svgMarkup={svgMarkup} onClose={close} />
+    </MermaidFullscreenContext.Provider>
+  );
+}
+
+// Without a provider (isolated renders), the overlay lives with the block.
+function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
+  const shared = useContext(MermaidFullscreenContext);
+  const local = useMermaidFullscreenState();
+  const { open } = shared ?? local;
 
   return (
     <>
       <Button
         aria-label="View fullscreen"
         className="size-6 bg-sidebar/80 text-muted-foreground hover:bg-sidebar/80 hover:text-foreground dark:hover:bg-sidebar/80 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur"
-        onClick={openFullscreen}
+        onClick={() => {
+          if (blockRef.current) open(blockRef.current);
+        }}
         size="icon-sm"
         title="View fullscreen"
         type="button"
@@ -97,7 +188,9 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
       >
         <FullscreenIcon />
       </Button>
-      {overlay}
+      {shared === null && (
+        <MermaidFullscreenOverlay svgMarkup={local.svgMarkup} onClose={local.close} />
+      )}
     </>
   );
 }
