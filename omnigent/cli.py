@@ -13727,18 +13727,20 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.
     from urllib.parse import urlsplit
 
+    from omnigent.onboarding.databricks_login import opens_browser, run_databricks_auth_login
+
     split = urlsplit(workspace_host.rstrip("/"))
     host = split.hostname or split.netloc or split.path
     profile = host.split(".")[0]
-    click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
-    result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
-        check=False,
+    action = "Opening browser to log in" if opens_browser() else "Signing in"
+    click.echo(f"{action} to {login_host} (profile {profile}) ...")
+    returncode = run_databricks_auth_login(
+        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile]
     )
-    if result.returncode != 0:
+    if returncode != 0:
         raise click.ClickException(
             f"`databricks auth login --host {login_host} --profile {profile}` failed "
-            f"(exit {result.returncode}). If the workspace is unreachable from "
+            f"(exit {returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
 

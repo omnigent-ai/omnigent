@@ -157,6 +157,9 @@ def test_first_host_login_registers_and_reuses_credentials(tmp_path: Path) -> No
                     "HOST_LOGIN_BROWSER_URL": str(browser_url),
                     "TERM": "xterm",
                     "BROWSER": None,
+                    # A desktop login: over SSH the CLI prints the link instead.
+                    "SSH_CONNECTION": None,
+                    "SSH_TTY": None,
                     "OPENAI_API_KEY": None,
                     "XDG_CONFIG_HOME": str(home / ".config"),
                     "XDG_CACHE_HOME": str(home / ".cache"),

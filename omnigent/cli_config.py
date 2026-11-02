@@ -1121,7 +1121,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         else:
             ucode_agents = sorted(_FAMILY_UCODE_AGENT.values())
         profile = login_databricks_workspace(workspace_url, console=console)
-        configure_ucode_for_workspace(workspace_url, agents=ucode_agents)
+        configure_ucode_for_workspace(workspace_url, agents=ucode_agents, profile=profile)
         # Fail loud if ucode didn't actually record state for the workspace —
         # otherwise routing would silently fall back and confuse the user.
         if not ucode_workspace_exists(workspace_url):
