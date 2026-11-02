@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterator
+from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -14,7 +16,15 @@ _COMPOSER = "Send a message…"
 
 
 @pytest.fixture
-def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
+def appearance_features() -> dict[str, bool]:
+    """Feature flags served by ``/v1/info``; a test may change them before reloading."""
+    return {}
+
+
+@pytest.fixture
+def appearance_url(
+    browser_contract: BrowserContract, appearance_features: dict[str, bool]
+) -> Iterator[str]:
     empty_list = {
         "object": "list",
         "data": [],
@@ -40,7 +50,7 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {},
+            "features": appearance_features,
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -67,6 +77,115 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
         "**/v1/sessions/updates*", lambda ws: ws.on_message(lambda _message: None)
     )
     yield browser_contract.base_url
+
+
+def test_custom_order_keeps_the_list_and_commits_on_drop(
+    page: Page,
+    appearance_url: str,
+    appearance_features: dict[str, bool],
+    browser_contract: BrowserContract,
+) -> None:
+    """Custom keeps the Updated list, moves a row only on drop, and adds new sessions above."""
+    appearance_features["sidebar_grouping_ui"] = True
+    sessions = [
+        {
+            "id": f"{index + 1:032x}",
+            "object": "conversation",
+            "title": title,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "status": "idle",
+            "labels": {},
+            "permission_level": None,
+        }
+        for index, (title, created_at, updated_at) in enumerate(
+            (("Busy session", 10, 300), ("Quiet session", 20, 100), ("Recent session", 30, 200))
+        )
+    ]
+
+    def session_list(request: Request) -> dict:
+        params = parse_qs(urlparse(request.url).query)
+        sort_by = params.get("sort_by", ["updated_at"])[0]
+        rows = [] if "pinned" in params else sorted(sessions, key=lambda row: -row[sort_by])
+        return {
+            "object": "list",
+            "data": rows,
+            "has_more": False,
+            "first_id": rows[0]["id"] if rows else None,
+            "last_id": rows[-1]["id"] if rows else None,
+        }
+
+    def choose(menu: str, option: str) -> None:
+        page.get_by_test_id("session-filter").press("ArrowDown")
+        page.get_by_test_id(menu).click()
+        page.get_by_role("menuitemradio", name=option, exact=True).click()
+
+    browser_contract.json("/v1/sessions", session_list)
+    browser_contract.json(
+        re.compile(r"/v1/sessions/[0-9a-f]{32}/items(?:\?.*)?$"), {"data": [], "has_more": False}
+    )
+    page.goto(appearance_url)
+    rows = page.locator("li[data-sidebar-session-id]").get_by_role("link")
+
+    def titles(*names: str) -> list[re.Pattern[str]]:
+        # A bumped session also reads "(unread)" to screen readers.
+        return [re.compile(rf"^{name}") for name in names]
+
+    updated = titles("Busy session", "Recent session", "Quiet session")
+    expect(rows).to_have_text(updated)
+    choose("session-ordering-menu", "Custom")
+    expect(rows).to_have_text(updated)
+    sessions[1]["updated_at"] = 999
+    page.reload()
+    expect(rows).to_have_text(updated)
+
+    source = rows.filter(has_text="Quiet session").bounding_box()
+    target_row = rows.filter(has_text="Busy session")
+    target = target_row.bounding_box()
+    assert source and target
+    page.mouse.move(source["x"] + 30, source["y"] + source["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    expect(target_row).to_have_css("outline-style", "dashed")
+    expect(target_row).to_have_css("outline-width", "2px")
+    expect(target_row).to_have_css("outline-color", re.compile(r"/ 0\.4\)$"))
+    expect(target_row).to_have_css("background-color", "rgba(0, 0, 0, 0)")
+    expect(rows).to_have_text(updated)
+    page.mouse.up()
+    custom = titles("Quiet session", "Busy session", "Recent session")
+    expect(rows).to_have_text(custom)
+
+    sessions.append(
+        {
+            **sessions[0],
+            "id": f"{4:032x}",
+            "title": "New session",
+            "created_at": int(time.time()),
+            "updated_at": int(time.time()),
+        }
+    )
+    page.reload()
+    expect(rows).to_have_text([*titles("New session"), *custom])
+
+    # Each tab keeps its own selection until reload; this tab's next write wins.
+    with page.expect_popup() as popup:
+        page.evaluate("window.open('about:blank')")
+    popup.value.evaluate("""() => {
+        const key = 'omnigent:sidebar-view';
+        const view = JSON.parse(localStorage.getItem(key));
+        localStorage.setItem(key, JSON.stringify({ ...view, ordering: 'updated' }));
+    }""")
+    popup.value.close()
+    choose("session-grouping-menu", "Status")
+    choose("session-grouping-menu", "Default")
+    page.reload()
+    expect(rows).to_have_text([*titles("New session"), *custom])
+
+    appearance_features["sidebar_grouping_ui"] = False
+    page.reload()
+    expect(rows).to_have_text(
+        titles("New session", "Quiet session", "Busy session", "Recent session")
+    )
 
 
 @pytest.fixture

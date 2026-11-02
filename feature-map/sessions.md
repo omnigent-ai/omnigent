@@ -19,6 +19,10 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
+- `custom-order`: behind `sidebar_grouping_ui`, drop one of your sessions onto
+  another row of the same list, project or group (or use Move up/down) to switch
+  Ordering to Custom. Positions are saved on this device and new sessions appear
+  above them; a drop on another project's row still files the session there.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
@@ -156,7 +160,7 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
+  (Updated / Created / Custom) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
   requests, pagination, and project folders use that order too. Switching order
@@ -257,6 +261,12 @@ sidebar has loaded it.
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
+
+**Custom order:** with `sidebar_grouping_ui` on, drag one of your sessions onto
+another row in the same list, project or group and release it; a faint dashed
+outline marks the rows that accept it. Move up and Move down in the row menu or
+right-click menu do the same. On mobile, press and hold a row in the sidebar
+drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
 actions (mark as read or unread, archive, unarchive, delete).
@@ -550,6 +560,18 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`pin-reorder`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
   Dropping an unpinned row onto a pinned row has web unit coverage only.
+- **`custom-order`:**
+  `tests/browser_ui/test_sessions_appearance.py::test_custom_order_keeps_the_list_and_commits_on_drop`
+  (built SPA, mocked backend) covers the menu, the dashed target without a fill,
+  committing on drop, reload, new sessions above, per-tab state and the flag-off
+  fallback.
+  `tests/e2e_ui/sessions/test_sidebar_projects.py::test_move_session_into_new_project`
+  files a session dropped on another project's row and releases a row over
+  itself without navigating. Group limits, both Move menus and the click after a
+  drag have web unit coverage in `web/src/shell/Sidebar.pinReorder.test.tsx`. No
+  test drives a touch drag: in a narrow window open the drawer, press and hold a
+  row, drop it on another row of its list, and expect the new order without the
+  session opening.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
@@ -1087,6 +1109,12 @@ plain `uv run pytest`, which starts a private server for the test.
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
   message. That is expected; run them with plain `uv run pytest`.
+- Custom positions apply to loaded rows: a session moved up from deep history
+  takes its place again once its page loads. History loaded after Custom started
+  follows Created or Updated until a move below it saves those positions. Each
+  tab reads the saved order once, so another tab's change shows after reload and
+  the last tab to save wins. Only your own live sessions can be dragged; shared
+  and archived rows keep their Custom place but can't be moved.
 - Grouping and ordering apply to the loaded pages only: an older session joins
   its group once it is paged in. Grouped views hide Projects, so dragging a
   session onto the list never removes it from its project there.

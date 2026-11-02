@@ -11,7 +11,11 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  clearRecentlyCreated,
+  markRecentlyCreated,
+  PINNED_LABEL_KEY,
+} from "@/lib/sessionListCache";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
 import type { Session } from "@/lib/types";
 import type * as IdentityModule from "@/lib/identity";
@@ -109,6 +113,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   localStorage.clear();
+  clearRecentlyCreated();
+  vi.restoreAllMocks();
   cleanup();
   client.clear();
   vi.useRealTimers();
@@ -629,3 +635,40 @@ it.each([false, true])(
     expect(fetchMock).not.toHaveBeenCalled();
   },
 );
+
+it("keeps Custom on its base's caches and saves cutoff-second arrivals through storage failures", async () => {
+  groupingUi = true;
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
+  fetchMock.mockClear();
+  const custom = { base: "updated", since: 100, ids: ["mine"] } as const;
+  act(() => result.current.updateView({ ordering: "custom", custom }));
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(result.current.customOrder?.positions.get("mine")).toBe(0);
+  expect(fetchMock).not.toHaveBeenCalled();
+
+  // Same-second history stays below; a session this tab saw created then is new.
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new DOMException("Quota exceeded", "QuotaExceededError");
+  });
+  const arrival = { ...row("arrival"), created_at: 100 };
+  markRecentlyCreated(arrival);
+  act(() =>
+    client.setQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"], (data) => ({
+      ...data!,
+      pages: [sessionRowsPage([arrival, { ...row("history"), created_at: 100 }, row("mine")])],
+    })),
+  );
+  await waitFor(() => expect(result.current.view.custom?.ids).toEqual(["arrival", "mine"]));
+  expect(result.current.loadedRows.map((r) => r.id)).toContain("history");
+  expect(setItem).toHaveBeenCalled();
+  setItem.mockRestore();
+  act(() => result.current.updateView({ ordering: "created" }));
+  expect(result.current.sortBy).toBe("created_at");
+  act(() => result.current.updateView({ ordering: "custom" }));
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).custom.ids).toEqual([
+    "arrival",
+    "mine",
+  ]);
+});
