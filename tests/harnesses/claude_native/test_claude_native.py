@@ -78,6 +78,16 @@ def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return bridge_root / "session"
 
 
+def _install_managed_mcp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    managed_dir = tmp_path / "etc-claude-code"
+    managed_dir.mkdir()
+    (managed_dir / "managed-mcp.json").write_text('{"mcpServers":{}}', encoding="utf-8")
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_dir / "managed-settings.json",),
+    )
+
+
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
@@ -161,6 +171,35 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "TaskCreated",
         "UserPromptSubmit",
     ]
+
+
+def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code exits at startup on ``--mcp-config`` when ``managed-mcp.json`` exists."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    monkeypatch.chdir(tmp_path)
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    captured_warnings: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge._logger,
+        "warning",
+        lambda message, *args, **kwargs: captured_warnings.append(
+            message % args if args else message
+        ),
+    )
+
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+
+    args = body["spec"]["args"]
+    assert "--mcp-config" not in args
+    assert "--strict-mcp-config" not in args
+    assert any("managed-mcp.json" in message for message in captured_warnings)
+    # The runner recovers the bridge from the settings path, and hooks still load.
+    assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
+    assert "SessionStart" in _load_invocation_settings(args)["hooks"]
 
 
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
@@ -11624,6 +11663,39 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert env["DISABLE_AUTOUPDATER"] == "1"
     assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in env
     assert "CLAUDECODE" not in env
+
+
+async def test_probe_claude_model_options_omits_mcp_flags_under_managed_mcp_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Claude Code rejects ``--strict-mcp-config`` when ``managed-mcp.json`` exists."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    spawned_args: list[list[str]] = []
+
+    class _FakeProcess:
+        pid = None
+        returncode = 0
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            return _picker_response("opus"), b""
+
+    async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        spawned_args.append(list(args))
+        return _FakeProcess()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    probe = await claude_native.probe_claude_model_options(_gateway_probe_config())
+
+    assert probe is not None
+    assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
+    assert spawned_args
+    for args in spawned_args:
+        assert "--strict-mcp-config" not in args
+        assert "--mcp-config" not in args
+        assert "--no-session-persistence" in args
 
 
 async def test_claude_model_catalog_marks_the_enumerated_default(

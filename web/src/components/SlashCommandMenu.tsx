@@ -29,6 +29,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
   "/mcp": "Show MCP servers enabled for this session",
+  "/permissions": "Change the approval mode for this session",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":

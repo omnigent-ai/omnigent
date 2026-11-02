@@ -64,7 +64,9 @@ be able to write resources without a separate Omnigent account.
   already connected, connected but the new host unconfirmed (the dialog stays
   open to pick it from the host list), closing the window mid sign-in (nothing
   left running on the machine), a sign-in link the machine shouldn't print
-  (refused, no browser), and failures, shown only in the app's own window.
+  (refused, no browser), a window connected to a server on this computer
+  (`localhost`; refused in the dialog before connecting), and failures, shown
+  only in the app's own window.
   Hidden where **Run on Arca** is offered (the Databricks-internal flag on a
   Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
