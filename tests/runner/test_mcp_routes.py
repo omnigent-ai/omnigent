@@ -228,7 +228,15 @@ async def test_tools_list_without_a_spec_reports_it() -> None:
 
 
 async def test_tools_list_returns_schemas_from_a_cached_resolved_spec() -> None:
-    h = Harness(mcp_manager=_FakeMcpManager())
+    manager = _FakeMcpManager()
+    manager.schemas = McpSchemasResult(
+        schemas=[{"name": "jira__search"}],
+        tool_names={"jira__search"},
+        failures={},
+        server_instructions={"jira": "Search with JQL."},
+        server_labels={"jira": "Jira"},
+    )
+    h = Harness(mcp_manager=manager)
     h.spec_cache[SESSION] = ResolvedSpec(spec=_spec(), workdir=Path("/tmp/wd"))
     status, body = await h.execute({"method": "tools/list"})
     assert status == 200
@@ -236,6 +244,8 @@ async def test_tools_list_returns_schemas_from_a_cached_resolved_spec() -> None:
         "schemas": [{"name": "jira__search"}],
         "tool_names": ["jira__search"],
         "failures": {},
+        "server_instructions": {"jira": "Search with JQL."},
+        "server_labels": {"jira": "Jira"},
     }
 
 
