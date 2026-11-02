@@ -497,6 +497,80 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_list_include_archived_lists_archived_rows_on_every_page() -> None:
+    """An archive-inclusive listing reaches the server on each page and marks archived rows.
+
+    Trigger automations find the workers they started through this listing, so
+    archiving a worker must not hide it from the next page either.
+    """
+    rows = [
+        {
+            "id": f"conv_{index:04d}",
+            "agent_id": "ag_1",
+            "agent_name": "claude",
+            "title": f"GitHub acme/app#{index}",
+            "status": "idle",
+            "runner_id": None,
+            "parent_session_id": None,
+            "archived": index % 2 == 0,
+            "labels": {"omnigent.created_by_session_id": "conv_caller"},
+        }
+        for index in range(150)
+    ]
+    received: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            received.append(request.url.params.get("include_archived"))
+            return _server_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def call(args: dict[str, object]) -> dict[str, object]:
+            return json.loads(
+                await execute_tool(
+                    tool_name="sys_session_list",
+                    arguments=json.dumps(args),
+                    server_client=client,
+                    conversation_id="conv_caller",
+                )
+            )
+
+        first = await call({"limit": 100, "include_archived": True})
+        cursor = first["page"]["next_cursor"]
+        second = await call({"limit": 100, "include_archived": True, "cursor": cursor})
+        mismatched = await call({"limit": 100, "cursor": cursor})
+        default = await call({"limit": 100})
+
+    assert received == ["true", "true", None]
+    assert first["sessions"][0] == {
+        "session_id": "conv_0000",
+        "agent_name": "claude",
+        "title": "GitHub acme/app#0",
+        "status": "idle",
+        "runner_id": None,
+        "runner_online": None,
+        "parent_session_id": None,
+        "created_by_session_id": "conv_caller",
+        "archived": True,
+    }
+    assert first["sessions"][1]["archived"] is False
+    assert second["sessions"][0]["session_id"] == "conv_0100"
+    assert second["sessions"][0]["archived"] is True
+    # The cursor is bound to the archive filter it was minted with.
+    assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
+    # Callers that don't ask keep the old row shape.
+    assert "archived" not in default["sessions"][0]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_list_checks_runner_status_only_for_returned_rows() -> None:
     """
     Runner status is resolved for the rows the tool returns, with bounded concurrency.
