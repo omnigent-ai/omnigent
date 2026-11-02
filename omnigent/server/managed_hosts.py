@@ -204,7 +204,11 @@ from omnigent.onboarding.sandboxes.base import (
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.onboarding.sandboxes.types import (
+    DEFAULT_GIT_CLONE_POLICY,
+    GitCloneOptions,
+    RepoWorkspace,
+)
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -715,8 +719,11 @@ class ManagedSandboxConfig:
         replace the current template's providers and bindings on restore.
     :param model_discovery: Server-only catalog endpoints and credential references,
         keyed by inference provider name. Never installed in the sandbox.
-    :param git_clone: Admin clone policy for fresh or missing repo checkouts.
-        Existing retained checkouts are not reconfigured.
+    :param git_clone: Admin clone policy for fresh or missing repo checkouts,
+        or ``None`` (no ``sandbox.git_clone`` configured) to apply
+        :data:`~omnigent.onboarding.sandboxes.types.DEFAULT_GIT_CLONE_POLICY`
+        on launchers that honor clone options. Existing retained checkouts
+        are not reconfigured.
     :param default_model_options: Optional, request-scoped provider catalog used
         when no host catalog is available for the selected harness and user.
         Supplies choices without selecting a default or provisioning a host.
@@ -733,7 +740,7 @@ class ManagedSandboxConfig:
     provider: str | None = None
     host_config: dict[str, object] | None = None
     model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
-    git_clone: GitCloneOptions = dataclass_field(default_factory=GitCloneOptions)
+    git_clone: GitCloneOptions | None = None
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
@@ -1621,9 +1628,9 @@ def _parse_multi_provider_sandbox_config(
     return ManagedSandboxDeployment(configs=tuple(parsed), reaper=reaper)
 
 
-def _parse_git_clone_options(raw: object) -> GitCloneOptions:
+def _parse_git_clone_options(raw: object) -> GitCloneOptions | None:
     if raw is None:
-        return GitCloneOptions()
+        return None
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox.git_clone' must be a mapping")
     if raw.keys() - {"depth", "single_branch", "filter", "tags"}:
@@ -4031,9 +4038,16 @@ async def relaunch_managed_host(
 def _apply_git_clone_options(
     launcher: SandboxHostLauncher,
     repos: Sequence[RepoWorkspace],
-    options: GitCloneOptions,
+    options: GitCloneOptions | None,
 ) -> Sequence[RepoWorkspace]:
-    """Apply admin clone policy before provisioning or replacing any sandbox."""
+    """Apply the admin clone policy, or the default policy where the launcher honors one.
+
+    Custom materializers that cannot honor options keep their own clone behavior.
+    """
+    if options is None:
+        if not launcher.capabilities.git_clone_options:
+            return repos
+        options = DEFAULT_GIT_CLONE_POLICY
     if options == GitCloneOptions():
         return repos
     if not launcher.capabilities.git_clone_options:
