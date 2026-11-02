@@ -1544,6 +1544,56 @@ describe("TerminalSession", () => {
         expect(refused).toEqual([["ls", "interrupted"]]);
       });
 
+      it("strips control characters before the xterm fallback pastes", async () => {
+        // WHY: an ESC sequence could end the bracketed paste and run the rest.
+        const { socket, session } = makeSession();
+        socket.open();
+        await writePane(socket, session, "\x1b[?2004h$ ");
+        vi.useFakeTimers();
+        session.pasteWhenShellReady(() => "echo a\x1b[201~\nrm -rf x");
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+
+        expect(inputFrames(socket)).toEqual([BRACKETED("echo a[201~\rrm -rf x")]);
+        session.dispose();
+      });
+
+      it("reports a paste interrupted once when the socket is closing at the timeout", () => {
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "ls",
+          (text, reason) => refused.push([text, reason]),
+        );
+        socket.readyState = 2;
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        socket.readyState = FakeWebSocket.CLOSED;
+        socket.emit("close", { code: 1006, reason: "" });
+
+        expect(inputFrames(socket)).toEqual([]);
+        expect(pasteFrames(socket, "paste-cancel")).toEqual([]);
+        expect(refused).toEqual([["ls", "interrupted"]]);
+        session.dispose();
+      });
+
+      it("forgets a typed fallback quietly when the view is torn down", () => {
+        // WHY: closing the shell on purpose is not a dropped connection.
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "ls",
+          (text, reason) => refused.push([text, reason]),
+        );
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        expect(inputFrames(socket)).toEqual(["ls"]);
+
+        session.dispose();
+        expect(refused).toEqual([]);
+      });
+
       it("waits past the timeout once the bridge accepted the paste", async () => {
         // WHY: a bridge waiting for a slow prompt must not race an xterm paste
         // that could land in whatever the pane is running.

@@ -2057,12 +2057,12 @@ function AppShellImpl() {
   // flight, so two quick presses can't spawn two shells (the menu disables its
   // item on create.isPending for the same reason).
   const createTerminal = useCreateTerminal(conversationId ?? "");
-  const shellLaunchable =
+  const shellReachable =
     agentSupportsShells &&
     !!conversationId &&
-    !createTerminal.isPending &&
     liveness?.kind !== "host_offline" &&
     liveness?.kind !== "local_stranded";
+  const shellLaunchable = shellReachable && !createTerminal.isPending;
   // A create that finishes after the user moved to another session must not
   // reveal its shell over that session.
   const currentConversationIdRef = useRef(conversationId);
@@ -2127,13 +2127,7 @@ function AppShellImpl() {
   // Chat code blocks get "Open in shell" only where the viewer could open a
   // shell themselves; non-owners attach read-only and couldn't type the paste.
   const shellCommandOpener =
-    agentSupportsShells &&
-    !!conversationId &&
-    isOwnerLevel(permissionLevel) &&
-    liveness?.kind !== "host_offline" &&
-    liveness?.kind !== "local_stranded"
-      ? openShellCommand
-      : null;
+    shellReachable && isOwnerLevel(permissionLevel) ? openShellCommand : null;
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.

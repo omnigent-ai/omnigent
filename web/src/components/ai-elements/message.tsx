@@ -6,6 +6,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { copyText } from "@/lib/clipboard";
 import {
   isShellCodeClassName,
+  isShellSessionClassName,
   shellCommandFromCodeBlock,
   useShellCommandOpener,
 } from "@/lib/shellCommand";
@@ -610,19 +611,19 @@ function ChatCodeBlockOpenInShellButton({ onOpen }: { onOpen: () => void }) {
   );
 }
 
-function isShellCodePre(children: ReactNode): boolean {
-  return (
-    isValidElement<{ className?: string }>(children) &&
-    isShellCodeClassName(children.props.className)
-  );
+function codeClassName(children: ReactNode): string | undefined {
+  return isValidElement<{ className?: string }>(children) ? children.props.className : undefined;
 }
 
 export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
   const openShellCommand = useShellCommandOpener();
+  const className = codeClassName(children);
   const shellCommand =
-    openShellCommand !== null && isShellCodePre(children) ? shellCommandFromCodeBlock(code) : "";
+    openShellCommand !== null && isShellCodeClassName(className)
+      ? shellCommandFromCodeBlock(code, isShellSessionClassName(className))
+      : "";
   const openInShell = useCallback(() => {
     if (shellCommand !== "") openShellCommand?.(shellCommand);
   }, [openShellCommand, shellCommand]);

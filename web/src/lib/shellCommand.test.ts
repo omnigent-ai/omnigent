@@ -3,6 +3,7 @@ import {
   claimPendingShellInput,
   hasPendingShellInput,
   isShellCodeClassName,
+  isShellSessionClassName,
   PENDING_SHELL_INPUT_TTL_MS,
   queuePendingShellInput,
   shellCommandFromCodeBlock,
@@ -23,6 +24,18 @@ describe("isShellCodeClassName", () => {
       expect(isShellCodeClassName(className)).toBe(false);
     },
   );
+});
+
+describe("isShellSessionClassName", () => {
+  it.each([
+    ["language-console", true],
+    ["language-shellsession", true],
+    ["x language-Shell-Session", true],
+    ["language-bash", false],
+    [undefined, false],
+  ])("answers %s with %s", (className, expected) => {
+    expect(isShellSessionClassName(className)).toBe(expected);
+  });
 });
 
 describe("shellCommandFromCodeBlock", () => {
@@ -101,8 +114,32 @@ describe("shellCommandFromCodeBlock", () => {
     ["a comment after an operator", "$ echo hi;# it's\n> rm -rf build\n"],
     ["a backslash at the end", "$ ls \\\n"],
     ["a backslash inside a comment", "$ ls # C:\\\nfile.txt\n"],
+    ["a loop body without prompts", '$ for f in a b; do\necho "$f"\ndone\n'],
+    ["a trailing then", "$ if true; then\necho yes\nfi\n"],
+    ["an open subshell", "$ (cd src &&\nmake)\n"],
+    ["an open command substitution", '$ echo "$(date\n'],
+    ["an open brace group", "$ { echo one\necho two; }\n"],
+    ["ANSI-C quoting", "$ echo $'it\\'s\nit's\n"],
   ])("offers nothing for a transcript with %s", (_case, transcript) => {
     expect(shellCommandFromCodeBlock(transcript)).toBe("");
+  });
+
+  it("keeps one-line compound commands and parameter expansions", () => {
+    expect(shellCommandFromCodeBlock("$ for f in a b; do echo $f; done\na\nb\n")).toBe(
+      "for f in a b; do echo $f; done",
+    );
+    expect(shellCommandFromCodeBlock("$ echo ${HOME} $(pwd)\n/home/me\n")).toBe(
+      "echo ${HOME} $(pwd)",
+    );
+  });
+
+  it("reads a terminal session block only after its $ prompts", () => {
+    // WHY: a console block with another prompt, or opening with output, would
+    // otherwise be pasted whole, output included.
+    expect(shellCommandFromCodeBlock("% ls\nfile.txt\n", true)).toBe("");
+    expect(shellCommandFromCodeBlock("user@host:~$ ls\n", true)).toBe("");
+    expect(shellCommandFromCodeBlock("$ ls\nfile.txt\n", true)).toBe("ls");
+    expect(shellCommandFromCodeBlock("% ls\n")).toBe("% ls");
   });
 
   it("drops leading blank lines and normalizes CRLF", () => {

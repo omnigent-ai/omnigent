@@ -18,6 +18,7 @@ import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
+import { withoutControlCharacters } from "@/lib/shellCommand";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
@@ -920,7 +921,7 @@ export class TerminalSession {
       "close",
       (ev) => {
         // An unanswered paste may already be in the pane; never repeat it.
-        this.interruptUnsettledPastes();
+        this.interruptUnsettledPastes(true);
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -1164,14 +1165,20 @@ export class TerminalSession {
     const inFlight = this.inFlightPaste;
     if (inFlight === null || inFlight.id !== id) return;
     this.dropInFlightPaste();
-    if (!this.disposed && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      // Closing: the bridge may still have pasted, and no close event follows
+      // for this paste any more.
+      inFlight.onRefused?.(inFlight.text, "interrupted");
+    } else {
       // A slow current bridge may still be waiting for the prompt; stop it.
       this.ws.send(JSON.stringify({ type: "paste-cancel", id }));
+      // Strip what the bridge would: ESC could end a bracketed paste early.
+      const text = withoutControlCharacters(inFlight.text.replace(/\r\n?/g, "\n"));
       // Unbracketed, a line break is Enter and a tab is a keystroke (completion,
       // or whatever readline binds it to), so only plain text is typed.
-      const typed = this.term.modes.bracketedPasteMode || !/[\r\n\t]/.test(inFlight.text);
+      const typed = this.term.modes.bracketedPasteMode || !/[\n\t]/.test(text);
       if (typed) {
-        this.term.paste(inFlight.text);
+        this.term.paste(text);
       } else {
         inFlight.onRefused?.(inFlight.text, "unsafe");
       }
@@ -1193,15 +1200,19 @@ export class TerminalSession {
     this.fallenBackPastes.delete(id);
   }
 
-  /** Report every paste whose outcome the closing socket leaves unknown. */
-  private interruptUnsettledPastes(): void {
+  /**
+   * Report every paste whose outcome the socket's end leaves unknown.
+   *
+   * @param reportFallenBack Whether the connection dropped, so a slow bridge's
+   *   answer to an xterm fallback is lost; a planned teardown forgets them.
+   */
+  private interruptUnsettledPastes(reportFallenBack: boolean): void {
     const inFlight = this.inFlightPaste;
     this.dropInFlightPaste();
     inFlight?.onRefused?.(inFlight.text, "interrupted");
-    // A slow bridge may have pasted after the fallback; its answer is lost now.
     for (const [id, fallenBack] of this.fallenBackPastes) {
       this.forgetFallenBackPaste(id);
-      fallenBack.onRefused?.(fallenBack.text, "interrupted");
+      if (reportFallenBack) fallenBack.onRefused?.(fallenBack.text, "interrupted");
     }
     this.resolvePasteIdleWaiters();
   }
@@ -1248,7 +1259,7 @@ export class TerminalSession {
     this.disposed = true;
     // The close listener is aborted below, so report the pastes here.
     this.pendingPaste = null;
-    this.interruptUnsettledPastes();
+    this.interruptUnsettledPastes(false);
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();

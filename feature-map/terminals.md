@@ -72,8 +72,10 @@ with their own terminal retain the switcher.
 - Hover a `bash`/`sh`/`zsh`/`shell`/`console` code block in an agent reply and
   choose "Open in shell". On desktop the shell opens as a rail tab; on a phone
   it opens in the full-screen terminal view. A `$ ` transcript offers only its
-  prompt lines; the button is hidden when output can't be told apart from a
-  command (here-documents, quotes or pipes that span lines).
+  prompt lines, and a `console` block without a `$ ` prompt offers nothing. The
+  button is also hidden when output can't be told apart from a command:
+  here-documents, unclosed quotes, `(`/`{` groups or pipes, a trailing `do` or
+  `then`, and ANSI-C `$'…'` quoting.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.

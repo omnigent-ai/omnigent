@@ -6092,7 +6092,7 @@ describe("AppShell open in shell", () => {
 
     await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
     expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other");
-    expect(screen.queryByTestId("terminals-panel")).not.toHaveAttribute("data-state", "open");
+    expect(screen.queryByTestId("terminals-panel")?.getAttribute("data-state")).not.toBe("open");
   });
 
   it("leaves the session the user moved to alone when a desktop create finishes", async () => {

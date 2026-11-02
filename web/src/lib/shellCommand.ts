@@ -4,6 +4,8 @@
 
 import { createContext, useContext } from "react";
 
+/** Fenced-code languages for terminal sessions: prompts mixed with output. */
+const SHELL_SESSION_LANGUAGES = new Set(["console", "shellsession", "shell-session"]);
 /** Fenced-code languages whose contents are commands for an interactive shell. */
 const SHELL_LANGUAGES = new Set([
   "bash",
@@ -13,10 +15,19 @@ const SHELL_LANGUAGES = new Set([
   "zsh",
   "ksh",
   "fish",
-  "console",
-  "shellsession",
-  "shell-session",
+  ...SHELL_SESSION_LANGUAGES,
 ]);
+
+function hasLanguage(className: string | undefined, languages: Set<string>): boolean {
+  if (!className) return false;
+  return className
+    .split(/\s+/)
+    .some(
+      (token) =>
+        token.startsWith("language-") &&
+        languages.has(token.slice("language-".length).toLowerCase()),
+    );
+}
 
 /**
  * Whether a fenced code block's ``language-*`` class marks it as shell input.
@@ -25,14 +36,18 @@ const SHELL_LANGUAGES = new Set([
  *   ``"language-bash"``; undefined for an unlabeled block.
  */
 export function isShellCodeClassName(className: string | undefined): boolean {
-  if (!className) return false;
-  return className
-    .split(/\s+/)
-    .some(
-      (token) =>
-        token.startsWith("language-") &&
-        SHELL_LANGUAGES.has(token.slice("language-".length).toLowerCase()),
-    );
+  return hasLanguage(className, SHELL_LANGUAGES);
+}
+
+/**
+ * Whether the block is a terminal session (``console`` and the like), whose
+ * lines are output unless they follow a ``$ `` prompt.
+ *
+ * @param className The rendered ``<code>`` element's class list, e.g.
+ *   ``"language-console"``.
+ */
+export function isShellSessionClassName(className: string | undefined): boolean {
+  return hasLanguage(className, SHELL_SESSION_LANGUAGES);
 }
 
 const FIRST_PROMPT = /^(\s*)\$ /;
@@ -43,6 +58,10 @@ const SECONDARY_PROMPT_LINE = /^\s*>(?:\s|$)/;
 // ``&&`` or ``||``: the command goes on past its first line.
 const HEREDOC_OPERATOR = /(?<!<)<<(?!<)/;
 const TRAILING_OPERATOR = /(?:\||&&)\s*$/;
+// A compound command whose body would be on the next lines.
+const TRAILING_KEYWORD = /(?:^|[\s;&|()])(?:do|then|else|elif|in)\s*$/;
+// ANSI-C quoting, where ``\'`` doesn't end the string.
+const ANSI_C_QUOTE = "$'";
 
 /** Whether a line ends in an unescaped backslash, which joins the next line. */
 function endsWithLineContinuation(line: string): boolean {
@@ -50,11 +69,15 @@ function endsWithLineContinuation(line: string): boolean {
   return trailing % 2 === 1;
 }
 
-/** Whether a command leaves a quote open (bash rules, ``#`` comments skipped). */
-function hasOpenQuote(command: string): boolean {
+/**
+ * Whether a command leaves a quote, ``(`` or ``{`` open (bash rules, ``#``
+ * comments skipped).
+ */
+function isUnclosed(command: string): boolean {
   let quote: "'" | '"' | null = null;
   let escaped = false;
   let inComment = false;
+  let groupDepth = 0;
   for (let index = 0; index < command.length; index++) {
     const char = command[index];
     if (inComment) {
@@ -71,9 +94,13 @@ function hasOpenQuote(command: string): boolean {
       quote = char;
     } else if (char === "#" && (index === 0 || /[\s;&|()<>]/.test(command[index - 1]))) {
       inComment = true;
+    } else if (char === "(" || char === "{") {
+      groupDepth++;
+    } else if (char === ")" || char === "}") {
+      groupDepth--;
     }
   }
-  return quote !== null;
+  return quote !== null || groupDepth > 0;
 }
 
 /**
@@ -86,8 +113,10 @@ function isAmbiguousCommand(lines: string[]): boolean {
   return (
     HEREDOC_OPERATOR.test(command) ||
     TRAILING_OPERATOR.test(command) ||
+    TRAILING_KEYWORD.test(command) ||
     endsWithLineContinuation(command) ||
-    hasOpenQuote(command) ||
+    command.includes(ANSI_C_QUOTE) ||
+    isUnclosed(command) ||
     // A "#" may comment out a backslash that seemed to join the next line.
     (lines.length > 1 && command.includes("#"))
   );
@@ -133,7 +162,7 @@ function isDroppedControl(code: number): boolean {
 
 // ESC would let a block end the shell's bracketed paste early (``ESC[201~``)
 // and run whatever follows; the bridge strips the same characters.
-function withoutControlCharacters(text: string): string {
+export function withoutControlCharacters(text: string): string {
   let kept = "";
   for (const char of text) {
     if (!isDroppedControl(char.charCodeAt(0))) kept += char;
@@ -153,12 +182,16 @@ function withoutControlCharacters(text: string): string {
  * other than tab are dropped.
  *
  * @param code The code block's text, e.g. ``"$ npm test\\nok\\n"``.
+ * @param sessionTranscript The block is a terminal session (see
+ *   :func:`isShellSessionClassName`), so without a ``$ `` prompt nothing in it
+ *   is known to be a command.
  * @returns The command, e.g. ``"npm test"``; empty when nothing remains.
  */
-export function shellCommandFromCodeBlock(code: string): string {
+export function shellCommandFromCodeBlock(code: string, sessionTranscript = false): string {
   const lines = withoutControlCharacters(code.replace(/\r\n?/g, "\n")).split("\n");
   const firstLine = lines.find((line) => line.trim() !== "");
   const firstPrompt = firstLine === undefined ? null : FIRST_PROMPT.exec(firstLine);
+  if (firstPrompt === null && sessionTranscript) return "";
   const commandLines = firstPrompt === null ? lines : transcriptCommands(lines, firstPrompt[1]);
   if (commandLines === null) return "";
   return commandLines

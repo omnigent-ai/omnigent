@@ -409,12 +409,16 @@ describe("MessageResponse open in shell", () => {
     expect(screen.queryByRole("button", { name: "Open in shell" })).toBeNull();
   });
 
-  it("does not offer a transcript whose commands it can't separate from output", async () => {
+  it.each([
+    [
+      "a pipeline it can't separate from output",
+      "```console\n$ printf 'one\\n' |\n> sed 's/one/two/'\ntwo\n```",
+    ],
+    ["a console session without a $ prompt", "```console\n% ls\nfile.txt\n```"],
+  ])("does not offer a transcript with %s", async (_case, markdown) => {
     render(
       <ShellCommandOpenerContext.Provider value={() => {}}>
-        <MessageResponse>
-          {"```console\n$ printf 'one\\n' |\n> sed 's/one/two/'\ntwo\n```"}
-        </MessageResponse>
+        <MessageResponse>{markdown}</MessageResponse>
       </ShellCommandOpenerContext.Provider>,
     );
 

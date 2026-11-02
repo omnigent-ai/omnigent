@@ -629,10 +629,8 @@ export function TerminalView({
       const retireOutgoing = () => {
         disposeActiveSession();
         node.replaceChildren();
-        // Reset to ``connecting`` for every fresh attach so a stale
-        // overlay from a previous mount doesn't flash during the
-        // handshake. The session's WS ``open`` handler transitions us
-        // to ``connected``.
+        // A stale overlay must not flash during the handshake; the session's
+        // WS ``open`` handler moves on to ``connected``.
         notifyState({ kind: "connecting" });
       };
       if (!retireAfterPaste) retireOutgoing();
