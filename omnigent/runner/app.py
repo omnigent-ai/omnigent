@@ -44,6 +44,7 @@ from omnigent.debug_logging import (
     runner_primary_session_id,
     set_current_session_id,
 )
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     session_resource_view_to_dict,
@@ -1339,6 +1340,7 @@ def create_runner_app(
     _session_root_spec_cache: dict[str, _SpecEntry] = {}  # session_id → unresolved root spec
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
+    _turn_occurrences: dict[str, ScheduledRunLogContext | None] = {}
     app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
@@ -3569,6 +3571,7 @@ def create_runner_app(
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        _turn_occurrences.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
@@ -4041,6 +4044,7 @@ def create_runner_app(
         :param body: Forwarded message that starts the turn, when there is one.
         """
         _active_turns[conv_id] = None
+        _turn_occurrences[conv_id] = _message_scheduled_run(body)
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
         pending_id = body.get("pending_id") if body is not None else None
         if isinstance(pending_id, str):
@@ -4071,6 +4075,7 @@ def create_runner_app(
         The two stores represent one fact; clearing only one leaves the idle reaper stuck.
         """
         _live_response_id.pop(conv_id, None)
+        _turn_occurrences.pop(conv_id, None)
         if process_manager is not None:
             process_manager.clear_in_flight(conv_id)
 
@@ -7146,6 +7151,8 @@ def create_runner_app(
                         not _native
                         and not _awaiting_approval
                         and conversation_id in _live_response_id
+                        and _message_scheduled_run(message_body)
+                        == _turn_occurrences.get(conversation_id)
                     )
                     if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"

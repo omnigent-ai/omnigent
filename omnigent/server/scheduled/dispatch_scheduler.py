@@ -12,6 +12,8 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal
 
+from cachetools import LRUCache
+
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import current_session_id_scope, debug_event, log_attributes_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -451,6 +453,7 @@ class PersistentTaskScheduler:
         self._loop: asyncio.Task[None] | None = None
         self._recovery: asyncio.Task[None] | None = None
         self._startups: dict[tuple[int, str], asyncio.Task[None]] = {}
+        self._last_observed_due: LRUCache[tuple[int, str], int] = LRUCache(maxsize=4096)
         self._poll_lock = asyncio.Lock()
         self._stopped = False
         self._initialization_cursor: TaskCursor | None = None
@@ -804,24 +807,27 @@ class PersistentTaskScheduler:
                 if self._stopped:
                     return
                 assert task.next_run_at is not None
-                _log_event(
-                    _logger.info,
-                    "Observed due occurrence %s of task %s",
-                    task.next_run_at,
-                    task.id,
-                    extra=debug_event(
-                        "scheduled_run_occurrence_observed",
-                        task_id=task.id,
-                        task_workspace_id=task.workspace_id,
-                        scheduled_at=task.next_run_at,
-                        trigger_key=scheduled_trigger_key(task.next_run_at),
-                        target=task.execution_target,
-                        observed_at=cutoff,
-                        rrule=task.rrule,
-                        timezone=task.timezone,
-                        schedule_anchor=task.created_at,
-                    ),
-                )
+                observation_key = (task.workspace_id, task.id)
+                if self._last_observed_due.get(observation_key) != task.next_run_at:
+                    self._last_observed_due[observation_key] = task.next_run_at
+                    _log_event(
+                        _logger.info,
+                        "Observed due occurrence %s of task %s",
+                        task.next_run_at,
+                        task.id,
+                        extra=debug_event(
+                            "scheduled_run_occurrence_observed",
+                            task_id=task.id,
+                            task_workspace_id=task.workspace_id,
+                            scheduled_at=task.next_run_at,
+                            trigger_key=scheduled_trigger_key(task.next_run_at),
+                            target=task.execution_target,
+                            observed_at=cutoff,
+                            rrule=task.rrule,
+                            timezone=task.timezone,
+                            schedule_anchor=task.created_at,
+                        ),
+                    )
                 try:
                     if await self._validate_schedule(task):
                         host_id = occurrence_host_id(task, scheduled_trigger_key(task.next_run_at))

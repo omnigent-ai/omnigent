@@ -194,6 +194,19 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog)
     assert all(event["rrule"] == tasks[0].rrule for event in observed)
     assert all(event["schedule_anchor"] == tasks[0].created_at for event in observed)
 
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(_events(caplog, "scheduled_run_occurrence_observed")) == len(observed)
+    clock.advance(3600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    later = _events(caplog, "scheduled_run_occurrence_observed")[len(observed) :]
+    assert len(later) == 1
+    assert later[0]["task_id"] == own.id
+    assert later[0]["scheduled_at"] != next(
+        e["scheduled_at"] for e in observed if e["task_id"] == own.id
+    )
+
 
 async def test_startup_limit_leaves_unclaimed_work_for_next_poll(store) -> None:
     tasks = [_task(store, str(i)) for i in range(2)]

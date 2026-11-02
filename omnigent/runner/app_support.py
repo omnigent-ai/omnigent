@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, overload
 
@@ -37,7 +37,7 @@ class _TurnMessage(dict[str, Any]):
         self.scheduled_run = scheduled_run
 
 
-def _message_scheduled_run(body: _JsonObject) -> ScheduledRunLogContext | None:
+def _message_scheduled_run(body: Mapping[str, Any] | None) -> ScheduledRunLogContext | None:
     """Internal wakes and ordinary dictionaries have no automation attribution."""
     return body.scheduled_run if isinstance(body, _TurnMessage) else None
 

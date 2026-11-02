@@ -179,9 +179,13 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
     assert row["attributes"]["trigger_key"] == run.trigger_key
 
 
-@pytest.mark.parametrize("session_mode", ["new", "continue"])
 @pytest.mark.parametrize(
-    "failed_stage", [None, "runner_start", "prompt_prepare", "prompt_send", "native_refusal"]
+    "session_mode,failed_stage",
+    [
+        ("new", stage)
+        for stage in [None, "runner_start", "prompt_prepare", "prompt_send", "native_refusal"]
+    ]
+    + [("continue", None)],
 )
 async def test_prompt_logs_measure_delivery_and_locate_failures(
     store, monkeypatch, caplog, session_mode, failed_stage
@@ -303,7 +307,9 @@ async def test_delivery_log_failure_does_not_fail_the_run(store, monkeypatch) ->
 
     claimed = _claim(store)
     deps = _deps(store)
-    send = AsyncMock()
+    send = AsyncMock(
+        return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None)
+    )
     monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
     monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
     monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
@@ -1405,3 +1411,32 @@ def test_creation_telemetry_bounds_dimensions(
     assert event.attributes["template_id"] == expected_template
     assert "private" not in str(event.attributes)
     assert task.prompt not in str(event.attributes)
+
+
+@pytest.mark.parametrize("stage", ["input_validation", "runner_start"])
+def test_stage_started_deduplicates_nested_scopes_per_run(caplog, stage):
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+
+    caplog.set_level(logging.INFO)
+    for run_id in ("A", "B"):
+        run = ScheduledRunLogContext(
+            task_id="task",
+            run_id=run_id,
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        )
+        with telemetry.scheduled_run_scope(run):
+            telemetry.start_fire_stage(stage)
+            with telemetry.fire_stage(stage, session_id="session"):
+                with telemetry.fire_stage(stage, session_id="session"):
+                    telemetry.start_fire_stage(stage, session_id="session")
+                    assert telemetry.current_fire_stage() == stage
+    events = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_stage_started"
+    ]
+    assert [(e["run_id"], e["fire_stage"]) for e in events] == [(run, stage) for run in ("A", "B")]
+    assert telemetry.current_fire_stage() == "input_validation"

@@ -23,7 +23,9 @@ from omnigent.scheduled_context import (
 )
 
 _logger = logging.getLogger(__name__)
-_current_stage: ContextVar[str] = ContextVar("scheduled_fire_stage", default="input_validation")
+_current_stage: ContextVar[tuple[ScheduledRunLogContext, str] | None] = ContextVar(
+    "scheduled_fire_stage", default=None
+)
 
 
 def run_log_context(task: ScheduledTask, run: ScheduledTaskRun) -> ScheduledRunLogContext:
@@ -41,14 +43,20 @@ def run_log_context(task: ScheduledTask, run: ScheduledTaskRun) -> ScheduledRunL
 
 def current_fire_stage() -> str:
     """Return the most recent delivery boundary reached in this task."""
-    return _current_stage.get()
+    progress = _current_stage.get()
+    return (
+        progress[1]
+        if progress is not None and progress[0] == current_scheduled_run()
+        else "input_validation"
+    )
 
 
 def start_fire_stage(stage: str, *, session_id: str | None = None) -> None:
     """Record progress before work starts, including work that never returns."""
-    if current_scheduled_run() is None:
+    run = current_scheduled_run()
+    if run is None or _current_stage.get() == (run, stage):
         return
-    _current_stage.set(stage)
+    _current_stage.set((run, stage))
     log_delivery("scheduled_run_stage_started", session_id=session_id, fire_stage=stage)
 
 
