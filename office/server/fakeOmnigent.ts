@@ -29,6 +29,11 @@ export class FakeOmnigent implements WorkflowOmnigent {
   async interrupt(sessionId: string) {
     this.interrupted.push(sessionId);
   }
+  archived: string[] = [];
+  async archiveSession(sessionId: string) {
+    this.archived.push(sessionId);
+    this.operations.push(`archive:${sessionId}`);
+  }
   async addSessionPolicy(sessionId: string, name: string, expression: string) {
     const id = `pol_${this.policies.length + 1}`;
     this.policies.push({ sessionId, id, name, expression });

@@ -1,33 +1,33 @@
-import { useState } from "react";
-import { AGENT_ROLES, GATE_TITLES, matrixRow, roleTitle } from "../../../shared/sdlcTheme.ts";
+// The SDLC workflow's sections: requirements, interview, tasks, activity, and
+// the per-role pieces the Team pane shows.
+
+import { useEffect, useState } from "react";
+import type { RoleToolReport } from "../../../shared/roleTools.ts";
+import type { RoleWorkLine } from "../../../shared/roleWork.ts";
+import { GATE_TITLES, roleTitle } from "../../../shared/sdlcTheme.ts";
+import { taskTypeOf, teamOf, coordinatorName } from "../../../shared/team.ts";
 import type { BranchView, Requirement } from "../../../shared/workflowTypes.ts";
 import { OfficeApiError, officeApi } from "../../api.ts";
 import { useRuntimeOptions } from "../../capabilities.ts";
 import { DictationButton } from "../../Dictation.tsx";
 import { interviewSegment, INTERVIEW_SEGMENTS } from "../../../shared/interviewProgress.ts";
-import { READINESS_LABELS, type RoleHealth } from "../../../shared/troubleshoot.ts";
-import { AgentProblems, problemAnchor } from "./AgentProblems.tsx";
+import type { RoleHealth } from "../../../shared/troubleshoot.ts";
+import { problemAnchor } from "./AgentProblems.tsx";
 import { InterviewProgressBar } from "./InterviewProgressBar.tsx";
 
-interface WorkflowPanelProps {
+export interface WorkflowPanelProps {
   view: BranchView;
   onChanged: () => void;
 }
 
-const HEALTH_LABELS: Record<RoleHealth["state"], string> = {
-  working: "working",
-  waiting_human: "waiting on you",
-  idle: "idle",
-  problem: "has a problem",
-  not_started: "not started",
-};
+const FEED_PAGE = 30;
 
 /** The role's own (persistent) session health, if the room loaded it. */
-function roleHealth(view: BranchView, role: string): RoleHealth | undefined {
+export function roleHealth(view: BranchView, role: string): RoleHealth | undefined {
   return view.health?.find((entry) => entry.role === role && !entry.temporary);
 }
 
-function focusProblem(view: BranchView, entry: RoleHealth): void {
+export function focusProblem(view: BranchView, entry: RoleHealth): void {
   const card = document.getElementById(problemAnchor(view.branch.id, entry));
   card?.scrollIntoView({ block: "center" });
   card?.focus();
@@ -41,7 +41,7 @@ function appendText(current: string, addition: string): string {
   return current.trim() ? `${current.trimEnd()} ${addition}` : addition;
 }
 
-function BoardEditor({ view, onChanged }: WorkflowPanelProps) {
+export function BoardEditor({ view, onChanged }: WorkflowPanelProps) {
   const [draft, setDraft] = useState<Requirement[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -77,7 +77,7 @@ function BoardEditor({ view, onChanged }: WorkflowPanelProps) {
       <h3>
         Requirements board <span className="muted small">revision {view.board.revision}</span>
       </h3>
-      {requirements.length === 0 && !editing ? <p className="muted">No requirements yet. Add them or start a PM interview.</p> : null}
+      {requirements.length === 0 && !editing ? <p className="muted">No requirements yet. Add them or start a {coordinatorName()} interview.</p> : null}
       <ol className="requirements-list">
         {requirements.map((requirement, index) =>
           editing ? (
@@ -153,7 +153,7 @@ function BoardEditor({ view, onChanged }: WorkflowPanelProps) {
   );
 }
 
-function Interview({ view, onChanged }: WorkflowPanelProps) {
+export function Interview({ view, onChanged }: WorkflowPanelProps) {
   const [topic, setTopic] = useState("");
   const [answer, setAnswer] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -182,8 +182,8 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
   };
 
   return (
-    <section aria-label="PM interview" className="workflow-section">
-      <h3>PM interview{current?.topic ? `: ${current.topic}` : ""}</h3>
+    <section aria-label="Interview" className="workflow-section">
+      <h3>{coordinatorName()} interview{current?.topic ? `: ${current.topic}` : ""}</h3>
       {current ? <InterviewProgressBar questions={agenda} /> : null}
       {agenda.length ? (
         <details>
@@ -201,14 +201,14 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
       {waitingOnPm ? (
         pm?.problem && !pm.dismissed ? (
           <p className="error-text" role="status">
-            ⚠ The PM can't continue the interview: {pm.problem.title}.{" "}
+            ⚠ The {coordinatorName()} can't continue the interview: {pm.problem.title}.{" "}
             <button type="button" onClick={() => focusProblem(view, pm)}>
               See how to fix it
             </button>
           </p>
         ) : (
           <p className="muted" role="status">
-            {pm?.state === "working" ? "The PM is preparing its next question…" : "Waiting for the PM to ask its next question."}
+            {pm?.state === "working" ? `The ${coordinatorName()} is preparing its next question…` : `Waiting for the ${coordinatorName()} to ask its next question.`}
           </p>
         )
       ) : null}
@@ -219,11 +219,11 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
             void run(async () => {
               await officeApi.answerInterview(view.branch.id, open.id, answer.trim());
               setAnswer("");
-            }, "Answer sent to the PM.");
+            }, `Answer sent to the ${coordinatorName()}.`);
           }}
         >
           <p className="approval-message">
-            <strong>PM asks:</strong> {open.question}
+            <strong>{coordinatorName()} asks:</strong> {open.question}
           </p>
           <label htmlFor="interview-answer">Your answer (edit any dictated text before sending)</label>
           <textarea id="interview-answer" rows={3} value={answer} onChange={(event) => setAnswer(event.target.value)} />
@@ -238,13 +238,13 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            void run(() => officeApi.startInterview(view.branch.id, topic), "Interview started; the PM was asked to plan its questions.");
+            void run(() => officeApi.startInterview(view.branch.id, topic), `Interview started; the ${coordinatorName()} was asked to plan its questions.`);
           }}
         >
           <label htmlFor="interview-topic">Interview topic (optional)</label>
           <input id="interview-topic" value={topic} onChange={(event) => setTopic(event.target.value)} />
           <button type="submit" disabled={busy}>
-            Start PM interview
+            Start {coordinatorName()} interview
           </button>
         </form>
       )}
@@ -268,12 +268,12 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
   );
 }
 
-function Tasks({ view, onChanged }: WorkflowPanelProps) {
+export function Tasks({ view, onChanged }: WorkflowPanelProps) {
   const [notice, setNotice] = useState<string | null>(null);
   return (
     <section aria-label="Tasks" className="workflow-section">
       <h3>Tasks</h3>
-      {view.tasks.length === 0 ? <p className="muted">The PM has not created tasks yet.</p> : null}
+      {view.tasks.length === 0 ? <p className="muted">The {coordinatorName()} has not created tasks yet.</p> : null}
       <ul className="task-list">
         {view.tasks.map((task) => (
           <li key={task.id} className={`task task-${task.status}`}>
@@ -294,7 +294,7 @@ function Tasks({ view, onChanged }: WorkflowPanelProps) {
                   ))
               : null}
             <div className="muted small">
-              {matrixRow(task.taskType)?.title ?? task.taskType} · R: {task.responsible.map(roleTitle).join(", ")} · A: {roleTitle(task.accountable)}
+              {taskTypeOf(teamOf(view.branch.runtime), task.taskType)?.title ?? task.taskType} · R: {task.responsible.map(roleTitle).join(", ")} · A: {roleTitle(task.accountable)}
               {task.gate ? ` · ${GATE_TITLES[task.gate]} gate` : ""}
               {task.dependsOn.length ? ` · after ${task.dependsOn.map((id) => view.tasks.find((other) => other.id === id)?.title ?? id).join(", ")}` : ""}
             </div>
@@ -339,98 +339,143 @@ function Tasks({ view, onChanged }: WorkflowPanelProps) {
   );
 }
 
-function Roles({ view, onChanged }: WorkflowPanelProps) {
-  const [notice, setNotice] = useState<string | null>(null);
-  const live = view.roleSessions.filter((link) => link.retiredAt === null);
-  return (
-    <section aria-label="Roles" className="workflow-section">
-      <h3>Roles</h3>
-      <ul>
-        {AGENT_ROLES.map((role) => {
-          const links = live.filter((link) => link.role === role);
-          const hasPersistent = links.some((link) => !link.temporary);
-          const health = roleHealth(view, role);
-          const notReady = health && health.harnessReadiness !== "ready" && health.harnessReadiness !== "unknown";
-          return (
-            <li key={role}>
-              {roleTitle(role)}: {links.length ? `${links.length} session${links.length > 1 ? "s" : ""}` : "not started"}
-              {health ? ` · ${health.harness}` : ""}
-              {health && health.state !== "not_started" && health.state !== "problem" ? ` · ${HEALTH_LABELS[health.state]}` : ""}
-              {notReady ? <span className="error-text small"> · {health.harness} on this host: {READINESS_LABELS[health.harnessReadiness]}</span> : null}
-              {health?.problem && !health.dismissed ? (
-                <button type="button" className="link-button" onClick={() => focusProblem(view, health)}>
-                  {" · "}
-                  ⚠ {health.problem.title}
-                </button>
-              ) : null}{" "}
-              {hasPersistent || role === "pm" ? (
-                <button
-                  type="button"
-                  onClick={() =>
-                    void officeApi
-                      .rollover(view.branch.id, role, hasPersistent ? "PO restarted the role." : "PO started the role.")
-                      .then(() => {
-                        setNotice(hasPersistent ? `${roleTitle(role)} restarted with a recorded handoff.` : `${roleTitle(role)} started.`);
-                        onChanged();
-                      })
-                      .catch((caught: Error) => setNotice(caught.message))
-                  }
-                >
-                  {hasPersistent ? "Restart with handoff" : "Start PM"}
-                </button>
-              ) : null}
-            </li>
-          );
-        })}
-      </ul>
-      <button
-        type="button"
-        className="danger"
-        onClick={() =>
-          void officeApi
-            .stopBranch(view.branch.id)
-            .then((result) => setNotice(`Stop sent to ${result.stopped} session(s).`))
-            .catch((caught: Error) => setNotice(caught.message))
-        }
-      >
-        Stop all work in this room
-      </button>
-      {notice ? <p role="status">{notice}</p> : null}
-    </section>
-  );
-}
+const TOOL_SOURCE_NOTES: Record<RoleToolReport["source"], string> = {
+  session: "As Omnigent reports them for the running session.",
+  planned: "Not started yet: what the role will start with.",
+  unavailable: "Omnigent did not report this session's configuration; showing what the office set up.",
+};
 
-export function WorkflowPanel({ view, onChanged }: WorkflowPanelProps) {
+/** Configured MCP servers, skills, and policies, and the office tools the role may call. */
+export function RoleTools({ report }: { report: RoleToolReport }) {
   return (
-    <div className="workflow-panel">
-      <AgentProblems view={view} onChanged={onChanged} />
-      <BoardEditor view={view} onChanged={onChanged} />
-      <Interview view={view} onChanged={onChanged} />
-      <Tasks view={view} onChanged={onChanged} />
-      <Roles view={view} onChanged={onChanged} />
-      {view.decisions.length ? (
-        <section aria-label="Coordinator decisions" className="workflow-section">
-          <h3>Coordinator decisions</h3>
-          <ul>
-            {view.decisions.map((decision) => (
-              <li key={decision.id}>
-                {formatTime(decision.at)}: {decision.summary}
-                {decision.affectedRoles.length ? ` (affects ${decision.affectedRoles.map(roleTitle).join(", ")})` : ""}
+    <div className="role-tools">
+      <p className="muted small">
+        {TOOL_SOURCE_NOTES[report.source]} The harness's own built-in tools (shell, file edits, search) come on top.
+      </p>
+      <div className="role-tools-grid">
+        <section aria-label="Available office tools">
+          <h4>Available office tools ({report.officeTools.length})</h4>
+          <ul className="tool-chips">
+            {report.officeTools.map((tool) => (
+              <li key={tool.name} title={tool.description}>
+                <code>{tool.name}</code>
               </li>
             ))}
           </ul>
         </section>
+        <section aria-label="Configured MCP servers">
+          <h4>MCP servers ({report.mcpServers.length})</h4>
+          <ul>
+            {report.mcpServers.map((server) => (
+              <li key={server.name}>
+                <code>{server.name}</code>
+                {server.transport ? <span className="muted"> · {server.transport}</span> : null}
+                {server.target ? <div className="muted small tool-target">{server.target}</div> : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+        <section aria-label="Configured skills">
+          <h4>Skills ({report.skills.length})</h4>
+          {report.skills.length ? (
+            <ul>
+              {report.skills.map((skill) => (
+                <li key={skill}>
+                  <code>{skill}</code>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted small">None</p>
+          )}
+        </section>
+        <section aria-label="Configured policies">
+          <h4>Policies ({report.policies.length})</h4>
+          <ul>
+            {report.policies.map((policy) => (
+              <li key={policy.name}>
+                <code>{policy.name}</code>
+                {policy.description ? <div className="muted small">{policy.description}</div> : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+const WORK_POLL_MS = 5_000;
+
+export function timeAgo(epochSeconds: number): string {
+  const minutes = Math.max(0, Math.round((Date.now() / 1000 - epochSeconds) / 60));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+/** Each role's one-line current work, refreshed while the Team tab is open. */
+export function useRoleWork(branchId: string | null): Map<string, RoleWorkLine> {
+  const [lines, setLines] = useState<Map<string, RoleWorkLine>>(new Map());
+  useEffect(() => {
+    if (!branchId) return;
+    let cancelled = false;
+    const load = () =>
+      officeApi
+        .roleWork(branchId)
+        .then((data) => !cancelled && setLines(new Map(data.map((entry) => [entry.role, entry]))))
+        .catch(() => undefined);
+    void load();
+    const timer = window.setInterval(load, WORK_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [branchId]);
+  return lines;
+}
+
+export function Activity({ view }: { view: BranchView }) {
+  const [shownEvents, setShownEvents] = useState(FEED_PAGE);
+  const [allDecisions, setAllDecisions] = useState(false);
+  const decisions = [...view.decisions].reverse();
+  const visibleDecisions = allDecisions ? decisions : decisions.slice(0, 5);
+  return (
+    <>
+      {decisions.length ? (
+        <section aria-label="Coordinator decisions" className="workflow-section">
+          <h3>Coordinator decisions <span className="muted small">newest first</span></h3>
+          <ul className="decision-list">
+            {visibleDecisions.map((decision) => (
+              <li key={decision.id}>
+                <span className="muted small">{formatTime(decision.at)}</span> {decision.summary}
+                {decision.affectedRoles.length ? <span className="muted small"> (affects {decision.affectedRoles.map(roleTitle).join(", ")})</span> : null}
+              </li>
+            ))}
+          </ul>
+          {decisions.length > 5 ? (
+            <button type="button" onClick={() => setAllDecisions((shown) => !shown)}>
+              {allDecisions ? "Show the latest 5" : `Show all ${decisions.length} decisions`}
+            </button>
+          ) : null}
+        </section>
       ) : null}
       <section aria-label="Event feed" className="workflow-section">
-        <h3>Event feed</h3>
+        <h3>Event feed <span className="muted small">newest first</span></h3>
         <ol className="event-feed">
-          {view.events.map((event) => (
+          {view.events.slice(0, shownEvents).map((event) => (
             <li key={event.id}>
               <span className="muted small">{formatTime(event.at)}</span> {event.summary}
             </li>
           ))}
         </ol>
+        {view.events.length > shownEvents ? (
+          <button type="button" onClick={() => setShownEvents((count) => count + FEED_PAGE)}>
+            Show older events
+          </button>
+        ) : null}
       </section>
-    </div>
+    </>
   );
 }

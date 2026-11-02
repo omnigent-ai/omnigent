@@ -1,7 +1,14 @@
 // Browser client for the office service. It never talks to Omnigent directly
 // and never sees Omnigent credentials.
 
-import type { GateType } from "../shared/sdlcTheme.ts";
+import type { HarnessModels } from "../shared/harnessModels.ts";
+import type { ProjectLink } from "../shared/projectLinks.ts";
+import type { TeamDefinition } from "../shared/team.ts";
+import type { RoleToolReport, RoleToolSettings } from "../shared/roleTools.ts";
+import type { TeamTemplate } from "../shared/teamTemplates.ts";
+import type { RoomMessage } from "../shared/roomMessages.ts";
+import type { RoleWorkLine } from "../shared/roleWork.ts";
+import type { AgentRoleId, GateType } from "../shared/sdlcTheme.ts";
 import type { ScheduledRetry } from "../shared/troubleshoot.ts";
 import type { BuildingSnapshot, RoomSettingsPatch } from "../shared/types.ts";
 import type { BranchRuntime, BranchView, Requirement } from "../shared/workflowTypes.ts";
@@ -105,6 +112,14 @@ async function call<T>(path: string, init?: { method?: string; body?: unknown })
   return body as T;
 }
 
+export interface WorkspaceEntry {
+  name: string;
+  /** Relative to the room's folder. */
+  path: string;
+  type: "directory" | "file";
+  bytes: number | null;
+}
+
 export interface NewRoomRequest {
   name: string;
   icon: string;
@@ -124,11 +139,6 @@ export const officeApi = {
   session: (sessionId: string) => call<SessionDetail>(`/sessions/${encodeURIComponent(sessionId)}`),
   items: async (sessionId: string) =>
     (await call<{ data: SessionItem[] }>(`/sessions/${encodeURIComponent(sessionId)}/items`)).data,
-  sendMessage: (sessionId: string, text: string) =>
-    call<{ queued: boolean; denied?: boolean }>(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
-      method: "POST",
-      body: { text },
-    }),
   stop: (sessionId: string) => call(`/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST" }),
   decide: (sessionId: string, elicitationId: string, action: "accept" | "decline", feedback?: string) =>
     call<{ replayed: boolean }>(
@@ -141,6 +151,53 @@ export const officeApi = {
       `/hosts/${encodeURIComponent(hostId)}/directories?path=${encodeURIComponent(path)}`,
     ),
   runtimeOptions: () => call<RuntimeOptions>("/runtime-options"),
+  harnessModels: (hostId: string, harness: string) =>
+    call<HarnessModels>(`/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/models`),
+  roomMessages: async (projectId: string) => (await call<{ data: RoomMessage[] }>(`/rooms/${encodeURIComponent(projectId)}/messages`)).data,
+  sendRoomMessage: (projectId: string, text: string, recipients: { sessionId: string; name: string }[]) =>
+    call<{ message: RoomMessage | null; failures: { name: string; error: string }[] }>(`/rooms/${encodeURIComponent(projectId)}/messages`, {
+      method: "POST",
+      body: { text, recipients },
+    }),
+  roomLinks: (projectId: string) =>
+    call<{ links: ProjectLink[]; app: { url: string; folder: string } | null }>(`/rooms/${encodeURIComponent(projectId)}/links`),
+  addRoomLink: (projectId: string, label: string, url: string) =>
+    call<{ link: ProjectLink }>(`/rooms/${encodeURIComponent(projectId)}/links`, { method: "POST", body: { label, url } }),
+  removeRoomLink: (projectId: string, linkId: string) =>
+    call<{ removed: boolean }>(`/rooms/${encodeURIComponent(projectId)}/links/${encodeURIComponent(linkId)}`, { method: "DELETE" }),
+  roomUsage: (projectId: string) => call<{ totalTokens: number; costUsd: number; sessions: number }>(`/rooms/${encodeURIComponent(projectId)}/usage`),
+  roomFiles: (projectId: string, path: string) =>
+    call<{ workspace: string; path: string; entries: WorkspaceEntry[]; hasMore: boolean }>(
+      `/rooms/${encodeURIComponent(projectId)}/files?path=${encodeURIComponent(path)}`,
+    ),
+  roomFile: (projectId: string, path: string) =>
+    call<{ path: string; content: string | null; truncated: boolean; bytes: number | null; contentType: string | null }>(
+      `/rooms/${encodeURIComponent(projectId)}/files/content?path=${encodeURIComponent(path)}`,
+    ),
+  closeTemporaryWorkers: (branchId: string, sessionIds: string[]) =>
+    call<{ closed: string[]; failed: string[] }>(`/branches/${branchId}/temporary-workers/close`, { method: "POST", body: { sessionIds } }),
+  closeReplacedSessions: (branchId: string, sessionIds: string[]) =>
+    call<{ closed: string[]; failed: string[] }>(`/branches/${branchId}/replaced-sessions/close`, { method: "POST", body: { sessionIds } }),
+  teamConfig: async (branchId: string) =>
+    (await call<{ data: { role: AgentRoleId; prompt: string; customInstructions: string }[] }>(`/branches/${branchId}/team-config`)).data,
+  setTeam: (branchId: string, team: TeamDefinition) => call<BranchView>(`/branches/${branchId}/team`, { method: "PUT", body: { team } }),
+  officeTools: async () => (await call<{ data: { name: string; description: string; coordinatorOnly: boolean }[] }>("/office-tools")).data,
+  teamTemplates: async () => (await call<{ data: TeamTemplate[] }>("/team-templates")).data,
+  saveTeamTemplate: (branchId: string, name: string, description: string) =>
+    call<{ template: TeamTemplate }>(`/branches/${branchId}/team-templates`, { method: "POST", body: { name, description } }),
+  applyTeamTemplate: (branchId: string, templateId: string, restart: boolean) =>
+    call<{ view: BranchView; changed: AgentRoleId[] }>(`/branches/${branchId}/team-templates/${encodeURIComponent(templateId)}/apply`, {
+      method: "POST",
+      body: { restart },
+    }),
+  importTeamTemplate: (yaml: string) => call<{ template: TeamTemplate; replaced: boolean }>("/team-templates/import", { method: "POST", body: { yaml } }),
+  deleteTeamTemplate: (templateId: string) => call<{ deleted: boolean }>(`/team-templates/${encodeURIComponent(templateId)}`, { method: "DELETE" }),
+  setRoleToolSettings: (branchId: string, role: AgentRoleId, settings: RoleToolSettings, restart: boolean) =>
+    call<BranchView>(`/branches/${branchId}/roles/${role}/tool-settings`, { method: "PUT", body: { settings, restart } }),
+  setRoleInstructions: (branchId: string, role: AgentRoleId, text: string, restart: boolean) =>
+    call<BranchView>(`/branches/${branchId}/roles/${role}/instructions`, { method: "PUT", body: { text, restart } }),
+  roleWork: async (branchId: string) => (await call<{ data: RoleWorkLine[] }>(`/branches/${branchId}/role-work`)).data,
+  roleTools: async (branchId: string) => (await call<{ data: RoleToolReport[] }>(`/branches/${branchId}/tools`)).data,
   branch: async (projectId: string) =>
     (await call<{ branch: BranchView | null }>(`/rooms/${encodeURIComponent(projectId)}/branch`)).branch,
   assignTheme: (projectId: string, runtime: BranchRuntime, gates: Partial<Record<GateType, boolean>>) =>
@@ -172,6 +229,6 @@ export const officeApi = {
     }),
   dismissProblem: (branchId: string, subject: string, key: string) =>
     call<{ dismissed: boolean }>(`/branches/${branchId}/problems/dismiss`, { method: "POST", body: { subject, key } }),
-  switchHarness: (branchId: string, roles: string[], harness: string, model: string, reason: string) =>
-    call<BranchView>(`/branches/${branchId}/roles/switch-harness`, { method: "POST", body: { roles, harness, model, reason } }),
+  switchHarness: (branchId: string, roles: string[], harness: string, model: string, effort: string, reason: string) =>
+    call<BranchView>(`/branches/${branchId}/roles/switch-harness`, { method: "POST", body: { roles, harness, model, effort, reason } }),
 };

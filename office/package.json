@@ -14,7 +14,11 @@
   },
   "dependencies": {
     "react": "catalog:",
-    "react-dom": "catalog:"
+    "react-dom": "catalog:",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "shiki": "catalog:",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^24.12.2",

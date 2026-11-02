@@ -15,6 +15,7 @@ export interface HostDirectoryEntry {
   name: string;
   path: string;
   type: "directory" | "file" | "other";
+  bytes?: number | null;
 }
 
 export interface OmnigentSessionListItem {
@@ -31,6 +32,8 @@ export interface OmnigentSessionListItem {
   pending_elicitations_count: number;
   archived: boolean;
   labels?: Record<string, string>;
+  /** The folder the session works in on its host. */
+  workspace?: string | null;
 }
 
 export class OmnigentError extends Error {
@@ -84,10 +87,11 @@ export class OmnigentClient {
     const text = await response.text();
     const parsed = text ? (JSON.parse(text) as unknown) : null;
     if (!response.ok) {
-      const error = (parsed as { error?: { message?: string; code?: string } } | null)?.error;
+      const body = parsed as { error?: { message?: string; code?: string }; detail?: unknown } | null;
+      const error = body?.error;
       throw new OmnigentError(
         response.status,
-        error?.message ?? `${response.status} ${response.statusText}`,
+        error?.message ?? (typeof body?.detail === "string" ? body.detail : `${response.status} ${response.statusText}`),
         error?.code,
       );
     }
@@ -140,8 +144,20 @@ export class OmnigentClient {
     return this.request<ItemsPage>(`/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`);
   }
 
-  async getSession(sessionId: string): Promise<Record<string, unknown>> {
-    const params = new URLSearchParams({ include_items: "false", include_usage: "false" });
+  /** A file in the session's workspace; `path` is relative to it. */
+  async readSessionFile(sessionId: string, path: string): Promise<{ content?: string; truncated?: boolean; bytes?: number; content_type?: string; encoding?: string }> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/resources/environments/default/filesystem/${encoded}`);
+  }
+
+  /** The session's agent: MCP servers, skills, and policies Omnigent applies to it. */
+  async getSessionAgent(sessionId: string): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/agent`);
+  }
+
+  /** Session detail; token usage is left out unless asked for, since most callers poll. */
+  async getSession(sessionId: string, options: { usage?: boolean } = {}): Promise<Record<string, unknown>> {
+    const params = new URLSearchParams({ include_items: "false", include_usage: options.usage ? "true" : "false" });
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}?${params}`);
   }
 
@@ -202,6 +218,11 @@ export class OmnigentClient {
     return this.request("/v1/harnesses");
   }
 
+  /** Models the host's harness lists before launch; fails for harnesses without a catalog. */
+  async hostModelOptions(hostId: string, harness: string): Promise<unknown> {
+    return this.request(`/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`);
+  }
+
   async info(): Promise<Record<string, unknown>> {
     return this.request("/v1/info");
   }
@@ -212,6 +233,10 @@ export class OmnigentClient {
       method: "POST",
       body: { type: "retry_session", data: {} },
     });
+  }
+
+  async archiveSession(sessionId: string): Promise<unknown> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body: { archived: true } });
   }
 
   async interrupt(sessionId: string): Promise<unknown> {
@@ -226,10 +251,14 @@ export class OmnigentClient {
     elicitationId: string,
     action: "accept" | "decline",
     content?: Record<string, unknown>,
+    meta?: Record<string, unknown>,
   ): Promise<unknown> {
+    const body: Record<string, unknown> = { action };
+    if (content) body.content = content;
+    if (meta) body._meta = meta;
     return this.request(
       `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/resolve`,
-      { method: "POST", body: content ? { action, content } : { action } },
+      { method: "POST", body },
     );
   }
 }

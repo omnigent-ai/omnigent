@@ -29,6 +29,7 @@ The office never starts Omnigent. Configure it with environment variables:
 | `OMNIGENT_USER_EMAIL` | unset | `X-Forwarded-Email` for header-auth servers |
 | `OMNIGENT_OFFICE_PORT` | `6780` | Office service port (loopback only) |
 | `OMNIGENT_OFFICE_DEV_PORT` | `6781` | Vite dev server port |
+| `OMNIGENT_OFFICE_PREVIEW_PORT` | `6782` | Serves rooms' web apps (loopback, read-only, its own origin) |
 | `OMNIGENT_OFFICE_DATA_DIR` | `~/.omnigent-office` | Durable office state |
 | `OMNIGENT_OFFICE_NOTIFICATIONS` | on | `off` disables desktop notifications |
 | `OMNIGENT_OFFICE_MCP_URL` | `http://127.0.0.1:<port>/office/mcp` | Office MCP URL given to role sessions |
@@ -46,10 +47,139 @@ The office never starts Omnigent. Configure it with environment variables:
 
 ### SDLC workflow
 
-Choose the SDLC theme in the New room dialog (roles default to Developer and QA on
-Claude, Architect and PM on Codex, DevOps on Gemini via the agy CLI (`antigravity-native`), and Reviewing Developer
-on Copilot; an optional harness overrides all roles), or assign
-it later from inside an unthemed room. The room's host and folder (picked by
+Choose the SDLC theme in the New room dialog, or assign it later from inside an
+unthemed room. Each role gets its own harness and model (defaults: Developer and QA
+on Claude, Architect and PM on Codex, DevOps on Gemini via the agy CLI
+(`antigravity-native`), and Reviewing Developer on Copilot). Models are listed from
+the host's own probe (`GET /v1/hosts/{id}/harnesses/{harness}/model-options`,
+cached by the service; the Codex SDK uses the Codex CLI's list). Omnigent cannot
+list Copilot or Antigravity models, so when the host is this machine the service
+reads them from `copilot help config` and `agy models`; elsewhere they take a typed
+model id or their default. Each role also has a reasoning effort (sent as
+`executor.reasoning_effort`), offered from the harness's effort family and narrowed
+to what the chosen model reports; agy picks effort through the model variant.
+A room has three panes: the **Office Board** (the room's Omnigent sessions; pick one
+to read and message it), the middle (the project's status, party size, and event
+count with Board, Team, Room settings, and Exit office; requests; stuck agents; and
+the pixel-art office), and **Team** / **Files** tabs on the right. Board opens the
+requirements, tasks, and PM interview in a dialog. Team shows the tokens and cost
+used across the project's sessions (`usage_by_model`), the team with the PO, and the
+activity feed. Files browses the room's host folder; a file opens as a tab beside
+the **Office** tab in the middle (read through a session working in that folder) with
+syntax highlighting by file type, line numbers, wrap, and copy. Markdown files open in
+**Reader** mode (GitHub-flavored, rendered with the repository's `react-markdown` and
+`remark-gfm`; raw HTML is not rendered), with a **Code** switch for the source.
+Relative links open the linked file as a tab; web links open outside the office. Escape on a file tab
+returns to the office, which keeps its place while hidden. Highlighting uses the repository's Shiki with its
+JavaScript regex engine, since the office's content policy blocks WebAssembly; very
+large files show as plain text. Paths outside the folder are refused.
+
+The message box under the office works like Slack: Enter sends, Shift+Enter adds a
+line, and it grows as you type. Typing `@` suggests who to address (`@PM`, `@Architect`,
+`@Developer`, `@Reviewer`, `@QA`, `@DevOps`; in an unthemed room, each session by name).
+A message with mentions goes to every mentioned role's current session; without one it
+goes to the **To** recipient. The office keeps the PO's messages per room (the latest
+200, in `office-state.json`), and the chat's project channel shows them, tagged with
+who they reached, alongside the event feed. Roles that have not started are listed but cannot receive
+messages yet.
+
+Temporary workers can be closed from the Office Board (× on the row, or **Clear N
+finished** for those whose tasks are done) and from their DM in the chat sidebar. Closing
+stops any turn, archives the session in Omnigent (it can be unarchived there), and
+retires it in the office; its task is left for the PM to redispatch, and the event
+feed records it.
+
+Both side panes collapse to a thin rail (« / »), giving the middle their width; the
+choice is remembered per browser. Choosing a worker reopens the Office Board, and the
+project bar's Team button reopens the right pane.
+
+**Animation ON/OFF** (top right of the middle stage) swaps the pixel-art office for a
+Slack-style chat of the same room: `# <project>` (the Omnigent project name) is the event feed, and each current
+session is a direct message showing its conversation. Choosing a DM points the message
+box at that worker. The choice is remembered per browser, and turning animation off
+stops the canvas.
+
+Under the project bar, **project links** collect the room's results:
+
+- **Open <project>** appears when the room's folder holds a web app (`index.html` in
+  `dist/`, `build/`, `out/`, the root, or `public/`) and its host is this machine. The
+  service serves it read-only on the preview port, a separate origin, so the app's
+  code cannot call the office API. Root paths such as `/assets/app.js` resolve to the
+  app opened last in that browser. Server apps (Next.js, APIs) need a link instead.
+- Roles share results with the `office_link_publish` tool (a deployment, preview URL,
+  pull request, or report); the PO can add or remove links. Links are http(s) only,
+  at most 20 per project, and each shows who shared it.
+
+The project bar's **Team** button opens **Team configuration** in an SDLC room: for each
+role, its harness, model, effort, and readiness (with Change…), its Omnigent session
+(Open in Omnigent, Restart with handoff), its tools, and its **role prompt**: the exact
+instructions the office gives a new session of that role. The PO can add instructions
+per role (`runtime.roleCustomInstructions`, up to 8,000 characters); they are appended to
+the prompt, and a running role picks them up on **Save and restart** or its next restart.
+
+Team configuration also edits each role's **tools and policies**
+(`runtime.roleToolSettings`): office tools can be turned off (refused and hidden by the
+office MCP at once; `office_board_get`, `office_task_update`, `office_message_role`, and
+the PM's create/dispatch stay on), extra MCP servers (name and http(s) URL) can be added to
+the role's session, and Omnigent's `blast_radius` policy can ask before (default), deny, or
+allow recoverable outward commands, always blocking catastrophic ones. MCP server and
+policy changes reach a running role when it restarts; the dialog marks such roles.
+
+A room has its own **team** (`runtime.team`; absent means the SDLC team): its roles and
+its task types. The PO can drop SDLC roles, add them back, and add custom roles with their
+own title, brief (the start of the role's prompt), and default harness; the PM always stays
+because it coordinates. Task types can be added, renamed, removed, and put behind a human
+gate. Every task type needs exactly one accountable role and at least one responsible role.
+The New room screen sets the team up in the same layout as Team configuration (a **Team**
+tab beside **Room**). The **Theme** list offers SDLC (default team), Native (single agent), Custom team, and each
+saved team template, kept in step with the Team tab. **Start from template** offers **Custom** and every template: with a
+template, roles can be removed (× in the left pane) and the template shows as modified;
+with Custom, **+ Add role** builds the team role by role from the current one; later changes happen in Team
+configuration. Taking a role off the team stops and retires its sessions; tasks keep
+their history. Agents see the room's roles and task types in the office tools' schemas and
+in `office_board_get`.
+
+Team configuration opens on **Team**: the room's whole RACI matrix (every task type
+against all seven roles, the PO included, each cell editable) and every role's open
+tasks side by side. Each role's page shows the same for that role, and both share one
+unsaved draft.
+Team configuration also shows each role's **tasks and RACI**: its open tasks with its part
+(R, A, R+A, C) and its letter for every task type, which the PO can change per room
+(`runtime.raci`, only the cells that differ from the SDLC theme). A task type keeps exactly
+one accountable role (making a role accountable moves it off the previous one) and at least
+one responsible role. Tasks the PM creates afterwards, their briefs, and the matrix agents
+read through `office_board_get` follow the room's RACI; existing tasks keep their roles.
+
+**Team templates** are named, reusable teams shared by every room (stored in
+`office-state.json`). In Team configuration, **Save as template…** captures each role's
+harness, model, effort, instructions, tools, and policies, plus the team itself (its roles,
+task types, and RACI; not the room's folder or human gates; saving under an existing name replaces it), and **Switch template…** previews which
+roles a template would change, then applies it for their next restart or restarts the
+changed roles now. **Default team** is built in and resets every role to the defaults.
+**Export YAML** downloads the room's team as a team file (`kind: omnigent-office-team`,
+`version: 1`): each role's id, title, brief, default harness, and setup (harness, model,
+effort, instructions, `tools` with `disabledTools`, `mcpServers`, and `riskPolicy`), and
+each task type's gate and RACI by role id (unlisted roles are Informed). **Import YAML…**
+checks a file like any team (the PM first, one accountable role per task type, known office
+tools) and saves it as a template, replacing one with the same name; a file named after a
+built-in team is saved as "<name> (imported)". Team configuration then shows it under
+**Switch template…** with what it would change; the New room Team tab starts the team from
+it. Both screens offer the two buttons.
+**Native (single agent)** is also built in: one **Full Stack Developer (FSD)**, on a native CLI harness
+(`claude-native` by default; the New room screen offers a **Native harness** picker), with a
+brief that has it plan the tasks and do each one itself. It takes the PM's place (the
+coordinator is always the `pm` role), so the room's events, prompts, and labels call it FSD
+and the message box addresses it as `@FSD`. It is responsible for every task type; the PO
+keeps its SDLC letters. Switching an existing room to it retires the other roles.
+
+Under each role, the Team tab shows a one-line status of its current work: the
+in-progress todo or latest tool use while it works, otherwise its most pressing open
+task (blocked, in progress, awaiting a gate, submitted, assigned) or what it last said.
+The Team tab also lists each role's tools: the MCP servers, skills, and policies
+Omnigent reports for its session (`GET /v1/sessions/{id}/agent`, or the planned spec
+before it starts), and the office MCP tools it may call (PM-only tools are hidden for
+specialists). The room's Team tab changes any role's harness, model, or effort later; a running
+role restarts with a handoff, and a role that has not started picks it up when it starts. The room's host and folder (picked by
 browsing the host) are stored in the Omnigent project config (`host_id`,
 `workspace`) and are where role sessions run. Assigning SDLC creates a theme
 branch and starts the PM. Other roles
@@ -145,6 +275,8 @@ takes over.
 | Recovering a turn | `retry_session` event; a continuation message | A message to a failed session starts a new turn rather than resuming the old one |
 | Harness readiness | `GET /v1/hosts` `configured_harnesses`, `GET /v1/harnesses` `setup_steps` | Unknown for runner-only rooms; only common aliases are mapped |
 | Per-harness support | `GET /v1/harnesses` capabilities, shown when assigning a theme | Unsupported resume falls back to a recorded role handoff |
+| Models per harness | `GET /v1/hosts/{id}/harnesses/{harness}/model-options` | Listed for Claude, Codex, Pi, and Devin; Copilot and Antigravity come from their CLIs only when the host is this machine |
+| Effort per role | Agent spec `executor.reasoning_effort`; `/v1/harnesses` `capabilities.effort` | Per-model levels only where the probe reports them (Codex) |
 | Theme switching | — | Not implemented; branch ids are reserved in every record |
 
 ### Known limits

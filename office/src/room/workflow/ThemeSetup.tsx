@@ -3,7 +3,7 @@ import { ROLES } from "../../../shared/sdlcTheme.ts";
 import type { RoomSummary } from "../../../shared/types.ts";
 import { officeApi } from "../../api.ts";
 import { HostFolderFields } from "../../HostFolderFields.tsx";
-import { SdlcFields, emptySdlcDraft, sdlcRuntime } from "./SdlcFields.tsx";
+import { SdlcFields, SdlcTeamEditor, emptySdlcDraft, sdlcDraftProblems, sdlcRuntime } from "./SdlcFields.tsx";
 
 interface ThemeSetupProps {
   room: RoomSummary;
@@ -44,14 +44,16 @@ export function ThemeSetup({ room, onAssigned }: ThemeSetupProps) {
           void submit();
         }}
       >
-        <SdlcFields draft={draft} onChange={setDraft} />
         <HostFolderFields hostId={hostId} workspace={workspace} onHostChange={setHostId} onWorkspaceChange={setWorkspace} />
+        <SdlcFields draft={draft} onChange={setDraft} />
+        <h3>Team</h3>
+        <SdlcTeamEditor draft={draft} hostId={hostId || undefined} onChange={setDraft} />
         {error ? (
           <p className="error-text" role="alert">
             {error}
           </p>
         ) : null}
-        <button type="submit" className="primary" disabled={busy || ((!(hostId && workspace.trim())) && !draft.runnerId.trim())}>
+        <button type="submit" className="primary" disabled={busy || ((!(hostId && workspace.trim())) && !draft.runnerId.trim()) || sdlcDraftProblems(draft).length > 0}>
           {busy ? "Starting the PM…" : "Assign SDLC"}
         </button>
       </form>

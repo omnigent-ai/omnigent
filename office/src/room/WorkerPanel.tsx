@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
 import { type SessionDetail, type SessionItem, type WorkerSession, officeApi } from "../api.ts";
-import { useRuntimeOptions } from "../capabilities.ts";
-import { DictationButton } from "../Dictation.tsx";
-import { type ActivityEntry, WORKER_STATE_LABELS, deriveWorkerState, toActivity } from "../workers.ts";
+import { type ActivityEntry, toActivity } from "../../shared/sessionActivity.ts";
+import { WORKER_STATE_LABELS, type WorkerState } from "../workers.ts";
 
 const POLL_MS = 3_000;
 
@@ -16,16 +15,16 @@ const ACTIVITY_LABELS: Record<ActivityEntry["kind"], string> = {
 
 interface WorkerPanelProps {
   worker: WorkerSession;
+  state: WorkerState;
+  /** The role restarted in a newer session; this one is kept for reading. */
+  replaced?: boolean;
   onClose: () => void;
 }
 
-export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
+export function WorkerPanel({ worker, state, replaced = false, onClose }: WorkerPanelProps) {
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [items, setItems] = useState<SessionItem[]>([]);
-  const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
-  const dictationAvailable = useRuntimeOptions()?.dictationAvailable ?? false;
 
   useEffect(() => {
     let cancelled = false;
@@ -34,8 +33,8 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
         const [nextDetail, nextItems] = await Promise.all([officeApi.session(worker.id), officeApi.items(worker.id)]);
         if (cancelled) return;
         setDetail(nextDetail);
-        // The service returns newest first; show chronologically.
-        setItems([...nextItems].reverse());
+        // Newest first, as the service returns them and like the room's Activity tab.
+        setItems(nextItems);
       } catch (error) {
         if (!cancelled) setNotice(`Could not load activity: ${(error as Error).message}`);
       }
@@ -48,34 +47,8 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
     };
   }, [worker.id]);
 
-  const state = deriveWorkerState(worker);
   const activity = toActivity(items);
   const nextSteps = (detail?.todos ?? []).filter((todo) => todo.status !== "completed");
-
-  const send = async () => {
-    const text = draft.trim();
-    if (!text) return;
-    setSending(true);
-    setNotice(null);
-    try {
-      const result = await officeApi.sendMessage(worker.id, text);
-      if (result.denied) setNotice("A policy blocked this message.");
-      else setDraft("");
-    } catch (error) {
-      setNotice(`Not sent: ${(error as Error).message}`);
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const stop = async () => {
-    try {
-      await officeApi.stop(worker.id);
-      setNotice("Stop sent.");
-    } catch (error) {
-      setNotice(`Stop failed: ${(error as Error).message}`);
-    }
-  };
 
   return (
     <section className="worker-panel" aria-label={`Worker ${worker.title ?? worker.agent_name ?? worker.id}`}>
@@ -88,6 +61,7 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
             {detail?.llm_model ? ` · ${detail.llm_model}` : ""}
           </p>
           <p className={`state-pill state-${state}`}>{WORKER_STATE_LABELS[state]}</p>
+          {replaced ? <p className="muted small">Replaced: the role now runs in a newer session, shown in the Team tab.</p> : null}
         </div>
         <button type="button" onClick={onClose} aria-label="Close worker panel">
           ✕
@@ -108,7 +82,9 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
           </ul>
         </div>
       ) : null}
-      <h3>Activity</h3>
+      <h3>
+        Activity <span className="muted small">newest first</span>
+      </h3>
       <ol className="activity" aria-live="polite">
         {activity.length === 0 ? <li className="muted">No visible activity yet.</li> : null}
         {activity.map((entry) => (
@@ -118,40 +94,9 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
           </li>
         ))}
       </ol>
-      <p className="muted small">Shows messages, tool use, and stated plans only; private reasoning is never displayed.</p>
-      <form
-        className="composer"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void send();
-        }}
-      >
-        <label htmlFor={`message-${worker.id}`}>Message this worker</label>
-        <textarea
-          id={`message-${worker.id}`}
-          value={draft}
-          rows={3}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-              event.preventDefault();
-              void send();
-            }
-          }}
-        />
-        <div className="composer-actions">
-          <DictationButton
-            available={dictationAvailable}
-            onText={(text) => setDraft((current) => (current.trim() ? `${current.trimEnd()} ${text}` : text))}
-          />
-          <button type="submit" disabled={sending || !draft.trim()}>
-            Send
-          </button>
-          <button type="button" className="danger" onClick={() => void stop()} disabled={state !== "working" && state !== "waiting_human"}>
-            Stop
-          </button>
-        </div>
-      </form>
+      <p className="muted small">
+        Shows messages, tool use, and stated plans only; private reasoning is never displayed. Message this worker below the office.
+      </p>
       {notice ? <p role="status">{notice}</p> : null}
     </section>
   );

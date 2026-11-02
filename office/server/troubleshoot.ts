@@ -1,7 +1,8 @@
 // Diagnoses failing role sessions and runs the PO's recovery actions, so a harness
 // crash or a spent quota is visible and fixable instead of looking like progress.
 
-import { AGENT_ROLES, COORDINATOR_ROLE, roleTitle, type AgentRoleId } from "../shared/sdlcTheme.ts";
+import { COORDINATOR_ROLE, type AgentRoleId } from "../shared/sdlcTheme.ts";
+import { teamOf, teamRoleIds } from "../shared/team.ts";
 import {
   ACTION_LABELS,
   DEFAULT_REMEDIATION,
@@ -265,7 +266,7 @@ export class TroubleshootService {
     const awaiting = this.workflow.interviewAwaitingCoordinator(branchId);
     const now = this.clock();
     const entries: RoleHealth[] = [];
-    for (const role of AGENT_ROLES) {
+    for (const role of teamRoleIds(teamOf(branch.runtime))) {
       const harness = roleHarness(branch.runtime, role);
       const links: (RoleSessionLink | null)[] = live.filter((link) => link.role === role).sort((a, b) => Number(a.temporary) - Number(b.temporary));
       if (!links.some((link) => link && !link.temporary)) links.unshift(null);
@@ -293,6 +294,7 @@ export class TroubleshootService {
           temporary: link?.temporary ?? false,
           harness,
           model: branch.runtime.roleModels?.[role] ?? branch.runtime.model ?? null,
+          effort: branch.runtime.roleEfforts?.[role] ?? null,
           harnessReadiness: readiness,
           state: diagnosis.state,
           problem: found,
@@ -316,7 +318,7 @@ export class TroubleshootService {
       this.state.notified[subject] = found.key;
       changed = true;
       void this.roomName(branch.projectId).then((room) =>
-        this.notifier.notify(`${room}: ${roleTitle(entry.role)} needs help`, `${found.title}. ${found.detail}`.slice(0, 240)),
+        this.notifier.notify(`${room}: ${this.workflow.roleName(branch.id, entry.role)} needs help`, `${found.title}. ${found.detail}`.slice(0, 240)),
       );
     }
     if (changed) this.store.save();
@@ -343,7 +345,7 @@ export class TroubleshootService {
     const result = await this.perform(branchId, target, action as "continue" | "recover" | "nudge" | "stop");
     delete this.state.retries[sessionId];
     this.store.save();
-    this.workflow.logRecovery(branchId, `PO chose "${ACTION_LABELS[action]}" for the ${roleTitle(target.role)}: ${result}`);
+    this.workflow.logRecovery(branchId, `PO chose "${ACTION_LABELS[action]}" for the ${this.workflow.roleName(branchId, target.role)}: ${result}`);
     this.building.invalidate();
     return { result };
   }
@@ -379,7 +381,7 @@ export class TroubleshootService {
     if (minutesInput === null) {
       delete this.state.retries[sessionId];
       this.store.save();
-      this.workflow.logRecovery(branchId, `PO cancelled the scheduled retry for the ${roleTitle(target.role)}.`);
+      this.workflow.logRecovery(branchId, `PO cancelled the scheduled retry for the ${this.workflow.roleName(branchId, target.role)}.`);
       return { retry: null };
     }
     const minutes = Number(minutesInput);
@@ -399,7 +401,7 @@ export class TroubleshootService {
     this.store.save();
     this.workflow.logRecovery(
       branchId,
-      `PO scheduled a retry for the ${roleTitle(target.role)} in ${minutes} minute${minutes === 1 ? "" : "s"}${retry.repeatMinutes ? ", repeating until it recovers" : ""}.`,
+      `PO scheduled a retry for the ${this.workflow.roleName(branchId, target.role)} in ${minutes} minute${minutes === 1 ? "" : "s"}${retry.repeatMinutes ? ", repeating until it recovers" : ""}.`,
     );
     return { retry };
   }
@@ -411,7 +413,7 @@ export class TroubleshootService {
     if (!target?.problem || target.problem.key !== keyInput) throw new WorkflowError(409, "stale_request", "That problem has changed; review it again.");
     this.state.dismissed[subjectKey(branchId, target.role, target.sessionId)] = target.problem.key;
     this.store.save();
-    this.workflow.logRecovery(branchId, `PO ignored "${target.problem.title}" for the ${roleTitle(target.role)}.`);
+    this.workflow.logRecovery(branchId, `PO ignored "${target.problem.title}" for the ${this.workflow.roleName(branchId, target.role)}.`);
     this.problemCounts.set(this.workflow.branch(branchId).projectId, entries.filter((entry) => entry.problem && !entry.dismissed && entry !== target).length);
     this.building.invalidate();
   }
@@ -438,7 +440,7 @@ export class TroubleshootService {
     if (!entry.problem) {
       delete this.state.retries[sessionId];
       this.store.save();
-      this.workflow.logRecovery(branchId, `The ${roleTitle(entry.role)} recovered; the scheduled retry is no longer needed.`);
+      this.workflow.logRecovery(branchId, `The ${this.workflow.roleName(branchId, entry.role)} recovered; the scheduled retry is no longer needed.`);
       return;
     }
     if (entry.state === "working") {
@@ -457,7 +459,7 @@ export class TroubleshootService {
     if (retry.repeatMinutes && retry.attempts < MAX_SCHEDULED_ATTEMPTS) retry.nextAt = this.clock() + retry.repeatMinutes * 60;
     else delete this.state.retries[sessionId];
     this.store.save();
-    this.workflow.logRecovery(branchId, `Scheduled retry ${retry.attempts} for the ${roleTitle(entry.role)}: ${result}`);
+    this.workflow.logRecovery(branchId, `Scheduled retry ${retry.attempts} for the ${this.workflow.roleName(branchId, entry.role)}: ${result}`);
     this.building.invalidate();
   }
 }

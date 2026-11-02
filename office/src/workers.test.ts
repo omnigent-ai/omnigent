@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { WorkerSession } from "./api.ts";
-import { deriveWorkerState, toActivity } from "./workers.ts";
+import type { RoleHealth } from "../shared/troubleshoot.ts";
+import { toActivity } from "../shared/sessionActivity.ts";
+import { deriveWorkerState, roomWorkerState } from "./workers.ts";
 
 function worker(overrides: Partial<WorkerSession>): WorkerSession {
   return {
@@ -24,7 +26,7 @@ describe("deriveWorkerState", () => {
     [{ status: "running", pending_elicitations_count: 1 }, "waiting_human"],
     [{ status: "waiting" }, "waiting_dependency"],
     [{ status: "failed", host_online: false }, "failed"],
-    [{ status: "idle" }, "completed"],
+    [{ status: "idle" }, "idle"],
   ] as const)("maps %o to %s", (overrides, expected) => {
     expect(deriveWorkerState(worker(overrides))).toBe(expected);
   });
@@ -50,5 +52,35 @@ describe("toActivity", () => {
       ["agent", "Done."],
       ["error", "Rate limited"],
     ]);
+  });
+});
+
+describe("roomWorkerState", () => {
+  const health = (overrides: Partial<RoleHealth>): RoleHealth => ({
+    role: "pm",
+    sessionId: "conv",
+    temporary: false,
+    harness: "codex",
+    model: null,
+    effort: null,
+    harnessReadiness: "ready",
+    state: "idle",
+    problem: null,
+    dismissed: false,
+    scheduledRetry: null,
+    ...overrides,
+  });
+  const problem = { title: "The turn stalled" } as RoleHealth["problem"];
+
+  it("follows Omnigent's status when the office found no problem", () => {
+    expect(roomWorkerState(worker({ status: "running" }), health({ state: "working" }))).toBe("working");
+    expect(roomWorkerState(worker({ status: "idle" }), undefined)).toBe("idle");
+  });
+
+  it("shows a diagnosed problem as needing help unless it is dismissed, failed, or offline", () => {
+    expect(roomWorkerState(worker({ status: "running" }), health({ state: "problem", problem }))).toBe("needs_help");
+    expect(roomWorkerState(worker({ status: "idle" }), health({ state: "problem", problem, dismissed: true }))).toBe("idle");
+    expect(roomWorkerState(worker({ status: "failed" }), health({ state: "problem", problem }))).toBe("failed");
+    expect(roomWorkerState(worker({ host_online: false }), health({ state: "problem", problem }))).toBe("offline");
   });
 });

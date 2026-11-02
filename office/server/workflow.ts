@@ -5,19 +5,12 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import {
-  AGENT_ROLES,
   COORDINATOR_ROLE,
   DEFAULT_GATES,
   GATE_INVALIDATES,
   GATE_TITLES,
   RUNTIME_GATE_PATTERNS,
   SDLC_MATRIX,
-  accountableRole,
-  isAgentRole,
-  matrixRow,
-  responsibleRoles,
-  roleTitle,
-  rolesWith,
   type AgentRoleId,
   type GateType,
   type RoleId,
@@ -40,8 +33,37 @@ import type {
   WorkflowState,
   WorkflowTask,
 } from "../shared/workflowTypes.ts";
-import { gatePolicyExpression, roleBundle, roleHarness } from "./bundle.ts";
+import { EFFORT_ORDER } from "../shared/harnessModels.ts";
+import { parseTeamFile } from "../shared/teamFile.ts";
+import { MAX_LINKS_PER_PROJECT, type ProjectLink, parseLinkInput } from "../shared/projectLinks.ts";
+import {
+  PO_ROLE,
+  type TeamDefinition,
+  accountableOf,
+  consultedOf,
+  hasRole,
+  parseTeam,
+  registerTeam,
+  teamRoleTitle,
+  responsibleOf,
+  sameTeam,
+  sdlcTeam,
+  taskTypeOf,
+  describeTeamChange,
+  teamOf,
+} from "../shared/team.ts";
+import { RISK_POLICY_LABELS, parseRoleToolSettings } from "../shared/roleTools.ts";
+import {
+  BUILT_IN_TEAM_TEMPLATES,
+  TEMPLATE_FIELD_LABELS,
+  type TeamTemplate,
+  runtimeWithTemplate,
+  templateDiff,
+  templateRolesFromRuntime,
+} from "../shared/teamTemplates.ts";
+import { gatePolicyExpression, roleAgentSpec, roleBundle, roleHarness, roleInstructions } from "./bundle.ts";
 import type { Notifier } from "./notifier.ts";
+import type { RoleToolContext } from "./roleTools.ts";
 import type { StateStore } from "./stateStore.ts";
 
 export class WorkflowError extends Error {
@@ -64,6 +86,8 @@ export interface WorkflowOmnigent {
   bindRunner(sessionId: string, runnerId: string): Promise<void>;
   sendMessage(sessionId: string, text: string, stableId?: string): Promise<unknown>;
   interrupt(sessionId: string): Promise<unknown>;
+  /** Hide a session from Omnigent's lists; it can be unarchived there. */
+  archiveSession(sessionId: string): Promise<unknown>;
   addSessionPolicy(sessionId: string, name: string, expression: string): Promise<{ id: string }>;
   deleteSessionPolicy(sessionId: string, policyId: string): Promise<void>;
   listProjects(): Promise<{ id: string; name: string; config?: { host_id?: string; workspace?: string } }[]>;
@@ -165,6 +189,29 @@ export class WorkflowService {
     this.mcpUrl = options.mcpUrl;
     this.clock = options.clock;
     this.migrateInterviews();
+    for (const branch of Object.values(this.state.branches)) registerTeam(teamOf(branch.runtime));
+  }
+
+  /** A role's office tools, set by the HTTP layer that owns the tool list. */
+  private toolsFor: ((role: string) => string[]) | null = null;
+
+  setToolCatalog(toolsFor: (role: string) => string[]): void {
+    this.toolsFor = toolsFor;
+  }
+
+  /** The room's team: its roles, task types, and RACI. */
+  team(branchId: string): TeamDefinition {
+    return teamOf(this.branch(branchId).runtime);
+  }
+
+  /** A role's title on the room's team, which may rename the theme's roles. */
+  roleName(branchId: string, role: string): string {
+    return teamRoleTitle(teamOf(this.state.branches[branchId]?.runtime), role);
+  }
+
+  private requireRole(branchId: string, value: unknown): string {
+    if (!hasRole(this.team(branchId), value)) throw new WorkflowError(400, "invalid_role", "That role is not on this room's team.");
+    return value;
   }
 
   /** Questions saved before interview agendas existed become one interview per branch. */
@@ -224,12 +271,335 @@ export class WorkflowService {
     return this.liveLinks(branchId).find((link) => link.role === role && !link.temporary);
   }
 
+  /** Each role's prompt as a new session would get it, and the PO's own instructions for it. */
+  async teamConfig(branchId: string): Promise<{ role: AgentRoleId; prompt: string; customInstructions: string }[]> {
+    const branch = this.branch(branchId);
+    const projectName = await this.projectName(branch.projectId);
+    return teamOf(branch.runtime).roles.map(({ id: role }) => ({
+      role,
+      prompt: roleInstructions({ role, projectName, runtime: branch.runtime }),
+      customInstructions: branch.runtime.roleCustomInstructions?.[role] ?? "",
+    }));
+  }
+
+  /**
+   * Replace the room's team: its roles, task types, and RACI. Tasks the PM creates from now on
+   * follow it; existing tasks keep their roles. Roles taken off the team stop and retire.
+   */
+  async setTeam(branchId: string, input: unknown): Promise<BranchView> {
+    const branch = this.branch(branchId);
+    const parsed = parseTeam(input);
+    if ("error" in parsed) throw new WorkflowError(400, "invalid_team", parsed.error);
+    const before = teamOf(branch.runtime);
+    const summary = describeTeamChange(before, parsed.team);
+    this.adoptTeam(branch, parsed.team);
+    if (summary) this.recordEvent(branchId, "po", "team_updated", `PO changed the team: ${summary}. New tasks follow it.`);
+    this.save();
+    await this.retireRemovedRoles(branch, before, parsed.team, "PO took this role off the team.");
+    return this.view(branchId);
+  }
+
+  /** Store a team on the room, dropping settings of roles that left it. */
+  private adoptTeam(branch: ThemeBranch, team: TeamDefinition): void {
+    const runtime = branch.runtime;
+    delete runtime.raci;
+    if (sameTeam(team, sdlcTeam())) delete runtime.team;
+    else runtime.team = team;
+    for (const field of ["roleHarnesses", "roleModels", "roleEfforts", "roleCustomInstructions", "roleToolSettings"] as const) {
+      const values = runtime[field] as Record<string, unknown> | undefined;
+      if (!values) continue;
+      for (const role of Object.keys(values)) if (!hasRole(team, role)) delete values[role];
+    }
+    registerTeam(team);
+  }
+
+  /** Stop and retire the live sessions of roles a team change removed; tasks keep their history. */
+  private async retireRemovedRoles(branch: ThemeBranch, before: TeamDefinition, after: TeamDefinition, reason: string): Promise<void> {
+    const removed = before.roles.filter((role) => !hasRole(after, role.id));
+    if (!removed.length) return;
+    for (const link of this.liveLinks(branch.id).filter((entry) => removed.some((role) => role.id === entry.role))) {
+      await this.omnigent.interrupt(link.sessionId).catch(() => undefined);
+      link.retiredAt = this.clock();
+      this.recordEvent(branch.id, "office", "role_retired", `${this.roleName(branch.id, link.role)} session retired: ${reason}`);
+    }
+    this.save();
+  }
+
+  /** The built-in teams, then saved templates by name. */
+  teamTemplates(): TeamTemplate[] {
+    const saved = Object.values(this.state.teamTemplates ?? {}).sort((a, b) => a.name.localeCompare(b.name));
+    return [...BUILT_IN_TEAM_TEMPLATES, ...saved];
+  }
+
+  /** Save the room's team as a template; a template with the same name is replaced. */
+  saveTeamTemplate(branchId: string, nameInput: unknown, descriptionInput: unknown): TeamTemplate {
+    const branch = this.branch(branchId);
+    const name = text(nameInput, "name", { max: 60 });
+    const description = text(descriptionInput, "description", { required: false, max: 300 }) || null;
+    const builtIn = BUILT_IN_TEAM_TEMPLATES.find((entry) => entry.name.toLowerCase() === name.toLowerCase());
+    if (builtIn) throw new WorkflowError(409, "template_builtin", `"${builtIn.name}" is built in; choose another name.`);
+    const existing = this.templateNamed(name);
+    const template = this.storeTemplate(name, description, teamOf(branch.runtime), templateRolesFromRuntime(branch.runtime));
+    branch.runtime.teamTemplateId = template.id;
+    this.recordEvent(branchId, "po", "team_template_saved", `PO ${existing ? "updated" : "saved"} the team as the template "${name}".`);
+    this.save();
+    return template;
+  }
+
+  /**
+   * Switch the room's team to a template. Changed roles pick it up when they restart;
+   * with `restart`, running ones restart now with a handoff.
+   */
+  async applyTeamTemplate(branchId: string, templateId: string, restart: boolean): Promise<{ view: BranchView; changed: AgentRoleId[] }> {
+    const branch = this.branch(branchId);
+    const template = this.teamTemplates().find((entry) => entry.id === templateId);
+    if (!template) throw new WorkflowError(404, "template_not_found", "That team template no longer exists.");
+    const diff = templateDiff(branch.runtime, template);
+    const before = teamOf(branch.runtime);
+    const next = runtimeWithTemplate(branch.runtime, template, this.clock());
+    branch.runtime = next;
+    this.adoptTeam(branch, teamOf(next));
+    const detail = [
+      ...diff.roles.map((change) => `${change.title} (${change.fields.map((field) => TEMPLATE_FIELD_LABELS[field]).join(", ")})`),
+      ...diff.taskTypes,
+    ].join("; ");
+    this.recordEvent(branchId, "po", "team_template_applied", `PO switched the team to "${template.name}"${detail ? `: ${detail}` : "; nothing changed"}.`);
+    this.save();
+    await this.retireRemovedRoles(branch, before, teamOf(next), `the team switched to "${template.name}".`);
+    // Only roles that stay on the team and changed need a fresh session.
+    const changed = diff.roles.filter((change) => !change.fields.includes("added") && !change.fields.includes("removed")).map((change) => change.role);
+    if (restart) {
+      const failures: string[] = [];
+      for (const role of changed) {
+        if (!this.persistentLink(branchId, role) && role !== COORDINATOR_ROLE) continue;
+        await this.rolloverRole(branchId, role, `PO switched the team to "${template.name}".`).catch((error: Error) => failures.push(`${this.roleName(branchId, role)}: ${error.message}`));
+      }
+      if (failures.length) throw new WorkflowError(502, "template_restart_incomplete", `Template applied, but some roles did not restart. ${failures.join("; ")}`);
+    }
+    return { view: this.view(branchId), changed };
+  }
+
+  /**
+   * Save a team file (YAML) as a template, replacing a saved one with its name. A file named
+   * after a built-in team is saved as "<name> (imported)".
+   */
+  importTeamTemplate(yamlInput: unknown): { template: TeamTemplate; replaced: boolean } {
+    const parsed = parseTeamFile(text(yamlInput, "yaml", { max: 256 * 1024 }), (role) => this.toolsFor?.(role) ?? []);
+    if ("error" in parsed) throw new WorkflowError(400, "invalid_team_file", parsed.error);
+    const builtIn = BUILT_IN_TEAM_TEMPLATES.some((entry) => entry.name.toLowerCase() === parsed.name.toLowerCase());
+    const name = builtIn ? `${parsed.name.slice(0, 49)} (imported)` : parsed.name;
+    const replaced = Boolean(this.templateNamed(name));
+    const template = this.storeTemplate(name, parsed.description, parsed.team, parsed.roles);
+    this.save();
+    return { template, replaced };
+  }
+
+  private templateNamed(name: string): TeamTemplate | undefined {
+    return Object.values(this.state.teamTemplates ?? {}).find((entry) => entry.name.toLowerCase() === name.toLowerCase());
+  }
+
+  private storeTemplate(name: string, description: string | null, team: TeamDefinition, roles: TeamTemplate["roles"]): TeamTemplate {
+    this.state.teamTemplates ??= {};
+    const existing = this.templateNamed(name);
+    const now = this.clock();
+    const template: TeamTemplate = {
+      id: existing?.id ?? newId("team"),
+      name,
+      description,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      roles,
+      ...(sameTeam(team, sdlcTeam()) ? {} : { team }),
+    };
+    this.state.teamTemplates[template.id] = template;
+    return template;
+  }
+
+  deleteTeamTemplate(templateId: string): void {
+    if (BUILT_IN_TEAM_TEMPLATES.some((entry) => entry.id === templateId)) throw new WorkflowError(409, "template_builtin", "Built-in teams cannot be deleted.");
+    if (!this.state.teamTemplates?.[templateId]) throw new WorkflowError(404, "template_not_found", "That team template no longer exists.");
+    delete this.state.teamTemplates[templateId];
+    this.save();
+  }
+
+  /**
+   * Set the PO's tool and policy choices for a role. Turned-off office tools stop working at
+   * once; MCP servers and the risk policy reach a running role when it restarts.
+   */
+  async setRoleToolSettings(
+    branchId: string,
+    roleInput: unknown,
+    input: unknown,
+    availableTools: string[],
+    restart: boolean,
+  ): Promise<BranchView> {
+    const branch = this.branch(branchId);
+    const role = this.requireRole(branchId, roleInput);
+    const parsed = parseRoleToolSettings(input, role, availableTools);
+    if ("error" in parsed) throw new WorkflowError(400, "invalid_tool_settings", parsed.error);
+    const previous = branch.runtime.roleToolSettings?.[role] ?? {};
+    const sessionChanged =
+      JSON.stringify(previous.mcpServers ?? []) !== JSON.stringify(parsed.settings.mcpServers ?? []) ||
+      (previous.riskPolicy ?? "ask") !== (parsed.settings.riskPolicy ?? "ask");
+    branch.runtime.roleToolSettings = { ...branch.runtime.roleToolSettings };
+    // Only changes a session must restart for move the "out of date" mark.
+    branch.runtime.roleToolSettings[role] = { ...parsed.settings, updatedAt: sessionChanged ? this.clock() : previous.updatedAt };
+    const summary = [
+      `${parsed.settings.disabledTools?.length ?? 0} office tool(s) off`,
+      `${parsed.settings.mcpServers?.length ?? 0} extra MCP server(s)`,
+      `risk policy: ${RISK_POLICY_LABELS[parsed.settings.riskPolicy ?? "ask"].toLowerCase()}`,
+    ].join(", ");
+    this.recordEvent(branchId, "po", "role_tools", `PO updated the ${this.roleName(branchId, role)}'s tools and policies (${summary}).`);
+    this.save();
+    if (restart && (this.persistentLink(branchId, role) || role === COORDINATOR_ROLE)) {
+      await this.rolloverRole(branchId, role, "PO changed this role's tools and policies.");
+    }
+    return this.view(branchId);
+  }
+
+  /** Set the PO's instructions for a role; a running role picks them up when it restarts. */
+  async setRoleInstructions(branchId: string, roleInput: unknown, textInput: unknown, restart: boolean): Promise<BranchView> {
+    const branch = this.branch(branchId);
+    const role = this.requireRole(branchId, roleInput);
+    const instructions = text(textInput, "instructions", { required: false, max: MAX_CUSTOM_INSTRUCTIONS });
+    branch.runtime.roleCustomInstructions = { ...branch.runtime.roleCustomInstructions };
+    if (instructions) branch.runtime.roleCustomInstructions[role] = instructions;
+    else delete branch.runtime.roleCustomInstructions[role];
+    this.recordEvent(branchId, "po", "role_instructions", `PO ${instructions ? "updated" : "cleared"} the ${this.roleName(branchId, role)}'s instructions.`);
+    this.save();
+    if (restart && (this.persistentLink(branchId, role) || role === COORDINATOR_ROLE)) {
+      await this.rolloverRole(branchId, role, "PO updated this role's instructions.");
+    }
+    return this.view(branchId);
+  }
+
+  /**
+   * Close temporary workers the PO no longer needs: stop any turn, archive the session in
+   * Omnigent, and retire it here. Their tasks stay as they are for the PM to redispatch.
+   */
+  async closeTemporaryWorkers(branchId: string, sessionIdsInput: unknown): Promise<{ closed: string[]; failed: string[] }> {
+    this.branch(branchId);
+    const sessionIds = requestedSessionIds(sessionIdsInput, "Choose a temporary worker to close.");
+    const live = this.liveLinks(branchId);
+    const links = sessionIds.map((sessionId) => live.find((link) => link.sessionId === sessionId && link.temporary));
+    if (links.some((link) => !link)) throw new WorkflowError(404, "not_temporary", "Only live temporary workers of this room can be closed.");
+    return this.archiveLinks(branchId, links as StoredRoleSession[], (link) => {
+      const task = link.taskId ? this.state.tasks[link.taskId] : undefined;
+      const open = task && task.status !== "done" && task.status !== "cancelled";
+      this.recordEvent(
+        branchId,
+        "po",
+        "temporary_closed",
+        `PO closed the temporary ${this.roleName(branchId, link.role)}${task ? ` for "${task.title}"` : ""}${open ? `; the task is still ${task.status.replace("_", " ")}` : ""}.`,
+        link.taskId,
+      );
+    });
+  }
+
+  /** Close replaced sessions (a role's earlier sessions, retired by a restart or handoff) and archive them in Omnigent. */
+  async closeReplacedSessions(branchId: string, sessionIdsInput: unknown): Promise<{ closed: string[]; failed: string[] }> {
+    this.branch(branchId);
+    const sessionIds = requestedSessionIds(sessionIdsInput, "Choose a replaced session to close.");
+    const known = this.links(branchId);
+    const links = sessionIds.map((sessionId) => known.find((link) => link.sessionId === sessionId));
+    if (links.some((link) => !link || link.retiredAt === null)) {
+      throw new WorkflowError(404, "not_replaced", "Only replaced sessions of this room can be closed; a role's current session restarts instead.");
+    }
+    const result = await this.archiveLinks(branchId, links as StoredRoleSession[], () => undefined);
+    if (result.closed.length) {
+      const titles = [...new Set((links as StoredRoleSession[]).filter((link) => result.closed.includes(link.sessionId)).map((link) => this.roleName(branchId, link.role)))];
+      this.recordEvent(branchId, "po", "replaced_closed", `PO closed ${result.closed.length} replaced session${result.closed.length === 1 ? "" : "s"} (${titles.join(", ")}).`);
+      this.save();
+    }
+    return result;
+  }
+
+  /** Stop and archive role sessions in Omnigent, retiring their links. */
+  private async archiveLinks(branchId: string, links: StoredRoleSession[], onClosed: (link: StoredRoleSession) => void): Promise<{ closed: string[]; failed: string[] }> {
+    const closed: string[] = [];
+    const failed: string[] = [];
+    for (const link of links) {
+      await this.omnigent.interrupt(link.sessionId).catch(() => undefined);
+      try {
+        await this.omnigent.archiveSession(link.sessionId);
+      } catch (error) {
+        failed.push(`${this.roleName(branchId, link.role)}: ${(error as Error).message}`);
+        continue;
+      }
+      link.retiredAt ??= this.clock();
+      closed.push(link.sessionId);
+      onClosed(link);
+    }
+    this.save();
+    return { closed, failed };
+  }
+
+  /** The role's current (persistent) session, if it has started. */
+  roleSessionId(branchId: string, role: AgentRoleId): string | null {
+    return this.persistentLink(branchId, role)?.sessionId ?? null;
+  }
+
+  /** A role's live session with its office gate policies, and the spec a new session would get. */
+  roleToolContext(branchId: string, role: AgentRoleId): RoleToolContext {
+    const branch = this.branch(branchId);
+    const link = this.persistentLink(branchId, role);
+    const gatePolicies = link
+      ? Object.entries(link.gatePolicies).map(([gate, policy]) => gatePolicyName(gate as GateType, policy?.version))
+      : (Object.keys(RUNTIME_GATE_PATTERNS) as GateType[]).filter((gate) => branch.gates[gate]).map((gate) => gatePolicyName(gate));
+    const plannedSpec = roleAgentSpec({ role, projectName: "", runtime: branch.runtime, mcpUrl: this.mcpUrl, mcpToken: "" });
+    return {
+      sessionId: link?.sessionId ?? null,
+      sessionStartedAt: link?.createdAt ?? null,
+      settings: branch.runtime.roleToolSettings?.[role] ?? {},
+      gatePolicies,
+      plannedSpec,
+    };
+  }
+
   callerForToken(token: string): McpCaller | null {
     if (!token) return null;
     const link = (this.state.roleSessions as StoredRoleSession[]).find((entry) => entry.mcpToken === token);
     if (!link || link.retiredAt !== null) return null;
     const branch = this.state.branches[link.branchId];
     return branch ? { link, branch } : null;
+  }
+
+  projectLinks(projectId: string): ProjectLink[] {
+    return this.state.projectLinks[projectId] ?? [];
+  }
+
+  /** Add a result link, or update the one with the same URL. */
+  addProjectLink(projectId: string, input: unknown, addedBy: ProjectLink["addedBy"]): ProjectLink {
+    const parsed = parseLinkInput(input);
+    if ("error" in parsed) throw new WorkflowError(400, "invalid_link", parsed.error);
+    const links = [...this.projectLinks(projectId)];
+    const index = links.findIndex((entry) => entry.url === parsed.url);
+    if (index < 0 && links.length >= MAX_LINKS_PER_PROJECT) {
+      throw new WorkflowError(409, "too_many_links", `A project keeps at most ${MAX_LINKS_PER_PROJECT} links; remove one first.`);
+    }
+    const link: ProjectLink = { id: index >= 0 ? links[index].id : newId("lnk"), ...parsed, addedBy, at: this.clock() };
+    if (index >= 0) links[index] = link;
+    else links.push(link);
+    this.state.projectLinks[projectId] = links;
+    const branch = this.activeBranch(projectId);
+    if (branch) this.recordEvent(branch.id, addedBy, "link_shared", `${this.roleName(branch.id, addedBy)} shared a link: ${link.label} (${link.url})`);
+    this.save();
+    return link;
+  }
+
+  removeProjectLink(projectId: string, linkId: string): void {
+    const links = this.projectLinks(projectId);
+    const removed = links.find((entry) => entry.id === linkId);
+    if (!removed) throw new WorkflowError(404, "link_not_found", "That link was already removed.");
+    this.state.projectLinks[projectId] = links.filter((entry) => entry.id !== linkId);
+    const branch = this.activeBranch(projectId);
+    if (branch) this.recordEvent(branch.id, "po", "link_removed", `PO removed the link ${removed.label}.`);
+    this.save();
+  }
+
+  /** A role shares a result, such as a deployment URL or a pull request, with the PO. */
+  publishLink(caller: McpCaller, args: Record<string, unknown>): ProjectLink {
+    return this.addProjectLink(caller.branch.projectId, args, caller.link.role);
   }
 
   isRelayedItem(itemId: string): boolean {
@@ -302,7 +672,7 @@ export class WorkflowService {
     if (this.activeBranch(projectId)) {
       throw new WorkflowError(409, "theme_already_assigned", "This project already has an SDLC theme branch.");
     }
-    const runtime = normalizeRuntime(input.runtime);
+    const runtime = normalizeRuntime(input.runtime, this.toolsFor ?? undefined);
     const gates = { ...DEFAULT_GATES };
     for (const [gate, enabled] of Object.entries(input.gates ?? {})) {
       if (!(gate in gates) || typeof enabled !== "boolean") throw new WorkflowError(400, "invalid_gate", `Unknown gate setting ${gate}`);
@@ -380,8 +750,8 @@ export class WorkflowService {
       temporaryTaskTitle: options.temporaryTask?.title,
     });
     const title = options.temporaryTask
-      ? `${roleTitle(role)} · ${options.temporaryTask.title}`.slice(0, 200)
-      : `${roleTitle(role)} · SDLC`;
+      ? `${this.roleName(branch.id, role)} · ${options.temporaryTask.title}`.slice(0, 200)
+      : `${this.roleName(branch.id, role)} · SDLC`;
     const metadata: Record<string, unknown> = {
       project_id: branch.projectId,
       title,
@@ -404,7 +774,7 @@ export class WorkflowService {
       const harness = roleHarness(branch.runtime, role);
       const code = (error as { code?: string }).code ?? "role_start_failed";
       this.state.roleStartFailures[failureKey] = { branchId: branch.id, role, harness, at: this.clock(), code, message: (error as Error).message };
-      this.recordEvent(branch.id, "office", "role_start_failed", `${roleTitle(role)} could not start on ${harness}: ${(error as Error).message}`);
+      this.recordEvent(branch.id, "office", "role_start_failed", `${this.roleName(branch.id, role)} could not start on ${harness}: ${(error as Error).message}`);
       this.save();
       throw error;
     }
@@ -426,7 +796,7 @@ export class WorkflowService {
       branch.id,
       "office",
       "role_started",
-      `${roleTitle(role)} session started${options.temporaryTask ? ` as a temporary worker for "${options.temporaryTask.title}"` : ""}.`,
+      `${this.roleName(branch.id, role)} session started${options.temporaryTask ? ` as a temporary worker for "${options.temporaryTask.title}"` : ""}.`,
       options.temporaryTask?.id ?? null,
     );
     this.save();
@@ -443,7 +813,7 @@ export class WorkflowService {
       const previous = link.gatePolicies[gate];
       const version = (previous?.version ?? 0) + 1;
       // Add the replacement before removing the old policy so the gate never lapses.
-      const created = await this.omnigent.addSessionPolicy(link.sessionId, `office_${gate}_gate_v${version}`, expression);
+      const created = await this.omnigent.addSessionPolicy(link.sessionId, gatePolicyName(gate, version), expression);
       link.gatePolicies[gate] = { id: created.id, version };
       this.save();
       if (previous) await this.omnigent.deleteSessionPolicy(link.sessionId, previous.id).catch(() => undefined);
@@ -465,7 +835,7 @@ export class WorkflowService {
       try {
         await this.installGatePolicies(branch, link);
       } catch (error) {
-        this.recordEvent(branch.id, "office", "policy_update_failed", `Could not update gate policy on ${roleTitle(link.role)}: ${(error as Error).message}`);
+        this.recordEvent(branch.id, "office", "policy_update_failed", `Could not update gate policy on ${this.roleName(branch.id, link.role)}: ${(error as Error).message}`);
       }
     }
     this.save();
@@ -481,14 +851,14 @@ export class WorkflowService {
   }
 
   private async relayToRole(branch: ThemeBranch, role: RoleId, message: string): Promise<boolean> {
-    if (!isAgentRole(role)) return false;
+    if (!hasRole(teamOf(branch.runtime), role)) return false;
     const link = this.persistentLink(branch.id, role);
     if (!link) return false;
     try {
       await this.relay(link.sessionId, message);
       return true;
     } catch (error) {
-      this.recordEvent(branch.id, "office", "relay_failed", `Could not reach ${roleTitle(role)}: ${(error as Error).message}`);
+      this.recordEvent(branch.id, "office", "relay_failed", `Could not reach ${this.roleName(branch.id, role)}: ${(error as Error).message}`);
       return false;
     }
   }
@@ -772,8 +1142,7 @@ export class WorkflowService {
   /** Replace a role's session through a recorded handoff, e.g. after a coordinator failure. */
   async rolloverRole(branchId: string, roleInput: unknown, reasonInput: unknown): Promise<BranchView> {
     const branch = this.branch(branchId);
-    if (!isAgentRole(roleInput)) throw new WorkflowError(400, "invalid_role", "Unknown role");
-    const role = roleInput;
+    const role = this.requireRole(branchId, roleInput);
     const reason = text(reasonInput, "reason", { required: false, max: 2000 }) || "PO requested a fresh session.";
     const previous = this.persistentLink(branchId, role);
     const next = await this.ensureRoleSession(branch, role, undefined, { handoffFrom: previous ?? undefined });
@@ -781,7 +1150,7 @@ export class WorkflowService {
       previous.retiredAt = this.clock();
       await this.omnigent.interrupt(previous.sessionId).catch(() => undefined);
     }
-    this.recordEvent(branchId, "office", "handoff", `${roleTitle(role)} rolled over to a new session (${reason}).`);
+    this.recordEvent(branchId, "office", "handoff", `${this.roleName(branchId, role)} rolled over to a new session (${reason}).`);
     this.save();
     await this.relay(next.sessionId, this.handoffBrief(branch, role, previous, reason));
     return this.view(branchId);
@@ -792,7 +1161,7 @@ export class WorkflowService {
       (task) => task.branchId === branch.id && ACTIVE_TASK_STATUSES.includes(task.status) && (role === COORDINATOR_ROLE || task.responsible.includes(role) || task.accountable === role),
     );
     const lines = [
-      `[Office handoff] You are taking over the ${roleTitle(role)} role${previous ? ` from session ${previous.sessionId}` : ""}. Reason: ${reason}`,
+      `[Office handoff] You are taking over the ${this.roleName(branch.id, role)} role${previous ? ` from session ${previous.sessionId}` : ""}. Reason: ${reason}`,
       `Requirements board revision ${this.state.boards[branch.id].revision}. Read the full state with office_board_get.`,
       tasks.length ? "Open tasks:" : "No open tasks.",
       ...tasks.map((task) => `- ${task.id} [${task.status}] ${task.title}`),
@@ -813,29 +1182,46 @@ export class WorkflowService {
   }
 
   /** Move roles to another harness (and optionally model), restarting each with a handoff. */
-  async switchRoleHarness(branchId: string, rolesInput: unknown, harnessInput: unknown, modelInput: unknown, reasonInput: unknown): Promise<BranchView> {
+  async switchRoleHarness(
+    branchId: string,
+    rolesInput: unknown,
+    harnessInput: unknown,
+    modelInput: unknown,
+    reasonInput: unknown,
+    effortInput: unknown = "",
+  ): Promise<BranchView> {
     const branch = this.branch(branchId);
-    const roles = Array.isArray(rolesInput) ? [...new Set(rolesInput.filter(isAgentRole))] : [];
+    const team = teamOf(branch.runtime);
+    const roles = Array.isArray(rolesInput) ? [...new Set(rolesInput.filter((role): role is string => hasRole(team, role)))] : [];
     if (roles.length === 0) throw new WorkflowError(400, "invalid_role", "Choose at least one role to switch.");
     const harness = text(harnessInput, "harness", { max: 100 });
     const model = text(modelInput, "model", { required: false, max: 200 });
     const reason = text(reasonInput, "reason", { required: false, max: 2000 }) || "PO switched the harness.";
+    if (effortInput !== "" && effortInput !== undefined && effortInput !== null && !isEffort(effortInput)) {
+      throw new WorkflowError(400, "invalid_effort", `effort must be one of ${EFFORT_ORDER.join(", ")}`);
+    }
+    const effort = isEffort(effortInput) ? effortInput : "";
     branch.runtime.roleHarnesses = { ...branch.runtime.roleHarnesses };
     branch.runtime.roleModels = { ...branch.runtime.roleModels };
+    branch.runtime.roleEfforts = { ...branch.runtime.roleEfforts };
+    const target = `${harness} (${model || "harness default model"}${effort ? `, ${effort} effort` : ""})`;
     for (const role of roles) {
       const from = roleHarness(branch.runtime, role);
       branch.runtime.roleHarnesses[role] = harness;
       // A model name rarely carries across providers, so the old override is dropped.
       if (model) branch.runtime.roleModels[role] = model;
       else delete branch.runtime.roleModels[role];
-      this.recordEvent(branchId, "po", "harness_switched", `${roleTitle(role)} moved from ${from} to ${harness}${model ? ` (${model})` : ""}: ${reason}`);
+      if (effort) branch.runtime.roleEfforts[role] = effort;
+      else delete branch.runtime.roleEfforts[role];
+      const change = from === harness ? `now uses ${target}` : `moved from ${from} to ${target}`;
+      this.recordEvent(branchId, "po", "harness_switched", `${this.roleName(branchId, role)} ${change}: ${reason}`);
     }
     this.save();
     const failures: string[] = [];
     for (const role of roles) {
       // Roles that never started pick up the new harness when the PM first dispatches to them.
       if (!this.persistentLink(branchId, role) && role !== COORDINATOR_ROLE) continue;
-      await this.rolloverRole(branchId, role, `${reason} Now running on ${harness}.`).catch((error: Error) => failures.push(`${roleTitle(role)}: ${error.message}`));
+      await this.rolloverRole(branchId, role, `${reason} Now running on ${target}.`).catch((error: Error) => failures.push(`${this.roleName(branchId, role)}: ${error.message}`));
     }
     if (failures.length) throw new WorkflowError(502, "switch_incomplete", `Harness saved, but some roles did not restart. ${failures.join("; ")}`);
     return this.view(branchId);
@@ -852,8 +1238,13 @@ export class WorkflowService {
 
   /** Record a PO recovery action in the room's event feed. */
   logRecovery(branchId: string, summary: string): void {
-    this.branch(branchId);
-    this.recordEvent(branchId, "po", "recovery", summary);
+    this.logPoEvent(branchId, "recovery", summary);
+  }
+
+  /** Record something done on the PO's behalf, such as an automatic session approval. */
+  logPoEvent(branchId: string, kind: string, summary: string): void {
+    if (!this.state.branches[branchId]) return;
+    this.recordEvent(branchId, "po", kind, summary);
     this.save();
   }
 
@@ -911,7 +1302,7 @@ export class WorkflowService {
       (task) => task.responsible.includes(caller.link.role) || task.accountable === caller.link.role,
     );
     return {
-      you: { role: caller.link.role, title: roleTitle(caller.link.role), sessionId: caller.link.sessionId },
+      you: { role: caller.link.role, title: this.roleName(caller.branch.id, caller.link.role), sessionId: caller.link.sessionId },
       board: view.board,
       gatesEnabled: caller.branch.gates,
       tasks: view.tasks.map((task) => ({
@@ -929,7 +1320,8 @@ export class WorkflowService {
       pendingInterviewQuestion: this.openQuestion(caller.branch.id)?.question ?? null,
       interview: this.interviewAgenda(caller.branch.id),
       recentDecisions: view.decisions.slice(0, 10),
-      matrix: SDLC_MATRIX.map((entry) => ({ taskType: entry.id, title: entry.title, assignments: entry.assignments })),
+      team: teamOf(caller.branch.runtime).roles.map((role) => ({ id: role.id, title: role.title })),
+      matrix: teamOf(caller.branch.runtime).taskTypes.map((entry) => ({ taskType: entry.id, title: entry.title, gate: entry.gate, assignments: entry.assignments })),
     };
   }
 
@@ -960,9 +1352,10 @@ export class WorkflowService {
 
   async createTask(caller: McpCaller, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     this.requireCoordinator(caller);
-    const entry = matrixRow(text(args.taskType, "taskType", { max: 100 }));
+    const team = teamOf(caller.branch.runtime);
+    const entry = taskTypeOf(team, text(args.taskType, "taskType", { max: 100 }));
     if (!entry) {
-      throw new WorkflowError(400, "unknown_task_type", `taskType must be one of ${SDLC_MATRIX.map((row) => row.id).join(", ")}`);
+      throw new WorkflowError(400, "unknown_task_type", `taskType must be one of ${team.taskTypes.map((row) => row.id).join(", ")}`);
     }
     const branchId = caller.branch.id;
     const dependsOn = stringList(args.dependsOn, "dependsOn").map((dependency) => this.task(branchId, dependency).id);
@@ -986,8 +1379,8 @@ export class WorkflowService {
       title: text(args.title, "title", { max: 300 }),
       deliverable: text(args.deliverable, "deliverable"),
       acceptanceCriteria,
-      responsible: responsibleRoles(entry),
-      accountable: accountableRole(entry),
+      responsible: responsibleOf(entry),
+      accountable: accountableOf(entry),
       dependsOn,
       resources,
       gate,
@@ -1001,7 +1394,7 @@ export class WorkflowService {
     // Where the PO is responsible the task blocks on the human.
     if (task.responsible.includes("po")) task.status = "blocked";
     this.state.tasks[task.id] = task;
-    this.recordEvent(branchId, "pm", "task_created", `Task "${task.title}" (${entry.title}); R: ${task.responsible.map(roleTitle).join(", ")}; A: ${roleTitle(task.accountable)}.`, task.id);
+    this.recordEvent(branchId, "pm", "task_created", `Task "${task.title}" (${entry.title}); R: ${task.responsible.map((role) => this.roleName(branchId, role)).join(", ")}; A: ${this.roleName(branchId, task.accountable)}.`, task.id);
     this.save();
     if (task.status === "blocked") this.attention(caller.branch, "Task needs the PO", task.title);
     return { task };
@@ -1023,7 +1416,8 @@ export class WorkflowService {
     }
     const brief = text(args.brief, "brief", { required: false });
     const temporary = args.temporary === true;
-    const agentRoles = task.responsible.filter(isAgentRole);
+    const team = teamOf(branch.runtime);
+    const agentRoles = task.responsible.filter((role) => role !== PO_ROLE && hasRole(team, role));
     if (agentRoles.length === 0) {
       throw new WorkflowError(409, "human_responsible", "The PO is responsible for this task; it waits on the human.");
     }
@@ -1034,7 +1428,7 @@ export class WorkflowService {
         : await this.ensureRoleSession(branch, role);
       await this.relay(link.sessionId, this.taskBrief(task, role, brief));
       if (!task.assignedSessionIds.includes(link.sessionId)) task.assignedSessionIds.push(link.sessionId);
-      delivered.push(roleTitle(role));
+      delivered.push(this.roleName(caller.branch.id, role));
     }
     task.status = "in_progress";
     task.updatedAt = this.clock();
@@ -1044,7 +1438,8 @@ export class WorkflowService {
   }
 
   private taskBrief(task: WorkflowTask, role: AgentRoleId, brief: string): string {
-    const consulted = rolesWith(matrixRow(task.taskType)!, "C").filter((entry) => entry !== role);
+    const row = taskTypeOf(teamOf(this.state.branches[task.branchId]?.runtime), task.taskType);
+    const consulted = (row ? consultedOf(row) : []).filter((entry) => entry !== role);
     return [
       `[Office task ${task.id}] ${task.title}`,
       `Your role on it: ${task.responsible.includes(role) ? "Responsible" : "Accountable"}${task.accountable === role ? " and Accountable" : ""}.`,
@@ -1054,7 +1449,7 @@ export class WorkflowService {
       "Evidence required for completion:",
       ...task.evidenceRequired.map((evidence) => `- ${evidence}`),
       task.gate ? `Human gate: ${GATE_TITLES[task.gate]}.` : "No human gate.",
-      consulted.length ? `Consult: ${consulted.map(roleTitle).join(", ")} (through the PM).` : "",
+      consulted.length ? `Consult: ${consulted.map((role) => this.roleName(task.branchId, role)).join(", ")} (through the PM).` : "",
       brief ? `PM notes: ${brief}` : "",
       "Report progress with office_task_update and submit evidence when done.",
     ]
@@ -1079,18 +1474,18 @@ export class WorkflowService {
     task.evidence.push({ at: this.clock(), role, summary, references });
     if (task.status !== "awaiting_gate") task.status = status;
     task.updatedAt = this.clock();
-    this.recordEvent(branch.id, role, `task_${status}`, `${roleTitle(role)}: ${summary}`, task.id);
+    this.recordEvent(branch.id, role, `task_${status}`, `${this.roleName(caller.branch.id, role)}: ${summary}`, task.id);
     this.save();
     if (status === "submitted" && task.accountable !== role) {
       const delivered = await this.relayToRole(
         branch,
         task.accountable,
-        `[Office] ${roleTitle(role)} submitted task ${task.id} "${task.title}": ${summary}\nReview it against the acceptance criteria and complete it with office_task_complete (or request a gate first).`,
+        `[Office] ${this.roleName(caller.branch.id, role)} submitted task ${task.id} "${task.title}": ${summary}\nReview it against the acceptance criteria and complete it with office_task_complete (or request a gate first).`,
       );
       if (!delivered && task.accountable === "po") this.attention(branch, "Task ready for the PO", task.title);
     }
     if (status === "blocked" && role !== COORDINATOR_ROLE) {
-      await this.relayToRole(branch, COORDINATOR_ROLE, `[Office] ${roleTitle(role)} is blocked on task ${task.id} "${task.title}": ${summary}`);
+      await this.relayToRole(branch, COORDINATOR_ROLE, `[Office] ${this.roleName(caller.branch.id, role)} is blocked on task ${task.id} "${task.title}": ${summary}`);
     }
     return { taskId: task.id, status: task.status };
   }
@@ -1099,7 +1494,7 @@ export class WorkflowService {
     const branch = caller.branch;
     const task = this.task(branch.id, args.taskId);
     if (task.accountable !== caller.link.role) {
-      throw new WorkflowError(403, "not_accountable", `Only the accountable role (${roleTitle(task.accountable)}) completes this task.`);
+      throw new WorkflowError(403, "not_accountable", `Only the accountable role (${this.roleName(caller.branch.id, task.accountable)}) completes this task.`);
     }
     if (task.status === "done") return { taskId: task.id, status: "done" };
     if (!ACTIVE_TASK_STATUSES.includes(task.status)) throw new WorkflowError(409, "task_closed", `Task is ${task.status}.`);
@@ -1209,7 +1604,7 @@ export class WorkflowService {
       task.status = "awaiting_gate";
       task.updatedAt = now;
     }
-    this.recordEvent(branch.id, caller.link.role, "gate_requested", `${roleTitle(caller.link.role)} requested the ${GATE_TITLES[gateType]} gate: ${request.summary}`, request.taskId);
+    this.recordEvent(branch.id, caller.link.role, "gate_requested", `${this.roleName(caller.branch.id, caller.link.role)} requested the ${GATE_TITLES[gateType]} gate: ${request.summary}`, request.taskId);
     this.save();
     this.attention(branch, `${GATE_TITLES[gateType]} approval needed`, request.summary);
     return { gateId: request.id, status: "pending", note: "Wait for the PO's decision; you will be told the outcome. Continue independent work meanwhile." };
@@ -1217,7 +1612,8 @@ export class WorkflowService {
 
   async messageRole(caller: McpCaller, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const target = args.role;
-    if (!isAgentRole(target)) throw new WorkflowError(400, "invalid_role", `role must be one of ${AGENT_ROLES.join(", ")}`);
+    const roles = teamOf(caller.branch.runtime).roles.map((role) => role.id);
+    if (!hasRole(teamOf(caller.branch.runtime), target)) throw new WorkflowError(400, "invalid_role", `role must be one of ${roles.join(", ")}`);
     if (target === caller.link.role) throw new WorkflowError(400, "invalid_role", "You cannot message yourself.");
     // Specialists coordinate through the PM; only the PM addresses specialists directly.
     if (caller.link.role !== COORDINATOR_ROLE && target !== COORDINATOR_ROLE) {
@@ -1225,23 +1621,24 @@ export class WorkflowService {
     }
     const body = text(args.text, "text");
     const link = caller.link.role === COORDINATOR_ROLE ? await this.ensureRoleSession(caller.branch, target) : this.persistentLink(caller.branch.id, target);
-    if (!link) throw new WorkflowError(409, "role_not_running", `${roleTitle(target)} is not running.`);
-    await this.relay(link.sessionId, `[From ${roleTitle(caller.link.role)} via the office] ${body}`);
-    this.recordEvent(caller.branch.id, caller.link.role, "message", `${roleTitle(caller.link.role)} → ${roleTitle(target)}: ${body.slice(0, 200)}`);
+    if (!link) throw new WorkflowError(409, "role_not_running", `${this.roleName(caller.branch.id, target)} is not running.`);
+    await this.relay(link.sessionId, `[From ${this.roleName(caller.branch.id, caller.link.role)} via the office] ${body}`);
+    this.recordEvent(caller.branch.id, caller.link.role, "message", `${this.roleName(caller.branch.id, caller.link.role)} → ${this.roleName(caller.branch.id, target)}: ${body.slice(0, 200)}`);
     this.save();
     return { delivered: true };
   }
 
   async recordDecision(caller: McpCaller, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     this.requireCoordinator(caller);
-    const affected = stringList(args.affectedRoles, "affectedRoles").filter(isAgentRole);
+    const team = teamOf(caller.branch.runtime);
+    const affected = stringList(args.affectedRoles, "affectedRoles").filter((role) => hasRole(team, role));
     const decision = {
       id: newId("decision"),
       branchId: caller.branch.id,
       at: this.clock(),
       summary: text(args.summary, "summary"),
       affectedRoles: affected,
-      requestedBy: (isAgentRole(args.requestedBy) || args.requestedBy === "po" ? args.requestedBy : "pm") as RoleId,
+      requestedBy: (hasRole(team, args.requestedBy) || args.requestedBy === PO_ROLE ? args.requestedBy : "pm") as RoleId,
     };
     this.state.decisions[decision.id] = decision;
     this.recordEvent(caller.branch.id, "pm", "decision", `Coordinator decision: ${decision.summary}`);
@@ -1361,7 +1758,7 @@ export class WorkflowService {
 
   postUpdate(caller: McpCaller, args: Record<string, unknown>): Record<string, unknown> {
     const taskId = args.taskId ? this.task(caller.branch.id, args.taskId).id : null;
-    const event = this.recordEvent(caller.branch.id, caller.link.role, "update", `${roleTitle(caller.link.role)}: ${text(args.summary, "summary", { max: 2000 })}`, taskId);
+    const event = this.recordEvent(caller.branch.id, caller.link.role, "update", `${this.roleName(caller.branch.id, caller.link.role)}: ${text(args.summary, "summary", { max: 2000 })}`, taskId);
     this.save();
     return { eventId: event.id };
   }
@@ -1372,14 +1769,43 @@ function publicLink(link: StoredRoleSession): RoleSessionLink {
   return rest;
 }
 
-export function normalizeRuntime(value: unknown): BranchRuntime {
+const MAX_CUSTOM_INSTRUCTIONS = 8_000;
+
+function isEffort(value: unknown): value is string {
+  return typeof value === "string" && (EFFORT_ORDER as readonly string[]).includes(value);
+}
+
+/** Omnigent policy name of an office gate; each replacement gets a new version. */
+export function gatePolicyName(gate: GateType, version?: number): string {
+  return version === undefined ? `office_${gate}_gate` : `office_${gate}_gate_v${version}`;
+}
+
+/** Distinct session ids from a request body; at least one. */
+function requestedSessionIds(input: unknown, emptyMessage: string): string[] {
+  const sessionIds = Array.isArray(input) ? [...new Set(input.filter((id): id is string => typeof id === "string"))] : [];
+  if (sessionIds.length === 0) throw new WorkflowError(400, "no_sessions", emptyMessage);
+  return sessionIds;
+}
+
+/**
+ * A room's runtime from untrusted input. `toolsFor` lists a role's office tools, so per-role
+ * tool settings can be checked; without it they are dropped.
+ */
+export function normalizeRuntime(value: unknown, toolsFor?: (role: string) => string[]): BranchRuntime {
   if (!value || typeof value !== "object") throw new WorkflowError(400, "invalid_runtime", "runtime is required");
   const record = value as Record<string, unknown>;
+  let team = sdlcTeam();
+  if (record.team !== undefined) {
+    const parsed = parseTeam(record.team);
+    if ("error" in parsed) throw new WorkflowError(400, "invalid_team", parsed.error);
+    team = parsed.team;
+  }
+  const isAgentRole = (role: unknown): role is string => hasRole(team, role);
   const harness = text(record.harness, "runtime.harness", { required: false, max: 100 });
   const optional = (field: string) => text(record[field], `runtime.${field}`, { required: false, max: 1000 }) || undefined;
   const runtime: BranchRuntime = {};
   if (harness) runtime.harness = harness;
-  for (const field of ["model", "hostId", "workspace", "runnerId"] as const) {
+  for (const field of ["model", "hostId", "workspace", "runnerId", "teamTemplateId"] as const) {
     const entry = optional(field);
     if (entry) runtime[field] = entry;
   }
@@ -1396,6 +1822,31 @@ export function normalizeRuntime(value: unknown): BranchRuntime {
       if (isAgentRole(role) && typeof model === "string" && model.trim()) roleModels[role] = model.trim().slice(0, 200);
     }
     if (Object.keys(roleModels).length) runtime.roleModels = roleModels;
+  }
+  if (record.roleCustomInstructions && typeof record.roleCustomInstructions === "object") {
+    const custom: Partial<Record<AgentRoleId, string>> = {};
+    for (const [role, value] of Object.entries(record.roleCustomInstructions as Record<string, unknown>)) {
+      if (isAgentRole(role) && typeof value === "string" && value.trim()) custom[role] = value.trim().slice(0, MAX_CUSTOM_INSTRUCTIONS);
+    }
+    if (Object.keys(custom).length) runtime.roleCustomInstructions = custom;
+  }
+  if (record.roleEfforts && typeof record.roleEfforts === "object") {
+    const roleEfforts: Partial<Record<AgentRoleId, string>> = {};
+    for (const [role, effort] of Object.entries(record.roleEfforts as Record<string, unknown>)) {
+      if (isAgentRole(role) && isEffort(effort)) roleEfforts[role] = effort;
+    }
+    if (Object.keys(roleEfforts).length) runtime.roleEfforts = roleEfforts;
+  }
+  if (!sameTeam(team, sdlcTeam())) runtime.team = team;
+  if (toolsFor && record.roleToolSettings && typeof record.roleToolSettings === "object") {
+    const settings: NonNullable<BranchRuntime["roleToolSettings"]> = {};
+    for (const [role, entry] of Object.entries(record.roleToolSettings as Record<string, unknown>)) {
+      if (!isAgentRole(role)) continue;
+      const parsed = parseRoleToolSettings(entry, role, toolsFor(role));
+      if ("error" in parsed) throw new WorkflowError(400, "invalid_tool_settings", `${teamRoleTitle(team, role)}: ${parsed.error}`);
+      if (Object.keys(parsed.settings).length) settings[role] = parsed.settings;
+    }
+    if (Object.keys(settings).length) runtime.roleToolSettings = settings;
   }
   if (!runtime.hostId && !runtime.runnerId) {
     throw new WorkflowError(400, "invalid_runtime", "Choose a host (and workspace) for the role sessions.");

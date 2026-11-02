@@ -3,6 +3,8 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import type { RoomMessage } from "../shared/roomMessages.ts";
+import type { AutoApproveRule } from "../shared/sessionApproval.ts";
 import type { Priority } from "../shared/types.ts";
 import { emptyTroubleshootState, type TroubleshootState } from "../shared/troubleshoot.ts";
 import { emptyWorkflowState, type WorkflowState } from "../shared/workflowTypes.ts";
@@ -21,6 +23,8 @@ export interface ApprovalDecision {
   elicitationId: string;
   action: "accept" | "decline";
   decidedAt: number;
+  /** Answered by an "approve for this session" rule rather than by the PO directly. */
+  automatic?: boolean;
 }
 
 export interface OfficeState {
@@ -31,10 +35,14 @@ export interface OfficeState {
   decisions: Record<string, ApprovalDecision>;
   workflow: WorkflowState;
   troubleshooting: TroubleshootState;
+  /** "Approve for this session" rules, keyed by session id. */
+  autoApprove: Record<string, AutoApproveRule>;
+  /** Messages the PO sent from each room, keyed by project id. */
+  roomMessages: Record<string, RoomMessage[]>;
 }
 
 export function emptyState(): OfficeState {
-  return { version: 1, rooms: {}, sessions: {}, decisions: {}, workflow: emptyWorkflowState(), troubleshooting: emptyTroubleshootState() };
+  return { version: 1, rooms: {}, sessions: {}, decisions: {}, workflow: emptyWorkflowState(), troubleshooting: emptyTroubleshootState(), autoApprove: {}, roomMessages: {} };
 }
 
 export class StateStore {

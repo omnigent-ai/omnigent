@@ -1,13 +1,17 @@
 // The SDLC theme: roles, the user-supplied RACI matrix, default human gates,
 // and the runtime gate patterns. Shared by the service and the browser.
 
-export type RoleId = "pm" | "po" | "architect" | "developer" | "reviewer" | "qa" | "devops";
-export type AgentRoleId = Exclude<RoleId, "po">;
+export type BuiltInRoleId = "pm" | "po" | "architect" | "developer" | "reviewer" | "qa" | "devops";
+export type BuiltInAgentRoleId = Exclude<BuiltInRoleId, "po">;
+/** A role of a room's team: one of the SDLC roles above, or a role the PO added. */
+export type RoleId = string;
+/** A role played by an agent session (every team role but the PO). */
+export type AgentRoleId = string;
 export type Raci = "R" | "A" | "RA" | "C" | "I";
 export type GateType = "requirements" | "architecture" | "merge" | "deployment" | "outage_triage";
 
 export interface RoleDefinition {
-  id: RoleId;
+  id: BuiltInRoleId;
   title: string;
   /** Persistent role conversations exist for agent roles; the PO is the human. */
   human: boolean;
@@ -25,12 +29,13 @@ export const ROLES: readonly RoleDefinition[] = [
   { id: "devops", title: "DevOps", human: false, appearance: 5 },
 ];
 
-export const AGENT_ROLES: readonly AgentRoleId[] = ["pm", "architect", "developer", "reviewer", "qa", "devops"];
+/** The SDLC theme's own agent roles; a room's team may drop some and add others. */
+export const BUILT_IN_AGENT_ROLES: readonly BuiltInAgentRoleId[] = ["pm", "architect", "developer", "reviewer", "qa", "devops"];
 /**
  * Default agent harness per role: Developer/QA on Claude, Architect/PM on Codex, DevOps on Gemini, Reviewing Developer on Copilot.
  * Gemini runs through the agy CLI (`antigravity-native`); plain `agy` is Omnigent's alias for the SDK harness, which needs an extra package.
  */
-export const DEFAULT_ROLE_HARNESSES: Readonly<Record<AgentRoleId, string>> = {
+export const DEFAULT_ROLE_HARNESSES: Readonly<Record<BuiltInAgentRoleId, string>> = {
   developer: "claude-sdk",
   architect: "codex",
   pm: "codex",
@@ -39,14 +44,34 @@ export const DEFAULT_ROLE_HARNESSES: Readonly<Record<AgentRoleId, string>> = {
   reviewer: "copilot",
 };
 
-export const COORDINATOR_ROLE: AgentRoleId = "pm";
+export const COORDINATOR_ROLE: BuiltInAgentRoleId = "pm";
 
-export function roleTitle(role: RoleId): string {
-  return ROLES.find((definition) => definition.id === role)?.title ?? role;
+/** The agent name of a role's sessions; the office also picks each role's look from it. */
+export function roleAgentName(role: AgentRoleId): string {
+  return `sdlc_${role}`;
 }
 
-export function isAgentRole(value: unknown): value is AgentRoleId {
-  return typeof value === "string" && (AGENT_ROLES as readonly string[]).includes(value);
+// Role titles of the team on screen: roles the PO added, and theme roles a team renamed.
+const customTitles = new Map<string, string>();
+
+/** Remember a team's role titles so any view can name its roles; theme roles it leaves out keep the theme's titles. */
+export function registerRoleTitles(roles: readonly { id: string; title: string }[]): void {
+  for (const role of BUILT_IN_AGENT_ROLES) customTitles.delete(role);
+  for (const role of roles) customTitles.set(role.id, role.title);
+}
+
+/** A role's title on the team last registered; the server names roles per room with the team instead. */
+export function roleTitle(role: RoleId): string {
+  return (
+    customTitles.get(role) ??
+    ROLES.find((definition) => definition.id === role)?.title ??
+    role.replace(/[_-]+/g, " ").replace(/^\w/, (letter) => letter.toUpperCase())
+  );
+}
+
+/** One of the SDLC theme's own agent roles. A room's team may have others (see shared/team.ts). */
+export function isBuiltInAgentRole(value: unknown): value is BuiltInAgentRoleId {
+  return typeof value === "string" && (BUILT_IN_AGENT_ROLES as readonly string[]).includes(value);
 }
 
 export interface MatrixRow {
@@ -143,7 +168,7 @@ export const RUNTIME_GATE_TOOLS: Partial<Record<GateType, string[]>> = {
 /** Every tool name Omnigent harnesses use for shell execution. */
 export const SHELL_TOOL_NAMES = ["sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell", "shell"];
 
-export const ROLE_BRIEFS: Record<AgentRoleId, string> = {
+export const ROLE_BRIEFS: Record<BuiltInAgentRoleId, string> = {
   pm: [
     "You are the PM and the coordinator of this SDLC project room. The human is the Product Owner (PO).",
     "Plan work as tasks with office_task_create (each task names its matrix row), dispatch them with",
@@ -189,4 +214,6 @@ export const SDLC_WORKFLOW_RULES = [
   "- A stop instruction from the PO takes effect immediately.",
   "- A human approval satisfies a workflow gate only. It never grants credentials or bypasses runtime policy.",
   "- Waiting on a gate blocks only dependent tasks; keep working on independent ones.",
+  "- When you produce something the PO can open (a deployment, a preview URL, a pull request, a report),",
+  "  share it with office_link_publish so it appears on the room's project bar.",
 ].join("\n");

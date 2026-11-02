@@ -1,3 +1,4 @@
+import { coordinatorName } from "../../../shared/team.ts";
 import { useEffect, useRef, useState } from "react";
 import { GATE_TITLES, roleTitle } from "../../../shared/sdlcTheme.ts";
 import type { BoardProposal, GateRequest, RequirementsBoard, WorkflowTask } from "../../../shared/workflowTypes.ts";
@@ -71,7 +72,7 @@ export function WorkflowRequestDialog({ branchId, request, onClose, onDecided }:
   const title =
     request.kind === "gate"
       ? `${GATE_TITLES[request.gate.gate]} approval requested by ${roleTitle(request.gate.requestedBy)}`
-      : "PM proposal for the requirements board";
+      : `${coordinatorName()} proposal for the requirements board`;
   return (
     <dialog
       ref={dialogRef}

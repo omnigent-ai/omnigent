@@ -1,7 +1,7 @@
 // Procedural pixel-art sprites drawn on a 2D canvas, so the prototype needs
 // no image assets or renderer dependency.
 
-import type { WorkerState } from "./workers.ts";
+import { type WorkerState, appearanceIndex } from "./workers.ts";
 
 export interface Palette {
   skin: string;
@@ -17,6 +17,11 @@ export const WORKER_PALETTES: Palette[] = [
   { skin: "#8d5524", hair: "#2b1d0e", shirt: "#d1913c", pants: "#2f2f46" },
   { skin: "#e0ac69", hair: "#6b4e2e", shirt: "#3aa6a0", pants: "#36454f" },
 ];
+
+/** A worker's colors, stable for the same agent name or session id. */
+export function workerPalette(key: string): Palette {
+  return WORKER_PALETTES[appearanceIndex(key, WORKER_PALETTES.length)];
+}
 
 export const HUMAN_PALETTE: Palette = { skin: "#ffe0bd", hair: "#5a3825", shirt: "#e4572e", pants: "#1d3557" };
 
@@ -70,18 +75,20 @@ const STATE_COLORS: Record<WorkerState, string> = {
   working: "#3fa34d",
   waiting_human: "#f2c14e",
   waiting_dependency: "#5c9ead",
+  needs_help: "#ff7a45",
   failed: "#d7263d",
   offline: "#8d8d8d",
-  completed: "#7fb069",
+  idle: "#c6e8b0",
 };
 
 const STATE_GLYPHS: Record<WorkerState, string> = {
   working: "…",
   waiting_human: "!",
   waiting_dependency: "⧗",
+  needs_help: "?",
   failed: "×",
   offline: "z",
-  completed: "✓",
+  idle: "–",
 };
 
 /** A small speech-bubble badge above a worker showing its state. */

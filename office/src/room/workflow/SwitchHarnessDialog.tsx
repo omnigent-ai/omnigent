@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { roleTitle, type AgentRoleId } from "../../../shared/sdlcTheme.ts";
-import { READINESS_LABELS, harnessReadiness, type RoleHealth } from "../../../shared/troubleshoot.ts";
+import { READINESS_LABELS, type RoleHealth } from "../../../shared/troubleshoot.ts";
 import { officeApi } from "../../api.ts";
 import { useRuntimeOptions } from "../../capabilities.ts";
+import { EffortSelect, HarnessSelect, ModelSelect, useHarnessReadiness } from "../../RuntimePickers.tsx";
 
 interface SwitchHarnessDialogProps {
   branchId: string;
@@ -11,20 +12,21 @@ interface SwitchHarnessDialogProps {
   /** Persistent roles in the branch, to offer moving every role off a failing harness. */
   roles: RoleHealth[];
   reason: string;
+  /** Preselect another ready harness, as when the current one is failing. */
+  preferOtherHarness?: boolean;
   onClose: () => void;
   onSwitched: (message: string) => void;
 }
 
-/** Move a role, or every role on the same harness, to another harness with a recorded handoff. */
-export function SwitchHarnessDialog({ branchId, hostId, target, roles, reason, onClose, onSwitched }: SwitchHarnessDialogProps) {
+/** Change a role's harness or model, or move every role on the same harness, restarting running roles with a handoff. */
+export function SwitchHarnessDialog({ branchId, hostId, target, roles, reason, preferOtherHarness = false, onClose, onSwitched }: SwitchHarnessDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const options = useRuntimeOptions();
-  const harnesses = (options?.harnesses.data ?? []).filter((entry) => entry.id !== target.harness);
-  const report = (options?.hosts.hosts ?? []).find((host) => host.host_id === hostId)?.configured_harnesses;
-  const readiness = (harness: string) => (hostId ? harnessReadiness(harness, report) : "unknown");
-  const firstReady = harnesses.find((entry) => readiness(entry.id) === "ready")?.id ?? harnesses[0]?.id ?? "";
-  const [harness, setHarness] = useState(firstReady);
-  const [model, setModel] = useState("");
+  const harnesses = (useRuntimeOptions()?.harnesses.data ?? []).filter((entry) => entry.id !== target.harness);
+  const readiness = useHarnessReadiness(hostId);
+  const otherHarness = harnesses.find((entry) => readiness(entry.id) === "ready")?.id ?? harnesses[0]?.id ?? target.harness;
+  const [harness, setHarness] = useState(preferOtherHarness ? otherHarness : target.harness);
+  const [model, setModel] = useState(preferOtherHarness ? "" : (target.model ?? ""));
+  const [effort, setEffort] = useState(preferOtherHarness ? "" : (target.effort ?? ""));
   const sameHarness = [...new Set(roles.filter((entry) => !entry.temporary && entry.harness === target.harness).map((entry) => entry.role))];
   const [scope, setScope] = useState<"role" | "harness">("role");
   const [busy, setBusy] = useState(false);
@@ -37,13 +39,16 @@ export function SwitchHarnessDialog({ branchId, hostId, target, roles, reason, o
 
   const affected: AgentRoleId[] = scope === "harness" ? sameHarness : [target.role];
   const chosenReadiness = harness ? readiness(harness) : "unknown";
+  const unchanged = harness === target.harness && model.trim() === (target.model ?? "") && effort === (target.effort ?? "");
+  const started = target.state !== "not_started";
 
   const submit = async () => {
     setBusy(true);
     setError(null);
     try {
-      await officeApi.switchHarness(branchId, affected, harness, model.trim(), reason);
-      onSwitched(`${affected.map(roleTitle).join(", ")} moved to ${harness} and restarted with a handoff.`);
+      await officeApi.switchHarness(branchId, affected, harness, model.trim(), effort, reason);
+      const runtime = `${harness} (${model.trim() || "harness default model"}${effort ? `, ${effort} effort` : ""})`;
+      onSwitched(`${affected.map(roleTitle).join(", ")} now on ${runtime}${started ? ", restarted with a handoff" : ""}.`);
     } catch (caught) {
       setError((caught as Error).message);
     } finally {
@@ -67,29 +72,36 @@ export function SwitchHarnessDialog({ branchId, hostId, target, roles, reason, o
           void submit();
         }}
       >
-        <h2 id="switch-harness-title">Switch the {roleTitle(target.role)} to another harness</h2>
+        <h2 id="switch-harness-title">Change the {roleTitle(target.role)}'s harness, model, or effort</h2>
         <p className="muted small">
-          Now on {target.harness}. Running roles restart in a new session with a handoff of their open tasks; their old session stays
-          readable.
+          Now on {target.harness} ({target.model ?? "harness default model"}
+          {target.effort ? `, ${target.effort} effort` : ""}).{" "}
+          {started
+            ? "A running role restarts in a new session with a handoff of its open tasks; its old session stays readable."
+            : "The role has not started yet; it starts on this choice when the PM first gives it work."}
         </p>
         <label>
-          New harness{" "}
-          <input required list="switch-harness-options" value={harness} onChange={(event) => setHarness(event.target.value.trim())} />
-          <datalist id="switch-harness-options">
-            {harnesses.map((entry) => (
-              <option key={entry.id} value={entry.id}>
-                {`${entry.label ?? entry.id} (${READINESS_LABELS[readiness(entry.id)]})`}
-              </option>
-            ))}
-          </datalist>
+          Harness{" "}
+          <HarnessSelect
+            hostId={hostId}
+            value={harness}
+            onChange={(next) => {
+              setHarness(next);
+              setModel(next === target.harness ? (target.model ?? "") : "");
+              setEffort(next === target.harness ? (target.effort ?? "") : "");
+            }}
+          />
         </label>
-        {harness ? (
-          <p className={chosenReadiness === "ready" || chosenReadiness === "unknown" ? "muted small" : "error-text"}>
+        {chosenReadiness !== "ready" && chosenReadiness !== "unknown" ? (
+          <p className="error-text">
             {harness} on this host: {READINESS_LABELS[chosenReadiness]}
           </p>
         ) : null}
         <label>
-          Model (optional; blank uses the harness default) <input value={model} onChange={(event) => setModel(event.target.value)} />
+          Model <ModelSelect hostId={hostId} harness={harness} value={model} onChange={setModel} />
+        </label>
+        <label>
+          Effort <EffortSelect hostId={hostId} harness={harness} model={model} value={effort} onChange={setEffort} />
         </label>
         {sameHarness.length > 1 ? (
           <fieldset>
@@ -113,8 +125,8 @@ export function SwitchHarnessDialog({ branchId, hostId, target, roles, reason, o
           <button type="button" onClick={onClose} disabled={busy}>
             Cancel
           </button>
-          <button type="submit" className="primary" disabled={busy || !harness}>
-            {busy ? "Switching…" : `Switch ${affected.length === 1 ? roleTitle(affected[0]) : `${affected.length} roles`}`}
+          <button type="submit" className="primary" disabled={busy || !harness || unchanged}>
+            {busy ? "Saving…" : `${started ? "Restart" : "Update"} ${affected.length === 1 ? roleTitle(affected[0]) : `${affected.length} roles`}`}
           </button>
         </div>
       </form>

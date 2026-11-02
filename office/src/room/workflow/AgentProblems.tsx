@@ -220,6 +220,7 @@ export function AgentProblems({ view, onChanged }: { view: BranchView; onChanged
           hostId={view.branch.runtime.hostId}
           target={switching}
           roles={health}
+          preferOtherHarness
           reason={switching.problem ? `${switching.problem.title}: ${switching.problem.detail}`.slice(0, 2000) : "PO switched the harness."}
           onClose={() => setSwitching(null)}
           onSwitched={(message) => {

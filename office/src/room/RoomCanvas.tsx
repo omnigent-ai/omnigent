@@ -1,7 +1,7 @@
-import { type MouseEvent, useCallback, useEffect, useRef } from "react";
+import { type MouseEvent, useCallback, useEffect, useRef, useState } from "react";
 import type { WorkerSession } from "../api.ts";
-import { HUMAN_PALETTE, PERSON_WIDTH, WORKER_PALETTES, drawDesk, drawFloorTiles, drawPerson, drawStateBadge } from "../sprites.ts";
-import { appearanceIndex, deriveWorkerState } from "../workers.ts";
+import { HUMAN_PALETTE, PERSON_WIDTH, drawDesk, drawFloorTiles, drawPerson, drawStateBadge, workerPalette } from "../sprites.ts";
+import type { WorkerState } from "../workers.ts";
 import {
   DESK_WIDTH,
   TILE,
@@ -33,6 +33,8 @@ const MOVES: Record<string, [number, number]> = {
 interface RoomCanvasProps {
   layout: RoomLayout;
   workers: WorkerSession[];
+  /** Each worker's room state, shared with the worker list and the Team tab. */
+  stateOf: (worker: WorkerSession) => WorkerState;
   selectedWorkerId: string | null;
   onOpenWorker: (sessionId: string) => void;
   onExit: () => void;
@@ -40,7 +42,7 @@ interface RoomCanvasProps {
   inputEnabled: boolean;
 }
 
-export function RoomCanvas({ layout, workers, selectedWorkerId, onOpenWorker, onExit, inputEnabled }: RoomCanvasProps) {
+export function RoomCanvas({ layout, workers, stateOf, selectedWorkerId, onOpenWorker, onExit, inputEnabled }: RoomCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const avatar = useRef<{ position: Tile; path: Tile[]; onArrive: (() => void) | null; steps: number }>({
     position: layout.spawn,
@@ -50,9 +52,32 @@ export function RoomCanvas({ layout, workers, selectedWorkerId, onOpenWorker, on
   });
   const workersRef = useRef(workers);
   workersRef.current = workers;
+  const stateOfRef = useRef(stateOf);
+  stateOfRef.current = stateOf;
 
   const width = layout.columns * TILE;
   const height = layout.rows * TILE;
+  // Fill the space around the canvas at the room's proportions, and draw at a whole
+  // multiple of the room's size for that space and the screen density, so art pixels
+  // stay square and crisp instead of being stretched.
+  const [fit, setFit] = useState<{ shown: number; scale: number } | null>(null);
+  const scaleRef = useRef(1);
+  scaleRef.current = fit?.scale ?? 1;
+
+  useEffect(() => {
+    const container = canvasRef.current?.parentElement;
+    if (!container || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width: spaceWidth, height: spaceHeight } = entry.contentRect;
+      // A hidden stage (a file tab is open) measures zero; keep the last size.
+      if (spaceWidth <= 0 || spaceHeight <= 0) return;
+      const shown = Math.min(spaceWidth / width, spaceHeight / height);
+      setFit({ shown, scale: Math.max(1, Math.min(8, Math.ceil(shown * (window.devicePixelRatio || 1)))) });
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [width, height]);
+  const scale = fit?.scale ?? 1;
 
   const interactWith = useCallback(
     (desk: Desk) => {
@@ -93,6 +118,7 @@ export function RoomCanvas({ layout, workers, selectedWorkerId, onOpenWorker, on
       }
       const context = canvasRef.current?.getContext("2d");
       if (context) {
+        context.setTransform(scaleRef.current, 0, 0, scaleRef.current, 0, 0);
         drawFloorTiles(context, width, height, TILE);
         context.fillStyle = "#7a8b99";
         context.fillRect(0, 0, width, TILE * 2);
@@ -116,8 +142,8 @@ export function RoomCanvas({ layout, workers, selectedWorkerId, onOpenWorker, on
         layout.desks.forEach((desk) => {
           const worker = workersRef.current[desk.workerIndex];
           if (!worker) return;
-          const workerState = deriveWorkerState(worker);
-          const palette = WORKER_PALETTES[appearanceIndex(worker.agent_name ?? worker.id, WORKER_PALETTES.length)];
+          const workerState = stateOfRef.current(worker);
+          const palette = workerPalette(worker.agent_name ?? worker.id);
           const seatX = desk.column * TILE + (DESK_WIDTH * TILE - PERSON_WIDTH * PIXEL) / 2;
           const seatY = (desk.row - 1) * TILE - 4;
           drawPerson(context, seatX, seatY, PIXEL, palette, workerState === "working" ? Math.floor(now / 350) : 0);
@@ -203,8 +229,9 @@ export function RoomCanvas({ layout, workers, selectedWorkerId, onOpenWorker, on
     <canvas
       ref={canvasRef}
       className="room-canvas"
-      width={width}
-      height={height}
+      width={width * scale}
+      height={height * scale}
+      style={fit ? { width: Math.floor(width * fit.shown), height: Math.floor(height * fit.shown) } : undefined}
       tabIndex={0}
       aria-label="Room interior. Use arrow keys or WASD to walk, Enter at a desk to talk to a worker, Enter on the exit to leave. Every worker is also listed in the side panel."
       onClick={onClick}

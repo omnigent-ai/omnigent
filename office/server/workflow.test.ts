@@ -7,7 +7,11 @@ import type { AgentRoleId } from "../shared/sdlcTheme.ts";
 import type { InterviewQuestion } from "../shared/workflowTypes.ts";
 import { FakeOmnigent } from "./fakeOmnigent.ts";
 import { StateStore } from "./stateStore.ts";
-import { type McpCaller, WorkflowError, WorkflowService } from "./workflow.ts";
+import { addRole, addTaskType, assign as assignRaci, nativeTeam, removeRole, removeTaskType, sdlcTeam, teamOf, updateRole } from "../shared/team.ts";
+import { NATIVE_TEAM_TEMPLATE, effectiveRoleHarness } from "../shared/teamTemplates.ts";
+import { templateFileYaml } from "../shared/teamFile.ts";
+import { roleInstructions } from "./bundle.ts";
+import { type McpCaller, WorkflowError, WorkflowService, normalizeRuntime } from "./workflow.ts";
 
 const NOW = 1_800_000_000;
 
@@ -357,6 +361,197 @@ describe("WorkflowService", () => {
     expect(workflow.roleStartFailure(branchId, "reviewer")).toBeNull();
   });
 
+  it("closes temporary workers by archiving their sessions, leaving their tasks for the PM", async () => {
+    const branchId = await assign();
+    const taskId = await task(branchId, "architecture");
+    await workflow.dispatchTask(caller(branchId, "pm"), { taskId, temporary: true });
+    const temporary = workflow.view(branchId).roleSessions.find((link) => link.temporary && link.retiredAt === null);
+    expect(temporary).toBeDefined();
+    const pmSession = caller(branchId, "pm").link.sessionId;
+    // Only live temporary workers of the room can be closed.
+    await expect(workflow.closeTemporaryWorkers(branchId, [pmSession])).rejects.toMatchObject({ code: "not_temporary" });
+    await expect(workflow.closeTemporaryWorkers(branchId, [])).rejects.toMatchObject({ code: "no_sessions" });
+
+    const result = await workflow.closeTemporaryWorkers(branchId, [temporary!.sessionId]);
+    expect(result).toEqual({ closed: [temporary!.sessionId], failed: [] });
+    expect(omnigent.interrupted).toContain(temporary!.sessionId);
+    expect(omnigent.archived).toEqual([temporary!.sessionId]);
+    const view = workflow.view(branchId);
+    expect(view.roleSessions.find((link) => link.sessionId === temporary!.sessionId)?.retiredAt).not.toBeNull();
+    expect(view.tasks.find((entry) => entry.id === taskId)?.status).toBe("in_progress");
+    expect(view.events.map((event) => event.summary)).toContainEqual(expect.stringMatching(/PO closed the temporary .+; the task is still in progress/));
+    await expect(workflow.closeTemporaryWorkers(branchId, [temporary!.sessionId])).rejects.toMatchObject({ code: "not_temporary" });
+  });
+
+  it("closes replaced sessions, archiving them, but never a role's current session", async () => {
+    const branchId = await assign();
+    const oldPm = caller(branchId, "pm").link.sessionId;
+    await workflow.rolloverRole(branchId, "pm", "Context is full.");
+    const newPm = caller(branchId, "pm").link.sessionId;
+    await expect(workflow.closeReplacedSessions(branchId, [newPm])).rejects.toMatchObject({ code: "not_replaced" });
+    await expect(workflow.closeReplacedSessions(branchId, ["s_elsewhere"])).rejects.toMatchObject({ code: "not_replaced" });
+    await expect(workflow.closeReplacedSessions(branchId, [])).rejects.toMatchObject({ code: "no_sessions" });
+
+    expect(await workflow.closeReplacedSessions(branchId, [oldPm])).toEqual({ closed: [oldPm], failed: [] });
+    expect(omnigent.archived).toEqual([oldPm]);
+    expect(omnigent.archived).not.toContain(newPm);
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual("PO closed 1 replaced session (PM).");
+  });
+
+  it("lets the PO change the room's RACI, which new tasks follow", async () => {
+    const branchId = await assign();
+    const before = await task(branchId, "implementation");
+    await workflow.setTeam(branchId, assignRaci(sdlcTeam(), "implementation", "architect", "A"));
+    const after = await task(branchId, "implementation");
+    const tasks = workflow.view(branchId).tasks;
+    // Existing tasks keep their roles; new ones follow the room's matrix.
+    expect(tasks.find((entry) => entry.id === before)).toMatchObject({ responsible: ["developer"], accountable: "developer" });
+    expect(tasks.find((entry) => entry.id === after)).toMatchObject({ responsible: ["developer"], accountable: "architect" });
+    const snapshot = workflow.boardSnapshot(caller(branchId, "pm")) as { matrix: { taskType: string; assignments: Record<string, string> }[] };
+    expect(snapshot.matrix.find((row) => row.taskType === "implementation")?.assignments).toMatchObject({ architect: "A", developer: "R" });
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual(expect.stringContaining("Architect accountable for Write code and unit tests"));
+    // A task type cannot be left without a responsible role.
+    await expect(workflow.setTeam(branchId, assignRaci(sdlcTeam(), "test_plan", "qa", "A"))).rejects.toThrow(/needs at least one responsible role/);
+    // Templates carry the team, and switching to the default brings the SDLC team back.
+    const template = workflow.saveTeamTemplate(branchId, "Architect owns code", "");
+    expect(template.team?.taskTypes.find((entry) => entry.id === "implementation")?.assignments).toMatchObject({ architect: "A", developer: "R" });
+    const reset = await workflow.applyTeamTemplate(branchId, "builtin_default", false);
+    expect(reset.changed).toEqual(expect.arrayContaining(["architect", "developer"]));
+    expect(store.state.workflow.branches[branchId].runtime.team).toBeUndefined();
+  });
+
+  it("runs custom roles and task types, and retires roles taken off the team", async () => {
+    const branchId = await assign();
+    const withDesigner = addRole(sdlcTeam(), "UX Designer");
+    const designer = withDesigner.roleId;
+    const team = updateRole(withDesigner.team, designer, { brief: "You design screens and flows." });
+    const withType = addTaskType(team, "Design screens");
+    // A new task type starts with the PM as R+A; handing it to the designer leaves the PM responsible until changed.
+    const handedOver = assignRaci(assignRaci(withType.team, withType.taskTypeId, designer, "RA"), withType.taskTypeId, "pm", "I");
+    await workflow.setTeam(branchId, handedOver);
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual(expect.stringContaining("added UX Designer"));
+
+    // The PM sees the room's task types and roles, and the designer starts with its own brief.
+    const pm = caller(branchId, "pm");
+    const created = await workflow.createTask(pm, {
+      taskType: withType.taskTypeId,
+      title: "Checkout screens",
+      deliverable: "Mockups",
+      acceptanceCriteria: ["Covers checkout"],
+      evidenceRequired: ["Figma link"],
+    });
+    const taskId = (created.task as { id: string }).id;
+    expect(workflow.view(branchId).tasks.find((entry) => entry.id === taskId)).toMatchObject({ responsible: [designer], accountable: designer });
+    await workflow.dispatchTask(pm, { taskId });
+    const spec = omnigent.sessions.at(-1)?.spec as { name: string; prompt: string };
+    expect(spec.name).toBe(`sdlc_${designer}`);
+    expect(spec.prompt).toContain("Your role: UX Designer.");
+    expect(spec.prompt).toContain("You design screens and flows.");
+    const designerSession = workflow.view(branchId).roleSessions.find((link) => link.role === designer)!.sessionId;
+    await workflow.messageRole(pm, { role: designer, text: "Please start." });
+
+    // Taking the role off the team stops and retires its session; the task stays.
+    const without = removeRole(teamOf(store.state.workflow.branches[branchId].runtime), designer);
+    await workflow.setTeam(branchId, without.taskTypes.reduce((next, entry) => (entry.id === withType.taskTypeId ? removeTaskType(next, entry.id) : next), without));
+    expect(omnigent.interrupted).toContain(designerSession);
+    expect(workflow.view(branchId).roleSessions.find((link) => link.sessionId === designerSession)?.retiredAt).not.toBeNull();
+    await expect(workflow.messageRole(pm, { role: designer, text: "Still there?" })).rejects.toMatchObject({ code: "invalid_role" });
+    expect(workflow.view(branchId).tasks.find((entry) => entry.id === taskId)).toBeDefined();
+  });
+
+  it("saves the team as a template and switches rooms between templates", async () => {
+    const branchId = await assign();
+    const runtime = () => store.state.workflow.branches[branchId].runtime;
+    await workflow.switchRoleHarness(branchId, ["pm"], "claude-sdk", "opus", "Try Claude");
+    await workflow.setRoleInstructions(branchId, "qa", "Test in Safari too.", false);
+    const saved = workflow.saveTeamTemplate(branchId, "Claude PM", "PM on Claude, QA in Safari");
+    // The room runs every role on openai-agents, so the template keeps that too.
+    expect(saved.roles).toMatchObject({
+      pm: { harness: "claude-sdk", model: "opus" },
+      qa: { harness: "openai-agents", instructions: "Test in Safari too." },
+      developer: { harness: "openai-agents" },
+    });
+    expect(runtime().teamTemplateId).toBe(saved.id);
+    // Saving under the same name replaces it; the built-in name is reserved.
+    expect(workflow.saveTeamTemplate(branchId, "claude pm", "").id).toBe(saved.id);
+    expect(() => workflow.saveTeamTemplate(branchId, "Default team", "")).toThrow(WorkflowError);
+    expect(workflow.teamTemplates().map((template) => template.name)).toEqual(["Default team", "Native (single agent)", "claude pm"]);
+
+    // Switching to the default resets every role; the running PM restarts on request.
+    const oldPm = caller(branchId, "pm").link.sessionId;
+    const result = await workflow.applyTeamTemplate(branchId, "builtin_default", true);
+    expect(result.changed).toEqual(["pm", "architect", "developer", "reviewer", "qa", "devops"]);
+    expect(runtime()).toMatchObject({ teamTemplateId: "builtin_default", roleHarnesses: {}, roleCustomInstructions: {} });
+    expect(caller(branchId, "pm").link.sessionId).not.toBe(oldPm);
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual(expect.stringContaining('switched the team to "Default team": PM (harness, model)'));
+
+    // And back again, without restarting.
+    await workflow.applyTeamTemplate(branchId, saved.id, false);
+    expect(runtime().roleHarnesses).toMatchObject({ pm: "claude-sdk", qa: "openai-agents" });
+    expect(runtime().roleCustomInstructions).toEqual({ qa: "Test in Safari too." });
+    workflow.deleteTeamTemplate(saved.id);
+    await expect(workflow.applyTeamTemplate(branchId, saved.id, false)).rejects.toMatchObject({ code: "template_not_found" });
+    expect(() => workflow.deleteTeamTemplate("builtin_default")).toThrow(WorkflowError);
+  });
+
+  it("imports a team file as a template, keeping built-in names free", async () => {
+    const branchId = await assign();
+    const yaml = templateFileYaml(NATIVE_TEAM_TEMPLATE);
+    const first = workflow.importTeamTemplate(yaml);
+    expect(first).toMatchObject({ replaced: false, template: { name: "Native (single agent) (imported)", team: nativeTeam() } });
+    // Importing the same name again replaces it.
+    expect(workflow.importTeamTemplate(yaml)).toMatchObject({ replaced: true, template: { id: first.template.id } });
+    expect(() => workflow.importTeamTemplate("kind: nope")).toThrow(expect.objectContaining({ code: "invalid_team_file" }));
+    await workflow.applyTeamTemplate(branchId, first.template.id, false);
+    expect(workflow.roleName(branchId, "pm")).toBe("Full Stack Developer (FSD)");
+  });
+
+  it("switches a room to the native theme: one PM on a native harness doing every task type", async () => {
+    const branchId = await assign();
+    const result = await workflow.applyTeamTemplate(branchId, "builtin_native", false);
+    expect(result.changed).toEqual(["pm"]);
+    const view = workflow.view(branchId);
+    const runtime = store.state.workflow.branches[branchId].runtime;
+    expect(runtime.team?.roles.map((role) => role.id)).toEqual(["pm"]);
+    expect(effectiveRoleHarness(runtime, "pm")).toBe("claude-native");
+    // The one agent is the Full Stack Developer in this room's prompt and events.
+    expect(workflow.roleName(branchId, "pm")).toBe("Full Stack Developer (FSD)");
+    expect(roleInstructions({ role: "pm", projectName: "Demo", runtime })).toContain("Your role: Full Stack Developer (FSD).");
+    expect(view.events.map((event) => event.summary)).toContainEqual(expect.stringContaining("Developer (leaves the team)"));
+    expect(() => workflow.deleteTeamTemplate("builtin_native")).toThrow(WorkflowError);
+    expect(() => workflow.saveTeamTemplate(branchId, "native (single agent)", "")).toThrow(WorkflowError);
+  });
+
+  it("saves a role's tool and policy choices, marking only session changes as needing a restart", async () => {
+    const branchId = await assign();
+    const available = ["office_board_get", "office_task_update", "office_message_role", "office_link_publish"];
+    await workflow.setRoleToolSettings(branchId, "developer", { disabledTools: ["office_link_publish"] }, available, false);
+    const runtime = store.state.workflow.branches[branchId].runtime;
+    expect(runtime.roleToolSettings?.developer).toEqual({ disabledTools: ["office_link_publish"], updatedAt: undefined });
+    await workflow.setRoleToolSettings(branchId, "developer", { riskPolicy: "deny" }, available, false);
+    expect(runtime.roleToolSettings?.developer?.updatedAt).toEqual(expect.any(Number));
+    await expect(workflow.setRoleToolSettings(branchId, "developer", { disabledTools: ["office_task_update"] }, available, false)).rejects.toMatchObject({
+      code: "invalid_tool_settings",
+    });
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual(expect.stringContaining("risk policy: deny risky commands"));
+  });
+
+  it("shows each role's prompt and applies the PO's instructions, restarting a running role on request", async () => {
+    const branchId = await assign();
+    const oldPm = caller(branchId, "pm").link.sessionId;
+    await workflow.setRoleInstructions(branchId, "qa", "  Test in Safari too.  ", false);
+    await workflow.setRoleInstructions(branchId, "pm", "Keep standups short.", true);
+    const config = await workflow.teamConfig(branchId);
+    expect(config.find((entry) => entry.role === "qa")).toMatchObject({ customInstructions: "Test in Safari too." });
+    expect(config.find((entry) => entry.role === "qa")?.prompt).toContain("PO instructions for this role:\nTest in Safari too.");
+    // The PM restarted onto the new prompt; QA has not started, so it simply starts with it later.
+    expect(caller(branchId, "pm").link.sessionId).not.toBe(oldPm);
+    expect(omnigent.sessions.at(-1)?.spec.prompt).toContain("Keep standups short.");
+    await workflow.setRoleInstructions(branchId, "qa", "", false);
+    expect((await workflow.teamConfig(branchId)).find((entry) => entry.role === "qa")?.customInstructions).toBe("");
+    await expect(workflow.setRoleInstructions(branchId, "po", "x", false)).rejects.toMatchObject({ code: "invalid_role" });
+  });
+
   it("switches roles to another harness and restarts the running ones with a handoff", async () => {
     const branchId = await assign();
     const oldPm = caller(branchId, "pm").link.sessionId;
@@ -371,6 +566,35 @@ describe("WorkflowService", () => {
     // QA never started, so it simply starts on the new harness later.
     expect(omnigent.sessions).toHaveLength(2);
     await expect(workflow.switchRoleHarness(branchId, [], "codex", "", "")).rejects.toMatchObject({ code: "invalid_role" });
+
+    // Changing only the model keeps the harness and restarts the role on that model.
+    await workflow.switchRoleHarness(branchId, ["pm"], "codex", "gpt-6.1-sol", "Use a stronger model.", "high");
+    expect(runtime.roleModels).toEqual({ pm: "gpt-6.1-sol" });
+    expect(runtime.roleEfforts).toEqual({ pm: "high" });
+    expect(omnigent.sessions.at(-1)?.spec.executor).toMatchObject({ config: { harness: "codex" }, model: "gpt-6.1-sol", reasoning_effort: "high" });
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual(
+      expect.stringContaining("PM now uses codex (gpt-6.1-sol, high effort)"),
+    );
+    await expect(workflow.switchRoleHarness(branchId, ["pm"], "codex", "", "", "extreme")).rejects.toMatchObject({ code: "invalid_effort" });
+  });
+
+  it("keeps result links from the PO and roles, updating by URL and refusing unsafe ones", async () => {
+    const branchId = await assign();
+    const pm = caller(branchId, "pm");
+    const shared = workflow.publishLink(pm, { label: "Staging", url: "https://staging.example.com/app" });
+    expect(shared).toMatchObject({ addedBy: "pm", label: "Staging", url: "https://staging.example.com/app" });
+    workflow.publishLink(pm, { label: "Staging v2", url: "https://staging.example.com/app" });
+    workflow.addProjectLink("proj", { label: "PR #42", url: "https://github.com/acme/shop/pull/42", description: "Checkout" }, "po");
+    expect(workflow.projectLinks("proj").map((link) => [link.label, link.addedBy])).toEqual([
+      ["Staging v2", "pm"],
+      ["PR #42", "po"],
+    ]);
+    expect(workflow.view(branchId).events.map((event) => event.summary)).toContainEqual(expect.stringContaining("PM shared a link: Staging"));
+    expect(() => workflow.addProjectLink("proj", { label: "x", url: "javascript:alert(1)" }, "po")).toThrow(/http/);
+    expect(() => workflow.addProjectLink("proj", { label: "", url: "https://example.com" }, "po")).toThrow(/label/);
+    workflow.removeProjectLink("proj", shared.id);
+    expect(workflow.projectLinks("proj")).toHaveLength(1);
+    expect(() => workflow.removeProjectLink("proj", shared.id)).toThrow(WorkflowError);
   });
 
   it("tells a restarted PM about the interview it was running", async () => {
@@ -419,5 +643,17 @@ describe("WorkflowService", () => {
     expect(reloaded.callerForToken(token)?.link.role).toBe("pm");
     expect(reloaded.callerForToken("not-a-token")).toBeNull();
     expect(() => reloaded.view("branch_missing")).toThrow(WorkflowError);
+  });
+});
+
+describe("normalizeRuntime", () => {
+  it("keeps per-role efforts Omnigent knows and drops other values and roles", () => {
+    const runtime = normalizeRuntime({
+      hostId: "host",
+      workspace: "/repo",
+      roleEfforts: { pm: "high", qa: "extreme", po: "low", developer: 3 },
+    });
+    expect(runtime.roleEfforts).toEqual({ pm: "high" });
+    expect(normalizeRuntime({ hostId: "host", workspace: "/repo", roleEfforts: { qa: "" } }).roleEfforts).toBeUndefined();
   });
 });

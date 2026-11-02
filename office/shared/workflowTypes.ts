@@ -2,6 +2,10 @@
 // part of every record so additional theme branches need no migration.
 
 import type { AgentRoleId, GateType, RoleId } from "./sdlcTheme.ts";
+import type { ProjectLink } from "./projectLinks.ts";
+import type { RaciOverrides, TeamDefinition } from "./team.ts";
+import type { RoleToolSettings } from "./roleTools.ts";
+import type { TeamTemplate } from "./teamTemplates.ts";
 import type { RoleHealth } from "./troubleshoot.ts";
 
 export type ThemeId = "sdlc";
@@ -16,6 +20,18 @@ export interface BranchRuntime {
   model?: string;
   /** Per-role model overrides, e.g. a stronger model for the Architect. */
   roleModels?: Partial<Record<AgentRoleId, string>>;
+  /** Per-role reasoning effort, e.g. "high"; omit for the harness default. */
+  roleEfforts?: Partial<Record<AgentRoleId, string>>;
+  /** The room's own team: roles, task types, and their RACI. Absent means the SDLC team. */
+  team?: TeamDefinition;
+  /** Earlier RACI changes over the SDLC matrix; read into the team (see teamOf). */
+  raci?: RaciOverrides;
+  /** The team template the room last switched to or was saved as. */
+  teamTemplateId?: string;
+  /** The PO's tool and policy choices per role. */
+  roleToolSettings?: Partial<Record<AgentRoleId, RoleToolSettings>>;
+  /** The PO's own instructions for a role, added to its prompt. */
+  roleCustomInstructions?: Partial<Record<AgentRoleId, string>>;
   hostId?: string;
   workspace?: string;
   /** Bind to an already running runner instead of launching on a host. */
@@ -218,6 +234,10 @@ export interface WorkflowState {
   relayedItemIds: string[];
   /** Latest failure to start each role, keyed `${branchId}:${role}`; cleared when it starts. */
   roleStartFailures: Record<string, RoleStartFailure>;
+  /** Result links per project, from the PO and from roles. */
+  projectLinks: Record<string, ProjectLink[]>;
+  /** Saved team templates, shared by every room. */
+  teamTemplates: Record<string, TeamTemplate>;
 }
 
 export function emptyWorkflowState(): WorkflowState {
@@ -234,6 +254,8 @@ export function emptyWorkflowState(): WorkflowState {
     decisions: {},
     relayedItemIds: [],
     roleStartFailures: {},
+    projectLinks: {},
+    teamTemplates: {},
   };
 }
 

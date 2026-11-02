@@ -211,26 +211,6 @@ select {
   grid-column: 2;
 }
 
-.room-main {
-  flex: 0 1 auto;
-  min-width: 0;
-}
-
-.room-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-}
-
-.room-controls {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
 .rank-explanation {
   background: var(--panel);
   border-left: 4px solid var(--warn);
@@ -295,8 +275,12 @@ select {
   background: #8d8d8d;
 }
 
-.state-completed {
-  background: #7fb069;
+.state-needs_help {
+  background: #ff7a45;
+}
+
+.state-idle {
+  background: #c6e8b0;
 }
 
 .todo-active {
@@ -395,7 +379,7 @@ select {
 }
 
 /* Workflow (functional styling only) */
-.workflow-panel { display: grid; gap: 12px; margin-top: 12px; }
+.workflow-panel { display: grid; gap: 12px; margin: 0 0 12px; }
 .workflow-section { border: 2px solid var(--line, #3a3f55); padding: 8px 12px; background: rgba(0, 0, 0, 0.15); }
 .workflow-section h3 { margin: 0 0 6px; }
 .workflow-section label { display: block; margin: 4px 0; }
@@ -458,3 +442,423 @@ select {
 .request-alert-text { display: flex; flex-direction: column; flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
 .request-alert-actions { display: flex; gap: 6px; }
 .request-alert .error-text { flex-basis: 100%; margin: 0; }
+
+.workflow-tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 2px solid var(--panel-border); }
+.workflow-tab { display: inline-flex; align-items: center; gap: 6px; border-bottom: none; margin-bottom: -2px; background: var(--bg); }
+.workflow-tab[aria-selected="true"] { background: var(--panel); border-color: var(--warn); border-bottom: 2px solid var(--panel); }
+.workflow-tabpanel { display: grid; gap: 12px; }
+.tab-badge { min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--panel-border); font-size: 11px; text-align: center; }
+.tab-badge-urgent { background: var(--warn); color: #111; }
+
+.role-runtime-table { width: 100%; border-collapse: collapse; margin: 4px 0 8px; }
+.role-runtime-table th, .role-runtime-table td { text-align: left; padding: 6px; border-bottom: 1px dashed var(--panel-border); vertical-align: top; }
+.role-runtime-table thead th { color: var(--muted); font-size: 12px; font-weight: normal; }
+.team-state { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.team-state .state-dot { margin-top: 0; }
+.state-not_started { background: transparent; border: 1px solid var(--muted); }
+.role-runtime-table select, .role-runtime-table input { width: 100%; }
+.model-select { display: grid; gap: 4px; }
+.inline-field select { width: auto; }
+.decision-list { padding-left: 18px; }
+.decision-list li, .event-feed li { margin-bottom: 4px; }
+.approval-dialog:has(.role-runtime-table) { max-width: 820px; }
+.person-sprite { display: block; image-rendering: pixelated; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.role-tools-row > td { background: rgba(0, 0, 0, 0.2); }
+.role-tools-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; }
+.role-tools h4 { margin: 4px 0; font-size: 13px; }
+.role-tools ul { list-style: none; padding: 0; margin: 0; }
+.role-tools li { margin-bottom: 4px; }
+.tool-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.tool-chips li { margin: 0; padding: 1px 6px; border: 1px solid var(--panel-border); }
+.tool-target { overflow-wrap: anywhere; }
+.replaced-workers { margin-top: 8px; }
+.replaced-workers summary { cursor: pointer; color: var(--muted); }
+.team-work { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.team-work-todo, .team-work-tool { color: #9fe0a8; }
+.team-work-error { color: #ff8a8a; }
+.team-work-task { color: var(--text); }
+
+/* Room: Office Board | project, requests, and office | Team and Files. */
+.room-view.room-grid {
+  display: grid;
+  grid-template-columns: minmax(200px, 240px) minmax(0, 1fr) minmax(280px, 340px);
+  align-items: start;
+  gap: 10px;
+  padding: 10px;
+}
+.room-pane {
+  position: sticky;
+  top: 10px;
+  height: calc(100vh - 20px);
+  overflow: auto;
+  background: var(--panel);
+  border: 2px solid var(--panel-border);
+  padding: 10px;
+}
+/* The middle column is exactly one screen tall: the office or file takes whatever the bar,
+   links, requests, and message box leave, so the whole room fits on a laptop screen. */
+.room-center { min-width: 0; display: flex; flex-direction: column; gap: 8px; height: calc(100vh - 20px); min-height: 520px; overflow-y: auto; }
+.room-center > * { flex: none; }
+.room-center > .room-stage-area { flex: 1 1 auto; min-height: 240px; }
+.room-center > .requests { max-height: 28vh; overflow-y: auto; }
+.room-center > .agent-problems { max-height: 32vh; overflow-y: auto; }
+.room-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.15); border: 2px solid var(--panel-border); padding: 4px; }
+/* The canvas sizes itself to the stage at the room's proportions (see RoomCanvas). */
+.room-stage .room-canvas { max-width: 100%; max-height: 100%; }
+.room-pane-body { padding-top: 10px; }
+/* The Team / Files tabs stay put; only the tab's content scrolls beneath them. */
+.room-right { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 0; }
+.room-right > .pane-header { flex: none; }
+.room-right > .room-pane-body { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 10px; }
+.room-right .workflow-tab { flex: 1 1 0; justify-content: center; }
+
+.project-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 10px; background: var(--panel); border: 2px solid var(--panel-border); }
+.project-bar-title { flex: 1 1 160px; min-width: 0; }
+.project-bar-title h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.project-bar-title h1 { margin: 0; }
+.project-bar-title p { margin: 2px 0 0; }
+.project-stats { display: flex; gap: 16px; margin: 0; }
+.project-stats div { display: grid; }
+.project-stats dt { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+.project-stats dd { margin: 0; font-weight: bold; }
+.project-status-ok { color: #9fe0a8; }
+.project-status-busy { color: #7fd1ff; }
+.project-status-attention { color: var(--warn); }
+.project-status-problem { color: #ff8a8a; }
+.project-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+.room-settings { position: relative; }
+.room-settings summary { list-style: none; cursor: pointer; border: 2px solid var(--panel-border); padding: 6px 10px; background: #3b3650; }
+.room-settings[open] summary { border-color: var(--accent); }
+.room-settings-body { position: absolute; right: 0; z-index: 5; width: 300px; display: grid; gap: 8px; padding: 10px; background: var(--panel); border: 2px solid var(--panel-border); }
+.room-settings-body .rank-explanation { margin: 0; }
+.exit-button { background: #5a2430; }
+
+.board-modal { max-width: 900px; }
+.board-modal-header { display: flex; justify-content: space-between; align-items: center; }
+
+.team-pane { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.team-pane h3 { margin: 0 0 6px; }
+.usage-card p { margin: 0; }
+.usage-total { font-size: 22px; font-weight: bold; }
+.team-list { list-style: none; margin: 0; padding: 0; }
+.team-member { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 8px 0; border-bottom: 1px dashed var(--panel-border); }
+.team-member-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; }
+.team-member-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.team-member-head .team-state { margin-left: auto; font-size: 12px; }
+.team-member-name { padding: 0; font-weight: bold; color: var(--text); }
+.team-member-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 2px; }
+.team-member-actions button:not(.link-button) { padding: 2px 8px; font-size: 12px; }
+.team-member .team-work { font-size: 12px; }
+.team-activity .workflow-section { padding: 6px 8px; }
+
+.file-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; }
+.file-crumbs .link-button { padding: 0 2px; }
+.file-refresh { margin-left: auto; padding: 2px 8px; }
+.file-root { margin: 4px 0 8px; overflow-wrap: anywhere; }
+.file-list { list-style: none; margin: 0; padding: 0; }
+.file-list button { width: 100%; text-align: left; background: none; border: none; padding: 4px 2px; }
+.file-list button:hover { background: rgba(255, 255, 255, 0.05); }
+
+/* Long session titles take at most two lines in the Office Board. */
+.office-board .worker-name { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* Collapsed side panes become thin rails, giving the middle their space. */
+.room-view.room-grid.left-collapsed { grid-template-columns: 40px minmax(0, 1fr) minmax(280px, 340px); }
+.room-view.room-grid.right-collapsed { grid-template-columns: minmax(200px, 240px) minmax(0, 1fr) 40px; }
+.room-view.room-grid.left-collapsed.right-collapsed { grid-template-columns: 40px minmax(0, 1fr) 40px; }
+.pane-header { display: flex; align-items: flex-start; gap: 6px; }
+.pane-header > h2, .pane-header > .workflow-tabs { flex: 1; min-width: 0; }
+.pane-collapse { flex: none; padding: 2px 8px; }
+.pane-rail { padding: 0; overflow: hidden; }
+.pane-rail-button { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 10px 0; background: none; border: none; }
+.pane-rail-button:hover { background: rgba(255, 255, 255, 0.05); }
+.pane-rail-label { writing-mode: vertical-rl; color: var(--muted); letter-spacing: 1px; }
+.pane-rail-left .pane-rail-label { transform: rotate(180deg); }
+.pane-rail-badge { writing-mode: vertical-rl; font-size: 11px; padding: 4px 1px; background: var(--panel-border); }
+
+@media (max-width: 1100px) {
+  .room-view.room-grid { grid-template-columns: minmax(200px, 240px) minmax(0, 1fr); }
+  .room-view.room-grid.left-collapsed, .room-view.room-grid.left-collapsed.right-collapsed { grid-template-columns: 40px minmax(0, 1fr); }
+  .room-view.room-grid.right-collapsed { grid-template-columns: minmax(200px, 240px) minmax(0, 1fr); }
+  .pane-rail-right { grid-column: 1 / -1; position: static; height: auto; }
+  .pane-rail-right .pane-rail-button { flex-direction: row; justify-content: center; padding: 6px; }
+  .pane-rail-right .pane-rail-label, .pane-rail-right .pane-rail-badge { writing-mode: horizontal-tb; }
+  .room-right { grid-column: 1 / -1; position: static; height: 70vh; max-height: none; }
+}
+@media (max-width: 760px) {
+  .room-view.room-grid, .room-view.room-grid.left-collapsed, .room-view.room-grid.right-collapsed, .room-view.room-grid.left-collapsed.right-collapsed { grid-template-columns: minmax(0, 1fr); }
+  .pane-rail .pane-rail-button { flex-direction: row; justify-content: center; padding: 6px; }
+  .pane-rail .pane-rail-label, .pane-rail .pane-rail-badge { writing-mode: horizontal-tb; transform: none; }
+  .room-pane { position: static; height: auto; max-height: none; }
+  .office-board { max-height: 40vh; }
+  .room-center { height: auto; }
+  .room-center > .room-stage-area { min-height: 70vw; }
+}
+
+.project-links { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: -8px; padding: 4px 10px; background: var(--panel); border: 2px solid var(--panel-border); border-top: none; }
+.project-links a { color: #7fd1ff; }
+.project-open { padding: 4px 10px; background: var(--ok); color: #111 !important; text-decoration: none; font-weight: bold; }
+.project-open:hover, .project-open:focus-visible { outline: 3px solid var(--warn); }
+.project-link { display: inline-flex; align-items: center; gap: 2px; padding: 1px 4px 1px 8px; border: 1px solid var(--panel-border); }
+.link-remove { background: none; border: none; padding: 0 4px; color: var(--muted); }
+.project-link-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.project-link-form input { background: #15131c; border: 2px solid var(--panel-border); padding: 4px 6px; }
+
+/* A file tab takes the office's place in the middle of the room. */
+.room-stage-area { display: flex; flex-direction: column; min-width: 0; }
+.stage-tabs { overflow-x: auto; flex-wrap: nowrap; }
+.stage-file-tab { display: inline-flex; align-items: stretch; }
+.stage-file-tab .workflow-tab { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-right: none; }
+.stage-tab-close { margin-bottom: -2px; padding: 0 8px; border-bottom: none; background: var(--bg); }
+.stage-file-tab-active .stage-tab-close { background: var(--panel); border-color: var(--warn); border-bottom: 2px solid var(--panel); }
+.room-stage-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; border: 2px solid var(--panel-border); border-top: none; }
+.room-stage-panel > .room-stage { border: none; }
+.room-stage[hidden] { display: none; }
+.file-viewer { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #22272e; }
+.file-viewer-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 12px; border-bottom: 2px solid var(--panel-border); }
+.file-viewer-header h2 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.file-viewer-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.file-viewer > p { margin: 8px 12px; }
+.file-viewer-header { background: var(--panel); }
+.code-view { flex: 1; min-height: 0; overflow: auto; font-size: 13px; line-height: 1.5; background: #22272e; }
+.code-view pre { margin: 0; padding: 8px 0; background: transparent !important; counter-reset: line; }
+.code-view code { display: block; min-width: max-content; }
+.code-view .line { display: inline-block; width: 100%; padding-right: 16px; counter-increment: line; }
+.code-view .line::before { content: counter(line); display: inline-block; width: 4.5ch; margin-right: 16px; padding-right: 8px; text-align: right; color: #636e7b; border-right: 1px solid #373e47; user-select: none; }
+.code-wrap code { min-width: 0; }
+.code-wrap .line { white-space: pre-wrap; overflow-wrap: anywhere; }
+.code-plain { margin: 0; padding: 8px 12px; color: #adbac7; white-space: pre; }
+.code-plain.code-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+
+.stage-bar { display: flex; align-items: flex-end; gap: 8px; border-bottom: 2px solid var(--panel-border); }
+.stage-bar .stage-tabs { flex: 1; min-width: 0; border-bottom: none; }
+.animation-toggle { flex: none; margin-bottom: 4px; display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; font-size: 12px; }
+.animation-state { padding: 1px 6px; background: #5a2430; color: var(--text); font-weight: bold; }
+.animation-on .animation-state { background: var(--ok); color: #111; }
+
+/* Slack-style chat of the room, shown when animation is off. */
+.slack-view { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(150px, 200px) minmax(0, 1fr); background: #1a1d21; }
+.slack-sidebar { display: flex; flex-direction: column; gap: 2px; padding: 8px 6px; overflow-y: auto; background: #3f0e40; color: #e8dce8; }
+.slack-workspace { padding: 4px 8px 8px; font-weight: bold; border-bottom: 1px solid #5d2c5d; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slack-section { padding: 6px 8px 2px; font-size: 11px; text-transform: uppercase; color: #c9a7c9; }
+.slack-item { display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 8px; background: none; border: none; color: inherit; text-align: left; font-size: 13px; }
+.slack-item:hover:not(:disabled) { background: #350d36; }
+.slack-item[aria-current], .slack-item[aria-current]:hover { background: #1164a3; color: #fff; }
+.slack-item .state-dot { flex: none; width: 8px; height: 8px; margin: 0; border-radius: 50%; }
+.slack-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slack-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.slack-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 12px; border-bottom: 1px solid #35373b; }
+.slack-messages { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 8px 0; }
+.slack-empty { padding: 8px 12px; }
+.slack-message { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 6px 12px; }
+.slack-message:hover { background: #222529; }
+.slack-message-meta strong { color: #e8e8e8; }
+.slack-message-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; color: #d1d2d3; }
+.slack-message-tool .slack-message-text, .slack-message-office .slack-message-text { color: #9a9b9d; font-style: italic; }
+.slack-message-error .slack-message-text { color: #ff8a8a; }
+.slack-hint { margin: 0; padding: 6px 12px; border-top: 1px solid #35373b; }
+
+/* Slack-style message box under the office. */
+.slack-composer { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; }
+.slack-composer-box { position: relative; background: #222529; border: 1px solid #565856; border-radius: 8px; }
+.slack-composer-box:focus-within { border-color: #9a9b9d; }
+.slack-composer-box textarea { display: block; width: 100%; resize: none; padding: 10px 12px 4px; border: none; background: transparent; color: #d1d2d3; line-height: 1.45; outline: none; }
+.slack-composer-box textarea:focus-visible { outline: none; }
+.slack-composer-toolbar { display: flex; align-items: center; gap: 4px; padding: 4px 6px 6px; }
+.composer-spacer { flex: 1; }
+.to-pill { display: inline-flex; align-items: center; gap: 4px; padding: 0 0 0 8px; border-radius: 12px; background: #35373b; font-size: 12px; color: #c9c9c9; }
+.to-pill select { max-width: 220px; border: none; background: transparent; padding: 3px 4px; font-size: 12px; color: #e8e8e8; }
+.composer-icon { padding: 2px 8px; border: none; border-radius: 4px; background: none; color: #9a9b9d; font-weight: bold; }
+.composer-icon:hover:not(:disabled) { background: #35373b; color: #e8e8e8; }
+.composer-stop { padding: 2px 8px; border: 1px solid #8b3a46; border-radius: 4px; background: none; color: #ff8a8a; font-size: 12px; }
+.composer-send { padding: 3px 12px; border: none; border-radius: 4px; background: #007a5a; color: #fff; }
+.composer-send:disabled { background: #35373b; color: #6b6c6e; opacity: 1; }
+.slack-composer-foot { margin: 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-menu { position: absolute; left: 8px; bottom: calc(100% + 4px); z-index: 10; min-width: 260px; max-width: calc(100% - 16px); margin: 0; padding: 6px 0; list-style: none; background: #222529; border: 1px solid #565856; border-radius: 8px; box-shadow: 0 4px 16px rgb(0 0 0 / 50%); }
+.mention-option { display: flex; align-items: baseline; gap: 10px; padding: 5px 12px; cursor: pointer; color: #d1d2d3; }
+.mention-option[aria-selected="true"] { background: #1164a3; color: #fff; }
+.mention-option[aria-selected="true"] .muted { color: #dbe9f5; }
+.slack-to { color: #7fd1ff; font-size: 12px; }
+
+/* Markdown reader mode: a readable document rather than source. */
+.view-mode { display: inline-flex; }
+.view-mode button { padding: 3px 10px; font-size: 12px; }
+.view-mode button + button { border-left: none; }
+.view-mode button[aria-pressed="true"] { background: var(--panel-border); border-color: var(--warn); }
+.markdown-reader { flex: 1; min-height: 0; overflow: auto; background: #22272e; }
+.markdown-body { max-width: 860px; margin: 0 auto; padding: 20px 28px 40px; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; line-height: 1.6; color: #d1d7e0; overflow-wrap: anywhere; }
+.markdown-body h1, .markdown-body h2 { padding-bottom: 6px; border-bottom: 1px solid #3d444d; }
+.markdown-body h1 { font-size: 1.8em; margin: 0 0 16px; }
+.markdown-body h2 { font-size: 1.4em; margin: 28px 0 12px; }
+.markdown-body h3 { font-size: 1.15em; margin: 22px 0 8px; }
+.markdown-body h4, .markdown-body h5, .markdown-body h6 { font-size: 1em; margin: 18px 0 6px; }
+.markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body table, .markdown-body pre, .markdown-body blockquote { margin: 0 0 14px; }
+.markdown-body ul, .markdown-body ol { padding-left: 1.6em; }
+.markdown-body li + li { margin-top: 4px; }
+.markdown-body a { color: #7fd1ff; }
+.markdown-body code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.88em; padding: 1px 5px; border-radius: 4px; background: #2d333b; }
+.markdown-body pre { padding: 12px 14px; overflow: auto; border-radius: 6px; background: #1c2128; }
+.markdown-body pre code { padding: 0; background: none; font-size: 0.85em; }
+.markdown-body blockquote { padding: 0 14px; color: #9ea7b3; border-left: 4px solid #3d444d; }
+.markdown-body table { display: block; overflow: auto; border-collapse: collapse; }
+.markdown-body th, .markdown-body td { padding: 6px 12px; border: 1px solid #3d444d; }
+.markdown-body th { background: #2d333b; }
+.markdown-body tr:nth-child(2n) td { background: #262c34; }
+.markdown-body hr { border: none; border-top: 1px solid #3d444d; margin: 24px 0; }
+.markdown-body input[type="checkbox"] { margin-right: 6px; }
+.markdown-body kbd { padding: 1px 6px; border: 1px solid #545d68; border-bottom-width: 2px; border-radius: 4px; font-size: 0.85em; background: #2d333b; }
+.md-image { display: inline-block; padding: 2px 8px; border: 1px dashed #545d68; border-radius: 4px; background: none; color: #9ea7b3; font-size: 0.9em; }
+.md-blocked-link { text-decoration: underline dotted; color: #9ea7b3; }
+.slack-main { position: relative; }
+.slack-new-messages { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 4px 14px; border: none; border-radius: 14px; background: #1164a3; color: #fff; font-size: 12px; box-shadow: 0 2px 8px rgb(0 0 0 / 45%); }
+
+/* Team configuration dialog: roles on the left, the chosen role's full configuration on the right. */
+.team-config { max-width: min(1100px, calc(100vw - 32px)); width: 100%; height: calc(100vh - 48px); max-height: none; padding: 0; flex-direction: column; }
+.team-config[open] { display: flex; }
+.team-config-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 14px; border-bottom: 2px solid var(--panel-border); }
+.team-config-header h2 { margin: 0; }
+.team-config-header button { margin-left: auto; }
+.team-config-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 210px minmax(0, 1fr); }
+.team-config-roles { display: flex; flex-direction: column; gap: 4px; padding: 10px; overflow-y: auto; border-right: 2px solid var(--panel-border); }
+.team-config-roles button { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; }
+.team-config-roles button[aria-current] { border-color: var(--warn); background: var(--panel-border); }
+.team-config-role-name { flex: 1; min-width: 0; }
+.team-config-custom { color: var(--warn); }
+.team-config-roles .state-dot { flex: none; margin: 0; }
+.team-config-detail { min-width: 0; overflow-y: auto; padding: 12px 18px 20px; }
+.team-config-detail h4 { margin: 18px 0 6px; padding-bottom: 4px; border-bottom: 1px dashed var(--panel-border); }
+.team-config-title { display: flex; align-items: center; gap: 10px; }
+.team-config-title h3 { margin: 0; }
+.team-config-title .team-state { margin-left: auto; }
+.team-config-facts { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.team-config-facts dt { color: var(--muted); }
+.team-config-facts dd { margin: 0; overflow-wrap: anywhere; }
+.team-config-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.team-config-instructions { display: grid; gap: 6px; }
+.team-config-instructions textarea { width: 100%; background: #15131c; border: 2px solid var(--panel-border); padding: 8px; resize: vertical; }
+.team-config-prompt { margin-top: 12px; }
+.team-config-prompt summary { cursor: pointer; }
+.team-config-prompt pre { margin: 8px 0 0; padding: 10px 12px; max-height: none; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: #15131c; }
+@media (max-width: 760px) {
+  .team-config-body { grid-template-columns: minmax(0, 1fr); }
+  .team-config-roles { flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 2px solid var(--panel-border); }
+  .team-config-roles button { width: auto; }
+}
+
+/* Closing temporary workers from the Office Board and the chat sidebar. */
+.worker-list li { position: relative; }
+/* Opt out of the full-width row button style of .worker-list. */
+.worker-list .worker-close, .worker-list .worker-close-confirm button { width: auto; display: inline-block; margin: 0; }
+.worker-close { position: absolute; top: 4px; right: 4px; padding: 0 6px; border: none; background: none; color: var(--muted); font-size: 16px; line-height: 1.2; }
+.worker-close:hover { color: #ff8a8a; }
+.worker-row-closable > button:first-child { padding-right: 26px; }
+.worker-close-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -2px 0 6px; padding: 6px 8px; border: 1px solid var(--danger); background: rgba(215, 38, 61, 0.12); }
+.worker-close-confirm button { padding: 2px 8px; font-size: 12px; }
+.clear-finished { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0 8px; }
+.clear-finished button:not(.link-button) { padding: 2px 8px; font-size: 12px; }
+.slack-item-row { display: flex; align-items: center; }
+.slack-item-row .slack-item { flex: 1; min-width: 0; }
+.slack-item-close { flex: none; padding: 0 6px; border: none; background: none; color: #c9a7c9; opacity: 0; }
+.slack-item-row:hover .slack-item-close, .slack-item-close:focus-visible { opacity: 1; }
+.slack-item-close:hover { color: #fff; }
+.slack-close-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 4px 8px; font-size: 12px; background: #5d2c5d; }
+.slack-close-confirm button { padding: 1px 6px; font-size: 11px; }
+.slack-close-error { margin: 4px 8px; color: #ffb3b3; }
+
+/* Editing a role's tools and policies in Team configuration. */
+.role-tools-editor { display: grid; gap: 10px; }
+.role-tools-editor fieldset { margin: 0; padding: 8px 10px; border: 1px solid var(--panel-border); }
+.role-tools-editor legend { padding: 0 4px; font-weight: bold; }
+.tool-toggles { list-style: none; margin: 4px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 2px 12px; }
+.mcp-server-rows { list-style: none; margin: 4px 0 6px; padding: 0; display: grid; gap: 4px; }
+.mcp-server-row { display: grid; grid-template-columns: minmax(90px, 160px) minmax(0, 1fr) auto; gap: 6px; }
+.mcp-server-row input { background: #15131c; border: 2px solid var(--panel-border); padding: 4px 6px; min-width: 0; }
+.mcp-server-row button { padding: 2px 8px; }
+.risk-option { display: block; margin: 4px 0; }
+.restart-pending { margin: 0; padding: 6px 8px; border-left: 4px solid var(--warn); background: rgba(242, 193, 78, 0.12); }
+.role-tools-live summary { cursor: pointer; color: var(--muted); }
+
+/* Team templates in Team configuration. */
+.team-templates { padding: 8px 14px; border-bottom: 2px solid var(--panel-border); }
+.team-templates-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.team-templates-bar > span { margin-right: auto; }
+.team-templates-bar button { padding: 3px 10px; font-size: 13px; }
+.team-templates-panel { display: grid; gap: 6px; margin-top: 8px; padding: 10px; border: 1px solid var(--panel-border); background: rgba(0, 0, 0, 0.15); }
+.team-templates-panel label { display: grid; gap: 2px; }
+.team-templates-panel input:not([type="radio"]) { background: #15131c; border: 2px solid var(--panel-border); padding: 4px 6px; }
+.template-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 200px; overflow-y: auto; }
+.template-list label { display: flex; align-items: flex-start; gap: 8px; padding: 4px 6px; cursor: pointer; border: 1px solid transparent; }
+.template-list label.template-chosen { border-color: var(--warn); }
+.template-description { display: block; }
+.template-preview ul { margin: 4px 0; padding-left: 18px; }
+.warn-text { color: var(--warn); margin: 0; }
+
+/* Tasks and RACI per role in Team configuration. */
+.role-raci h5 { margin: 10px 0 4px; font-size: 13px; }
+.role-task-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.role-task-list li { min-width: 0; }
+.role-task-list .state-pill, .role-task-list .raci-letter { flex: none; }
+.role-task-list li { display: flex; align-items: center; gap: 8px; }
+.role-task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.raci-letter { flex: none; min-width: 32px; padding: 0 4px; text-align: center; font-weight: bold; color: #111; background: var(--warn); }
+.raci-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.raci-table th, .raci-table td { text-align: left; padding: 4px 6px; border-bottom: 1px dashed var(--panel-border); vertical-align: middle; }
+.raci-table thead th { color: var(--muted); font-weight: normal; font-size: 12px; }
+.raci-table select { padding: 2px 4px; font-size: 12px; }
+.raci-table tr.raci-changed { background: rgba(242, 193, 78, 0.1); }
+.raci-table tr.raci-changed select { border-color: var(--warn); }
+.raci-problems { margin: 6px 0 0; padding-left: 18px; }
+.role-task-list .state-pill { margin: 0; padding: 0 6px; color: var(--muted); border: 1px solid var(--panel-border); }
+
+/* Whole-team view in Team configuration. */
+.team-config-roles .team-config-team { flex-direction: column; align-items: flex-start; gap: 0; margin-bottom: 6px; }
+.raci-matrix-scroll { overflow-x: auto; }
+.raci-matrix { border-collapse: collapse; font-size: 12px; min-width: 100%; }
+.raci-matrix th, .raci-matrix td { padding: 3px 4px; border-bottom: 1px dashed var(--panel-border); text-align: left; vertical-align: middle; }
+.raci-matrix thead th { color: var(--muted); font-weight: normal; white-space: nowrap; text-align: center; }
+.raci-matrix tbody th { font-weight: normal; min-width: 180px; }
+.raci-matrix .raci-human { color: var(--warn); }
+.raci-cell { text-align: center; }
+.raci-cell select { width: 100%; min-width: 52px; padding: 2px; font-size: 12px; font-weight: bold; text-align: center; }
+.raci-cell-RA select, .raci-cell-A select { background: #4d4120; border-color: var(--warn); }
+.raci-cell-R select { background: #233a2a; border-color: #3fa34d; }
+.raci-cell-C select { background: #20314d; border-color: #4ea1d3; }
+.raci-cell-I select { color: var(--muted); }
+.raci-cell.raci-changed select { outline: 2px solid var(--warn); outline-offset: -2px; }
+.raci-legend { margin: 6px 0 0; }
+.tasks-by-role { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.tasks-by-role-column { padding: 8px; border: 1px solid var(--panel-border); background: rgba(0, 0, 0, 0.15); min-width: 0; }
+.tasks-by-role-column header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.tasks-by-role-column header .muted { margin-left: auto; }
+.tasks-by-role .role-task-list li { align-items: flex-start; }
+.tasks-by-role .role-task-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: 12px; }
+.tasks-by-role .state-pill { font-size: 10px; }
+
+/* New room and theme setup: the team is set up in the Team configuration layout. */
+.approval-dialog.new-room-sdlc { max-width: min(1100px, calc(100vw - 32px)); }
+.new-room-tabs { margin-bottom: 8px; }
+.team-setup { display: grid; gap: 8px; }
+.team-setup .team-config-body { height: min(560px, calc(100vh - 260px)); border: 2px solid var(--panel-border); }
+.theme-setup .team-setup .team-config-body { height: 560px; }
+.role-runtime-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px 12px; }
+.role-runtime-fields label { display: grid; gap: 2px; }
+.role-definition { display: grid; gap: 6px; }
+.role-definition label { display: grid; gap: 2px; }
+.role-definition textarea, .role-definition input:not([type="checkbox"]) { width: 100%; background: #15131c; border: 2px solid var(--panel-border); padding: 6px; }
+.add-role-button { margin-top: 6px; border-style: dashed; }
+.add-role-form { display: grid; gap: 6px; margin-top: 6px; padding: 6px; border: 1px dashed var(--panel-border); }
+.add-role-form input { width: 100%; background: #15131c; border: 2px solid var(--panel-border); padding: 4px 6px; }
+.add-task-type { display: flex; gap: 6px; margin-top: 8px; }
+.add-task-type input { flex: 1; min-width: 0; background: #15131c; border: 2px solid var(--panel-border); padding: 4px 6px; }
+.task-type-title { width: 100%; min-width: 160px; background: transparent; border: 1px solid transparent; padding: 2px 4px; }
+.task-type-title:hover, .task-type-title:focus { border-color: var(--panel-border); background: #15131c; }
+.raci-changed-input { border-color: var(--warn) !important; }
+.raci-matrix td select { font-size: 12px; }
+.row-remove { padding: 0 6px; border: none; background: none; color: var(--muted); }
+.row-remove:hover { color: #ff8a8a; }
+.team-nav-role { display: flex; align-items: stretch; gap: 4px; }
+.team-nav-role > button:first-child { flex: 1; min-width: 0; }
+.team-config-roles .team-nav-role .team-nav-remove { flex: none; width: auto; padding: 0 8px; color: var(--muted); }
+.team-config-roles .team-nav-role .team-nav-remove:hover { color: #ff8a8a; border-color: var(--danger); }

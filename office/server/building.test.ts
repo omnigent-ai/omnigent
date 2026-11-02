@@ -99,6 +99,37 @@ describe("BuildingService", () => {
     expect((await restarted.getSnapshot(true)).rooms[0].firstSyncAt).toBe(NOW);
   });
 
+  it("sends a room message to each recipient and keeps it for the room's channel", async () => {
+    client.sessions = [session("conv_a"), session("conv_b"), session("conv_other", { project_id: "elsewhere" })];
+    const sent = await service.sendRoomMessage("proj", "  @PM @QA status?  ", [
+      { sessionId: "conv_a", name: "@PM" },
+      { sessionId: "conv_b", name: "@QA" },
+      { sessionId: "conv_a", name: "@PM" },
+    ]);
+    expect(client.messages).toEqual([
+      { sessionId: "conv_a", text: "@PM @QA status?" },
+      { sessionId: "conv_b", text: "@PM @QA status?" },
+    ]);
+    expect(sent.failures).toEqual([]);
+    expect(service.roomMessages("proj")).toEqual([
+      expect.objectContaining({ at: NOW, text: "@PM @QA status?", recipients: [{ sessionId: "conv_a", name: "@PM" }, { sessionId: "conv_b", name: "@QA" }] }),
+    ]);
+    // The channel survives a restart.
+    expect(new StateStore(store.path).state.roomMessages.proj).toHaveLength(1);
+  });
+
+  it("refuses room messages to sessions of another room, and keeps nothing when no one is reached", async () => {
+    client.sessions = [session("conv_a"), session("conv_other", { project_id: "elsewhere" })];
+    await expect(service.sendRoomMessage("proj", "hi", [{ sessionId: "conv_other", name: "x" }])).rejects.toMatchObject({ code: "not_in_room" });
+    await expect(service.sendRoomMessage("proj", "  ", [{ sessionId: "conv_a", name: "a" }])).rejects.toMatchObject({ code: "empty_message" });
+    client.sendMessage = async () => {
+      throw new Error("runner offline");
+    };
+    const failed = await service.sendRoomMessage("proj", "hi", [{ sessionId: "conv_a", name: "@PM" }]);
+    expect(failed).toEqual({ message: null, failures: [{ name: "@PM", error: "runner offline" }] });
+    expect(service.roomMessages("proj")).toEqual([]);
+  });
+
   it("rescans a session only after it changes", async () => {
     await service.getSnapshot(true);
     await service.getSnapshot(true);

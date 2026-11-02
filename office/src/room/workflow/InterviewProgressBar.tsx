@@ -1,10 +1,11 @@
+import { coordinatorName } from "../../../shared/team.ts";
 import { INTERVIEW_SEGMENTS, interviewProgress } from "../../../shared/interviewProgress.ts";
 import type { InterviewQuestion } from "../../../shared/workflowTypes.ts";
 
 /** One bar split into answered, awaiting, to be answered, newly added, and skipped questions. */
 export function InterviewProgressBar({ questions }: { questions: InterviewQuestion[] }) {
   const progress = interviewProgress(questions);
-  if (progress.total === 0) return <p className="muted small">The PM has not planned any questions yet.</p>;
+  if (progress.total === 0) return <p className="muted small">The {coordinatorName()} has not planned any questions yet.</p>;
   const shown = INTERVIEW_SEGMENTS.filter((segment) => progress.counts[segment.id] > 0);
   const summary = shown.map((segment) => `${progress.counts[segment.id]} ${segment.label.toLowerCase()}`).join(", ");
   const resolved = progress.counts.answered + progress.counts.skipped;

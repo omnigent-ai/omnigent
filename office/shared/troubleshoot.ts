@@ -82,6 +82,7 @@ export interface RoleHealth {
   temporary: boolean;
   harness: string;
   model: string | null;
+  effort: string | null;
   harnessReadiness: HarnessReadiness;
   state: RoleHealthState;
   problem: RoleProblem | null;

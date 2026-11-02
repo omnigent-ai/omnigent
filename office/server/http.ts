@@ -7,8 +7,16 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { extname, join, normalize, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { OfficeRequestError, type BuildingService } from "./building.ts";
+import { roleWorkLine } from "../shared/roleWork.ts";
+import { teamOf, teamRoleIds } from "../shared/team.ts";
+import type { ActivityItem } from "../shared/sessionActivity.ts";
 import { proxyDictation } from "./dictationProxy.ts";
-import { handleMcpMessage, officeTools } from "./mcp.ts";
+import { handleMcpMessage, officeTools, toolsForRole } from "./mcp.ts";
+import type { PreviewService } from "./preview.ts";
+import { UsageTracker, workspacePath } from "./roomResources.ts";
+import { roleToolReport } from "./roleTools.ts";
+import { isThisMachine, localCliModels } from "./localModels.ts";
+import { ModelCatalog } from "./modelCatalog.ts";
 import { OmnigentError, type OmnigentClient } from "./omnigentClient.ts";
 import type { TroubleshootService } from "./troubleshoot.ts";
 import { WorkflowError, normalizeRuntime, type WorkflowService } from "./workflow.ts";
@@ -89,6 +97,8 @@ export interface OfficeHandlerOptions {
   building: BuildingService;
   workflow: WorkflowService;
   client: OmnigentClient;
+  /** Serves rooms' web apps on their own port; absent when not started. */
+  preview?: PreviewService;
   /** Absent in tests that do not exercise agent troubleshooting. */
   troubleshooter?: TroubleshootService;
   /** Ports the browser may use to reach the office (service and dev server). */
@@ -99,13 +109,39 @@ export interface OfficeHandlerOptions {
 type RouteHandler = (params: string[], request: IncomingMessage) => Promise<unknown>;
 
 export function createOfficeHandler(options: OfficeHandlerOptions) {
-  const { building, workflow, client, troubleshooter, allowedPorts, staticDir } = options;
+  const { building, workflow, client, troubleshooter, preview, allowedPorts, staticDir } = options;
 
   const requireTroubleshooter = (): TroubleshootService => {
     if (!troubleshooter) throw new OfficeRequestError(503, "unavailable", "Troubleshooting is not available.");
     return troubleshooter;
   };
   const tools = officeTools(workflow);
+  workflow.setToolCatalog?.((role) => toolsForRole(tools, role).map((tool) => tool.name));
+  const usageTracker = new UsageTracker((sessionId) => client.getSession(sessionId, { usage: true }));
+
+  /** The room's host and folder, which its Files tab browses. */
+  const roomFolder = async (projectId: string, path: string) => {
+    const room = (await building.getSnapshot()).rooms.find((entry) => entry.projectId === projectId);
+    if (!room) throw new OfficeRequestError(404, "room_not_found", "No such room.");
+    if (!room.hostId || !room.workspace) throw new OfficeRequestError(409, "no_workspace", "This room has no host folder.");
+    const resolved = workspacePath(room.workspace, path);
+    if (!resolved) throw new OfficeRequestError(400, "outside_workspace", "That path is outside the room's folder.");
+    return { hostId: room.hostId, workspace: room.workspace, ...resolved };
+  };
+
+  const modelCatalog = new ModelCatalog({
+    hostOptions: (hostId, harness) => client.hostModelOptions(hostId, harness),
+    localModels: localCliModels,
+    isLocalHost: async (hostId) => {
+      const { hosts } = (await client.listHosts()) as { hosts?: { host_id: string; name?: string }[] };
+      return isThisMachine(hosts?.find((host) => host.host_id === hostId)?.name);
+    },
+    effortFamily: async (harness) => {
+      const { data } = (await client.listHarnesses()) as { data?: { id: string; capabilities?: { effort?: unknown } }[] };
+      const effort = data?.find((entry) => entry.id === harness)?.capabilities?.effort;
+      return typeof effort === "string" ? effort : null;
+    },
+  });
 
   /** Send the PO's own words to a session; these count as human interactions. */
   async function sendAsPo(sessionId: string | null, text: string): Promise<void> {
@@ -128,7 +164,7 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
         const theme = body.theme as { runtime?: Record<string, unknown>; gates?: unknown } | null | undefined;
         const runtime = theme ? { ...theme.runtime, hostId: body.hostId, workspace: body.workspace } : null;
         // Refuse a bad runtime before the project exists, so a failed request leaves no half-made room.
-        if (runtime) normalizeRuntime(runtime);
+        if (runtime) normalizeRuntime(runtime, (role) => toolsForRole(tools, role).map((tool) => tool.name));
         const { projectId } = await building.createRoom(body);
         if (runtime) await workflow.assignTheme(projectId, { runtime: runtime as never, gates: theme?.gates as never });
         return { projectId, snapshot: await building.getSnapshot(true) };
@@ -145,6 +181,214 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
           hasMore: listing.has_more,
         };
       },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/hosts\/([^/]+)\/harnesses\/([^/]+)\/models$/,
+      handle: async ([hostId, harness]) => modelCatalog.models(hostId, harness),
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/messages$/,
+      handle: async ([projectId]) => ({ data: building.roomMessages(projectId) }),
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/messages$/,
+      handle: async ([projectId], request) => {
+        const body = await readJsonBody(request);
+        return building.sendRoomMessage(projectId, body.text, body.recipients);
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/links$/,
+      handle: async ([projectId]) => ({
+        links: workflow.projectLinks(projectId),
+        app: preview ? await preview.entryUrl(projectId) : null,
+      }),
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/links$/,
+      handle: async ([projectId], request) => ({ link: workflow.addProjectLink(projectId, await readJsonBody(request), "po") }),
+    },
+    {
+      method: "DELETE",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/links\/([^/]+)$/,
+      handle: async ([projectId, linkId]) => {
+        workflow.removeProjectLink(projectId, linkId);
+        return { removed: true };
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/usage$/,
+      handle: async ([projectId]) => usageTracker.projectUsage(await building.listWorkers(projectId)),
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/files$/,
+      handle: async ([projectId], request) => {
+        const folder = await roomFolder(projectId, new URL(request.url ?? "/", "http://localhost").searchParams.get("path") ?? "");
+        const listing = await client.listHostDirectory(folder.hostId, folder.absolute);
+        const entries = listing.data
+          .filter((entry) => entry.type !== "other")
+          .map((entry) => ({
+            name: entry.name,
+            path: folder.relative ? `${folder.relative}/${entry.name}` : entry.name,
+            type: entry.type,
+            bytes: entry.bytes ?? null,
+          }))
+          .sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1));
+        return { workspace: folder.workspace, path: folder.relative, entries, hasMore: listing.has_more };
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/rooms\/([^/]+)\/files\/content$/,
+      handle: async ([projectId], request) => {
+        const folder = await roomFolder(projectId, new URL(request.url ?? "/", "http://localhost").searchParams.get("path") ?? "");
+        if (!folder.relative) throw new OfficeRequestError(400, "not_a_file", "Choose a file.");
+        // Omnigent reads files through a session working in that same folder.
+        const reader = (await building.listWorkers(projectId)).find((session) => session.workspace === folder.workspace);
+        if (!reader) throw new OfficeRequestError(409, "no_session", "Start a session in this room's folder to preview files.");
+        const file = await client.readSessionFile(reader.id, folder.relative);
+        return {
+          path: folder.relative,
+          content: file.encoding === "utf-8" && typeof file.content === "string" ? file.content : null,
+          truncated: file.truncated === true,
+          bytes: file.bytes ?? null,
+          contentType: file.content_type ?? null,
+        };
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/temporary-workers\/close$/,
+      handle: async ([branchId], request) => {
+        const body = await readJsonBody(request);
+        return afterWorkflowChange(await workflow.closeTemporaryWorkers(branchId, body.sessionIds));
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/replaced-sessions\/close$/,
+      handle: async ([branchId], request) => {
+        const body = await readJsonBody(request);
+        return afterWorkflowChange(await workflow.closeReplacedSessions(branchId, body.sessionIds));
+      },
+    },
+    {
+      method: "PUT",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/team$/,
+      handle: async ([branchId], request) => {
+        const body = await readJsonBody(request);
+        return afterWorkflowChange(await workflow.setTeam(branchId, body.team));
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/office-tools$/,
+      handle: async () => ({ data: tools.map(({ name, description, coordinatorOnly }) => ({ name, description, coordinatorOnly: Boolean(coordinatorOnly) })) }),
+    },
+    { method: "GET", pattern: /^\/office\/api\/team-templates$/, handle: async () => ({ data: workflow.teamTemplates() }) },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/team-templates\/import$/,
+      handle: async (_params, request) => {
+        // A team file with long briefs and instructions can be larger than other request bodies.
+        const body = (await readJson(request, 320 * 1024)) as Record<string, unknown> | null;
+        return workflow.importTeamTemplate(body?.yaml);
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/team-templates$/,
+      handle: async ([branchId], request) => {
+        const body = await readJsonBody(request);
+        return { template: workflow.saveTeamTemplate(branchId, body.name, body.description) };
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/team-templates\/([^/]+)\/apply$/,
+      handle: async ([branchId, templateId], request) => {
+        const body = await readJsonBody(request);
+        return afterWorkflowChange(await workflow.applyTeamTemplate(branchId, templateId, body.restart === true));
+      },
+    },
+    {
+      method: "DELETE",
+      pattern: /^\/office\/api\/team-templates\/([^/]+)$/,
+      handle: async ([templateId]) => {
+        workflow.deleteTeamTemplate(templateId);
+        return { deleted: true };
+      },
+    },
+    {
+      method: "PUT",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/roles\/([^/]+)\/tool-settings$/,
+      handle: async ([branchId, role], request) => {
+        const body = await readJsonBody(request);
+        const available = toolsForRole(tools, role).map((tool) => tool.name);
+        return afterWorkflowChange(await workflow.setRoleToolSettings(branchId, role, body.settings, available, body.restart === true));
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/team-config$/,
+      handle: async ([branchId]) => ({ data: await workflow.teamConfig(branchId) }),
+    },
+    {
+      method: "PUT",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/roles\/([^/]+)\/instructions$/,
+      handle: async ([branchId, role], request) => {
+        const body = await readJsonBody(request);
+        return afterWorkflowChange(await workflow.setRoleInstructions(branchId, role, body.text, body.restart === true));
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/role-work$/,
+      handle: async ([branchId]) => {
+        const openTasks = workflow
+          .view(branchId)
+          .tasks.filter((task) => task.status !== "done" && task.status !== "cancelled")
+          .sort((a, b) => b.updatedAt - a.updatedAt);
+        return {
+          data: await Promise.all(
+            teamRoleIds(teamOf(workflow.branch(branchId).runtime)).map(async (role) => {
+              const sessionId = workflow.roleSessionId(branchId, role);
+              const [detail, page] = sessionId
+                ? await Promise.all([client.getSession(sessionId).catch(() => null), client.listItems(sessionId, { limit: 20 }).catch(() => null)])
+                : [null, null];
+              const status = typeof detail?.status === "string" ? detail.status : "";
+              return roleWorkLine({
+                role,
+                sessionId,
+                busy: status === "running" || status === "launching" || status === "waiting",
+                todos: Array.isArray(detail?.todos) ? (detail.todos as { content: string; status: string; activeForm?: string }[]) : [],
+                items: ((page?.data ?? []) as ActivityItem[]).map((item) => (workflow.isRelayedItem(item.id) ? { ...item, office_relayed: true } : item)),
+                tasks: openTasks.filter((task) => task.responsible.includes(role)),
+              });
+            }),
+          ),
+        };
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/tools$/,
+      handle: async ([branchId]) => ({
+        data: await Promise.all(
+          teamRoleIds(teamOf(workflow.branch(branchId).runtime)).map(async (role) => {
+            const context = workflow.roleToolContext(branchId, role);
+            const agent = context.sessionId ? await client.getSessionAgent(context.sessionId).catch(() => null) : null;
+            return roleToolReport(role, context, agent, toolsForRole(tools, role));
+          }),
+        ),
+      }),
     },
     {
       method: "GET",
@@ -277,7 +521,7 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
       pattern: /^\/office\/api\/branches\/([^/]+)\/roles\/switch-harness$/,
       handle: async ([branchId], request) => {
         const body = await readJsonBody(request);
-        return afterWorkflowChange(await workflow.switchRoleHarness(branchId, body.roles, body.harness, body.model, body.reason));
+        return afterWorkflowChange(await workflow.switchRoleHarness(branchId, body.roles, body.harness, body.model, body.reason, body.effort));
       },
     },
     {
@@ -317,15 +561,6 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
     },
     {
       method: "POST",
-      pattern: /^\/office\/api\/sessions\/([^/]+)\/messages$/,
-      handle: async ([sessionId], request) => {
-        const body = await readJsonBody(request);
-        if (typeof body.text !== "string") throw new OfficeRequestError(400, "invalid_text", "text must be a string");
-        return building.sendMessage(sessionId, body.text);
-      },
-    },
-    {
-      method: "POST",
       pattern: /^\/office\/api\/sessions\/([^/]+)\/stop$/,
       handle: async ([sessionId]) => client.interrupt(sessionId),
     },
@@ -339,7 +574,17 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
           elicitationId,
           body.action as "accept" | "decline",
           typeof body.feedback === "string" ? body.feedback : undefined,
+          { forSession: body.forSession === true },
         );
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/sessions\/([^/]+)\/auto-approve$/,
+      handle: async ([sessionId], request) => {
+        const body = await readJsonBody(request);
+        if (body.enabled !== false) throw new OfficeRequestError(400, "invalid_input", "Turn session approval on by approving a request with it checked.");
+        return building.disableAutoApprove(sessionId);
       },
     },
   ];
