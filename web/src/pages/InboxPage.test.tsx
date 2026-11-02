@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -8,7 +8,8 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // The page composes several live data sources, so we mock at their seams:
 //  - `useConversations` (the session list + its paging drain),
 //  - `useCommentInbox` (the comment side of the inbox),
-//  - `getSession` / `approve` (per-session snapshot fetch + the verdict POST).
+//  - `getSession` / `approve` (per-session snapshot fetch + the verdict POST),
+//  - `postEvent` (the reply POST).
 // The pure assembly helper `collectInboxItems` and the display helpers are
 // left REAL, so raw events follow the production parse path. Native delivery
 // tests also use the real ApprovalCard; other prompts use an Accept-button stub.
@@ -23,8 +24,17 @@ import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import * as sessionsApi from "@/lib/sessionsApi";
-import type { CommentInbox } from "@/hooks/useCommentInbox";
 import {
+  type AskUserQuestionDraft,
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
+import type { CommentInbox } from "@/hooks/useCommentInbox";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import {
+  isConversationUnseen,
   isExplicitlyUnread,
   resetReadStateForTests,
   seedReadState,
@@ -35,7 +45,7 @@ vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
   const actual = await importActual<typeof approvalCard>();
   return {
     ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) => {
-      if (props.nativeDelivery || props.permissionDirectories)
+      if (props.nativeDelivery || props.permissionDirectories || props.askUserQuestion)
         return <actual.ApprovalCard {...props} />;
       const { elicitationId, message, status, allowAutoMode, onSubmit, requester } = props;
       return (
@@ -68,10 +78,13 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({
+// Real exports (ApiError, codes) so failure handling sees genuine error types.
+vi.mock("@/lib/sessionsApi", async (importActual) => ({
+  ...(await importActual<typeof sessionsApi>()),
   getSession: vi.fn(),
   approve: vi.fn(),
   fetchSessionItemsPage: vi.fn(),
+  postEvent: vi.fn(),
 }));
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
@@ -88,6 +101,15 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
     ...overrides,
   };
 }
+
+const draftQuestions = [{ question: "Pick a region", options: [], multiSelect: false }];
+const draftSignature = askUserQuestionSignature(draftQuestions);
+const unsentDraft: AskUserQuestionDraft = {
+  currentIndex: 0,
+  selections: { "Pick a region": "" },
+  customSelected: { "Pick a region": true },
+  customInputs: { "Pick a region": "eu-west" },
+};
 
 /** A raw `response.elicitation_request` event dict, as a snapshot replays it. */
 function rawElicitation(id: string, message: string, extra: Record<string, unknown> = {}) {
@@ -145,6 +167,7 @@ beforeEach(() => {
     {} as Awaited<ReturnType<typeof sessionsApi.approve>>,
   );
   vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({ items: [], hasMore: false });
+  vi.mocked(sessionsApi.postEvent).mockResolvedValue({ queued: true });
 });
 
 afterEach(() => {
@@ -152,6 +175,8 @@ afterEach(() => {
   vi.clearAllMocks();
   resetReadStateForTests();
   localStorage.clear();
+  clearAskUserQuestionDraft("eli_1");
+  clearAskUserQuestionDraft("eli_question");
 });
 
 /** A finished session whose latest turn the viewer hasn't opened yet. */
@@ -281,6 +306,30 @@ describe("InboxPage approval items", () => {
     expect(toggle.textContent).not.toContain("**");
   });
 
+  it("keeps a question card's answers when its row is collapsed and reopened", async () => {
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_question", "Claude has questions", {
+          ask_user_question: { questions: draftQuestions },
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    fireEvent.change(await screen.findByTestId("ask-user-question-custom-input"), {
+      target: { value: "eu-west" },
+    });
+    const item = screen.getByTestId("inbox-item");
+    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+    await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
+    expect(screen.queryByTestId("ask-user-question-form")).not.toBeInTheDocument();
+    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+
+    expect(await screen.findByTestId("ask-user-question-custom-input")).toHaveValue("eu-west");
+  });
+
   it("previews a policy prompt's command verbatim in the collapsed row", async () => {
     // WHY: only the bridges' `**<tool>**` message is formatted; a balanced `**`
     // inside a command the user is approving must not be read as emphasis.
@@ -308,6 +357,7 @@ describe("InboxPage approval items", () => {
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -318,6 +368,7 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toBeUndefined();
   });
 
   it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
@@ -381,6 +432,7 @@ describe("InboxPage approval items", () => {
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("nope"));
+    saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -388,6 +440,7 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
     );
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toEqual(unsentDraft);
   });
 
   it("clears a stale verdict when a snapshot refresh still shows the elicitation as pending", async () => {
@@ -653,6 +706,48 @@ describe("InboxPage unread sessions", () => {
     expect(await screen.findByTestId("inbox-unread")).toHaveAttribute("data-expanded", "false");
   });
 
+  it("shows the whole latest reply on hover when the preview cut it", async () => {
+    // WHY: the preview keeps 3 lines and 280 characters, but the full reply is
+    // already loaded, so hovering shows the rest without another request.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    const reply = ["First line.", "Second line.", "Third line.", "**Fourth** has the verdict."];
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({
+      items: [assistantReply(reply.join("\n"))],
+      hasMore: false,
+    });
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    const preview = await within(item).findByText(/Third line\./);
+    expect(preview).toHaveAttribute("tabindex", "0");
+    expect(screen.queryByText(/has the verdict/)).not.toBeInTheDocument();
+
+    fireEvent.pointerEnter(preview);
+
+    // Rendered like the chat: the markdown bold renders as bold, not asterisks.
+    expect(await screen.findByText("Fourth")).toHaveAttribute("data-streamdown", "strong");
+    expect(screen.getByText(/has the verdict/)).toBeInTheDocument();
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no hover card when the preview already shows the whole reply", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({
+      items: [assistantReply("All done.\n\nNothing else to report.")],
+      hasMore: false,
+    });
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    const preview = await within(item).findByText(/Nothing else to report\./);
+    expect(preview).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    expect(preview).not.toHaveAttribute("tabindex");
+  });
+
   it("keeps the row usable when its preview fetch fails", async () => {
     // WHY: a missing preview isn't a load failure — the row still renders
     // without one, raises no error banner, and can be marked read.
@@ -673,6 +768,606 @@ describe("InboxPage unread sessions", () => {
     fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
     fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
     await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+  });
+});
+
+describe("InboxPage replies", () => {
+  function expandUnread(): HTMLElement {
+    const item = screen.getByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    return item;
+  }
+
+  /** Types a reply and sends it once the preview has loaded and Send is live. */
+  async function typeAndSend(item: HTMLElement, text: string): Promise<HTMLElement> {
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: text } });
+    const send = within(item).getByRole("button", { name: "Send" });
+    await waitFor(() => expect(send).toBeEnabled());
+    fireEvent.click(send);
+    return box;
+  }
+
+  /** Renders the page and returns a hook that pushes refetched session rows. */
+  function renderWithRows(initial: Conversation[]): (rows: Conversation[]) => void {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={queryClient}>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub(initial));
+    const { rerender } = render(tree());
+    return (rows) => {
+      vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub(rows));
+      rerender(tree());
+    };
+  }
+
+  function sessionItems(...items: unknown[]) {
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({
+      items: items as Awaited<ReturnType<typeof sessionsApi.fetchSessionItemsPage>>["items"],
+      hasMore: false,
+    });
+  }
+
+  /** Sends "Ship it" from a Done row whose preview shows "Refactor done.". */
+  async function sendFromDoneRow(initial: Conversation) {
+    sessionItems({ ...assistantReply("Refactor done."), id: "item_done" });
+    const pushRows = renderWithRows([initial]);
+    await within(await screen.findByTestId("inbox-unread")).findByText(/Refactor done\./);
+    await typeAndSend(expandUnread(), "Ship it");
+    await within(screen.getByTestId("inbox-unread")).findByRole("status");
+    return pushRows;
+  }
+
+  it("posts the reply as a user message and waits for the agent's answer", async () => {
+    const toasts: unknown[] = [];
+    const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const row = unreadConversation();
+    sessionItems(assistantReply("Refactor done."));
+    renderWithRows([row]);
+
+    await within(await screen.findByTestId("inbox-unread")).findByText(/Refactor done\./);
+    const item = expandUnread();
+    expect(within(item).getByRole("button", { name: "Send" })).toBeDisabled();
+    await typeAndSend(item, "Ship it");
+
+    expect(await within(item).findByRole("status")).toHaveTextContent("Reply sent.");
+    expect(within(item).queryByRole("textbox")).not.toBeInTheDocument();
+    expect(sessionsApi.postEvent).toHaveBeenCalledWith(
+      "sess_unread",
+      {
+        type: "message",
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "Ship it" }],
+          stable_id: expect.any(String),
+        },
+      },
+      { holdWhenHostOffline: true },
+    );
+    expect(toasts).toEqual(["Reply sent to Unread Session"]);
+    // The baseline didn't move: only the session's next output decides.
+    expect(isConversationUnseen(row.id, row.updated_at, row.status)).toBe(true);
+  });
+
+  it("brings the row back when the replied turn fails in the same second", async () => {
+    // WHY: `updated_at` has whole-second precision, so a baseline moved to
+    // "now" on send would read a failure recorded in that second as seen.
+    const row = unreadConversation();
+    const pushRows = await sendFromDoneRow(row);
+
+    sessionItems(
+      { ...assistantReply("Refactor done."), id: "item_done" },
+      { id: "item_failed", type: "error", message: "The host is offline." },
+    );
+    pushRows([{ ...row, status: "failed", updated_at: Math.floor(Date.now() / 1000) }]);
+
+    const failed = screen.getByTestId("inbox-unread");
+    await waitFor(() => expect(failed).toHaveAttribute("data-kind", "error"));
+    expect(await within(failed).findByText("The host is offline.")).toBeInTheDocument();
+    expect(within(failed).queryByRole("status")).not.toBeInTheDocument();
+    expect(within(failed).getByRole("textbox", { name: /Reply to/ })).toHaveValue("");
+  });
+
+  it("shows an answer that lands in the second whose preview was already fetched", async () => {
+    // WHY: persisting the reply bumps `updated_at` before the runner reports
+    // running, and the preview for that second is cached with the old output.
+    // An answer in the same second must still replace it.
+    const row = unreadConversation();
+    const pushRows = await sendFromDoneRow(row);
+    const replySecond = row.updated_at + 1;
+
+    pushRows([{ ...row, updated_at: replySecond }]);
+    await waitFor(() => expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(within(screen.getByTestId("inbox-unread")).getByRole("status")).toHaveTextContent(
+      "Reply sent.",
+    );
+
+    pushRows([{ ...row, status: "running", updated_at: replySecond }]);
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+
+    sessionItems(
+      { ...assistantReply("Refactor done."), id: "item_done" },
+      { ...assistantReply("Shipped."), id: "item_answer" },
+    );
+    pushRows([{ ...row, status: "idle", updated_at: replySecond }]);
+    const answered = await screen.findByTestId("inbox-unread");
+    expect(await within(answered).findByText("Shipped.")).toBeInTheDocument();
+    expect(within(answered).queryByRole("status")).not.toBeInTheDocument();
+    expect(within(answered).getByRole("textbox", { name: /Reply to/ })).toHaveValue("");
+  });
+
+  it("shows a same-second answer even when the running turn is never seen", async () => {
+    // WHY: with no status change and no new `updated_at`, nothing would
+    // refetch the preview; the post-send re-check catches the answer.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const row = unreadConversation();
+    await sendFromDoneRow(row);
+
+    sessionItems(
+      { ...assistantReply("Refactor done."), id: "item_done" },
+      { ...assistantReply("Shipped."), id: "item_answer" },
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    const item = screen.getByTestId("inbox-unread");
+    expect(await within(item).findByText("Shipped.")).toBeInTheDocument();
+    expect(within(item).queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("keeps the sent note when a preview refetch fails", async () => {
+    // WHY: a failed fetch carries no output, so it says nothing about an answer.
+    const row = unreadConversation();
+    const pushRows = await sendFromDoneRow(row);
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockRejectedValue(new Error("boom"));
+    const callsBefore = vi.mocked(sessionsApi.fetchSessionItemsPage).mock.calls.length;
+
+    pushRows([{ ...row, updated_at: row.updated_at + 1 }]);
+    // The preview query retries once before settling into its error state.
+    await waitFor(
+      () =>
+        expect(vi.mocked(sessionsApi.fetchSessionItemsPage).mock.calls.length).toBe(
+          callsBefore + 2,
+        ),
+      { timeout: 3_000 },
+    );
+    await act(async () => {});
+    expect(within(screen.getByTestId("inbox-unread")).getByRole("status")).toHaveTextContent(
+      "Reply sent.",
+    );
+  });
+
+  it("waits on the turn after replying from an Error row", async () => {
+    const row = unreadConversation({ status: "failed" });
+    sessionItems({ id: "item_failed", type: "error", message: "Model overloaded" });
+    renderWithRows([row]);
+
+    const item = await screen.findByTestId("inbox-unread");
+    expect(item).toHaveAttribute("data-kind", "error");
+    await within(item).findByText(/Model overloaded/);
+    fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
+    await typeAndSend(item, "Try a smaller model");
+
+    // The row is still failed until the new turn runs; that alone settles nothing.
+    expect(await within(item).findByRole("status")).toHaveTextContent("Reply sent.");
+  });
+
+  it("drops the sent note when the turn fails without writing an error item", async () => {
+    const row = unreadConversation();
+    const pushRows = await sendFromDoneRow(row);
+
+    pushRows([{ ...row, status: "failed" }]);
+
+    const failed = screen.getByTestId("inbox-unread");
+    await waitFor(() => expect(failed).toHaveAttribute("data-kind", "error"));
+    expect(within(failed).queryByRole("status")).not.toBeInTheDocument();
+    expect(within(failed).getByRole("textbox", { name: /Reply to/ })).toBeInTheDocument();
+  });
+
+  it("holds Send until the row's preview has loaded", async () => {
+    // WHY: the send records the current output to tell the answer from it.
+    let loadPreview!: (page: { items: never[]; hasMore: boolean }) => void;
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockReturnValueOnce(
+      new Promise((resolve) => {
+        loadPreview = resolve;
+      }),
+    );
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: "Ship it" } });
+    const send = within(item).getByRole("button", { name: "Send" });
+    expect(send).toBeDisabled();
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+
+    await act(async () => loadPreview({ items: [], hasMore: false }));
+    await waitFor(() => expect(send).toBeEnabled());
+  });
+
+  it("won't send until a preview loads, even after the preview fetch fails", async () => {
+    // WHY: a failed fetch carries no baseline; sending anyway would record
+    // `null` and read the next fetch's old reply as the agent's answer.
+    const row = unreadConversation();
+    vi.mocked(sessionsApi.fetchSessionItemsPage).mockRejectedValue(new Error("boom"));
+    const pushRows = renderWithRows([row]);
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: "Ship it" } });
+    // The preview query retries once before settling into its error state.
+    expect(
+      await within(item).findByText(/replying here is paused/, {}, { timeout: 3_000 }),
+    ).toBeInTheDocument();
+    const send = within(item).getByRole("button", { name: "Send" });
+    expect(send).toBeDisabled();
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.click(send);
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+
+    // A later successful fetch supplies the baseline.
+    sessionItems({ ...assistantReply("Refactor done."), id: "item_done" });
+    pushRows([{ ...row, updated_at: row.updated_at + 1 }]);
+    await waitFor(() => expect(send).toBeEnabled());
+    expect(within(item).queryByText(/replying here is paused/)).not.toBeInTheDocument();
+    fireEvent.click(send);
+    await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it("sends on Enter and leaves Shift+Enter to the textarea", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: "Line one" } });
+    await waitFor(() => expect(within(item).getByRole("button", { name: "Send" })).toBeEnabled());
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: true });
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it("sends only on Mod+Enter when that preference is on", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: "Ship it" } });
+    await waitFor(() => expect(within(item).getByRole("button", { name: "Send" })).toBeEnabled());
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it("never sends on Enter with a touch pointer", async () => {
+    const realMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(pointer: coarse)",
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    onTestFinished(() => {
+      window.matchMedia = realMatchMedia;
+    });
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: "Ship it" } });
+    const send = within(item).getByRole("button", { name: "Send" });
+    await waitFor(() => expect(send).toBeEnabled());
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+
+    fireEvent.click(send);
+    await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it("inserts a newline on Alt+Enter instead of sending", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const box = within(expandUnread()).getByRole<HTMLTextAreaElement>("textbox", {
+      name: /Reply to/,
+    });
+    fireEvent.change(box, { target: { value: "firstsecond" } });
+    box.setSelectionRange(5, 5);
+
+    expect(fireEvent.keyDown(box, { key: "Enter", altKey: true })).toBe(false);
+    expect(box).toHaveValue("first\nsecond");
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+  });
+
+  it("never sends the Enter that confirms an IME candidate", async () => {
+    // WHY: Safari confirms a candidate with an Enter that isn't flagged as
+    // composing (keyCode 229), which would send a half-typed reply.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = within(item).getByRole("textbox", { name: /Reply to/ });
+    fireEvent.change(box, { target: { value: "にほんご" } });
+    await waitFor(() => expect(within(item).getByRole("button", { name: "Send" })).toBeEnabled());
+
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(box);
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.compositionEnd(box);
+    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it("locks the reply while it sends, keeping focus and refusing a second send", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.postEvent).mockReturnValueOnce(new Promise(() => {}));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = await typeAndSend(item, "Ship it");
+
+    expect(box).toHaveAttribute("readonly");
+    expect(box).not.toBeDisabled();
+    const send = within(item).getByRole("button", { name: "Send" });
+    expect(send).toBeDisabled();
+    // Leaving would drop reply state the pending POST is about to write.
+    expect(within(item).getByRole("button", { name: /Mark as read/ })).toBeDisabled();
+    expect(within(item).getByRole("link", { name: /Open session/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.click(send);
+    // Alt+Enter's fallback edits even a read-only box; it must not unlock it.
+    expect(fireEvent.keyDown(box, { key: "Enter", altKey: true })).toBe(false);
+    fireEvent.change(box, { target: { value: "Ship it twice" } });
+    expect(box).toHaveValue("Ship it");
+    expect(send).toBeDisabled();
+    expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the draft and the row when the reply is refused", async () => {
+    // WHY: a failed send has no server-side record, so the inbox must hand
+    // the text back rather than drop it with the row.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.postEvent).mockRejectedValueOnce(
+      new Error("No host can restart this session's runner, so your message was not sent."),
+    );
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = await typeAndSend(item, "Try again");
+
+    expect(await within(item).findByRole("alert")).toHaveTextContent(
+      "No host can restart this session's runner",
+    );
+    expect(box).toHaveValue("Try again");
+    expect(box).not.toHaveAttribute("readonly");
+    expect(isConversationUnseen(row.id, row.updated_at, row.status)).toBe(true);
+
+    // Editing the draft clears the stale error.
+    fireEvent.change(box, { target: { value: "Try again now" } });
+    expect(within(item).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("says the reply wasn't sent when the session's host is offline", async () => {
+    // WHY: the server's hold message promises a resend that only the chat
+    // composer performs.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.postEvent).mockRejectedValueOnce(
+      new sessionsApi.ApiError(
+        "The host for this session is offline. Your message will be sent when it reconnects.",
+        503,
+        sessionsApi.HOST_OFFLINE_CODE,
+      ),
+    );
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = await typeAndSend(item, "Wake up");
+
+    const alert = await within(item).findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The host for this session is offline, so the reply wasn’t sent.",
+    );
+    expect(alert).not.toHaveTextContent("will be sent when it reconnects");
+    expect(box).toHaveValue("Wake up");
+  });
+
+  it("retries an untouched failed reply under the same stable id, an edited one under a new id", async () => {
+    // WHY: an untouched retry reuses the id so the server dedupes a reply that
+    // already landed, after a lost response or a refusal after saving.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.postEvent)
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockRejectedValueOnce(
+        new sessionsApi.ApiError("The runner didn't come online", 503, "runner_unavailable"),
+      )
+      .mockRejectedValueOnce(new Error("still down"))
+      .mockResolvedValueOnce({ queued: true });
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = await typeAndSend(item, "Ship it");
+    expect(await within(item).findByRole("alert")).toHaveTextContent("Failed to fetch");
+    fireEvent.click(within(item).getByRole("button", { name: "Send" }));
+    expect(await within(item).findByRole("alert")).toHaveTextContent(
+      "The runner didn't come online",
+    );
+    fireEvent.click(within(item).getByRole("button", { name: "Send" }));
+    expect(await within(item).findByRole("alert")).toHaveTextContent("still down");
+    fireEvent.change(box, { target: { value: "Ship it now" } });
+    fireEvent.click(within(item).getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(4));
+
+    const stableIds = vi
+      .mocked(sessionsApi.postEvent)
+      .mock.calls.map(([, event]) => (event.data as { stable_id: string }).stable_id);
+    expect(stableIds[1]).toBe(stableIds[0]);
+    expect(stableIds[2]).toBe(stableIds[0]);
+    expect(stableIds[3]).not.toBe(stableIds[0]);
+  });
+
+  it("settles a successful retry at once, since the server may have deduped it", async () => {
+    // WHY: a retry that matches a send that already ran starts no new turn,
+    // so a "Reply sent" note would never clear.
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.postEvent)
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({ queued: true });
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    await typeAndSend(item, "Ship it");
+    await within(item).findByRole("alert");
+    fireEvent.click(within(item).getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(within(item).getByRole("textbox", { name: /Reply to/ })).toHaveValue(""),
+    );
+    expect(within(item).queryByRole("status")).not.toBeInTheDocument();
+    expect(within(item).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("reports a policy-denied reply and keeps the draft and the row", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.postEvent).mockResolvedValueOnce({ queued: false, denied: true });
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    const box = await typeAndSend(item, "rm -rf /");
+
+    expect(await within(item).findByRole("alert")).toHaveTextContent(
+      "A policy blocked this reply.",
+    );
+    expect(box).toHaveValue("rm -rf /");
+    expect(screen.getByTestId("inbox-unread")).toBeInTheDocument();
+  });
+
+  it("keeps a draft across collapsing and re-expanding the card", async () => {
+    const row = unreadConversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    fireEvent.change(within(item).getByRole("textbox", { name: /Reply to/ }), {
+      target: { value: "Half-written" },
+    });
+    const toggle = within(item).getByRole("button", { name: /Unread Session/ });
+    fireEvent.click(toggle);
+    expect(within(item).queryByRole("textbox")).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+
+    expect(within(item).getByRole("textbox", { name: /Reply to/ })).toHaveValue("Half-written");
+  });
+
+  it.each([
+    ["Mark as read", "button"],
+    ["Open session", "link"],
+  ] as const)("drops a stale draft and error once %s clears the row", async (name, role) => {
+    const row = unreadConversation();
+    vi.mocked(sessionsApi.postEvent).mockRejectedValueOnce(new Error("boom"));
+    const pushRows = renderWithRows([row]);
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    await typeAndSend(item, "Never mind");
+    await within(item).findByRole("alert");
+    fireEvent.click(within(item).getByRole(role, { name: new RegExp(name) }));
+    await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+
+    pushRows([{ ...row, updated_at: Math.floor(Date.now() / 1000) + 60 }]);
+    await screen.findByTestId("inbox-unread");
+    const resurfaced = expandUnread();
+    expect(within(resurfaced).getByRole("textbox", { name: /Reply to/ })).toHaveValue("");
+    expect(within(resurfaced).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("undoes an explicit Mark as unread when a reply is sent", async () => {
+    const row = conversation({
+      id: "sess_flagged",
+      title: "Flagged Session",
+      status: "idle",
+      pending_elicitations_count: 0,
+    });
+    seedReadState([{ id: row.id, viewer_last_seen: row.updated_at - 1, viewer_unread: true }]);
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-unread");
+    fireEvent.click(within(item).getByRole("button", { name: /Flagged Session/ }));
+    await typeAndSend(item, "Ship it");
+
+    await within(item).findByRole("status");
+    expect(isExplicitlyUnread("sess_flagged")).toBe(false);
+  });
+
+  it("offers no reply box on a session shared read-only", async () => {
+    // WHY: the server refuses user messages below edit access.
+    const row = unreadConversation({ permission_level: 1 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    renderPage();
+
+    await screen.findByTestId("inbox-unread");
+    const item = expandUnread();
+    expect(within(item).queryByRole("textbox")).not.toBeInTheDocument();
+    expect(within(item).queryByRole("button", { name: "Send" })).not.toBeInTheDocument();
+    expect(within(item).getByRole("link", { name: /Open session/ })).toBeInTheDocument();
   });
 });
 
@@ -791,6 +1486,7 @@ it.each(
       act(async () => {
         await queryClient.refetchQueries({ queryKey: ["inbox-elicitations"] });
       });
+    saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft);
     renderPage(queryClient);
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
     await poll();
@@ -817,6 +1513,10 @@ it.each(
       submissions[1]!.reject(new Error("retry failed"));
     });
     expect(await screen.findByRole("button", { name: "Retry sending approval" })).toBeEnabled();
+    // Only a success for the attempt still on screen clears the draft.
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toEqual(
+      outcome === "success" && !retryFirst ? undefined : unsentDraft,
+    );
   },
 );
 

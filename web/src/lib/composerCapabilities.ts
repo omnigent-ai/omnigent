@@ -1,6 +1,7 @@
 import type { NativeModelOption } from "./types";
 import { nativeCodingAgentForHarness } from "./nativeCodingAgents";
-import { codexEffortLevelsForModel, findNativeModelOption } from "./codexNativeModels";
+import { codexEffortLevelsForModel } from "./codexNativeModels";
+import { findModelLabelOption } from "./composerModelLabel";
 import { effortLevelsForFamily, supportsEffortControl } from "./sessionCapabilities";
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
@@ -39,7 +40,7 @@ export function selectedModelForPicker(
 ): string | null {
   if (kind === "claude" || kind === "codex") {
     const model = reportedModel || requestedModel;
-    return model ? (findNativeModelOption(options, model)?.id ?? model) : null;
+    return model ? (findModelLabelOption(options, model)?.id ?? model) : null;
   }
   return requestedModel ?? (kind === "configured" ? reportedModel : null);
 }

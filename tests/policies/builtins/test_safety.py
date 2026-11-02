@@ -180,35 +180,29 @@ def test_ask_on_os_tools_asks_for_goose_native_tools(
     assert expected_preview in result["reason"]
 
 
-# ── ask_on_os_tools: opencode native permission categories ────────────────────
+# ── ask_on_os_tools: opencode native permission actions ───────────────────────
 
 
 @pytest.mark.parametrize(
     "tool,args,expected_preview",
     [
-        ("bash", {"command": "rm -rf /"}, "rm -rf /"),
+        ("shell", {"command": "rm -rf /"}, "rm -rf /"),
         ("read", {"path": "/etc/passwd"}, "/etc/passwd"),
         ("edit", {"path": "main.py"}, "main.py"),
         ("grep", {"pattern": "secret"}, "secret"),
         ("glob", {"pattern": "**/*.py"}, "**/*.py"),
     ],
-    ids=["bash", "read", "edit", "grep", "glob"],
+    ids=["shell", "read", "edit", "grep", "glob"],
 )
 def test_ask_on_os_tools_asks_for_opencode_native_tools(
     tool: str,
     args: dict[str, str],
     expected_preview: str,
 ) -> None:
-    """opencode's permission categories trigger ASK via the SSE forwarder's
+    """opencode 2.x permission actions trigger ASK via the forwarder's
     ``permission.asked`` → policy-evaluate path.
 
-    The forwarder maps opencode's ``permission`` field (e.g. ``"bash"``) onto
-    the policy tool name. Without these in the OS-tool set, enabling "Require
-    Approval for File & Shell Operations" never prompted in an opencode session
-    (the policy returned ALLOW). ``grep`` / ``glob`` are the categories the
-    overlapping lowercase pi set does not cover.
-
-    :param tool: opencode permission category, e.g. ``"bash"``.
+    :param tool: opencode permission action, e.g. ``"shell"``.
     :param args: Tool arguments dict.
     :param expected_preview: Substring that must appear in the reason.
     """
@@ -216,6 +210,48 @@ def test_ask_on_os_tools_asks_for_opencode_native_tools(
     assert result["result"] == "ASK"
     assert tool in result["reason"]
     assert expected_preview in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "tool", ["webfetch", "skill", "subagent", "question", "external_directory"]
+)
+def test_ask_on_os_tools_ignores_non_file_opencode_actions(tool: str) -> None:
+    """Non file/shell opencode actions are not OS tools."""
+    assert ask_on_os_tools(tc(tool, {}))["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize("tool", ["opencode_list_mcp_resources", "opencode_read_mcp_resource"])
+def test_ask_on_os_tools_asks_for_opencode_mcp_builtins(tool: str) -> None:
+    """OpenCode's own MCP builtins reach MCP servers without a relay tool name."""
+    result = ask_on_os_tools(tc(tool, {}))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+
+
+def test_opencode_os_tool_set_is_v2_action_names() -> None:
+    from omnigent.policies.builtins.safety import _OPENCODE_NATIVE_OS_TOOLS
+
+    assert (
+        frozenset(
+            {
+                "shell",
+                "edit",
+                "read",
+                "grep",
+                "glob",
+                "opencode_list_mcp_resources",
+                "opencode_read_mcp_resource",
+            }
+        )
+        == _OPENCODE_NATIVE_OS_TOOLS
+    )
+
+
+def test_block_skills_blocks_opencode_skill_action() -> None:
+    """opencode's ``skill`` permission action carries the skill id as ``skill``."""
+    policy = block_skills(["deploy"])
+    assert policy(tc("skill", {"skill": "deploy"}))["result"] == "DENY"
+    assert policy(tc("skill", {"skill": "review"}))["result"] == "ALLOW"
 
 
 # ── ask_on_os_tools: codex in-process harness observed shell tool ─────────────

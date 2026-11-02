@@ -139,6 +139,53 @@ it("keeps the saved selection when the server rejects a change", async () => {
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
+it.each([false, true])(
+  "keeps the context variant's label and checked row consistent (draft=%s)",
+  async (draft) => {
+    const extendedModel = "system.ai.claude-sonnet-5[1m]";
+    render(
+      <QueryClientProvider client={cache}>
+        <SideChatSettings
+          session={{
+            ...child,
+            harness: "claude-native",
+            labels: { "omnigent.wrapper": "claude-code-native-ui" },
+            modelOverride: "sonnet",
+            llmModel: draft ? "claude-sonnet-5" : extendedModel,
+            codexModelOptions: [
+              { id: "sonnet", model: "claude-sonnet-5", displayName: "Sonnet 5" },
+              {
+                id: "sonnet[1m]",
+                model: "claude-sonnet-5[1m]",
+                displayName: "Sonnet 5 1M",
+              },
+            ],
+          }}
+          draft={
+            draft
+              ? { settings: { modelOverride: extendedModel }, onChange: vi.fn(), disabled: false }
+              : undefined
+          }
+        />
+      </QueryClientProvider>,
+    );
+    const picker = screen.getByRole("button", { name: "Side chat model and effort" });
+    expect(picker).toHaveTextContent("Sonnet 5 1M");
+    const user = userEvent.setup();
+    await user.click(picker);
+    await user.click(screen.getByTestId("side-chat-model-edit"));
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 5 1M" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 5" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(sessionsApi.updateSession).not.toHaveBeenCalled();
+  },
+);
+
 it("keeps the reported Claude model when a saved request is not applied", async () => {
   conversationRegistry.acquire("side").setState({ llmModel: "model-a" });
   mount({

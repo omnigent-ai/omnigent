@@ -1,5 +1,5 @@
-// Expanded view of a file-edit tool call: the change as a diff per file, with the
-// tool's reported failure, or output that does not confirm the edit, above it.
+// Expanded view of a file-edit or write tool call: the change as a diff per file,
+// with the tool's reported failure, or output that does not confirm it, above it.
 
 import { type ReactNode, useMemo } from "react";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
@@ -17,7 +17,7 @@ export function FileEditBody({ call }: { call: ToolCall }) {
   const { name, args, output, state } = call;
   // Before output arrives, the card shows the pending or cancelled state below instead.
   const awaitingOutput = output === null && state !== "output-available";
-  const diff = useMemo(() => getFileEditDiff(name, args), [name, args]);
+  const diff = useMemo(() => getFileEditDiff(name, args, output), [name, args, output]);
   const error = useMemo(() => {
     if (output === null) return null;
     // Defensive: the transcript sets output-error only without output, but a direct
@@ -60,7 +60,7 @@ export function FileEditBody({ call }: { call: ToolCall }) {
   );
 }
 
-/** One file's diff, titled with its path, whether it is new, deleted or renamed, and its counts. */
+/** One file's diff, titled with its path, its kind of change and its counts. */
 function FileDiffPanel({ file, perMatch }: { file: FileDiffSection; perMatch: boolean }) {
   const { root, home } = useWorkspacePaths();
   const shown = (path: string) => resolveChatFilePath(path, root, home)?.path ?? path;
@@ -72,6 +72,7 @@ function FileDiffPanel({ file, perMatch }: { file: FileDiffSection; perMatch: bo
         {file.newPath !== undefined && ` renamed to ${shown(file.newPath)}`}
         {file.kind === "add" && " (new file)"}
         {file.kind === "delete" && " (deleted)"}
+        {file.kind === "write" && " (whole file written)"}
         {perMatch && " (each match)"}
         {file.additions > 0 && (
           <span className={cn("ml-2", DIFF_TONE_CLASS.added)}>+{file.additions}</span>
@@ -82,11 +83,16 @@ function FileDiffPanel({ file, perMatch }: { file: FileDiffSection; perMatch: bo
       </>
     ) : undefined;
   if (file.text === "") {
-    // An empty file added or deleted, or a rename that changes no lines.
+    // An empty file added, deleted or written, or a rename that changes no lines.
+    const what = file.kind === "write" ? "empty file" : "no line changes";
     return (
-      <p className="text-muted-foreground text-sm">{title ?? shown(file.path)}: no line changes</p>
+      <p className="text-muted-foreground text-sm">
+        {title ?? shown(file.path)}: {what}
+      </p>
     );
   }
+  // The previous content of a rewritten file is not recorded, so it shows as written.
+  const isWrite = file.kind === "write";
   return (
     <OutputSection
       output={file.text}
@@ -95,8 +101,8 @@ function FileDiffPanel({ file, perMatch }: { file: FileDiffSection; perMatch: bo
           title={title}
           text={text}
           copyText={file.text}
-          copyLabel="Copy diff"
-          language="diff"
+          copyLabel={isWrite ? "Copy file" : "Copy diff"}
+          language={isWrite ? "text" : "diff"}
         />
       )}
     />

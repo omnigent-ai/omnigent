@@ -69,6 +69,9 @@ def _shrink_window_and_open_sidebar(page: Page) -> Locator:
         "button", name="Close sidebar", exact=True
     ).click()
     expect(aside).to_have_attribute("data-collapsed", "true")
+    # Park the pointer over the chat: left where it is, it lands on the narrow
+    # header's "Open sidebar" toggle, and a slow run dwells long enough to peek.
+    page.mouse.move(_NARROW_VIEWPORT["width"] / 2, _NARROW_VIEWPORT["height"] / 2)
 
     page.set_viewport_size(_NARROW_VIEWPORT)
     open_sidebar = page.get_by_role("button", name="Open sidebar", exact=True)
