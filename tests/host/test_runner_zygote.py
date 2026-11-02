@@ -651,6 +651,23 @@ def test_forked_runner_runs_in_the_requested_workspace(manager: ZygoteManager, t
     assert f"cwd={workspace.resolve()}\n" in log.read_text()
 
 
+def test_runner_setup_failure_lands_in_the_runner_log(manager: ZygoteManager, tmp_path) -> None:
+    """A child that fails before the runner starts writes the cause to its own log.
+
+    The host's exit report reads only the runner log, so a setup failure such
+    as a vanished workspace must not leave that log empty.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    log = tmp_path / "runner.log"
+
+    proc = manager.fork_runner(_fork_env(0), str(log), str(tmp_path / "gone"))
+
+    assert _wait_exit(proc) == 1
+    assert "FileNotFoundError" in log.read_text()
+
+
 def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
     """A daemon-side OMNIGENT_LOG_TTY_FD in the payload never leaks as-is.
 
