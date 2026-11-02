@@ -107,11 +107,45 @@ export const ComposerWorkspaceTrigger = forwardRef<
   );
 });
 
+export type HostStatusDotStatus = "online" | "offline" | "unknown" | "starting";
+
+const HOST_RING_CLASS = "border-[1.5px] border-muted-foreground";
+
+const HOST_STATUS_DOT_CLASS: Record<HostStatusDotStatus, string> = {
+  online: "bg-success",
+  offline: HOST_RING_CLASS,
+  unknown: HOST_RING_CLASS,
+  // The ring's gap keeps "starting" distinct when motion is reduced.
+  starting: `${HOST_RING_CLASS} border-t-transparent animate-spin motion-reduce:animate-none`,
+};
+
+/**
+ * Host liveness dot shared by the composer's host chip and its host menu, so
+ * the two agree: a ring while not running, a spinning ring while starting,
+ * and a filled green dot once online.
+ */
+export function HostStatusDot({
+  status,
+  testId,
+}: {
+  status: HostStatusDotStatus;
+  testId?: string;
+}) {
+  return (
+    <span
+      aria-hidden
+      data-status={status}
+      className={cn("size-2 shrink-0 rounded-full", HOST_STATUS_DOT_CLASS[status])}
+      data-testid={testId}
+    />
+  );
+}
+
 export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status?: "online" | "offline" | "unknown";
+    status?: HostStatusDotStatus;
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -134,14 +168,7 @@ export const ComposerHostTrigger = forwardRef<
       <span className="flex items-center">
         {status && (
           <span className="flex size-4 shrink-0 items-center justify-center">
-            <span
-              aria-hidden
-              className={cn(
-                "size-2 rounded-full",
-                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-              )}
-              data-testid={`${testIdPrefix}-host-status`}
-            />
+            <HostStatusDot status={status} testId={`${testIdPrefix}-host-status`} />
           </span>
         )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />

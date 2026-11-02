@@ -372,9 +372,17 @@ composer open: sending starts the same Arca reconnect, the message waits in the
 queue as **Waiting for host** without reaching the server, and it sends once the
 host is back. In a sandbox session (for example an Arclet) whose host is
 asleep, **Reconnect host** in the composer's host menu has the server wake the
-sandbox and start the agent without sending a message, in the browser too; a
-toast says when it's back online or why the wake failed. Reloading during the
-wake keeps its progress (for example "Provisioning sandbox…") in the chat.
+sandbox and start the agent without sending a message, in the browser too.
+The host status dot in the composer chip and its menu spins while the sandbox
+starts and turns green once it is online. A toast appears only when the wake
+fails or, after the server answers, three regular host health checks still
+find the host offline. Extra checks, such as the one run right after the
+server answers, don't count. The checks count only once the server stops
+reporting launch progress. If the server reports the launch failed or waiting
+on the user, the dot stops and Reconnect host returns.
+Reloading during the wake keeps it spinning, with the stage (for example
+"Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
+stays in the menu then, in case that stage never finishes.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -853,10 +861,12 @@ plain `uv run pytest`, which starts a private server for the test.
   and a message that waits for the host, not live SSH or the desktop's consent
   console.
 - **`reconnect`, asleep sandbox:**
-  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_asks_server_to_wake_asleep_host`
-  drives the real SPA and server with the session patched to an asleep host. It
-  checks that Reconnect host sends `retry_session` and shows the server's answer,
-  not a live sandbox resume.
+  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_wakes_asleep_sandbox_in_status_dot`
+  drives the real SPA and server with the session patched to an asleep Arclet
+  host. It checks that Reconnect host sends `retry_session`, spins the chip and
+  menu dots with no toast, and turns them green once `/health` reports the host
+  online. Sibling tests cover a failed wake's error toast and retry, and a
+  session opened mid-wake. None of them resume a live sandbox.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It
