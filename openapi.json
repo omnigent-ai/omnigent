@@ -5986,6 +5986,58 @@
         "title": "SandboxStatus",
         "type": "object"
       },
+      "ScheduledRunLogContext": {
+        "description": "Occurrence identity retained with a saved prompt across replica changes.",
+        "properties": {
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scheduled_at": {
+            "format": "int64",
+            "title": "Scheduled At",
+            "type": "integer"
+          },
+          "session_mode": {
+            "title": "Session Mode",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "task_workspace_id": {
+            "format": "int64",
+            "title": "Task Workspace Id",
+            "type": "integer"
+          },
+          "trigger_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Key"
+          }
+        },
+        "required": [
+          "task_id",
+          "run_id",
+          "task_workspace_id",
+          "scheduled_at",
+          "target",
+          "session_mode"
+        ],
+        "title": "ScheduledRunLogContext",
+        "type": "object"
+      },
       "SendCommentsRequest": {
         "description": "Request body for `POST .../comments/send`.",
         "properties": {
@@ -9899,6 +9951,16 @@
               }
             ],
             "title": "Model Override"
+          },
+          "scheduled_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduledRunLogContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "tools": {
             "anyOf": [
