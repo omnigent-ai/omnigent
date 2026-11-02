@@ -1628,7 +1628,7 @@ def create_app(
                     "Reaped %d orphaned native bridge dir(s) from prior runs",
                     _reaped_bridge_dirs,
                 )
-        except Exception:  # housekeeping must never block startup
+        except Exception:  # noqa: BLE001 — housekeeping must never block startup
             _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
@@ -1840,7 +1840,7 @@ async def _run_tunnel_from_env() -> None:
         from omnigent.runtime import telemetry
 
         telemetry.init("omni-runner")
-    except Exception:  # best-effort; tracing failure must not crash the runner
+    except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
         _logger.debug(
             "telemetry init failed in runner",
             exc_info=True,
@@ -1961,7 +1961,7 @@ async def _run_tunnel_from_env() -> None:
                         allowed_origins=frozenset({allowed_origin}),
                     )
                 )
-        except Exception:  # optimization only; never block the tunnel
+        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
             _logger.warning(
                 "direct-attach listener setup failed",
                 exc_info=True,
@@ -2075,19 +2075,32 @@ async def _run_tunnel_from_env() -> None:
                 exit_reason or "shutdown requested",
                 extra={"session_id": runner_primary_session_id()},
             )
-        for task in wait_tasks:
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await stop_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await tunnel_task
-        if idle_task is not None:
+        try:
+            for task in wait_tasks:
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await idle_task
-        if direct_attach_listener is not None:
-            with contextlib.suppress(Exception):
-                await direct_attach_listener.stop()
-        await _lifespan_cm.__aexit__(None, None, None)
+                await stop_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await tunnel_task
+            if idle_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await idle_task
+        finally:
+            # Reaping a failed task can raise again; owned services still need cleanup.
+            unwinding = sys.exc_info()[0] is not None
+            if direct_attach_listener is not None:
+                with contextlib.suppress(Exception):
+                    await direct_attach_listener.stop()
+            try:
+                await _lifespan_cm.__aexit__(None, None, None)
+            except Exception:
+                if not unwinding:
+                    raise
+                _logger.warning(
+                    "runner teardown failed while exiting",
+                    exc_info=True,
+                    extra={"session_id": runner_primary_session_id()},
+                )
 
 
 def _install_signal_handlers(
