@@ -14,7 +14,7 @@ class SysSessionMessageTool(Tool):
     def description(cls) -> str:
         return (
             "Send work to another session owned by the same user. Requires session "
-            "orchestration enabled and a private, non-scheduled sending session, including "
+            "orchestration enabled and a private sending session, including "
             "its side-chat source chain. The receiver "
             "may be shared: its readers will see your message. It uses normal queue/steering "
             "behavior without changing parentage or forwarding replies. A queued result "
