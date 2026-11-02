@@ -6321,6 +6321,7 @@ async def _launch_runner_on_host_impl(
         structured refusal from the host.
     """
     lock = _relaunch_locks.setdefault(conv.id, asyncio.Lock())
+    previous_attempt = _relaunch_last_attempt.get(conv.id)
     async with lock:
         # Re-read under the lock: a binding that moved past the caller's
         # snapshot means another flight just relaunched (concurrently, or
@@ -6337,8 +6338,11 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        last = _relaunch_last_attempt.get(conv.id)
+        # A waiter may already have read the active flight's replacement binding.
+        if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
+            return last
         if fresh.runner_id and fresh.runner_id != conv.runner_id:
-            last = _relaunch_last_attempt.get(conv.id)
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
