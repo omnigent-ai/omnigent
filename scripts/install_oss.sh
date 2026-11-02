@@ -30,6 +30,8 @@ VERSION=
 EXTRAS=
 INCLUDE_DATABRICKS=true
 DATABRICKS_CLI_VERSION=1.21.0
+# The standalone installer runs before omnigent.util.tmux_compat is importable.
+TMUX_MIN_VERSION=3.3
 # SHA-256 values from this release's official SHA256SUMS manifest.
 DATABRICKS_CLI_SHA256_LINUX_AMD64=5599f6a4c01535142cdb1aa16527ec68e6aa849bd7ce72581ec4ed491e9d16b7
 DATABRICKS_CLI_SHA256_LINUX_ARM64=27440b096de110978ea8621ed936692bf88e6912ddadea810f7cac78850ceb02
@@ -432,43 +434,82 @@ linux_pkg_install_cmd() {
   fi
 }
 
+tmux_version_supported() {
+  tmux_version_output=$(tmux -V 2>/dev/null) || return 1
+  case "$tmux_version_output" in
+    "tmux "*.*) ;;
+    *) return 1 ;;
+  esac
+  tmux_release=${tmux_version_output#tmux }
+  tmux_major=${tmux_release%%.*}
+  tmux_minor=${tmux_release#*.}
+  tmux_minor=${tmux_minor%%[!0-9]*}
+  case "$tmux_major:$tmux_minor" in
+    *[!0-9:]*|:*|*:) return 1 ;;
+  esac
+  [ "$tmux_major" -gt "${TMUX_MIN_VERSION%%.*}" ] || {
+    [ "$tmux_major" -eq "${TMUX_MIN_VERSION%%.*}" ] &&
+      [ "$tmux_minor" -ge "${TMUX_MIN_VERSION#*.}" ]
+  }
+}
+
 check_tmux() {
+  tmux_preexisting=false
+  tmux_problem="tmux not found"
   if command -v tmux >/dev/null 2>&1; then
+    tmux_preexisting=true
     OMNIGENT_LEDGER_DEP_TMUX=preexisting
     export OMNIGENT_LEDGER_DEP_TMUX
-    step "tmux is available"
-    return
+    if tmux_version_supported; then
+      step "$tmux_version_output is supported"
+      return
+    fi
+    tmux_problem="tmux is unsupported (${tmux_version_output:-version unavailable})"
   fi
 
-  case "$(uname -s)" in
+  install_cmd=
+  tmux_platform=$(uname -s)
+  case "$tmux_platform" in
     Darwin)
       if command -v brew >/dev/null 2>&1; then
-        if prompt_yes_no "tmux is missing (needed for \`omnigent claude\` / \`omnigent codex\`). Install it with brew?"; then
-          run_with_spinner "brew install tmux" brew install tmux || warn "brew install tmux failed — install tmux manually before \`omnigent claude\`."
-          return
+        if [ "$tmux_preexisting" = true ] && brew list --formula tmux >/dev/null 2>&1; then
+          install_cmd="brew upgrade tmux"
+        else
+          install_cmd="brew install tmux"
         fi
       fi
-      warn "tmux not found — \`omnigent claude\` / \`omnigent codex\` need it. Install with: brew install tmux"
       ;;
     Linux)
-      install_cmd="$(linux_pkg_install_cmd tmux)"
-      if [ -n "$install_cmd" ] && prompt_yes_no "tmux is missing (needed for \`omnigent claude\` / \`omnigent codex\`). Install it now ($install_cmd)?"; then
-        # Run directly (not via run_with_spinner) so sudo can prompt for a password.
-        sh -c "$install_cmd" || warn "tmux install failed — run manually: $install_cmd"
-        if command -v tmux >/dev/null 2>&1; then
-          OMNIGENT_LEDGER_DEP_TMUX=omnigent
-          export OMNIGENT_LEDGER_DEP_TMUX
-          step "tmux installed"
-        fi
-        return
-      fi
-      if [ -n "$install_cmd" ]; then
-        warn "tmux not found — \`omnigent claude\` / \`omnigent codex\` need it. Install with: $install_cmd"
-      else
-        warn "tmux not found — \`omnigent claude\` / \`omnigent codex\` need it. Install it with your package manager."
+      if [ "$tmux_preexisting" = false ]; then
+        install_cmd="$(linux_pkg_install_cmd tmux)"
       fi
       ;;
   esac
+  if [ -n "$install_cmd" ] && prompt_yes_no "$tmux_problem; native terminals need tmux $TMUX_MIN_VERSION or newer. Install/upgrade it now ($install_cmd)?"; then
+    if [ "$tmux_platform" = Darwin ]; then
+      run_with_spinner "$install_cmd" sh -c "$install_cmd" || warn "tmux install/upgrade failed — run manually: $install_cmd"
+    else
+      # Run directly so sudo can prompt for a password.
+      sh -c "$install_cmd" || warn "tmux install/upgrade failed — run manually: $install_cmd"
+    fi
+    if command -v tmux >/dev/null 2>&1; then
+      if [ "$tmux_preexisting" = false ]; then
+        OMNIGENT_LEDGER_DEP_TMUX=omnigent
+        export OMNIGENT_LEDGER_DEP_TMUX
+      fi
+      if tmux_version_supported; then
+        step "$tmux_version_output is supported"
+        return
+      fi
+    fi
+    warn "tmux $TMUX_MIN_VERSION or newer is still unavailable. Check \`tmux -V\` on PATH and install a supported package before launching native terminals."
+    return
+  fi
+  if [ -n "$install_cmd" ]; then
+    warn "$tmux_problem — native terminals need tmux $TMUX_MIN_VERSION or newer. Run $install_cmd, then verify \`tmux -V\`."
+  else
+    warn "$tmux_problem — native terminals need tmux $TMUX_MIN_VERSION or newer. Install a supported version with your package manager, then verify \`tmux -V\`."
+  fi
 }
 
 # The native `omnigent claude` / `omnigent codex` / `pi` harnesses wrap each
