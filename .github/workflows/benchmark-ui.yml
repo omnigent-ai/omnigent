@@ -37,7 +37,7 @@ jobs:
   detect:
     name: Detect UI benchmark inputs
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       ui: ${{ steps.changes.outputs.ui }}

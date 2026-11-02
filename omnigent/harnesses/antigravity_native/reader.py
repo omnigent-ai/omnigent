@@ -84,6 +84,7 @@ from omnigent.harnesses.antigravity_native.rpc import (
 # (relocated from the retired transcript forwarder). The reader reuses the SAME
 # event shape so the mapped events post identically.
 from omnigent.harnesses.antigravity_native.steps import (
+    _AGENT_NAME,
     OutboundEvent,
     PendingInteraction,
     _execution_discriminator,
@@ -97,6 +98,7 @@ from omnigent.harnesses.antigravity_native.steps import (
 )
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
+from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -3093,6 +3095,8 @@ async def _rotate_session_for_cascade(
        conversation id (the reader re-reads this on rebind to bind the new cascade).
     6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
        a failure is logged, not raised — the new session is already live).
+    7. POST the shared ``/clear`` supersession notice to the OLD conversation
+       (best-effort), so its web view stops spinning and follows the new chat.
 
     Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
     logged at WARNING and yields ``None``, and the caller keeps serving the OLD
@@ -3199,6 +3203,13 @@ async def _rotate_session_for_cascade(
             new_session_id,
             exc_info=True,
         )
+
+    await post_clear_supersession(
+        client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
+    )
 
     _logger.info(
         "agy reader rotated Omnigent session after /clear: old_session=%s new_session=%s "

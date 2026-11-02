@@ -336,8 +336,10 @@ async def test_transient_attachment_read_does_not_drop_native_attachment(
     # fail-once stays armed for the resolver under test.
     probe_id = _upload_file(base_url, session_id, "probe.md", b"probe")
     probe_base = f"{base_url}/v1/sessions/{session_id}/resources/files/{probe_id}"
-    first = _http.get(probe_base, timeout=10.0)
-    second = _http.get(probe_base, timeout=10.0)
+    # The server closes the connection after this 500, so a pooled client could
+    # resend on the closing socket; give each probe read its own connection.
+    first = httpx.get(probe_base, timeout=10.0, trust_env=False)
+    second = httpx.get(probe_base, timeout=10.0, trust_env=False)
     assert first.status_code == 500, f"transient failure signature not live: {first.status_code}"
     assert first.json()["error"]["code"] == "internal_error"
     assert second.status_code == 200, "resource must be readable again on the next read"

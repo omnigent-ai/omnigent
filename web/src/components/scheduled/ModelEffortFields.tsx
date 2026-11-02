@@ -44,6 +44,7 @@ export function ModelEffortFields({
   effort,
   permissionMode,
   hostId,
+  disabled = false,
   onModelChange,
   onEffortChange,
   onPermissionModeChange,
@@ -57,6 +58,7 @@ export function ModelEffortFields({
   permissionMode: string;
   /** Pinned host id, or "" when unset (task resolves a host at fire time). */
   hostId: string;
+  disabled?: boolean;
   onModelChange: (model: string) => void;
   onEffortChange: (effort: string) => void;
   onPermissionModeChange: (mode: string) => void;
@@ -65,9 +67,9 @@ export function ModelEffortFields({
   onSelectOpenChange?: (open: boolean) => void;
 }) {
   // When a host is pinned, use its live-resolved model options (mirrors the
-  // interactive dialog on a connected host). With no host pinned — the common
-  // case, since scheduled tasks resolve a host at fire time — fall back to the
-  // static Claude aliases so the picker is always populated.
+  // interactive dialog on a connected host). With no host pinned (an older
+  // task that resolves its host when it fires, or before one is picked), fall
+  // back to the static Claude aliases so the picker is always populated.
   const { data: hostModelOptions } = useHostModelOptions(
     hostId === "" ? null : hostId,
     "claude-native",
@@ -84,6 +86,7 @@ export function ModelEffortFields({
         <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-model-control">
           <Label htmlFor="task-model">Model</Label>
           <Select
+            disabled={disabled}
             value={model === "" ? MODEL_SELECT_DEFAULT : model}
             componentId="tasks.scheduled.model"
             valueHasNoPii
@@ -111,6 +114,7 @@ export function ModelEffortFields({
         <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-effort-control">
           <Label htmlFor="task-effort">Effort</Label>
           <Select
+            disabled={disabled}
             value={effort === "" ? EFFORT_SELECT_NONE : effort}
             componentId="tasks.scheduled.effort"
             valueHasNoPii
@@ -139,6 +143,7 @@ export function ModelEffortFields({
       <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
         <Label htmlFor="task-permission">Permission mode</Label>
         <Select
+          disabled={disabled}
           value={permissionMode === "" ? PERMISSION_SELECT_DEFAULT : permissionMode}
           componentId="tasks.scheduled.permission_mode"
           valueHasNoPii
