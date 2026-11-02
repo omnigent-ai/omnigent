@@ -120,6 +120,24 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
     )
 
 
+def test_classify_codex_error_ip_access_list_refusal_not_auth() -> None:
+    """A workspace IP access list refusal (HTTP 403) is not a sign-in failure.
+
+    Signing in again cannot clear a network policy, so the re-auth status and
+    hint would point the user at the wrong fix.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Synthetic address, workspace and request id; the wording is the gateway's.
+    acl_message = (
+        "unexpected status 403 Forbidden: Source IP address: 203.0.113.7 is blocked by "
+        "Databricks IP ACL for workspace: 1234567890123456 "
+        "[ReqId: 00000000-0000-4000-8000-000000000000]"
+    )
+    structured_403 = {"codexErrorInfo": {"httpStatusCode": 403}}
+    assert fwd._classify_codex_error(structured_403, acl_message) == generic
+    assert fwd._classify_codex_error({}, acl_message) == generic
+
+
 @pytest.mark.parametrize(
     "request_id",
     [

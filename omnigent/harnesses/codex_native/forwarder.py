@@ -298,6 +298,8 @@ _CODEX_BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# A workspace IP access list refusal is also an HTTP 403; signing in cannot clear it.
+_CODEX_IP_ACCESS_LIST_FRAGMENTS = ("blocked by databricks ip acl",)
 
 
 @dataclass
@@ -1193,9 +1195,10 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     standalone 401/403 token or :data:`_CODEX_AUTH_ERROR_FRAGMENTS` in the
     message for versions/shapes that omit it, unless the message is a 429.
 
-    Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
-    for these, which the auth checks below would otherwise misclassify. So is a
-    failed model provider token command, which ``codex login`` cannot renew.
+    Budget/quota exhaustion and IP access list refusals are checked first: the
+    AI gateway returns HTTP 403 for both, which the auth checks below would
+    otherwise misclassify. So is a failed model provider token command, which
+    ``codex login`` cannot renew.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -1204,7 +1207,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     """
     lowered = message.lower()
     if any(
-        fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS
+        fragment in lowered
+        for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
     ) or is_codex_provider_auth_failure(message):
         return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
