@@ -5263,6 +5263,7 @@ async def _auto_create_codex_terminal(
         apply_codex_thread_effort,
         build_codex_native_server,
         codex_remote_resume_omits_permission_args,
+        codex_reprobed_launch_catalog,
         codex_session_meta_model_provider,
         fresh_codex_launch_catalog,
         is_missing_rollout_error,
@@ -5339,12 +5340,69 @@ async def _auto_create_codex_terminal(
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     _codex_terminal_args = launch_config.terminal_launch_args or ()
-    _codex_launch = await asyncio.to_thread(
-        resolve_native_codex_launch,
-        model=default_model,
-        spec=_launch_spec,
-        terminal_launch_args=_codex_terminal_args,
-    )
+    try:
+        _codex_launch = await asyncio.to_thread(
+            resolve_native_codex_launch,
+            model=default_model,
+            spec=_launch_spec,
+            terminal_launch_args=_codex_terminal_args,
+        )
+    except ValueError as launch_error:
+        from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
+        from omnigent.models.model_override import is_databricks_model_id
+        from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
+        from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
+
+        if (
+            default_model is None
+            or not is_databricks_model_id(default_model)
+            or _launch_spec is None
+        ):
+            raise
+        try:
+            requested_provider = await asyncio.to_thread(
+                _resolve_provider_for_build,
+                _launch_spec,
+                harness_type="codex",
+                actual_harness="codex-native",
+            )
+            # Missing declared credentials cannot be replaced with an account route.
+            if requested_provider is not None and requested_provider.kind != SUBSCRIPTION_KIND:
+                raise launch_error
+            if requested_provider is None and (
+                _launch_spec.executor.auth is not None
+                or _launch_spec.executor.profile
+                or _launch_spec.executor.config.get("profile")
+                or await asyncio.to_thread(_load_global_auth) is not None
+            ):
+                raise launch_error
+            catalog_route = await asyncio.to_thread(
+                resolve_native_codex_launch,
+                model=None,
+                spec=_launch_spec,
+                terminal_launch_args=_codex_terminal_args,
+            )
+            catalog_rows = fresh_codex_launch_catalog(launch=catalog_route)
+            if catalog_rows is None:
+                catalog_rows = await codex_reprobed_launch_catalog(launch=catalog_route)
+        except Exception:
+            _logger.debug(
+                "codex catalog proof unavailable for session=%s", session_id, exc_info=True
+            )
+            raise launch_error from None
+        reachable = codex_reachable_model_slug(default_model, catalog_rows or ())
+        if reachable is None or is_databricks_model_id(reachable):
+            raise
+        # Keep the route and credentials that supplied the proven native slug.
+        _codex_launch = dataclasses.replace(
+            catalog_route,
+            model=reachable,
+            config_overrides=[
+                value
+                for value in catalog_route.config_overrides
+                if value.partition("=")[0].strip() != "model"
+            ],
+        )
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
@@ -5406,7 +5464,6 @@ async def _auto_create_codex_terminal(
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
-            codex_reprobed_launch_catalog,
         )
         from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.models.model_catalog_store import default_row

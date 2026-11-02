@@ -26,7 +26,7 @@ from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     REAL_CODEX_LAUNCH_CATALOG,
@@ -96,6 +96,7 @@ async def codex_launch_harness(
 ) -> AsyncIterator[_LaunchHarness]:
     """Keep the real catalog store and launcher isolated from all live CLIs."""
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -233,10 +234,27 @@ async def codex_launch_harness(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pick", ["databricks-gpt-5-6-sol", "system.ai.gpt-5-6-sol"])
-@pytest.mark.parametrize("route", ["same-provider", "subscription-with-gateway"])
+@pytest.mark.parametrize(
+    ("pick", "served"),
+    [
+        ("databricks-gpt-5-6-sol", "gpt-5.6-sol"),
+        ("system.ai.gpt-5-6-sol", "gpt-5.6-sol"),
+        ("databricks-gpt-5-5", "gpt-5.5"),
+    ],
+)
+@pytest.mark.parametrize(
+    "route",
+    [
+        "same-provider",
+        "subscription-with-gateway",
+        "spec-gateway",
+        "subscription-only",
+        "spec-subscription",
+    ],
+)
 async def test_equivalent_gateway_pick_launches_without_reset(
     pick: str,
+    served: str,
     route: str,
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -245,54 +263,144 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     """Gateway prefixes and endpoint punctuation do not make a pick unavailable."""
     harness = codex_launch_harness
     harness.snapshot["model_override"] = pick
-    rows = [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]
-    if route == "subscription-with-gateway":
+    rows = [{"id": served, "model": served, "isDefault": True}]
+    if route != "same-provider":
         config = isolate_provider_resolution(monkeypatch, tmp_path / "providers")
-        (config / "config.yaml").write_text(
-            yaml.safe_dump(
-                {
-                    "providers": {
-                        "subscription": {"kind": "subscription", "cli": "codex", "default": True},
-                        "gateway": {
-                            "kind": "key",
-                            "openai": {
-                                "base_url": "https://gateway.example.test/v1",
-                                "api_key": "test-gateway-key",
-                            },
-                        },
-                    }
-                }
-            )
-        )
+        providers: dict[str, Any] = {
+            "subscription": {"kind": "subscription", "cli": "codex", "default": True}
+        }
+        if route in {"subscription-with-gateway", "spec-gateway"}:
+            providers["gateway"] = {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://gateway.example.test/v1",
+                    "api_key": "test-gateway-key",
+                },
+            }
+        (config / "config.yaml").write_text(yaml.safe_dump({"providers": providers}))
         home = tmp_path / "codex-home"
         home.mkdir()
         (home / "auth.json").write_text('{"auth_mode":"apikey","OPENAI_API_KEY":"test-login"}')
         monkeypatch.setenv("CODEX_HOME", str(home))
         monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_native_codex_launch)
-        selected = resolve_native_codex_launch(model=pick, spec=harness.agent_spec)
-        gateway_shape = replace(
-            selected,
-            model=None,
-            config_overrides=[
-                value for value in selected.config_overrides if value.partition("=")[0] != "model"
-            ],
-        )
-        model_catalog_store.write_catalog(
-            "codex-native",
-            codex_app.codex_catalog_fingerprint(gateway_shape, codex_path=_CODEX_PATH),
-            rows,
-        )
-        harness.seed_catalog([{"id": "account-only-model", "isDefault": True}])
+        if route == "spec-gateway":
+            harness.agent_spec.executor.auth = ProviderAuth(name="gateway")
+        elif route == "spec-subscription":
+            harness.agent_spec.executor.auth = ProviderAuth(name="subscription")
+        if route in {"subscription-with-gateway", "spec-gateway"}:
+            selected = resolve_native_codex_launch(model=pick, spec=harness.agent_spec)
+            gateway_shape = replace(
+                selected,
+                model=None,
+                config_overrides=[
+                    value
+                    for value in selected.config_overrides
+                    if value.partition("=")[0] != "model"
+                ],
+            )
+            model_catalog_store.write_catalog(
+                "codex-native",
+                codex_app.codex_catalog_fingerprint(gateway_shape, codex_path=_CODEX_PATH),
+                rows,
+            )
+            harness.seed_catalog(
+                [{"id": "account-only-model", "isDefault": True}], ambient=route == "spec-gateway"
+            )
+        else:
+            with pytest.raises(ValueError, match="requires a Databricks gateway"):
+                resolve_native_codex_launch(model=pick, spec=harness.agent_spec)
+            harness.seed_catalog(rows)
     else:
         harness.seed_catalog(rows)
 
     await harness.launch()
 
-    assert harness.builds[0]["model"] == pick
+    account_route = route in {"subscription-only", "spec-subscription"}
+    assert harness.builds[0]["model"] == (served if account_route else pick)
     assert harness.builds[0]["session_id"] == _SESSION_ID
     assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
+    assert harness.snapshot["model_override"] == pick
+    if route in {"subscription-with-gateway", "spec-gateway"}:
+        overrides = "\n".join(harness.builds[0]["extra_config_overrides"])
+        assert 'base_url="https://gateway.example.test/v1"' in overrides
+        assert 'model_provider="openai"' not in overrides
+    elif account_route:
+        assert 'model_provider="openai"' in harness.builds[0]["extra_config_overrides"]
     harness.probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["unknown", "empty", "stale"])
+async def test_gateway_pick_without_catalog_proof_still_requires_a_gateway(
+    evidence: str,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = codex_launch_harness
+    isolate_provider_resolution(monkeypatch, tmp_path / "providers")
+    monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_native_codex_launch)
+    pick = "databricks-unknown-native-model" if evidence == "unknown" else "databricks-gpt-5-5"
+    harness.snapshot["model_override"] = pick
+    rows = (
+        [] if evidence == "empty" else [{"id": "gpt-5.5", "model": "gpt-5.5", "isDefault": True}]
+    )
+    harness.seed_catalog(rows, stale=evidence == "stale")
+
+    with pytest.raises(ValueError, match="requires a Databricks gateway"):
+        await harness.launch()
+
+    assert harness.builds == []
+    assert harness.resets == []
+    assert harness.snapshot["model_override"] == pick
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["default", "spec"])
+async def test_gateway_credential_is_not_replaced_with_account_for_alias(
+    authority: str,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    harness = codex_launch_harness
+    config = isolate_provider_resolution(monkeypatch, tmp_path / "providers")
+    (config / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "subscription": {
+                        "kind": "subscription",
+                        "cli": "codex",
+                        "default": authority == "spec",
+                    },
+                    "gateway": {
+                        "kind": "key",
+                        "default": authority == "default",
+                        "openai": {
+                            "base_url": "https://gateway.example.test/v1",
+                            "api_key_ref": "env:CODEX_TEST_MISSING_GATEWAY_KEY",
+                        },
+                    },
+                }
+            }
+        )
+    )
+    monkeypatch.delenv("CODEX_TEST_MISSING_GATEWAY_KEY", raising=False)
+    if authority == "spec":
+        harness.agent_spec.executor.auth = ProviderAuth(name="gateway")
+    monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_native_codex_launch)
+    pick = "databricks-gpt-5-5"
+    harness.snapshot["model_override"] = pick
+    harness.seed_catalog([{"id": "gpt-5.5", "model": "gpt-5.5", "isDefault": True}], ambient=True)
+
+    with pytest.raises(ValueError):
+        await harness.launch()
+
+    assert harness.builds == []
+    assert harness.resets == []
+    assert harness.snapshot["model_override"] == pick
 
 
 @pytest.mark.asyncio
