@@ -272,6 +272,42 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
     )
 
 
+async def test_sigkilled_terminal_reports_a_kill_outside_omnigent(
+    launch: _Launch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    released = asyncio.Event()
+
+    async def release(_self, session_id: str) -> None:
+        released.set()
+
+    monkeypatch.setattr(_FakeProcessManager, "release", release)
+    publish_exit = launch.resources._terminal_exit_publisher
+    assert publish_exit is not None
+    publish_exit(
+        TerminalExitEvent(
+            session_id=_SESSION,
+            terminal_id="terminal_claude_main",
+            terminal_name="claude",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            command="env",
+            last_output="Pane is dead (signal 9, Thu Jan  1 00:00:00 2026)",
+            lifecycle_context={"terminal_exit_signal": "SIGKILL"},
+        )
+    )
+    await asyncio.wait_for(released.wait(), timeout=2)
+    [row] = _rows(caplog, "required_terminal_exited")
+    assert row["attributes"]["error_category"] == "user"
+    [error] = [
+        event["error"]
+        for event in _drain_session_event_queue(_session_event_queues_ref.get(_SESSION))
+        if event.get("status") == "failed"
+    ]
+    assert error["title"] == "The agent was force-killed outside Omnigent"
+    assert "command: env (killed by SIGKILL)" in error["message"]
+
+
 async def test_old_terminal_exit_does_not_read_replacement_hook_evidence(
     launch: _Launch,
     tmp_path: Path,

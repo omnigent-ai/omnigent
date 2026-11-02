@@ -1863,9 +1863,12 @@ def create_runner_app(
                 "Required terminal exited unexpectedly; the session runtime is no longer "
                 "available."
             )
-        exited_with = (
-            f" (exited with status {event.exit_status})" if event.exit_status is not None else ""
-        )
+        exited_with = ""
+        exit_signal = event.lifecycle_context.get("terminal_exit_signal")
+        if event.exit_status is not None:
+            exited_with = f" (exited with status {event.exit_status})"
+        elif exit_signal:
+            exited_with = f" (killed by {exit_signal})"
         parts.extend(
             [
                 "",
@@ -2025,6 +2028,7 @@ def create_runner_app(
             command=event.command,
             exit_status=event.exit_status,
             output=event.last_output,
+            exit_signal=event.lifecycle_context.get("terminal_exit_signal"),
         )
         if diagnosis is None and event.closed_outside_omnigent:
             diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
