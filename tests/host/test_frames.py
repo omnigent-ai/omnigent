@@ -18,6 +18,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
@@ -1196,10 +1197,30 @@ def test_harness_readiness_frame_round_trip() -> None:
             status="ok",
             configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
         ),
+        HostInstallHarnessResultFrame(
+            request_id="install-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostHarnessLoginCompletedFrame(
+            login_id="login-1",
+            success=True,
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostHarnessLogoutResultFrame(
+            request_id="logout-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostStoreSecretResultFrame(
+            request_id="secret-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
     ],
 )
 def test_unresponsive_cli_readiness_stays_decodable_by_older_servers(
-    frame: HostHelloFrame | HostHarnessReadinessFrame | HostRefreshHarnessesResultFrame,
+    frame: HostFrame,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An older server still applies the other harnesses' readiness in the same update."""

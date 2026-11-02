@@ -3156,15 +3156,15 @@ export function NewChatLandingScreen() {
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings. A CLI that
   // missed its version check still launches, so its catalog stays loadable.
-  const canLoadHostModels = (harness: string) => {
+  const hostModelsBlocked = (harness: string) => {
     const unavailableReason = harnessUnavailableReasonOnHost(harness, selectedHost);
-    return (
-      selectedNativeHarness === harness &&
-      hostSelected &&
-      selectedHost?.status === "online" &&
-      (unavailableReason === null || unavailableReason === "cli-unresponsive")
-    );
+    return unavailableReason !== null && unavailableReason !== "cli-unresponsive";
   };
+  const canLoadHostModels = (harness: string) =>
+    selectedNativeHarness === harness &&
+    hostSelected &&
+    selectedHost?.status === "online" &&
+    !hostModelsBlocked(harness);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -3207,7 +3207,7 @@ export function NewChatLandingScreen() {
     (selectedNativeHarness !== harness ||
     loading ||
     hostReadinessPending ||
-    harnessUnconfiguredOnHost(harness, selectedHost) ||
+    hostModelsBlocked(harness) ||
     selectedHostId === null
       ? cached
       : undefined);
