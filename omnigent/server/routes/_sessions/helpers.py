@@ -10301,6 +10301,54 @@ async def _remove_session_worktree_best_effort(
     return False
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_failed_launch_restores: set[asyncio.Task[None]] = set()
+
+
+async def _restore_failed_launch_binding(
+    conversation_store: ConversationStore,
+    previous: Conversation,
+    detach: asyncio.Task[Conversation],
+) -> None:
+    """
+    Restore a failed launch's binding once its detach has committed.
+
+    :param conversation_store: Store holding the session row.
+    :param previous: The session row read before the detach.
+    :param detach: The pending or finished detach of that row.
+    """
+    try:
+        detached = await detach
+    except Exception:  # noqa: BLE001 — the cleanup that started the detach reports it
+        return
+    if detached.runner_id is not None or detached.host_id is not None:
+        return
+    try:
+        restored = await asyncio.to_thread(
+            conversation_store.rollback_runner_reassignment,
+            previous,
+            expected_runner_id=None,
+            expected_host_id=None,
+        )
+    except Exception:  # noqa: BLE001 — may run detached from a cancelled request
+        _logger.warning(
+            "Could not restore session %s after keeping worktree %s on host %s",
+            previous.id,
+            previous.workspace,
+            previous.host_id,
+            exc_info=True,
+        )
+        return
+    if not restored:
+        _logger.warning(
+            "Session %s was rebound or lost its host while worktree %s on host %s "
+            "was kept; remove it manually",
+            previous.id,
+            previous.workspace,
+            previous.host_id,
+        )
+
+
 async def _remove_failed_launch_worktree(
     *,
     conversation_store: ConversationStore,
@@ -10341,17 +10389,20 @@ async def _remove_failed_launch_worktree(
                 or (fingerprint := conv.labels.get(WORKTREE_ROOT_LABEL_KEY)) is None
             ):
                 return None
-            detached = await asyncio.to_thread(
-                conversation_store.clear_host_binding,
-                session_id,
-                expected_host_id=conv.host_id,
-                expected_runner_id=runner_id,
-                clear_profile=True,
+            detach = asyncio.create_task(
+                asyncio.to_thread(
+                    conversation_store.clear_host_binding,
+                    session_id,
+                    expected_host_id=conv.host_id,
+                    expected_runner_id=runner_id,
+                    clear_profile=True,
+                )
             )
-            if detached.runner_id is not None or detached.host_id is not None:
-                return None
             removed = False
             try:
+                detached = await asyncio.shield(detach)
+                if detached.runner_id is not None or detached.host_id is not None:
+                    return None
                 removed = await _remove_session_worktree_best_effort(
                     host_id=conv.host_id,
                     worktree_path=conv.workspace,
@@ -10364,19 +10415,14 @@ async def _remove_failed_launch_worktree(
                     expected_root_fingerprint=fingerprint,
                 )
             finally:
-                if not removed and not await asyncio.to_thread(
-                    conversation_store.rollback_runner_reassignment,
-                    conv,
-                    expected_runner_id=None,
-                    expected_host_id=None,
-                ):
-                    _logger.warning(
-                        "Session %s was rebound or lost its host while worktree %s on host %s "
-                        "was kept; remove it manually",
-                        session_id,
-                        conv.workspace,
-                        conv.host_id,
+                if not removed:
+                    # A cancelled request must not leave the detach committed and unrestored.
+                    restore = asyncio.create_task(
+                        _restore_failed_launch_binding(conversation_store, conv, detach)
                     )
+                    _failed_launch_restores.add(restore)
+                    restore.add_done_callback(_failed_launch_restores.discard)
+                    await asyncio.shield(restore)
             if not removed:
                 return None
             try:

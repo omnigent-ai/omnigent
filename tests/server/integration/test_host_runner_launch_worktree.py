@@ -662,6 +662,74 @@ async def test_inline_create_keeps_binding_when_worktree_removal_fails(
     assert WORKTREE_ROOT_LABEL_KEY in conv.labels
 
 
+async def test_inline_create_cancelled_while_detaching_restores_the_binding(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create cancelled mid-detach restores the binding after the detach commits."""
+    detach_started = threading.Event()
+    release_detach = threading.Event()
+    detach_finished = threading.Event()
+    restore_finished = threading.Event()
+    restored_after_detach: list[bool] = []
+    original_clear = SqlAlchemyConversationStore.clear_host_binding
+    original_rollback = SqlAlchemyConversationStore.rollback_runner_reassignment
+
+    def _gated_clear(*args: Any, **kwargs: Any) -> Any:
+        detach_started.set()
+        assert release_detach.wait(timeout=budget(2.0))
+        try:
+            return original_clear(*args, **kwargs)
+        finally:
+            detach_finished.set()
+
+    def _recorded_rollback(*args: Any, **kwargs: Any) -> Any:
+        restored_after_detach.append(detach_finished.is_set())
+        try:
+            return original_rollback(*args, **kwargs)
+        finally:
+            restore_finished.set()
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "clear_host_binding", _gated_clear)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "rollback_runner_reassignment", _recorded_rollback
+    )
+    cap = register_host(launch_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-detach-cancel-agent")
+    create = asyncio.create_task(
+        client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": _SOURCE_REPO,
+                "git": {"branch_name": "feature/leak"},
+            },
+        )
+    )
+    assert await asyncio.to_thread(detach_started.wait, budget(2.0))
+    create.cancel()
+    release_detach.set()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await create
+    assert await asyncio.to_thread(detach_finished.wait, budget(2.0))
+    await asyncio.to_thread(restore_finished.wait, budget(2.0))
+
+    assert cap.remove == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(cap.launch[0].session_id)
+    assert conv is not None
+    assert conv.runner_id is not None
+    assert (conv.host_id, conv.workspace, conv.git_branch) == (
+        _HOST_ID,
+        f"{_SOURCE_REPO}-worktrees/feature-leak",
+        "feature/leak",
+    )
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+    assert restored_after_detach == [True]
+
+
 @pytest.mark.parametrize("launch_outcome", ["timeout", "send_error"])
 async def test_inline_create_keeps_new_worktree_when_launch_outcome_is_unknown(
     register_host: RegisterHost,
@@ -814,15 +882,19 @@ async def test_inline_create_keeps_worktree_another_session_attached_to(
     assert (other_conv.host_id, other_conv.workspace) == (_HOST_ID, root)
 
 
+@contextlib.asynccontextmanager
 async def _create_with_held_removal(
     client: httpx.AsyncClient,
     cap: _HostCapture,
     monkeypatch: pytest.MonkeyPatch,
     store: SqlAlchemyConversationStore,
-) -> tuple[asyncio.Task[httpx.Response], Conversation]:
-    """Start a git create whose launch fails; return once its worktree removal is in flight.
+    remove_gate: asyncio.Event,
+) -> AsyncIterator[tuple[asyncio.Task[httpx.Response], Conversation]]:
+    """Start a git create whose launch fails; yield once its worktree removal is in flight.
 
-    :returns: The pending create request and the session row read before cleanup began.
+    On exit the removal gate is released and the create request is settled.
+
+    :yields: The pending create request and the session row read before cleanup began.
     """
     before_cleanup: list[Conversation] = []
     remove_failed_launch_worktree = routes_core._remove_failed_launch_worktree
@@ -846,8 +918,13 @@ async def _create_with_held_removal(
             },
         )
     )
-    await asyncio.wait_for(cap.remove_started.wait(), timeout=budget(5.0))
-    return create, before_cleanup[0]
+    try:
+        await asyncio.wait_for(cap.remove_started.wait(), timeout=budget(5.0))
+        yield create, before_cleanup[0]
+    finally:
+        remove_gate.set()
+        with contextlib.suppress(Exception):
+            _ = await asyncio.wait_for(create, timeout=budget(5.0))
 
 
 @pytest.mark.parametrize("remove_status", ["ok", "failed"])
@@ -867,7 +944,6 @@ async def test_inline_create_cleanup_does_not_hand_its_worktree_to_a_rebound_run
     )
     register_test_runner(app, "runner_replacement", owner=RESERVED_USER_LOCAL)
     store = SqlAlchemyConversationStore(db_uri)
-    create, before_cleanup = await _create_with_held_removal(client, cap, monkeypatch, store)
     initialized: list[dict[str, Any]] = []
 
     async def _initialize_runner(path: str, *, json: dict[str, Any], **kwargs: Any) -> object:
@@ -878,18 +954,22 @@ async def test_inline_create_cleanup_does_not_hand_its_worktree_to_a_rebound_run
             request=httpx.Request("POST", "http://runner/v1/sessions"),
         )
 
-    monkeypatch.setattr(
-        sessions_routes,
-        "_get_runner_client",
-        AsyncMock(return_value=SimpleNamespace(post=_initialize_runner)),
-    )
-    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", AsyncMock())
+    async with _create_with_held_removal(client, cap, monkeypatch, store, remove_gate) as (
+        create,
+        before_cleanup,
+    ):
+        monkeypatch.setattr(
+            sessions_routes,
+            "_get_runner_client",
+            AsyncMock(return_value=SimpleNamespace(post=_initialize_runner)),
+        )
+        monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", AsyncMock())
 
-    patched = await client.patch(
-        f"/v1/sessions/{before_cleanup.id}", json={"runner_id": "runner_replacement"}
-    )
-    remove_gate.set()
-    resp = await create
+        patched = await client.patch(
+            f"/v1/sessions/{before_cleanup.id}", json={"runner_id": "runner_replacement"}
+        )
+        remove_gate.set()
+        resp = await create
 
     assert patched.status_code == 200, patched.text
     assert resp.status_code == 201, resp.text
@@ -927,11 +1007,13 @@ async def test_inline_create_cleanup_does_not_relink_a_host_deleted_during_remov
     remove_gate = asyncio.Event()
     cap = register_host(launch_status="failed", remove_status="failed", remove_gate=remove_gate)
     store = SqlAlchemyConversationStore(db_uri)
-    create, before_cleanup = await _create_with_held_removal(client, cap, monkeypatch, store)
-
-    assert HostStore(db_uri).delete_host(_HOST_ID) is not None
-    remove_gate.set()
-    resp = await create
+    async with _create_with_held_removal(client, cap, monkeypatch, store, remove_gate) as (
+        create,
+        before_cleanup,
+    ):
+        assert HostStore(db_uri).delete_host(_HOST_ID) is not None
+        remove_gate.set()
+        resp = await create
 
     assert resp.status_code == 201, resp.text
     assert len(cap.remove) == 1
@@ -993,20 +1075,25 @@ async def test_inline_create_cleanup_refuses_a_relaunch_queued_behind_it(
     remove_gate = asyncio.Event()
     cap = register_host(launch_status="failed", remove_gate=remove_gate)
     store = SqlAlchemyConversationStore(db_uri)
-    create, before_cleanup = await _create_with_held_removal(client, cap, monkeypatch, store)
     host_registry = app.state.host_registry
-
-    relaunch = asyncio.create_task(
-        sessions_routes._launch_runner_on_host(
-            before_cleanup, store, host_registry, host_registry.get(_HOST_ID)
+    async with _create_with_held_removal(client, cap, monkeypatch, store, remove_gate) as (
+        create,
+        before_cleanup,
+    ):
+        relaunch = asyncio.create_task(
+            sessions_routes._launch_runner_on_host(
+                before_cleanup, store, host_registry, host_registry.get(_HOST_ID)
+            )
         )
-    )
-    await asyncio.sleep(0)
-    assert not relaunch.done()
-    remove_gate.set()
-    resp = await create
-    with pytest.raises(OmnigentError, match="no longer bound to this host"):
-        await relaunch
+        try:
+            await asyncio.sleep(0)
+            assert not relaunch.done()
+            remove_gate.set()
+            resp = await create
+            with pytest.raises(OmnigentError, match="no longer bound to this host"):
+                await relaunch
+        finally:
+            relaunch.cancel()
 
     assert resp.status_code == 201, resp.text
     assert len(cap.remove) == 1

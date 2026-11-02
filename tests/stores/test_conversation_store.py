@@ -9067,6 +9067,8 @@ def test_clear_host_binding_requires_the_expected_host_and_runner(
 def test_detach_rollback_restores_only_a_live_host(
     conversation_store: SqlAlchemyConversationStore, db_uri: str, host_state: str
 ) -> None:
+    from omnigent.db.utils import now_epoch
+
     host_id = uuid.uuid4().hex
     hosts = HostStore(db_uri)
     if host_state == "tombstoned":
@@ -9077,7 +9079,7 @@ def test_detach_rollback_restores_only_a_live_host(
             token="launch-token",
             provider="modal",
             sandbox_id="sb-detach",
-            token_expires_at=4_102_444_800,
+            token_expires_at=now_epoch() + 3600,
         )
     else:
         _register_host(db_uri, host_id)
