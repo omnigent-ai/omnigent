@@ -234,7 +234,7 @@ def _find_codex_cli() -> str | None:
     spec = harness_install_spec(OPENAI_FAMILY)
     if spec is None:
         return None
-    return resolve_cli_binary(spec.binary)
+    return resolve_cli_binary(spec.binary, env_var="OMNIGENT_CODEX_PATH")
 
 
 def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
