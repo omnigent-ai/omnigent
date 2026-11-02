@@ -258,6 +258,11 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
         profile,
     )?);
 
+    let web = if args.no_vite {
+        None
+    } else {
+        Some(process::WebCommands::resolve(&pod)?)
+    };
     let shared = Shared::new(&pod);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
@@ -272,12 +277,7 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     )?;
 
     // Supervisor runs on the tokio runtime; the TUI drives it via cmd_tx.
-    let supervisor = Supervisor::new(
-        pod.clone(),
-        shared.clone(),
-        !args.no_vite,
-        args.trust_lan_origins,
-    );
+    let supervisor = Supervisor::new(pod.clone(), shared.clone(), web, args.trust_lan_origins);
     let sup_handle = tokio::spawn(supervisor.run(cmd_rx));
 
     // Run the TUI (owns the terminal) until the user quits.
