@@ -320,7 +320,11 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
         <MessageResponse mode={mode}>{markdown}</MessageResponse>
       </MermaidFullscreenProvider>
     );
-    const { container, rerender } = render(reply("streaming"), { container: root });
+    // The app renders under StrictMode, which replays mount effects.
+    const { container, rerender } = render(reply("streaming"), {
+      container: root,
+      reactStrictMode: true,
+    });
     const streamedBlock = container.querySelector(".chat-mermaid")!;
     expect(streamedBlock.querySelector('svg[id^="mermaid-"]')).toBeNull();
     fireEvent.click(screen.getByTitle("View fullscreen"));
@@ -389,6 +393,17 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     await draw("settled", "a");
     const exit = screen.queryByTitle("Exit fullscreen");
     expect(exit?.parentElement?.querySelector('svg[id^="mermaid-"]')?.id).toBe(shownId);
+  });
+
+  it("drops a waiting click when its block unmounts without a replacement", async () => {
+    const { rerender } = render(reply("clicked", "flowchart LR; A-->B"));
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    rerender(<MermaidFullscreenProvider resetKey="/sessions/a">{null}</MermaidFullscreenProvider>);
+    await act(async () => {});
+
+    rerender(reply("later", "flowchart LR; A-->B"));
+    await draw("later", "a");
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
   });
 
   it("keeps the original wait after a remount", async () => {

@@ -68,6 +68,7 @@ interface MermaidFullscreenControls {
   open: (block: HTMLElement, source: string) => void;
   close: () => void;
   track: (block: HTMLElement, source: string) => void;
+  release: (block: HTMLElement) => void;
 }
 
 interface PendingOpen {
@@ -106,6 +107,12 @@ function useMermaidFullscreenState(resetKey?: string) {
       return current.block === block || replaced ? { ...current, block, source } : current;
     });
   }, []);
+  // Deferred past the commit's mount effects: only a same-commit replacement keeps the wait.
+  const release = useCallback((block: HTMLElement) => {
+    queueMicrotask(() =>
+      setPending((current) => (current?.block === block && !block.isConnected ? null : current)),
+    );
+  }, []);
 
   const pendingBlock = pending?.block ?? null;
   const deadline = pending?.deadline ?? 0;
@@ -137,7 +144,7 @@ function useMermaidFullscreenState(resetKey?: string) {
     return () => window.removeEventListener("keydown", onKey);
   }, [active, close]);
 
-  return { svgMarkup, open, close, track };
+  return { svgMarkup, open, close, track, release };
 }
 
 function MermaidFullscreenOverlay({
@@ -196,8 +203,10 @@ export function MermaidFullscreenProvider({
   resetKey: string;
 }) {
   const themeMode = useResolvedThemeMode();
-  const { svgMarkup, open, close, track } = useMermaidFullscreenState(`${resetKey}:${themeMode}`);
-  const controls = useMemo(() => ({ open, close, track }), [open, close, track]);
+  const { svgMarkup, open, close, track, release } = useMermaidFullscreenState(
+    `${resetKey}:${themeMode}`,
+  );
+  const controls = useMemo(() => ({ open, close, track, release }), [open, close, track, release]);
   return (
     <MermaidFullscreenContext.Provider value={controls}>
       {children}
@@ -216,11 +225,17 @@ function MermaidFullscreen({
 }) {
   const shared = useContext(MermaidFullscreenContext);
   const local = useMermaidFullscreenState();
-  const { open, track } = shared ?? local;
+  const { open, track, release } = shared ?? local;
 
   useEffect(() => {
     if (blockRef.current) track(blockRef.current, source);
   }, [blockRef, source, track]);
+  useEffect(() => {
+    const block = blockRef.current;
+    return () => {
+      if (block) release(block);
+    };
+  }, [blockRef, release]);
 
   return (
     <>
