@@ -120,6 +120,18 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
     )
 
 
+@pytest.mark.parametrize("info", [None, "unauthorized", {"httpStatusCode": 403}])
+def test_retired_model_service_does_not_suggest_login(info: object) -> None:
+    message = (
+        "unexpected status 403 Forbidden: 'databricks-gpt-5-6-luna' is no longer available. "
+        "Use Unity Catalog model services."
+    )
+    assert (
+        fwd._classify_codex_error({"codexErrorInfo": info}, message)
+        == fwd._CODEX_ERROR_KIND_GENERIC
+    )
+
+
 @pytest.mark.parametrize(
     "request_id",
     [

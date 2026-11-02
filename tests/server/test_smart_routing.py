@@ -831,12 +831,7 @@ async def test_external_routing_client_sends_snake_case_and_parses() -> None:
 
 @pytest.mark.asyncio
 async def test_external_routing_client_roundtrips_provider_prefix() -> None:
-    """Send bare ids out; recover the exact catalog id from the bare answer.
-
-    A Databricks catalog carries a ``databricks-`` prefix the router doesn't
-    want, so we send bare ids and map the router's (bare) pick back to the
-    local prefixed id the runner needs.
-    """
+    """The gateway receives and returns the catalog's exact model-service ID."""
     import httpx
 
     from omnigent.server.smart_routing import ExternalRoutingClient
@@ -845,10 +840,10 @@ async def test_external_routing_client_roundtrips_provider_prefix() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
-        # Router echoes the bare id it was given.
+        # Router echoes the workspace id it was given.
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+            json={"route_selection": [{"route_option": {"model": "databricks-claude-opus-4-8"}}]},
         )
 
     client = ExternalRoutingClient(
@@ -859,19 +854,17 @@ async def test_external_routing_client_roundtrips_provider_prefix() -> None:
             "hi", {"self": ["databricks-claude-opus-4-8", "databricks-gpt-5-5"]}
         )
 
-    # Outbound: configured prefix stripped for the router's vocabulary.
     assert captured["body"]["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "self"},
-        {"model": "gpt-5-5", "harness": "self"},
+        {"model": "databricks-claude-opus-4-8", "harness": "self"},
+        {"model": "databricks-gpt-5-5", "harness": "self"},
     ]
-    # Inbound: mapped back to the local (prefixed) catalog id.
     assert result is not None
     assert result.model == "databricks-claude-opus-4-8"
 
 
 @pytest.mark.asyncio
-async def test_external_routing_client_strips_first_matching_prefix() -> None:
-    """With multiple prefixes, the first matching one is stripped per id."""
+async def test_external_routing_client_preserves_distinct_catalog_prefixes() -> None:
+    """Configured prefixes do not rewrite catalog-only route options."""
     import httpx
 
     from omnigent.server.smart_routing import ExternalRoutingClient
@@ -882,7 +875,7 @@ async def test_external_routing_client_strips_first_matching_prefix() -> None:
         captured["body"] = json.loads(request.content)
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+            json={"route_selection": [{"route_option": {"model": "databricks-claude-opus-4-8"}}]},
         )
 
     client = ExternalRoutingClient(
@@ -895,10 +888,9 @@ async def test_external_routing_client_strips_first_matching_prefix() -> None:
             "hi", {"self": ["databricks-claude-opus-4-8", "system.ai.claude-sonnet-5"]}
         )
 
-    # Each id has its own matching prefix stripped.
     assert captured["body"]["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "self"},
-        {"model": "claude-sonnet-5", "harness": "self"},
+        {"model": "databricks-claude-opus-4-8", "harness": "self"},
+        {"model": "system.ai.claude-sonnet-5", "harness": "self"},
     ]
     assert result is not None
     assert result.model == "databricks-claude-opus-4-8"
@@ -906,12 +898,7 @@ async def test_external_routing_client_strips_first_matching_prefix() -> None:
 
 @pytest.mark.asyncio
 async def test_external_routing_client_maps_back_by_harness() -> None:
-    """The same bare id under two harnesses maps back to distinct local ids.
-
-    A Databricks-authed harness carries the ``databricks-`` prefix while a
-    subscription harness (e.g. Codex) uses the bare id; both reduce to the
-    same router id, so the (harness, router-id) key keeps them distinct.
-    """
+    """Gateway and subscription spellings retain their catalog harness."""
     import httpx
 
     from omnigent.server.smart_routing import ExternalRoutingClient
@@ -935,21 +922,18 @@ async def test_external_routing_client_maps_back_by_harness() -> None:
             {"pi": ["databricks-gpt-5-5"], "codex": ["gpt-5-5"]},
         )
 
-    # Both harnesses reduce to router id "gpt-5-5"; the pick maps back to the
-    # codex local id, not pi's prefixed one.
+    assert captured["body"]["route_options"] == [
+        {"model": "databricks-gpt-5-5", "harness": "codex"},
+        {"model": "gpt-5-5", "harness": "codex"},
+    ]
     assert result is not None
     assert result.model == "gpt-5-5"
     assert result.harness == "codex"
 
 
 @pytest.mark.asyncio
-async def test_external_routing_client_strips_the_default_prefixes() -> None:
-    """Unconfigured, the client still speaks the one shared prefix list.
-
-    The server-side seam and the client must agree about which prefixes a
-    catalog id carries; a client left on an empty list is exactly the
-    double-resolution downgrade. Ids carrying no known prefix pass through.
-    """
+async def test_external_routing_client_preserves_the_default_prefixes() -> None:
+    """Default prefix configuration also preserves exact catalog IDs."""
     import httpx
 
     from omnigent.server.smart_routing import ExternalRoutingClient
@@ -960,7 +944,7 @@ async def test_external_routing_client_strips_the_default_prefixes() -> None:
         captured["body"] = json.loads(request.content)
         return httpx.Response(
             200,
-            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+            json={"route_selection": [{"route_option": {"model": "databricks-claude-opus-4-8"}}]},
         )
 
     client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
@@ -968,10 +952,9 @@ async def test_external_routing_client_strips_the_default_prefixes() -> None:
         result = await client.route("hi", {"self": ["databricks-claude-opus-4-8", "gpt-5-5"]})
 
     assert captured["body"]["route_options"] == [
-        {"model": "claude-opus-4-8", "harness": "self"},
+        {"model": "databricks-claude-opus-4-8", "harness": "self"},
         {"model": "gpt-5-5", "harness": "self"},
     ]
-    # Restored to the exact catalog id the runner needs.
     assert result is not None
     assert result.model == "databricks-claude-opus-4-8"
 
@@ -1930,10 +1913,10 @@ _CLAUDE_CATALOG_ONLY = {"claude-sdk": ["databricks-claude-haiku-4-5"]}
         (
             "task_v0",
             _CODEX_CATALOG_ONLY,
-            {"model": "gpt-5-4", "harness": "codex"},
+            {"model": "databricks-gpt-5-4", "harness": "codex"},
             (),
             (),
-            ["gpt-5-4"],
+            ["databricks-gpt-5-4"],
             None,
             True,
         ),
@@ -2123,7 +2106,7 @@ def test_route_option_source_offers_only_the_catalog_for_another_router() -> Non
 
     source = TaskV1RouteOptionSource(router_name="task_v9")
     options = source.build_route_options(["codex"], {"codex": ["databricks-gpt-5-4"]})
-    assert [o.model for o in options] == ["gpt-5-4"]
+    assert [o.model for o in options] == ["databricks-gpt-5-4"]
 
 
 def test_build_route_options_sends_canonical_harness_names() -> None:
@@ -2138,9 +2121,9 @@ def test_build_route_options_sends_canonical_harness_names() -> None:
         },
     )
     assert [(o.model, o.harness) for o in options] == [
-        ("glm-5-3", "codex"),
-        ("claude-sonnet-5", "claude"),
-        ("claude-opus-4-8", "claude"),
+        ("system.ai.glm-5-3", "codex"),
+        ("system.ai.claude-sonnet-5", "claude"),
+        ("databricks-claude-opus-4-8", "claude"),
     ]
 
 
@@ -2159,8 +2142,8 @@ def test_pi_options_are_tagged_by_the_models_own_family() -> None:
         ["pi"], {"pi": ["databricks-claude-sonnet-5", "databricks-gpt-5-5"]}
     )
     assert [(o.model, o.harness) for o in options] == [
-        ("claude-sonnet-5", "claude"),
-        ("gpt-5-5", "codex"),
+        ("databricks-claude-sonnet-5", "claude"),
+        ("databricks-gpt-5-5", "codex"),
     ]
 
 
@@ -2169,6 +2152,39 @@ def test_a_harness_with_no_known_family_keeps_its_tag() -> None:
     source = TaskV1RouteOptionSource(router_name="task_v3")
     options = source.build_route_options(["self"], {"self": ["acme-model"]})
     assert [o.harness for o in options] == ["self"]
+
+
+@pytest.mark.parametrize(
+    "pick",
+    [
+        "workspace.ai.glm-5-2",
+        "system.ai.gpt-5-6-luna",
+        "team.models.assistant",
+        "glm-5-2",
+        "system.ai.glm-5-2",
+        "databricks-gpt-5-6-luna",
+        "gpt-5-6-luna",
+    ],
+)
+def test_catalog_router_preserves_exact_service_ids(pick: str) -> None:
+    from omnigent.server.smart_routing import RoutePick
+
+    models = ["workspace.ai.glm-5-2", "system.ai.gpt-5-6-luna", "team.models.assistant"]
+    catalog = {"codex-native": [*models, models[0]]}
+    source = TaskV1RouteOptionSource(
+        router_name="task_v3", model_prefixes=("system.ai.", "workspace.ai.")
+    )
+    options = source.build_route_options(list(catalog), catalog)
+    assert [option.model for option in options] == models
+    resolved = source.resolve_selection(
+        RoutePick(model=pick, harness="claude"), list(catalog), catalog
+    )
+    if pick in models:
+        assert resolved is not None
+        assert resolved.model == resolved.raw_model == pick
+        assert resolved.harness == "codex-native"
+    else:
+        assert resolved is None
 
 
 def test_route_option_source_rejects_never_offered_pick() -> None:
@@ -2424,7 +2440,7 @@ def test_an_unconfigured_menu_stays_off_for_a_router_other_than_task_v1() -> Non
     options = route_option_source(settings).build_route_options(
         ["codex"], {"codex": ["databricks-gpt-5-4"]}
     )
-    assert [o.model for o in options] == ["gpt-5-4"]
+    assert [o.model for o in options] == ["databricks-gpt-5-4"]
 
 
 def test_an_empty_configured_menu_means_no_arms() -> None:
@@ -2435,7 +2451,7 @@ def test_an_empty_configured_menu_means_no_arms() -> None:
     options = route_option_source(settings).build_route_options(
         ["codex"], {"codex": ["databricks-gpt-5-4"]}
     )
-    assert [o.model for o in options] == ["gpt-5-4"]
+    assert [o.model for o in options] == ["databricks-gpt-5-4"]
 
 
 def test_a_configured_alias_maps_a_pick_onto_the_served_spelling() -> None:
@@ -3090,6 +3106,50 @@ async def test_route_turn_skips_the_static_table_off_gateway_but_takes_the_catal
     assert model == "claude-sonnet-4-6"
     assert verdict is not None
     assert local.offered == [{"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8"]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("models", [[], ["team.models.assistant"], ["system.ai.claude-sonnet-5"]])
+@pytest.mark.parametrize("from_runner", [False, True])
+async def test_route_turn_does_not_replace_an_unusable_catalog(
+    models: list[str], from_runner: bool
+) -> None:
+    router = FakeRoutingClient(RoutingResult(model="system.ai.gpt-5-6-luna", rationale="fast"))
+    runner = _counting_catalog_client(models)
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=router)):
+        result = await route_turn(
+            "codex-native",
+            "hello",
+            session_id="conv_catalog",
+            runner_client=runner,
+            catalog=None if from_runner else models,
+        )
+    assert result == (None, None)
+    assert router.offered == []
+    assert runner.get.await_count == int(from_runner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pick", ["workspace.ai.glm-5-2", "system.ai.glm-5-2", "glm-5-2"])
+async def test_route_turn_preserves_an_exact_custom_service_pick(pick: str) -> None:
+    from omnigent.server.smart_routing import RoutingSettings
+
+    selected = "workspace.ai.glm-5-2"
+    router = FakeRoutingClient(RoutingResult(model=pick, rationale="custom service"))
+    caps = FakeCaps(
+        routing_client=router,
+        routing_settings=RoutingSettings(
+            router_name="task_v3", model_prefixes=("system.ai.", "workspace.ai.")
+        ),
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn("codex-native", "hello", catalog=[selected])
+    if pick == selected:
+        assert model == selected
+        assert verdict is not None and verdict["model"] == selected
+    else:
+        assert (model, verdict) == (None, None)
+    assert router.offered == [{"codex-native": [selected]}]
 
 
 @pytest.mark.asyncio
