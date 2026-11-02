@@ -167,7 +167,11 @@ the header menu), and each place is a separate entry point.
   existing sessions fixed as updates arrive, with new sessions at the top and
   older sessions added by Load more at the bottom. It retains Created/Updated
   for fetching pages. Equal timestamps do not lift history above the saved order.
+  Unmoved new arrivals follow creation order, including after reload.
   Deleting a session removes its saved position; paging or collapsing folders preserves it.
+  Untouched history loaded later stays fixed in the current tab; moving across it
+  saves the order through that position. After reload, the untouched tail uses
+  the saved Created/Updated base order.
   Choosing an automatic order preserves the saved Custom
   order for later. Drag within a group, or use a row's Move up/down menu actions,
   to switch to Custom. Hover marks valid reorder targets with a faint brand-colored
@@ -1051,6 +1055,8 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - Sidebar view changes still work if browser storage is full or blocked, but
   unsaved changes are lost on reload.
+- Each tab keeps its own sidebar view. Another tab's saved preferences take
+  effect on reload, rather than changing a list during an interaction.
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new

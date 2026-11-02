@@ -15,6 +15,7 @@ import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   readSidebarViewPreferences,
   removeSidebarCustomOrderIds,
+  resetSidebarViewPreferencesForTests,
   writeSidebarViewPreferences,
   DEFAULT_SIDEBAR_VIEW,
 } from "@/lib/sidebarViewPreferences";
@@ -76,6 +77,15 @@ function wrapper({ children }: { children: ReactNode }) {
     </QueryClientProvider>
   );
 }
+function WriteOnMount({ children }: { children: ReactNode }) {
+  useLayoutEffect(() => {
+    writeSidebarViewPreferences({ ...DEFAULT_SIDEBAR_VIEW, grouping: "harness" });
+  }, []);
+  return children;
+}
+function writeOnMountWrapper({ children }: { children: ReactNode }) {
+  return wrapper({ children: <WriteOnMount>{children}</WriteOnMount> });
+}
 const params = (url: string) => new URL(url, "http://localhost").searchParams;
 const listCalls = (scope: string) =>
   fetchMock.mock.calls.filter(
@@ -88,6 +98,7 @@ const response = (rows: Conversation[], more = false) => ({
 beforeEach(() => {
   groupingUi = false;
   localStorage.clear();
+  resetSidebarViewPreferencesForTests();
   identity.viewerId = null;
   identity.resolution = Promise.resolve(null);
   view = "mine";
@@ -674,15 +685,7 @@ it.each(["created", "updated"] as const)(
 
 it("observes a preference write between render and subscription", async () => {
   groupingUi = true;
-  function WriteOnMount({ children }: { children: ReactNode }) {
-    useLayoutEffect(() => {
-      writeSidebarViewPreferences({ ...DEFAULT_SIDEBAR_VIEW, grouping: "harness" });
-    }, []);
-    return children;
-  }
-  const { result } = renderHook(useSidebarData, {
-    wrapper: ({ children }) => wrapper({ children: <WriteOnMount>{children}</WriteOnMount> }),
-  });
+  const { result } = renderHook(useSidebarData, { wrapper: writeOnMountWrapper });
   await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
   expect(result.current.view.grouping).toBe("harness");
 });

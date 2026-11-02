@@ -1969,6 +1969,7 @@ function ConversationList({
     project: string | null;
     isPinned: boolean;
     canGrid: boolean;
+    canManage: boolean;
   } | null>(null);
   const { mutateAsync: pinAt } = useTogglePinnedConversation();
   // Pin writes don't overlap (the hooks refuse one while another saves), so the
@@ -2070,18 +2071,14 @@ function ConversationList({
   // the longer-lived selection reports from collapsed folders.
   const orderingRows = useMemo(
     () =>
-      sortConversations(
-        dedupeConversationsById([...allConversations, ...allLoadedRows]).filter(
-          (row) => !row.provisional,
-        ),
-        activeOverride,
-        frozenKeys,
-        sortBy,
+      dedupeConversationsById([...allConversations, ...allLoadedRows]).filter(
+        (row) => !row.provisional,
       ),
-    [allConversations, allLoadedRows, activeOverride, frozenKeys, sortBy],
+    [allConversations, allLoadedRows],
   );
   const observedOrderIds = useRef<ReadonlySet<string> | null>(null);
-  if (observedOrderIds.current === null) observedOrderIds.current = new Set(view.customOrder?.ids);
+  if (observedOrderIds.current === null)
+    observedOrderIds.current = new Set(view.customOrder?.capturedIds ?? view.customOrder?.ids);
   const updateView = useStableCallback(
     (patch: Partial<SidebarViewPreferences>, move?: { fromId: string; toId: string }) => {
       if (patch.grouping !== undefined && patch.grouping !== view.grouping && selectionMode) {
@@ -2089,27 +2086,40 @@ function ConversationList({
       }
       saveView((current) => {
         let order = current.customOrder;
-        if (order || patch.ordering === "custom") {
+        if ((patch.ordering ?? current.ordering) === "custom") {
           const fromAutomatic = move && current.ordering !== "custom";
-          const saved = fromAutomatic ? new Set(order?.ids) : undefined;
-          // An observed ID missing from the saved order was pruned. Only a later
+          const saved = fromAutomatic ? new Set(order?.capturedIds ?? order?.ids) : undefined;
+          // An observed ID missing from the captured order was pruned. Only a later
           // departure and re-entry may add it again, never a stale folder response.
           const arrivals = orderingRows.filter(
             (row) => !observedOrderIds.current!.has(row.id) || !order || saved?.has(row.id),
           );
+          order = (!fromAutomatic && order) || {
+            baseOrdering: sidebarBaseOrdering(current),
+            ids: [],
+            startedAt: 0,
+          };
           order = extendSidebarCustomOrder(
-            (!fromAutomatic && order) || {
-              baseOrdering: sidebarBaseOrdering(current),
-              ids: [],
-              startedAt: 0,
-            },
-            arrivals,
+            order,
+            sortConversations(
+              arrivals,
+              activeOverride,
+              frozenKeys,
+              order.baseOrdering === "created" ? "created_at" : "updated_at",
+            ),
           );
           if (move) {
-            const from = order.ids.indexOf(move.fromId);
-            const to = order.ids.indexOf(move.toId);
+            const capturedIds = order.capturedIds ?? order.ids;
+            const from = capturedIds.indexOf(move.fromId);
+            const to = capturedIds.indexOf(move.toId);
             if (from < 0 || to < 0 || from === to) return current;
-            order = { ...order, ids: arrayMove([...order.ids], from, to) };
+            const moved = arrayMove([...capturedIds], from, to);
+            const savedEnd = capturedIds.indexOf(order.ids.at(-1) ?? "") + 1;
+            order = {
+              ...order,
+              ids: moved.slice(0, Math.max(savedEnd, from + 1, to + 1)),
+              capturedIds: moved,
+            };
           }
           // Advance arrival tracking only when this transaction can commit.
           observedOrderIds.current = new Set(orderingRows.map((row) => row.id));
@@ -2120,8 +2130,8 @@ function ConversationList({
     },
   );
   useEffect(() => {
-    if (groupingUi && view.customOrder) updateView({});
-  }, [groupingUi, view.customOrder, orderingRows, updateView]);
+    if (groupingUi && view.ordering === "custom") updateView({});
+  }, [groupingUi, view.ordering, view.customOrder, orderingRows, updateView]);
   const reorderSessions = useCallback(
     (fromId: string, toId: string) => {
       updateView({ ordering: "custom" }, { fromId, toId });
@@ -2462,7 +2472,13 @@ function ConversationList({
       return;
     }
     const data = event.active.data.current as
-      | { label?: string; project?: string | null; isPinned?: boolean; canGrid?: boolean }
+      | {
+          label?: string;
+          project?: string | null;
+          isPinned?: boolean;
+          canGrid?: boolean;
+          canManage?: boolean;
+        }
       | undefined;
     setActiveDrag({
       id: String(event.active.id),
@@ -2470,6 +2486,7 @@ function ConversationList({
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
       canGrid: data?.canGrid !== false,
+      canManage: data?.canManage !== false,
     });
   }, []);
   const handleDragEnd = useCallback(
@@ -2974,6 +2991,7 @@ function ConversationList({
             isn't rendered and there'd otherwise be nowhere to drop. */}
               {!showShared &&
                 !grouped &&
+                activeDrag?.canManage &&
                 activeDrag?.project != null &&
                 sections.sessions.length === 0 && <UngroupDropZone />}
               {totalVisible === 0 && searchQuery && !sessionStatus && !importing ? (
@@ -3002,7 +3020,7 @@ function ConversationList({
                     // Drop a session here to pin it — pin-precedence then floats it
                     // out of any project into this section. Active only while dragging
                     // an unpinned session; outline-only highlight.
-                    <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                    <PinDropZone active={!!activeDrag?.canManage && !activeDrag.isPinned}>
                       <PinOrderContext.Provider value={pinOrder}>
                         <ConversationSection
                           title="Pinned"

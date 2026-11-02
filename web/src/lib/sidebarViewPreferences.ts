@@ -10,6 +10,8 @@ export interface SidebarCustomOrder {
   baseOrdering: Exclude<SidebarOrdering, "custom">;
   ids: readonly string[];
   startedAt: number;
+  // ponytail: unmoved arrivals stay in this tab; full-history snapshots would need IndexedDB.
+  capturedIds?: readonly string[];
 }
 
 export interface SidebarViewPreferences {
@@ -40,10 +42,14 @@ export const DEFAULT_SIDEBAR_VIEW: SidebarViewPreferences = {
   show: [],
 };
 
-let current = DEFAULT_SIDEBAR_VIEW;
-let persistedRaw: string | null | undefined;
-let unsaved = false;
+let current: SidebarViewPreferences | undefined;
+let persisted: SidebarViewPreferences | undefined;
 const listeners = new Set<() => void>();
+
+export function resetSidebarViewPreferencesForTests(): void {
+  current = undefined;
+  persisted = undefined;
+}
 
 export function subscribeSidebarViewPreferences(listener: () => void) {
   listeners.add(listener);
@@ -96,18 +102,15 @@ function parseSidebarViewPreferences(raw: string | null): SidebarViewPreferences
   };
 }
 
-/** Stable snapshot; a failed save stays authoritative until a later write succeeds. */
+/** Each tab owns its snapshot; another tab's preferences take effect only on reload. */
 export function readSidebarViewPreferences(): SidebarViewPreferences {
   if (typeof window === "undefined") return DEFAULT_SIDEBAR_VIEW;
-  if (!unsaved) {
+  if (!current) {
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw !== persistedRaw) {
-        persistedRaw = raw;
-        current = parseSidebarViewPreferences(raw);
-      }
+      current = parseSidebarViewPreferences(window.localStorage.getItem(STORAGE_KEY));
+      persisted = current;
     } catch {
-      // Keep the current session usable when browser storage is unavailable.
+      current = DEFAULT_SIDEBAR_VIEW;
     }
   }
   return current;
@@ -117,14 +120,28 @@ export function readSidebarViewPreferences(): SidebarViewPreferences {
 export function writeSidebarViewPreferences(value: SidebarViewPreferences): void {
   if (typeof window === "undefined") return;
   current = value;
-  unsaved = true;
-  try {
-    const raw = JSON.stringify(value);
-    window.localStorage.setItem(STORAGE_KEY, raw);
-    persistedRaw = raw;
-    unsaved = false;
-  } catch {
-    // The next write retries persistence using the current in-memory view.
+  const order = value.customOrder;
+  if (
+    !persisted ||
+    persisted.grouping !== value.grouping ||
+    persisted.ordering !== value.ordering ||
+    persisted.show !== value.show ||
+    persisted.customOrder?.ids !== order?.ids ||
+    persisted.customOrder?.baseOrdering !== order?.baseOrdering ||
+    persisted.customOrder?.startedAt !== order?.startedAt
+  ) {
+    try {
+      const customOrder = order && {
+        baseOrdering: order.baseOrdering,
+        ids: order.ids,
+        startedAt: order.startedAt,
+      };
+      const snapshot = { ...value, customOrder };
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+      persisted = snapshot;
+    } catch {
+      // The next write retries persistence without rolling back the in-memory view.
+    }
   }
   for (const listener of listeners) listener();
 }
@@ -135,7 +152,16 @@ export function removeSidebarCustomOrderIds(removedIds: readonly string[]): void
   if (!view.customOrder || removedIds.length === 0) return;
   const removed = new Set(removedIds);
   const ids = view.customOrder.ids.filter((id) => !removed.has(id));
-  if (ids.length !== view.customOrder.ids.length) {
-    writeSidebarViewPreferences({ ...view, customOrder: { ...view.customOrder, ids } });
+  const capturedIds = view.customOrder.capturedIds?.filter((id) => !removed.has(id));
+  const savedChanged = ids.length !== view.customOrder.ids.length;
+  if (savedChanged || capturedIds?.length !== view.customOrder.capturedIds?.length) {
+    writeSidebarViewPreferences({
+      ...view,
+      customOrder: {
+        ...view.customOrder,
+        ids: savedChanged ? ids : view.customOrder.ids,
+        ...(capturedIds && { capturedIds }),
+      },
+    });
   }
 }

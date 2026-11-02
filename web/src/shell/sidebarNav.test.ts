@@ -808,6 +808,7 @@ it.each(["created", "updated"] as const)(
       row("a", 10),
       row("history", 1),
       row("new", 110),
+      { ...row("new-earlier", 105), updated_at: 900 },
       row("same-second-history", 100),
       sameSecondNew,
     ];
@@ -818,6 +819,7 @@ it.each(["created", "updated"] as const)(
     expect(frozen.get("a")).toBe(10);
     expect(sorted.map((session) => session.id)).toEqual([
       "new",
+      "new-earlier",
       "same-second-new",
       "a",
       "b",
@@ -825,8 +827,10 @@ it.each(["created", "updated"] as const)(
       "history",
     ]);
     const saved = extendSidebarCustomOrder(order, sorted);
-    expect(saved.ids).toEqual([
+    expect(saved.ids).toEqual(["same-second-new", "a", "unloaded", "b"]);
+    expect(saved.capturedIds).toEqual([
       "new",
+      "new-earlier",
       "same-second-new",
       "a",
       "unloaded",
@@ -835,6 +839,18 @@ it.each(["created", "updated"] as const)(
       "history",
     ]);
     expect(extendSidebarCustomOrder(saved, sorted)).toBe(saved);
+    clearRecentlyCreated();
+    expect(
+      sortConversations(rows, null, null, sortBy, { ...saved, capturedIds: undefined }).map(
+        (session) => session.id,
+      ),
+    ).toEqual(sorted.map((session) => session.id));
+    expect(
+      extendSidebarCustomOrder(
+        saved,
+        Array.from({ length: 10_000 }, (_, index) => row(`later-${index}`, 200 + index)),
+      ).ids,
+    ).toBe(saved.ids);
     expect(
       sortConversations(
         [
@@ -846,7 +862,7 @@ it.each(["created", "updated"] as const)(
         sortBy,
         saved,
       ).map((session) => session.id),
-    ).toEqual(saved.ids);
+    ).toEqual(saved.capturedIds);
     expect(
       sortConversations([rows[0]], null, null, sortBy, saved).map((session) => session.id),
     ).toEqual(["b"]);
@@ -855,7 +871,7 @@ it.each(["created", "updated"] as const)(
 );
 
 it("seeds an empty Custom list from server timestamps before loading older pages", () => {
-  const empty = { baseOrdering: "updated" as const, ids: [], startedAt: 0 };
+  const empty = { baseOrdering: "updated" as const, ids: [], capturedIds: [], startedAt: 0 };
   expect(extendSidebarCustomOrder(empty, [])).toBe(empty);
   const first = extendSidebarCustomOrder(empty, [conversation("z", "Z", new Date(100_000))]);
   expect(first.startedAt).toBe(100);
@@ -867,7 +883,7 @@ it("seeds an empty Custom list from server timestamps before loading older pages
       sameSecondNew,
       conversation("a", "History in the same second", new Date(100_000)),
       conversation("history", "History", new Date(90_000)),
-    ]).ids,
+    ]).capturedIds,
   ).toEqual(["new", "new-same-second", "z", "a", "history"]);
   expect(
     extendSidebarCustomOrder({ ...first, ids: [] }, [

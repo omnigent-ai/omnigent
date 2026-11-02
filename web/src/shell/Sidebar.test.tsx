@@ -6,6 +6,7 @@ import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import {
   readSidebarViewPreferences,
   removeSidebarCustomOrderIds,
+  resetSidebarViewPreferencesForTests,
 } from "@/lib/sidebarViewPreferences";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -324,6 +325,7 @@ beforeEach(() => {
   useSessionWorktreesMock.mockReset();
   useSessionWorktreesMock.mockReturnValue({ data: undefined });
   localStorage.clear();
+  resetSidebarViewPreferencesForTests();
   resetReadStateForTests();
   clearSessionDrafts();
   clearOptimisticTitles();
@@ -3846,9 +3848,22 @@ describe("Sidebar view options", () => {
         screen.getByTestId(`session-ordering-${ordering === "created" ? "updated" : "created"}`),
       );
       expect(ids()).toEqual([...initial].reverse());
+      mockConversations([
+        conv("conv_a", "Codex", { created_at: 1, updated_at: 200 }),
+        conv("conv_b", "Codex", { created_at: 2, updated_at: 100 }),
+        conv("conv_history_a", "Codex", { created_at: 0.5, updated_at: 50 }),
+        conv("conv_history_b", "Codex", { created_at: 0.8, updated_at: 40 }),
+      ]);
+      openViewSubmenu("session-show-menu");
+      fireEvent.click(screen.getByTestId("session-show-branch"));
+      closeProjectsMenu();
       openViewSubmenu("session-ordering-menu");
       fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
-      expect(ids()).toEqual(initial);
+      const history = ["conv_history_a", "conv_history_b"];
+      expect(ids()).toEqual([
+        ...initial,
+        ...(ordering === "created" ? history.reverse() : history),
+      ]);
     },
   );
 

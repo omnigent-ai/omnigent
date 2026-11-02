@@ -6,7 +6,10 @@ import * as capabilities from "@/lib/CapabilitiesContext";
 import * as serverOrigin from "@/lib/serverOrigin";
 import * as gridSessions from "@/grid/GridSessionsContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
-import { readSidebarViewPreferences } from "@/lib/sidebarViewPreferences";
+import {
+  readSidebarViewPreferences,
+  resetSidebarViewPreferencesForTests,
+} from "@/lib/sidebarViewPreferences";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
@@ -96,6 +99,7 @@ async function dropOnto(sourceId: string, targetId: string, { expectTarget = tru
 
 beforeEach(() => {
   localStorage.clear();
+  resetSidebarViewPreferencesForTests();
   mocks.filterHonored = true;
   vi.mocked(useProjectSessions).mockReturnValue(conversationPage([]));
   vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
@@ -256,6 +260,7 @@ describe("custom session ordering", () => {
     renderSidebar();
 
     const point = await hoverOnto("source", "target");
+    if (archived) expect(screen.queryByTestId("sidebar-ungroup-drop-zone")).toBeNull();
     await act(async () => {
       fireEvent.mouseUp(document, point);
     });
@@ -369,12 +374,44 @@ describe("custom session ordering", () => {
 
       cleanup();
       rows = [
-        conv("new_session", { created_at: Math.floor(Date.now() / 1000) + 1, updated_at: 1000 }),
+        conv("new_session", { created_at: Math.floor(Date.now() / 1000) + 2, updated_at: 1000 }),
+        conv("new_earlier_session", {
+          created_at: Math.floor(Date.now() / 1000) + 1,
+          updated_at: 2000,
+        }),
         ...rows.map((row) => ({ ...row, updated_at: 1000 - row.updated_at })),
         conv("older_page", { created_at: 1, updated_at: 1 }),
+        conv("untouched_tail", { created_at: 0, updated_at: 0 }),
       ];
       renderSidebar();
-      expect(rowIds()).toEqual(["new_session", ...reordered, "older_page"]);
+      expect(rowIds()).toEqual([
+        "new_session",
+        "new_earlier_session",
+        ...reordered,
+        "older_page",
+        "untouched_tail",
+      ]);
+      expect(readSidebarViewPreferences().customOrder?.ids).toEqual(reordered);
+      const newTarget = await hoverOnto("new_earlier_session", "new_session");
+      await act(async () => {
+        fireEvent.mouseUp(document, newTarget);
+      });
+      expect(readSidebarViewPreferences().customOrder?.ids).toEqual([
+        "new_earlier_session",
+        "new_session",
+        ...reordered,
+      ]);
+      const historyTarget = await hoverOnto("older_page", reordered[0]);
+      await act(async () => {
+        fireEvent.mouseUp(document, historyTarget);
+      });
+      const saved = ["new_earlier_session", "new_session", "older_page", ...reordered];
+      expect(rowIds()).toEqual([...saved, "untouched_tail"]);
+      expect(readSidebarViewPreferences().customOrder?.ids).toEqual(saved);
+      cleanup();
+      resetSidebarViewPreferencesForTests();
+      renderSidebar();
+      expect(rowIds()).toEqual([...saved, "untouched_tail"]);
       expect(mocks.pinFn).not.toHaveBeenCalled();
       expect(mocks.reorderPins).not.toHaveBeenCalled();
     },
@@ -432,6 +469,12 @@ describe("custom session ordering", () => {
     fireEvent.keyDown(move, { key: "Enter" });
     expect(rowIds()).toEqual(["shared_a", "shared_b"]);
     expect(readSidebarViewPreferences().ordering).toBe("custom");
+    fireEvent.contextMenu(screen.getByRole("link", { name: "shared_a" }));
+    expect(screen.getByRole("menuitem", { name: "Move up" })).toHaveAttribute("data-disabled");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move down" }));
+    expect(rowIds()).toEqual(["shared_b", "shared_a"]);
+    fireEvent.contextMenu(screen.getByRole("link", { name: "shared_a" }));
+    expect(screen.getByRole("menuitem", { name: "Move down" })).toHaveAttribute("data-disabled");
     expect(mocks.pinFn).not.toHaveBeenCalled();
   });
 

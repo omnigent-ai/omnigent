@@ -221,7 +221,7 @@ const customOrderPositions = new WeakMap<SidebarCustomOrder, ReadonlyMap<string,
 function positionsForCustomOrder(order: SidebarCustomOrder): ReadonlyMap<string, number> {
   let positions = customOrderPositions.get(order);
   if (!positions) {
-    positions = new Map(order.ids.map((id, index) => [id, index]));
+    positions = new Map((order.capturedIds ?? order.ids).map((id, index) => [id, index]));
     customOrderPositions.set(order, positions);
   }
   return positions;
@@ -235,32 +235,46 @@ function isNewCustomOrderSession(row: Conversation, order: SidebarCustomOrder): 
   );
 }
 
-/** Keep saved positions, including unloaded IDs; append newly loaded history. */
+/** Capture arrivals in this tab; persist only the initial list and ambiguous timestamp ties. */
 export function extendSidebarCustomOrder(
   order: SidebarCustomOrder,
   orderedRows: readonly Conversation[],
 ): SidebarCustomOrder {
   const positions = positionsForCustomOrder(order);
   const added = new Set<string>();
-  const newer: string[] = [];
-  const older: string[] = [];
-  for (const row of orderedRows) {
-    if (positions.has(row.id) || added.has(row.id)) continue;
+  const arrivals = orderedRows.filter((row) => {
+    if (positions.has(row.id) || added.has(row.id)) return false;
     added.add(row.id);
-    (isNewCustomOrderSession(row, order) ? newer : older).push(row.id);
+    return true;
+  });
+  if (arrivals.length === 0) return order;
+  const previousIds = order.capturedIds ?? order.ids;
+  if (previousIds.length === 0 && order.startedAt === 0) {
+    const ids = arrivals.map((row) => row.id);
+    return {
+      ...order,
+      ids,
+      capturedIds: ids,
+      // Server timestamps keep a skewed device clock from misclassifying new sessions.
+      startedAt: arrivals.reduce(
+        (latest, row) => Math.max(latest, row.created_at, row.updated_at),
+        0,
+      ),
+    };
   }
-  if (newer.length === 0 && older.length === 0) return order;
+  const newer = sortConversations(
+    arrivals.filter((row) => isNewCustomOrderSession(row, order)),
+    null,
+    null,
+    "created_at",
+  );
+  const older = arrivals.filter((row) => !isNewCustomOrderSession(row, order));
+  // Only this first timestamp needs saved IDs to distinguish new sessions from history on reload.
+  const ties = newer.filter((row) => row.created_at === order.startedAt).map((row) => row.id);
   return {
     ...order,
-    ids: [...newer, ...order.ids, ...older],
-    // Use server timestamps so a skewed device clock cannot misclassify new sessions.
-    startedAt:
-      order.ids.length > 0
-        ? order.startedAt
-        : orderedRows.reduce(
-            (latest, row) => Math.max(latest, row.created_at, row.updated_at),
-            order.startedAt,
-          ),
+    ids: ties.length > 0 ? [...ties, ...order.ids] : order.ids,
+    capturedIds: [...newer.map((row) => row.id), ...previousIds, ...older.map((row) => row.id)],
   };
 }
 
@@ -286,7 +300,14 @@ export function sortConversations(
     (customOrder && isNewCustomOrderSession(row, customOrder) ? -1 : (positions?.size ?? 0));
   return [...conversations].sort((a, b) => {
     const byTime = effective(b) - effective(a);
-    return position(a) - position(b) || byTime || b.id.localeCompare(a.id);
+    const aPosition = position(a);
+    const bPosition = position(b);
+    const unrecordedNew = aPosition === -1 && (positions!.size > 0 || customOrder!.startedAt > 0);
+    return (
+      aPosition - bPosition ||
+      (unrecordedNew ? b.created_at - a.created_at : byTime) ||
+      b.id.localeCompare(a.id)
+    );
   });
 }
 

@@ -1,12 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
   removeSidebarCustomOrderIds,
+  resetSidebarViewPreferencesForTests,
   sidebarBaseOrdering,
   subscribeSidebarViewPreferences,
   writeSidebarViewPreferences,
 } from "./sidebarViewPreferences";
+
+beforeEach(resetSidebarViewPreferencesForTests);
 
 afterEach(() => {
   localStorage.clear();
@@ -15,6 +18,52 @@ afterEach(() => {
 describe("sidebarViewPreferences", () => {
   it("defaults when nothing is stored", () => {
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
+  });
+
+  it("keeps other tabs' preferences out of the current snapshot and subsequent writes", () => {
+    const view = { ...DEFAULT_SIDEBAR_VIEW, grouping: "status" as const };
+    writeSidebarViewPreferences(view);
+    const otherTab = { ...DEFAULT_SIDEBAR_VIEW, ordering: "created" as const };
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify(otherTab));
+    window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:sidebar-view" }));
+    expect(readSidebarViewPreferences()).toBe(view);
+    writeSidebarViewPreferences({ ...readSidebarViewPreferences(), show: ["branch"] });
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toEqual({
+      ...view,
+      show: ["branch"],
+    });
+  });
+
+  it("keeps untouched history in memory without growing or rewriting the saved order", () => {
+    const view = {
+      ...DEFAULT_SIDEBAR_VIEW,
+      ordering: "custom" as const,
+      customOrder: { baseOrdering: "updated" as const, ids: ["saved"], startedAt: 100 },
+    };
+    writeSidebarViewPreferences(view);
+    const raw = localStorage.getItem("omnigent:sidebar-view");
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    try {
+      const capturedIds = [
+        "saved",
+        ...Array.from({ length: 10_000 }, (_, index) => `old-${index}`),
+      ];
+      const captured = { ...view, customOrder: { ...view.customOrder, capturedIds } };
+      writeSidebarViewPreferences(captured);
+      expect(readSidebarViewPreferences()).toBe(captured);
+      expect(setItem.mock.calls).toHaveLength(0);
+      expect(localStorage.getItem("omnigent:sidebar-view")).toBe(raw);
+      removeSidebarCustomOrderIds(["old-9999"]);
+      expect(readSidebarViewPreferences().customOrder?.capturedIds).not.toContain("old-9999");
+      expect(setItem.mock.calls).toHaveLength(0);
+      writeSidebarViewPreferences({ ...readSidebarViewPreferences(), grouping: "status" });
+      const stored = JSON.parse(localStorage.getItem("omnigent:sidebar-view")!);
+      expect(stored.customOrder).toEqual(view.customOrder);
+      resetSidebarViewPreferencesForTests();
+      expect(readSidebarViewPreferences()).toEqual(stored);
+    } finally {
+      setItem.mockRestore();
+    }
   });
 
   it.each(["status", "created", "updated", "harness"] as const)(
@@ -50,6 +99,7 @@ describe("sidebarViewPreferences", () => {
     });
 
     localStorage.setItem("omnigent:sidebar-view", "{not json");
+    resetSidebarViewPreferencesForTests();
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
   });
 

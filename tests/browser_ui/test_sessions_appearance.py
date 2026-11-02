@@ -180,6 +180,29 @@ def test_custom_order_commits_on_drop_and_survives_grouping_and_reload(
     )
     page.reload()
     expect(rows).to_have_text(["New session", *reordered])
+
+    # An about:blank popup inherits this origin and delivers a real cross-tab storage event.
+    with page.expect_popup() as popup:
+        page.evaluate("window.open('about:blank')")
+    other_tab = popup.value
+    try:
+        other_tab.evaluate("""() => {
+            const view = JSON.parse(localStorage.getItem('omnigent:sidebar-view'));
+            localStorage.setItem('omnigent:sidebar-view',
+                JSON.stringify({ ...view, ordering: 'updated' }));
+        }""")
+    finally:
+        other_tab.close()
+    open_submenu("session-grouping-menu")
+    page.get_by_role("menuitemradio", name="Default", exact=True).click()
+    page.keyboard.press("Escape")
+    expect(rows).to_have_text(["New session", *reordered])
+    open_submenu("session-ordering-menu")
+    expect(page.get_by_role("menuitemradio", name="Custom")).to_be_checked()
+    page.keyboard.press("Escape")
+    page.reload()
+    expect(rows).to_have_text(["New session", *reordered])
+
     appearance_features["sidebar_grouping_ui"] = False
     page.reload()
     expect(rows).to_have_text(
