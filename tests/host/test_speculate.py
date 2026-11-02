@@ -362,6 +362,35 @@ def test_checkpoint_the_verifier_cannot_copy_fails_before_forking(repo: Path) ->
         speculate(repo, "fix", drafters=[fix_both], verifier=_VERIFIER)
 
 
+def test_git_without_an_identity_fails_before_forking(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Promotion is a commit, so a run that could not make one refuses before any replica.
+
+    Otherwise r1's passing tree would be verified and then lost when promotion fails.
+    """
+    for name in ("NAME", "EMAIL"):
+        for role in ("AUTHOR", "COMMITTER"):
+            monkeypatch.delenv(f"GIT_{role}_{name}")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    _git(repo, "config", "user.useConfigOnly", "true")
+    drafted: list[Path] = []
+
+    def draft(workdir: Path, prompt: str, stop: threading.Event) -> None:
+        drafted.append(workdir)
+        fix_both(workdir, prompt, stop)
+
+    with pytest.raises(SpeculationError, match="git cannot create the promotion commit"):
+        speculate(repo, "fix", drafters=[draft], verifier=_VERIFIER)
+
+    assert (drafted, _worktrees(repo)) == ([], 1)
+    # A committed checkpoint that already passes needs no promotion commit.
+    fix_both(repo)
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "fixed")
+    assert not speculate(repo, "fix", drafters=[draft], verifier=_VERIFIER).admitted
+
+
 def test_verifier_timeout_kills_what_the_verifier_started(
     repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:

@@ -169,8 +169,8 @@ def speculate(cwd: Path, task: str, *, drafters: Sequence[Drafter], verifier: Ve
     :param verifier: Command run outside every replica.
     :returns: The ledger, and the promotion when a candidate passed.
     :raises ValueError: If there are no drafters or more than :data:`MAX_REPLICAS`.
-    :raises SpeculationError: If the run itself cannot proceed, e.g. git fails, a
-        protected path matches nothing, or the promotion branch already exists.
+    :raises SpeculationError: If the run itself cannot proceed, e.g. git fails or has no
+        identity, a protected path matches nothing, or the promotion branch already exists.
     """
     if not 1 <= len(drafters) <= MAX_REPLICAS:
         raise ValueError(f"need 1 to {MAX_REPLICAS} drafters, got {len(drafters)}")
@@ -180,6 +180,12 @@ def speculate(cwd: Path, task: str, *, drafters: Sequence[Drafter], verifier: Ve
         raise SpeculationError(f"cannot verify the checkpoint: {admission.detail}")
     if admission.passed:
         return run.outcome(rounds=0)
+    # Promotion is a commit, so a missing identity fails here, not after every replica ran.
+    try:
+        for ident in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+            _git(run.repo, "var", ident)
+    except SpeculationError as exc:
+        raise SpeculationError(f"git cannot create the promotion commit: {exc}") from exc
     # An interrupted run may leave replicas writing here, so cleanup is best effort.
     with tempfile.TemporaryDirectory(
         prefix="omnigent-speculate-", ignore_cleanup_errors=True
