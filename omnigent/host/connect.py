@@ -597,6 +597,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        # git's own CA paths: git built on libcurl-gnutls ignores SSL_CERT_FILE,
+        # so sandboxes that terminate TLS (e.g. OpenShell) inject these instead.
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
         # Force UTF-8 I/O on Windows. Without this, Python on Windows defaults
         # to the system ANSI code page (e.g. cp1252), causing UnicodeEncodeError
         # when the host daemon / runner prints Unicode characters such as "✓" or

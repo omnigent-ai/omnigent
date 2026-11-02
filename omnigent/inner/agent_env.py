@@ -63,6 +63,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # without it a corporate-CA user upgrading would hit TLS failures from
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
+        # git's CA paths, for git builds that ignore SSL_CERT_FILE.
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
         # ssh-agent socket path, so an agent's git-over-SSH and SSH-cert
         # tooling authenticates. A path to a unix socket, not a bearer token:
         # reaching the agent still requires the user's own ssh-agent to be
