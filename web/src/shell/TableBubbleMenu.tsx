@@ -8,8 +8,8 @@
 //   Drag  : mousedown-drag to reorder the column
 //   Click : dropdown menu — Insert column before/after, Delete column
 //
-// Both are fixed-position portals so they are never clipped by the editor's
-// overflow container.
+// Both are fixed-position portals so the table's scroll wrapper never clips
+// them; placeTableHandles bounds them to the visible part of the table instead.
 //
 // Drag uses mousedown/mousemove/mouseup rather than the HTML5 DnD API because
 // ProseMirror intercepts dragover/drop events on its own DOM node, making
@@ -274,21 +274,76 @@ interface Rect {
   height: number;
 }
 
+/** The overlap of `rect` and `bounds`, or null when they don't overlap. */
+export function clipRect(rect: Rect, bounds: Rect): Rect | null {
+  const top = Math.max(rect.top, bounds.top);
+  const left = Math.max(rect.left, bounds.left);
+  const bottom = Math.min(rect.top + rect.height, bounds.top + bounds.height);
+  const right = Math.min(rect.left + rect.width, bounds.left + bounds.width);
+  if (bottom <= top || right <= left) return null;
+  return { top, left, width: right - left, height: bottom - top };
+}
+
+/** Places a cell's grips beside the table's visible columns; null when none is in view. */
+export function placeTableHandles({
+  row,
+  cell,
+  table,
+  wrapper,
+  viewport,
+}: {
+  row: Rect;
+  cell: Rect;
+  table: Rect;
+  wrapper: Rect;
+  viewport: Rect;
+}): { visible: Rect; rowGrip: Rect | null; colGrip: Rect | null } | null {
+  const visible = clipRect(
+    { top: viewport.top, height: viewport.height, left: wrapper.left, width: wrapper.width },
+    viewport,
+  );
+  if (!visible) return null;
+  const rowGripLeft = Math.max(row.left - 22, visible.left - 22, viewport.left);
+  return {
+    visible,
+    rowGrip: clipRect(
+      { top: row.top + 2, left: rowGripLeft, width: 20, height: row.height - 4 },
+      viewport,
+    ),
+    colGrip: clipRect(
+      { top: table.top - 24, left: cell.left + 2, width: cell.width - 4, height: 18 },
+      visible,
+    ),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // State types
 // ---------------------------------------------------------------------------
 
 interface HandlePos {
-  top: number;
-  left: number;
   rowIndex: number;
   colIndex: number;
-  cellWidth: number;
-  rowHeight: number;
-  /** Full width of the row (= table width) — used for the row selection overlay. */
-  rowWidth: number;
-  /** Full height of the table — used for the column selection overlay. */
-  tableHeight: number;
+  /** Where the grip pill is drawn, already clipped to the visible table. */
+  grip: Rect;
+  /** The whole row or column the grip selects and drags. */
+  target: Rect;
+  /** Wrapper's visible columns within the editor viewport; overlays are clipped to it. */
+  visible: Rect;
+}
+
+function sameRect(a: Rect, b: Rect): boolean {
+  return a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height;
+}
+
+function sameHandle(prev: HandlePos, next: HandlePos): boolean {
+  return (
+    prev.rowIndex === next.rowIndex &&
+    prev.colIndex === next.colIndex &&
+    sameRect(prev.grip, next.grip) &&
+    sameRect(prev.target, next.target) &&
+    sameRect(prev.visible, next.visible)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -389,48 +444,40 @@ export function TableHandles({
       const rowRect = row.getBoundingClientRect();
       const cellRect = cell.getBoundingClientRect();
       const tableRect = table.getBoundingClientRect();
+      const placement = placeTableHandles({
+        row: rowRect,
+        cell: cellRect,
+        table: tableRect,
+        wrapper: (table.closest(".tableWrapper") ?? table).getBoundingClientRect(),
+        viewport: scrollContainerRef.current?.getBoundingClientRect() ?? {
+          top: 0,
+          left: 0,
+          width: window.innerWidth,
+          height: window.innerHeight,
+        },
+      });
+      const handle = (grip: Rect | null | undefined, selection: Rect): HandlePos | null =>
+        grip && placement
+          ? { rowIndex, colIndex, grip, target: selection, visible: placement.visible }
+          : null;
+      const nextRow = handle(placement?.rowGrip, {
+        top: rowRect.top,
+        left: rowRect.left,
+        width: rowRect.width,
+        height: rowRect.height,
+      });
+      const nextCol = handle(placement?.colGrip, {
+        top: tableRect.top,
+        left: cellRect.left,
+        width: cellRect.width,
+        height: tableRect.height,
+      });
 
-      // Skip the state update (and consequent re-render) when the cursor is
-      // still in the same cell at the same position — mousemove fires very
-      // frequently and each setState triggers a portal re-paint.
-      setRowHandle((prev) => {
-        if (
-          prev?.rowIndex === rowIndex &&
-          prev.colIndex === colIndex &&
-          prev.top === rowRect.top &&
-          prev.left === rowRect.left
-        )
-          return prev;
-        return {
-          top: rowRect.top,
-          left: rowRect.left,
-          rowIndex,
-          colIndex,
-          cellWidth: cellRect.width,
-          rowHeight: rowRect.height,
-          rowWidth: rowRect.width,
-          tableHeight: tableRect.height,
-        };
-      });
-      setColHandle((prev) => {
-        if (
-          prev?.rowIndex === rowIndex &&
-          prev.colIndex === colIndex &&
-          prev.top === tableRect.top &&
-          prev.left === cellRect.left
-        )
-          return prev;
-        return {
-          top: tableRect.top,
-          left: cellRect.left,
-          rowIndex,
-          colIndex,
-          cellWidth: cellRect.width,
-          rowHeight: rowRect.height,
-          rowWidth: rowRect.width,
-          tableHeight: tableRect.height,
-        };
-      });
+      // Skip the state update (and consequent re-render) when the cell and its
+      // geometry are unchanged — mousemove fires very frequently and each
+      // setState triggers a portal re-paint.
+      setRowHandle((prev) => (prev && nextRow && sameHandle(prev, nextRow) ? prev : nextRow));
+      setColHandle((prev) => (prev && nextCol && sameHandle(prev, nextCol) ? prev : nextCol));
       // Selection overlays are set only when the handle pill is hovered (see onMouseEnter below).
     };
 
@@ -450,7 +497,13 @@ export function TableHandles({
     };
 
     const onMouseLeave = () => scheduleHide();
-    const onScroll = () => {
+    const scrollEl = scrollContainerRef.current;
+    const onScroll = (e: Event) => {
+      // Other nested scrollers, such as a wide code block, don't move the table.
+      const movesTable =
+        e.target === scrollEl ||
+        (e.target instanceof Element && e.target.classList.contains("tableWrapper"));
+      if (!movesTable) return;
       setRowHandle(null);
       setColHandle(null);
       setRowMenu(null);
@@ -466,14 +519,14 @@ export function TableHandles({
     dom.addEventListener("mousemove", onMouseMove);
     dom.addEventListener("mouseleave", onMouseLeave);
     dom.addEventListener("contextmenu", onContextMenu);
-    const scrollEl = scrollContainerRef.current;
-    scrollEl?.addEventListener("scroll", onScroll);
+    // Capture also sees a wide table scrolling its wrapper; that scroll doesn't bubble.
+    scrollEl?.addEventListener("scroll", onScroll, { capture: true });
 
     return () => {
       dom.removeEventListener("mousemove", onMouseMove);
       dom.removeEventListener("mouseleave", onMouseLeave);
       dom.removeEventListener("contextmenu", onContextMenu);
-      scrollEl?.removeEventListener("scroll", onScroll);
+      scrollEl?.removeEventListener("scroll", onScroll, { capture: true });
       window.clearTimeout(hideTimer.current);
     };
   }, [editor, scheduleHide, cancelHide, scrollContainerRef]);
@@ -531,6 +584,7 @@ export function TableHandles({
       fromIndex: number,
       tableRowIndex: number,
       sourceRect: Rect,
+      visible: Rect,
     ) => {
       e.preventDefault(); // prevent editor focus steal on mousedown
       wasDragRef.current = false;
@@ -554,19 +608,29 @@ export function TableHandles({
 
         // Ghost follows the cursor: row strip slides vertically, column strip slides horizontally.
         if (type === "row") {
-          setDragGhostRect({
-            top: ev.clientY - sourceRect.height / 2,
-            left: sourceRect.left,
-            width: sourceRect.width,
-            height: sourceRect.height,
-          });
+          setDragGhostRect(
+            clipRect(
+              {
+                top: ev.clientY - sourceRect.height / 2,
+                left: sourceRect.left,
+                width: sourceRect.width,
+                height: sourceRect.height,
+              },
+              visible,
+            ),
+          );
         } else {
-          setDragGhostRect({
-            top: sourceRect.top,
-            left: ev.clientX - sourceRect.width / 2,
-            width: sourceRect.width,
-            height: sourceRect.height,
-          });
+          setDragGhostRect(
+            clipRect(
+              {
+                top: sourceRect.top,
+                left: ev.clientX - sourceRect.width / 2,
+                width: sourceRect.width,
+                height: sourceRect.height,
+              },
+              visible,
+            ),
+          );
         }
 
         if (type === "row") {
@@ -588,24 +652,24 @@ export function TableHandles({
 
           // Show drag-target overlay (full-border rectangle) over the target row.
           if (idx !== fromIndex) {
-            setDragTargetRect({
-              top: rects[localIdx].top,
-              left: rects[localIdx].left,
-              width: rects[localIdx].right - rects[localIdx].left,
-              height: rects[localIdx].bottom - rects[localIdx].top,
-            });
+            setDragTargetRect(clipRect(rects[localIdx], visible));
           } else {
             setDragTargetRect(null);
           }
 
           // Drop-indicator line above or below the target row.
           const insertAfter = idx > fromIndex;
-          setDropIndicator({
-            top: insertAfter ? rects[localIdx].bottom - 1 : rects[localIdx].top - 1,
-            left: rects[localIdx].left,
-            width: rects[localIdx].right - rects[localIdx].left,
-            height: 3,
-          });
+          setDropIndicator(
+            clipRect(
+              {
+                top: insertAfter ? rects[localIdx].bottom - 1 : rects[localIdx].top - 1,
+                left: rects[localIdx].left,
+                width: rects[localIdx].width,
+                height: 3,
+              },
+              visible,
+            ),
+          );
         } else {
           // Look up target column by X band within the source table only.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
@@ -625,12 +689,17 @@ export function TableHandles({
           const matched = cellRects.find((r) => r.cellIndex === idx);
           if (matched && tableEl && idx !== fromIndex) {
             const tableRect = tableEl.getBoundingClientRect();
-            setDragTargetRect({
-              top: tableRect.top,
-              left: matched.left,
-              width: matched.right - matched.left,
-              height: tableRect.height,
-            });
+            setDragTargetRect(
+              clipRect(
+                {
+                  top: tableRect.top,
+                  left: matched.left,
+                  width: matched.right - matched.left,
+                  height: tableRect.height,
+                },
+                visible,
+              ),
+            );
           } else {
             setDragTargetRect(null);
           }
@@ -639,12 +708,17 @@ export function TableHandles({
           if (matched && tableEl) {
             const tableRect = tableEl.getBoundingClientRect();
             const insertAfter = idx > fromIndex;
-            setDropIndicator({
-              top: tableRect.top,
-              left: insertAfter ? matched.right - 1 : matched.left - 1,
-              width: 3,
-              height: tableRect.height,
-            });
+            setDropIndicator(
+              clipRect(
+                {
+                  top: tableRect.top,
+                  left: insertAfter ? matched.right - 1 : matched.left - 1,
+                  width: 3,
+                  height: tableRect.height,
+                },
+                visible,
+              ),
+            );
           }
         }
       };
@@ -821,22 +895,12 @@ export function TableHandles({
               "hover:bg-primary hover:text-primary-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
               rowMenu ? "bg-primary text-primary-foreground" : "",
             )}
-            style={{
-              top: rowHandle.top + 2,
-              left: rowHandle.left - 22,
-              width: 20,
-              height: rowHandle.rowHeight - 4,
-            }}
+            style={rowHandle.grip}
             onMouseEnter={() => {
               mouseInUI.current = true;
               cancelHide();
               setColSelRect(null); // only one overlay active at a time
-              setRowSelRect({
-                top: rowHandle.top,
-                left: rowHandle.left,
-                width: rowHandle.rowWidth,
-                height: rowHandle.rowHeight,
-              });
+              setRowSelRect(clipRect(rowHandle.target, rowHandle.visible));
             }}
             onMouseLeave={() => {
               mouseInUI.current = false;
@@ -844,12 +908,14 @@ export function TableHandles({
               scheduleHide();
             }}
             onMouseDown={(e) =>
-              startDrag(e, "row", rowHandle.rowIndex, rowHandle.rowIndex, {
-                top: rowHandle.top,
-                left: rowHandle.left,
-                width: rowHandle.rowWidth,
-                height: rowHandle.rowHeight,
-              })
+              startDrag(
+                e,
+                "row",
+                rowHandle.rowIndex,
+                rowHandle.rowIndex,
+                rowHandle.target,
+                rowHandle.visible,
+              )
             }
             onClick={(e) => {
               if (wasDragRef.current) {
@@ -900,22 +966,12 @@ export function TableHandles({
               "hover:bg-primary hover:text-primary-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
               colMenu ? "bg-primary text-primary-foreground" : "",
             )}
-            style={{
-              top: colHandle.top - 24,
-              left: colHandle.left + 2,
-              width: colHandle.cellWidth - 4,
-              height: 18,
-            }}
+            style={colHandle.grip}
             onMouseEnter={() => {
               mouseInUI.current = true;
               cancelHide();
               setRowSelRect(null); // only one overlay active at a time
-              setColSelRect({
-                top: colHandle.top,
-                left: colHandle.left,
-                width: colHandle.cellWidth,
-                height: colHandle.tableHeight,
-              });
+              setColSelRect(clipRect(colHandle.target, colHandle.visible));
             }}
             onMouseLeave={() => {
               mouseInUI.current = false;
@@ -923,12 +979,14 @@ export function TableHandles({
               scheduleHide();
             }}
             onMouseDown={(e) =>
-              startDrag(e, "col", colHandle.colIndex, colHandle.rowIndex, {
-                top: colHandle.top,
-                left: colHandle.left,
-                width: colHandle.cellWidth,
-                height: colHandle.tableHeight,
-              })
+              startDrag(
+                e,
+                "col",
+                colHandle.colIndex,
+                colHandle.rowIndex,
+                colHandle.target,
+                colHandle.visible,
+              )
             }
             onClick={(e) => {
               if (wasDragRef.current) {
