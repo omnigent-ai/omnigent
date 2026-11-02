@@ -829,6 +829,7 @@ async def test_create_files_runs_into_an_owned_project(
     _make_user(db_uri, "bob@example.com")
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_projects"] is True
+    assert info["scheduled_task_harness_settings"] is True
     mine = await _make_project(auth_client, "mine")
     bobs = await _make_project(auth_client, "bob's", owner="bob@example.com")
 
@@ -1181,14 +1182,7 @@ async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri:
 async def test_create_rejects_permission_mode_for_non_claude_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A valid mode on a non-Claude agent is rejected (server capability gate).
-
-    The web dialog only shows the permission control for Claude Code; the server
-    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
-    fire path would inject as an unknown ``--permission-mode`` flag. The value
-    itself is a valid Claude mode — the rejection is purely about the agent's
-    harness.
-    """
+    """Claude's permission vocabulary cannot be saved on a Codex agent."""
     from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
@@ -2782,3 +2776,32 @@ async def test_changing_where_a_task_runs_starts_a_new_session(
 
     assert moved.status_code == 200, moved.text
     assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)
+
+
+@pytest.mark.parametrize("mode", ["default", "full-access", "read-only", "bypass"])
+async def test_codex_permission_round_trip(
+    auth_client: httpx.AsyncClient, db_uri: str, mode: str
+) -> None:
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME), permission_mode=mode
+        ),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    task_id = response.json()["id"]
+    loaded = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert loaded.json()["permission_mode"] == mode
+    changed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"permission_mode": "read-only"}, headers=_headers()
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["permission_mode"] == "read-only"
+    cleared = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"permission_mode": None}, headers=_headers()
+    )
+    assert cleared.json()["permission_mode"] is None

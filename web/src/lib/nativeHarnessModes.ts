@@ -1,3 +1,5 @@
+import permissionModes from "../../../omnigent/native/permission_modes.json";
+
 // Native-harness permission / approval / execution mode tables, shared by the
 // new-session dialog and the fork dialog so the option lists, CLI-flag
 // mappings, and default values can't drift between the two surfaces.
@@ -6,7 +8,10 @@
 // native CLI; a mode whose `args` are empty sends no flags (the CLI keeps its
 // own configured default). Keep in sync with each CLI's `--help`.
 
-import { CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE } from "@/lib/claudePermissionMode";
+import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
+} from "@/lib/claudePermissionMode";
 
 /** One selectable mode: value + label + blurb + the CLI flags it maps to. */
 export interface NativeHarnessMode {
@@ -86,20 +91,7 @@ export function permissionModeConcept(
 // request-review prompt in place. Keep in sync with `agy --help`.
 export const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
 export const AGY_NATIVE_SKIP_VALUE = "skip";
-export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
-  {
-    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
-    label: "Ask every time",
-    description: "Prompts before each tool runs",
-    args: [],
-  },
-  {
-    value: AGY_NATIVE_SKIP_VALUE,
-    label: "Skip permissions",
-    description: "Runs everything; no prompts or safety checks",
-    args: ["--dangerously-skip-permissions"],
-  },
-];
+export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = permissionModes["antigravity-native"];
 
 // The Auto Harness's Permissions vocabulary: Default only. No cross-harness
 // permission mapping exists, so the row stays locked and the create call sends
@@ -114,38 +106,7 @@ export const AUTO_PERMISSION_MODE_OPTIONS = [AUTO_PERMISSION_MODE] as const;
 // Cursor execution modes. "default" sends no flags; other values map to CLI
 // args passed via terminal_launch_args. Keep in sync with `cursor-agent --help`.
 export const CURSOR_NATIVE_DEFAULT_EXEC_MODE = "default";
-export const CURSOR_NATIVE_EXEC_MODES: NativeHarnessMode[] = [
-  {
-    value: "default",
-    label: "Default",
-    description: "Normal agent mode; prompts before running commands",
-    args: [],
-  },
-  {
-    value: "auto-review",
-    label: "Auto-review",
-    description: "Smart Auto: auto-runs safe tool calls and prompts for the rest",
-    args: ["--auto-review"],
-  },
-  {
-    value: "plan",
-    label: "Plan",
-    description: "Read-only planning; analyzes and proposes plans, no edits",
-    args: ["--mode", "plan"],
-  },
-  {
-    value: "ask",
-    label: "Ask",
-    description: "Q&A style; explains and answers questions (read-only)",
-    args: ["--mode", "ask"],
-  },
-  {
-    value: "yolo",
-    label: "Yolo",
-    description: "Runs everything without prompts or safety checks",
-    args: ["--yolo"],
-  },
-];
+export const CURSOR_NATIVE_EXEC_MODES: NativeHarnessMode[] = permissionModes["cursor-native"];
 
 // Devin's own permission vocabulary (`devin --help`), deliberately NOT Claude's:
 // Devin's rungs differ, and it reads them from `--permission-mode`. "auto" is
@@ -154,32 +115,7 @@ export const CURSOR_NATIVE_EXEC_MODES: NativeHarnessMode[] = [
 // `bypass`/`yolo` for `dangerous`), because a mid-session switch stores the mode
 // the pane confirmed — which is always the canonical one.
 export const DEVIN_NATIVE_DEFAULT_PERMISSION_MODE = "normal";
-export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
-  {
-    value: "normal",
-    label: "Normal",
-    description: "Auto-approves read-only tools; prompts for anything else",
-    args: [],
-  },
-  {
-    value: "accept-edits",
-    label: "Accept edits",
-    description: "Also auto-approves edits inside the workspace",
-    args: ["--permission-mode", "accept-edits"],
-  },
-  {
-    value: "smart",
-    label: "Smart",
-    description: "Also auto-runs actions a fast model judges safe",
-    args: ["--permission-mode", "smart"],
-  },
-  {
-    value: "dangerous",
-    label: "Dangerous",
-    description: "Auto-approves every tool, with no prompts",
-    args: ["--permission-mode", "dangerous"],
-  },
-];
+export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = permissionModes["devin-native"];
 
 // Codex approval presets matching the `/permissions` TUI popup.
 // Each preset bundles a sandbox profile + approval policy, mirroring
@@ -189,26 +125,9 @@ export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
 // Keep in sync with `codex --help` and
 // https://developers.openai.com/codex/agent-approvals-security
 export const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
-export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = [
-  {
-    value: "default",
-    label: "Default",
-    description: "Read/edit/run in workspace; approval for external edits or network",
-    args: [],
-  },
-  {
-    value: "full-access",
-    label: "Full access",
-    description: "Edit any file and access the internet without approval",
-    args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
-  },
-  {
-    value: "read-only",
-    label: "Read only",
-    description: "Read files only; approval required for edits, commands, or network",
-    args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
-  },
-];
+export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = permissionModes[
+  "codex-native"
+].filter((mode) => mode.value !== "bypass");
 
 // Conversation-label key for the DANGEROUS codex full-bypass opt-in. When
 // set to "1" the runner launches Codex with
@@ -224,9 +143,24 @@ export const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypa
 // presets above but has no bypass). It rides as a conversation label, not
 // terminal_launch_args, so its `args` are empty and it's handled specially.
 export const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
-export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
-  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
-  label: "Bypass approvals & sandbox",
-  description: "Runs Codex with no approval prompts and no command sandbox",
-  args: [],
-};
+export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = permissionModes[
+  "codex-native"
+].find((mode) => mode.value === CODEX_NATIVE_BYPASS_APPROVAL_VALUE)!;
+
+/** Create-time permission choices shared by New Chat and automations. */
+export function nativePermissionOptions(harness: string | null | undefined) {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_PERMISSION_MODES;
+    case "codex-native":
+      return [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION];
+    case "cursor-native":
+      return CURSOR_NATIVE_EXEC_MODES;
+    case "antigravity-native":
+      return AGY_NATIVE_SKIP_MODES;
+    case "devin-native":
+      return DEVIN_NATIVE_PERMISSION_MODES;
+    default:
+      return [];
+  }
+}

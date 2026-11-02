@@ -890,23 +890,63 @@ def _claude_agent_deps(
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_becomes_terminal_launch_args() -> None:
-    """A Claude task's permission_mode fires as the runner's --permission-mode args."""
+@pytest.mark.parametrize(
+    ("harness", "mode", "args", "bypass"),
+    [
+        ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
+        (
+            "codex-native",
+            "full-access",
+            ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+            False,
+        ),
+        (
+            "codex-native",
+            "read-only",
+            ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+            False,
+        ),
+        ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
+        ("cursor-native", "auto-review", ["--auto-review"], False),
+        ("cursor-native", "plan", ["--mode", "plan"], False),
+        ("cursor-native", "ask", ["--mode", "ask"], False),
+        ("cursor-native", "yolo", ["--yolo"], False),
+        ("antigravity-native", "skip", ["--dangerously-skip-permissions"], False),
+        ("devin-native", "normal", None, False),
+        ("devin-native", "accept-edits", ["--permission-mode", "accept-edits"], False),
+        ("devin-native", "smart", ["--permission-mode", "smart"], False),
+        ("devin-native", "dangerous", ["--permission-mode", "dangerous"], False),
+    ],
+)
+async def test_permission_mode_becomes_terminal_launch_args(
+    harness: str,
+    mode: str,
+    args: list[str] | None,
+    bypass: bool,
+) -> None:
+    """Each saved permission choice reaches its native launch representation."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        _claude_agent_deps(store, conv_store, harness=harness),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
     await _drain()
 
     assert len(conv_store.created) == 1
-    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+    assert conv_store.created[0]["terminal_launch_args"] == args
+
+    from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+
+    assert conv_store.created[0]["labels"].get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == (
+        "1" if bypass else None
+    )
 
 
 @pytest.mark.asyncio

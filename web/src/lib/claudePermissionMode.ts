@@ -1,3 +1,5 @@
+import permissionModes from "../../../omnigent/native/permission_modes.json";
+
 // Claude Code's permission modes. Two vocabularies: every mode
 // `--permission-mode` accepts when starting a session, and the subset a
 // running session can be switched to (see the SWITCHABLE list below).
@@ -28,26 +30,8 @@ export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 // Claude Code's `claude --permission-mode` choices (v2.1). Keep in sync
 // with `claude --help`. The prompting mode is spelled `default` on the
 // wire and labelled "Manual" in Claude's own UI, which this mirrors.
-export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
-  { value: "default", label: "Manual", description: "Prompts before edits and commands" },
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Auto-runs; a classifier blocks risky actions",
-  },
-  {
-    value: "acceptEdits",
-    label: "Accept edits",
-    description: "Auto-applies file edits; commands still prompt",
-  },
-  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
-  { value: "dontAsk", label: "Don't ask", description: "Auto-denies anything not pre-approved" },
-  {
-    value: "bypassPermissions",
-    label: "Bypass permissions",
-    description: "Runs everything; no prompts or safety checks",
-  },
-];
+export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] =
+  permissionModes["claude-native"];
 
 /** Modes a running session can be switched to (shift+tab-reachable). */
 export const CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES: ClaudePermissionModeOption[] =

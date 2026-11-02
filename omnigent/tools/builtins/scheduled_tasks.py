@@ -97,8 +97,11 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": ["string", "null"],
                             "description": (
                                 "Optional permission mode for native coding agents that "
-                                "support one (Claude Code): 'default', 'auto', "
-                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
+                                "support one. Use the selected harness's vocabulary: "
+                                "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
+                                "'read-only', 'full-access', 'bypass'), "
+                                "Cursor (e.g. 'auto-review'), "
+                                "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
                                 "stalls waiting for approval — prefer an auto-running mode. "
                                 "Set null for the agent default. This field is required so "

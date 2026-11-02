@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
@@ -93,20 +94,14 @@ async def resolve_project_session_create(
     return ProjectCreateResolution(body=resolved, project_id=project_id)
 
 
-# Claude Code's ``--permission-mode`` launch vocabulary — every value the CLI
-# accepts at start, not just the shift+tab-switchable subset. ``dontAsk`` and
-# ``bypassPermissions`` are launch-only (rejected on a running-session PATCH),
-# but a scheduled task launches a fresh session each fire, so all of them are
-# valid here. Mirrors the frontend's ``CLAUDE_NATIVE_PERMISSION_MODES``.
+# Launch accepts all Claude modes, including modes unavailable on a running session.
 CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
-    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+    PERMISSION_LAUNCH_ARGS["claude-native"]
 )
 
 
-# The only harness that accepts a ``--permission-mode`` launch arg — the same
-# ``permissionMode`` capability the web dialog gates its permission control on.
-# Other native CLIs (codex / cursor / …) use different flags, so injecting
-# ``--permission-mode`` there would be an unknown flag that breaks the launch.
+# The session API's permission_mode field uses Claude's vocabulary. Other
+# harnesses receive their own permission settings through terminal_launch_args.
 _PERMISSION_MODE_HARNESS = "claude-native"
 
 
@@ -159,14 +154,7 @@ async def validate_permission_mode_agent_support(
 
 
 def validate_session_permission_mode(permission_mode: str | None) -> str | None:
-    """Validate a persisted per-task permission mode shared by schedules.
-
-    A scheduled task fires a fresh native session each run, so the whole launch
-    vocabulary is allowed (including the launch-only ``dontAsk`` /
-    ``bypassPermissions``). The value reaches the native CLI as the
-    ``--permission-mode`` argv element the fire path derives, so reject anything
-    outside the known set before a row persists it.
-    """
+    """Validate the session API's Claude permission mode against its launch vocabulary."""
     if permission_mode is None:
         return None
     if permission_mode not in CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES:

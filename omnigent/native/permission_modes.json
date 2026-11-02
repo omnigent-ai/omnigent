@@ -1,0 +1,138 @@
+{
+  "claude-native": [
+    {
+      "value": "default",
+      "label": "Manual",
+      "description": "Prompts before edits and commands",
+      "args": ["--permission-mode", "default"]
+    },
+    {
+      "value": "auto",
+      "label": "Auto",
+      "description": "Auto-runs; a classifier blocks risky actions",
+      "args": ["--permission-mode", "auto"]
+    },
+    {
+      "value": "acceptEdits",
+      "label": "Accept edits",
+      "description": "Auto-applies file edits; commands still prompt",
+      "args": ["--permission-mode", "acceptEdits"]
+    },
+    {
+      "value": "plan",
+      "label": "Plan",
+      "description": "Plans only; makes no edits",
+      "args": ["--permission-mode", "plan"]
+    },
+    {
+      "value": "dontAsk",
+      "label": "Don't ask",
+      "description": "Auto-denies anything not pre-approved",
+      "args": ["--permission-mode", "dontAsk"]
+    },
+    {
+      "value": "bypassPermissions",
+      "label": "Bypass permissions",
+      "description": "Runs everything; no prompts or safety checks",
+      "args": ["--permission-mode", "bypassPermissions"]
+    }
+  ],
+  "codex-native": [
+    {
+      "value": "default",
+      "label": "Default",
+      "description": "Read/edit/run in workspace; approval for external edits or network",
+      "args": []
+    },
+    {
+      "value": "full-access",
+      "label": "Full access",
+      "description": "Edit any file and access the internet without approval",
+      "args": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+    },
+    {
+      "value": "read-only",
+      "label": "Read only",
+      "description": "Read files only; approval required for edits, commands, or network",
+      "args": ["--sandbox", "read-only", "--ask-for-approval", "on-request"]
+    },
+    {
+      "value": "bypass",
+      "label": "Bypass approvals & sandbox",
+      "description": "Runs Codex with no approval prompts and no command sandbox",
+      "args": []
+    }
+  ],
+  "cursor-native": [
+    {
+      "value": "default",
+      "label": "Default",
+      "description": "Normal agent mode; prompts before running commands",
+      "args": []
+    },
+    {
+      "value": "auto-review",
+      "label": "Auto-review",
+      "description": "Smart Auto: auto-runs safe tool calls and prompts for the rest",
+      "args": ["--auto-review"]
+    },
+    {
+      "value": "plan",
+      "label": "Plan",
+      "description": "Read-only planning; analyzes and proposes plans, no edits",
+      "args": ["--mode", "plan"]
+    },
+    {
+      "value": "ask",
+      "label": "Ask",
+      "description": "Q&A style; explains and answers questions (read-only)",
+      "args": ["--mode", "ask"]
+    },
+    {
+      "value": "yolo",
+      "label": "Yolo",
+      "description": "Runs everything without prompts or safety checks",
+      "args": ["--yolo"]
+    }
+  ],
+  "antigravity-native": [
+    {
+      "value": "default",
+      "label": "Ask every time",
+      "description": "Prompts before each tool runs",
+      "args": []
+    },
+    {
+      "value": "skip",
+      "label": "Skip permissions",
+      "description": "Runs everything; no prompts or safety checks",
+      "args": ["--dangerously-skip-permissions"]
+    }
+  ],
+  "devin-native": [
+    {
+      "value": "normal",
+      "label": "Normal",
+      "description": "Auto-approves read-only tools; prompts for anything else",
+      "args": []
+    },
+    {
+      "value": "accept-edits",
+      "label": "Accept edits",
+      "description": "Also auto-approves edits inside the workspace",
+      "args": ["--permission-mode", "accept-edits"]
+    },
+    {
+      "value": "smart",
+      "label": "Smart",
+      "description": "Also auto-runs actions a fast model judges safe",
+      "args": ["--permission-mode", "smart"]
+    },
+    {
+      "value": "dangerous",
+      "label": "Dangerous",
+      "description": "Auto-approves every tool, with no prompts",
+      "args": ["--permission-mode", "dangerous"]
+    }
+  ]
+}
