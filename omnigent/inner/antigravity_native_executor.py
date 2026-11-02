@@ -79,6 +79,8 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InterruptOutcome,
+    InterruptReport,
     Message,
     ToolSpec,
     TurnComplete,
@@ -144,6 +146,14 @@ class AntigravityNativeExecutor(Executor):
         return outcome is None
 
     async def interrupt_session(self, session_key: str) -> bool:
+        """Interrupt the active native Antigravity turn; see :meth:`interrupt_session_report`.
+
+        :returns: ``True`` only when agy accepted the cancel.
+        """
+        report = await self.interrupt_session_report(session_key)
+        return report.outcome is InterruptOutcome.STOPPED
+
+    async def interrupt_session_report(self, session_key: str) -> InterruptReport:
         """
         Interrupt the active native Antigravity turn via ``CancelCascadeSteps``.
 
@@ -164,34 +174,36 @@ class AntigravityNativeExecutor(Executor):
 
         :param session_key: Adapter session key. Unused; the native bridge is
             per conversation.
-        :returns: ``True`` when agy accepted the cancel; ``False`` when there is
-            no real conversation yet (placeholder / missing or inactive bridge
-            state), no agy connect-RPC port could be resolved, or the cancel RPC
-            failed.
+        :returns: ``STOPPED`` when agy accepted the cancel; ``NOTHING_TO_STOP``
+            when there is no real conversation yet (placeholder / missing or
+            inactive bridge state); ``UNCONFIRMED`` when a live conversation's
+            cancel could not be delivered (no connect-RPC port, or the RPC failed).
         """
         del session_key
         state = await asyncio.to_thread(read_bridge_state, self._bridge_dir)
         if state is None or not _session_is_active(state.session_id, self._request_session_id):
-            return False
+            return InterruptReport(InterruptOutcome.NOTHING_TO_STOP)
         cascade_id = state.conversation_id
         # No live cascade exists before agy mints its real id, so never RPC the
         # ``agy_conv_*`` placeholder.
         if is_placeholder_conversation_id(cascade_id):
-            return False
+            return InterruptReport(InterruptOutcome.NOTHING_TO_STOP)
         port = await asyncio.to_thread(resolve_language_server_port, cascade_id)
         if port is None:
             _logger.warning(
                 "antigravity native interrupt: no connect-RPC port for conversation=%s",
                 cascade_id,
             )
-            return False
+            return InterruptReport(InterruptOutcome.UNCONFIRMED)
         cancelled = await asyncio.to_thread(cancel_cascade_steps, port, cascade_id)
         _logger.info(
             "antigravity native interrupt via CancelCascadeSteps: conversation=%s accepted=%s",
             cascade_id,
             cancelled,
         )
-        return cancelled
+        return InterruptReport(
+            InterruptOutcome.STOPPED if cancelled else InterruptOutcome.UNCONFIRMED
+        )
 
     async def run_turn(
         self,

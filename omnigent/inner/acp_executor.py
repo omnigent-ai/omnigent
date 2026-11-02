@@ -71,6 +71,8 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InterruptOutcome,
+    InterruptReport,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -1998,15 +2000,25 @@ class AcpExecutor(Executor):
             # Inbound message = progress; reset the idle deadline.
             deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
 
-    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
+    async def interrupt_session(self, session_key: str) -> bool:
+        """Abort the running turn; see :meth:`interrupt_session_report`.
+
+        :returns: ``True`` only when ``session/cancel`` was sent.
+        """
+        report = await self.interrupt_session_report(session_key)
+        return report.outcome is InterruptOutcome.STOPPED
+
+    async def interrupt_session_report(self, session_key: str) -> InterruptReport:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.
 
         The agent responds by ending the in-flight ``session/prompt`` with a
         ``cancelled`` stop reason, which the ``run_turn`` loop then surfaces.
-        Best-effort: a no-op (returns ``False``) if there's no live session.
+
+        :returns: ``STOPPED`` when the cancel was sent, ``NOTHING_TO_STOP`` with no
+            live session, and ``UNCONFIRMED`` when sending the cancel failed.
         """
         if self._proc is None or self._proc.returncode is not None or self._session_id is None:
-            return False
+            return InterruptReport(InterruptOutcome.NOTHING_TO_STOP)
         try:
             await self._send(
                 {
@@ -2015,10 +2027,10 @@ class AcpExecutor(Executor):
                     "params": {"sessionId": self._session_id},
                 }
             )
-            return True
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
-            logger.debug("acp[%s] session/cancel failed: %s", self._config.name, exc)
-            return False
+            logger.warning("acp[%s] session/cancel failed: %s", self._config.name, exc)
+            return InterruptReport(InterruptOutcome.UNCONFIRMED)
+        return InterruptReport(InterruptOutcome.STOPPED)
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""

@@ -24,7 +24,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_bridge_state,
 )
 from omnigent.inner.antigravity_native_executor import AntigravityNativeExecutor
-from omnigent.inner.executor import ExecutorError, ExecutorEvent, TurnComplete
+from omnigent.inner.executor import ExecutorError, ExecutorEvent, InterruptOutcome, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 _CONVERSATION_ID = "90468e33-38c3-4e48-ae9f-03c843196227"
@@ -464,6 +464,9 @@ def test_interrupt_session_rpc_failure_returns_false(
     monkeypatch.setattr(executor_mod, "cancel_cascade_steps", lambda _port, _cid: False)
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
+    # A live conversation whose cancel failed may still be running, so it is not idle.
+    report = asyncio.run(_executor(tmp_path).interrupt_session_report("main"))
+    assert report.outcome is InterruptOutcome.UNCONFIRMED
 
 
 def test_interrupt_session_no_port_returns_false(
@@ -487,6 +490,8 @@ def test_interrupt_session_no_port_returns_false(
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
     assert called["cancel"] is False
+    report = asyncio.run(_executor(tmp_path).interrupt_session_report("main"))
+    assert report.outcome is InterruptOutcome.UNCONFIRMED
 
 
 def test_interrupt_session_placeholder_returns_false(
@@ -514,6 +519,8 @@ def test_interrupt_session_placeholder_returns_false(
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
     assert called["cancel"] is False
+    report = asyncio.run(_executor(tmp_path).interrupt_session_report("main"))
+    assert report.outcome is InterruptOutcome.NOTHING_TO_STOP
 
 
 def test_interrupt_session_missing_state_returns_false(
@@ -535,6 +542,8 @@ def test_interrupt_session_missing_state_returns_false(
     result = asyncio.run(_executor(tmp_path).interrupt_session("main"))
     assert result is False
     assert called["cancel"] is False
+    report = asyncio.run(_executor(tmp_path).interrupt_session_report("main"))
+    assert report.outcome is InterruptOutcome.NOTHING_TO_STOP
 
 
 # ---------------------------------------------------------------------------
