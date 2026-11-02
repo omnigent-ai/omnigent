@@ -168,6 +168,7 @@ function loadNavigationHarness({
   acceptedSessions = new Set(),
   deepLinks = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
+  clipboardWriteText = async () => {},
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -417,7 +418,7 @@ function loadNavigationHarness({
       },
       { isSupported: () => notificationsSupported },
     ),
-    clipboard: { writeText: () => {} },
+    clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
@@ -2726,6 +2727,30 @@ describe("setup clipboard IPC wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
     );
+  });
+
+  it("settles the copy only after the asynchronous clipboard write", async (t) => {
+    const written = [];
+    let failureMessage = null;
+    const h = loadNavigationHarness({
+      clipboardWriteText: async (text) => {
+        await new Promise((resolve) => {
+          setImmediate(resolve);
+        });
+        if (failureMessage) throw new Error(failureMessage);
+        written.push(text);
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const copy = h.ipc.get("omnigent:copy-setup-text");
+    const event = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+
+    await copy(event, "https://host.example/ml/omnigents");
+    assert.deepEqual(written, ["https://host.example/ml/omnigents"]);
+
+    failureMessage = "clipboard unavailable";
+    await assert.rejects(copy(event, "https://other.example"), /clipboard unavailable/);
   });
 });
 

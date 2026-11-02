@@ -641,10 +641,10 @@ const GRANTED_PERMISSIONS = new Set([
  * (localhost-trusted origins, not just pinned ones — see
  * isLocalhostTrustedOrigin). Two names because Chromium renamed the
  * permission: ``loopback-network`` is the granular Chromium 145+ name
- * (valid in Electron 42's Chromium 148, and the one Okta FastPass queries
+ * (valid in Electron 45's Chromium 156, and the one Okta FastPass queries
  * FIRST), ``local-network-access`` the older aggregate it falls back to.
  *
- * The localhost fetches themselves are NOT gated in Electron 42 (Chromium's
+ * The localhost fetches themselves are NOT gated in Electron 45 (Chromium's
  * LNA checks are disabled; verified empirically, including with
  * LocalNetworkAccessChecks force-enabled). But
  * ``navigator.permissions.query({name: ...})`` for these routes through the
@@ -707,7 +707,7 @@ async function ensureSystemMicAccess() {
  * request/check to a webContents — the requesting page is its top-level
  * page. Permission *checks* (the permissions.query path) can arrive with a
  * null webContents; those are allowed on origin trust alone, because the
- * answer is advisory in Electron 42 — it gates nothing beyond what fetch
+ * answer is advisory in Electron 45 — it gates nothing beyond what fetch
  * already allows, and a "denied" would falsely turn away IdP scripts that
  * probe before fetching.
  *
@@ -4350,7 +4350,8 @@ function registerIpc() {
     if (typeof text !== "string") {
       throw new TypeError("copy-setup-text requires a string");
     }
-    clipboard.writeText(text);
+    // Async since Electron 44; returning it lets the page report a failed copy.
+    return clipboard.writeText(text);
   });
 
   // SPA server picker → the sender window's pinned origin plus the persisted
