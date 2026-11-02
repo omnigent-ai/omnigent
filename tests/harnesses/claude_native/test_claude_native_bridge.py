@@ -4289,6 +4289,36 @@ def test_augment_claude_args_appends_caller_system_prompt(
     assert prompt_args == expected_prompt_args
 
 
+@pytest.mark.parametrize(
+    "user_args",
+    [
+        ("--system-prompt", "--append-system-prompt", "--model", "sonnet"),
+        ("--system-prompt", "--append-system-prompt"),
+    ],
+    ids=["before-user-option", "before-omnigent-options"],
+)
+def test_augment_claude_args_keeps_prompt_flag_owned_by_another_option(
+    tmp_path: Path,
+    user_args: tuple[str, ...],
+) -> None:
+    """An ``--append-system-prompt`` that is another option's value stays untouched."""
+    omnigent_args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt="Keep framework metadata separate.",
+    )
+
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt="Keep framework metadata separate.",
+    )
+
+    assert args == [*user_args, *omnigent_args]
+
+
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
     """Framework preapproval extends rather than replaces the user's allowlist."""
     args = augment_claude_args(

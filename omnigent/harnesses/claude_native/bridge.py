@@ -2968,6 +2968,56 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
+# Claude Code options with a required value: Claude consumes the next token as
+# that value even when it starts with a dash (``--system-prompt --append-system-prompt``).
+_CLAUDE_VALUE_FLAGS = frozenset(
+    {
+        "-n",
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--allowed-tools",
+        "--allowedTools",
+        "--append-system-prompt",
+        "--append-system-prompt-file",
+        "--autocompact",
+        "--betas",
+        "--client-data-url",
+        "--debug-file",
+        "--disallowed-tools",
+        "--disallowedTools",
+        "--effort",
+        "--environment",
+        "--fallback-model",
+        "--file",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--max-thinking-tokens",
+        "--max-turns",
+        "--mcp-config",
+        "--model",
+        "--name",
+        "--output-format",
+        "--permission-mode",
+        "--permission-prompt-tool",
+        "--permission-prompts",
+        "--plugin-dir",
+        "--plugin-url",
+        "--prefill",
+        "--remote-control-session-name-prefix",
+        "--resume-session-at",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--system-prompt",
+        "--system-prompt-file",
+        "--system-prompt-snapshot",
+        "--tools",
+    }
+)
+
+
 def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
     """Append ``extra`` to the caller's ``--append-system-prompt`` value.
 
@@ -2985,13 +3035,13 @@ def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]
     effective: tuple[int, bool] | None = None
     idx = 0
     while idx < len(args):
-        if args[idx] == flag and idx + 1 < len(args):
-            # Claude takes the next token as the value even when it starts with a dash.
-            effective = (idx + 1, False)
-            idx += 2
-            continue
-        if args[idx].startswith(joined_prefix):
+        arg = args[idx]
+        if arg.startswith(joined_prefix):
             effective = (idx, True)
+        elif arg in _CLAUDE_VALUE_FLAGS:
+            if arg == flag and idx + 1 < len(args):
+                effective = (idx + 1, False)
+            idx += 1
         idx += 1
     if effective is None:
         args.extend([flag, extra])
