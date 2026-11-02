@@ -280,14 +280,14 @@ export function AskUserQuestionForm({
                 <label
                   key={opt.label}
                   htmlFor={inputId}
-                  className="flex items-start gap-2 cursor-pointer text-ui text-foreground mobile-touch-target mobile-app:items-center"
+                  className="flex items-start gap-2 cursor-pointer text-ui text-foreground mobile-touch-target mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center"
                 >
                   <input
                     type="checkbox"
                     id={inputId}
                     checked={checked}
                     onChange={() => handleMultiToggle(currentKey, opt.label)}
-                    className="mt-1 mobile-app:mt-0"
+                    className="mt-1 mobile-app:mt-0 mobile-app:justify-self-center"
                   />
                   <span className="flex flex-col">
                     <span>{opt.label}</span>
@@ -304,7 +304,7 @@ export function AskUserQuestionForm({
               <label
                 key={opt.label}
                 htmlFor={inputId}
-                className="flex items-start gap-2 cursor-pointer text-ui text-foreground mobile-touch-target mobile-app:items-center"
+                className="flex items-start gap-2 cursor-pointer text-ui text-foreground mobile-touch-target mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center"
               >
                 <input
                   type="radio"
@@ -312,7 +312,7 @@ export function AskUserQuestionForm({
                   name={currentKey}
                   checked={checked}
                   onChange={() => handleSingleSelect(currentKey, opt.label)}
-                  className="mt-1 mobile-app:mt-0"
+                  className="mt-1 mobile-app:mt-0 mobile-app:justify-self-center"
                 />
                 <span className="flex flex-col">
                   <span>{opt.label}</span>
@@ -328,7 +328,7 @@ export function AskUserQuestionForm({
                matching radio/checkbox prefix, so the user picks
                between predefined options and free-form input the
                same way. */
-            <div className="flex items-start gap-2 text-ui text-foreground mobile-app:items-center">
+            <div className="flex items-start gap-2 text-ui text-foreground mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center">
               <label
                 htmlFor={customRowId}
                 className="flex shrink-0 cursor-pointer mobile-touch-target mobile-app:items-center mobile-app:justify-center"
@@ -359,7 +359,7 @@ export function AskUserQuestionForm({
                 onChange={(e) => handleCustomInput(currentKey, e)}
                 data-testid="ask-user-question-custom-input"
                 aria-label="Custom answer"
-                className="mobile-touch-target mobile-app:min-w-0 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+                className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
               />
             </div>
           )}
