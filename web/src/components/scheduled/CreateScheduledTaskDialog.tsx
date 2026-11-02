@@ -896,9 +896,8 @@ export function CreateScheduledTaskDialog({
                   >
                     <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
                     <p>
-                      These settings apply when starting a new session. This automation continues an
-                      existing session; change its model, effort, and permission mode directly in
-                      that session.
+                      To change model, effort, or permission mode, edit the existing session
+                      directly.
                     </p>
                   </div>
                 ) : (

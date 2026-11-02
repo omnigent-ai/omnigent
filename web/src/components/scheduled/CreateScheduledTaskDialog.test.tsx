@@ -1339,7 +1339,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
       }
       expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
-        "change its model, effort, and permission mode directly in that session",
+        "To change model, effort, or permission mode, edit the existing session directly.",
       );
       fireEvent.change(screen.getByTestId("task-prompt-input"), {
         target: { value: "Updated prompt" },
