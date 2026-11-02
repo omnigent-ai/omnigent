@@ -1527,6 +1527,7 @@ def create_runner_app(
     # the stream's failure handler consumes the record to report the exit.
     _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
+    _clean_terminal_exit_responses: dict[str, str | None] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -2017,10 +2018,28 @@ def create_runner_app(
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
-        # Record the exit before releasing the harness: the release severs any
-        # in-flight turn stream, whose failure handler then reports this exit
-        # instead of the transport error the severed socket raises.
-        # Classify once; the error card and the failure log share the diagnosis.
+        # A dead required terminal cannot still be working a turn.
+        _native_pane_status.pop(event.session_id, None)
+
+        # A claude /exit or /quit prints this banner and exits 0. Printing it
+        # can flip the idle memo back to "running" before pane death, so treat
+        # a banner exit as a clean stop rather than a failure.
+        if (event.terminal_name in ("qwen", "antigravity") and event.session_key == "main") or (
+            event.exit_status == 0
+            and event.terminal_name == "claude"
+            and event.last_output is not None
+            and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
+        ):
+            # Releasing the harness can sever this response's stream after its clean exit.
+            _required_terminal_exit_errors.pop(event.session_id, None)
+            _clean_terminal_exit_responses[event.session_id] = _live_response_id.get(
+                event.session_id
+            )
+            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _release_required_terminal_session(event.session_id)
+            return
+
+        # Record the exit before release severs its stream, preserving the cause.
         diagnosis = classify_terminal_failure(
             command=event.command,
             exit_status=event.exit_status,
@@ -2030,26 +2049,6 @@ def create_runner_app(
             diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
         error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
-        # A dead required terminal cannot still be working a turn.
-        _native_pane_status.pop(event.session_id, None)
-
-        if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
-            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
-            _release_required_terminal_session(event.session_id)
-            return
-
-        # A claude /exit or /quit prints this banner and exits 0. Printing it
-        # can flip the idle memo back to "running" before pane death, so treat
-        # a banner exit as a clean stop rather than a failure.
-        if (
-            event.exit_status == 0
-            and event.terminal_name == "claude"
-            and event.last_output is not None
-            and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
-        ):
-            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
-            _release_required_terminal_session(event.session_id)
-            return
 
         if event.session_was_idle:
             _release_required_terminal_session(event.session_id)
@@ -3572,6 +3571,7 @@ def create_runner_app(
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
+        _clean_terminal_exit_responses.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
@@ -4089,6 +4089,7 @@ def create_runner_app(
         error: dict[str, Any] | None = None,
         owner_response_id: str | None = None,
         sign_in_hold: bool = False,
+        cancelled: bool = False,
     ) -> None:
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
@@ -4122,14 +4123,16 @@ def create_runner_app(
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
+        inbox_recovery_checked = False
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
         if _suppress_status:
             _desync_terminalized.pop(conv_id, None)
-        if was_interrupted:
+        if was_interrupted or cancelled:
             _interrupted_sessions.discard(conv_id)
-            _append_cancellation_items(conv_id)
+            if was_interrupted:
+                _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
         elif sign_in_hold:
@@ -4161,14 +4164,19 @@ def create_runner_app(
             if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
                 watcher.cancel()
             if not has_buffered and not _suppress_status:
+                # Schedule unread inbox results before deciding the session is done.
+                # An intermediate idle lets headless clients stop the runner early.
+                _rewake_parent_if_inbox_stranded(conv_id)
+                inbox_recovery_checked = True
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
-                    (e := _subagent_work_by_child.get(c)) is not None
-                    and e.status in ("launching", "running", "waiting")
-                    for c in children
+                    (entry := _subagent_work_by_child.get(child_id)) is not None
+                    and entry.status in ("launching", "running", "waiting")
+                    for child_id in children
                 )
-                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
-        if was_interrupted:
+                waiting = has_running_children or conv_id in _subagent_wake_pending
+                _publish_turn_status(conv_id, "waiting" if waiting else "idle")
+        if was_interrupted or cancelled:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
                 # interrupt marker to unwind the harness), NOT by a user
@@ -4202,6 +4210,8 @@ def create_runner_app(
             # A clean native turn end acknowledges prompt submission, so the
             # dispatch leaves ``launching`` even when no running edge is relayed.
             mark_subagent_work_started(conv_id)
+        if inbox_recovery_checked:
+            return
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
@@ -6035,6 +6045,7 @@ def create_runner_app(
         # A required-terminal exit recorded before this turn belongs to an
         # earlier stream; only exits observed from here on can end this one.
         _required_terminal_exit_errors.pop(conv_id, None)
+        _clean_terminal_exit_responses.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -6252,6 +6263,7 @@ def create_runner_app(
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
+            _response_data: _JsonObject = {}
             # A sign-in refusal kept from the chat while its message waits to be resent.
             _held_refusal: _JsonObject | None = None
             _held_body: _JsonObject | None = None
@@ -6362,6 +6374,7 @@ def create_runner_app(
                             if event is not None:
                                 if event.get("type") == "response.created":
                                     resp_obj = event.get("response") or {}
+                                    _response_data = dict(resp_obj)
                                     _response_id = resp_obj.get("id")
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
@@ -6780,6 +6793,25 @@ def create_runner_app(
             except (httpx.HTTPError, RuntimeError) as exc:
                 # A refusal kept before the stream broke still reports its message undelivered.
                 _report_held_refusal()
+                if (
+                    conv_id in _clean_terminal_exit_responses
+                    and _clean_terminal_exit_responses[conv_id] == _response_id
+                ):
+                    _clean_terminal_exit_responses.pop(conv_id)
+                    _on_proxy_stream_end(conv_id, owner_response_id=_response_id, cancelled=True)
+                    if _response_id is not None:
+                        cancelled_event = {
+                            "type": "response.cancelled",
+                            "response": {
+                                **_response_data,
+                                "status": "cancelled",
+                                "completed_at": int(time.time()),
+                            },
+                            **turn_input_identity,
+                        }
+                        _publish_event(conv_id, cancelled_event)
+                        yield _encode_sse_event(cancelled_event)
+                    return
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
                 if _exit_error is not None:
                     # The runner ended this stream itself: the session's required
@@ -8155,6 +8187,7 @@ def create_runner_app(
         session_id: str,
     ) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
+        _clean_terminal_exit_responses.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -8185,6 +8218,7 @@ def create_runner_app(
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
+        _clean_terminal_exit_responses.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
