@@ -75,6 +75,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runtime import (
     inflight_text,
+    pending_client_tool_calls,
     pending_elicitations,
     pending_inputs,
     session_stream,
@@ -2773,6 +2774,13 @@ def register_events_routes(
                     "Failed to deliver the tool result to the session runner.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
+            # Drain the pending-client-tool-call index eagerly, on the first
+            # accepted answer, rather than waiting for the completed
+            # function_call to round-trip back through the stream. This is
+            # what makes a second client's reconnect snapshot reflect an
+            # answer immediately, and makes a duplicate answer harmless
+            # (resolve() on an already-drained call_id is a no-op).
+            pending_client_tool_calls.resolve(session_id, body.data["call_id"])
             return {"queued": True, "item_id": body.data["call_id"]}
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first

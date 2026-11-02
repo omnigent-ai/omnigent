@@ -17,6 +17,7 @@ from typing import Any
 
 from omnigent.runner.app import (
     TurnDispatch,
+    _compute_client_side_tool_names,
     _merge_request_client_tools,
     _schema_tool_name,
     _should_dispatch_tool_locally,
@@ -33,6 +34,11 @@ def _schema(name: str) -> dict[str, Any]:
             "parameters": {"type": "object", "properties": {}},
         },
     }
+
+
+def _flat_schema(name: str) -> dict[str, Any]:
+    """Flat-form tool schema, as a server-discovered tool may arrive."""
+    return {"name": name, "description": "", "parameters": {"type": "object", "properties": {}}}
 
 
 def test_client_tools_appended_after_spec_tools() -> None:
@@ -235,3 +241,76 @@ def test_legacy_path_dispatches_builtin() -> None:
         )
         is True
     )
+
+
+# ── _compute_client_side_tool_names: the harness's idle-watchdog /
+# reconnect-snapshot ownership source ──────────────────────────────────
+
+
+def test_compute_client_side_tool_names_excludes_a_spec_owned_tool() -> None:
+    """A spec/server tool merged into the same request never counts as client-owned.
+
+    Reproduces the production-boundary defect directly: ``tools`` (the
+    harness-facing merged list) mixes ``github__get_issue`` (spec-owned)
+    with ``report_done`` (the only tool the client actually offered).
+    Deriving ownership from the merged list alone would wrongly exempt
+    ``github__get_issue`` from the idle watchdog; this function must
+    exclude it.
+    """
+    spec = [_schema("github__get_issue")]
+    client = [_schema("report_done")]
+
+    result = _compute_client_side_tool_names(spec, client)
+
+    assert result == frozenset({"report_done"})
+
+
+def test_compute_client_side_tool_names_resolves_name_collision_to_spec_ownership() -> None:
+    """A name a spec tool already claims is never client-owned, even if the client re-declares it.
+
+    Mirrors ``_merge_request_client_tools``'s own builtins-win precedence:
+    the collision must resolve the same way on both sides, or the merged
+    tool list and the ownership set would disagree about who owns the call
+    that name produces.
+    """
+    spec = [_schema("github__get_issue")]
+    client = [_schema("github__get_issue"), _schema("report_done")]
+
+    result = _compute_client_side_tool_names(spec, client)
+
+    assert result == frozenset({"report_done"})
+
+
+def test_compute_client_side_tool_names_resolves_flat_wrapped_collision_to_spec_ownership() -> (
+    None
+):
+    """A flat-form spec schema and a nested-form client schema for the same name still collide.
+
+    ``_schema_tool_name`` must recognize both shapes, or a flat-form
+    spec-discovered tool goes unrecognized in the spec-name set and a
+    client re-declaration of the same name (in either shape) incorrectly
+    survives as client-owned.
+    """
+    spec = [_flat_schema("github__get_issue")]
+    client = [_schema("github__get_issue"), _flat_schema("report_done")]
+
+    result = _compute_client_side_tool_names(spec, client)
+
+    assert result == frozenset({"report_done"})
+
+
+def test_compute_client_side_tool_names_empty_client_tools() -> None:
+    """No request-supplied tools → nothing is client-owned, regardless of the spec surface."""
+    assert _compute_client_side_tool_names([_schema("load_skill")], []) == frozenset()
+
+
+def test_schema_tool_name_reads_flat_form() -> None:
+    """``_schema_tool_name`` recognizes the flat form, not just nested/wrapped.
+
+    A server-discovered tool schema can arrive flat (``{"name": ...}``).
+    Before this fix, only the nested ``{"function": {"name": ...}}`` form
+    was recognized, so a flat-form spec tool went unrecognized in the
+    spec-name set used for both the merge and the ownership subtraction.
+    """
+    assert _schema_tool_name(_flat_schema("github__get_issue")) == "github__get_issue"
+    assert _schema_tool_name(_schema("github__get_issue")) == "github__get_issue"

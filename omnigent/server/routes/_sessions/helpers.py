@@ -60,6 +60,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
+    FunctionCallOutputData,
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
@@ -105,6 +106,7 @@ from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelR
 from omnigent.runtime import (
     get_policy_store,
     inflight_text,
+    pending_client_tool_calls,
     pending_elicitations,
     pending_inputs,
 )
@@ -1705,6 +1707,45 @@ def _pending_elicitation_snapshot_for_session(
                 seen.add(elicitation_id)
             events.append(_targeted_elicitation_event(event, target_session_id=child.id))
     return events
+
+
+def _pending_client_tool_call_snapshot_for_session(
+    conv_id: str,
+    items: list[ConversationItem],
+) -> list[dict[str, Any]]:
+    """
+    Return outstanding client-tool-call event payloads for a session snapshot.
+
+    Cross-checks the index against the already-fetched item page: a
+    ``call_id`` already answered in the conversation store is dropped even
+    if the in-memory index did not clear it. This guards against the one
+    multi-replica split where ``POST /events`` accepts an answer (and the
+    runner persists the completed call) on a different replica than the one
+    that recorded the original ``action_required`` entry, so that replica's
+    index never saw the drain. Without this check a client could be shown a
+    call to answer that is already resolved.
+
+    :param conv_id: Session conversation id being snapshotted.
+    :param items: The item page already fetched for this snapshot
+        (newest-first window of the conversation's persisted items).
+    :returns: Pending client-tool-call event dicts suitable for
+        :class:`SessionResponse.pending_client_tool_calls`.
+    """
+    pending = pending_client_tool_calls.snapshot_for(conv_id)
+    if not pending:
+        return pending
+    answered_call_ids = {
+        item.data.call_id
+        for item in items
+        if item.type == "function_call_output" and isinstance(item.data, FunctionCallOutputData)
+    }
+    if not answered_call_ids:
+        return pending
+    return [
+        event
+        for event in pending
+        if (event.get("item") or {}).get("call_id") not in answered_call_ids
+    ]
 
 
 def _publish_input_consumed(
@@ -12418,6 +12459,7 @@ __all__ = [
     "_parse_external_conversation_item",
     "_parse_session_create_metadata",
     "_parse_skill_slash_command",
+    "_pending_client_tool_call_snapshot_for_session",
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",

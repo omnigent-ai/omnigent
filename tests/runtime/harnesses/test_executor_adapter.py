@@ -1909,6 +1909,90 @@ def test_run_turn_clears_mcp_queue_at_turn_start() -> None:
     )
 
 
+async def test_stable_tool_executor_holds_idle_watchdog_only_for_a_request_declared_tool() -> None:
+    """
+    ``_stable_tool_executor`` classifies client-owned waits from ``request.tools``,
+    not a name prefix.
+
+    Reproduces the second watchdog defect: an ordinary runner/server-side
+    tool (an MCP tool, a spec-local tool, a runner builtin — anything not
+    starting with ``sys_os_``) must NOT hold the idle watchdog open merely
+    because its name doesn't match a prefix heuristic. The only
+    authoritative signal is whether the turn's own request actually
+    declared the tool (``_current_client_tool_names``, built from
+    ``request.tools`` — the same kind of per-run ownership record the
+    runner's own ``TurnDispatch.client_side_tool_names`` is for the
+    native-harness/subprocess model). Drives the real
+    :class:`TurnContext` and the real ``_stable_tool_executor`` /
+    ``_bridge_one_dispatch`` chain — no hand-rolled ctx fake.
+    """
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_classification", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "test-agent"
+    # This turn's request declared exactly one client tool.
+    adapter._current_client_tool_names = frozenset({"lookup_secret_token"})
+
+    # An ordinary server-side tool the request never declared — an MCP tool,
+    # a spec-local tool, or a runner builtin. Not a sys_os_* name either, so
+    # the old prefix heuristic would have wrongly held the watchdog open.
+    server_task = asyncio.create_task(
+        adapter._stable_tool_executor("search_docs", {}, call_id="call_server")
+    )
+    await queue.get()  # the action_required emit
+    assert ctx._pending_human_waits == 0, (
+        "a tool the request never declared must not count as a human wait — "
+        "a wedge here must still trip the idle watchdog"
+    )
+    ctx._pending_tool_calls["call_server"].set_result("{}")
+    assert await server_task == {}
+    assert ctx._pending_human_waits == 0
+
+
+async def test_stable_tool_executor_holds_idle_watchdog_for_a_request_declared_client_tool() -> (
+    None
+):
+    """
+    An explicitly-offered client tool DOES hold the idle watchdog open while parked.
+
+    The companion case to the test above: a tool the turn's own request
+    actually declared in ``request.tools`` is the one case that may
+    legitimately wait on a person far longer than an idle window, so it
+    must still hold the watchdog open — the fix for the first defect must
+    not have been lost while fixing the classification source for the
+    second.
+    """
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_classification_client", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "test-agent"
+    adapter._current_client_tool_names = frozenset({"lookup_secret_token"})
+
+    client_task = asyncio.create_task(
+        adapter._stable_tool_executor("lookup_secret_token", {}, call_id="call_client")
+    )
+    await queue.get()
+    assert ctx._pending_human_waits == 1, (
+        "a request-declared client tool must hold the idle watchdog open "
+        "while parked, same as before this fix"
+    )
+    ctx._pending_tool_calls["call_client"].set_result("{}")
+    assert await client_task == {}
+    assert ctx._pending_human_waits == 0
+
+
 async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
     """
     ``_stable_tool_executor`` pops the queued tool_use_id even
@@ -1964,6 +2048,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             name: str,
             arguments: str,
             agent: str,
+            client_owned: bool = True,
         ) -> str:
             """Record the call_id then return a benign payload.
 
@@ -1971,10 +2056,12 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             :param name: Tool name (ignored).
             :param arguments: JSON-encoded args (ignored).
             :param agent: Agent name (ignored).
+            :param client_owned: Watchdog-hold flag (ignored here;
+                pinned separately in test_scaffold.py).
             :returns: Empty JSON object so
                 ``_bridge_one_dispatch`` can decode.
             """
-            del name, arguments, agent
+            del name, arguments, agent, client_owned
             captured_call_ids.append(call_id)
             return "{}"
 
@@ -2088,6 +2175,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             name: str,
             arguments: str,
             agent: str,
+            client_owned: bool = True,
         ) -> str:
             """
             Record the call_id and return a benign payload.
@@ -2100,10 +2188,12 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             :param name: Tool name (ignored for this test).
             :param arguments: JSON-encoded args (ignored).
             :param agent: Agent name (ignored).
+            :param client_owned: Watchdog-hold flag (ignored here;
+                pinned separately in test_scaffold.py).
             :returns: ``"{}"`` so the inner SDK can decode it as
                 JSON without errors.
             """
-            del name, arguments, agent
+            del name, arguments, agent, client_owned
             captured_dispatched_call_ids.append(call_id)
             return "{}"
 
@@ -2162,6 +2252,117 @@ async def test_executor_adapter_builds_config_from_request() -> None:
     await adapter.run_turn(request, ctx)
     assert captured["extra"] == {"reasoning_effort": "medium", "max_tokens": 65536}
     assert captured["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_prefers_request_client_side_tool_names_over_tools_derivation() -> None:
+    """
+    ``_current_client_tool_names`` comes from ``request.client_side_tool_names`` when present.
+
+    Reproduces the production-boundary defect: ``request.tools`` is the
+    runner's MERGED spec + client tool list once a real turn reaches the
+    harness, so deriving ownership from ``tools`` directly would wrongly
+    treat a spec-owned tool merged into the same request as client-owned
+    whenever ``client_side_tool_names`` isn't read. With the authoritative
+    field present, only its names — not every name in ``tools`` — become
+    the turn's client-owned set.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    captured: dict[str, object] = {}
+
+    class _CaptureClientToolNamesExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            captured["client_tool_names"] = adapter._current_client_tool_names
+            yield TurnComplete(response="ok")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _CaptureClientToolNamesExecutor())
+    ctx = TurnContext(
+        response_id="resp_authoritative_ownership",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    request = CreateResponseRequest(
+        model="test-agent",
+        input="hi",
+        tools=[
+            {"type": "function", "function": {"name": "github__get_issue"}},
+            {"type": "function", "function": {"name": "report_done"}},
+        ],
+        # The authoritative set excludes the spec-owned github__get_issue,
+        # even though it is also present in ``tools`` above.
+        client_side_tool_names=["report_done"],
+    )
+    await adapter.run_turn(request, ctx)
+    assert captured["client_tool_names"] == frozenset({"report_done"}), (
+        "github__get_issue must not leak into the client-owned set merely "
+        "because it is also present in request.tools"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_fails_closed_when_client_side_tool_names_absent() -> None:
+    """
+    Without the authoritative field, NOTHING is treated as client-owned.
+
+    An absent ``client_side_tool_names`` (an older runner, or a direct or
+    synthetic caller that can't compute it) must fail CLOSED, not fall
+    back to treating every name in ``tools`` as a candidate: that fallback
+    would re-admit the exact spec/client ambiguity the field exists to
+    resolve (a spec tool sharing the request with a client tool would
+    again be wrongly exempted from the idle watchdog). The cost of failing
+    closed is only that a genuine client wait isn't specially recognized
+    until the sender is updated; it still parks and resolves normally.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    captured: dict[str, object] = {}
+
+    class _CaptureClientToolNamesExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            captured["client_tool_names"] = adapter._current_client_tool_names
+            yield TurnComplete(response="ok")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _CaptureClientToolNamesExecutor())
+    ctx = TurnContext(
+        response_id="resp_fail_closed_ownership",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    request = CreateResponseRequest(
+        model="test-agent",
+        input="hi",
+        tools=[{"type": "function", "function": {"name": "report_done"}}],
+        client_side_tool_names=None,
+    )
+    await adapter.run_turn(request, ctx)
+    expected_failure_message = (
+        "an absent ownership signal must never be treated as "
+        f"'everything in tools is client-owned'; got {captured['client_tool_names']!r}"
+    )
+    assert captured["client_tool_names"] == frozenset(), expected_failure_message
 
 
 @pytest.mark.asyncio

@@ -311,6 +311,7 @@ from omnigent.server.routes._sessions.helpers import (
     _owner_from_grants,
     _owns_host_runner,
     _parse_external_conversation_item,
+    _pending_client_tool_call_snapshot_for_session,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
     _persist_native_policy_notice,
@@ -1562,6 +1563,10 @@ def _build_session_response(
             if pending_elicitation_events is not None
             else pending_elicitations.snapshot_for(conv.id)
         ),
+        # Replay outstanding client-tool calls into the snapshot, the same
+        # way as pending_elicitations above — a call parked before this
+        # client (re)connected would otherwise never surface as answerable.
+        pending_client_tool_calls=_pending_client_tool_call_snapshot_for_session(conv.id, items),
         # Replay un-consumed web messages on native-terminal sessions
         # so a client that posted then navigated away / rebound re-
         # hydrates the optimistic bubble. Empty for non-native sessions
