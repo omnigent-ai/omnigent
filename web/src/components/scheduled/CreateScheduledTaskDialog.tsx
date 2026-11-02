@@ -142,7 +142,6 @@ export function CreateScheduledTaskDialog({
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
-  const [permissionSelectionTouched, setPermissionSelectionTouched] = useState(false);
 
   const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(
@@ -259,14 +258,18 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
-  const permissionChanged =
-    permissionSelectionTouched &&
-    isEdit &&
+  const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
+    ? "managed_sandbox"
+    : "connected_host";
+  // Changing the agent, host, workspace, or execution target clears the session binding.
+  const reusesExistingSession =
+    sessionMode === "continue" &&
+    editingTask?.sessionId != null &&
+    !startNewSession &&
     !agentChanged &&
-    showModelEffort &&
-    pickedPermission !== (editingTask?.permissionMode ?? "");
-  const keepsExistingSession =
-    permissionChanged && sessionMode === "continue" && editingTask?.sessionId != null;
+    executionTarget === editingTask.executionTarget &&
+    (hostId === "" || hostId === editingTask.hostId) &&
+    (workspace.trim() === "" || workspace.trim() === editingTask.workspace);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
@@ -289,7 +292,6 @@ export function CreateScheduledTaskDialog({
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
-      setPermissionSelectionTouched(false);
       setAdvancedOpen(true);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
@@ -449,9 +451,6 @@ export function CreateScheduledTaskDialog({
       // are omitted. Only send executionTarget when it's meaningful: on create
       // when sandbox is chosen (connected_host is the server default), and on
       // edit only when it actually changed — mirroring how agentId is threaded.
-      const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
-        ? "managed_sandbox"
-        : "connected_host";
       const executionTargetChanged = editingTask
         ? editingTask.executionTarget !== executionTarget
         : sandboxMode;
@@ -475,17 +474,16 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Thread model/effort ONLY when the agent supports them. Each control's
-        // "" (Default) maps to `null` so an update CLEARS a previously-set
-        // override; a non-default pick sends the value. When the agent has no
-        // model/effort surface we send neither key (left untouched server-side).
-        const overrides = showModelEffort
-          ? {
-              modelOverride: pickedModel === "" ? null : pickedModel,
-              reasoningEffort: pickedEffort === "" ? null : pickedEffort,
-              permissionMode: pickedPermission === "" ? null : pickedPermission,
-            }
-          : {};
+        // Only send supported launch settings when starting a new session.
+        // Default clears the saved override; continued-session edits omit these fields.
+        const overrides =
+          showModelEffort && !reusesExistingSession
+            ? {
+                modelOverride: pickedModel === "" ? null : pickedModel,
+                reasoningEffort: pickedEffort === "" ? null : pickedEffort,
+                permissionMode: pickedPermission === "" ? null : pickedPermission,
+              }
+            : {};
         await updateMutation.mutateAsync({
           id: editingTask.id,
           input: {
@@ -876,38 +874,39 @@ export function CreateScheduledTaskDialog({
               </CollapsibleTrigger>
               <CollapsibleContent className="pt-3" data-testid="task-model-effort-field">
                 <ModelEffortFields
-                  model={pickedModel}
-                  effort={pickedEffort}
-                  permissionMode={pickedPermission}
+                  model={reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel}
+                  effort={
+                    reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
+                  }
+                  permissionMode={
+                    reusesExistingSession ? (editingTask?.permissionMode ?? "") : pickedPermission
+                  }
                   hostId={hostId}
+                  disabled={reusesExistingSession}
                   onModelChange={setPickedModel}
                   onEffortChange={setPickedEffort}
-                  onPermissionModeChange={(mode) => {
-                    setPickedPermission(mode);
-                    setPermissionSelectionTouched(true);
-                  }}
+                  onPermissionModeChange={setPickedPermission}
                   onSelectOpenChange={handleSelectOpenChange}
                 />
-                <p className="mt-1.5 text-sm text-muted-foreground">
-                  Leave on Default to use the agent&apos;s configured model, effort, and permission
-                  mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait
-                  for approval that never comes.
-                </p>
-                {permissionChanged && (
+                {reusesExistingSession ? (
                   <div
                     className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
-                    data-testid="task-permission-change-note"
+                    data-testid="task-session-settings-note"
                     role="status"
                   >
                     <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
                     <p>
-                      {keepsExistingSession && sessionModesSupported
-                        ? startNewSession
-                          ? "The current session keeps its permission mode. The next run starts a new session with this selection."
-                          : "This change doesn't affect the current session. To use it, select “Start a new session on the next run” above."
-                        : "This change applies only to sessions created after you save. Existing sessions keep their permission mode."}
+                      These settings apply when starting a new session. This automation continues an
+                      existing session; change its model, effort, and permission mode directly in
+                      that session.
                     </p>
                   </div>
+                ) : (
+                  <p className="mt-1.5 text-sm text-muted-foreground">
+                    Leave on Default to use the agent&apos;s configured model, effort, and
+                    permission mode. Automations run unattended, so a prompting mode (Manual or
+                    Plan) will wait for approval that never comes.
+                  </p>
                 )}
               </CollapsibleContent>
             </Collapsible>

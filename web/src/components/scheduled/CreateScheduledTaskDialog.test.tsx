@@ -1311,73 +1311,159 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
-    expect(screen.queryByTestId("task-permission-change-note")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
   });
 
-  it.each([false, true])("warns before saving a permission edit with reset=%s", async (reset) => {
-    render(
-      <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
-      >
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({
-            agentId: "ag_claude_native",
-            permissionMode: "plan",
-            sessionMode: "continue",
-            sessionId: "conv_1",
-          })}
-        />
-      </CapabilitiesProvider>,
-    );
-
-    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Auto" }));
-
-    const note = screen.getByTestId("task-permission-change-note");
-    expect(note).toHaveTextContent("This change doesn't affect the current session");
-    expect(note).toHaveTextContent("Start a new session on the next run");
-
-    if (reset) {
-      fireEvent.click(screen.getByTestId("task-start-new-session"));
-      expect(note).toHaveTextContent(
-        "The current session keeps its permission mode. The next run starts a new session with this selection.",
+  it.each([false, true])(
+    "locks existing session settings with session controls supported=%s",
+    async (sessionModesSupported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: sessionModesSupported,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+            })}
+          />
+        </CapabilitiesProvider>,
       );
-    }
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    const { input } = updateMutateAsync.mock.calls[0][0];
-    expect(input.permissionMode).toBe("auto");
-    if (reset) expect(input.sessionId).toBeNull();
-    else expect(input).not.toHaveProperty("sessionId");
-  });
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+      }
+      expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
+        "change its model, effort, and permission mode directly in that session",
+      );
+      fireEvent.change(screen.getByTestId("task-prompt-input"), {
+        target: { value: "Updated prompt" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.prompt).toBe("Updated prompt");
+      for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+        expect(input).not.toHaveProperty(field);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "only saves edited session settings when reset stays selected=%s",
+    async (reset) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              modelOverride: "sonnet",
+              reasoningEffort: "medium",
+              permissionMode: "plan",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+
+      fireEvent.click(screen.getByTestId("task-start-new-session"));
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+      for (const [field, option] of [
+        ["model", "Opus"],
+        ["effort", "High"],
+        ["permission", "Auto"],
+      ]) {
+        const control = screen.getByTestId(`task-${field}-trigger`);
+        expect(control).toBeEnabled();
+        fireEvent.keyDown(control, { key: "Enter" });
+        fireEvent.click(screen.getByRole("option", { name: option }));
+      }
+      if (!reset) {
+        fireEvent.click(screen.getByTestId("task-start-new-session"));
+        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
+        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
+        for (const field of ["model", "effort", "permission"]) {
+          expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+        }
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      if (reset) {
+        expect(input).toMatchObject({
+          modelOverride: "opus",
+          reasoningEffort: "high",
+          permissionMode: "auto",
+          sessionId: null,
+        });
+      } else {
+        for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+          expect(input).not.toHaveProperty(field);
+        }
+      }
+    },
+  );
 
   it.each(["new", "continue"] as const)(
-    "explains permission edits with session controls unavailable (%s)",
-    async (sessionMode) => {
+    "allows configuring %s tasks before a session exists",
+    (sessionMode) => {
       render(
         <CreateScheduledTaskDialog
           open
           onOpenChange={vi.fn()}
-          editingTask={scheduledTask({
-            agentId: "ag_claude_native",
-            permissionMode: "plan",
-            sessionMode,
-            sessionId: sessionMode === "continue" ? "conv_1" : null,
-          })}
+          editingTask={scheduledTask({ agentId: "ag_claude_native", sessionMode })}
         />,
       );
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+      }
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+    },
+  );
 
-      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Auto" }));
-
-      expect(screen.getByTestId("task-permission-change-note")).toHaveTextContent(
-        "This change applies only to sessions created after you save. Existing sessions keep their permission mode.",
+  it.each(["session mode", "host"])(
+    "unlocks settings when changing the %s starts a new session",
+    async (change) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+            })}
+          />
+        </CapabilitiesProvider>,
       );
-      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name: "Plan" }));
-      expect(screen.queryByTestId("task-permission-change-note")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      fireEvent.keyDown(
+        screen.getByTestId(change === "host" ? "task-host-trigger" : "task-session-mode-trigger"),
+        { key: "Enter" },
+      );
+      fireEvent.click(
+        await screen.findByRole("option", {
+          name: change === "host" ? "laptop" : "New session each run",
+        }),
+      );
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+      }
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
     },
   );
 
