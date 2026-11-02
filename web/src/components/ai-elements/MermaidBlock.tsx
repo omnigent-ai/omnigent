@@ -191,11 +191,8 @@ function MermaidFullscreenOverlay({
 
 const MermaidFullscreenContext = createContext<MermaidFullscreenControls | null>(null);
 
-/**
- * Owns the open diagram above the chat so it survives the block remount when a
- * streamed reply settles. Closes when the block unmounts unreplaced, or on
- * `resetKey` or theme change.
- */
+// Keeps the open diagram above the chat across a streamed reply's settle remount.
+// Closes when its block unmounts unreplaced, or on `resetKey` or theme change.
 export function MermaidFullscreenProvider({
   children,
   resetKey,
