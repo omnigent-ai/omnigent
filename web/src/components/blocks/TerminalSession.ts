@@ -1167,8 +1167,9 @@ export class TerminalSession {
     if (!this.disposed && this.ws.readyState === WebSocket.OPEN) {
       // A slow current bridge may still be waiting for the prompt; stop it.
       this.ws.send(JSON.stringify({ type: "paste-cancel", id }));
-      // Without bracketed paste every line but the last would run.
-      const typed = this.term.modes.bracketedPasteMode || !/[\r\n]/.test(inFlight.text);
+      // Unbracketed, a line break is Enter and a tab is a keystroke (completion,
+      // or whatever readline binds it to), so only plain text is typed.
+      const typed = this.term.modes.bracketedPasteMode || !/[\r\n\t]/.test(inFlight.text);
       if (typed) {
         this.term.paste(inFlight.text);
       } else {

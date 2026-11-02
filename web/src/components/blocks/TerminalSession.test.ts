@@ -1350,34 +1350,53 @@ describe("TerminalSession", () => {
     it("tells the caller when the socket closes before the bridge answers", () => {
       // WHY: the bridge may already have pasted, so the browser can't retry,
       // but the user must know to check the prompt.
-      const { socket, session } = makeSession();
-      const refused: [string, string][] = [];
-      socket.open();
-      session.pasteWhenShellReady(
-        () => "make deploy",
-        (text, reason) => refused.push([text, reason]),
-      );
-      acceptPaste(socket, 1);
-      socket.emit("close", { code: 1006, reason: "" });
+      vi.useFakeTimers();
+      try {
+        const { socket, session } = makeSession();
+        const refused: [string, string][] = [];
+        socket.open();
+        session.pasteWhenShellReady(
+          () => "make deploy",
+          (text, reason) => refused.push([text, reason]),
+        );
+        // Unacknowledged, so the close must also stop the xterm fallback.
+        socket.readyState = FakeWebSocket.CLOSED;
+        socket.emit("close", { code: 1006, reason: "" });
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
 
-      expect(refused).toEqual([["make deploy", "interrupted"]]);
-      expect(inputFrames(socket)).toEqual([]);
-      session.dispose();
+        expect(refused).toEqual([["make deploy", "interrupted"]]);
+        expect(inputFrames(socket)).toEqual([]);
+        // The next command stays queued for the view's next session to claim.
+        const claim = vi.fn(() => "pwd");
+        session.pasteWhenShellReady(claim);
+        expect(claim).not.toHaveBeenCalled();
+        expect(pasteFrames(socket)).toHaveLength(1);
+        session.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("tells the caller when the session is disposed before the bridge answers", () => {
       // WHY: dispose aborts the close listener, and the chat already handed
       // the command over, so this is the user's only notice.
-      const { socket, session } = makeSession();
-      const refused: [string, string][] = [];
-      socket.open();
-      session.pasteWhenShellReady(
-        () => "make deploy",
-        (text, reason) => refused.push([text, reason]),
-      );
-      session.dispose();
+      vi.useFakeTimers();
+      try {
+        const { socket, session } = makeSession();
+        const refused: [string, string][] = [];
+        socket.open();
+        session.pasteWhenShellReady(
+          () => "make deploy",
+          (text, reason) => refused.push([text, reason]),
+        );
+        session.dispose();
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
 
-      expect(refused).toEqual([["make deploy", "interrupted"]]);
+        expect(refused).toEqual([["make deploy", "interrupted"]]);
+        expect(inputFrames(socket)).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("resolves whenShellPasteIdle once the bridge answers", async () => {
@@ -1548,16 +1567,16 @@ describe("TerminalSession", () => {
         session.dispose();
       });
 
-      it("types a single-line command but refuses a multi-line one", () => {
-        // WHY: without bracketed paste every newline is Enter, which would run
-        // the command the user has not reviewed yet.
+      it("types a plain single-line command but refuses line breaks and tabs", () => {
+        // WHY: without bracketed paste a newline is Enter and a tab can complete
+        // or even accept the line, before the user has reviewed it.
         vi.useFakeTimers();
         const { socket, session } = makeSession();
         const refused: [string, string][] = [];
         socket.open();
         session.pasteWhenShellReady(() => "ls -la");
         vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
-        for (const text of ["echo one\necho two", "echo one\recho two"]) {
+        for (const text of ["echo one\necho two", "echo one\recho two", "touch file\t"]) {
           session.pasteWhenShellReady(
             () => text,
             (refusedText, reason) => refused.push([refusedText, reason]),
@@ -1569,28 +1588,9 @@ describe("TerminalSession", () => {
         expect(refused).toEqual([
           ["echo one\necho two", "unsafe"],
           ["echo one\recho two", "unsafe"],
+          ["touch file\t", "unsafe"],
         ]);
         session.dispose();
-      });
-
-      it("never repeats a paste after the socket closes or the session ends", () => {
-        vi.useFakeTimers();
-        const { socket, session } = makeSession();
-        socket.open();
-        session.pasteWhenShellReady(() => "ls");
-        socket.readyState = FakeWebSocket.CLOSED;
-        socket.emit("close", { code: 1006, reason: "" });
-        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
-        expect(inputFrames(socket)).toEqual([]);
-
-        // The command stays queued for the view's next session to claim.
-        const claim = vi.fn(() => "pwd");
-        session.pasteWhenShellReady(claim);
-        session.dispose();
-        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
-        expect(claim).not.toHaveBeenCalled();
-        expect(pasteFrames(socket)).toHaveLength(1);
-        expect(inputFrames(socket)).toEqual([]);
       });
     });
   });

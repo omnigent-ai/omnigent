@@ -2170,45 +2170,45 @@ describe("Workspace rail maximize", () => {
   });
 });
 
-describe("Sidebar across the md breakpoint", () => {
-  // Resizable viewport: matchMedia answers the md queries from `width` and
-  // fires change listeners for the queries a resize flips.
-  function mockViewportWidth(initialWidth: number) {
-    let width = initialWidth;
-    const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-    const matches = (query: string) => {
-      if (query === "(min-width: 768px)") return width >= 768;
-      if (query === "(max-width: 767.98px)") return width < 768;
-      return false;
-    };
-    const baseMatchMedia = window.matchMedia;
-    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
-      ...baseMatchMedia(query),
-      matches: matches(query),
-      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (!listeners.has(query)) listeners.set(query, new Set());
-        listeners.get(query)?.add(listener);
-      },
-      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        listeners.get(query)?.delete(listener);
-      },
-    }));
-    onTestFinished(() => matchMedia.mockRestore());
-    return (nextWidth: number) =>
-      act(() => {
-        const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
-        width = nextWidth;
-        for (const [query, queryListeners] of listeners) {
-          const event = { matches: matches(query), media: query } as MediaQueryListEvent;
-          if (before.get(query) === event.matches) continue;
-          for (const listener of queryListeners) {
-            if (typeof listener === "function") listener(event);
-            else listener.handleEvent(event);
-          }
+// Resizable viewport: matchMedia answers the md queries from `width` and
+// fires change listeners for the queries a resize flips.
+function mockViewportWidth(initialWidth: number) {
+  let width = initialWidth;
+  const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  const matches = (query: string) => {
+    if (query === "(min-width: 768px)") return width >= 768;
+    if (query === "(max-width: 767.98px)") return width < 768;
+    return false;
+  };
+  const baseMatchMedia = window.matchMedia;
+  const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+    ...baseMatchMedia(query),
+    matches: matches(query),
+    addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      if (!listeners.has(query)) listeners.set(query, new Set());
+      listeners.get(query)?.add(listener);
+    },
+    removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      listeners.get(query)?.delete(listener);
+    },
+  }));
+  onTestFinished(() => matchMedia.mockRestore());
+  return (nextWidth: number) =>
+    act(() => {
+      const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+      width = nextWidth;
+      for (const [query, queryListeners] of listeners) {
+        const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+        if (before.get(query) === event.matches) continue;
+        for (const listener of queryListeners) {
+          if (typeof listener === "function") listener(event);
+          else listener.handleEvent(event);
         }
-      });
-  }
+      }
+    });
+}
 
+describe("Sidebar across the md breakpoint", () => {
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
     const resize = mockViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
@@ -5978,15 +5978,6 @@ describe("AppShell open in shell", () => {
     );
   }
 
-  function stubPhoneViewport() {
-    const baseMatchMedia = window.matchMedia;
-    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
-      ...baseMatchMedia(query),
-      matches: false,
-    }));
-    onTestFinished(() => matchMedia.mockRestore());
-  }
-
   /** Stub fetch so the create POST waits for the returned ``finish``. */
   function deferShellCreate() {
     let finishCreate: (response: Response) => void = () => {};
@@ -6003,9 +5994,12 @@ describe("AppShell open in shell", () => {
   }
 
   it("creates the default shell and queues the command for its first prompt", async () => {
+    mockViewportWidth(1280);
+    writeSessionWorkspaceState("conv_sdk", { open: false });
     const fetchMock = vi.fn(async () => createdShellResponse());
     vi.stubGlobal("fetch", fetchMock);
     renderOpenerProbe(4);
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "open command" }));
 
@@ -6017,13 +6011,16 @@ describe("AppShell open in shell", () => {
         url === "/v1/sessions/conv_sdk/resources/terminals" && init?.method === "POST",
     );
     expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({ terminal: "zsh" });
+    await waitFor(() =>
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument(),
+    );
     expect(claimPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe("npm test");
   });
 
   it("opens the new shell full screen on a phone", async () => {
     // WHY: the Workspace rail is hidden below md, so a rail tab would leave
     // the pasted command out of sight.
-    stubPhoneViewport();
+    mockViewportWidth(390);
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => createdShellResponse()),
@@ -6081,7 +6078,7 @@ describe("AppShell open in shell", () => {
   it("leaves the session the user moved to alone when a phone create finishes", async () => {
     // WHY: the shell belongs to the first session; revealing it would take
     // over the second session's screen.
-    stubPhoneViewport();
+    mockViewportWidth(390);
     const create = deferShellCreate();
     renderOpenerProbe(4);
 
@@ -6096,6 +6093,28 @@ describe("AppShell open in shell", () => {
     await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
     expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other");
     expect(screen.queryByTestId("terminals-panel")).not.toHaveAttribute("data-state", "open");
+  });
+
+  it("leaves the session the user moved to alone when a desktop create finishes", async () => {
+    mockViewportWidth(1280);
+    writeSessionWorkspaceState("conv_sdk", { open: false });
+    writeSessionWorkspaceState("conv_other", { open: false });
+    const create = deferShellCreate();
+    renderOpenerProbe(4);
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+    await waitFor(() => expect(create.posts()).toHaveLength(1));
+    fireEvent.click(screen.getByRole("link", { name: "other session" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other"),
+    );
+    create.finish(createdShellResponse());
+
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+    expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(readSessionWorkspaceState("conv_other")?.open).toBe(false);
   });
 
   it("offers no opener to a viewer who would attach read-only", () => {

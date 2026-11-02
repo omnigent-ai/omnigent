@@ -1436,10 +1436,12 @@ async def test_shell_paste_flags_follow_the_paste_method(
 
 
 @pytest.mark.asyncio
-async def test_shell_paste_refuses_multiline_fish_without_a_reported_mode(
+@pytest.mark.parametrize("text", ["ls\npwd", "ls\t-la"])
+async def test_shell_paste_refuses_fish_line_breaks_without_a_reported_mode(
     monkeypatch: pytest.MonkeyPatch,
+    text: str,
 ) -> None:
-    """Unbracketed, every newline would run a line, so nothing is pasted."""
+    """Unbracketed, a newline would run a line and a tab complete, so nothing is pasted."""
     tmux_calls: list[tuple[str, ...]] = []
 
     async def fake_state(*_args: object) -> _PastePaneState:
@@ -1451,7 +1453,7 @@ async def test_shell_paste_refuses_multiline_fish_without_a_reported_mode(
 
     monkeypatch.setattr(control_bridge, "_read_paste_pane_state", fake_state)
     monkeypatch.setattr(control_bridge, "_run_tmux_command", fake_tmux)
-    assert await _paste_shell_command("tmux", "sock", "main", "ls\npwd") == "unsafe"
+    assert await _paste_shell_command("tmux", "sock", "main", text) == "unsafe"
     assert tmux_calls == []
 
 
