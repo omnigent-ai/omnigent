@@ -39,6 +39,9 @@ export interface ResolvedSetupStep {
 
 export type HarnessReadinessState = "available" | "unavailable" | "broken" | "setup-required";
 
+/** Oldest tmux native terminals accept (mirrors `MIN_TMUX_VERSION` in `omnigent/util/tmux_compat.py`). */
+export const MIN_TMUX_VERSION = "3.3";
+
 export type HarnessReadinessReason =
   | "ready"
   | "readiness-unknown"
@@ -48,6 +51,7 @@ export type HarnessReadinessReason =
   | "needs-auth"
   | "unconfigured"
   | "version-too-low"
+  | "tmux-unavailable"
   | "readiness-error";
 
 export interface HarnessReadinessExplanation {
@@ -140,6 +144,12 @@ export function harnessReadinessOnHost(
     return harnessReadinessResult("broken", "version-too-low", true, {
       label: "Harness is outdated",
       description: "Update this harness before starting a session with it.",
+    });
+  }
+  if (availability === "tmux-unavailable") {
+    return harnessReadinessResult("setup-required", "tmux-unavailable", true, {
+      label: "tmux is required",
+      description: `Install tmux ${MIN_TMUX_VERSION} or newer on the selected host, then check again.`,
     });
   }
   if (availability === "binary-missing") {
@@ -239,11 +249,13 @@ export function harnessUnavailableReasonOnHost(
   }
   // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
   // string when installed-but-not-ready. "version-too-low" can surface for
-  // any CLI-backed harness whose binary is present but too old.
+  // any CLI-backed harness whose binary is present but too old, and
+  // "tmux-unavailable" for a native harness on a host without a usable tmux.
   if (
     availability === "binary-missing" ||
     availability === "needs-auth" ||
-    availability === "version-too-low"
+    availability === "version-too-low" ||
+    availability === "tmux-unavailable"
   ) {
     return availability;
   }
@@ -296,6 +308,7 @@ export function harnessWarningBadgeText(reason: string | null, collapsed = false
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
   if (reason === "version-too-low") return "outdated";
+  if (reason === "tmux-unavailable") return "needs tmux";
   return "needs setup";
 }
 

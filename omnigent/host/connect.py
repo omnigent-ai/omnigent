@@ -65,7 +65,11 @@ from omnigent.harness_aliases import (
     harness_account_key,
     is_claude_sdk_harness_name,
 )
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_TMUX_UNAVAILABLE,
+    HarnessAvailability,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -73,6 +77,7 @@ from omnigent.host.frames import (
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
+    SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -140,6 +145,8 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    frame_for_server,
+    parse_server_capabilities,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -231,6 +238,7 @@ from omnigent.runtime.websocket_metrics import (
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
@@ -332,10 +340,32 @@ def _harness_now_configured(harness: str) -> bool:
     return verdict
 
 
+# Quick-probe cache key for the host-wide tmux check; no harness uses this name.
+_TMUX_QUICK_PROBE_KEY = "\0tmux"
+
+
+def _record_tmux_quick_probe(usable: bool) -> None:
+    """Cache a tmux verdict for the quick probe, stamped now."""
+    _quick_probe_cache[_TMUX_QUICK_PROBE_KEY] = time.monotonic()
+    _quick_probe_cached[_TMUX_QUICK_PROBE_KEY] = usable
+
+
+def _tmux_now_usable() -> bool:
+    """tmux_unavailable_reason through the quick-probe TTL cache."""
+    stamp = _quick_probe_cache.get(_TMUX_QUICK_PROBE_KEY)
+    if stamp is not None and time.monotonic() - stamp < HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S:
+        return _quick_probe_cached[_TMUX_QUICK_PROBE_KEY]
+    usable = tmux_unavailable_reason() is None
+    _record_tmux_quick_probe(usable)
+    return usable
+
+
 def _unavailable_harness_became_ready(
     previous: Mapping[str, HarnessAvailability],
 ) -> bool:
-    """Detect newly available binaries; auth changes wait for the full refresh."""
+    """Detect newly available binaries or tmux; auth changes wait for the full refresh."""
+    if HARNESS_TMUX_UNAVAILABLE in previous.values() and _tmux_now_usable():
+        return True
     return any(
         (availability is False or availability == HARNESS_BINARY_MISSING)
         and _harness_now_configured(harness)
@@ -1337,6 +1367,8 @@ class HostProcess:
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
+        # Capabilities the connected server advertised on its upgrade response.
+        self._server_capabilities: frozenset[str] = frozenset()
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
@@ -2745,7 +2777,7 @@ class HostProcess:
         ws = self._ws
         if ws is not None:
             try:
-                await self._send_text(ws, encode_host_frame(report))
+                await self._send_text(ws, self._encode_frame(report))
                 return
             except Exception:  # any send failure parks the report
                 _logger.debug(
@@ -2905,7 +2937,7 @@ class HostProcess:
             if enum_error is not None:
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostImportLocalDoneFrame(
                             request_id=frame.request_id, status="failed", error=enum_error
                         )
@@ -2975,7 +3007,7 @@ class HostProcess:
                     continue
             await self._send_text(
                 ws,
-                encode_host_frame(
+                self._encode_frame(
                     HostImportLocalDoneFrame(
                         request_id=frame.request_id,
                         status="ok",
@@ -2993,7 +3025,7 @@ class HostProcess:
             with contextlib.suppress(Exception):
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostImportLocalDoneFrame(
                             request_id=frame.request_id, status="failed", error=str(exc)
                         )
@@ -3414,7 +3446,7 @@ class HostProcess:
             self._replace_capabilities(configured, self._gateway_inference, accounts)
             await self._send_text(
                 ws,
-                encode_host_frame(
+                self._encode_frame(
                     HostHarnessLoginCompletedFrame(
                         login_id=login_id,
                         success=success,
@@ -3432,7 +3464,7 @@ class HostProcess:
             with contextlib.suppress(Exception):
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostHarnessLoginCompletedFrame(
                             login_id=login_id,
                             success=False,
@@ -4582,7 +4614,7 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
-            return await self._run_host_subprocess_in_thread(configured_harness_map)
+            configured = await self._run_host_subprocess_in_thread(configured_harness_map)
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
@@ -4592,6 +4624,11 @@ class HostProcess:
                     stderr=True,
                 )
             return None
+        if HARNESS_TMUX_UNAVAILABLE in configured.values():
+            # A fresh map is authoritative: a stale "usable" verdict would make
+            # every quick pass re-run the full map until the cache expired.
+            _record_tmux_quick_probe(False)
+        return configured
 
     async def _probe_harness_accounts(self, *, explicit_refresh: bool) -> HarnessAccounts | None:
         """Probe account families concurrently, with one timeout per CLI."""
@@ -5198,6 +5235,12 @@ class HostProcess:
             if fatal is not None:
                 raise fatal from exc
             raise
+        upgrade_response = getattr(ws, "response", None)
+        self._server_capabilities = parse_server_capabilities(
+            upgrade_response.headers.get(SERVER_CAPABILITIES_HEADER)
+            if upgrade_response is not None
+            else None
+        )
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         reconnect = self._ever_connected
@@ -5445,6 +5488,10 @@ class HostProcess:
             return self._tunnel_diagnostics[1]
         return None
 
+    def _encode_frame(self, frame: HostFrame) -> str:
+        """Encode *frame* in the readiness vocabulary the connected server accepts."""
+        return encode_host_frame(frame_for_server(frame, self._server_capabilities))
+
     async def _send_text(self, ws: websockets.asyncio.client.ClientConnection, data: str) -> None:
         diagnostics = self._diagnostics_for(ws)
         if diagnostics is None:
@@ -5489,7 +5536,7 @@ class HostProcess:
             connection_id=connection_id,
         )
         try:
-            encoded_hello = encode_host_frame(hello)
+            encoded_hello = self._encode_frame(hello)
         except Exception as exc:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await self._send_text(ws, encoded_hello)
@@ -5590,7 +5637,7 @@ class HostProcess:
             ):
                 await self._send_text(
                     ws,
-                    encode_host_frame(
+                    self._encode_frame(
                         HostHarnessReadinessFrame(
                             configured_harnesses=configured,
                             harness_accounts=self._harness_accounts,
@@ -5782,7 +5829,7 @@ class HostProcess:
                 completion.set_result(None)
             if launch_result is not None:
                 try:
-                    await self._send_text(ws, encode_host_frame(launch_result))
+                    await self._send_text(ws, self._encode_frame(launch_result))
                 except ConnectionClosed:
                     if launch_fault is None:
                         raise
@@ -5796,18 +5843,18 @@ class HostProcess:
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)
-            await self._send_text(ws, encode_host_frame(stop_result))
+            await self._send_text(ws, self._encode_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
+            await self._send_text(ws, self._encode_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
+            await self._send_text(ws, self._encode_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
             # Stat-ing every entry can be slow on large or network-backed
             # directories; keep the tunnel's event loop free meanwhile.
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
-            await self._send_text(ws, encode_host_frame(list_result))
+            await self._send_text(ws, self._encode_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
+            await self._send_text(ws, self._encode_frame(self._handle_create_dir(frame)))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
@@ -5819,11 +5866,11 @@ class HostProcess:
                     install_result.configured_harnesses,
                     install_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(install_result))
+            await self._send_text(ws, self._encode_frame(install_result))
         elif isinstance(frame, HostProbeAccountsFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_probe_harness_accounts(frame)),
+                self._encode_frame(await self._handle_probe_harness_accounts(frame)),
             )
         elif isinstance(frame, HostRefreshHarnessesFrame):
             refresh_result = await self._handle_refresh_harnesses(frame)
@@ -5832,21 +5879,21 @@ class HostProcess:
                     refresh_result.configured_harnesses,
                     refresh_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(refresh_result))
+            await self._send_text(ws, self._encode_frame(refresh_result))
         elif isinstance(frame, HostHarnessLoginFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_harness_login(ws, frame)),
+                self._encode_frame(await self._handle_harness_login(ws, frame)),
             )
         elif isinstance(frame, HostHarnessLoginCancelFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_harness_login_cancel(frame)),
+                self._encode_frame(await self._handle_harness_login_cancel(frame)),
             )
         elif isinstance(frame, HostHarnessLogoutFrame):
             await self._send_text(
                 ws,
-                encode_host_frame(await self._handle_harness_logout(frame)),
+                self._encode_frame(await self._handle_harness_logout(frame)),
             )
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
@@ -5859,45 +5906,49 @@ class HostProcess:
                     secret_result.configured_harnesses,
                     secret_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(secret_result))
+            await self._send_text(ws, self._encode_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
             # off the event loop.
             credentials_result = await asyncio.to_thread(self._handle_detect_credentials, frame)
-            await self._send_text(ws, encode_host_frame(credentials_result))
+            await self._send_text(ws, self._encode_frame(credentials_result))
         elif isinstance(frame, HostCreateWorktreeFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_create_worktree(frame)))
+            await self._send_text(
+                ws, self._encode_frame(await self._handle_create_worktree(frame))
+            )
         elif isinstance(frame, HostRemoveWorktreeFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_remove_worktree(frame)))
+            await self._send_text(
+                ws, self._encode_frame(await self._handle_remove_worktree(frame))
+            )
         elif isinstance(frame, HostListWorktreesFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_list_worktrees(frame)))
+            await self._send_text(ws, self._encode_frame(await self._handle_list_worktrees(frame)))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
             fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
-            await self._send_text(ws, encode_host_frame(fs_result))
+            await self._send_text(ws, self._encode_frame(fs_result))
         elif isinstance(frame, HostFsWriteFrame):
             # gh/git writes can block; run off the event loop and reply back.
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
-            await self._send_text(ws, encode_host_frame(fs_write_result))
+            await self._send_text(ws, self._encode_frame(fs_write_result))
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
-            await self._send_text(ws, encode_host_frame(skills_result))
+            await self._send_text(ws, self._encode_frame(skills_result))
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
-            await self._send_text(ws, encode_host_frame(plugins_result))
+            await self._send_text(ws, self._encode_frame(plugins_result))
         elif isinstance(frame, HostSkillContentFrame):
             content_result = await asyncio.to_thread(self._handle_skill_content, frame)
-            await self._send_text(ws, encode_host_frame(content_result))
+            await self._send_text(ws, self._encode_frame(content_result))
         elif isinstance(frame, HostMcpToolsFrame):
             tools_result = await self._handle_mcp_tools(frame)
-            await self._send_text(ws, encode_host_frame(tools_result))
+            await self._send_text(ws, self._encode_frame(tools_result))
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
-            await self._send_text(ws, encode_host_frame(startup_result))
+            await self._send_text(ws, self._encode_frame(startup_result))
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
-            await self._send_text(ws, encode_host_frame(mcp_result))
+            await self._send_text(ws, self._encode_frame(mcp_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall
@@ -5912,7 +5963,7 @@ class HostProcess:
                     status="failed",
                     error=f"model options resolution crashed for {frame.harness!r}",
                 )
-            await self._send_text(ws, encode_host_frame(options_result))
+            await self._send_text(ws, self._encode_frame(options_result))
         elif isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.

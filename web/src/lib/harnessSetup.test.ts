@@ -280,6 +280,34 @@ describe("harnessReadinessOnHost", () => {
   });
 });
 
+describe("tmux-unavailable readiness", () => {
+  const host = hostWith({ "claude-native": "tmux-unavailable", "claude-sdk": true });
+
+  it("blocks the native harness with tmux repair copy", () => {
+    expect(harnessReadinessOnHost("claude-native", host)).toEqual({
+      state: "setup-required",
+      reason: "tmux-unavailable",
+      selectable: false,
+      fallbackRelevant: true,
+      explanation: {
+        label: "tmux is required",
+        description: "Install tmux 3.3 or newer on the selected host, then check again.",
+      },
+    });
+    expect(harnessUnavailableReasonOnHost("claude-native", host)).toBe("tmux-unavailable");
+    expect(harnessWarningBadgeText("tmux-unavailable")).toBe("needs tmux");
+    expect(harnessWarningBadgeText("tmux-unavailable", true)).toBe("needs setup");
+  });
+
+  it("leaves SDK harnesses on the same host ready", () => {
+    expect(harnessReadinessOnHost("claude-sdk", host)).toMatchObject({
+      state: "available",
+      reason: "ready",
+    });
+    expect(harnessUnavailableReasonOnHost("claude-sdk", host)).toBeNull();
+  });
+});
+
 describe("harnessInstallableOnHost", () => {
   const online = hostWith({ codex: false });
 

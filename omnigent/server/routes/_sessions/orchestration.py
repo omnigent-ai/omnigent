@@ -53,6 +53,7 @@ from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
 )
 from omnigent.harnesses.claude_native import PEER_MESSAGE_WAKE_KIND, PEER_MESSAGE_WAKE_TEXT
@@ -10757,10 +10758,17 @@ def _native_subagent_wrapper_labels(
 
 
 # Host readiness values that mean the native CLI cannot launch. A routed
-# session landing on a missing or unauthenticated binary would fail to open its
-# terminal, so those harnesses are never offered to Smart Routing.
+# session landing on a missing or unauthenticated binary, or on a host without a
+# usable tmux, would fail to open its terminal, so those harnesses are never
+# offered to Smart Routing.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
-    {False, HARNESS_BINARY_MISSING, HARNESS_NEEDS_AUTH, HARNESS_VERSION_TOO_LOW}
+    {
+        False,
+        HARNESS_BINARY_MISSING,
+        HARNESS_NEEDS_AUTH,
+        HARNESS_VERSION_TOO_LOW,
+        HARNESS_TMUX_UNAVAILABLE,
+    }
 )
 
 

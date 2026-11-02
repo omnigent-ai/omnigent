@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -42,6 +43,8 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    SERVER_CAP_TMUX_READINESS,
+    SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -1791,6 +1794,230 @@ def test_quick_probe_cache_survives_configured_flip_within_ttl(
         assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is True
     finally:
         connect_mod._invalidate_quick_probe_cache()
+
+
+def _write_fake_tmux(directory: Path, version_line: str) -> None:
+    """Write an executable ``tmux`` that answers ``tmux -V`` with *version_line*."""
+    directory.mkdir(parents=True, exist_ok=True)
+    tmux = directory / "tmux"
+    tmux.write_text(f"#!/bin/sh\necho {shlex.quote(version_line)}\n")
+    tmux.chmod(0o755)
+
+
+def test_quick_probe_detects_repaired_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A tmux-unavailable entry re-probes tmux, not the vendor CLI it already has."""
+    from omnigent.host import connect as connect_mod
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    monkeypatch.setenv("PATH", str(bin_dir))
+    # The vendor CLI is installed, so consulting it would always report "ready".
+    monkeypatch.setattr(connect_mod, "harness_is_configured", lambda _h: True)
+    monkeypatch.setattr(connect_mod, "HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+    connect_mod._invalidate_quick_probe_cache()
+    previous = {"devin-native": "tmux-unavailable", "claude-sdk": True}
+    try:
+        assert connect_mod._unavailable_harness_became_ready(previous) is False
+        _write_fake_tmux(bin_dir, "tmux 3.2")
+        assert connect_mod._unavailable_harness_became_ready(previous) is False
+        _write_fake_tmux(bin_dir, "tmux 3.6a")
+        assert connect_mod._unavailable_harness_became_ready(previous) is True
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+
+
+async def test_live_host_publishes_ready_after_tmux_repair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Installing tmux into the host's PATH flips native readiness without a restart."""
+    bin_dir = tmp_path / "bin"
+    _write_fake_tmux(bin_dir, "tmux 3.4")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    readiness = iter(({"devin-native": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 0.01)
+    from omnigent.host import connect as connect_mod
+
+    connect_mod._invalidate_quick_probe_cache()
+    host = _make_host_process()
+    host._configured_harnesses = {"devin-native": "tmux-unavailable"}
+    host._harness_accounts = {}
+    host._gateway_inference = {}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+        connect_mod._invalidate_quick_probe_cache()
+
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"devin-native": True}
+    _cleanup_host(host)
+
+
+async def test_full_map_overrides_stale_usable_tmux_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A fresh map's tmux-unavailable stops the quick loop re-running the full map each pass."""
+    from omnigent.host import connect as connect_mod
+
+    _write_fake_tmux(tmp_path / "bin", "tmux 3.6a")
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: {"devin-native": "tmux-unavailable"},
+    )
+    connect_mod._invalidate_quick_probe_cache()
+    host = _make_host_process()
+    try:
+        connect_mod._record_tmux_quick_probe(True)
+        configured = await host._probe_configured_harnesses(startup=False)
+        assert configured == {"devin-native": "tmux-unavailable"}
+        assert connect_mod._unavailable_harness_became_ready(configured) is False
+    finally:
+        connect_mod._invalidate_quick_probe_cache()
+        _cleanup_host(host)
+
+
+async def test_live_host_real_readiness_map_recovers_after_tmux_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The real readiness map, re-run by the loop, flips a native harness once tmux appears."""
+    import omnigent._platform as platform
+    from omnigent.host import connect as connect_mod
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    devin = bin_dir / "devin"
+    devin.write_text("#!/bin/sh\necho 'devin 1.0.0'\n")
+    devin.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S", 0.0)
+    connect_mod._invalidate_quick_probe_cache()
+    host = _make_host_process()
+    host._configured_harnesses = await host._probe_configured_harnesses(startup=False)
+    assert host._configured_harnesses is not None
+    assert host._configured_harnesses["devin-native"] == "tmux-unavailable"
+    host._harness_accounts = {}
+    host._gateway_inference = {}
+    ws = _RecordingWS()
+
+    _write_fake_tmux(bin_dir, "tmux 3.4")
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=10.0)
+    finally:
+        await _cancel(task)
+        connect_mod._invalidate_quick_probe_cache()
+
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses["devin-native"] is True
+    _cleanup_host(host)
+
+
+# What a server without the tmux_readiness capability decodes; its live readiness
+# decoder rejects the whole frame for any other state.
+_PRE_TMUX_SERVER_READINESS = (True, False, "binary-missing", "needs-auth", "version-too-low")
+
+
+@pytest.mark.parametrize(
+    ("server_capabilities", "expected_native"),
+    [(frozenset(), False), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+    ids=["older-server", "tmux-aware-server"],
+)
+async def test_live_readiness_matches_server_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    server_capabilities: frozenset[str],
+    expected_native: bool | str,
+) -> None:
+    """An older server still gets an unrelated harness's update instead of a rejected frame."""
+    readiness = iter(({"codex": True, "devin-native": "tmux-unavailable"},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", lambda: next(readiness))
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._server_capabilities = server_capabilities
+    host._configured_harnesses = {"codex": "needs-auth", "devin-native": "tmux-unavailable"}
+    host._harness_accounts = {}
+    host._gateway_inference = {}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    sent = json.loads(ws.sent[0])["configured_harnesses"]
+    assert sent == {"codex": True, "devin-native": expected_native}
+    if not server_capabilities:
+        assert all(value in _PRE_TMUX_SERVER_READINESS for value in sent.values())
+    _cleanup_host(host)
+
+
+@pytest.mark.parametrize(
+    ("advertise", "expected_native"),
+    [(False, False), (True, "tmux-unavailable")],
+    ids=["no-capability-header", "capability-header"],
+)
+async def test_hello_readiness_follows_upgrade_capability_header(
+    monkeypatch: pytest.MonkeyPatch,
+    advertise: bool,
+    expected_native: bool | str,
+) -> None:
+    """The host reads the server's upgrade header before encoding its hello."""
+    from websockets.asyncio.server import serve
+
+    received: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    def _process_response(_connection: object, _request: object, response: Response) -> Response:
+        if advertise:
+            response.headers[SERVER_CAPABILITIES_HEADER] = SERVER_CAP_TMUX_READINESS
+        return response
+
+    async def _handler(ws: object) -> None:
+        received.set_result(await ws.recv())  # type: ignore[attr-defined]
+        await ws.wait_closed()  # type: ignore[attr-defined]
+
+    async with serve(_handler, "127.0.0.1", 0, process_response=_process_response) as server:
+        port = server.sockets[0].getsockname()[1]
+        host = HostProcess(
+            identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+            server_url=f"http://127.0.0.1:{port}",
+        )
+        host._configured_harnesses = {"devin-native": "tmux-unavailable", "claude-sdk": True}
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        monkeypatch.setattr(host, "_initialize_capabilities", AsyncMock())
+        monkeypatch.setattr(host, "_ensure_owner_user_id", AsyncMock())
+        connect_task = asyncio.create_task(host._connect_and_serve())
+        try:
+            hello = json.loads(await asyncio.wait_for(received, timeout=5.0))
+        finally:
+            connect_task.cancel()
+            with contextlib.suppress(BaseException):
+                await connect_task
+            _cleanup_host(host)
+
+    assert hello["configured_harnesses"] == {"devin-native": expected_native, "claude-sdk": True}
 
 
 async def test_live_host_refreshes_harness_readiness_without_reconnect(

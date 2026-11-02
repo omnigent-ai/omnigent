@@ -10,6 +10,7 @@ import pytest
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -78,6 +79,8 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    frame_for_server,
+    parse_server_capabilities,
     workspace_missing_message,
 )
 
@@ -1179,6 +1182,51 @@ def test_harness_readiness_frame_round_trip() -> None:
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
 
 
+def test_tmux_unavailable_readiness_survives_hello_and_live_refresh() -> None:
+    """A native harness blocked on tmux reaches the server instead of being dropped."""
+    configured = {"claude-native": "tmux-unavailable", "claude-sdk": True}
+    hello = decode_host_frame(
+        encode_host_frame(
+            HostHelloFrame(
+                version="0.1.0",
+                frame_protocol_version=1,
+                name="laptop",
+                configured_harnesses=configured,
+            )
+        )
+    )
+    refresh = decode_host_frame(
+        encode_host_frame(HostHarnessReadinessFrame(configured_harnesses=configured))
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert hello.configured_harnesses == configured
+    assert refresh.configured_harnesses == configured
+
+
+@pytest.mark.parametrize(
+    ("server_capabilities", "expected_native"),
+    [(frozenset(), False), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+)
+def test_frame_for_server_down_maps_tmux_for_older_servers(
+    server_capabilities: frozenset[str], expected_native: bool | str
+) -> None:
+    """Only a server that advertises tmux readiness receives the new state."""
+    frame = HostHarnessReadinessFrame(
+        configured_harnesses={"claude-native": "tmux-unavailable", "codex": True}
+    )
+
+    sent = frame_for_server(frame, server_capabilities)
+
+    assert sent.configured_harnesses == {"claude-native": expected_native, "codex": True}
+    assert frame.configured_harnesses == {"claude-native": "tmux-unavailable", "codex": True}
+
+
+def test_parse_server_capabilities_tolerates_spacing_and_absence() -> None:
+    assert parse_server_capabilities(None) == frozenset()
+    assert parse_server_capabilities(" tmux_readiness , future ,") == {"tmux_readiness", "future"}
+
+
 def test_hello_frame_gateway_inference_round_trip() -> None:
     original = HostHelloFrame(
         version="0.1.0",
@@ -1243,8 +1291,8 @@ def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:
     assert decoded.gateway_inference is None
 
 
-def test_harness_readiness_frame_rejects_unknown_availability() -> None:
-    """Unknown readiness states cannot partially replace the live map."""
+def test_harness_readiness_frame_drops_unknown_availability_per_entry() -> None:
+    """A newer host's unknown state reads as not ready without losing the frame's other updates."""
     encoded = json.dumps(
         {
             "kind": "host.harness_readiness",
@@ -1252,10 +1300,24 @@ def test_harness_readiness_frame_rejects_unknown_availability() -> None:
                 "pi": "future-state",
                 "codex": "needs-auth",
             },
+            "gateway_inference": {"codex": True},
         }
     )
 
-    with pytest.raises(ValueError, match="unsupported availability state"):
+    decoded = decode_host_frame(encoded)
+
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.configured_harnesses == {"codex": "needs-auth"}
+    assert decoded.gateway_inference == {"codex": True}
+
+
+def test_harness_readiness_frame_rejects_only_unknown_availability() -> None:
+    """A frame with no decodable entry cannot replace the live map with an empty one."""
+    encoded = json.dumps(
+        {"kind": "host.harness_readiness", "configured_harnesses": {"pi": "future-state"}}
+    )
+
+    with pytest.raises(ValueError, match="non-empty"):
         decode_host_frame(encoded)
 
 

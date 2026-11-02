@@ -642,6 +642,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "host, then start a new session."
     ),
     "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
+    "harness_not_configured": "The harness isn't set up on the host, so this session can't start.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

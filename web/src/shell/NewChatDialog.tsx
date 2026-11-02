@@ -153,6 +153,7 @@ import {
   isCodexHarness,
   isNativeCursorHarness,
   isNativeOpenCodeHarness,
+  MIN_TMUX_VERSION,
   skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
@@ -887,6 +888,17 @@ function harnessWarningMessage(
         {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
         <code>npm i -g @opencode/cli@2.0.32</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
         <code>omni setup</code> on that machine.
+      </>
+    );
+  }
+  // Native harnesses run in tmux on the host. The desktop app keeps the PATH it
+  // started with, so a tmux installed later may need an app restart to be seen.
+  if (reason === "tmux-unavailable") {
+    return (
+      <>
+        {agentName} needs tmux {MIN_TMUX_VERSION} or newer on {hostName}. Install it (macOS:{" "}
+        <code>brew install tmux</code>), then check again. If Omnigent still can&apos;t find it,
+        quit and reopen the Omnigent app.
       </>
     );
   }

@@ -7111,6 +7111,7 @@ describe("NewChatLandingScreen", () => {
     [false, "install"],
     ["needs-auth", "reconfigure"],
     ["version-too-low", "update"],
+    ["tmux-unavailable", "tmux"],
     ["future-error", "reconfigure"],
   ] as const)("opens repair over the composer for %s", (readiness, mode) => {
     renderLanding({ harness_install_enabled: true });
@@ -7292,6 +7293,17 @@ describe("NewChatLandingScreen", () => {
       warning: "OpenCode needs OpenCode 2.0 on machine-1 — run npm i -g @opencode/cli@2.0.32",
     },
     {
+      id: "a_devin",
+      name: "devin-native-ui",
+      displayName: "Devin",
+      harness: "devin-native",
+      readiness: "tmux-unavailable",
+      badgeName: "needs tmux",
+      warning:
+        "Devin needs tmux 3.3 or newer on machine-1. Install it (macOS: brew install tmux), " +
+        "then check again. If Omnigent still can't find it, quit and reopen the Omnigent app.",
+    },
+    {
       id: "a_polly",
       name: "polly",
       displayName: "Polly",
@@ -7346,6 +7358,34 @@ describe("NewChatLandingScreen", () => {
       expect(await screen.findByRole("tooltip")).toHaveTextContent(warning);
     },
   );
+
+  it("keeps native rows selectable on a managed sandbox when the local host lacks tmux", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: {
+          "claude-native": "tmux-unavailable",
+          "codex-native": "tmux-unavailable",
+        },
+      } as Host,
+    ]);
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "modal" });
+
+    expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Run in the sandbox" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    const { body } = await readCreateBody();
+    expect(body).toMatchObject({ host_type: "managed", sandbox_provider: "modal" });
+  });
 
   it("disables broken harness rows and explains the actionable failure", async () => {
     mockHosts([
