@@ -79,8 +79,16 @@ vi.mock("./ContentSearchPanel", () => ({
   ),
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: ({ conversationId, active }: { conversationId: string; active?: boolean }) => (
-    <div data-testid="browser-pane-stub" data-active={String(active)}>
+  BrowserPane: ({
+    conversationId,
+    active,
+    focus,
+  }: {
+    conversationId: string;
+    active?: boolean;
+    focus?: string | null;
+  }) => (
+    <div data-testid="browser-pane-stub" data-active={String(active)} data-focus={focus ?? ""}>
       {conversationId}
     </div>
   ),
@@ -2057,6 +2065,183 @@ describe("WorkspacePanel desktop menu commands", () => {
     close();
     expect(onCloseFile).not.toHaveBeenCalled();
     expect(onHide).not.toHaveBeenCalled();
+  });
+
+  describe("a browser tab opened with New Browser Tab", () => {
+    const pane = () => screen.getByTestId("browser-pane-stub");
+    const viewOf = (tabId: string) => browserViewId("conv_ws", tabId);
+    let chatBox: HTMLTextAreaElement;
+
+    beforeEach(() => {
+      writeSessionWorkspaceState("conv_ws", {
+        openBrowsers: ["browser-1"],
+        selectedBrowserId: "browser-1",
+      });
+      // Stands in for the chat composer, outside the rail.
+      chatBox = document.createElement("textarea");
+      document.body.append(chatBox);
+    });
+
+    afterEach(() => {
+      chatBox.remove();
+    });
+
+    it.each([
+      ["before the menu opens", true],
+      ["after the menu opens", false],
+    ])(
+      "returns focus to the browser page a tab was opened from with the + menu, answered %s",
+      async (_when, answerFirst) => {
+        let answer: (viewId: string | null) => void = () => {};
+        const browserFocusedView = vi.fn(
+          () =>
+            new Promise<string | null>((resolve) => {
+              answer = resolve;
+            }),
+        );
+        Object.assign((window as unknown as { omnigentDesktop: object }).omnigentDesktop, {
+          browserFocusedView,
+        });
+        renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+        // A click into the page takes keyboard focus out of this window's document.
+        await act(async () => {
+          window.dispatchEvent(new Event("blur"));
+        });
+        if (answerFirst) await act(async () => answer(viewOf("browser-1")));
+        fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+          button: 0,
+          ctrlKey: false,
+        });
+        fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+        if (!answerFirst) await act(async () => answer(viewOf("browser-1")));
+        await waitFor(() => expect(pane()).not.toHaveTextContent(viewOf("browser-1")));
+
+        closeNewTab();
+        await waitFor(() => expect(pane()).toHaveTextContent(viewOf("browser-1")));
+        expect(pane()).toHaveAttribute("data-focus", "page");
+      },
+    );
+
+    it("returns focus to the chat box for a tab opened from the + menu", async () => {
+      renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+      chatBox.focus();
+      // Radix opens the menu on pointerdown, before it takes focus from the chat box.
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+      await waitFor(() => expect(pane()).not.toHaveTextContent(viewOf("browser-1")));
+
+      closeNewTab();
+      await waitFor(() => expect(chatBox).toHaveFocus());
+      expect(pane()).toHaveTextContent(viewOf("browser-1"));
+    });
+
+    async function openNewTab(focusedViewId: string | null = null) {
+      sendCommand({ command: "new-browser-tab", browserViewId: focusedViewId });
+      await waitFor(() => expect(pane()).not.toHaveTextContent(viewOf("browser-1")));
+      expect(pane()).toHaveAttribute("data-focus", "address");
+    }
+
+    /** Close the new tab as Close (⌘W) from its address bar would. */
+    function closeNewTab() {
+      focusRail();
+      close();
+    }
+
+    it("takes focus in its address bar, and Close puts focus back in the chat box", async () => {
+      renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+      chatBox.focus();
+      await openNewTab();
+
+      closeNewTab();
+      await waitFor(() => expect(chatBox).toHaveFocus());
+      expect(pane()).toHaveTextContent(viewOf("browser-1"));
+    });
+
+    it("returns to the browser tab whose page had focus, and focuses that page", async () => {
+      renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+      await openNewTab(viewOf("browser-1"));
+
+      closeNewTab();
+      await waitFor(() => expect(pane()).toHaveTextContent(viewOf("browser-1")));
+      expect(pane()).toHaveAttribute("data-focus", "page");
+    });
+
+    it("returns to the shell it was opened from", async () => {
+      const { openTerminalTab, rerender } = renderWorkspace({
+        showBrowserTab: true,
+        openTerminals: ["terminal:zsh"],
+        selectedTerminalKey: "terminal:zsh",
+      });
+      focusRail();
+      sendCommand({ command: "new-browser-tab", browserViewId: null });
+      // AppShell answers onRightRailTabChange("browser") by showing the new tab.
+      rerender({ selectedTerminalKey: null, rightRailTab: "browser" });
+      await screen.findByTestId("browser-pane-stub");
+
+      closeNewTab();
+      await waitFor(() =>
+        expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh", { focus: true }),
+      );
+    });
+
+    it("shows that shell again without taking focus from the chat box", async () => {
+      const { openTerminalTab, rerender } = renderWorkspace({
+        showBrowserTab: true,
+        openTerminals: ["terminal:zsh"],
+        selectedTerminalKey: "terminal:zsh",
+      });
+      chatBox.focus();
+      sendCommand({ command: "new-browser-tab", browserViewId: null });
+      rerender({ selectedTerminalKey: null, rightRailTab: "browser" });
+      await screen.findByTestId("browser-pane-stub");
+
+      closeNewTab();
+      await waitFor(() =>
+        expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh", { focus: false }),
+      );
+      expect(chatBox).toHaveFocus();
+    });
+
+    it("forgets where it came from once the user switches tabs", async () => {
+      renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+      chatBox.focus();
+      await openNewTab();
+      fireEvent.click(screen.getByRole("tab", { name: "Browser 1" }));
+      fireEvent.click(screen.getByRole("tab", { name: "Browser 2" }));
+
+      closeNewTab();
+      await waitFor(() =>
+        expect(screen.queryByRole("tab", { name: "Browser 2" })).not.toBeInTheDocument(),
+      );
+      expect(chatBox).not.toHaveFocus();
+    });
+
+    it("stays on a tab the user picks while the close is still pending", async () => {
+      writeSessionWorkspaceState("conv_ws", {
+        openBrowsers: ["browser-1", "browser-2"],
+        selectedBrowserId: "browser-1",
+      });
+      let finishClose: (result: { ok: boolean }) => void = () => {};
+      browserClose.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishClose = resolve;
+        }),
+      );
+      renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+      chatBox.focus();
+      await openNewTab();
+
+      closeNewTab();
+      fireEvent.click(screen.getByRole("tab", { name: "Browser 2" }));
+      await act(async () => finishClose({ ok: true }));
+
+      expect(screen.queryByRole("tab", { name: "Browser 3" })).not.toBeInTheDocument();
+      expect(pane()).toHaveTextContent(viewOf("browser-2"));
+      expect(chatBox).not.toHaveFocus();
+    });
   });
 
   it("opens a browser tab for New Browser Tab when the workspace offers browsers", () => {

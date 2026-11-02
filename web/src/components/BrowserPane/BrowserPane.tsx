@@ -85,7 +85,10 @@ interface NavResult {
  *  component doesn't depend on the full nativeBridge type; every method is
  *  optional (an older shell may predate the browser feature). */
 interface BrowserPaneBridge {
-  browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
+  browserSetActive?: (
+    conversationId: string | null,
+    options?: { focus?: boolean },
+  ) => Promise<{ ok: boolean; error?: string }>;
   browserResize?: (
     conversationId: string,
     bounds: Bounds,
@@ -163,6 +166,9 @@ export interface BrowserPaneProps {
   active?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
+  /** Take keyboard focus once, in the address bar or the page, then call `onFocused`. */
+  focus?: "address" | "page" | null;
+  onFocused?: () => void;
 }
 
 /**
@@ -174,6 +180,8 @@ export function BrowserPane({
   className,
   agentBrowser = true,
   active = true,
+  focus = null,
+  onFocused,
 }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const toolbarRef = useRef<HTMLDivElement | null>(null);
@@ -549,6 +557,19 @@ export function BrowserPane({
       }
     };
   }, [conversationId, browserSupported, hasView, active, syncBounds]);
+
+  // A tab just opened takes focus in its address bar, as in a browser; one the
+  // user returns to gets it back where it was. The page needs its view attached.
+  useEffect(() => {
+    if (focus === "address") {
+      addressBarRef.current?.focus();
+    } else if (focus === "page" && hasView && active) {
+      void getBridge()?.browserSetActive?.(conversationId, { focus: true });
+    } else {
+      return;
+    }
+    onFocused?.();
+  }, [focus, hasView, active, conversationId, onFocused]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
