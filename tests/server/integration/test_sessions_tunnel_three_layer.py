@@ -2645,7 +2645,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("scenario", ["reconnect", "runner_gone", "expired", "no_answer"])
+@pytest.mark.parametrize(
+    "scenario", ["reconnect", "runner_gone", "expired", "no_answer", "host_sleeps"]
+)
 async def test_runner_disconnect_holds_turn_while_host_runs_the_runner(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
@@ -2655,8 +2657,9 @@ async def test_runner_disconnect_holds_turn_while_host_runs_the_runner(
 
     The host stays connected, so this is not the host-offline hold: the runner
     is stuck on a failing network path and resumes the turn once it reconnects.
-    The turn fails when the host stops reporting it alive, when the hold ends,
-    or at the grace when the host gives no answer.
+    The turn fails when the host reports the runner exited, when the hold ends,
+    or at the grace when the host gives no answer. A host that then goes
+    offline too hands the turn to the host-offline hold.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
@@ -2671,11 +2674,21 @@ async def test_runner_disconnect_holds_turn_while_host_runs_the_runner(
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
     host_id = "fedcba9876543210fedcba9876543210"
     host_conn = object()
+    host_connected = [True]
     monkeypatch.setattr(
         ap_app.state.host_registry,
         "get",
-        lambda registered_host_id: host_conn if registered_host_id == host_id else None,
+        lambda registered_host_id: (
+            host_conn if host_connected[0] and registered_host_id == host_id else None
+        ),
     )
+    host_row_checks: list[str] = []
+
+    async def scripted_host_row_offline(host_store: object, checked_host_id: str) -> bool:
+        host_row_checks.append(checked_host_id)
+        return not host_connected[0]
+
+    monkeypatch.setattr(sessions_module, "_host_row_offline", scripted_host_row_offline)
     status = ["alive" if scenario != "no_answer" else None]
     status_queries: list[str] = []
 
@@ -2730,7 +2743,14 @@ async def test_runner_disconnect_holds_turn_while_host_runs_the_runner(
 
         assert orchestration._relay_turn_held_for_host is not None
         assert await orchestration._relay_turn_held_for_host(runner_id, session_id)
-        if scenario == "reconnect":
+        if scenario == "host_sleeps":
+            host_connected[0] = False
+            # Past two host-offline re-checks the turn is still held.
+            target = len(host_row_checks) + 3
+            while len(host_row_checks) < target:
+                await asyncio.sleep(0.01)
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+        if scenario in ("reconnect", "host_sleeps"):
             reconnect = await _connect_runner_tunnel(ap_app, runner_id)
             await _send_hello_and_wait(
                 reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]

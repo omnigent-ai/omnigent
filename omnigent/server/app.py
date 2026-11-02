@@ -4109,6 +4109,9 @@ def create_app(
         hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
         if hold is None and not idle_shutdown:
             hold = await _hold_for_alive_runner(runner_id, affected)
+            if hold == "host_offline":
+                # The host followed its runner offline; wait for it like a sleeping laptop.
+                hold = await _hold_for_offline_host(runner_id, affected)
         hold_s = None if hold is None else time.monotonic() - hold_started
         if hold in ("runner_reconnected", "server_shutdown"):
             return
@@ -4350,18 +4353,20 @@ def create_app(
 
         A runner on a failing network path keeps working and retries its tunnel,
         often for minutes, then resumes the turn, so the turn waits for it while
-        the host reports it alive. The hold ends once the host stops reporting it
-        alive or after :data:`RUNNER_ALIVE_HOLD_S`.
+        the host reports it alive. The hold ends when the host reports the runner
+        dead or untracked, when the host itself goes offline (the host-offline
+        hold takes over), or after :data:`RUNNER_ALIVE_HOLD_S`.
 
         :returns: ``None`` when nothing was held, else how the hold ended:
-            ``"runner_reconnected"``, ``"server_shutdown"``, ``"runner_gone"``
-            or ``"runner_alive_expired"``.
+            ``"runner_reconnected"``, ``"server_shutdown"``, ``"runner_gone"``,
+            ``"host_offline"`` or ``"runner_alive_expired"``.
         """
         from omnigent.server.routes.sessions import (
             _MID_TURN_STATUSES,
             HOST_OFFLINE_RECHECK_S,
             RUNNER_ALIVE_HOLD_S,
             _intentional_stop_sessions,
+            _query_host_runner_status,
             _session_status_cache,
         )
 
@@ -4410,7 +4415,16 @@ def create_app(
                 if shutdown_state.server_shutting_down():
                     outcome = "server_shutdown"
                     break
-                if not await _host_reports_runner_alive(host_id, runner_id):
+                host_conn = None if host_id is None else host_registry.get(host_id)
+                if host_conn is None:
+                    # The host left too, as a laptop going to sleep does.
+                    if await _host_offline(host_id) is True:
+                        outcome = "host_offline"
+                        break
+                    continue
+                # No answer proves nothing; only an exited or untracked runner ends it.
+                status = await _query_host_runner_status(host_conn, host_registry, runner_id)
+                if status in ("dead", "unknown"):
                     outcome = "runner_gone"
                     break
         finally:
