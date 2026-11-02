@@ -551,6 +551,7 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
         list(getattr(sandbox, "egress_rules", None) or []) if sandbox is not None else []
     )
     git_ssh = list(getattr(sandbox, "git_ssh", None) or []) if sandbox is not None else []
+    tcp_egress = list(getattr(sandbox, "tcp_egress", None) or []) if sandbox is not None else []
 
     if start_in_scratch and fork:
         result.add(
@@ -583,6 +584,11 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
         result.add(
             "os_env.sandbox.git_ssh",
             "git_ssh requires linux_bwrap or darwin_seatbelt for hard network enforcement",
+        )
+    if tcp_egress and sandbox_type not in _EGRESS_CAPABLE_BACKENDS:
+        result.add(
+            "os_env.sandbox.tcp_egress",
+            "tcp_egress requires linux_bwrap or darwin_seatbelt for hard network enforcement",
         )
 
 

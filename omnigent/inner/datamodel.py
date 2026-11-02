@@ -417,6 +417,16 @@ class GitSshBinding:
     allow_loopback: bool = False
 
 
+@dataclass(frozen=True)
+class TcpEgressRoute:
+    """One named, exact TCP destination with optional address restrictions."""
+
+    name: str
+    host: str
+    port: int
+    allowed_cidrs: tuple[str, ...] = ()
+
+
 @dataclass
 class CredentialProxyEntry:
     """One normalized host binding for the secretless credential proxy.
@@ -802,10 +812,11 @@ class OSEnvSandboxSpec:
     # Git's SSH transport runs in the trusted parent. Only the private
     # broker socket and a Git helper command are exposed to the sandbox.
     git_ssh: list[GitSshBinding] | None = None
+    tcp_egress: list[TcpEgressRoute] | None = None
 
     @property
     def requires_network_enforcement(self) -> bool:
-        return bool(self.egress_rules or self.git_ssh)
+        return bool(self.egress_rules or self.git_ssh or self.tcp_egress)
 
     @property
     def write_path_specs(self) -> list[WritePathSpec]:
