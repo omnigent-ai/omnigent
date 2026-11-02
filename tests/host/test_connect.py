@@ -2684,9 +2684,12 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
+@pytest.mark.parametrize("blocked_probe", ["configured_harnesses", "gateway_inference", "both"])
 async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    blocked_probe: str,
 ) -> None:
     """The bounded discovery wait preserves the existing degraded registration."""
     host = _make_host_process()
@@ -2696,8 +2699,14 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
         del startup
         await never.wait()
 
-    monkeypatch.setattr(host, "_probe_configured_harnesses", _blocked)
-    monkeypatch.setattr(host, "_probe_gateway_inference", _blocked)
+    async def _ready(*, startup: bool) -> dict[str, bool]:
+        del startup
+        return {}
+
+    for name in ("configured_harnesses", "gateway_inference"):
+        monkeypatch.setattr(
+            host, f"_probe_{name}", _blocked if blocked_probe in (name, "both") else _ready
+        )
     monkeypatch.setattr("omnigent.host.connect._HOST_CAPABILITY_INIT_TIMEOUT_S", 0.01)
 
     tunnel = _FakeTunnel()
@@ -2712,6 +2721,20 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     assert host._configured_harnesses is None
     assert host._gateway_inference is None
     assert "capability discovery timed out" in capsys.readouterr().err
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "host_capability_discovery_timeout"
+    ]
+    assert record.attributes["configured_harnesses_completed"] == (
+        blocked_probe == "gateway_inference"
+    )
+    assert record.attributes["gateway_inference_completed"] == (
+        blocked_probe == "configured_harnesses"
+    )
+    assert record.attributes["timeout_s"] == 0.01
+    assert record.attributes["elapsed_ms"] >= 0
+    assert record.attributes["capability_generation"] == 0
 
 
 async def test_fast_capability_discovery_is_included_in_hello(
