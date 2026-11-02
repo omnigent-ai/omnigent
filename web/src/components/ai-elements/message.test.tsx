@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { ThemeProvider } from "next-themes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
 import { MermaidPreview } from "@/shell/MermaidPreview";
@@ -312,6 +313,25 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
   }, 15_000);
+
+  it("opens a diagram clicked before it was drawn once the settled reply draws it", async () => {
+    const reply = (mode: "streaming" | "static") => (
+      <MermaidFullscreenProvider resetKey="/sessions/a">
+        <MessageResponse mode={mode}>{markdown}</MessageResponse>
+      </MermaidFullscreenProvider>
+    );
+    const { container, rerender } = render(reply("streaming"), { container: root });
+    const streamedBlock = container.querySelector(".chat-mermaid")!;
+    expect(streamedBlock.querySelector('svg[id^="mermaid-"]')).toBeNull();
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+
+    rerender(reply("static"));
+    expect(streamedBlock.isConnected).toBe(false);
+    const settledSvg = await findInlineDiagram(container);
+
+    const overlay = (await screen.findByTitle("Exit fullscreen")).parentElement!;
+    expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(settledSvg.outerHTML);
+  }, 15_000);
 });
 
 describe("Mermaid fullscreen before the diagram is drawn", () => {
@@ -352,6 +372,25 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
   });
 
+  it.each([
+    ["the same diagram", "flowchart LR; A-->B", "mermaid-a"],
+    ["a different diagram", "flowchart LR; A-->C", undefined],
+  ])("after a remount, opens only for %s", async (_case, settledSource, shownId) => {
+    const reply = (testId: string, source: string) => (
+      <MermaidFullscreenProvider resetKey="/sessions/a">
+        <MermaidBlock key={testId} block={<div data-testid={testId}>{source}</div>} />
+      </MermaidFullscreenProvider>
+    );
+    const { rerender } = render(reply("streamed", "flowchart LR; A"));
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    rerender(reply("streamed", "flowchart LR; A-->B"));
+
+    rerender(reply("settled", settledSource));
+    await draw("settled", "a");
+    const exit = screen.queryByTitle("Exit fullscreen");
+    expect(exit?.parentElement?.querySelector('svg[id^="mermaid-"]')?.id).toBe(shownId);
+  });
+
   it("shows the diagram clicked last", async () => {
     render(
       <MermaidFullscreenProvider resetKey="/sessions/a">
@@ -370,18 +409,30 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     expect(overlayDiagram()?.id).toBe("mermaid-b");
   });
 
-  it("closes when the page changes", async () => {
-    const page = (resetKey: string) => (
-      <MermaidFullscreenProvider resetKey={resetKey}>
-        {diagramBlock("diagram")}
-      </MermaidFullscreenProvider>
+  it.each([
+    ["page", "/sessions/b", "light"],
+    ["theme", "/sessions/a", "dark"],
+  ])("closes and drops a waiting click when the %s changes", async (_case, resetKey, theme) => {
+    const page = (key: string, forcedTheme: string) => (
+      <ThemeProvider forcedTheme={forcedTheme}>
+        <MermaidFullscreenProvider resetKey={key}>
+          {diagramBlock("drawn")}
+          {diagramBlock("waiting")}
+        </MermaidFullscreenProvider>
+      </ThemeProvider>
     );
-    const { rerender } = render(page("/sessions/a"));
-    await draw("diagram", "a");
-    fireEvent.click(screen.getByTitle("View fullscreen"));
+    const { rerender } = render(page("/sessions/a", "light"));
+    await draw("drawn", "a");
+    const [drawn, waiting] = screen.getAllByTitle("View fullscreen");
+    fireEvent.click(drawn!);
     expect(overlayDiagram()?.id).toBe("mermaid-a");
 
-    rerender(page("/sessions/b"));
+    rerender(page(resetKey, theme));
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+
+    fireEvent.click(waiting!);
+    rerender(page("/sessions/a", "light"));
+    await draw("waiting", "b");
     expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
   });
 });

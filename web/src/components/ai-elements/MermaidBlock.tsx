@@ -44,51 +44,89 @@ const DIAGRAM_SVG = 'svg[id^="mermaid-"]';
 // A click while Mermaid is still drawing (e.g. as a reply settles) opens once it finishes.
 export const DIAGRAM_WAIT_MS = 5_000;
 
+export function extractCodeText(children: ReactNode): string {
+  if (typeof children === "string" || typeof children === "number") {
+    return String(children);
+  }
+
+  if (Array.isArray(children)) {
+    return children.map(extractCodeText).join("");
+  }
+
+  if (isValidElement(children)) {
+    const props = children.props as { children?: ReactNode; code?: unknown };
+    if (typeof props.code === "string") {
+      return props.code;
+    }
+    return extractCodeText(props.children);
+  }
+
+  return "";
+}
+
 interface MermaidFullscreenControls {
-  open: (block: HTMLElement) => void;
+  open: (block: HTMLElement, source: string) => void;
   close: () => void;
+  track: (block: HTMLElement, source: string) => void;
+}
+
+interface PendingOpen {
+  block: HTMLElement;
+  source: string;
+  deadline: number;
 }
 
 // Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
 function useMermaidFullscreenState(resetKey?: string) {
   const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
-  const [pendingBlock, setPendingBlock] = useState<HTMLElement | null>(null);
+  const [pending, setPending] = useState<PendingOpen | null>(null);
   const [stateKey, setStateKey] = useState(resetKey);
   if (stateKey !== resetKey) {
     setStateKey(resetKey);
     setSvgMarkup(null);
-    setPendingBlock(null);
+    setPending(null);
   }
 
-  const open = useCallback((block: HTMLElement) => {
+  const open = useCallback((block: HTMLElement, source: string) => {
     const svg = block.querySelector(DIAGRAM_SVG);
     setSvgMarkup(svg ? svg.outerHTML : null);
-    setPendingBlock(svg ? null : block);
+    setPending(svg ? null : { block, source, deadline: Date.now() + DIAGRAM_WAIT_MS });
   }, []);
   const close = useCallback(() => {
     setSvgMarkup(null);
-    setPendingBlock(null);
+    setPending(null);
+  }, []);
+  // When a settling reply remounts the clicked block, a new block with the same
+  // source draws the same diagram, so it takes over the wait.
+  const track = useCallback((block: HTMLElement, source: string) => {
+    setPending((current) => {
+      if (current === null) return null;
+      const replaced = !current.block.isConnected && current.source === source;
+      return current.block === block || replaced ? { ...current, block, source } : current;
+    });
   }, []);
 
+  const pendingBlock = pending?.block ?? null;
+  const deadline = pending?.deadline ?? 0;
   useEffect(() => {
     if (pendingBlock === null) return;
     const showWhenDrawn = () => {
       const svg = pendingBlock.isConnected ? pendingBlock.querySelector(DIAGRAM_SVG) : null;
       if (!svg) return;
       setSvgMarkup(svg.outerHTML);
-      setPendingBlock(null);
+      setPending(null);
     };
     const observer = new MutationObserver(showWhenDrawn);
     observer.observe(pendingBlock, { childList: true, subtree: true });
-    const timer = window.setTimeout(() => setPendingBlock(null), DIAGRAM_WAIT_MS);
+    const timer = window.setTimeout(() => setPending(null), deadline - Date.now());
     showWhenDrawn();
     return () => {
       observer.disconnect();
       window.clearTimeout(timer);
     };
-  }, [pendingBlock]);
+  }, [pendingBlock, deadline]);
 
-  const active = svgMarkup !== null || pendingBlock !== null;
+  const active = svgMarkup !== null || pending !== null;
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
@@ -98,7 +136,7 @@ function useMermaidFullscreenState(resetKey?: string) {
     return () => window.removeEventListener("keydown", onKey);
   }, [active, close]);
 
-  return { svgMarkup, open, close };
+  return { svgMarkup, open, close, track };
 }
 
 function MermaidFullscreenOverlay({
@@ -157,8 +195,8 @@ export function MermaidFullscreenProvider({
   resetKey: string;
 }) {
   const themeMode = useResolvedThemeMode();
-  const { svgMarkup, open, close } = useMermaidFullscreenState(`${resetKey}:${themeMode}`);
-  const controls = useMemo(() => ({ open, close }), [open, close]);
+  const { svgMarkup, open, close, track } = useMermaidFullscreenState(`${resetKey}:${themeMode}`);
+  const controls = useMemo(() => ({ open, close, track }), [open, close, track]);
   return (
     <MermaidFullscreenContext.Provider value={controls}>
       {children}
@@ -168,10 +206,20 @@ export function MermaidFullscreenProvider({
 }
 
 // Without a provider (isolated renders), the overlay lives with the block.
-function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
+function MermaidFullscreen({
+  blockRef,
+  source,
+}: {
+  blockRef: RefObject<HTMLDivElement | null>;
+  source: string;
+}) {
   const shared = useContext(MermaidFullscreenContext);
   const local = useMermaidFullscreenState();
-  const { open } = shared ?? local;
+  const { open, track } = shared ?? local;
+
+  useEffect(() => {
+    if (blockRef.current) track(blockRef.current, source);
+  }, [blockRef, source, track]);
 
   return (
     <>
@@ -179,7 +227,7 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
         aria-label="View fullscreen"
         className="size-6 bg-sidebar/80 text-muted-foreground hover:bg-sidebar/80 hover:text-foreground dark:hover:bg-sidebar/80 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur"
         onClick={() => {
-          if (blockRef.current) open(blockRef.current);
+          if (blockRef.current) open(blockRef.current, source);
         }}
         size="icon-sm"
         title="View fullscreen"
@@ -202,7 +250,7 @@ export function MermaidBlock({ block }: { block: ReactNode }) {
     <div ref={blockRef} className="chat-mermaid relative">
       {block}
       <div className="absolute top-2 right-2 z-20 flex items-center rounded-md border border-sidebar bg-sidebar/80 px-1.5 py-1 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur">
-        <MermaidFullscreen blockRef={blockRef} />
+        <MermaidFullscreen blockRef={blockRef} source={extractCodeText(block)} />
       </div>
     </div>
   );

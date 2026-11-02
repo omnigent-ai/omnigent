@@ -109,11 +109,12 @@ def test_fullscreen_diagram_stays_open_when_the_reply_settles(
     expect(page.get_by_role("button", name="Interrupt", exact=True)).to_be_visible()
     assert page.get_by_text(REPLY_DONE).count() == 0, "reply finished before the click"
 
+    streamed_diagram = page.locator(DIAGRAM_SVG).first.element_handle()
     _click_view_fullscreen(page)
     _assert_overlay_visible(page)
 
     _wait_for_reply_to_finish(page)
-    page.wait_for_timeout(2_000)
+    page.wait_for_function("svg => !svg.isConnected", arg=streamed_diagram, timeout=10_000)
     _assert_overlay_visible(page)
 
     page.keyboard.press("Escape")
