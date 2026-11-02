@@ -253,7 +253,7 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
             ("app root", min(at_app_root)),
             ("session default view", min(in_default_view)),
             ("session Terminal view", min(in_terminal_view)),
-            ("10s after the phone closed", final_width),
+            ("after the phone closed", final_width),
         ]
         if width < baseline * 0.9
     }

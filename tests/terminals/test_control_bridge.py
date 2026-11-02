@@ -405,25 +405,26 @@ async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
     tmux = shutil.which("tmux")
     assert tmux
     sock, target = await _new_private_tmux("sleep 30")
-    # Another attached client keeps this owner's size task waiting.
-    other_client = await asyncio.create_subprocess_exec(
-        *(tmux, "-S", str(sock), "-C", "attach", "-t", target),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.DEVNULL,
-    )
-    await _wait_for(lambda: _client_widths(sock), [80])
+    other_client: asyncio.subprocess.Process | None = None
     ws = _FakeWebSocket(inbound=[])
-    task = asyncio.create_task(
-        bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
-        )
-    )
 
     async def _size_task_waiting() -> bool:
         pending = {pending.get_name() for pending in asyncio.all_tasks() if not pending.done()}
         return "tmux-control-size" in pending
 
     try:
+        # Another attached client keeps this owner's size task waiting.
+        other_client = await asyncio.create_subprocess_exec(
+            *(tmux, "-S", str(sock), "-C", "attach", "-t", target),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+        )
+        await _wait_for(lambda: _client_widths(sock), [80])
+        task = asyncio.create_task(
+            bridge_tmux_control_to_websocket(
+                ws, socket_path=str(sock), tmux_target=target, read_only=False
+            )
+        )
         await _wait_for(_size_task_waiting, True)
         assert task.cancel()
         [task_result] = await asyncio.gather(task, return_exceptions=True)
@@ -441,9 +442,10 @@ async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
         )
     finally:
         await _kill_tmux(sock)
-        with contextlib.suppress(ProcessLookupError):
-            other_client.kill()
-        await other_client.wait()
+        if other_client is not None:
+            with contextlib.suppress(ProcessLookupError):
+                other_client.kill()
+            await other_client.wait()
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
