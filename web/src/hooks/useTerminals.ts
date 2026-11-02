@@ -4,7 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isTempConvId } from "@/lib/tempConversationId";
-import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import {
+  setTerminalLaunching,
+  terminalInfoFromResource,
+  terminalResourceId,
+  terminalsQueryKey,
+  type TerminalInfo,
+} from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -248,6 +254,7 @@ async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[]
  * :param terminal: Declared terminal name from the agent spec,
  *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
  *     session offering the host's installed shells).
+ * :param sessionKey: Launch key, e.g. ``"u-ab12cd"``; a fresh one by default.
  * :returns: The created terminal mapped to :class:`TerminalInfo`.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.
@@ -255,11 +262,8 @@ async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[]
 export async function createTerminal(
   conversationId: string,
   terminal: string,
+  sessionKey: string = newTerminalSessionKey(),
 ): Promise<TerminalInfo> {
-  // Random session key so repeated clicks launch fresh terminals —
-  // the runner's launch is idempotent per (terminal, session_key), so
-  // a fixed key would silently return the same terminal every time.
-  const sessionKey = `u-${Math.random().toString(36).slice(2, 8)}`;
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals`,
     {
@@ -286,6 +290,33 @@ export async function createTerminal(
 }
 
 /**
+ * A fresh launch key, e.g. ``"u-ab12cd"``.
+ *
+ * Random so repeated clicks launch fresh terminals — the runner's launch is
+ * idempotent per (terminal, session_key), so a fixed key would silently
+ * return the same terminal every time.
+ */
+function newTerminalSessionKey(): string {
+  return `u-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+interface TerminalCreateRequest {
+  terminal: string;
+  sessionKey: string;
+}
+
+/** Callbacks for {@link useCreateTerminal}'s ``launch``. */
+export interface TerminalLaunchCallbacks {
+  /** The shell's tab can open (before the create returns when the runner is online). */
+  onOpen?: (info: TerminalInfo) => void;
+  /**
+   * The create failed. *opened* is the terminal handed to ``onOpen`` early, if
+   * any; it is already gone from the terminal list.
+   */
+  onError?: (error: Error, opened?: TerminalInfo) => void;
+}
+
+/**
  * Mutation hook around :func:`createTerminal`.
  *
  * On success the created terminal is merged into the terminals query
@@ -293,20 +324,78 @@ export async function createTerminal(
  * waiting for the ``session.resource.created`` SSE round-trip — which
  * still arrives and dedupes as a no-op.
  *
+ * ``launch`` is the UI entry point. With the runner online it adds the
+ * terminal under its predicted id and opens it at once, so the attach
+ * WebSocket (``await_launch``) runs alongside the create instead of after
+ * it. Otherwise (runner asleep or unknown, where the create may wake it)
+ * the tab opens once the create returns.
+ *
  * :param conversationId: Session/conversation identifier.
- * :returns: TanStack mutation taking the declared terminal name.
+ * :returns: TanStack mutation taking the declared terminal name, plus ``launch``.
  */
 export function useCreateTerminal(conversationId: string) {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (terminal: string) => createTerminal(conversationId, terminal),
-    onSuccess: (info) => {
-      const key = terminalsQueryKey(conversationId);
-      const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
-      if (current.some((t) => t.id === info.id)) return;
-      queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
-    },
+  const runnerOnline = useSessionRunnerOnline(conversationId || undefined);
+  const key = terminalsQueryKey(conversationId);
+  const addToCache = (info: TerminalInfo) => {
+    const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+    if (current.some((t) => t.id === info.id)) return;
+    queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+  };
+  const removeFromCache = (terminalId: string) => {
+    const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+    queryClient.setQueryData<TerminalInfo[]>(
+      key,
+      current.filter((t) => t.id !== terminalId),
+    );
+  };
+  const mutation = useMutation({
+    mutationFn: (request: string | TerminalCreateRequest) =>
+      typeof request === "string"
+        ? createTerminal(conversationId, request)
+        : createTerminal(conversationId, request.terminal, request.sessionKey),
+    onSuccess: addToCache,
   });
+  const launch = (terminal: string, callbacks: TerminalLaunchCallbacks = {}) => {
+    if (runnerOnline !== true) {
+      mutation.mutate(terminal, {
+        onSuccess: (info) => callbacks.onOpen?.(info),
+        onError: (error) => callbacks.onError?.(error),
+      });
+      return;
+    }
+    const sessionKey = newTerminalSessionKey();
+    const predicted: TerminalInfo = {
+      id: terminalResourceId(terminal, sessionKey),
+      name: terminal,
+      session: sessionKey,
+      running: true,
+    };
+    setTerminalLaunching(predicted.id, true);
+    addToCache(predicted);
+    callbacks.onOpen?.(predicted);
+    mutation
+      .mutateAsync({ terminal, sessionKey })
+      .then((info) => {
+        if (info.id === predicted.id) {
+          // Keep the tab's slot; take the server's fields over the prediction.
+          const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+          queryClient.setQueryData<TerminalInfo[]>(
+            key,
+            current.map((t) => (t.id === info.id ? info : t)),
+          );
+          return;
+        }
+        removeFromCache(predicted.id);
+        callbacks.onOpen?.(info);
+      })
+      .catch((error: unknown) => {
+        removeFromCache(predicted.id);
+        callbacks.onError?.(error instanceof Error ? error : new Error(String(error)), predicted);
+      })
+      .finally(() => setTerminalLaunching(predicted.id, false));
+  };
+  return { ...mutation, launch };
 }
 
 /**

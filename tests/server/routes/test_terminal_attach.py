@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from omnigent.entities import Conversation, SessionPermission
 from omnigent.inner.terminal import TerminalInstance
@@ -613,6 +614,23 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
     ]
 
 
+async def test_attach_terminal_proxy_forwards_await_launch(app: FastAPI) -> None:
+    """``?await_launch=true`` reaches the runner so it waits for the launch."""
+    factory = _FakeRunnerWSFactory(_FakeRunnerWSConn())
+    set_runner_ws_factory(factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert factory.calls == [
+        "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach"
+        "?read_only=false&await_launch=true"
+    ]
+
+
 async def test_attach_terminal_proxy_forwards_browser_bytes_to_runner(
     app: FastAPI,
 ) -> None:
@@ -736,3 +754,37 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         pass
 
     assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
+
+
+async def test_attach_terminal_local_fallback_await_launch_waits_for_registration(
+    app: FastAPI,
+    server_registry: TerminalRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-process path also waits for an in-flight launch to register."""
+    calls: list[str] = []
+
+    async def fake_control(websocket: WebSocket, *, socket_path: str, **_: object) -> None:
+        calls.append(socket_path)
+        await websocket.close()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
+        fake_control,
+    )
+    launch = threading.Timer(
+        0.2,
+        _seed_registry,
+        args=(server_registry, "conv_local_wait", [_make_running_instance("zsh", "u1", tmp_path)]),
+    )
+
+    launch.start()
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_local_wait/resources/terminals/terminal_zsh_u1/attach?await_launch=true"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+    launch.join()
+
+    assert calls == [str(tmp_path / "zsh-u1.sock")]

@@ -134,6 +134,7 @@ def create_terminal_attach_router(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        await_launch: bool = Query(default=False),
     ) -> None:
         """
         Attach to a terminal by resource id via WebSocket.
@@ -147,9 +148,12 @@ def create_terminal_attach_router(
         :param terminal_id: Opaque terminal resource id,
             e.g. ``"terminal_bash_s1"``.
         :param read_only: Prevent terminal input when ``True``.
+        :param await_launch: Wait briefly for a terminal whose create request
+            is still in flight instead of closing as not found.
         """
         from omnigent.entities.session_resources import (
             resolve_terminal_entry_by_resource_id,
+            wait_for_terminal_entry_by_resource_id,
         )
 
         user_id = await _authorize_terminal_attach(
@@ -181,7 +185,10 @@ def create_terminal_attach_router(
         if ws_factory is not None:
             from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
+            query = {"read_only": "true" if read_only else "false"}
+            if await_launch:
+                query["await_launch"] = "true"
+            qs = urlencode(query)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
             )
@@ -251,6 +258,12 @@ def create_terminal_attach_router(
             terminal_id,
             terminal_registry,
         )
+        if entry is None and await_launch:
+            entry = await wait_for_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
+            )
         if entry is None or not entry.instance.running or not await entry.instance.is_alive():
             await websocket.close(
                 code=_WS_CLOSE_TERMINAL_NOT_FOUND,

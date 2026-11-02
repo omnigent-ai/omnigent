@@ -21,12 +21,16 @@ import {
   terminalInfoFromResource,
   terminalsReconcileInterval,
   terminalTabKey,
+  useCreateTerminal,
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
 import {
   clearDirectAttachCaches,
   directProbeUrl,
+  isTerminalLaunching,
+  terminalResourceId,
+  terminalsQueryKey,
   resolveInitialAttachUrl,
   watchDirectUpgrade,
   withAttachParams,
@@ -383,6 +387,118 @@ describe("createTerminal", () => {
       ),
     );
     await expect(createTerminal("conv_abc", "zsh")).rejects.toThrow(/not declared/);
+  });
+});
+
+describe("terminalResourceId", () => {
+  it("mirrors the server's terminal_resource_id sanitizing", () => {
+    expect(terminalResourceId("zsh", "u-ab12cd")).toBe("terminal_zsh_u-ab12cd");
+    expect(terminalResourceId(" my shell! ", "s1")).toBe("terminal_my_shell_s1");
+    expect(terminalResourceId("__", "main")).toBe("terminal_resource_main");
+  });
+});
+
+describe("useCreateTerminal launch", () => {
+  function renderLaunch(conversationId: string) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const hook = renderHook(() => useCreateTerminal(conversationId), {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children),
+    });
+    const cached = () => client.getQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId));
+    return { hook, cached };
+  }
+
+  function createdResponse(body: string): Response {
+    const { session_key: sessionKey, terminal } = JSON.parse(body) as {
+      session_key: string;
+      terminal: string;
+    };
+    return mockResponse({
+      id: `terminal_${terminal}_${sessionKey}`,
+      metadata: { terminal_name: terminal, session_key: sessionKey, running: true },
+    });
+  }
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    runnerOnlineMock.mockReturnValue(undefined);
+  });
+
+  it("opens the predicted terminal before the create returns when the runner is online", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    let requestBody = "";
+    fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+      requestBody = init.body as string;
+      return new Promise<Response>((resolve) => {
+        respond = resolve;
+      });
+    });
+    const onOpen = vi.fn();
+    const { hook, cached } = renderLaunch("conv_parallel");
+
+    act(() => hook.result.current.launch("zsh", { onOpen }));
+
+    // Opened at once, under the id the server will assign, with the attach
+    // flagged to wait for the launch.
+    expect(onOpen).toHaveBeenCalledOnce();
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    expect(opened.id).toBe(terminalResourceId("zsh", opened.session));
+    await vi.waitFor(() => expect(requestBody).not.toBe(""));
+    expect(JSON.parse(requestBody).session_key).toBe(opened.session);
+    expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+    expect(isTerminalLaunching(opened.id)).toBe(true);
+
+    await act(async () => respond(createdResponse(requestBody)));
+
+    await vi.waitFor(() => expect(isTerminalLaunching(opened.id)).toBe(false));
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+  });
+
+  it("removes the early-opened terminal and reports it when the create fails", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "invalid_input", message: "Shell 'zsh' is not available" } },
+        { ok: false, status: 400 },
+      ),
+    );
+    const onOpen = vi.fn();
+    const onError = vi.fn();
+    const { hook, cached } = renderLaunch("conv_parallel_fail");
+
+    act(() => hook.result.current.launch("zsh", { onOpen, onError }));
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect((onError.mock.calls[0][0] as Error).message).toMatch(/not available/);
+    expect(onError.mock.calls[0][1]).toEqual(opened);
+    expect(cached()).toEqual([]);
+    expect(isTerminalLaunching(opened.id)).toBe(false);
+  });
+
+  it("waits for the create when runner liveness is unknown (the create may wake it)", async () => {
+    runnerOnlineMock.mockReturnValue(undefined);
+    fetchMock.mockImplementationOnce(async (_url: string, init: RequestInit) =>
+      createdResponse(init.body as string),
+    );
+    const onOpen = vi.fn();
+    const { hook, cached } = renderLaunch("conv_sequential");
+
+    act(() => hook.result.current.launch("bash", { onOpen }));
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(cached()).toBeUndefined();
+
+    await vi.waitFor(() => expect(onOpen).toHaveBeenCalledOnce());
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    expect(isTerminalLaunching(opened.id)).toBe(false);
+    expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
   });
 });
 

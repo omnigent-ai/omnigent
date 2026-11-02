@@ -165,6 +165,12 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?await_launch=true for a terminal whose create is in flight", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, true)).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?await_launch=true",
+    );
+  });
+
   it("combines read_only and slice-key params", () => {
     const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789");
     expect(path).toContain("read_only=true");
