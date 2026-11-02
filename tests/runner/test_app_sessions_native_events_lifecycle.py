@@ -1758,6 +1758,9 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     )
     from omnigent.spec.types import DatabricksAuth
 
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     cfg = tmp_path / "databrickscfg"
     cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
