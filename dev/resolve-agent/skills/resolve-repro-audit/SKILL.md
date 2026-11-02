@@ -69,6 +69,21 @@ before Step 1.
    - For an existence-check or weak assertion, preserve the original and rewrite
      a behavioral test that exercises the real journey; confirm it fails for
      the right reason. Disclose the change and rationale in `test_audit`.
+   - A wait that can only return after catching a transient state (for
+     example, the session must be *seen* leaving `idle`), or whose deadlines
+     do not leave the whole test well inside the effective per-test timeout
+     (`pytest-timeout` is 300 s by default and 180 s in some e2e workflows;
+     CI's workflow-provided sandbox test lane, which is not configured in
+     this repository, defaults to a 300 s command cap) with margin for setup
+     and teardown, sleeps its full budget on a correct fix and times out the
+     lane. Rewrite it to return on evidence the turn leaves behind — a new
+     assistant or error item (or rendered reply) past a pre-send snapshot
+     together with a terminal status, or a `failed` status that was not
+     already present before the send, which some failures persist without
+     appending an item — with deadlines below that cap. A wait that accepts a
+     cached `failed` from an earlier turn can end before the requested turn
+     runs and misreport the transition. Confirm the fail reason is unchanged
+     on the base, and disclose the change in `test_audit`.
    - If the test passes but the journey still misbehaves, the test is too loose:
      strengthen it and re-establish the failure.
    - A passing test alone does not establish that main has fixed the bug.
