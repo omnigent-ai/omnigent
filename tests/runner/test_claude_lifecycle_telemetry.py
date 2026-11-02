@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -230,9 +231,17 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
     caplog.set_level(logging.INFO)
     released = asyncio.Event()
 
-    async def release(_self, session_id: str) -> None:
+    async def release(
+        _self,
+        session_id: str,
+        *,
+        only_if_current: Callable[[], bool] | None = None,
+        only_if_unused_since: float | None = None,
+    ) -> None:
         assert session_id == _SESSION
-        released.set()
+        assert only_if_unused_since is not None
+        if only_if_current is None or only_if_current():
+            released.set()
 
     monkeypatch.setattr(_FakeProcessManager, "release", release)
     publish_exit = launch.resources._terminal_exit_publisher
@@ -246,6 +255,7 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
             lifecycle=TerminalLifecycle.REQUIRED,
             command="claude",
             exit_status=1,
+            terminal_instance_id=launch.instance.diagnostic_id,
             lifecycle_context={
                 "event_name": "wrong_event",
                 "session_id": "wrong_session",

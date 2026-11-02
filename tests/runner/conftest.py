@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -318,6 +319,9 @@ class _FakeProcessManager:
         # Every release call with its idle-cutoff guard, including calls the
         # guard suppressed; ``released`` records only completed releases.
         self.release_calls: list[tuple[str, float | None]] = []
+        # Session, ownership result, last-use result; None means no guard.
+        self.release_guards: list[tuple[str, bool | None, bool | None]] = []
+        self._last_used_at: dict[str, float] = {}
 
     async def get_client(
         self, conversation_id: str, harness: str, env: Any = None
@@ -325,6 +329,7 @@ class _FakeProcessManager:
         """Return the fixed scripted client."""
         self.get_client_calls.append((conversation_id, harness, env))
         self._sessions.add(conversation_id)
+        self._last_used_at[conversation_id] = time.monotonic()
         return self._client
 
     def has_session(self, conversation_id: str) -> bool:
@@ -338,6 +343,7 @@ class _FakeProcessManager:
     def note_activity(self, conversation_id: str) -> None:
         """Record an activity lease refresh for a conversation."""
         self.activity_noted.append(conversation_id)
+        self._last_used_at[conversation_id] = time.monotonic()
 
     def mark_turn_active(self, conversation_id: str) -> None:
         """Mark a conversation as having an active turn (test helper)."""
@@ -359,7 +365,12 @@ class _FakeProcessManager:
         return True
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        only_if_current: Callable[[], bool] | None = None,
+        only_if_unused_since: float | None = None,
     ) -> None:
         """Record a release and remove the session.
 
@@ -369,8 +380,19 @@ class _FakeProcessManager:
         :param conversation_id: Session/conversation id being released.
         :param only_if_idle_cutoff: Idle-reap cutoff; when given, a
             conversation with an active turn is not torn down.
+        :param only_if_current: Ownership check guarding delayed cleanup.
+        :param only_if_unused_since: Preserve a harness used after this time.
         """
         self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        owned = only_if_current() if only_if_current is not None else None
+        unused = (
+            self._last_used_at.get(conversation_id, 0.0) <= only_if_unused_since
+            if only_if_unused_since is not None
+            else None
+        )
+        self.release_guards.append((conversation_id, owned, unused))
+        if owned is False or unused is False:
+            return
         if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
             return
         self.released.append(conversation_id)
