@@ -12252,25 +12252,31 @@ ific earlier point.
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("draft", ["", _STALE_MULTILINE_DRAFT], ids=["empty", "hidden-draft"])
 @pytest.mark.parametrize("printed", list(_PRINTED_OVER_BOX_PANES))
-@pytest.mark.parametrize("repaint_shows_box", [True, False], ids=["repainted", "still-covered"])
+# Where the repaint finds Claude Code: in the pane's process tree, only through
+# the bridge's session (a launcher runs it outside that tree), or nowhere.
+@pytest.mark.parametrize("repaint_reaches", ["pane-tree", "bridge-session", "nothing"])
 def test_output_printed_over_the_input_box_is_repainted_before_refusing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     slash: bool,
     draft: str,
     printed: str,
-    repaint_shows_box: bool,
+    repaint_reaches: str,
 ) -> None:
     """Output another process printed over the box is repainted, not refused as a draft."""
     composer = _EditableComposer(draft, cursor=len(draft))
     composer.install(monkeypatch)
+    bridge_dir = _picker_bridge_dir(tmp_path)
     covered = True
     repaints: list[str] = []
 
-    def repaint(socket_path: str, tmux_target: str) -> int:
+    def repaint(socket_path: str, tmux_target: str, session_bridge_dir: Path | None = None) -> int:
         nonlocal covered
         repaints.append(tmux_target)
-        covered = not repaint_shows_box
+        if repaint_reaches == "pane-tree" or (
+            repaint_reaches == "bridge-session" and session_bridge_dir == bridge_dir
+        ):
+            covered = False
         return 1
 
     monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
@@ -12281,25 +12287,25 @@ def test_output_printed_over_the_input_box_is_repainted_before_refusing(
             _PRINTED_OVER_BOX_PANES[printed] if covered else composer._capture_pane(*args)
         ),
     )
-    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    message = "/effort high" if slash else "hello from the web"
 
     def inject() -> None:
         if slash:
-            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+            claude_native_bridge.inject_slash_command(bridge_dir, command=message)
         else:
-            inject_user_message(bridge_dir, content="hello from the web")
+            inject_user_message(bridge_dir, content=message)
 
-    if repaint_shows_box:
-        inject()
-        assert [text.strip() for text in composer.submitted] == [
-            "/effort high" if slash else "hello from the web"
-        ]
-    else:
+    if repaint_reaches == "nothing":
         with pytest.raises(
             claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
         ):
             inject()
+        assert message not in composer.text
         assert composer.submitted == []
+    else:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [message]
     assert len(repaints) == 1
 
 
@@ -12391,7 +12397,9 @@ def test_blank_rows_after_an_empty_glyph_row_count_as_a_cleared_box(
     """A whole box holding only blank rows below ``❯`` is empty: nothing can join the paste."""
     sends = _fake_tmux(monkeypatch, ["──────\n❯\n\n──────\n  ? for shortcuts\n"])
 
-    claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+    claude_native_bridge._clear_composer(
+        "/tmp/example/tmux.sock", "claude:0.0", bridge_dir=Path("/tmp/example/bridge")
+    )
 
     assert sum(1 for send in sends if "-l" in send) == 1
 
