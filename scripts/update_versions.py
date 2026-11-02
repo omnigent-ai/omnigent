@@ -9,8 +9,10 @@ version:
 - ``omnigent-ui-sdk``  — ``sdks/ui/pyproject.toml``
 - ``omnigent-slack``   — ``integrations/slack/pyproject.toml``
 
-Each declares its own ``[project].version``. The first three ``==``-pin
-their siblings in ``[project].dependencies``; the root ``omnigent``
+Each declares its own ``[project].version``. The root ``omnigent`` and
+``omnigent-ui-sdk`` ``==``-pin their siblings in
+``[project].dependencies`` (``omnigent-client`` pins none, so it installs
+without the server); the root ``omnigent``
 package also ``==``-pins ``omnigent-slack`` in the ``slack`` optional
 dependency extra — the lockstep contract that
 ``.github/workflows/release-omnigent.yml`` verifies at tag time. This

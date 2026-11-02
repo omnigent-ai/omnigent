@@ -7,6 +7,8 @@ delineator further down:
 1. Request and response body schemas for the JSON endpoints.
 2. SSE event payload models — the discriminated union that every
    event the server emits over its SSE endpoints validates against.
+   The public models live in :mod:`omnigent_client.wire` and are
+   re-exported here; runner-internal events stay in this module.
 """
 
 from __future__ import annotations
@@ -3123,13 +3125,12 @@ class PermissionObject(BaseModel):
 # STREAM EVENTS — typed Pydantic union for SSE event boundary
 # ─────────────────────────────────────────────────────────────────────
 #
-# Single source of truth for the omnigent SSE event stream. Every
-# event the server emits over its two SSE endpoints is modeled below
-# as a Pydantic class with a ``type: Literal[...]`` discriminator, and
-# the ``ServerStreamEvent`` annotated union routes raw event dicts to
-# the right concrete model. Server, runtime, REPL/TUI, and SDK all
-# import these names from this module so wire-name renames and
-# payload changes are a one-edit change.
+# Every event the server emits over its SSE endpoints is a Pydantic
+# class with a ``type: Literal[...]`` discriminator, and the
+# ``ServerStreamEvent`` annotated union routes raw event dicts to the
+# right concrete model. The single definition lives in
+# ``omnigent_client.wire`` so the client can validate envelopes without
+# this package; this module re-exports it for server and runtime code.
 #
 # The SSE endpoint is:
 #
@@ -3160,24 +3161,18 @@ class PermissionObject(BaseModel):
 # Wire-shape note: the server today emits some events with a flat
 # shape (``{"type": ..., <fields>}``) and others with a nested
 # ``{"type": ..., "data": {...}}`` envelope. The Pydantic models
-# below match the wire shapes verbatim — see each model's docstring
-# for the emit site reference.
-# ─────────────────────────────────────────────────────────────────────
-
-
-# ── Module-level constants (rule 34) ──────────────────────────────
-
+# match the wire shapes verbatim — see each model's docstring for the
+# emit site reference.
+#
 # Forward-compatibility note: every event model uses ``ConfigDict(
 # extra="ignore")`` so harnesses (or AP) can add new fields to an
 # event in a future contract revision without breaking older
 # parsers — see ``designs/SERVER_HARNESS_CONTRACT.md`` §Validation
 # discipline (loose by default).
+# ─────────────────────────────────────────────────────────────────────
 
 
-# ── Session-scoped events (session.*) ──────────────────────────────
-
-
-# ── Response pass-through events (response.*) ──────────────────────
+# ── Runner-internal events (not in ServerStreamEvent) ──────────────
 
 
 class InjectionConsumedEvent(_SSEEventBase):
@@ -3201,9 +3196,6 @@ class InjectionConsumedEvent(_SSEEventBase):
 
     type: Literal["injection.consumed"]
     injection_id: str
-
-
-# ── Session resource lifecycle events (Phase 1d) ─────────────────────
 
 
 # ── Discriminated union ─────────────────────────────────────────────

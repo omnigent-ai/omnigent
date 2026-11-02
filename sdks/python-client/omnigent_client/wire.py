@@ -20,10 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field
 # Sentinel ``Origin`` header that the project's own non-browser clients
 # (the SDK, runner -> server tunnel, host/daemon -> server tunnel,
 # terminal-attach) send so the server's CSWSH / CSRF origin guards allow
-# them. It is part of the client/server handshake contract, so it lives
-# with the wire schemas; ``omnigent.runner.identity`` re-exports it. The
-# non-HTTP scheme is deliberate: a browser computes ``Origin`` from the
-# page URL and can never emit this value.
+# them. ``omnigent.runner.identity`` keeps its own stdlib-only copy, and a
+# test pins the two equal. The non-HTTP scheme is deliberate: a browser
+# computes ``Origin`` from the page URL and can never emit this value.
 OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 
 

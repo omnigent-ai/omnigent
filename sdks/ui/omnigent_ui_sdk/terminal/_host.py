@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from omnigent_client import TERMINAL_TASK_STATUSES, child_session_busy
+from omnigent_client.session_lifecycle import is_session_closed
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
@@ -1539,6 +1540,8 @@ class TerminalHost:
             from omnigent.cli_diagnostics import redirect_stderr_to_log
 
             redirect_stderr_to_log()
+        except ModuleNotFoundError:
+            pass  # Installed without omnigent: there is no CLI log to redirect to.
         except Exception as err:
             _log.exception("Failed to redirect stderr to the CLI diagnostics log: %s", err)
         return self
@@ -1584,6 +1587,8 @@ class TerminalHost:
             from omnigent.cli_diagnostics import restore_stderr
 
             restore_stderr()
+        except ModuleNotFoundError:
+            pass  # Installed without omnigent: nothing was redirected.
         except Exception as err:
             _log.exception("Failed to restore stderr from the CLI diagnostics log: %s", err)
         # Clear the title before the drain so it reverts even if a
@@ -3172,13 +3177,9 @@ class TerminalHost:
         # never reopens, and a partial delta that omits labels must not flip it
         # back to open. Derive it from the same labels/title the server uses so
         # the selector knows the child is view-only (a ``message`` to a closed
-        # session 409s). Imported lazily to keep this UI SDK importable without
-        # the ``omnigent`` server package on the path.
-        if not node.closed:
-            from omnigent.util.session_lifecycle import is_session_closed
-
-            if is_session_closed(child.get("labels"), child.get("title")):
-                node.closed = True
+        # session 409s).
+        if not node.closed and is_session_closed(child.get("labels"), child.get("title")):
+            node.closed = True
         # ``done_at`` stamps a TERMINAL task OUTCOME (completed / failed /
         # cancelled, or a durable failure detail) — NOT a merely-not-busy loop.
         # Web parity: a child whose loop is idle between turns (``busy=False``

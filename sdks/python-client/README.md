@@ -19,7 +19,7 @@ pip install omnigent-client
 
 Compatibility:
 
-- Python 3.12 or newer, the same range CI tests.
+- Python 3.12 or newer (`requires-python = ">=3.12"`); CI tests 3.12.
 - It is released in lockstep with the core `omnigent` package at a matching
   version. A client works best against the server release with the same
   version.
