@@ -650,6 +650,7 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert result["result"] == "ASK"
     assert "nightly triage" in result["reason"]
     assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
+    assert "Effective task permission mode: agent default (no task override)" in result["reason"]
 
 
 def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -> None:
@@ -770,7 +771,8 @@ def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
         }
     )
     assert "scheduled task '(unnamed)'" in create["reason"]
-    assert "scheduled task (no id)" in update["reason"]
+    assert update["result"] == "DENY"
+    assert "scheduled_task_id" in update["reason"]
 
 
 def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
@@ -830,7 +832,60 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
         }
     )
     assert result["result"] == "DENY"
-    assert "complete review fields" in result["reason"]
+    assert "scheduled_task_id" in result["reason"]
+
+
+@pytest.mark.parametrize("action", ["create", "update"])
+@pytest.mark.parametrize("prompt", [None, "", " \n\t", 1, ["instructions"]])
+def test_scheduled_task_approval_denies_invalid_prompts(action: str, prompt: object) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": f"sys_scheduled_task_{action}",
+            "data": {
+                "arguments": {
+                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": prompt,
+                    "permission_mode": None,
+                }
+            },
+        }
+    )
+    assert result["result"] == "DENY"
+    assert "prompt must be a non-empty string" in result["reason"]
+
+
+@pytest.mark.parametrize("action", ["create", "update"])
+@pytest.mark.parametrize("missing_field", ["prompt", "permission_mode"])
+def test_legacy_scheduled_task_approval_identifies_omitted_fields(
+    action: str, missing_field: str
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    arguments = {
+        "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+        "prompt": "Review every issue.",
+        "permission_mode": "auto",
+    }
+    arguments.pop(missing_field)
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": f"sys_scheduled_task_{action}",
+            "data": {"arguments": arguments},
+        }
+    )
+    if action == "create" and missing_field == "prompt":
+        assert result["result"] == "DENY"
+    else:
+        assert result["result"] == "ASK"
+        if action == "create":
+            assert "agent default (no task override)" in result["reason"]
+        else:
+            assert "Legacy partial update" in result["reason"]
+            assert "not supplied by legacy caller" in result["reason"]
 
 
 # ── block_skills: native Skill tool (PreToolUse hook path) ─────────────────

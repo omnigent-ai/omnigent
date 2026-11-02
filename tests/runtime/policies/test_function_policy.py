@@ -1119,7 +1119,11 @@ async def test_schedule_approval_uses_dispatched_tool_identity(
             action=PolicyAction.ALLOW,
             data={
                 "name": "display-only-name",
-                "arguments": {"prompt": "Run it.", "permission_mode": None},
+                "arguments": {
+                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                },
             },
         )
 

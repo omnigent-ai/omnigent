@@ -30,9 +30,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
-    token_bound_runner_id,
 )
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.routes._auth_helpers import require_user
@@ -49,6 +48,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
+from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.session_orchestration import require_owned_session
@@ -289,7 +289,7 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
-def require_approved_scheduled_task_agent_origin(
+def require_scheduled_task_agent_origin(
     request: Request,
     *,
     owner: str,
@@ -298,16 +298,15 @@ def require_approved_scheduled_task_agent_origin(
     permission_store: PermissionStore | None,
 ) -> None:
     """Bind a runner-marked mutation to the owner's source session and runner."""
-    if auth_provider is None:
+    if auth_provider is None or owner == RESERVED_USER_LOCAL:
+        return
+    if ORCHESTRATION_SOURCE_HEADER not in request.headers:
+        # UI/API saves and older runners do not opt into source verification.
         return
     source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
-    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-    if not source_id and not token:
-        # Browser/API saves retain their existing ownership and validation path.
-        return
-    if not source_id or not token or permission_store is None:
+    if not source_id or permission_store is None:
         raise OmnigentError(
-            "Agent automation changes require an approved source session",
+            "Agent automation changes require a source session",
             code=ErrorCode.FORBIDDEN,
         )
     try:
@@ -322,7 +321,32 @@ def require_approved_scheduled_task_agent_origin(
             "Agent automation changes require an owned source session",
             code=ErrorCode.FORBIDDEN,
         ) from exc
-    if not source.runner_id or token_bound_runner_id(token) != source.runner_id:
+    is_loopback = request.client is not None and bind_host_is_loopback(request.client.host)
+    allowed_tokens = request.app.state.runner_tunnel_tokens
+    try:
+        try:
+            expected_runner_id = _expected_runner_id_from_headers(
+                request.headers, allowed_tunnel_tokens=allowed_tokens
+            )
+        except ValueError:
+            if not is_loopback:
+                raise
+            expected_runner_id = _expected_runner_id_from_headers(request.headers)
+        if expected_runner_id is None and allowed_tokens is None and not is_loopback:
+            raise ValueError("runner tunnel token is required")
+    except ValueError as exc:
+        raise OmnigentError(
+            "Agent automation changes require an authorized runner token",
+            code=ErrorCode.FORBIDDEN,
+        ) from exc
+    if (
+        not source.runner_id
+        or (expected_runner_id is not None and expected_runner_id != source.runner_id)
+        or (
+            RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+            and source.runner_id.startswith("runner_token_")
+        )
+    ):
         raise OmnigentError(
             "Agent automation changes require the source session's bound runner",
             code=ErrorCode.FORBIDDEN,
@@ -538,7 +562,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        require_approved_scheduled_task_agent_origin(
+        require_scheduled_task_agent_origin(
             request,
             owner=owner,
             auth_provider=auth_provider,
@@ -815,7 +839,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
-        require_approved_scheduled_task_agent_origin(
+        require_scheduled_task_agent_origin(
             request,
             owner=owner,
             auth_provider=auth_provider,

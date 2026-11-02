@@ -20,8 +20,6 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.entities import Conversation, SessionPermission
-from omnigent.errors import OmnigentError
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -276,95 +274,79 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
 
 
 @pytest.mark.parametrize(
-    "missing_header",
-    [None, ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER],
+    ("mode", "expected_status"),
+    [
+        ("bound-token", 200),
+        ("legacy-token-only", 200),
+        ("allow-listed", 200),
+        ("loopback", 200),
+        ("wrong-token", 403),
+        ("unowned-source", 403),
+        ("unbound-source", 403),
+        ("missing-source", 403),
+        ("empty-source", 403),
+        ("missing-token", 403),
+        ("loopback-missing-bound-token", 403),
+        ("invalid-allow-listed-token", 403),
+    ],
 )
-async def test_agent_mutation_requires_owned_bound_runner_source(
-    missing_header: str | None,
+async def test_agent_mutations_validate_origin_at_http_boundary(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    mode: str,
+    expected_status: int,
 ) -> None:
     token = "scheduled-approval-token"
-    source_id = uuid.uuid4().hex
-    source = Conversation(
-        id=source_id,
-        created_at=0,
-        updated_at=0,
-        root_conversation_id=source_id,
-        runner_id=token_bound_runner_id(token),
+    conversations = SqlAlchemyConversationStore(db_uri)
+    source = conversations.create_conversation()
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant("alice@example.com", source.id, 1 if mode == "unowned-source" else 4)
+    runner_id = (
+        "stable-runner"
+        if mode in {"allow-listed", "loopback", "invalid-allow-listed-token"}
+        else token_bound_runner_id(token)
     )
-    conversations = Mock()
-    conversations.get_conversation.return_value = source
-    permissions = Mock()
-    permissions.get.return_value = SessionPermission("alice@example.com", source_id, 4)
+    if mode != "unbound-source":
+        conversations.set_runner_id(source.id, runner_id)
     headers = {
-        ORCHESTRATION_SOURCE_HEADER: source_id,
+        **_headers(),
+        ORCHESTRATION_SOURCE_HEADER: source.id,
         RUNNER_TUNNEL_TOKEN_HEADER: token,
     }
-    if missing_header is not None:
-        headers.pop(missing_header)
-    request = SimpleNamespace(headers=headers)
-
-    if missing_header is None:
-        scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
-            request,
-            owner="alice@example.com",
-            auth_provider=Mock(),
-            conversation_store=conversations,
-            permission_store=permissions,
+    if mode == "legacy-token-only":
+        headers.pop(ORCHESTRATION_SOURCE_HEADER)
+    elif mode == "empty-source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = ""
+    elif mode == "missing-source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = uuid.uuid4().hex
+    elif mode == "wrong-token":
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = "different-token"
+    elif mode in {"loopback", "missing-token", "loopback-missing-bound-token"}:
+        headers.pop(RUNNER_TUNNEL_TOKEN_HEADER)
+    if mode in {"allow-listed", "invalid-allow-listed-token"}:
+        auth_app.state.runner_tunnel_tokens = frozenset(
+            {token if mode == "allow-listed" else "another-token"}
         )
-    else:
-        with pytest.raises(OmnigentError, match="approved source session"):
-            scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
-                request,
-                owner="alice@example.com",
-                auth_provider=Mock(),
-                conversation_store=conversations,
-                permission_store=permissions,
+    peer = "127.0.0.1" if mode.startswith("loopback") else "192.0.2.10"
+    transport = httpx.ASGITransport(app=auth_app, client=(peer, 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+        assert created.status_code == expected_status, created.text
+        if expected_status == 403:
+            listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+            assert listed.json()["scheduled_tasks"] == []
+            created = await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
             )
-
-
-async def test_agent_mutation_rejects_a_different_runner_token() -> None:
-    source_id = uuid.uuid4().hex
-    conversations = Mock()
-    conversations.get_conversation.return_value = Conversation(
-        id=source_id,
-        created_at=0,
-        updated_at=0,
-        root_conversation_id=source_id,
-        runner_id=token_bound_runner_id("bound-token"),
-    )
-    permissions = Mock()
-    permissions.get.return_value = SessionPermission("alice@example.com", source_id, 4)
-    request = SimpleNamespace(
-        headers={
-            ORCHESTRATION_SOURCE_HEADER: source_id,
-            RUNNER_TUNNEL_TOKEN_HEADER: "different-token",
-        }
-    )
-
-    with pytest.raises(OmnigentError, match="source session's bound runner"):
-        scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
-            request,
-            owner="alice@example.com",
-            auth_provider=Mock(),
-            conversation_store=conversations,
-            permission_store=permissions,
+            assert created.status_code == 200, created.text
+        task_id = created.json()["id"]
+        updated = await client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=headers
         )
-
-
-async def test_unmarked_ui_mutation_keeps_the_existing_route() -> None:
-    conversations = Mock()
-    permissions = Mock()
-
-    scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
-        SimpleNamespace(headers={}),
-        owner="alice@example.com",
-        auth_provider=Mock(),
-        conversation_store=conversations,
-        permission_store=permissions,
-    )
-
-    conversations.get_conversation.assert_not_called()
-    permissions.get.assert_not_called()
+        assert updated.status_code == expected_status, updated.text
+        stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+        assert stored.json()["state"] == ("paused" if expected_status == 200 else "active")
 
 
 async def test_automations_gate_is_checked_per_request(
