@@ -607,6 +607,8 @@ def test_queued_rows_and_nested_workspace_share_the_tray_grid(
     chat_session_contract: ChatSessionContract,
 ) -> None:
     chat = chat_session_contract
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     open_live(page, chat, DESKTOP)
     chat.emit_busy("geometry-turn")
     composer = page.get_by_label("Message the agent")

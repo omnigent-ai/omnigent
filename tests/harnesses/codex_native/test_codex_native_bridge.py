@@ -51,6 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.process_logging import data_dir
 
 
 def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
@@ -77,12 +78,14 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
     assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
-def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
-    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` and the runner's data dir.
 
     The MCP server starts in the session workspace, and without ``-I`` python puts
     that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
-    the bridge's own package. Every other native bridge passes ``-I`` here.
+    the bridge's own package. Every other native bridge passes ``-I`` here. codex
+    also drops ``OMNIGENT_DATA_DIR`` from an MCP server's env, so the relay gets it
+    pinned to find the bridge root that holds its bridge dir.
 
     :param tmp_path: Stands in for the per-session bridge dir.
     """
@@ -96,6 +99,29 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
     ]
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    assert json.loads(raw_data_dir) == str(data_dir())
+
+
+def test_codex_mcp_config_overrides_pin_a_relative_data_dir_as_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay starts in the session workspace, so it must get an absolute data dir.
+
+    :param tmp_path: Stands in for the host's launch directory.
+    :param monkeypatch: Sets a relative ``OMNIGENT_DATA_DIR`` and the cwd.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", "state")
+
+    overrides = codex_mcp_config_overrides(tmp_path / "bridge")
+
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    pinned = Path(json.loads(raw_data_dir))
+    assert pinned.is_absolute()
+    assert pinned == Path.cwd() / "state"
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -137,6 +163,72 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize("native_turn", [None, "turn_agent", "turn_shell"])
+def test_shell_reconciliation_requires_idle_or_the_original_parent(
+    tmp_path: Path, native_turn: str | None
+) -> None:
+    """Only authoritative idle or the original model turn makes steering safe."""
+    _seed_active_turn(tmp_path, "turn_agent")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "shell_request")
+    pending = read_bridge_state(tmp_path)
+    assert pending is not None
+    for _ in range(2):
+        codex_native_bridge.reconcile_shell_command_state(tmp_path, pending, native_turn)
+        updated = read_bridge_state(tmp_path)
+        assert updated is not None
+        assert updated.active_turn_id == "turn_agent"
+        assert (updated.pending_shell_command_id is None) == (native_turn != "turn_shell")
+        assert updated.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+)
+def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """A delayed fence response cannot change state that replaced its captured submission."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, None)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "older_request")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    newer = replace(observed, **{changed_field: "newer_value"})
+    write_bridge_state(tmp_path, newer)
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, None)
+
+    assert read_bridge_state(tmp_path) == newer
+
+
+def test_shell_reconciliation_never_restores_a_completed_turn(tmp_path: Path) -> None:
+    """Completion during the probe must not create a stale standalone-shell latch."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_shell")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    observed = replace(state, pending_shell_command_id="submission")
+    write_bridge_state(tmp_path, observed)
+    clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, "turn_shell")
+
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    assert current.active_turn_id is None
+    assert current.active_shell_turn_id is None
+    assert current.pending_shell_command_id == "submission"
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, current, None)
+    settled = read_bridge_state(tmp_path)
+    assert settled is not None and settled.pending_shell_command_id is None
 
 
 @pytest.mark.parametrize(
