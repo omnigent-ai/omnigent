@@ -380,8 +380,9 @@ desktop Workspace rail and the mobile Files drawer alike. The wake only
 reconnects: it resumes no interrupted turn and retries no failed startup input.
 The panel shows **Starting sandbox…**, then the file list; a failed wake shows
 the reason and **Try again**. If the sandbox sleeps again while the panel stays
-open, it shows **Start sandbox** rather than waking again. Read-only viewers
-keep the send-a-message hint.
+open, it shows **Start sandbox** rather than waking again. Read-only viewers,
+and servers that don't advertise `retry_session_wake_only` in `/v1/info`, keep
+the send-a-message hint.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -869,7 +870,8 @@ plain `uv run pytest`, which starts a private server for the test.
   with workspace reads failing until the wake succeeds. It checks that opening
   Files in the desktop rail sends only a wake-only `retry_session` and then
   lists the files, and that a failed wake offers Try again, not a live sandbox
-  resume. The mobile drawer is covered by `web/src/shell/FilesPanel.test.tsx`.
+  resume. The mobile drawer and the older-server fallback are covered by
+  `web/src/shell/FilesPanel.test.tsx`.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

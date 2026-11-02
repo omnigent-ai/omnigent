@@ -15,6 +15,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
@@ -494,8 +495,13 @@ export function FilesPanel({
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
   // Opening the panel on an asleep sandbox starts it, as Reconnect host does,
-  // so its files load without a chat message. Restarting needs edit access.
-  const canWake = isEditorLevel(session?.permissionLevel ?? null);
+  // so its files load without a chat message. Restarting needs edit access,
+  // and a server that can wake without resuming an interrupted turn.
+  const serverInfo = useServerInfo();
+  const canWake =
+    isEditorLevel(session?.permissionLevel ?? null) &&
+    serverInfo !== "loading" &&
+    serverInfo.retry_session_wake_only === true;
   const sandboxWake = useSandboxAutoWake({
     conversationId,
     asleep: showAsleepHint,

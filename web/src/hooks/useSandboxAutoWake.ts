@@ -25,6 +25,13 @@ interface WakeState {
   error: string | null;
 }
 
+interface Opening {
+  conversationId: string | undefined;
+  /** This opening already woke, or joined an in-flight wake. */
+  attempted: boolean;
+  pending: boolean;
+}
+
 const PHASE_BY_STEP: Record<WakeState["step"], SandboxWakePhase> = {
   idle: "idle",
   requesting: "waking",
@@ -61,15 +68,21 @@ export function useSandboxAutoWake({
   const [state, setState] = useState<WakeState>({ conversationId, step: "idle", error: null });
   const current: WakeState =
     state.conversationId === conversationId ? state : { conversationId, step: "idle", error: null };
-  const openingRef = useRef({ conversationId, attempted: false, pending: false });
-  if (openingRef.current.conversationId !== conversationId) {
-    openingRef.current = { conversationId, attempted: false, pending: false };
-  }
+  const openingRef = useRef<Opening>({ conversationId, attempted: false, pending: false });
+  // Read outside render: another session's view starts a fresh opening.
+  const openingFor = useCallback((id: string | undefined): Opening => {
+    if (openingRef.current.conversationId !== id) {
+      openingRef.current = { conversationId: id, attempted: false, pending: false };
+    }
+    return openingRef.current;
+  }, []);
   const activeRef = useRef(active);
-  activeRef.current = active;
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   const wake = useCallback(async () => {
-    const opening = openingRef.current;
+    const opening = openingFor(conversationId);
     if (!conversationId || opening.pending) return;
     opening.attempted = true;
     opening.pending = true;
@@ -96,19 +109,26 @@ export function useSandboxAutoWake({
       // The view closed mid-wake; let its next opening try again.
       if (!activeRef.current) opening.attempted = false;
     }
-  }, [conversationId]);
+  }, [conversationId, openingFor]);
 
   // Closing the view ends this opening; the next one may wake again.
   useEffect(() => {
-    if (!active && !openingRef.current.pending) openingRef.current.attempted = false;
-  }, [active, conversationId]);
-
-  useEffect(() => {
-    if (!active || !asleep || !canWake || openingRef.current.attempted) return;
-    void wake();
-  }, [active, asleep, canWake, conversationId, wake]);
+    const opening = openingFor(conversationId);
+    if (!active && !opening.pending) opening.attempted = false;
+  }, [active, conversationId, openingFor]);
 
   const step = current.step;
+  useEffect(() => {
+    const opening = openingFor(conversationId);
+    if (!active || !asleep || !canWake || opening.attempted) return;
+    // Reopened while an earlier wake is still in flight: that wake counts.
+    if (step === "requesting" || step === "settling") {
+      opening.attempted = true;
+      return;
+    }
+    void wake();
+  }, [active, asleep, canWake, conversationId, openingFor, step, wake]);
+
   useEffect(() => {
     // Back online, by this wake or any other: forget the attempt's outcome.
     if ((step === "settling" || step === "failed") && !asleep) {

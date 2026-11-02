@@ -19,6 +19,8 @@ import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFi
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { retrySession } from "@/lib/sessionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
@@ -90,6 +92,8 @@ const useSearchMock = vi.mocked(useWorkspaceFileSearch);
 const allFilesRefetchMock = vi.fn(() => Promise.resolve());
 const changedFilesRefetchMock = vi.fn(() => Promise.resolve());
 const searchRefetchMock = vi.fn(() => Promise.resolve());
+const WAKE_CAPABLE_INFO: ServerInfo = { ...FALLBACK_SERVER_INFO, retry_session_wake_only: true };
+let serverInfo: ServerInfo | "loading" = WAKE_CAPABLE_INFO;
 
 function file(path: string, bytes = 10): WorkspaceFile {
   return {
@@ -252,28 +256,31 @@ function renderPanel({
 /** A fresh routed FilesPanel element, so rerenders re-read the hook mocks. */
 function panelAt(conversationId: string, props: Partial<ComponentProps<typeof FilesPanel>> = {}) {
   return (
-    <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
-      <Routes>
-        <Route
-          path="/c/:conversationId"
-          element={
-            <FilesPanel
-              sort="recent"
-              onSortChange={vi.fn()}
-              flatView={false}
-              onFileSelect={vi.fn()}
-              showHidden={false}
-              onShowHiddenChange={vi.fn()}
-              {...props}
-            />
-          }
-        />
-      </Routes>
-    </MemoryRouter>
+    <CapabilitiesProvider info={serverInfo}>
+      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+                {...props}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </CapabilitiesProvider>
   );
 }
 
 beforeEach(() => {
+  serverInfo = WAKE_CAPABLE_INFO;
   useAllFilesMock.mockReset();
   useAsleepMock.mockReturnValue(false);
   retrySessionMock.mockReset();
@@ -474,25 +481,27 @@ describe("FilesPanel on an asleep sandbox", () => {
     useEnvironmentMock.mockReturnValue(environmentResult(null, null));
     useSearchMock.mockReturnValue(searchResult([], false, false, false));
     const drawer = (open: boolean) => (
-      <MemoryRouter initialEntries={["/c/conv_asleep"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanelDrawer
-                sort="recent"
-                onSortChange={vi.fn()}
-                open={open}
-                onClose={vi.fn()}
-                onFileSelect={vi.fn()}
-                flatView={false}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>
+      <CapabilitiesProvider info={serverInfo}>
+        <MemoryRouter initialEntries={["/c/conv_asleep"]}>
+          <Routes>
+            <Route
+              path="/c/:conversationId"
+              element={
+                <FilesPanelDrawer
+                  sort="recent"
+                  onSortChange={vi.fn()}
+                  open={open}
+                  onClose={vi.fn()}
+                  onFileSelect={vi.fn()}
+                  flatView={false}
+                  showHidden={false}
+                  onShowHiddenChange={vi.fn()}
+                />
+              }
+            />
+          </Routes>
+        </MemoryRouter>
+      </CapabilitiesProvider>
     );
     const { rerender } = render(drawer(false));
     expect(retrySessionMock).not.toHaveBeenCalled();
@@ -512,6 +521,48 @@ describe("FilesPanel on an asleep sandbox", () => {
       fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
     });
     expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
+  });
+
+  it("offers Start sandbox, not another automatic wake, when it sleeps again while open", async () => {
+    useAsleepMock.mockReturnValue(true);
+    const { rerender } = renderPanel({
+      conversationId: "conv_asleep",
+      files: [],
+      listsLoaded: false,
+    });
+    await act(async () => {});
+    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+
+    useAsleepMock.mockReturnValue(false);
+    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
+    rerender(panelAt("conv_asleep"));
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+
+    useAsleepMock.mockReturnValue(true);
+    useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
+    await act(async () => rerender(panelAt("conv_asleep")));
+    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
+    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
+    });
+    expect(retrySessionMock).toHaveBeenCalledTimes(2);
+    expect(retrySessionMock).toHaveBeenLastCalledWith("conv_asleep", { wakeOnly: true });
+  });
+
+  it.each<[string, ServerInfo | "loading"]>([
+    ["an older server", { ...FALLBACK_SERVER_INFO, retry_session_wake_only: undefined }],
+    ["the capability probe still loading", "loading"],
+  ])("keeps the send-a-message hint on %s", (_label, info) => {
+    serverInfo = info;
+    useAsleepMock.mockReturnValue(true);
+    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+
+    expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
   });
 
   it("keeps the send-a-message hint for a read-only viewer", () => {
@@ -619,25 +670,7 @@ describe("FilesPanel changed files search", () => {
 
     expect(screen.queryByRole("searchbox", { name: "Search changed files" })).toBeNull();
 
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_search_visible"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={true}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_search_visible", { flatView: true }));
 
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
   });
@@ -680,46 +713,10 @@ describe("FilesPanel changed files search", () => {
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toHaveValue("App");
 
     // Switch to Explore (tree) view
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_search_clear"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={false}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_search_clear", { flatView: false }));
 
     // Switch back to Changed view
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_search_clear"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={true}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_search_clear", { flatView: true }));
 
     // useEffect resets changedSearch when flatView becomes false, so the box should be empty on return
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toHaveValue("");
@@ -962,25 +959,7 @@ describe("FilesPanel tree (Explore) search", () => {
     expect(screen.queryByRole("searchbox", { name: "Search changed files" })).toBeNull();
 
     // Switch to Changed view
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_tree_search_visible"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={true}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_tree_search_visible", { flatView: true }));
 
     // Changed view has its own search box; tree search must not be present
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
@@ -1242,46 +1221,10 @@ describe("FilesPanel tree (Explore) search", () => {
 
     // Switch to Changed (flat) view — this triggers the useEffect that calls
     // setTreeSearch("") so returning to tree view starts with a blank query.
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_tree_search_tab_clear"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={true}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_tree_search_tab_clear", { flatView: true }));
 
     // Switch back to Explore view
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_tree_search_tab_clear"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={false}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_tree_search_tab_clear", { flatView: false }));
 
     // The search box must be empty — treeSearch was cleared by the useEffect
     // when flatView became true.  Using rerender() (not render()) keeps the
@@ -1473,47 +1416,11 @@ describe("FilesPanel tree (Explore) search", () => {
     );
 
     // Switch to Changed (flat) view — the useEffect resets the glob filters.
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_tree_filters_tab_clear"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={true}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_tree_filters_tab_clear", { flatView: true }));
 
     // Switch back to Explore — the toggle stays open (UI preference persists)
     // but both filter inputs must be empty again (the values were cleared).
-    rerender(
-      <MemoryRouter initialEntries={["/c/conv_tree_filters_tab_clear"]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={false}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    rerender(panelAt("conv_tree_filters_tab_clear", { flatView: false }));
 
     expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("");
     expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("");

@@ -258,6 +258,18 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
+describe("resolveServerInfo retry_session_wake_only", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ retry_session_wake_only: advertised });
+    expect(parsed.retry_session_wake_only).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_event_types", () => {
   it.each([
     [undefined, []],

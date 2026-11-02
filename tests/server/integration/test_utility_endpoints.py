@@ -115,6 +115,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["session_search_scope"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
+    # Gates the Files panel's sandbox wake; older servers ignore the flag.
+    assert data["retry_session_wake_only"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # Gates the web's /clear for native sessions; older servers reject it.

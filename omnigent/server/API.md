@@ -1026,8 +1026,13 @@ Request body matches `SessionEventInput`:
                                   submission. Returns `{queued, recovered,
                                   recovery}`. Payload `{}`, or
                                   `{"wake_only": true}` to only reconnect:
-                                  no interrupted turn resumes and failed
-                                  saved inputs stay failed.
+                                  failed saved inputs stay failed and the
+                                  request resumes no interrupted turn (a
+                                  concurrent retry shares the in-flight
+                                  attempt, started by its first caller).
+                                  Send `wake_only` only when `/v1/info`
+                                  reports `retry_session_wake_only: true`;
+                                  older servers ignore it.
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without

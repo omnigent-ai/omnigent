@@ -3895,13 +3895,17 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     assert conv.runner_id != original_runner_id
 
 
+@pytest.mark.parametrize(
+    "second_data", [{}, {"wake_only": True}], ids=["same-mode", "mixed-wake-only"]
+)
 async def test_retry_session_single_flight_launches_and_rotates_once(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    second_data: dict[str, bool],
 ) -> None:
-    """Concurrent retries share one host launch and one binding rotation."""
+    """Concurrent retries, wake-only or not, share one launch and one rotation."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -3939,7 +3943,7 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
         ),
         client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": "retry_session", "data": {}},
+            json={"type": "retry_session", "data": second_data},
         ),
     )
     await responder
@@ -3982,7 +3986,7 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
         return second_result
 
     monkeypatch.setattr(routes_events, "_recover_retry_session", _recover)
-    flight = (session_id, None, False)
+    flight = (session_id, None)
     routes_events._retry_recovery_tasks.pop(flight, None)
 
     waiter = asyncio.create_task(

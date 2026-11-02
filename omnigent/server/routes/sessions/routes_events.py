@@ -338,9 +338,9 @@ from omnigent.util.session_lifecycle import (
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
-# One shared Resume attempt per session, split by caller for side chats and by
-# wake-only mode; see _retry_session_single_flight.
-_RetryFlight = tuple[str, str | None, bool]
+# One shared Resume attempt per session, split by caller for side chats; see
+# _retry_session_single_flight.
+_RetryFlight = tuple[str, str | None]
 _retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
     WorkspaceScopedCache()
 )
@@ -782,10 +782,12 @@ async def _retry_session_single_flight(
 
     A side chat's recovery depends on the caller's access to its source and
     ownership of the source's runner, so it is shared only by one caller's
-    concurrent requests.
+    concurrent requests. A wake-only request joins any in-flight attempt, so
+    the attempt's first caller decides whether an interrupted turn resumes;
+    after a reconnect a later attempt would not resume one either.
     """
     is_side_chat = conversation is not None and _side_chat_source_id(conversation) is not None
-    flight: _RetryFlight = (session_id, user_id if is_side_chat else None, wake_only)
+    flight: _RetryFlight = (session_id, user_id if is_side_chat else None)
     lock = _retry_recovery_lock(session_id)
     async with lock:
         task = _retry_recovery_tasks.get(flight)

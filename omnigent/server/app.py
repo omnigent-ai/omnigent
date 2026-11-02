@@ -276,6 +276,9 @@ class ServerInfoResponse(BaseModel):
     request_managed_sandbox_host_id: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True
+    # ``retry_session`` honours ``wake_only``; older servers ignore it and may
+    # resume an interrupted turn, so clients must not send it there.
+    retry_session_wake_only: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -3623,6 +3626,7 @@ def create_app(
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
+                "retry_session_wake_only": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit

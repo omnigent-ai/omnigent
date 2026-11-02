@@ -104,6 +104,23 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("idle");
   });
 
+  it("does not wake again when reopened while the earlier wake is still settling", async () => {
+    vi.useFakeTimers();
+    const { result, rerender } = renderWake(asleepAndOpen);
+    await act(async () => {});
+    expect(result.current.phase).toBe("waking");
+
+    rerender({ ...asleepAndOpen, active: false });
+    await act(async () => rerender(asleepAndOpen));
+    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(result.current.phase).toBe("waking");
+
+    // The reopening joined that wake, so its timeout doesn't trigger another.
+    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS));
+    expect(result.current.phase).toBe("failed");
+    expect(retryMock).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["hidden", { active: false }],
     ["awake", { asleep: false }],
