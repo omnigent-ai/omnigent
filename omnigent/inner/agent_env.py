@@ -11,6 +11,9 @@ harness added is filtered by construction rather than by remembering.
 The model is not "no credentials ever". It is:
 
     shared safe base  +  this harness's own config/provider families
+                      +  the Git credential-helper pair in managed sandboxes
+                      +  exact names the host owner forwarded through
+                         ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
                       +  whatever the spec declared in
                          ``os_env.sandbox.env_passthrough``
 
@@ -24,12 +27,15 @@ import os
 from collections.abc import Iterable, Mapping
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR, RUNNER_AUTH_SECRET_ENV_VARS
 
 # Desktop access requires an explicit grant outside the sandbox.
 DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
     {"DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"}
 )
+
+# The managed host image's Git credential helper reads these exact names.
+SANDBOX_GIT_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset({"GIT_TOKEN", "GIT_USERNAME"})
 
 # Categories every POSIX CLI needs regardless of vendor: where the user's
 # config lives, how to reach the network, how to format output, where to put
@@ -105,14 +111,24 @@ def clean_agent_env(
         ``os_env.sandbox.env_passthrough``. This is the documented escape hatch
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
-        for tests.
-    :returns: A filtered copy; desktop-session variables require ``extra_allowed``.
+        for tests. Its ``IS_SANDBOX`` marker controls the Git credential grant;
+        its ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also allowed, subject
+        to the deny rules.
+    :returns: A filtered copy without runner-auth secrets; desktop-session
+        variables require ``extra_allowed``.
     """
     env_source = os.environ if source is None else source
     prefixes = BASE_ALLOW_PREFIXES + tuple(allow_prefixes)
+    operator_names = {
+        name.strip()
+        for name in env_source.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",")
+        if name.strip()
+    }
     extra = set(extra_allowed)
-    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra
-    denied = set(deny_exact) | (DESKTOP_SESSION_ENV_VARS - extra)
+    exact = BASE_ALLOW_EXACT | set(allow_exact) | extra | operator_names
+    if (env_source.get("IS_SANDBOX") or "").strip() == "1":
+        exact |= SANDBOX_GIT_CREDENTIAL_ENV_VARS
+    denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
     return {
         key: value
         for key, value in env_source.items()

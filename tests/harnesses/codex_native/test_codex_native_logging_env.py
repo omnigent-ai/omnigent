@@ -66,15 +66,27 @@ def test_explicit_launch_filter_wins_without_mutating_input(
     assert original["RUST_LOG"] == override
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("host_filter", [None, "off"])
-async def test_app_server_start_passes_native_filter_only_to_enabled_subprocess(
+@pytest.mark.parametrize(
+    "enabled,host_filter,operator_passthrough",
+    [
+        (False, None, False),
+        (False, "off", False),
+        (True, None, False),
+        (True, "off", False),
+        pytest.param(False, "off", True, id="operator-passthrough-capture-disabled"),
+    ],
+)
+async def test_app_server_start_respects_logging_opt_in_and_operator_passthrough(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     enabled: bool,
     host_filter: str | None,
+    operator_passthrough: bool,
 ) -> None:
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1" if enabled else "0")
+    monkeypatch.setenv(
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH", "RUST_LOG" if operator_passthrough else ""
+    )
     if host_filter is None:
         monkeypatch.delenv("RUST_LOG", raising=False)
     else:
@@ -118,6 +130,11 @@ async def test_app_server_start_passes_native_filter_only_to_enabled_subprocess(
             host_filter if host_filter is not None else CODEX_DIAGNOSTIC_RUST_LOG
         )
     assert spawn_env == expected
+    if operator_passthrough:
+        forwarded_filter = spawn_env.get("RUST_LOG")
+        assert forwarded_filter == host_filter
+    elif not enabled:
+        assert "RUST_LOG" not in spawn_env
     assert server.env == original_env
     assert "RUST_LOG" not in app_server.codex_terminal_env(server)
     assert not (source_home / "config.toml").exists()
