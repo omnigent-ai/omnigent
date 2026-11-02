@@ -109,6 +109,17 @@ class PermissionStore(ABC):
         """
         ...
 
+    def has_other_write_grants(self, conversation_id: str, owner_id: str) -> bool:
+        """Whether another principal may write to this session.
+
+        The compatibility default treats any sharing or remaining page as unsafe,
+        preserving private-only orchestration for existing adapters. Override with
+        a complete, fresh check of explicit EDIT-or-higher grants (including public
+        access) to support read-only sharing. Implicit administrators do not count.
+        """
+        grants, cursor = self.list_for_session(conversation_id, limit=2)
+        return cursor is not None or any(grant.user_id != owner_id for grant in grants)
+
     @abstractmethod
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions in one batched query.

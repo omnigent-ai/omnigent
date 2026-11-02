@@ -26,6 +26,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
@@ -378,6 +379,21 @@ class SqlAlchemyPermissionStore(PermissionStore):
         else:
             next_cursor = None
         return [_to_entity(r) for r in rows], next_cursor
+
+    def has_other_write_grants(self, conversation_id: str, owner_id: str) -> bool:
+        with self._session("check_other_session_writers") as session:
+            return bool(
+                session.scalar(
+                    select(
+                        exists().where(
+                            SqlSessionPermission.workspace_id == current_workspace_id(),
+                            SqlSessionPermission.conversation_id == conversation_id,
+                            SqlSessionPermission.user_id != owner_id,
+                            SqlSessionPermission.level >= LEVEL_EDIT,
+                        )
+                    )
+                )
+            )
 
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""

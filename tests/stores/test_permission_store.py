@@ -14,7 +14,13 @@ import pytest
 from sqlalchemy import event
 
 from omnigent.entities import SessionPermission
-from omnigent.server.auth import RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -262,6 +268,40 @@ def test_get_returns_none_for_missing(store: SqlAlchemyPermissionStore, db_uri: 
         f"Expected None for a nonexistent grant, got {result!r}. "
         "get() should return None, not raise, for missing grants."
     )
+
+
+def test_other_write_grants_are_complete_fresh_and_scoped(store, db_uri):
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+    from omnigent.stores.permission_store import PermissionStore
+
+    conv_id = _create_conversation(db_uri)
+    other_id = _create_conversation(db_uri)
+    store.ensure_user("owner")
+    store.grant("owner", conv_id, LEVEL_OWNER)
+    store.ensure_user("admin", is_admin=True)
+    assert not store.has_other_write_grants(conv_id, "owner")
+    assert not PermissionStore.has_other_write_grants(store, conv_id, "owner")
+    # Readers span more than the listing API's default page, with an editor last.
+    for index in range(101):
+        reader = f"reader-{index:03}"
+        store.ensure_user(reader)
+        store.grant(reader, conv_id, LEVEL_READ)
+    assert not store.has_other_write_grants(conv_id, "owner")
+    assert PermissionStore.has_other_write_grants(store, conv_id, "owner")
+    for writer in ("zz-writer", RESERVED_USER_PUBLIC):
+        store.ensure_user(writer)
+        store.grant(writer, other_id, LEVEL_OWNER)
+        assert not store.has_other_write_grants(conv_id, "owner")
+        for level in (LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER):
+            store.grant(writer, conv_id, level)
+            assert store.has_other_write_grants(conv_id, "owner")
+            with workspace_scope(current_workspace_id() + 1):
+                assert not store.has_other_write_grants(conv_id, "owner")
+            store.grant(writer, conv_id, LEVEL_READ)
+            assert not store.has_other_write_grants(conv_id, "owner")
+        store.grant(writer, conv_id, LEVEL_EDIT)
+        store.revoke(writer, conv_id)
+        assert not store.has_other_write_grants(conv_id, "owner")
 
 
 # ── list_for_session ─────────────────────────────────────────────────────────
@@ -1000,7 +1040,9 @@ def test_check_access_direct_grant(store: SqlAlchemyPermissionStore, db_uri: str
 
 def test_check_access_public_grant_fallback(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
     """check_access falls back to __public__ grant when user has no direct grant."""
-    from omnigent.server.auth import RESERVED_USER_PUBLIC
+    from omnigent.server.auth import (
+        RESERVED_USER_PUBLIC,
+    )
 
     _ensure_user(store, "alice")
     _ensure_user(store, RESERVED_USER_PUBLIC)
@@ -1051,7 +1093,9 @@ def test_get_permission_level_public_fallback(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
     """get_permission_level falls back to public grant when no direct grant."""
-    from omnigent.server.auth import RESERVED_USER_PUBLIC
+    from omnigent.server.auth import (
+        RESERVED_USER_PUBLIC,
+    )
 
     _ensure_user(store, "alice")
     _ensure_user(store, RESERVED_USER_PUBLIC)
