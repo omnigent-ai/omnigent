@@ -68,7 +68,22 @@ describe("shellCommandFromCodeBlock", () => {
   });
 
   it("skips output that merely starts with a secondary prompt", () => {
+    // WHY: only an unfinished command gets a "> " line; after a complete one
+    // it is output, and pasting it would run it on Enter.
     expect(shellCommandFromCodeBlock("$ ls\nfile.txt\n> quoted output\n")).toBe("ls");
+    expect(shellCommandFromCodeBlock("$ cat notes.md\n> rm -rf build\n")).toBe("cat notes.md");
+    expect(shellCommandFromCodeBlock("$ cat <<EOF\n> one\n> EOF\n> quoted\n")).toBe(
+      "cat <<EOF\none\nEOF",
+    );
+    expect(shellCommandFromCodeBlock("$ echo hi # it's\n> rm -rf build\n")).toBe("echo hi # it's");
+    expect(shellCommandFromCodeBlock("$ cat <<<'x'\n> rm -rf build\n")).toBe("cat <<<'x'");
+  });
+
+  it("keeps secondary-prompt lines of an open quote", () => {
+    expect(
+      shellCommandFromCodeBlock('$ git commit -m "first\n> second"\n[main 1a2b3c] first\n'),
+    ).toBe('git commit -m "first\nsecond"');
+    expect(shellCommandFromCodeBlock("$ echo 'a\\\n> b'\na\\\nb\n")).toBe("echo 'a\\\nb'");
   });
 
   it("drops leading blank lines and normalizes CRLF", () => {

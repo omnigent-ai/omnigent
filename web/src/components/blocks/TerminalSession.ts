@@ -638,9 +638,11 @@ const BRIDGE_PASTE_REFUSALS = [
 
 /**
  * Why a command was not pasted: a bridge reason, ``unsafe`` (an xterm paste
- * would run lines) or ``interrupted`` (the socket closed before the answer).
+ * would run lines), ``interrupted`` (the socket closed before the answer) or
+ * ``duplicated`` (the bridge pasted too, after the xterm fallback).
  */
-export type ShellPasteRefusal = (typeof BRIDGE_PASTE_REFUSALS)[number] | "unsafe" | "interrupted";
+export type ShellPasteRefusal =
+  (typeof BRIDGE_PASTE_REFUSALS)[number] | "unsafe" | "interrupted" | "duplicated";
 
 /** Called with a command that was not pasted and why. */
 export type ShellPasteRefusedHandler = (text: string, reason: ShellPasteRefusal) => void;
@@ -745,6 +747,9 @@ export class TerminalSession {
   private pendingPaste: PendingShellPaste | null = null;
   /** The ``paste`` frame awaiting the bridge's answer, or null. */
   private inFlightPaste: InFlightShellPaste | null = null;
+  /** A paste sent through xterm after the bridge timed out, until it answers. */
+  private fallenBackPaste: InFlightShellPaste | null = null;
+  private pasteIdleWaiters: (() => void)[] = [];
   private nextPasteId = 1;
 
   /**
@@ -1117,6 +1122,12 @@ export class TerminalSession {
   }
 
   private settleInFlightPaste(frame: TerminalPasteFrame): void {
+    const fallenBack = this.fallenBackPaste;
+    if (fallenBack !== null && frame.id === fallenBack.id && frame.kind === "result") {
+      this.fallenBackPaste = null;
+      if (frame.pasted) fallenBack.onRefused?.(fallenBack.text, "duplicated");
+      return;
+    }
     const inFlight = this.inFlightPaste;
     if (inFlight === null || frame.id !== inFlight.id) return;
     if (frame.kind === "accepted") {
@@ -1134,9 +1145,12 @@ export class TerminalSession {
     if (inFlight === null || inFlight.id !== id) return;
     this.dropInFlightPaste();
     if (this.disposed || this.ws.readyState !== WebSocket.OPEN) return;
+    // A slow current bridge may still be waiting for the prompt; stop it.
+    this.ws.send(JSON.stringify({ type: "paste-cancel", id }));
     // Without bracketed paste every line but the last would run.
     if (this.term.modes.bracketedPasteMode || !inFlight.text.includes("\n")) {
       this.term.paste(inFlight.text);
+      this.fallenBackPaste = inFlight;
     } else {
       inFlight.onRefused?.(inFlight.text, "unsafe");
     }
@@ -1147,6 +1161,17 @@ export class TerminalSession {
     if (this.inFlightPaste === null) return;
     if (this.inFlightPaste.ackTimer !== null) clearTimeout(this.inFlightPaste.ackTimer);
     this.inFlightPaste = null;
+    const waiters = this.pasteIdleWaiters;
+    this.pasteIdleWaiters = [];
+    for (const resolve of waiters) resolve();
+  }
+
+  /** Resolves once no paste awaits the bridge's answer, so a re-dial can't cut one off. */
+  whenShellPasteIdle(): Promise<void> {
+    if (this.inFlightPaste === null) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.pasteIdleWaiters.push(resolve);
+    });
   }
 
   /**
@@ -1161,8 +1186,12 @@ export class TerminalSession {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    // The close listener is aborted below, so report the paste here.
+    const inFlight = this.inFlightPaste;
     this.dropInFlightPaste();
     this.pendingPaste = null;
+    this.fallenBackPaste = null;
+    inFlight?.onRefused?.(inFlight.text, "interrupted");
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();

@@ -38,6 +38,53 @@ export function isShellCodeClassName(className: string | undefined): boolean {
 const PROMPT_PREFIX = /^\s*\$ /;
 // The shell's secondary prompt (PS2), shown before each continuation line.
 const CONTINUATION_PREFIX = /^> /;
+// ``<<EOF``, ``<<-'EOF'`` or ``<< "EOF"``, but not a ``<<<`` here-string.
+const HEREDOC_START = /(?<!<)<<(?!<)-?\s*(['"]?)([A-Za-z_]\w*)\1/g;
+
+/** Why the transcript command so far still needs another line. */
+interface OpenCommand {
+  /** The line ended with a backslash outside single quotes. */
+  continued: boolean;
+  /** The quote a line left open, or null. */
+  quote: "'" | '"' | null;
+  /** Here-document delimiters still awaited, in order. */
+  heredocs: string[];
+}
+
+const CLOSED_COMMAND: OpenCommand = { continued: false, quote: null, heredocs: [] };
+
+function isOpen(command: OpenCommand): boolean {
+  return command.continued || command.quote !== null || command.heredocs.length > 0;
+}
+
+/** The command's state after one more of its lines (prompt already removed). */
+function afterLine(command: OpenCommand, line: string): OpenCommand {
+  const [delimiter, ...laterHeredocs] = command.heredocs;
+  if (delimiter !== undefined) {
+    const closed = line.trim() === delimiter;
+    return { ...CLOSED_COMMAND, heredocs: closed ? laterHeredocs : command.heredocs };
+  }
+  let quote = command.quote;
+  let escaped = false;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (quote === "'") {
+      if (char === "'") quote = null;
+    } else if (escaped) {
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (quote === '"') {
+      if (char === '"') quote = null;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === "#" && (index === 0 || /\s/.test(line[index - 1]))) {
+      break;
+    }
+  }
+  const heredocs = command.quote === null ? [...line.matchAll(HEREDOC_START)].map((m) => m[2]) : [];
+  return { continued: escaped, quote, heredocs };
+}
 
 /** Whether a UTF-16 code unit is a control character other than tab or LF. */
 function isDroppedControl(code: number): boolean {
@@ -59,8 +106,9 @@ function withoutControlCharacters(text: string): string {
  *
  * A block whose first non-blank line starts with ``$ `` is a transcript: only
  * its ``$ `` lines and their continuations are kept, without the prompts. A
- * continuation follows a trailing backslash or carries the ``> `` secondary
- * prompt. Trailing newlines and control characters other than tab are dropped.
+ * continuation follows a trailing backslash, or carries the ``> `` secondary
+ * prompt after an unfinished line (open quote or here-document). Trailing
+ * newlines and control characters other than tab are dropped.
  *
  * @param code The code block's text, e.g. ``"$ npm test\\nok\\n"``.
  * @returns The command, e.g. ``"npm test"``; empty when nothing remains.
@@ -71,22 +119,24 @@ export function shellCommandFromCodeBlock(code: string): string {
   const firstLine = lines.find((line) => line.trim() !== "");
   if (firstLine !== undefined && PROMPT_PREFIX.test(firstLine)) {
     commandLines = [];
-    let inCommand = false;
-    let continued = false;
+    let command = CLOSED_COMMAND;
     for (const line of lines) {
+      let kept: string;
       if (PROMPT_PREFIX.test(line)) {
-        commandLines.push(line.replace(PROMPT_PREFIX, ""));
-        inCommand = true;
-      } else if (inCommand && CONTINUATION_PREFIX.test(line)) {
+        kept = line.replace(PROMPT_PREFIX, "");
+        command = CLOSED_COMMAND;
+      } else if (isOpen(command) && CONTINUATION_PREFIX.test(line)) {
         // Left in, "> " would be a redirection that truncates a file.
-        commandLines.push(line.replace(CONTINUATION_PREFIX, ""));
-      } else if (continued) {
-        commandLines.push(line);
+        kept = line.replace(CONTINUATION_PREFIX, "");
+      } else if (command.continued) {
+        kept = line;
       } else {
-        inCommand = false;
+        // Output, including output that starts with "> ".
+        command = CLOSED_COMMAND;
         continue;
       }
-      continued = line.trimEnd().endsWith("\\");
+      commandLines.push(kept);
+      command = afterLine(command, kept);
     }
   }
   return commandLines

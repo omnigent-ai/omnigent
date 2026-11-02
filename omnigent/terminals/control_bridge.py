@@ -425,14 +425,17 @@ def _paste_method(state: _PastePaneState, previous: _PastePaneState | None) -> P
 
     :param state: The latest pane state.
     :param previous: The state one poll earlier, or ``None`` on the first poll.
-    :returns: ``"bracketed"`` when the pane reports bracketed paste on.
-        Otherwise a known shell must be reading a line (raw tty) at a prompt
-        that hasn't moved since the previous poll; bash and zsh then take
-        ``"quoted"`` keystrokes, which never depend on the paste mode.
+    :returns: ``None`` unless a known shell is in the foreground; then
+        ``"bracketed"`` when the pane reports bracketed paste on. Otherwise the
+        shell must be reading a line (raw tty) at a prompt that hasn't moved
+        since the previous poll; bash and zsh then take ``"quoted"``
+        keystrokes, which never depend on the paste mode.
     """
+    command = os.path.basename(state.current_command).lstrip("-")
+    if command not in _QUOTED_INSERT_SHELLS | _ALWAYS_BRACKETED_SHELLS:
+        return None
     if state.bracket_paste_flag == "1":
         return "bracketed"
-    command = os.path.basename(state.current_command).lstrip("-")
     settled = (
         state.line_editing is True
         and state.cursor[0] > 0
@@ -547,7 +550,11 @@ async def _read_paste_pane_state(
 
 
 async def _paste_shell_command(
-    tmux: str, socket_path: str, tmux_target: str, text: str
+    tmux: str,
+    socket_path: str,
+    tmux_target: str,
+    text: str,
+    cancelled: asyncio.Event | None = None,
 ) -> str | None:
     """Paste *text* at the pane's prompt without running it.
 
@@ -559,6 +566,7 @@ async def _paste_shell_command(
     :param socket_path: Private tmux server socket.
     :param tmux_target: The pane's ``-t`` target.
     :param text: Untrusted command text from the browser.
+    :param cancelled: Set when the browser gave up; checked until the paste starts.
     :returns: ``None`` when pasted, otherwise the refusal reason.
     """
     if len(text) > _SHELL_PASTE_MAX_CHARS:
@@ -571,6 +579,8 @@ async def _paste_shell_command(
     previous: _PastePaneState | None = None
     while True:
         state = await _read_paste_pane_state(tmux, socket_path, tmux_target)
+        if cancelled is not None and cancelled.is_set():
+            return "cancelled"
         method = _paste_method(state, previous) if state is not None else None
         if method is not None:
             break
@@ -584,28 +594,37 @@ async def _paste_shell_command(
         # -r keeps LF as LF; tmux would otherwise send CR after the Ctrl-V.
         payload, paste_flags = _quote_for_line_editor(command), ("-r",)
     buffer_name = _SHELL_PASTE_BUFFER_PREFIX + os.urandom(8).hex()
-    pasted = await _run_tmux_command(
-        tmux,
-        socket_path,
-        "load-buffer",
-        "-b",
-        buffer_name,
-        "-",
-        ";",
-        "paste-buffer",
-        *paste_flags,
-        "-d",
-        "-b",
-        buffer_name,
-        "-t",
-        tmux_target,
-        stdin=payload.encode("utf-8"),
-    )
+    try:
+        pasted = await _run_tmux_command(
+            tmux,
+            socket_path,
+            "load-buffer",
+            "-b",
+            buffer_name,
+            "-",
+            ";",
+            "paste-buffer",
+            *paste_flags,
+            "-d",
+            "-b",
+            buffer_name,
+            "-t",
+            tmux_target,
+            stdin=payload.encode("utf-8"),
+        )
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(_delete_tmux_buffer(tmux, socket_path, buffer_name))
+        raise
     if pasted is None:
-        # paste-buffer -d never ran; don't leave the command in a tmux buffer.
-        await _run_tmux_command(tmux, socket_path, "delete-buffer", "-b", buffer_name)
+        await _delete_tmux_buffer(tmux, socket_path, buffer_name)
         return "failed"
     return None
+
+
+async def _delete_tmux_buffer(tmux: str, socket_path: str, buffer_name: str) -> None:
+    """Drop a paste buffer that ``paste-buffer -d`` may not have consumed."""
+    await _run_tmux_command(tmux, socket_path, "delete-buffer", "-b", buffer_name)
 
 
 async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
@@ -1128,6 +1147,8 @@ async def bridge_tmux_control_to_websocket(
 
     # One shell paste in flight at a time, waiting off the receive loop.
     paste_task: asyncio.Task[None] | None = None
+    paste_task_id: int | None = None
+    paste_cancelled = asyncio.Event()
 
     async def _send_paste_result(paste_id: int | None, refusal: str | None) -> None:
         result: dict[str, object] = {"type": "paste-result", "id": paste_id}
@@ -1138,9 +1159,9 @@ async def bridge_tmux_control_to_websocket(
             async with ws_send_lock:
                 await websocket.send_text(json.dumps(result, separators=(",", ":")))
 
-    async def _run_shell_paste(paste_id: int | None, text: str) -> None:
+    async def _run_shell_paste(paste_id: int | None, text: str, cancelled: asyncio.Event) -> None:
         try:
-            refusal = await _paste_shell_command(tmux, socket_path, tmux_target, text)
+            refusal = await _paste_shell_command(tmux, socket_path, tmux_target, text, cancelled)
         except Exception:
             _logger.warning(
                 "control-attach: shell paste failed target=%s", tmux_target, exc_info=True
@@ -1151,7 +1172,7 @@ async def bridge_tmux_control_to_websocket(
 
     async def _start_shell_paste(ctl: dict[str, object]) -> None:
         """Handle a ``{"type": "paste", "id": n, "text": ...}`` frame."""
-        nonlocal paste_task, last_client_input_at
+        nonlocal paste_task, paste_task_id, paste_cancelled, last_client_input_at
         raw_id = ctl.get("id")
         paste_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
         text = ctl.get("text")
@@ -1172,9 +1193,16 @@ async def bridge_tmux_control_to_websocket(
                             {"type": "paste-accepted", "id": paste_id}, separators=(",", ":")
                         )
                     )
+            paste_task_id = paste_id
+            paste_cancelled = asyncio.Event()
             paste_task = asyncio.create_task(
-                _run_shell_paste(paste_id, text), name="tmux-control-shell-paste"
+                _run_shell_paste(paste_id, text, paste_cancelled), name="tmux-control-shell-paste"
             )
+
+    def _cancel_shell_paste(ctl: dict[str, object]) -> None:
+        """Handle ``{"type": "paste-cancel", "id": n}``: the browser pasted instead."""
+        if paste_task is not None and not paste_task.done() and ctl.get("id") == paste_task_id:
+            paste_cancelled.set()
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
@@ -1202,6 +1230,8 @@ async def bridge_tmux_control_to_websocket(
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                     elif isinstance(ctl, dict) and ctl.get("type") == "paste":
                         await _start_shell_paste(ctl)
+                    elif isinstance(ctl, dict) and ctl.get("type") == "paste-cancel":
+                        _cancel_shell_paste(ctl)
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.

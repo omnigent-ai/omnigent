@@ -123,7 +123,22 @@ export function shellPasteRefusalMessage(reason: ShellPasteRefusal): {
         title: "Command not pasted",
         description: `This shell is attached read-only. ${copyHint}`,
       };
-    default:
+    case "duplicated":
+      return {
+        title: "Command may have been pasted twice",
+        description: "The shell answered late. Check the prompt before pressing Enter.",
+      };
+    case "empty":
+      return {
+        title: "Command not pasted",
+        description: "Nothing was left to paste after removing control characters.",
+      };
+    case "failed":
+      return {
+        title: "Command not pasted",
+        description: `The shell couldn't paste this command. ${copyHint}`,
+      };
+    case "unsafe":
       return {
         title: "Command not pasted",
         description: `The shell couldn't take this command without running it. ${copyHint}`,
@@ -668,6 +683,9 @@ export function TerminalView({
         if (directUrl !== undefined && url === relayUrl) {
           const upgraded = await watchDirectUpgrade(directUrl, upgradeCtl.signal);
           if (superseded() || !upgraded) return;
+          // Re-dialing mid-paste would drop a command the chat already handed over.
+          await terminalSession.whenShellPasteIdle();
+          if (superseded()) return;
           disposeActiveSession();
           setConnectAttempt((attempt) => attempt + 1);
         }

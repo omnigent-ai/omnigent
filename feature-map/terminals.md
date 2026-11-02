@@ -205,8 +205,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - tmux before 3.7 does not report whether the shell enabled bracketed paste.
   "Open in shell" then waits until the pane's tty leaves canonical mode with the
   prompt settled. For bash and zsh it puts Ctrl-V before each newline and tab
-  so they are inserted, not run; fish always takes a bracketed paste. With no
-  prompt within 5 s the command is refused, so it never reaches a pager, an
-  editor or a shell that is still starting.
+  so they are inserted, not run; fish always takes a bracketed paste. Only
+  bash, zsh or fish in the foreground get the command, even when tmux reports
+  bracketed paste on. With no prompt within 5 s it is refused, so it never
+  reaches a pager, an editor or a shell that is still starting.
 - Tests that need a harness-specific or opt-in environment skip quietly without
   it. Check that the test ran, not only that the suite passed.

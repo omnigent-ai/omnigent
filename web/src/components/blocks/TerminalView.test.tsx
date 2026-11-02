@@ -70,6 +70,8 @@ function FileViewerHarness({
 }
 
 const terminalSessionMock = vi.hoisted(() => ({
+  /** What each session's whenShellPasteIdle returns; null resolves at once. */
+  pasteIdle: null as Promise<void> | null,
   instances: [] as {
     url: string;
     container: HTMLDivElement;
@@ -85,6 +87,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     pasteWhenShellReady: ReturnType<
       typeof vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>
     >;
+    whenShellPasteIdle: ReturnType<typeof vi.fn<() => Promise<void>>>;
   }[],
 }));
 
@@ -99,6 +102,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     focus = vi.fn();
     pasteWhenShellReady =
       vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>();
+    whenShellPasteIdle = vi.fn(() => terminalSessionMock.pasteIdle ?? Promise.resolve());
 
     constructor(
       container: HTMLDivElement,
@@ -126,6 +130,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
         pasteWhenShellReady: this.pasteWhenShellReady,
+        whenShellPasteIdle: this.whenShellPasteIdle,
       });
     }
   },
@@ -136,6 +141,7 @@ beforeEach(() => {
   act(() => toast.dismiss());
   render(<Toaster visibleToasts={100} />);
   terminalSessionMock.instances = [];
+  terminalSessionMock.pasteIdle = null;
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
   vi.mocked(resolveInitialAttachUrl).mockReset();
   vi.mocked(watchDirectUpgrade).mockReset();
@@ -285,6 +291,8 @@ describe("pending shell input", () => {
     ["unsafe", "Command not pasted", /couldn't take this command without running it/],
     ["not-ready", "Command not pasted", /didn't reach an empty prompt/],
     ["interrupted", "Command may not have been pasted", /Check the prompt before pressing Enter/],
+    ["duplicated", "Command may have been pasted twice", /Check the prompt before pressing Enter/],
+    ["failed", "Command not pasted", /couldn't paste this command/],
   ] as const)("explains a %s refusal", async (reason, title, description) => {
     queuePendingShellInput("conv_abc", "terminal_bash_s1", "a\nb");
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
@@ -1315,6 +1323,33 @@ describe("unmount", () => {
     await act(async () => resolveUrl!(DIRECT_URL));
 
     expect(terminalSessionMock.instances).toHaveLength(0);
+  });
+
+  it("waits for an in-flight shell paste before re-dialing the direct path", async () => {
+    // WHY: the chat already handed the command to this session; a re-dial
+    // mid-paste would drop it.
+    let pasteIdle: () => void = () => {};
+    terminalSessionMock.pasteIdle = new Promise<void>((resolve) => {
+      pasteIdle = resolve;
+    });
+    vi.mocked(resolveInitialAttachUrl).mockImplementationOnce(async (_direct, relay) => relay);
+    vi.mocked(watchDirectUpgrade).mockResolvedValueOnce(true);
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={DIRECT_URL}
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const relaySession = terminalSessionMock.instances[0];
+    await waitFor(() => expect(relaySession.whenShellPasteIdle).toHaveBeenCalled());
+    expect(relaySession.dispose).not.toHaveBeenCalled();
+
+    act(() => pasteIdle());
+
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(relaySession.dispose).toHaveBeenCalled();
   });
 
   it("keeps the upgrade watch live under StrictMode and aborts it on unmount", async () => {

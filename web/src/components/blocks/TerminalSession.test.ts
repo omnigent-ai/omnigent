@@ -1259,11 +1259,11 @@ describe("TerminalSession", () => {
       );
     }
 
-    function pasteFrames(socket: FakeWebSocket): unknown[] {
+    function pasteFrames(socket: FakeWebSocket, type = "paste"): unknown[] {
       return socket.sent.flatMap((frame) => {
         if (typeof frame !== "string") return [];
         const message = JSON.parse(frame) as { type?: string };
-        return message.type === "paste" ? [message] : [];
+        return message.type === type ? [message] : [];
       });
     }
 
@@ -1356,6 +1356,40 @@ describe("TerminalSession", () => {
       session.dispose();
     });
 
+    it("tells the caller when the session is disposed before the bridge answers", () => {
+      // WHY: dispose aborts the close listener, and the chat already handed
+      // the command over, so this is the user's only notice.
+      const { socket, session } = makeSession();
+      const refused: [string, string][] = [];
+      socket.open();
+      session.pasteWhenShellReady(
+        () => "make deploy",
+        (text, reason) => refused.push([text, reason]),
+      );
+      session.dispose();
+
+      expect(refused).toEqual([["make deploy", "interrupted"]]);
+    });
+
+    it("resolves whenShellPasteIdle once the bridge answers", async () => {
+      const { socket, session } = makeSession();
+      socket.open();
+      await session.whenShellPasteIdle();
+      session.pasteWhenShellReady(() => "ls");
+      let idle = false;
+      void session.whenShellPasteIdle().then(() => {
+        idle = true;
+      });
+      acceptPaste(socket, 1);
+      await Promise.resolve();
+      expect(idle).toBe(false);
+
+      answerPaste(socket, { id: 1, pasted: true });
+      await Promise.resolve();
+      expect(idle).toBe(true);
+      session.dispose();
+    });
+
     it("does nothing when the input was already claimed elsewhere", () => {
       const { socket, session } = makeSession();
       session.pasteWhenShellReady(() => null);
@@ -1386,10 +1420,31 @@ describe("TerminalSession", () => {
         vi.advanceTimersByTime(1);
 
         expect(inputFrames(socket)).toEqual([BRACKETED("echo one\recho two")]);
+        expect(pasteFrames(socket, "paste-cancel")).toEqual([{ type: "paste-cancel", id: 1 }]);
         expect(refused).toEqual([]);
-        // A late answer after the fallback must not paste or refuse again.
-        answerPaste(socket, { id: 1, pasted: false });
+        // A late refusal (the bridge honored the cancel) changes nothing.
+        answerPaste(socket, { id: 1, pasted: false, reason: "cancelled" });
         expect(refused).toEqual([]);
+        session.dispose();
+      });
+
+      it("warns when a slow bridge pasted after the xterm fallback", async () => {
+        // WHY: the command is then at the prompt twice; Enter would run both.
+        const { socket, session } = makeSession();
+        socket.open();
+        await writePane(socket, session, "\x1b[?2004h$ ");
+        vi.useFakeTimers();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "ls -la",
+          (text, reason) => refused.push([text, reason]),
+        );
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        acceptPaste(socket, 1);
+        answerPaste(socket, { id: 1, pasted: true });
+        answerPaste(socket, { id: 1, pasted: true });
+
+        expect(refused).toEqual([["ls -la", "duplicated"]]);
         session.dispose();
       });
 
