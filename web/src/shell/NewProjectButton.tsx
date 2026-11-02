@@ -53,7 +53,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             size="icon-xs"
             aria-label="New project"
             data-testid="new-project"
-            className="text-muted-foreground"
+            className="text-muted-foreground mobile-touch-target"
             onClick={(e) => {
               e.stopPropagation();
               setName("");

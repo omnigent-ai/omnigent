@@ -1194,7 +1194,7 @@ function SidebarImpl({
                   // transparent 1px border so the icon lands exactly on that
                   // column, flush with the Inbox row and folder rows.
                   SIDEBAR_ROW,
-                  "group/new-session w-full justify-start border-0 font-normal",
+                  "group/new-session w-full justify-start border-0 font-normal mobile-touch-target",
                   SIDEBAR_HOVER_HIGHLIGHT,
                   isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
@@ -1236,7 +1236,7 @@ function SidebarImpl({
                   // the active-pill, hover, insets, icon column, and text weight
                   // all match post-refactor.
                   SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal",
+                  "w-full justify-start border-0 font-normal mobile-touch-target",
                   SIDEBAR_HOVER_HIGHLIGHT,
                   isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
@@ -1260,7 +1260,7 @@ function SidebarImpl({
                 variant="ghost"
                 className={cn(
                   SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal",
+                  "w-full justify-start border-0 font-normal mobile-touch-target",
                   SIDEBAR_HOVER_HIGHLIGHT,
                   isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
                 )}
@@ -1317,7 +1317,7 @@ function SidebarImpl({
                   variant="ghost"
                   className={cn(
                     SIDEBAR_ROW,
-                    "w-full justify-start border-0 font-normal",
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
                     SIDEBAR_HOVER_HIGHLIGHT,
                     isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
                   )}
@@ -2705,7 +2705,7 @@ function ConversationList({
           size="icon-xs"
           aria-label="Select sessions"
           data-testid="toggle-selection-mode"
-          className="text-muted-foreground"
+          className="text-muted-foreground mobile-touch-target"
           onClick={(event) => {
             event.stopPropagation();
             onEnterSelectionMode("sessions");
@@ -2728,7 +2728,7 @@ function ConversationList({
             size="icon-xs"
             aria-label="New session"
             data-testid="sessions-new-session"
-            className="text-muted-foreground"
+            className="text-muted-foreground mobile-touch-target"
           >
             <Link
               to="/"
@@ -3365,8 +3365,12 @@ function SectionHeader({
                 !showsMarker &&
                 "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
-          : "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+          : cn(
+              "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+              (hasAction || hasPersistentAction) && "mobile-touch-target",
+            ),
         status && "w-auto min-w-0 max-w-1/2 shrink-0",
+        "mobile-touch-target mobile-app:h-auto mobile-app:min-w-0 mobile-app:max-w-full mobile-app:pr-2",
       )}
     >
       {icon ? (
@@ -3405,7 +3409,7 @@ function SectionHeader({
       {showsMarker && (
         <span
           className={cn(
-            "ml-auto flex shrink-0 items-center justify-center transition-opacity",
+            "ml-auto flex shrink-0 items-center justify-center transition-opacity mobile-app:mr-0 mobile-app:opacity-100",
             // Touch project rows have one menu; fine pointers also get a shortcut.
             hasAction
               ? cn(
@@ -3431,7 +3435,7 @@ function SectionHeader({
   );
 
   return (
-    <h2 className={status ? "flex min-w-0 flex-1 items-center gap-1" : undefined}>
+    <h2 className={cn("mobile-app:min-w-0", status && "flex min-w-0 flex-1 items-center gap-1")}>
       {contextMenu && !contextMenuDisabled ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{button}</ContextMenuTrigger>
@@ -3476,7 +3480,7 @@ function FilterMenuSub({
 }) {
   return (
     <DropdownMenuSub>
-      <DropdownMenuSubTrigger data-testid={testId}>
+      <DropdownMenuSubTrigger className="mobile-touch-target" data-testid={testId}>
         <span className="flex-1 flex justify-between">
           {label}
           {value && <span className="ml-auto text-muted-foreground">{value}</span>}
@@ -3513,6 +3517,7 @@ function SessionFilterMenu({
     <DropdownMenuRadioGroup value={value} onValueChange={(next) => onChange(next as SidebarTab)}>
       {filters.map((filter) => (
         <DropdownMenuRadioItem
+          className="mobile-touch-target"
           key={filter.value}
           value={filter.value}
           data-testid={`session-filter-${filter.value}`}
@@ -3535,7 +3540,7 @@ function SessionFilterMenu({
                 size="icon-xs"
                 aria-label={triggerLabel}
                 data-testid="session-filter"
-                className="text-muted-foreground"
+                className="text-muted-foreground mobile-touch-target"
                 onClick={(event) => event.stopPropagation()}
               >
                 <ListFilterIcon className="size-3.5" />
@@ -3566,6 +3571,7 @@ function SessionFilterMenu({
             >
               {SIDEBAR_GROUPINGS.map((grouping) => (
                 <DropdownMenuRadioItem
+                  className="mobile-touch-target"
                   key={grouping}
                   value={grouping}
                   data-testid={`session-grouping-${grouping}`}
@@ -3593,6 +3599,7 @@ function SessionFilterMenu({
             >
               {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
                 <DropdownMenuRadioItem
+                  className="mobile-touch-target"
                   key={ordering}
                   value={ordering}
                   data-testid={`session-ordering-${ordering}`}
@@ -3606,6 +3613,7 @@ function SessionFilterMenu({
           <FilterMenuSub label="Show" testId="session-show-menu">
             {SIDEBAR_SHOW_FIELDS.map((field) => (
               <DropdownMenuCheckboxItem
+                className="mobile-touch-target"
                 key={field}
                 checked={view.show.includes(field)}
                 data-testid={`session-show-${field}`}
@@ -3675,7 +3683,7 @@ function ProjectHeaderActions({
               size="icon-xs"
               aria-label="Project list actions"
               data-testid="project-list-actions"
-              className="text-muted-foreground"
+              className="text-muted-foreground mobile-touch-target"
               onClick={(event) => event.stopPropagation()}
             >
               <MoreHorizontalIcon className="size-3.5" />
@@ -3757,7 +3765,7 @@ function SectionGroup({
 }) {
   return (
     <section>
-      <div className="group/header relative">
+      <div className="group/header relative mobile-app:grid mobile-app:grid-cols-[minmax(0,1fr)_auto] mobile-app:items-center mobile-app:gap-1">
         <SectionHeader
           title={title}
           hasAction={headerAction != null}
@@ -3769,7 +3777,7 @@ function SectionGroup({
         {persistentHeaderAction ? (
           <div
             data-header-controls
-            className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
+            className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
           >
             {headerAction && (
               <div className="flex items-center gap-0.5 transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
@@ -3791,7 +3799,7 @@ function SectionGroup({
             // clicked button keeps focus afterward.
             <div
               data-header-controls
-              className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+              className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
             >
               {headerAction}
             </div>
@@ -3889,7 +3897,12 @@ function ConversationSection({
         // Header + its hover-revealed kebab share a `group/header` scope so the
         // kebab keys off hovering the header alone — NOT the whole section,
         // which would also reveal it when hovering a child row.
-        <div className={cn("group/header relative", headerStatus && "flex items-center gap-1")}>
+        <div
+          className={cn(
+            "group/header relative mobile-app:grid mobile-app:grid-cols-[minmax(0,1fr)_auto] mobile-app:items-center mobile-app:gap-1",
+            headerStatus && "flex items-center gap-1",
+          )}
+        >
           <SectionHeader
             title={title}
             status={headerStatus}
@@ -3921,7 +3934,7 @@ function ConversationSection({
               className={cn(
                 headerStatus
                   ? "ml-auto flex shrink-0 items-center gap-0.5 pr-1"
-                  : "-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
+                  : "mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
                 protectsCollapsedBadge &&
                   "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
@@ -5209,6 +5222,8 @@ function ConversationRowImpl({
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
+        // Touch reaches the row menu by long press.
+        "mobile-touch-target",
         // Mobile drops the pin + kebab (see the trailing controls below), so it
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
