@@ -1762,7 +1762,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
   it("replaces the prompt with a trigger builder, runs hourly and locks one kept session", () => {
     renderTrigger("jira");
-
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");

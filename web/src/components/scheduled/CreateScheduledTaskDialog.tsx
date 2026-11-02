@@ -83,8 +83,7 @@ export function CreateScheduledTaskDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Seed values applied to Name/Prompt when the dialog opens (e.g. from a
-   *  "Suggestions" suggestion chip). Omitted → the fields start empty. */
+  /** Seed values applied when opening from a template card. */
   initialName?: string;
   initialPrompt?: string;
   /** Open on a Jira/Slack/GitHub trigger template instead of a plain prompt. */
@@ -277,7 +276,7 @@ export function CreateScheduledTaskDialog({
   // while the dialog stays open. Each fresh open is AUTHORITATIVE — the fields
   // are set to the initial values, or cleared to "" when none are supplied — so
   // a stale prefill can never leak into a subsequent manual open regardless of
-  // how the prior instance was closed, and switching chips reseeds.
+  // how the prior instance was closed, and opening another template reseeds.
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
