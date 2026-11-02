@@ -31,6 +31,7 @@ import {
 import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
+import { OpenInMenu } from "./OpenInMenu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
@@ -225,6 +226,13 @@ function SearchFilterInput({
  * switch still lands on that session's own last location (or its root).
  */
 const browseLocationCache = new Map<string, string>();
+const folderRevealListeners = new Set<(conversationId: string, absolutePath: string) => void>();
+
+/** Point a session's Files tree at a folder: live if mounted, else on its next mount. */
+export function revealFolderInFilesPanel(conversationId: string, absolutePath: string): void {
+  browseLocationCache.set(conversationId, absolutePath);
+  folderRevealListeners.forEach((listener) => listener(conversationId, absolutePath));
+}
 
 /**
  * Right-side Files card. Always visible on desktop.
@@ -409,6 +417,18 @@ export function FilesPanel({
     setDebouncedTreeSearch("");
   }, []);
 
+  useEffect(() => {
+    const listener = (revealedId: string, absolutePath: string) => {
+      if (revealedId !== conversationId) return;
+      exitTreeSearch();
+      navigateTo(absolutePath);
+    };
+    folderRevealListeners.add(listener);
+    return () => {
+      folderRevealListeners.delete(listener);
+    };
+  }, [conversationId, navigateTo, exitTreeSearch]);
+
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
   const treeSearchQuery = useWorkspaceFileSearch(
@@ -473,7 +493,7 @@ export function FilesPanel({
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
       )}
     >
-      {/* Header — single row: [workingDir] [copy] [close?] */}
+      {/* Header — single row: [workingDir] [copy] [refresh] [close?] [open in] */}
       <div className="flex h-11 shrink-0 items-center gap-[2px] px-2">
         {flatView && <h2 className="shrink-0 pl-1 font-medium text-ui">Changes</h2>}
         {!flatView && workingDir && workspaceRoot && (
@@ -541,6 +561,7 @@ export function FilesPanel({
               <XIcon className="size-4" />
             </button>
           )}
+          {!flatView && workingDir && <OpenInMenu path={workingDir} directory />}
         </div>
       </div>
       {/* Content */}

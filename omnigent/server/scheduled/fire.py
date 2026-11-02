@@ -1911,6 +1911,7 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
                     relaunch_host=existing
                     if existing is not None and existing.sandbox_provider is not None
                     else None,
+                    sandbox_profiles=getattr(deps.app_state, "sandbox_profiles", None),
                 )
             except Exception as exc:
                 await _fail_running_run(

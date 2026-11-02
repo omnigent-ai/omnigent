@@ -88,6 +88,8 @@ interface MonacoCodeEditorProps extends CommentProps {
    */
   truncated?: boolean;
   largeMarkdown?: boolean;
+  /** Soft-wrap long lines at the pane edge instead of scrolling horizontally. */
+  wrapLines?: boolean;
   /** Reports unsaved-edit state up to FileViewer (navigation guard, etc.). */
   onDirtyChange?: (isDirty: boolean) => void;
   /** Reports the auto-save lifecycle up to FileViewer's toolbar status chip. */
@@ -127,6 +129,7 @@ export function MonacoCodeEditor({
   isSettled,
   truncated = false,
   largeMarkdown = false,
+  wrapLines = false,
   onDirtyChange,
   onSaveStatusChange,
   searchOpen,
@@ -165,6 +168,7 @@ export function MonacoCodeEditor({
       canEdit={canEdit}
       truncated={truncated}
       largeMarkdown={largeMarkdown}
+      wrapLines={wrapLines}
       isDirty={isDirty}
       setDirty={setDirty}
       hasExternalUpdate={hasExternalUpdate}
@@ -193,6 +197,7 @@ interface InnerProps extends CommentProps {
   canEdit: boolean;
   truncated: boolean;
   largeMarkdown: boolean;
+  wrapLines: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
   hasExternalUpdate: boolean;
@@ -223,6 +228,7 @@ function MonacoCodeEditorInner({
   canEdit,
   truncated,
   largeMarkdown,
+  wrapLines,
   isDirty,
   setDirty,
   hasExternalUpdate,
@@ -493,8 +499,10 @@ function MonacoCodeEditorInner({
       renderLineHighlight: canEdit ? "line" : "none",
       // Read-only buffers still allow selection + copy; just hide the caret.
       cursorStyle: canEdit ? "line" : "underline-thin",
+      // Toggling only updates options on the live editor, so edits and cursor survive.
+      wordWrap: wrapLines ? "on" : "off",
     };
-  }, [canEdit]);
+  }, [canEdit, wrapLines]);
 
   // Apply live code-font changes to the mounted editor. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new

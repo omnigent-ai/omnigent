@@ -13,13 +13,13 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-/** A tool call's failure message. */
 /** Diff colors for added and removed line counts, as in the changed-files diffstat. */
 export const DIFF_TONE_CLASS = {
   added: "text-green-600 dark:text-green-400",
   removed: "text-red-600 dark:text-red-400",
 } as const;
 
+/** A tool call's failure message. */
 export function ToolErrorBox({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <div
@@ -224,7 +224,6 @@ export function OutputSection({
   language?: CodeLanguage;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  useEffect(() => setIsExpanded(false), [output]);
 
   const collapsedPreview = useMemo(() => getOutputPreview(output), [output]);
   const preview = useMemo(() => getOutputPreview(output, isExpanded), [output, isExpanded]);
