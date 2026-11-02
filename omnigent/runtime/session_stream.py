@@ -176,7 +176,7 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
     A strict whitelist: content and free-text fields (``delta`` text, tool
     ``arguments`` / outputs, message/reasoning ``data``, ``error.message``,
     human/LLM-authored ``reason`` / ``blocked_on``, and ``tool_name``) are never
-    read, so no model response or user content reaches the debug table.
+    copied. Text is inspected only for presence; no content reaches the debug table.
     """
     attrs: dict[str, object] = {}
     for key in _SSE_SAFE_KEYS:
@@ -187,6 +187,10 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         count = event.get("background_task_count")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             attrs["background_task_count"] = count
+    if event.get("type") == "response.output_text.delta":
+        delta = event.get("delta")
+        if isinstance(delta, str):
+            attrs["text_delta_nonempty"] = bool(delta)
     response = event.get("response")
     if isinstance(response, dict) and isinstance(response.get("id"), str):
         attrs["response_id"] = response["id"]
@@ -205,6 +209,22 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             attrs["item_id"] = item["id"]
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
+        if item.get("type") == "message":
+            role = item.get("role")
+            if role in ("user", "assistant"):
+                attrs["item_role"] = role
+            content = item.get("content")
+            if isinstance(content, list):
+                attrs["item_has_text"] = any(
+                    isinstance(block, dict)
+                    and block.get("type") in ("input_text", "output_text", "text")
+                    and isinstance(block.get("text"), str)
+                    and bool(block["text"])
+                    for block in content
+                )
+            is_meta = item.get("is_meta")
+            if isinstance(is_meta, bool):
+                attrs["item_is_meta"] = is_meta
         # For error items capture code, level and source (all flat on the item
         # from to_api_dict()) so dashboards can exclude info-level notices from
         # error-rate metrics and group errors by cause and source.
