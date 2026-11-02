@@ -89,10 +89,12 @@ _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
-# Bounds one ``thread/resume`` attempt, which holds the session's delivery scope:
-# an unanswered resume would otherwise block every live post. Sized well above a
-# resume's normal latency so a large reconnect replay is not cut off.
+# Bounds the first ``thread/resume`` attempt, which holds the session's delivery
+# scope: an unanswered resume would otherwise block every live post. Each timed-out
+# retry doubles the bound, up to the max, so a slow full-history replay still
+# completes instead of being cancelled forever.
 _SUBSCRIBE_RESUME_TIMEOUT_SECONDS = 30.0
+_SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS = 240.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has
@@ -2885,6 +2887,7 @@ async def _subscribe_until_ready(
         and bridge_state.pending_shell_command_id is not None
     )
     saw_not_ready = False
+    resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
     while True:
         async with _conversation_item_delivery_scope(session_id):
             received_live_items = client.is_subscribed_to_thread(thread_id)
@@ -2894,7 +2897,7 @@ async def _subscribe_until_ready(
             try:
                 response = await asyncio.wait_for(
                     client.request("thread/resume", params),
-                    timeout=_SUBSCRIBE_RESUME_TIMEOUT_SECONDS,
+                    timeout=resume_timeout,
                 )
             except TimeoutError:
                 response = None
@@ -2927,8 +2930,9 @@ async def _subscribe_until_ready(
             _logger.warning(
                 "Codex thread/resume for %s did not answer within %.0fs; retrying subscription",
                 thread_id,
-                _SUBSCRIBE_RESUME_TIMEOUT_SECONDS,
+                resume_timeout,
             )
+            resume_timeout = min(resume_timeout * 2, _SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS)
             await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
             continue
         if not saw_not_ready:

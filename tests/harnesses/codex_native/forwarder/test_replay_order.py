@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -619,8 +620,10 @@ async def test_subscribe_parked_on_a_not_ready_thread_does_not_block_live_posts(
 async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A resume Codex never answers is retried instead of holding the scope forever."""
+    """A resume Codex never answers is retried, with a growing bound, instead of
+    holding the scope forever."""
 
     class _HangingFirstResumeClient:
         def __init__(self) -> None:
@@ -631,16 +634,18 @@ async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
 
         async def request(self, _method: str, params: dict) -> dict:
             self.params.append(params)
-            if len(self.params) == 1:
+            if len(self.params) <= 3:
                 await asyncio.Event().wait()
             return {"result": {"thread": {"id": "thread_1", "turns": []}}}
 
-    monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS", 0.04)
     native = _HangingFirstResumeClient()
     client = _RecordingClient()
     tracker = fwd._CodexElicitationTaskTracker()
     usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
     locks_token = fwd._conversation_item_locks.set({})
+    caplog.set_level(logging.WARNING, logger=fwd.__name__)
     try:
         subscribe = asyncio.create_task(
             fwd._subscribe_until_ready(
@@ -671,10 +676,110 @@ async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
         await tracker.close()
 
     # The retry is still a reconnect, not a fresh not-ready thread.
-    assert native.params == [
-        {"threadId": "thread_1", "excludeTurns": True},
-        {"threadId": "thread_1", "excludeTurns": True},
-    ]
+    assert native.params == [{"threadId": "thread_1", "excludeTurns": True}] * 4
+    # Each timed-out attempt doubles the next bound, up to the max.
+    assert [
+        record.args[1]  # type: ignore[index]
+        for record in caplog.records
+        if "did not answer" in record.getMessage()
+    ] == [0.02, 0.04, 0.04]
     assert [body["data"]["source_id"] for _url, body in client.posts] == [
         "thread_1:turn_1:item_live"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_timed_out_replay_resume_retries_with_turns_and_keeps_replay_first(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reconnect owing replay retries with turns after a timeout, and the replay
+    still lands before a live completion queued during the successful attempt."""
+
+    class _SlowThenAnsweringClient:
+        def __init__(self) -> None:
+            self.params: list[dict] = []
+            self.retry_entered = asyncio.Event()
+            self.release_retry = asyncio.Event()
+
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return True
+
+        async def request(self, _method: str, params: dict) -> dict:
+            self.params.append(params)
+            if len(self.params) == 1:
+                await asyncio.Event().wait()
+            self.retry_entered.set()
+            await self.release_retry.wait()
+            return {
+                "result": {
+                    "thread": {
+                        "id": "thread_1",
+                        "turns": [
+                            {
+                                "id": "turn_1",
+                                "items": [
+                                    {"type": "agentMessage", "id": "item_1", "text": "replayed"}
+                                ],
+                            }
+                        ],
+                    }
+                }
+            }
+
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_TIMEOUT_SECONDS", 0.05)
+    native = _SlowThenAnsweringClient()
+    client = _RecordingClient()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        subscribe = asyncio.create_task(
+            fwd._subscribe_until_ready(
+                native,  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+        )
+        await asyncio.wait_for(native.retry_entered.wait(), timeout=5.0)
+        live = asyncio.create_task(
+            fwd._handle_completed_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                {
+                    "threadId": "thread_1",
+                    "turnId": "turn_2",
+                    "item": {"type": "agentMessage", "id": "item_2", "text": "live"},
+                },
+                forwarder_state=fwd._CodexForwarderState(),
+            )
+        )
+        await asyncio.sleep(0)
+        assert not live.done()
+
+        native.release_retry.set()
+        await asyncio.wait_for(asyncio.gather(subscribe, live), timeout=5.0)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert native.params == [{"threadId": "thread_1"}, {"threadId": "thread_1"}]
+    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+        "thread_1:turn_1:item_1",
+        "thread_1:turn_2:item_2",
     ]
