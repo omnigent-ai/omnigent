@@ -5,7 +5,7 @@ import {
 } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 
@@ -23,6 +23,11 @@ vi.mock("@/hooks/useSession", () => ({
 
 import { useRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSession } from "@/hooks/useSession";
+import {
+  recordRunnerHealthSampleStart,
+  useRequestRunnerHealthRefresh,
+  useSessionRunnerSampledAt,
+} from "@/hooks/runnerHealthFreshness";
 import {
   RunnerHealthProvider,
   useRunnerHealthRegistration,
@@ -405,5 +410,29 @@ describe("RunnerHealthProvider registration", () => {
       </MemoryRouter>,
     );
     expect(useRunnerHealthMock.mock.calls.at(-1)?.[0]).toEqual([]);
+  });
+});
+
+describe("poll freshness context", () => {
+  function FreshnessProbe() {
+    const sampledAt = useSessionRunnerSampledAt("conv_open");
+    const refresh = useRequestRunnerHealthRefresh();
+    return (
+      <button type="button" data-testid="refresh" onClick={refresh}>
+        {String(sampledAt)}
+      </button>
+    );
+  }
+
+  it("bumps the poll's refresh revision on request and exposes the sample's request time", () => {
+    const polled = new Map<string, SessionLiveness>([["conv_open", liveness(false, true)]]);
+    recordRunnerHealthSampleStart(polled, 1234);
+    useRunnerHealthMock.mockReturnValue(polled);
+    renderInProvider(<FreshnessProbe />);
+
+    expect(screen.getByTestId("refresh").textContent).toBe("1234");
+    expect(useRunnerHealthMock.mock.calls.at(-1)?.[1]).toBe(0);
+    act(() => screen.getByTestId("refresh").click());
+    expect(useRunnerHealthMock.mock.calls.at(-1)?.[1]).toBe(1);
   });
 });

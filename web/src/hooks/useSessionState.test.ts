@@ -90,3 +90,74 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({}))).toBeNull();
   });
 });
+
+describe("getSessionState — runner liveness (asleep)", () => {
+  const runnerAsleep = { runnerOnline: false, hostOnline: true } as const;
+  const hostDown = { runnerOnline: false, hostOnline: false } as const;
+
+  it("returns asleep for a stopped runner on a live host", () => {
+    expect(getSessionState(conv({ status: "idle" }), null, runnerAsleep)).toEqual({
+      kind: "asleep",
+    });
+  });
+
+  it("marks asleep read-only (no restart promise) for viewers who cannot send", () => {
+    expect(
+      getSessionState(conv({ status: "idle" }), null, { ...runnerAsleep, readOnly: true }),
+    ).toEqual({ kind: "asleep", readOnly: true });
+  });
+
+  it("shows no badge when the host is down: resumability is not known on the row", () => {
+    expect(getSessionState(conv({ status: "idle" }), null, hostDown)).toBeNull();
+  });
+
+  it("returns null when the runner state is not yet known or online", () => {
+    expect(
+      getSessionState(conv({ status: "idle" }), null, {
+        runnerOnline: undefined,
+        hostOnline: true,
+      }),
+    ).toBeNull();
+    expect(
+      getSessionState(conv({ status: "idle" }), null, { runnerOnline: true, hostOnline: true }),
+    ).toBeNull();
+  });
+
+  it("returns null for a stopped runner on a non-host-bound session", () => {
+    expect(
+      getSessionState(conv({ status: "idle" }), null, { runnerOnline: false, hostOnline: null }),
+    ).toBeNull();
+  });
+
+  it("never overrides awaiting or running", () => {
+    expect(
+      getSessionState(
+        conv({ status: "running", pending_elicitations_count: 1 }),
+        null,
+        runnerAsleep,
+      ),
+    ).toEqual({ kind: "awaiting", count: 1 });
+    expect(getSessionState(conv({ status: "running" }), null, runnerAsleep)).toEqual({
+      kind: "running",
+    });
+  });
+
+  it("orders disconnected > error > asleep", () => {
+    expect(getSessionState(conv({ status: "idle" }), "disconnected", runnerAsleep)).toEqual({
+      kind: "disconnected",
+    });
+    expect(getSessionState(conv({ status: "idle" }), "error", runnerAsleep)).toEqual({
+      kind: "error",
+    });
+    expect(getSessionState(conv({ status: "failed" }), null, runnerAsleep)).toEqual({
+      kind: "error",
+    });
+  });
+
+  it("lets a recovered disconnect fall through to asleep", () => {
+    expect(getSessionState(conv({ status: "idle" }), "recovered_disconnect", runnerAsleep)).toEqual(
+      { kind: "asleep" },
+    );
+    expect(getSessionState(conv({ status: "idle" }), "recovered_disconnect")).toBeNull();
+  });
+});
