@@ -141,7 +141,7 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=10)
 
 
-@pytest.mark.min_server_version("0.20.0")
+@pytest.mark.min_server_version("0.21.0")
 # The host needs the host.connection_error frame to exit on a fatal refusal.
 @pytest.mark.min_runner_version("0.11.0")
 @pytest.mark.timeout(300)
