@@ -180,7 +180,9 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
 
 
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
-@pytest.mark.parametrize("failed_stage", [None, "runner_start", "prompt_send"])
+@pytest.mark.parametrize(
+    "failed_stage", [None, "runner_start", "prompt_prepare", "prompt_send", "native_refusal"]
+)
 async def test_prompt_logs_measure_delivery_and_locate_failures(
     store, monkeypatch, caplog, session_mode, failed_stage
 ) -> None:
@@ -205,13 +207,42 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         side_effect=RuntimeError("startup failed") if failed_stage == "runner_start" else None
     )
     send = AsyncMock(
-        side_effect=RuntimeError("send failed") if failed_stage == "prompt_send" else None
+        return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None),
+        side_effect=RuntimeError("send failed") if failed_stage == "prompt_send" else None,
     )
     monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", initialize)
-    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
-    monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+    native_refusal = failed_stage == "native_refusal"
+    if native_refusal:
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(
+            orchestration,
+            "_ensure_native_terminal_ready",
+            AsyncMock(
+                return_value=sessions._NativeTerminalEnsureOutcome(
+                    error=RuntimeError("terminal failed")
+                )
+            ),
+        )
+        persisted_failure = AsyncMock(return_value="failure-item")
+        monkeypatch.setattr(orchestration, "_persist_native_terminal_failure", persisted_failure)
+    else:
+        monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    monkeypatch.setattr(
+        fire_mod,
+        "_agent_revision",
+        AsyncMock(
+            return_value=None,
+            side_effect=RuntimeError("agent read failed")
+            if failed_stage == "prompt_prepare"
+            else None,
+        ),
+    )
 
     async def dispatch(conv, task):
+        if native_refusal:
+            conv = SimpleNamespace(**vars(conv), kind="default", harness_override="claude-native")
+            conv.labels = {**conv.labels, "omnigent.wrapper": "claude-native"}
         await fire_mod._send_prompt(deps, conv, object(), task)
 
     await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
@@ -230,6 +261,14 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
     if created:
         assert created[0].session_id == _runs(store, claimed.task)[0].conversation_id
         assert created[0].attributes["session_delay_seconds"] == 15
+    if native_refusal:
+        persisted_failure.assert_awaited_once()
+        failed_stage = "prompt_send"
+    if failed_stage in {"runner_start", "prompt_prepare"}:
+        assert not any(
+            getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+            for r in caplog.records
+        )
     if failed_stage:
         assert not sent
         assert len(failed) == 1
@@ -1300,3 +1339,69 @@ async def test_scheduler_records_a_session_that_finished_during_startup(store) -
     [run] = _runs(store, task)
     assert (run.status, run.conversation_id, run.lease_expires_at) == ("succeeded", _CONV_ID, None)
     assert run.finished_at is not None
+
+
+@pytest.mark.parametrize("status", ["running", "succeeded", "failed", "missing", "raced"])
+async def test_late_startup_failure_logs_only_a_transition(store, caplog, monkeypatch, status):
+    caplog.set_level(logging.INFO)
+    claimed = _claim(store)
+    run = claimed.lease.run
+    if status != "missing":
+        await claimed.lease.attach_session(_CONV_ID)
+        await claimed.lease.finish("running", conversation_id=_CONV_ID)
+        if status not in {"running", "raced"}:
+            store.update_run(run.id, status=status, finished_at=int(time.time()))
+    if status == "raced":
+        update = store.update_run
+
+        def finish_before_failure(run_id, **kwargs):
+            update(run_id, status="succeeded", finished_at=int(time.time()))
+            return update(run_id, **kwargs)
+
+        monkeypatch.setattr(store, "update_run", finish_before_failure)
+    with telemetry.scheduled_run_scope(telemetry.run_log_context(claimed.task, run)):
+        await fire_mod._fail_running_run(_deps(store), _CONV_ID, "late failure", "launch_failed")
+    failures = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+    ]
+    assert len(failures) == int(status == "running")
+    assert _runs(store, claimed.task)[0].status == (
+        {"running": "failed", "missing": "starting", "raced": "succeeded"}.get(status, status)
+    )
+
+
+@pytest.mark.parametrize(
+    "source,template,expected_source,expected_template",
+    [
+        (None, None, "api", "unknown"),
+        ("ui", "custom", "ui", "custom"),
+        ("ui", "jira", "ui", "jira"),
+        ("ui", "slack", "ui", "slack"),
+        ("ui", "github", "ui", "github"),
+        ("agent", None, "agent", "unknown"),
+        ("private source", "private prompt", "api", "unknown"),
+    ],
+)
+def test_creation_telemetry_bounds_dimensions(
+    caplog, source, template, expected_source, expected_template
+):
+    caplog.set_level(logging.INFO)
+    task = ScheduledTask(
+        id="task",
+        name="name",
+        prompt="private prompt",
+        rrule="FREQ=HOURLY",
+        user_id=None,
+        agent_id=_AGENT_ID,
+        timezone="UTC",
+        created_at=0,
+    )
+    telemetry.log_task_created(task, owner="alice@example.com", source=source, template=template)
+    [event] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_task_created"
+    ]
+    assert event.user_id == "alice@example.com"
+    assert event.attributes["creation_source"] == expected_source
+    assert event.attributes["template_id"] == expected_template
+    assert "private" not in str(event.attributes)
+    assert task.prompt not in str(event.attributes)

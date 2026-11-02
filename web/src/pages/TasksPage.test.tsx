@@ -456,6 +456,11 @@ describe("automation view navigation", () => {
       [{ type: "page_view", pageId: "tasks.templates" }],
     ]);
     selectView("Your automations");
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+      [{ type: "page_view", pageId: "tasks" }],
+    ]);
     expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(2);
     expect(analytics).toHaveBeenCalledWith({
       type: "value_change",

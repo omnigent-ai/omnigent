@@ -10,7 +10,11 @@ from collections.abc import Iterator
 from contextvars import ContextVar
 
 from omnigent.debug_logging import current_session_id_scope, debug_event, log_attributes_scope
-from omnigent.entities.scheduled_task import ScheduledTask
+from omnigent.entities.scheduled_task import (
+    ScheduledRunLogContext,
+    ScheduledTask,
+    ScheduledTaskRun,
+)
 from omnigent.scheduled_context import (
     current_scheduled_run as current_scheduled_run,
 )
@@ -20,6 +24,19 @@ from omnigent.scheduled_context import (
 
 _logger = logging.getLogger(__name__)
 _current_stage: ContextVar[str] = ContextVar("scheduled_fire_stage", default="input_validation")
+
+
+def run_log_context(task: ScheduledTask, run: ScheduledTaskRun) -> ScheduledRunLogContext:
+    """Build the occurrence identity shared by scheduling and direct execution."""
+    return ScheduledRunLogContext(
+        task_id=task.id,
+        run_id=run.id,
+        task_workspace_id=run.workspace_id,
+        scheduled_at=run.scheduled_at,
+        trigger_key=run.trigger_key,
+        target=task.execution_target,
+        session_mode=task.session_mode,
+    )
 
 
 def current_fire_stage() -> str:

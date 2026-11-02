@@ -604,7 +604,10 @@ The executor scopes ordinary server logs and child tasks with occurrence IDs,
 `startup_options` and restore them on the delivering replica, including after a
 restart. They are not forwarded as prompt content. Host launch frames and runner HTTP requests carry the same context. The host
 scopes launch logs and the runner scopes request logs; shared clients stamp each
-request separately, and interactive requests clear the occurrence fields. No
+request separately, and interactive requests clear the occurrence fields. Buffered inputs
+retain their own occurrence (or explicit absence) through queue drains and sign-in
+retries. SDK inputs from different occurrences are dispatched as separate turns.
+Session-wide relays and prompt/sign-in watchers clear occurrence context. No
 process-wide run ID is installed: continued sessions can serve multiple runs and
 interactive turns. Unrelated host heartbeats and process-lifecycle logs still
 join by host, runner, or session ID. Legacy timers and saved inputs created before this instrumentation do
@@ -620,7 +623,7 @@ not have the new delivery correlation.
 | `scheduled_run_session_attached` | The executor attached or replaced its session. | `target`, `session_delay_seconds` |
 | `scheduled_run_startup_ended` | Startup ended on its executing server. | `target`, `outcome`, `error_code`, known `failure_stage`, `startup_delay_seconds` |
 | `scheduled_run_prompt_dispatch_started` | The server begins a direct send or processes a saved input through normal dispatch. A competing saved-input worker may lose the claim and send nothing. | `session_id`, `dispatch_id`, saved `input_id` when applicable |
-| `scheduled_run_prompt_sent` | The runner accepted a prompt. Emitted immediately after dispatch returns successfully, before saved-input housekeeping. | `session_id`, `dispatch_id`, `input_id` when saved, `prompt_delay_seconds`, `target`, `session_mode` |
+| `scheduled_run_prompt_sent` | The runner accepted a prompt. Emitted only after explicit dispatch acceptance, before saved-input housekeeping. Handled native startup refusals do not count. | `session_id`, `dispatch_id`, `input_id` when saved, `prompt_delay_seconds`, `target`, `session_mode` |
 | `scheduled_run_stage_started` | A fire enters a stage, before potentially blocking/failing work. Gives the last observed boundary when a process dies. | `fire_stage` |
 | `scheduled_run_stage_failed` | Runner startup, prompt dispatch, managed launch, or post-delivery bookkeeping failed. | `failure_stage`, `exception_type` or `error_code`; saved-input failures also include `input_id`, `dispatch_id`, `outcome` |
 | `scheduled_run_stage_interrupted` | A direct runner startup or prompt send was cancelled. | `failure_stage`, `outcome=uncertain` |

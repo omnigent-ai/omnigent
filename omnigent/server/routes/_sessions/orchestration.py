@@ -8175,7 +8175,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 failure_context=ensure_outcome.failure_context,
             )
-            return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+            return _SessionEventDispatchResult(item_id=item_id, pending_id=None, accepted=False)
         if ensure_outcome.policy_notice is not None:
             # Terminal is up but policy enforcement is off (fail-open). Post
             # a durable, non-fatal banner; the user message still forwards.
@@ -8257,7 +8257,7 @@ async def _dispatch_session_event_to_runner_impl(
         if startup_input is not None and not await startup_input.claim(
             conversation_store, session_id
         ):
-            return _SessionEventDispatchResult(item_id=None, pending_id=None)
+            return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8474,7 +8474,7 @@ async def _dispatch_session_event_to_runner_impl(
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
-        return _SessionEventDispatchResult(item_id=None, pending_id=None)
+        return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,

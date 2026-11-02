@@ -9,7 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
@@ -1119,7 +1119,9 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
         await asyncio.gather(worker, return_exceptions=True)
 
 
-@pytest.mark.parametrize("failed_stage", ["runner_start", "input_claim", "prompt_send"])
+@pytest.mark.parametrize(
+    "failed_stage", ["runner_start", "input_claim", "prompt_send", "post_delivery"]
+)
 async def test_saved_delivery_identifies_failed_boundary(
     startup_env, monkeypatch, scheduled_run_context, caplog, failed_stage
 ):
@@ -1146,6 +1148,10 @@ async def test_saved_delivery_identifies_failed_boundary(
             return original(*args, **kwargs)
 
         monkeypatch.setattr(env.conv_store, "transition_pending_input", fail_claim)
+    elif failed_stage == "post_delivery":
+        monkeypatch.setattr(
+            env.conv_store, "set_labels", Mock(side_effect=RuntimeError("bookkeeping failed"))
+        )
     try:
         await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
     finally:
@@ -1156,8 +1162,16 @@ async def test_saved_delivery_identifies_failed_boundary(
     assert len(failures) == 1
     assert failures[0].attributes["failure_stage"] == failed_stage
     assert failures[0].attributes["outcome"] == (
-        "uncertain" if failed_stage == "prompt_send" else "not_sent"
+        "sent"
+        if failed_stage == "post_delivery"
+        else "uncertain"
+        if failed_stage == "prompt_send"
+        else "not_sent"
     )
-    assert not [
-        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
-    ]
+    assert len(
+        [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+    ) == int(failed_stage == "post_delivery")

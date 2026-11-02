@@ -77,7 +77,6 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
-from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -102,6 +101,7 @@ from omnigent.server.scheduled.telemetry import (
     log_delivery,
     log_prompt_sent,
     log_session_created,
+    run_log_context,
     scheduled_run_scope,
     start_fire_stage,
     startup_failure_stage,
@@ -1863,12 +1863,14 @@ async def _send_prompt(
         await _ensure_runner_session_initialized(
             conv.id, conv, runner_client, deps.conversation_store
         )
+    with fire_stage("prompt_prepare", session_id=conv.id):
+        agent_revision = await _agent_revision(deps, conv)
     with fire_stage("prompt_send", session_id=conv.id):
         dispatch_id = uuid.uuid4().hex
         log_delivery(
             "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
         )
-        await _dispatch_session_event_to_runner(
+        result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
             _prompt_event(task.prompt),
@@ -1879,8 +1881,10 @@ async def _send_prompt(
             artifact_store=deps.artifact_store,
             created_by=task.user_id or RESERVED_USER_LOCAL,
             runner_router=deps.runner_router,
-            agent_revision=await _agent_revision(deps, conv),
+            agent_revision=agent_revision,
         )
+        if not result.accepted:
+            raise RuntimeError("runner did not accept the scheduled prompt")
         log_prompt_sent(conv.id, dispatch_id=dispatch_id)
 
 
@@ -2010,25 +2014,27 @@ async def _fail_running_run(
     deps: FireDeps, conversation_id: str, error: str, error_code: str
 ) -> None:
     """Fail a fired session's still-``running`` run; a terminal run is left as is."""
-    log_delivery(
-        "scheduled_run_stage_failed",
-        session_id=conversation_id,
-        failure_stage=startup_failure_stage(error_code),
-        error_code=error_code,
-    )
 
-    def _transition() -> None:
+    def _transition() -> bool:
         run = deps.scheduled_task_store.get_running_run_by_conversation(conversation_id)
-        if run is not None:
-            deps.scheduled_task_store.update_run(
-                run.id,
-                status="failed",
-                finished_at=int(time.time()),
-                error=error,
-                error_code=error_code,
-            )
+        if run is None:
+            return False
+        updated = deps.scheduled_task_store.update_run(
+            run.id,
+            status="failed",
+            finished_at=int(time.time()),
+            error=error,
+            error_code=error_code,
+        )
+        return updated is not None
 
-    await asyncio.to_thread(_transition)
+    if await asyncio.to_thread(_transition):
+        log_delivery(
+            "scheduled_run_stage_failed",
+            session_id=conversation_id,
+            failure_stage=startup_failure_stage(error_code),
+            error_code=error_code,
+        )
 
 
 class _ClaimedRunRecorder:
@@ -2273,19 +2279,7 @@ class ClaimedRunExecutor:
             self._deps, task, lease, registration_timeout_s=self._registration_timeout_s
         )
         async with contextlib.AsyncExitStack() as stack:
-            stack.enter_context(
-                scheduled_run_scope(
-                    ScheduledRunLogContext(
-                        task_id=task.id,
-                        run_id=lease.run.id,
-                        task_workspace_id=lease.run.workspace_id,
-                        scheduled_at=lease.run.scheduled_at,
-                        trigger_key=lease.run.trigger_key,
-                        target=task.execution_target,
-                        session_mode=task.session_mode,
-                    )
-                )
-            )
+            stack.enter_context(scheduled_run_scope(run_log_context(task, lease.run)))
             try:
                 with fire_stage("owner_identity"):
                     await self._enter_owner_identity(stack, task)

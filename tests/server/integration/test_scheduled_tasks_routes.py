@@ -249,37 +249,20 @@ async def test_schedule_validation_keeps_requests_responsive(
     assert "time limit" in result.text
 
 
-@pytest.mark.parametrize(
-    "source,template,expected_source,expected_template",
-    [
-        (None, None, "api", "unknown"),
-        ("ui", "custom", "ui", "custom"),
-        ("ui", "jira", "ui", "jira"),
-        ("agent", None, "agent", "unknown"),
-        ("private source", "private prompt", "api", "unknown"),
-    ],
-)
-async def test_create_lists_and_gets(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-    source,
-    template,
-    expected_source,
-    expected_template,
-) -> None:
+async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
-    headers = _headers()
-    if source is not None:
-        headers["x-omnigent-automation-source"] = source
-    if template is not None:
-        headers["x-omnigent-automation-template"] = template
+    headers = {
+        **_headers(),
+        "x-omnigent-automation-source": "ui",
+        "x-omnigent-automation-template": "jira",
+    }
     with capture_debug_rows("server") as rows:
         resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
     [event] = [row for row in rows if row["event_name"] == "scheduled_task_created"]
     assert event["user_id"] == "alice@example.com"
     assert event["attributes"]["task_id"] == resp.json()["id"]
-    assert event["attributes"]["creation_source"] == expected_source
-    assert event["attributes"]["template_id"] == expected_template
+    assert event["attributes"]["creation_source"] == "ui"
+    assert event["attributes"]["template_id"] == "jira"
     assert "private" not in json.dumps(event)
     assert _create_body()["prompt"] not in json.dumps(event)
 

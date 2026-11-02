@@ -8336,6 +8336,7 @@ class _SessionEventDispatchResult:
     :param item_id: Store-assigned id of the AP-persisted item, e.g.
         ``"item_abc123"``. ``None`` for the claude-native message
         bypass, which persists nothing AP-side.
+    :param accepted: False when dispatch was handled without runner acceptance.
     :param pending_id: Id of the :mod:`omnigent.runtime.pending_inputs`
         entry recorded for a native-terminal web message, e.g.
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
@@ -8345,6 +8346,7 @@ class _SessionEventDispatchResult:
 
     item_id: str | None
     pending_id: str | None
+    accepted: bool = True
 
 
 def _extract_persistent_item_from_sse(

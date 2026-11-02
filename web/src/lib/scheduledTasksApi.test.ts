@@ -288,12 +288,8 @@ describe("deleteScheduledTask", () => {
 });
 
 describe("error path", () => {
-  it.each(["http", "network"])("records a failed creation on %s failure", async (failure) => {
-    if (failure === "network") fetchMock.mockRejectedValueOnce(new Error("offline"));
-    else
-      fetchMock.mockResolvedValueOnce(
-        mockResponse({ detail: "invalid" }, { ok: false, status: 400 }),
-      );
+  it("records a failed creation on network failure", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
     await expect(
       createScheduledTask({ name: "n", prompt: "p", rrule: "bad", agentId: "agent" }),
     ).rejects.toThrow();
@@ -318,6 +314,10 @@ describe("error path", () => {
       code: "invalid_input",
       message: "invalid rrule: fires only once",
     });
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "failure" }),
+    );
+    expect(analytics.mock.calls).toHaveLength(2);
   });
 
   it("falls back to the status line on a non-error-shaped body", async () => {

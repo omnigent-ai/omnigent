@@ -495,8 +495,9 @@ export function CreateScheduledTaskDialog({
         });
       } else {
         if (effectiveAgentId === null) return;
+        const templateId = initialTemplateId ?? initialTrigger;
         await createMutation.mutateAsync({
-          ...((trigger ?? initialTemplateId) ? { templateId: trigger ?? initialTemplateId } : {}),
+          ...(templateId ? { templateId } : {}),
           ...input,
           ...projectInput,
           agentId: effectiveAgentId,

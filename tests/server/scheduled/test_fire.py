@@ -1238,8 +1238,9 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
         return None
 
-    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
+    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
         captured["agent_revision"] = kwargs.get("agent_revision")
+        return sessions_routes._SessionEventDispatchResult(item_id="item", pending_id=None)
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)

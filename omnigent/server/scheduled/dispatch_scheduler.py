@@ -24,7 +24,11 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     scheduled_trigger_key,
 )
-from omnigent.server.scheduled.telemetry import startup_failure_stage
+from omnigent.server.scheduled.telemetry import (
+    run_log_context,
+    scheduled_run_scope,
+    startup_failure_stage,
+)
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
@@ -937,11 +941,7 @@ class PersistentTaskScheduler:
         outcome = "unfinished"
         with (
             workspace_scope(run.workspace_id),
-            log_attributes_scope(
-                **_run_attributes(run),
-                target=task.execution_target,
-                session_mode=task.session_mode,
-            ),
+            scheduled_run_scope(run_log_context(task, run)),
         ):
             fire = asyncio.create_task(self._fire(task, lease))
             heartbeat = asyncio.create_task(self._heartbeat(lease))
