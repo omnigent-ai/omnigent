@@ -64,6 +64,42 @@ directly instead of going through `data_dir()`.
 | `profiles/` | cProfile output when CLI profiling is enabled. | `omnigent/cli.py` |
 | `debug/` **†** | Per-session JSONL event tapes, `events-<session_id>.jsonl`. | `omnigent/repl/_event_tape.py` |
 
+### Process logs and disk pressure
+
+Shared process logging creates a timestamped file per launch and appends to it.
+It does not cap nonempty log files or remove them automatically. The exit-time
+sweep removes only empty files allocated by that process. CLI invocation
+diagnostics in `omnigent/cli_diagnostics.py` have separate rotation and retention;
+those limits do not apply to the host, runner, or local-server process logs.
+
+Some process logs have multiple writers: Python logging opens the path while
+stdout and stderr hold raw append descriptors inherited at launch. Zygote
+children reopen that same path for their standard streams. Renaming the file
+with a Python rotating handler would leave those descriptors writing to the old
+inode; deleting a rotated file can then hide live output without freeing its
+space until every descriptor closes. Copy-and-truncate can lose concurrent
+writes. File age does not prove that its process has stopped.
+
+An `ENOSPC` or `EDQUOT` failure identifies a storage constraint, not which
+directory consumed the space. Before choosing cleanup:
+
+1. Identify the failing host, exact write path, and filesystem. Check available
+   bytes, inodes, and any filesystem or user quota on that filesystem; the data
+   directory and system temporary directory may be on different mounts.
+2. Measure directory sizes on that filesystem and check for open, deleted files.
+   Separate process logs from package caches, temporary extraction directories,
+   workspaces, and native session state. A write failing in a log or cache file
+   does not establish that logs or caches filled the filesystem.
+3. Preserve diagnostics and stop the relevant writers before reviewing closed
+   process logs for archival or removal. Do not remove runtime databases,
+   artifacts, workspaces, or resumable native state as generic log cleanup.
+4. Restore capacity or quota and retry a small write and session launch on the
+   affected host. Verify both storage availability and successful runner startup.
+
+Automatic process-log retention needs a lifecycle that identifies every active
+writer, including inherited descriptors and zygote children, before it can
+safely reclaim files. That coordination is not currently implemented.
+
 ### Agent cache staging and recovery
 
 The server CLI places the extracted agent cache at `<artifact_dir>/.cache/`;
