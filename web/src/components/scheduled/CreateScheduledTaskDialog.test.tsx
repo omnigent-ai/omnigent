@@ -325,8 +325,9 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(submit).toBeEnabled();
   });
 
-  it("pins a workspace only after the full-screen browser confirms", () => {
-    renderDialog();
+  it("pins a workspace on confirmation and waits for reconnection if its host disconnects", () => {
+    const onOpenChange = vi.fn();
+    const { rerender } = renderDialog(onOpenChange);
     const hostTrigger = screen.getByTestId("task-host-trigger");
     fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(hostTrigger);
@@ -340,6 +341,26 @@ describe("CreateScheduledTaskDialog validation", () => {
 
     expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
     expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(screen.getByTestId("task-workspace-browse")).toBeEnabled();
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
   });
 });
 
@@ -607,11 +628,17 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   });
 
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
     renderWithSandboxes();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -718,13 +745,18 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
 
     await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
+    const browse = screen.getByTestId("task-workspace-browse");
+    expect(browse).toBeDisabled();
+    expect(browse).toHaveAccessibleDescription("Connect your host to select a workspace.");
+    fireEvent.click(browse);
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
   });
 
-  it("keeps the saved workspace in view and in the update when the host changes", async () => {
+  it("preserves a saved workspace when switching to an offline host, but disables browsing", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [
         { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
-        { host_id: "host_2", name: "desktop", owner: "me", status: "online" },
+        { host_id: "host_2", name: "desktop", owner: "me", status: "offline" },
       ],
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     render(
@@ -741,6 +773,10 @@ describe("CreateScheduledTaskDialog submit", () => {
 
     // Omitting the workspace would keep the saved one, so the form keeps showing it.
     expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getByText("Connect your host to select a workspace.")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -1275,7 +1311,229 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
+    for (const field of ["model", "effort", "permission"]) {
+      expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+    }
+    expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
   });
+
+  it.each([false, true])(
+    "locks existing session settings with session controls supported=%s",
+    async (sessionModesSupported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: sessionModesSupported,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+      }
+      expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
+        "To change model, effort, or permission mode, edit the existing session directly.",
+      );
+      fireEvent.change(screen.getByTestId("task-prompt-input"), {
+        target: { value: "Updated prompt" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.prompt).toBe("Updated prompt");
+      for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+        expect(input).not.toHaveProperty(field);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "only saves edited session settings when reset stays selected=%s",
+    async (reset) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              modelOverride: "sonnet",
+              reasoningEffort: "medium",
+              permissionMode: "plan",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              hostId: "host_1",
+              workspace: "/home/me/canonical-repo",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+
+      fireEvent.click(screen.getByTestId("task-workspace-browse"));
+      fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("task-start-new-session"));
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+      for (const [field, option] of [
+        ["model", "Opus"],
+        ["effort", "High"],
+        ["permission", "Auto"],
+      ]) {
+        const control = screen.getByTestId(`task-${field}-trigger`);
+        expect(control).toBeEnabled();
+        fireEvent.keyDown(control, { key: "Enter" });
+        fireEvent.click(screen.getByRole("option", { name: option }));
+      }
+      if (!reset) {
+        fireEvent.click(screen.getByTestId("task-start-new-session"));
+        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
+        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
+        for (const field of ["model", "effort", "permission"]) {
+          expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+        }
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      if (reset) {
+        expect(input).toMatchObject({
+          modelOverride: "opus",
+          reasoningEffort: "high",
+          permissionMode: "auto",
+          sessionId: null,
+        });
+      } else {
+        for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+          expect(input).not.toHaveProperty(field);
+        }
+      }
+    },
+  );
+
+  it("allows configuring a continuing task before its first session exists", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_claude_native", sessionMode: "continue" })}
+      />,
+    );
+    for (const field of ["model", "effort", "permission"]) {
+      expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+    }
+    expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+  });
+
+  it.each(["session mode", "host"])(
+    "unlocks settings when changing the %s starts a new session",
+    async (change) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              modelOverride: "opus",
+              reasoningEffort: "high",
+              permissionMode: "auto",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      fireEvent.keyDown(
+        screen.getByTestId(change === "host" ? "task-host-trigger" : "task-session-mode-trigger"),
+        { key: "Enter" },
+      );
+      fireEvent.click(
+        await screen.findByRole("option", {
+          name: change === "host" ? "laptop" : "New session each run",
+        }),
+      );
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+      }
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input).toMatchObject({
+        modelOverride: "opus",
+        reasoningEffort: "high",
+        permissionMode: "auto",
+      });
+      expect(input).not.toHaveProperty("sessionId");
+      if (change === "host") {
+        expect(input.hostId).toBe("host_1");
+        expect(input).not.toHaveProperty("sessionMode");
+      } else {
+        expect(input.sessionMode).toBe("new");
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps workspace aliases locked without reset with session controls supported=%s",
+    async (sessionModesSupported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: sessionModesSupported,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              hostId: "host_1",
+              workspace: "/home/me/canonical-repo",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      // The picker returns an alias; only the server can resolve it to the saved directory.
+      fireEvent.click(screen.getByTestId("task-workspace-browse"));
+      fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+      expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+      }
+      expect(screen.getByTestId("task-session-settings-note")).toBeVisible();
+      if (!sessionModesSupported) {
+        expect(screen.queryByTestId("task-start-new-session")).not.toBeInTheDocument();
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.workspace).toBe("/home/me/repo");
+      expect(input.hostId).toBe("host_1");
+      for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+        expect(input).not.toHaveProperty(field);
+      }
+    },
+  );
 
   it("threads model + effort + permission through update on edit, nulling a cleared override", async () => {
     render(
@@ -1762,7 +2020,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
   it("replaces the prompt with a trigger builder, runs hourly and locks one kept session", () => {
     renderTrigger("jira");
-
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
