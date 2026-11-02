@@ -298,7 +298,10 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
         <MessageResponse mode={mode}>{markdown}</MessageResponse>
       </MermaidFullscreenProvider>
     );
-    const { container, rerender } = render(reply("streaming"), { container: root });
+    const { container, rerender } = render(reply("streaming"), {
+      container: root,
+      reactStrictMode: true,
+    });
     const streamedSvg = await findInlineDiagram(container);
     const streamedMarkup = streamedSvg.outerHTML;
     fireEvent.click(screen.getByTitle("View fullscreen"));
@@ -336,6 +339,25 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
     const overlay = (await screen.findByTitle("Exit fullscreen")).parentElement!;
     expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(settledSvg.outerHTML);
   }, 15_000);
+
+  it("closes the diagram when the file preview moves to another file", async () => {
+    const preview = (diagram: string) => (
+      <MermaidFullscreenProvider resetKey="/sessions/a">
+        <MermaidPreview source={diagram} />
+      </MermaidFullscreenProvider>
+    );
+    const { container, rerender } = render(preview(source), {
+      container: root,
+      reactStrictMode: true,
+    });
+    await findInlineDiagram(container);
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    expect(screen.getByTitle("Exit fullscreen")).toBeInTheDocument();
+
+    rerender(preview("flowchart LR\n  Gamma --> Delta"));
+    await act(async () => {});
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+  }, 15_000);
 });
 
 describe("Mermaid fullscreen before the diagram is drawn", () => {
@@ -368,6 +390,7 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
 
   it.each([
     ["the wait expires", () => vi.advanceTimersByTime(DIAGRAM_WAIT_MS)],
+    ["the clock passes the deadline", () => vi.setSystemTime(Date.now() + DIAGRAM_WAIT_MS)],
     ["Escape is pressed", () => fireEvent.keyDown(window, { key: "Escape" })],
   ])("stays closed when %s first", async (_case, cancel) => {
     vi.useFakeTimers();
@@ -395,11 +418,16 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     expect(exit?.parentElement?.querySelector('svg[id^="mermaid-"]')?.id).toBe(shownId);
   });
 
-  it("drops a waiting click when its block unmounts without a replacement", async () => {
+  it.each([
+    ["an open diagram", true],
+    ["a waiting click", false],
+  ])("drops %s when its block unmounts without a replacement", async (_case, drawnFirst) => {
     const { rerender } = render(reply("clicked", "flowchart LR; A-->B"));
+    if (drawnFirst) await draw("clicked", "a");
     fireEvent.click(screen.getByTitle("View fullscreen"));
     rerender(<MermaidFullscreenProvider resetKey="/sessions/a">{null}</MermaidFullscreenProvider>);
     await act(async () => {});
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
 
     rerender(reply("later", "flowchart LR; A-->B"));
     await draw("later", "a");

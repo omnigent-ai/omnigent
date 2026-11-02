@@ -71,70 +71,70 @@ interface MermaidFullscreenControls {
   release: (block: HTMLElement) => void;
 }
 
-interface PendingOpen {
+interface FullscreenDiagram {
   block: HTMLElement;
   source: string;
+  // Null while the click waits for Mermaid to draw the diagram.
+  svgMarkup: string | null;
   deadline: number;
 }
 
-// Holds the cloned diagram markup and any click still waiting for Mermaid to draw.
+// Holds the open diagram, or the click still waiting for Mermaid to draw it.
 function useMermaidFullscreenState(resetKey?: string) {
-  const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
-  const [pending, setPending] = useState<PendingOpen | null>(null);
+  const [diagram, setDiagram] = useState<FullscreenDiagram | null>(null);
   const [stateKey, setStateKey] = useState(resetKey);
   if (stateKey !== resetKey) {
     setStateKey(resetKey);
-    setSvgMarkup(null);
-    setPending(null);
+    setDiagram(null);
   }
 
   // Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
   const open = useCallback((block: HTMLElement, source: string) => {
-    const svg = block.querySelector(DIAGRAM_SVG);
-    setSvgMarkup(svg ? svg.outerHTML : null);
-    setPending(svg ? null : { block, source, deadline: Date.now() + DIAGRAM_WAIT_MS });
+    const svgMarkup = block.querySelector(DIAGRAM_SVG)?.outerHTML ?? null;
+    setDiagram({ block, source, svgMarkup, deadline: Date.now() + DIAGRAM_WAIT_MS });
   }, []);
-  const close = useCallback(() => {
-    setSvgMarkup(null);
-    setPending(null);
-  }, []);
+  const close = useCallback(() => setDiagram(null), []);
   // When a settling reply remounts the clicked block, a new block with the same
-  // source draws the same diagram, so it takes over the wait.
+  // source draws the same diagram, so it takes over.
   const track = useCallback((block: HTMLElement, source: string) => {
-    setPending((current) => {
+    setDiagram((current) => {
       if (current === null) return null;
       const replaced = !current.block.isConnected && current.source === source;
       return current.block === block || replaced ? { ...current, block, source } : current;
     });
   }, []);
-  // Deferred past the commit's mount effects: only a same-commit replacement keeps the wait.
+  // Deferred past the commit's mount effects: only a same-commit replacement keeps the diagram.
   const release = useCallback((block: HTMLElement) => {
     queueMicrotask(() =>
-      setPending((current) => (current?.block === block && !block.isConnected ? null : current)),
+      setDiagram((current) => (current?.block === block && !block.isConnected ? null : current)),
     );
   }, []);
 
-  const pendingBlock = pending?.block ?? null;
-  const deadline = pending?.deadline ?? 0;
+  const waitingBlock = diagram?.svgMarkup === null ? diagram.block : null;
+  const deadline = diagram?.deadline ?? 0;
   useEffect(() => {
-    if (pendingBlock === null) return;
+    if (waitingBlock === null) return;
+    const finish = (svgMarkup: string | null) =>
+      setDiagram((current) => {
+        if (current?.block !== waitingBlock || current.svgMarkup !== null) return current;
+        return svgMarkup === null ? null : { ...current, svgMarkup };
+      });
     const showWhenDrawn = () => {
-      const svg = pendingBlock.isConnected ? pendingBlock.querySelector(DIAGRAM_SVG) : null;
-      if (!svg) return;
-      setSvgMarkup(svg.outerHTML);
-      setPending(null);
+      const svg = waitingBlock.isConnected ? waitingBlock.querySelector(DIAGRAM_SVG) : null;
+      if (Date.now() >= deadline) finish(null);
+      else if (svg) finish(svg.outerHTML);
     };
     const observer = new MutationObserver(showWhenDrawn);
-    observer.observe(pendingBlock, { childList: true, subtree: true });
-    const timer = window.setTimeout(() => setPending(null), deadline - Date.now());
+    observer.observe(waitingBlock, { childList: true, subtree: true });
+    const timer = window.setTimeout(() => finish(null), deadline - Date.now());
     showWhenDrawn();
     return () => {
       observer.disconnect();
       window.clearTimeout(timer);
     };
-  }, [pendingBlock, deadline]);
+  }, [waitingBlock, deadline]);
 
-  const active = svgMarkup !== null || pending !== null;
+  const active = diagram !== null;
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
@@ -144,7 +144,7 @@ function useMermaidFullscreenState(resetKey?: string) {
     return () => window.removeEventListener("keydown", onKey);
   }, [active, close]);
 
-  return { svgMarkup, open, close, track, release };
+  return { svgMarkup: diagram?.svgMarkup ?? null, open, close, track, release };
 }
 
 function MermaidFullscreenOverlay({
@@ -193,7 +193,8 @@ const MermaidFullscreenContext = createContext<MermaidFullscreenControls | null>
 
 /**
  * Owns the open diagram above the chat so it survives the block remount when a
- * streamed reply settles. Closes on `resetKey` or theme change.
+ * streamed reply settles. Closes when the block unmounts unreplaced, or on
+ * `resetKey` or theme change.
  */
 export function MermaidFullscreenProvider({
   children,
