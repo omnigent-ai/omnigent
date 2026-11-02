@@ -18,7 +18,7 @@ parameterization produces additional collected cases.
 | [test_resume_rollouts.py](test_resume_rollouts.py) | Resume rollouts | 18 |
 | [test_session_rotation.py](test_session_rotation.py) | Session rotation | 4 |
 | [test_subagents.py](test_subagents.py) | Subagents | 10 |
-| [test_subscription.py](test_subscription.py) | Subscription | 17 |
+| [test_subscription.py](test_subscription.py) | Subscription | 18 |
 | [test_terminal_attach.py](test_terminal_attach.py) | Terminal attach | 9 |
 | [test_terminal_prepare.py](test_terminal_prepare.py) | Terminal prepare | 13 |
 | [test_tools.py](test_tools.py) | Tools | 19 |
