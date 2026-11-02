@@ -2199,16 +2199,14 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
         assert host._auth_token_factory_resolved is False
 
 
+# Response classification is covered by the _is_login_redirect_or_unauthorized matrix.
 @pytest.mark.parametrize(
     ("reply", "drops_tunnel"),
     [
         (401, True),
-        (403, True),
         ("login_redirect", True),
         (200, False),
         (404, False),
-        (503, False),
-        ("app_redirect", False),
         ("network_error", False),
     ],
 )
@@ -2226,10 +2224,10 @@ async def test_host_drops_tunnel_only_when_server_refuses_its_credentials(
     def _reply(_transport: object, request: httpx.Request) -> httpx.Response:
         if reply == "network_error":
             raise httpx.ConnectError("unreachable", request=request)
-        if isinstance(reply, str):
-            path = "/oidc/oauth2/v2.0/authorize" if reply == "login_redirect" else "/sessions"
-            return httpx.Response(302, headers={"location": path}, request=request)
-        return httpx.Response(reply, request=request)
+        if reply == "login_redirect":
+            location = "/oidc/oauth2/v2.0/authorize"
+            return httpx.Response(302, headers={"location": location}, request=request)
+        return httpx.Response(int(reply), request=request)
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _reply)
     host = _host()
@@ -2259,9 +2257,10 @@ async def test_rejected_tunnel_refuses_launches_until_starting_runners_settle(
 
     from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
+    settle_s = 0.05
     monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
-    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.05)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", settle_s)
     monkeypatch.setattr(
         httpx.HTTPTransport,
         "handle_request",
@@ -2270,7 +2269,22 @@ async def test_rejected_tunnel_refuses_launches_until_starting_runners_settle(
     host = _make_host_process()
     host._auth_token_factory = lambda: "host-token"
     host._auth_token_factory_resolved = True
+    loop = asyncio.get_running_loop()
+    aborted_at: list[float] = []
     transport = Mock()
+    transport.abort.side_effect = lambda: aborted_at.append(loop.time())
+    check_starting_runners = host._has_starting_runners
+    last_starting_check_at = 0.0
+
+    async def _record_starting_checks() -> bool:
+        nonlocal last_starting_check_at
+        checked_at = loop.time()
+        starting = await check_starting_runners()
+        if starting:
+            last_starting_check_at = checked_at
+        return starting
+
+    monkeypatch.setattr(host, "_has_starting_runners", _record_starting_checks)
     rejected_tunnel = SimpleNamespace(transport=transport)
     host._ws = rejected_tunnel  # type: ignore[assignment]
     connected_marker = tmp_path / "connected.marker"
@@ -2306,15 +2320,28 @@ async def test_rejected_tunnel_refuses_launches_until_starting_runners_settle(
     host._runners.pop("runner_starting")
     await asyncio.wait_for(drop, timeout=5)
     transport.abort.assert_called_once_with()
+    assert aborted_at[0] - last_starting_check_at >= settle_s
 
     host._ws = SimpleNamespace(transport=Mock())  # type: ignore[assignment]
     relaunched = await host._handle_launch(frame)
     assert relaunched.error_code == WORKSPACE_MISSING_ERROR_CODE
 
 
-@pytest.mark.parametrize("starting", ["unreadable_marker", "pending_launch", "never_connects"])
+@pytest.mark.parametrize(
+    ("starting", "drain_cap_s", "earliest_drop_s"),
+    [
+        # An unreadable marker counts as connected, so the quiet window ends the drain.
+        ("unreadable_marker", 30.0, 0.05),
+        ("pending_launch", 0.3, 0.3),
+        ("never_connects", 0.3, 0.3),
+    ],
+)
 async def test_rejected_tunnel_drain_always_drops_the_tunnel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, starting: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    starting: str,
+    drain_cap_s: float,
+    earliest_drop_s: float,
 ) -> None:
     """The drain still drops the tunnel when starting work never settles or cannot be read."""
     import httpx
@@ -2324,7 +2351,7 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
     monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.05)
-    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_DRAIN_CAP_S", 0.3)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_DRAIN_CAP_S", drain_cap_s)
     monkeypatch.setattr(
         httpx.HTTPTransport,
         "handle_request",
@@ -2333,7 +2360,10 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
     host = _make_host_process()
     host._auth_token_factory = lambda: "host-token"
     host._auth_token_factory_resolved = True
+    loop = asyncio.get_running_loop()
+    aborted_at: list[float] = []
     transport = Mock()
+    transport.abort.side_effect = lambda: aborted_at.append(loop.time())
     host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
     marker: Path | Mock = tmp_path / "starting.marker"
     if starting == "unreadable_marker":
@@ -2346,9 +2376,11 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
             proc=Mock(), log_path=tmp_path / "starting.log", connect_marker=marker
         )
 
+    started_at = loop.time()
     await asyncio.wait_for(host._drop_tunnel_if_credentials_rejected(), timeout=5)
 
     transport.abort.assert_called_once_with()
+    assert aborted_at[0] - started_at >= earliest_drop_s
     host._ws = SimpleNamespace(transport=Mock())  # type: ignore[assignment]
     frame = HostLaunchRunnerFrame(
         request_id="req_after_drop",

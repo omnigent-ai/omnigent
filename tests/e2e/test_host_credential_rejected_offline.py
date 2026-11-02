@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -19,12 +18,7 @@ from tests._helpers.compat import runner_executable
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import isolated_local_server
 from tests._helpers.polling import poll_until
-from tests.e2e._host_login_workspace import (
-    ACCESS_TOKEN,
-    USER_EMAIL,
-    WORKSPACE_ID,
-    HostLoginWorkspace,
-)
+from tests.e2e._host_login_workspace import USER_EMAIL, HostLoginWorkspace, write_pat_profile
 
 pytestmark = [
     pytest.mark.skipif(not shutil.which("openssl"), reason="openssl required for the test CA"),
@@ -36,29 +30,11 @@ _LAUNCH_LINE = re.compile(r"Launched runner (\S+) for workspace")
 _USER_HEADERS = {"X-Forwarded-Email": USER_EMAIL}
 
 
-def _write_profile(path: Path, workspace_url: str, token: str) -> None:
-    path.write_text(f"[local-test]\nhost = {workspace_url}\nauth_type = pat\ntoken = {token}\n")
-
-
 @contextmanager
 def _edge_host(root: Path, edge: HostLoginWorkspace, host_id: str) -> Iterator[Host]:
     """Run ``omnigent host`` against the edge with a PAT profile and a stored workspace login."""
     home = root / "home"
-    data = home / ".omnigent"
-    data.mkdir(parents=True)
-    (data / "auth_tokens.json").write_text(
-        json.dumps(
-            {
-                edge.server_url: {
-                    "auth_type": "databricks",
-                    "workspace_host": edge.url,
-                    "org_id": WORKSPACE_ID,
-                    "user_id": USER_EMAIL,
-                }
-            }
-        )
-    )
-    _write_profile(home / ".databrickscfg", edge.url, ACCESS_TOKEN)
+    edge.seed_login(home)
     # Loopback clients ignore SSL_CERT_FILE, so make the test CA certifi's bundle
     # for the host and the runners it launches.
     shim = root / "ca-shim"
@@ -179,7 +155,7 @@ def test_host_goes_offline_when_its_credential_is_rejected_and_recovers(tmp_path
         assert _host_status(client, host_id) == "offline"
         assert host.proc.poll() is None
 
-        _write_profile(host.home / ".databrickscfg", edge.url, edge.issue_token())
+        write_pat_profile(host.home / ".databrickscfg", edge.url, edge.issue_token())
         poll_until(lambda: _host_status(client, host_id) == "online", timeout_s=60)
         _, recovered = _launch_runner(client, host.log_path, agent_id, host_id, workspace)
         poll_until(lambda: _runner_online(client, recovered), timeout_s=60)

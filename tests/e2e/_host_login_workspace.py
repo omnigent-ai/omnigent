@@ -21,6 +21,10 @@ ACCESS_TOKEN = "local-onboarding-access-token"
 MOUNT = "/api/2.0/omnigent"
 
 
+def write_pat_profile(path: Path, workspace_url: str, token: str) -> None:
+    path.write_text(f"[local-test]\nhost = {workspace_url}\nauth_type = pat\ntoken = {token}\n")
+
+
 class HostLoginWorkspace(AbstractContextManager):
     """Serve mock OAuth over TLS and forward authenticated traffic to a real server."""
 
@@ -71,6 +75,19 @@ class HostLoginWorkspace(AbstractContextManager):
         self.url = f"https://127.0.0.1:{self.server.server_port}"
         self.server_url = self.url + MOUNT
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def seed_login(self, home: Path) -> None:
+        """Store a login for this edge and a matching ``local-test`` PAT profile under ``home``."""
+        data = home / ".omnigent"
+        data.mkdir(parents=True)
+        login = {
+            "auth_type": "databricks",
+            "workspace_host": self.url,
+            "org_id": WORKSPACE_ID,
+            "user_id": USER_EMAIL,
+        }
+        (data / "auth_tokens.json").write_text(json.dumps({self.server_url: login}))
+        write_pat_profile(home / ".databrickscfg", self.url, ACCESS_TOKEN)
 
     def revoke_issued_tokens(self) -> None:
         """Reject every access token issued so far; later grants mint new accepted tokens."""
