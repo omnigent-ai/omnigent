@@ -141,7 +141,8 @@ def test_fork_retains_worked_for_duration(
     # "truncated" fork copies everything: the shared copy path under test.
     bubble = assistant.filter(has_text=_DONE_SENTINEL).first
     bubble.hover()
-    bubble.get_by_test_id("fork-from-response").click()
+    bubble.get_by_test_id("message-more-actions").click()
+    page.get_by_test_id("fork-from-response").click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
     page.get_by_test_id("fork-session-submit").click()

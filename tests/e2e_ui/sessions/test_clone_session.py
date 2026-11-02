@@ -89,6 +89,7 @@ def test_clone_session_copies_transcript_and_navigates(
     # header button drove. Non-coding source → the submit button reads
     # "Clone" (no host/directory section).
     assistant.hover()
+    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
@@ -186,6 +187,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
     expect(assistant).to_be_visible(timeout=60_000)
 
     assistant.hover()
+    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
@@ -385,6 +387,7 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
     expect(assistant).to_be_visible(timeout=60_000)
 
     assistant.hover()
+    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
@@ -484,6 +487,7 @@ def test_clone_submit_spins_while_the_fork_is_in_flight(
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
     expect(assistant).to_be_visible(timeout=30_000)
     assistant.hover()
+    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     expect(page.get_by_test_id("fork-session-dialog")).to_be_visible()
 

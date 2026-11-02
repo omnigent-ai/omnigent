@@ -7,7 +7,11 @@ import re
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, session_status_event
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    message_item,
+    session_status_event,
+)
 
 _WORKING_LABEL_RE = re.compile(
     r"^(Working|Cooking|Crunching|Tinkering|Pondering|Brewing|Noodling|Wrangling|"
@@ -60,6 +64,48 @@ def _pill(page: Page, count: int) -> Locator:
     return page.get_by_role(
         "button", name=f"{count} background task{plural} still running", exact=True
     )
+
+
+@pytest.mark.browser_context_args(has_touch=True)
+@pytest.mark.parametrize("width", [390, 1024])
+def test_touch_screens_reveal_timestamps_and_pending_steering(
+    page: Page, chat_session_contract: ChatSessionContract, width: int
+) -> None:
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.set_items(
+        [
+            {
+                **message_item("answer", "assistant", "Previous answer", response_id="previous"),
+                "created_at": 1_762_000_000,
+            }
+        ]
+    )
+    page.set_viewport_size({"width": width, "height": 900})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    assert page.evaluate("matchMedia('(pointer:coarse)').matches")
+    timestamp = page.get_by_test_id("message-timestamp")
+    expect(timestamp).to_be_visible()
+    opacity = """element => {
+      let value = 1;
+      for (let node = element; node; node = node.parentElement)
+        value *= Number(getComputedStyle(node).opacity);
+      return value;
+    }"""
+    assert timestamp.evaluate(opacity) >= 0.39
+    chat.emit_busy("current")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible()
+    page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
+    chat.event_ack = {"queued": True, "pending_id": "steer"}
+    page.get_by_label("Message the agent").fill("Keep this explanation visible on touch")
+    page.get_by_role("button", name="Send", exact=True).click()
+    notice = page.get_by_test_id("message-awaiting-agent")
+    expect(notice).to_be_visible()
+    page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
+    assert notice.evaluate(opacity) >= 0.39
 
 
 def test_bare_idle_clears_the_live_working_indicator(

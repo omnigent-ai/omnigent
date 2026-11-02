@@ -136,7 +136,9 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
 
 def _open_fork(page: Page, session_id: str, entry: str) -> None:
     if entry == "message":
-        page.locator('[data-testid="message-bubble"][data-role="assistant"]').first.hover()
+        assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+        assistant.hover()
+        assistant.get_by_test_id("message-more-actions").click()
         page.get_by_test_id("fork-from-response").first.click()
     elif entry.startswith("sidebar"):
         row = page.locator(f'li[data-sidebar-session-id="{session_id}"]')

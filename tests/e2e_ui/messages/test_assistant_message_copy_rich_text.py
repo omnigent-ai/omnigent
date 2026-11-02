@@ -18,8 +18,7 @@ Asserted, by reading both flavors back off the real browser clipboard:
 
 Selectors:
   - assistant bubble: ``data-testid="message-bubble"`` + ``data-role="assistant"``
-  - copy button: accessible name "Copy" exactly (MessageAction sr-only); exact
-    match avoids colliding with the sibling "Copy link" deep-link control
+  - copy button: accessible name "Copy" exactly (MessageAction sr-only)
   - copied state: lucide check icon (``svg.lucide-check``) replaces the copy
     icon (``svg.lucide-copy``) for ~2s after a successful write
 """

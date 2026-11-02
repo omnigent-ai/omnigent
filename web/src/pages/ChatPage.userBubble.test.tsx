@@ -300,12 +300,24 @@ describe("UserBubble entrance motion", () => {
 describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
-  it("tells the user a mid-turn message waits for the agent's current step", () => {
+  it("shares the timestamp row without adding a separate waiting line", () => {
     const [pending] = buildPendingBubbles([{ tempId: "pend_1", content, sentMidTurn: true }], null);
-    renderBubble(pending!);
-    expect(screen.getByTestId("message-awaiting-agent")).toHaveTextContent(
-      "The agent will read this after its current step",
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+    const explanation = screen.getByTestId("message-awaiting-agent");
+    expect(explanation).toHaveTextContent("The agent will read this after its current step");
+    const footer = screen.getByTestId("message-timestamp").parentElement;
+    expect(explanation.parentElement).toBe(footer);
+    expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
+    expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
+    expect(footer).toHaveClass(
+      "pt-1",
+      "md:opacity-0",
+      "md:group-hover:opacity-100",
+      "md:group-focus-within:opacity-100",
     );
+    expect(explanation).toHaveClass("truncate");
+    expect(explanation.querySelector("svg")).toBeNull();
   });
 
   it("stays hidden for a send that started a turn and for committed history", () => {
@@ -460,22 +472,32 @@ describe("AssistantBubble copy-link button", () => {
     vi.unstubAllGlobals();
   });
 
-  it("stamps data-message-id with the responseId and copies that link", async () => {
+  it("stamps data-message-id with the responseId and copies its link from More", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
+    const onToast = vi.fn();
     vi.stubGlobal("navigator", { clipboard: { writeText } });
     vi.stubGlobal("location", {
       href: "https://app.example/c/conv_1",
     });
+    window.addEventListener("omnigent:toast", onToast);
 
-    renderBubble(assistantBubble("completed"));
-    expect(screen.getByTestId("message-bubble")).toHaveAttribute(
-      "data-message-id",
-      "codex_turn_123",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
-    await waitFor(() =>
-      expect(writeText).toHaveBeenCalledWith("https://app.example/c/conv_1?message=codex_turn_123"),
-    );
+    try {
+      renderBubble(assistantBubble("completed"));
+      expect(screen.getByTestId("message-bubble")).toHaveAttribute(
+        "data-message-id",
+        "codex_turn_123",
+      );
+      fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
+      await waitFor(() =>
+        expect(writeText).toHaveBeenCalledWith(
+          "https://app.example/c/conv_1?message=codex_turn_123",
+        ),
+      );
+      expect(onToast).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener("omnigent:toast", onToast);
+    }
   });
 });
 

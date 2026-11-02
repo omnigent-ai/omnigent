@@ -158,7 +158,8 @@ def test_fork_of_filed_session_joins_the_folder_without_reload(
 
     reply = assistant.nth(0)
     reply.hover()
-    reply.get_by_test_id("fork-from-response").click()
+    reply.get_by_test_id("message-more-actions").click()
+    page.get_by_test_id("fork-from-response").click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
     page.get_by_test_id("fork-session-submit").click()

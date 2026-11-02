@@ -178,6 +178,7 @@ def test_typed_tilde_workspace_enables_clone(
     # ── Open the clone/fork dialog ─────────────────────────────────────
 
     assistant.hover()
+    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()

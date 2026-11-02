@@ -94,12 +94,12 @@ def test_fork_from_middle_truncates_history(
     expect(assistant).to_have_count(2, timeout=60_000)
 
     # Fork from the FIRST assistant response (the middle of the now
-    # two-turn conversation). The action lives inside that bubble's action
-    # bar (dimmed until hover but clickable); scoping the locator to the
-    # first bubble guarantees we pass turn 1's response id, not turn 2's.
+    # two-turn conversation). Open More on the first bubble so its menu
+    # passes turn 1's response id, not turn 2's.
     first_assistant = assistant.nth(0)
     first_assistant.hover()
-    first_assistant.get_by_test_id("fork-from-response").click()
+    first_assistant.get_by_test_id("message-more-actions").click()
+    page.get_by_test_id("fork-from-response").click()
 
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()

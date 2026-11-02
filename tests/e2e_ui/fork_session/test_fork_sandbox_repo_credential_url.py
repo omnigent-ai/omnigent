@@ -123,6 +123,7 @@ def test_fork_dialog_refuses_credential_repo_url_inline(
     expect(assistant).to_have_count(1, timeout=60_000)
 
     assistant.first.hover()
+    page.get_by_test_id("message-more-actions").first.click()
     page.get_by_test_id("fork-from-response").first.click()
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog).to_be_visible()
