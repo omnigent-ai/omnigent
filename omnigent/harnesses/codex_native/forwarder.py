@@ -298,6 +298,8 @@ _CODEX_BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# A workspace IP access list refusal is also an HTTP 403; signing in cannot clear it.
+_CODEX_IP_ACCESS_LIST_FRAGMENTS = ("blocked by databricks ip acl",)
 
 
 @dataclass
@@ -1193,9 +1195,10 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     standalone 401/403 token or :data:`_CODEX_AUTH_ERROR_FRAGMENTS` in the
     message for versions/shapes that omit it, unless the message is a 429.
 
-    Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
-    for these, which the auth checks below would otherwise misclassify. So is a
-    failed model provider token command, which ``codex login`` cannot renew.
+    Budget/quota exhaustion and IP access list refusals are checked first: the
+    AI gateway returns HTTP 403 for both, which the auth checks below would
+    otherwise misclassify. So is a failed model provider token command, which
+    ``codex login`` cannot renew.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -1204,7 +1207,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     """
     lowered = message.lower()
     if any(
-        fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS
+        fragment in lowered
+        for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
     ) or is_codex_provider_auth_failure(message):
         return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
@@ -7088,9 +7092,18 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
 
 def _post_file_change_observer(url: str, token: str, payload: _JsonObject) -> None:
     """POST one observer payload without the server client's auth middleware."""
+    encoded = json.dumps(payload).encode("utf-8")
+    if len(encoded) > 1_048_576:
+        # Preserve paths when original evidence exceeds the relay body limit.
+        tool_input = payload.get("tool_input")
+        changes = tool_input.get("changes") if isinstance(tool_input, dict) else None
+        for change in changes if isinstance(changes, list) else []:
+            if isinstance(change, dict):
+                change.pop("diff", None)
+        encoded = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
+        data=encoded,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -7105,13 +7118,13 @@ async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> No
     """Send a completed Codex fileChange through the runner's file observer."""
     if bridge_dir is None:
         return
-    if item.get("status") in {"failed", "declined"}:
+    if item.get("status") != "completed":
         return
     changes = item.get("changes")
     if not isinstance(changes, list):
         return
     observed_changes = [
-        {"path": change.get("path"), "kind": change.get("kind")}
+        {key: change[key] for key in ("path", "kind", "diff") if key in change}
         for change in changes
         if isinstance(change, dict) and isinstance(change.get("path"), str)
     ]

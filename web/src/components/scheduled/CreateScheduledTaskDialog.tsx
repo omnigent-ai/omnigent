@@ -83,8 +83,7 @@ export function CreateScheduledTaskDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Seed values applied to Name/Prompt when the dialog opens (e.g. from a
-   *  "Suggestions" suggestion chip). Omitted → the fields start empty. */
+  /** Seed values applied when opening from a template card. */
   initialName?: string;
   initialPrompt?: string;
   /** Open on a Jira/Slack/GitHub trigger template instead of a plain prompt. */
@@ -122,22 +121,9 @@ export function CreateScheduledTaskDialog({
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
-  // ── Agent / harness picker (shared with NewChatDialog) ─────────────────────
-  // The picker's "Harnesses" (Claude Code / Codex / Pi …) and "Agents"
-  // (Polly / Debby / custom) rows are all real AvailableAgents with ids, so a
-  // single `pickedAgentId` covers both cases — for a bare-harness pick it's the
-  // `*-native-ui` agent's id, exactly what the interactive dialog sends.
-  //
-  // Scheduled tasks create sessions from the selected agent. Model + effort are
-  // offered for native coding agents that support them (see `showModelEffort`
-  // below), reusing lightweight scheduled-local pickers rather than the
-  // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
-  // cost-control / per-turn model loading — disproportionate for a saved task).
-  // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
-  // are omitted so the fire path uses the agent's configured defaults. Permission
-  // mode is offered for native coding agents that support it (Claude Code); each
-  // fire launches a fresh session, so the whole launch vocabulary is valid —
-  // including the launch-only `dontAsk` / `bypassPermissions`.
+  // Harnesses and custom agents both use agent IDs in the shared picker.
+  // Empty launch settings use the agent's defaults when creating a session.
+  // Permission mode also accepts launch-only `dontAsk` / `bypassPermissions`.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(true);
   const [pickedModel, setPickedModel] = useState<string>("");
@@ -259,6 +245,19 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
+    ? "managed_sandbox"
+    : "connected_host";
+  // Agent, host, and execution-target changes clear the binding. Workspace-only
+  // edits stay locked: the server may resolve a symlink to the same directory.
+  const reusesExistingSession =
+    sessionMode === "continue" &&
+    editingTask !== null &&
+    editingTask.sessionId !== null &&
+    !startNewSession &&
+    !agentChanged &&
+    executionTarget === editingTask.executionTarget &&
+    (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
@@ -277,7 +276,7 @@ export function CreateScheduledTaskDialog({
   // while the dialog stays open. Each fresh open is AUTHORITATIVE — the fields
   // are set to the initial values, or cleared to "" when none are supplied — so
   // a stale prefill can never leak into a subsequent manual open regardless of
-  // how the prior instance was closed, and switching chips reseeds.
+  // how the prior instance was closed, and opening another template reseeds.
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
@@ -357,6 +356,10 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
+  const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
+  useEffect(() => {
+    if (workspaceHostOffline) setWorkspaceBrowserOpen(false);
+  }, [workspaceHostOffline]);
   // Host whose `configured_harnesses` drives the picker's "needs setup" badges.
   // Before a host is picked (or for an older unpinned task), fall back to the
   // first ONLINE host so unconfigured agents show "needs setup" right away.
@@ -436,9 +439,6 @@ export function CreateScheduledTaskDialog({
       // are omitted. Only send executionTarget when it's meaningful: on create
       // when sandbox is chosen (connected_host is the server default), and on
       // edit only when it actually changed — mirroring how agentId is threaded.
-      const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
-        ? "managed_sandbox"
-        : "connected_host";
       const executionTargetChanged = editingTask
         ? editingTask.executionTarget !== executionTarget
         : sandboxMode;
@@ -462,17 +462,16 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Thread model/effort ONLY when the agent supports them. Each control's
-        // "" (Default) maps to `null` so an update CLEARS a previously-set
-        // override; a non-default pick sends the value. When the agent has no
-        // model/effort surface we send neither key (left untouched server-side).
-        const overrides = showModelEffort
-          ? {
-              modelOverride: pickedModel === "" ? null : pickedModel,
-              reasoningEffort: pickedEffort === "" ? null : pickedEffort,
-              permissionMode: pickedPermission === "" ? null : pickedPermission,
-            }
-          : {};
+        // Only send supported launch settings when starting a new session.
+        // Default clears the saved override; continued-session edits omit these fields.
+        const overrides =
+          showModelEffort && !reusesExistingSession
+            ? {
+                modelOverride: pickedModel === "" ? null : pickedModel,
+                reasoningEffort: pickedEffort === "" ? null : pickedEffort,
+                permissionMode: pickedPermission === "" ? null : pickedPermission,
+              }
+            : {};
         await updateMutation.mutateAsync({
           id: editingTask.id,
           input: {
@@ -764,13 +763,17 @@ export function CreateScheduledTaskDialog({
           {!sandboxMode && hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
-              <p className="text-sm text-muted-foreground">
-                Defaults to the host&apos;s home directory. Pick a directory to pin it.
+              <p id="task-workspace-help" className="text-sm text-muted-foreground">
+                {workspaceHostOffline
+                  ? "Connect your host to select a workspace."
+                  : "Defaults to the host's home directory. Pick a directory to pin it."}
               </p>
               <Button
                 type="button"
                 variant="outline"
                 className="w-full justify-start gap-2"
+                disabled={workspaceHostOffline}
+                aria-describedby="task-workspace-help"
                 onClick={() => setWorkspaceBrowserOpen(true)}
                 data-testid="task-workspace-browse"
               >
@@ -778,7 +781,7 @@ export function CreateScheduledTaskDialog({
                 <span className="truncate">{workspace || "Browse folders…"}</span>
               </Button>
               <WorkspacePickerDialog
-                open={workspaceBrowserOpen}
+                open={workspaceBrowserOpen && !workspaceHostOffline}
                 onOpenChange={setWorkspaceBrowserOpen}
                 hostId={hostId}
                 initialPath={workspace}
@@ -859,20 +862,39 @@ export function CreateScheduledTaskDialog({
               </CollapsibleTrigger>
               <CollapsibleContent className="pt-3" data-testid="task-model-effort-field">
                 <ModelEffortFields
-                  model={pickedModel}
-                  effort={pickedEffort}
-                  permissionMode={pickedPermission}
+                  model={reusesExistingSession ? (editingTask?.modelOverride ?? "") : pickedModel}
+                  effort={
+                    reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
+                  }
+                  permissionMode={
+                    reusesExistingSession ? (editingTask?.permissionMode ?? "") : pickedPermission
+                  }
                   hostId={hostId}
+                  disabled={reusesExistingSession}
                   onModelChange={setPickedModel}
                   onEffortChange={setPickedEffort}
                   onPermissionModeChange={setPickedPermission}
                   onSelectOpenChange={handleSelectOpenChange}
                 />
-                <p className="mt-1.5 text-sm text-muted-foreground">
-                  Leave on Default to use the agent&apos;s configured model, effort, and permission
-                  mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait
-                  for approval that never comes.
-                </p>
+                {reusesExistingSession ? (
+                  <div
+                    className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
+                    data-testid="task-session-settings-note"
+                    role="status"
+                  >
+                    <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <p>
+                      To change model, effort, or permission mode, edit the existing session
+                      directly.
+                    </p>
+                  </div>
+                ) : (
+                  <p className="mt-1.5 text-sm text-muted-foreground">
+                    Leave on Default to use the agent&apos;s configured model, effort, and
+                    permission mode. Automations run unattended, so a prompting mode (Manual or
+                    Plan) will wait for approval that never comes.
+                  </p>
+                )}
               </CollapsibleContent>
             </Collapsible>
           )}

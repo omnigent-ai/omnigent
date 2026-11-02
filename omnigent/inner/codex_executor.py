@@ -44,6 +44,7 @@ from omnigent.databricks_ai_gateway import (
     CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
     CODING_AGENT_HEADER,
+    REQUEST_TAGS_HEADER,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
 )
@@ -1405,16 +1406,25 @@ def materialize_codex_provider_config(
                 base_url,
                 client_surface=client_surface,
             )
+            attribution_headers = {
+                name: value
+                for name, value in attributed.items()
+                if name.lower()
+                in (
+                    CODING_AGENT_HEADER.lower(),
+                    CLIENT_SURFACES_HEADER.lower(),
+                    REQUEST_TAGS_HEADER.lower(),
+                )
+            }
+            replaced_header_names = {name.lower() for name in attribution_headers}
             # Codex retains inherited routing and credentials; write only attribution.
             provider_config["http_headers"] = {
                 **{
                     name: value
                     for name, value in (headers.items() if isinstance(headers, Mapping) else ())
-                    if name.lower()
-                    not in (CODING_AGENT_HEADER.lower(), CLIENT_SURFACES_HEADER.lower())
+                    if name.lower() not in replaced_header_names
                 },
-                CODING_AGENT_HEADER: attributed[CODING_AGENT_HEADER],
-                CLIENT_SURFACES_HEADER: attributed[CLIENT_SURFACES_HEADER],
+                **attribution_headers,
             }
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))

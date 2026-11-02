@@ -28,7 +28,7 @@ from omnigent.harnesses.claude_native.main import (
 from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
 from omnigent.harnesses.opencode_native.provider import (
     OpenCodeGatewayResolution,
-    build_opencode_provider_config,
+    build_opencode_config,
     write_opencode_provider_config,
 )
 from omnigent.harnesses.pi_native.credentials import PiProviderConfig
@@ -286,7 +286,7 @@ def test_gateway_headers_reach_real_cli_requests(
                 model=_MODEL,
                 api_key="synthetic-key",
                 auth_header=True,
-            ).to_models_config()
+            ).to_models_config(client_surface=client_surface)
             if config_source == "pi-native"
             else _build_models_json(
                 _ORIGIN, "synthetic-key", base_urls={"openai": _ORIGIN + "/v1"}, model=_MODEL
@@ -314,10 +314,14 @@ def test_gateway_headers_reach_real_cli_requests(
             base_url=_ORIGIN + "/v1", api_key="synthetic-key", model_id=_MODEL
         )
         path = write_opencode_provider_config(
-            Path(env["XDG_CONFIG_HOME"]), build_opencode_provider_config(resolution)
+            Path(env["XDG_CONFIG_HOME"]),
+            build_opencode_config(
+                model=None, gateway=resolution, mcp_servers={}, plugin_paths=[], instructions=None
+            ),
+            client_surface=client_surface,
         )
         config = json.loads(path.read_text())
-        config["provider"][resolution.provider_id]["options"]["baseURL"] = destination
+        config["providers"][resolution.provider_id]["settings"]["baseURL"] = destination
         path.write_text(json.dumps(config))
         args = ["run", "--format", "json", "--model", resolution.qualified_model]
     completed = subprocess.run(
