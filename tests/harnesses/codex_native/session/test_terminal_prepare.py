@@ -142,6 +142,14 @@ async def test_prepare_codex_terminal_forwards_profile_to_launch_resolution(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("saved_model", "requested_model", "expected_model"),
+    [
+        ("session-model", None, "session-model"),
+        ("session-model", "requested-model", "requested-model"),
+        (None, None, "provider-default"),
+    ],
+)
+@pytest.mark.parametrize(
     ("profile", "overrides", "expected_provider"),
     [
         ("configured-workspace", [], "omnigent_databricks"),
@@ -156,13 +164,17 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
     profile: str | None,
     overrides: list[str],
     expected_provider: str | None,
+    saved_model: str | None,
+    requested_model: str | None,
+    expected_model: str,
 ) -> None:
-    """CLI cold resume applies the configured provider before attaching the TUI."""
-    from unittest.mock import AsyncMock
+    """CLI cold resume keeps the selected model on the configured provider."""
+    from unittest.mock import AsyncMock, Mock
 
     from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
 
     server = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1))
+    build_server = Mock(return_value=server)
     preload = AsyncMock(side_effect=RuntimeError("stop after resume"))
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(
@@ -172,6 +184,7 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
             return_value={
                 "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
                 "external_session_id": "thread_test",
+                "model_override": saved_model,
             }
         ),
     )
@@ -180,9 +193,11 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
     monkeypatch.setattr(
         codex_native,
         "resolve_native_codex_launch",
-        lambda **_kwargs: NativeCodexLaunch(overrides, "test-model", profile),
+        lambda **kwargs: NativeCodexLaunch(
+            overrides, kwargs["model"] or "provider-default", profile
+        ),
     )
-    monkeypatch.setattr(codex_native, "build_codex_native_server", lambda **_kwargs: server)
+    monkeypatch.setattr(codex_native, "build_codex_native_server", build_server)
     monkeypatch.setattr(codex_native, "preload_codex_thread_for_resume", preload)
 
     with pytest.raises(RuntimeError, match="stop after resume"):
@@ -194,9 +209,10 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
             session_bundle=None,
             codex_args=(),
             command="codex",
-            model=None,
+            model=requested_model,
         )
 
+    assert build_server.call_args.kwargs["model"] == expected_model
     preload.assert_awaited_once()
     assert preload.await_args.kwargs["model_provider"] == expected_provider
     server.close.assert_awaited_once()
