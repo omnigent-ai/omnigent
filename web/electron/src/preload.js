@@ -267,7 +267,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, sessionHostProtocol?: number, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
@@ -297,14 +297,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
-  browserScreenshot: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
+  browserScreenshot: (conversationId, opts) =>
+    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
-  browserPerformAction: (conversationId, action, params) =>
-    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
+  browserPerformAction: (conversationId, action, params, opts) =>
+    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
-  browserExecute: (conversationId, js) =>
-    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js }),
+  browserExecute: (conversationId, js, opts) =>
+    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
   /**
    * Destroy the conversation's view (explicit close — unmount only detaches).
    * @param {string} conversationId

@@ -493,6 +493,75 @@ def test_reduced_motion_transcript_holds_still_at_the_bottom(
     assert changes <= 2, heights
 
 
+# Records, once per painted frame, the top of the answer paragraph carrying ``text``.
+_TRACK_ANSWER_TOP = """
+(text) => {
+  window.__answerTops = [];
+  const frame = () => {
+    const observer = new ResizeObserver(() => {
+      observer.disconnect();
+      const answer = [...document.querySelectorAll('[data-testid="message-bubble"] p')].find(
+        (p) => (p.textContent || '').includes(text));
+      if (answer) window.__answerTops.push(answer.getBoundingClientRect().top);
+    });
+    observer.observe(document.documentElement);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+"""
+
+
+@pytest.mark.parametrize("reduced_motion", [False, True], ids=["animated", "reduced-motion"])
+def test_worked_fold_forms_without_jolting_the_answer(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    reduced_motion: bool,
+) -> None:
+    """The fold that forms over a finished turn's trace moves the answer only toward its rest.
+
+    The fold mounts open over the trace and closes. It used to mount with the trace
+    indented and padded under a row that could not shrink below its padding, so the
+    answer below dropped about 16px in one frame and slid back during the collapse.
+    """
+    chat = chat_session_contract
+    response_id = "fold-in-place"
+    answer = "The repo has one README and nothing else."
+    chronological = [
+        message_item("fold-in-place-user", "user", "What's in the repo?", response_id=response_id),
+        *tool_call_items(
+            "call-fold-in-place",
+            "shell",
+            {"command": "ls"},
+            "README.md\n",
+            response_id=response_id,
+        ),
+        message_item("fold-in-place-answer", "assistant", answer, response_id=response_id),
+    ]
+    chat.set_items(list(reversed(chronological)))
+    chat.update_session(status="running")
+    if reduced_motion:
+        page.emulate_media(reduced_motion="reduce")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    expect(page.get_by_test_id("working-indicator")).to_be_visible(timeout=20_000)
+    bubble = page.locator('[data-testid="message-bubble"]', has=page.get_by_text(answer)).first
+    expect(bubble).to_be_visible()
+    page.evaluate(_TRACK_ANSWER_TOP, answer)
+
+    chat.emit_idle(response_id)
+    expect(bubble.get_by_test_id("turn-worked-fold")).to_have_count(1, timeout=15_000)
+    # The trace's content is hidden once its collapse animation ends.
+    expect(bubble.locator(".turn-fold-content")).to_be_hidden(timeout=15_000)
+    tops = page.evaluate("() => window.__answerTops")
+    before, rest = tops[0], tops[-1]
+    low, high = min(before, rest) - 1, max(before, rest) + 1
+    assert all(low <= top <= high for top in tops), (
+        f"the answer moved past where it settled ({before:.1f} -> {rest:.1f}): "
+        f"{[round(top, 1) for top in tops]}"
+    )
+
+
 _ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"
 _PR_ERROR = "Error: 422 Validation Failed: A pull request already exists"
 _ISSUE_DESCRIPTION = (

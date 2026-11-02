@@ -224,7 +224,6 @@ export function OutputSection({
   language?: CodeLanguage;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  useEffect(() => setIsExpanded(false), [output]);
 
   const collapsedPreview = useMemo(() => getOutputPreview(output), [output]);
   const preview = useMemo(() => getOutputPreview(output, isExpanded), [output, isExpanded]);
