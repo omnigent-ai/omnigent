@@ -950,7 +950,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-100 mobile-app:[@media(pointer:coarse)]:opacity-100">
+        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-100 mobile-app:[@media(pointer:coarse)]:opacity-100">
           {ts && (
             <span
               className="select-none text-[11px] leading-4 text-foreground/56"
@@ -1123,7 +1123,10 @@ function AssistantBubble({
         data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
+        className={cn(
+          "mobile-app:gap-1",
+          spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
+        )}
       >
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
@@ -1160,7 +1163,7 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (
           <div
             className={cn(
-              "flex mobile-app:flex-wrap items-center gap-3 py-1",
+              "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
               actionsPersistent
                 ? "opacity-100"
                 : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-100 mobile-app:[@media(pointer:coarse)]:opacity-100",
