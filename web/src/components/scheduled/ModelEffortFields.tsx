@@ -93,7 +93,7 @@ export function ModelEffortFields({
             <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-effort-control">
               <Label htmlFor="task-effort">Effort</Label>
               <Select
-              disabled={disabled}
+                disabled={disabled}
                 value={effort === "" ? EFFORT_SELECT_NONE : effort}
                 componentId="tasks.scheduled.effort"
                 valueHasNoPii
@@ -132,7 +132,7 @@ export function ModelEffortFields({
         <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
           <Label htmlFor="task-permission">Permission mode</Label>
           <Select
-              disabled={disabled}
+            disabled={disabled}
             value={
               permissionMode === "" ||
               (settings.harness !== "claude-native" && permissionMode === "default")

@@ -731,40 +731,33 @@ def test_scheduled_task_create_persists_model_and_effort(
     live_server: str,
     claude_ready_host: Host,
 ) -> None:
-    """Picking a concrete Model + Effort on create persists both via the API.
-
-    Opens the create dialog on Claude Code, picks Opus + High through the
-    ``task-model-trigger`` / ``task-effort-trigger`` selects, submits, then reads
-    the created row back from ``GET /v1/scheduled-tasks`` and asserts its
-    ``model_override`` / ``reasoning_effort`` are the persisted picks (asserting
-    the server-side values is more robust than re-reading the row text). The
-    task pins the host, so Opus is that host's Claude Code option of that name,
-    and High is the ``"high"`` effort; a pick sends the option's id verbatim.
-    """
+    """Persist a model from the host's actual catalog and an explicit effort."""
     _open_automations_page(page, live_server)
-    # Until the host's options load, the picker shows the static aliases.
-    with page.expect_response(lambda r: r.url.endswith("/harnesses/claude-native/model-options")):
+    catalog_url = (
+        f"{live_server}/v1/hosts/{claude_ready_host.host_id}/harnesses/claude-native/model-options"
+    )
+    with page.expect_response(catalog_url) as catalog_response:
         _open_create_dialog(page)
+    response = catalog_response.value
+    assert response.ok, response.text()
+    options = response.json()["models"]
+    assert options, "The configured mock host must expose a model"
+    selected_model = options[0]
+    model_label = selected_model.get("displayName") or selected_model["id"]
 
     page.get_by_test_id("task-name-input").fill("Model effort create")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    _pick_select_option(page, "task-model-trigger", "Opus")
+    _pick_select_option(page, "task-model-trigger", model_label)
     _pick_select_option(page, "task-effort-trigger", "High")
-    expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
+    expect(page.get_by_test_id("task-model-trigger")).to_have_text(model_label)
     expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
-    # The row renders once the create resolves; assert the persisted API values.
     expect(_row_by_name(page, "Model effort create")).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == "Model effort create")
-    options = httpx.get(
-        f"{live_server}/v1/hosts/{claude_ready_host.host_id}/harnesses/claude-native/model-options",
-        timeout=30.0,
-    ).json()["models"]
-    opus = next(o["id"] for o in options if (o.get("displayName") or o["id"]) == "Opus")
     assert created["host_id"] == claude_ready_host.host_id, created
-    assert created["model_override"] == opus, created
+    assert created["model_override"] == selected_model["id"], created
     assert created["reasoning_effort"] == "high", created
 
 

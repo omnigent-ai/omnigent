@@ -499,15 +499,17 @@ export function CreateScheduledTaskDialog({
       );
       if (editingTask) {
         // Continued-session edits omit launch settings; new targets clear stale overrides.
-        const overrides = reusesExistingSession ? {} : {
-          ...(supportsModel || !originalTargetSelected
-            ? {
-                modelOverride: pickedModel || null,
-                reasoningEffort: pickedEffort || null,
-              }
-            : {}),
-          ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
-        };
+        const overrides = reusesExistingSession
+          ? {}
+          : {
+              ...(supportsModel || !originalTargetSelected
+                ? {
+                    modelOverride: pickedModel || null,
+                    reasoningEffort: pickedEffort || null,
+                  }
+                : {}),
+              ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
+            };
         await updateMutation.mutateAsync({
           id: editingTask.id,
           input: {
@@ -895,7 +897,9 @@ export function CreateScheduledTaskDialog({
                     reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
                   }
                   permissionMode={
-                    reusesExistingSession ? (editingTask?.permissionMode ?? "") : effectivePermission
+                    reusesExistingSession
+                      ? (editingTask?.permissionMode ?? "")
+                      : effectivePermission
                   }
                   settings={harnessSettings}
                   disabled={reusesExistingSession}
@@ -919,8 +923,8 @@ export function CreateScheduledTaskDialog({
                 ) : (
                   <p className="mt-1.5 text-sm text-muted-foreground">
                     Leave on Default to use the agent&apos;s configured model, effort, and
-                    permission mode. Automations run unattended, so a prompting mode (Manual or
-                    Plan) will wait for approval that never comes.
+                    permission mode. Automations run unattended; modes that require approval may
+                    pause until you respond.
                   </p>
                 )}
               </CollapsibleContent>

@@ -1489,8 +1489,8 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const { input } = updateMutateAsync.mock.calls[0][0];
       expect(input).toMatchObject({
-        modelOverride: "opus",
-        reasoningEffort: "high",
+        modelOverride: change === "host" ? null : "opus",
+        reasoningEffort: change === "host" ? null : "high",
         permissionMode: "auto",
       });
       expect(input).not.toHaveProperty("sessionId");
