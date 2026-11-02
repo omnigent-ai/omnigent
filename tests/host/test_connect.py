@@ -1252,6 +1252,10 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     tmp_path: Path,
 ) -> None:
     """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from omnigent.host.frames import decode_host_frame, encode_host_frame
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
 
     def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
@@ -1264,10 +1268,24 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
         binding_token="token_disk_full",
         workspace=str(tmp_path),
         session_id="session_disk_full",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="new",
+        ),
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        result = await host._handle_launch(frame)
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    with capture_debug_rows("host") as rows:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            result = await host._handle_launch(decoded)
+    row = next(row for row in rows if row["event_name"] == "runner_launch_failed")
+    assert row["attributes"]["run_id"] == "run"
+    assert row["attributes"]["task_id"] == "task"
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed"

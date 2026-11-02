@@ -67,6 +67,7 @@ import {
 import {
   ScheduledTaskApiError,
   type ScheduledTask,
+  type AutomationTemplateId,
   type ScheduledTaskExecutionTarget,
   type ScheduledTaskSessionMode,
 } from "@/lib/scheduledTasksApi";
@@ -78,6 +79,7 @@ export function CreateScheduledTaskDialog({
   initialName,
   initialPrompt,
   initialTrigger = null,
+  initialTemplateId,
   sessionLink = "",
   editingTask = null,
 }: {
@@ -88,6 +90,7 @@ export function CreateScheduledTaskDialog({
   initialPrompt?: string;
   /** Open on a Jira/Slack/GitHub trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
+  initialTemplateId?: AutomationTemplateId;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
   editingTask?: ScheduledTask | null;
@@ -493,6 +496,7 @@ export function CreateScheduledTaskDialog({
       } else {
         if (effectiveAgentId === null) return;
         await createMutation.mutateAsync({
+          ...((trigger ?? initialTemplateId) ? { templateId: trigger ?? initialTemplateId } : {}),
           ...input,
           ...projectInput,
           agentId: effectiveAgentId,

@@ -5,6 +5,8 @@
 // Mirrors the `sessionsApi.test.ts` pattern: one fetchMock per test,
 // vi.stubGlobal/unstubAllGlobals around it.
 
+import { setOmnigentHostConfig } from "./host";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ScheduledTaskApiError,
@@ -46,14 +48,18 @@ const TASK_WIRE = {
 };
 
 const fetchMock = vi.fn();
+const analytics = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  analytics.mockReset();
+  setOmnigentHostConfig({ analytics });
   vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  setOmnigentHostConfig({});
 });
 
 describe("listScheduledTasks", () => {
@@ -178,6 +184,15 @@ describe("createScheduledTask", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks");
     expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("x-omnigent-automation-template")).toBe("custom");
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        interactionKind: "create_scheduled_task",
+        phase: "complete",
+        status: "success",
+        name: "custom",
+      }),
+    );
     const body = JSON.parse(init.body);
     expect(body).toEqual({
       name: "Nightly triage",
@@ -190,6 +205,28 @@ describe("createScheduledTask", () => {
     expect(body).not.toHaveProperty("workspace");
     expect(body).not.toHaveProperty("timezone");
   });
+
+  it.each(["jira", "slack", "github", "follow-up-monitor", "pr-sweep", "news-digest"] as const)(
+    "attributes creation to %s without including prompt text in analytics",
+    async (templateId) => {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await createScheduledTask({
+        name: "private name",
+        prompt: "private prompt",
+        rrule: "FREQ=DAILY",
+        agentId: "agent",
+        templateId,
+      });
+      const [, init] = fetchMock.mock.calls[0];
+      expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
+      expect(new Headers(init.headers).get("x-omnigent-automation-template")).toBe(templateId);
+      expect(JSON.parse(init.body)).not.toHaveProperty("template_id");
+      expect(analytics).toHaveBeenLastCalledWith(
+        expect.objectContaining({ phase: "complete", status: "success", name: templateId }),
+      );
+      expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
+    },
+  );
 
   it("includes the host/workspace pair and timezone when provided", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
@@ -251,6 +288,21 @@ describe("deleteScheduledTask", () => {
 });
 
 describe("error path", () => {
+  it.each(["http", "network"])("records a failed creation on %s failure", async (failure) => {
+    if (failure === "network") fetchMock.mockRejectedValueOnce(new Error("offline"));
+    else
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ detail: "invalid" }, { ok: false, status: 400 }),
+      );
+    await expect(
+      createScheduledTask({ name: "n", prompt: "p", rrule: "bad", agentId: "agent" }),
+    ).rejects.toThrow();
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "failure" }),
+    );
+    expect(analytics.mock.calls).toHaveLength(2);
+  });
+
   it("throws a ScheduledTaskApiError carrying the server code + message", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse(

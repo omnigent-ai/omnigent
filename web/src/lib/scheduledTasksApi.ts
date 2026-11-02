@@ -10,6 +10,7 @@
 // at fire time; supply them only as a validated pair.
 
 import { authenticatedFetch } from "./identity";
+import { startTimedInteraction } from "./analyticsEmit";
 
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
@@ -117,8 +118,14 @@ export interface ScheduledTaskRun {
   viewerUnread: boolean | null;
 }
 
+/** Fixed template labels for adoption analytics; never prompt or template field text. */
+export type AutomationTemplateId =
+  "custom" | "jira" | "slack" | "github" | "follow-up-monitor" | "pr-sweep" | "news-digest";
+
 /** Body for `POST /v1/scheduled-tasks`. */
 export interface CreateScheduledTaskInput {
+  /** Diagnostic creation attribution, sent as headers for older-server compatibility. */
+  templateId?: AutomationTemplateId;
   name: string;
   prompt: string;
   rrule: string;
@@ -350,12 +357,28 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
-  const res = await authenticatedFetch("/v1/scheduled-tasks", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+  const interaction = startTimedInteraction(
+    "create_scheduled_task",
+    undefined,
+    input.templateId ?? "custom",
+  );
+  try {
+    const res = await authenticatedFetch("/v1/scheduled-tasks", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-omnigent-automation-source": "ui",
+        "x-omnigent-automation-template": input.templateId ?? "custom",
+      },
+      body: JSON.stringify(body),
+    });
+    const task = taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+    interaction.complete();
+    return task;
+  } catch (error) {
+    interaction.fail();
+    throw error;
+  }
 }
 
 /**

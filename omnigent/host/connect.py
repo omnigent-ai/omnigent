@@ -228,6 +228,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -1968,7 +1969,10 @@ class HostProcess:
         log_runner_id = (
             token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
         )
-        with runner_log_scope(frame.session_id, log_runner_id):
+        with (
+            runner_log_scope(frame.session_id, log_runner_id),
+            scheduled_run_scope(frame.scheduled_run, session_id=frame.session_id),
+        ):
             _logger.info(
                 "Runner launch requested",
                 extra=debug_event(

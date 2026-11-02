@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import FakeSandboxLauncher
 
@@ -247,9 +249,40 @@ async def test_schedule_validation_keeps_requests_responsive(
     assert "time limit" in result.text
 
 
-async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+@pytest.mark.parametrize(
+    "source,template,expected_source,expected_template",
+    [
+        (None, None, "api", "unknown"),
+        ("ui", "custom", "ui", "custom"),
+        ("ui", "jira", "ui", "jira"),
+        ("agent", None, "agent", "unknown"),
+        ("private source", "private prompt", "api", "unknown"),
+    ],
+)
+async def test_create_lists_and_gets(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    source,
+    template,
+    expected_source,
+    expected_template,
+) -> None:
     _make_user(db_uri)
-    resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    headers = _headers()
+    if source is not None:
+        headers["x-omnigent-automation-source"] = source
+    if template is not None:
+        headers["x-omnigent-automation-template"] = template
+    with capture_debug_rows("server") as rows:
+        resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    [event] = [row for row in rows if row["event_name"] == "scheduled_task_created"]
+    assert event["user_id"] == "alice@example.com"
+    assert event["attributes"]["task_id"] == resp.json()["id"]
+    assert event["attributes"]["creation_source"] == expected_source
+    assert event["attributes"]["template_id"] == expected_template
+    assert "private" not in json.dumps(event)
+    assert _create_body()["prompt"] not in json.dumps(event)
+
     assert resp.status_code == 200, resp.text
     created = resp.json()
     assert created["name"] == "nightly triage"
@@ -546,12 +579,15 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(rrule="FREQ=SECONDLY"),
-        headers=_headers(),
-    )
+    with capture_debug_rows("server") as rows:
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(rrule="FREQ=SECONDLY"),
+            headers=_headers(),
+        )
     assert resp.status_code == 400, resp.text
+
+    assert not [row for row in rows if row["event_name"] == "scheduled_task_created"]
 
 
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:

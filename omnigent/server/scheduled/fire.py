@@ -75,7 +75,9 @@ from starlette.datastructures import Headers
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
+from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -94,6 +96,16 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+from omnigent.server.scheduled.telemetry import (
+    current_fire_stage,
+    fire_stage,
+    log_delivery,
+    log_prompt_sent,
+    log_session_created,
+    scheduled_run_scope,
+    start_fire_stage,
+    startup_failure_stage,
+)
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
@@ -548,6 +560,7 @@ async def _run_fire_for_task(
     """
     # A deleted / rotated owner registration fires nothing — managed or
     # connected — and disables the task.
+    start_fire_stage("owner_identity")
     if await _owner_is_deleted(deps, task):
         await _disable_for_deleted_owner(deps, task, recorder)
         return
@@ -577,12 +590,14 @@ async def _run_fire_for_task(
     # Resolve this fire's host/workspace without changing the stored task.
     # A managed launch starts hostless and binds a fresh sandbox afterward.
     try:
+        start_fire_stage("host_validation")
         effective = await _resolve_effective_task(deps, task)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
         await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
         return
 
+    start_fire_stage("input_validation")
     input_error = None if managed else _validate_connected_host_inputs(effective)
     if input_error is not None:
         error, error_code = input_error
@@ -592,6 +607,7 @@ async def _run_fire_for_task(
 
     if preflight is not None:
         try:
+            start_fire_stage("host_validation")
             await preflight(effective)
         except _CannotLaunchScheduledFire as exc:
             _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -601,6 +617,7 @@ async def _run_fire_for_task(
     # Check connected-host workspaces, including the resolved HOME default,
     # against the agent's cwd boundary. A new sandbox has no workspace yet.
     validate_workspace = preflight is not None and effective.workspace is not None
+    start_fire_stage("input_validation")
     validation_error = await _validate_fire_session_inputs(
         deps, effective, validate_workspace=validate_workspace
     )
@@ -623,8 +640,10 @@ async def _run_fire_for_task(
 
     await recorder.check()
     try:
+        start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
         conv = await _create_session(deps, effective)
+        log_session_created(conv.id)
     except Exception:
         _logger.exception("scheduled fire: failed to create session for task %s", task.id)
         await recorder.finish(
@@ -632,6 +651,7 @@ async def _run_fire_for_task(
         )
         return
     try:
+        start_fire_stage("owner_grant", session_id=conv.id)
         await _grant_owner(deps, effective, conv.id)
     except Exception:
         _logger.exception(
@@ -651,6 +671,7 @@ async def _run_fire_for_task(
     stored = replace(task, agent_id=effective.agent_id, updated_at=effective.updated_at)
     try:
         # A connected-host session pins its host, so every later run routes there.
+        start_fire_stage("session_record", session_id=conv.id)
         await _keep_first_session(
             deps, stored, conv.id, host_id=None if managed else effective.host_id
         )
@@ -674,6 +695,7 @@ async def _run_fire_for_task(
         return
     await recorder.session_created(conv.id)
 
+    start_fire_stage("budget_validation", session_id=conv.id)
     await _attach_cost_budget(deps, task, conv.id)
     _announce_session_added(
         effective.user_id if effective.user_id is not None else deps.single_user_owner, conv.id
@@ -694,6 +716,7 @@ async def _run_fire_for_task(
 
     await recorder.check()
     try:
+        start_fire_stage("sandbox_create" if managed else "runner_start", session_id=conv.id)
         await dispatch(conv, effective)
     except Exception:
         # The session + grant are already persisted and owner-visible, so a
@@ -749,6 +772,7 @@ async def _continue_session(
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
+    start_fire_stage("session_validation", session_id=session_id)
     conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
     problem = await continued_session_problem(
         task, conv, host_store=deps.host_store, permission_store=deps.permission_store
@@ -763,6 +787,7 @@ async def _continue_session(
     assert conv is not None
 
     await recorder.check()
+    start_fire_stage("budget_validation", session_id=session_id)
     spent_usd = await asyncio.to_thread(_session_cost_usd, deps, session_id)
     try:
         await _attach_cost_budget(deps, task, session_id, spent_usd=spent_usd, replace=True)
@@ -795,6 +820,7 @@ async def _continue_session(
         )
         return
     try:
+        start_fire_stage("runner_start", session_id=session_id)
         await dispatch(conv, task)
     except Exception:
         _logger.exception(
@@ -1703,49 +1729,50 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             _wait_for_runner_client,
         )
 
-        if deps.host_registry is None or deps.host_store is None:
-            raise RuntimeError("connected host registry/store is not configured")
+        with fire_stage("runner_start", session_id=conv.id):
+            if deps.host_registry is None or deps.host_store is None:
+                raise RuntimeError("connected host registry/store is not configured")
 
-        owner = task.user_id or RESERVED_USER_LOCAL
-        host_id = task.host_id
-        if host_id is None or deps.host_registry.get(host_id) is None:
-            raise RuntimeError(f"connected host {host_id!r} is not online")
+            owner = task.user_id or RESERVED_USER_LOCAL
+            host_id = task.host_id
+            if host_id is None or deps.host_registry.get(host_id) is None:
+                raise RuntimeError(f"connected host {host_id!r} is not online")
 
-        # Authorize + resolve the live host connection (owner check skipped when
-        # auth is disabled, consistent with single-user behavior).
-        target = await asyncio.to_thread(
-            resolve_host_launch,
-            user_id=owner,
-            host_id=host_id,
-            session_id=conv.id,
-            host_store=deps.host_store,
-            host_registry=deps.host_registry,
-            conversation_store=deps.conversation_store,
-            permission_store=deps.permission_store,
-        )
+            # Authorize + resolve the live host connection (owner check skipped when
+            # auth is disabled, consistent with single-user behavior).
+            target = await asyncio.to_thread(
+                resolve_host_launch,
+                user_id=owner,
+                host_id=host_id,
+                session_id=conv.id,
+                host_store=deps.host_store,
+                host_registry=deps.host_registry,
+                conversation_store=deps.conversation_store,
+                permission_store=deps.permission_store,
+            )
 
-        attempt = await _launch_runner_on_host(
-            target.conv,
-            deps.conversation_store,
-            deps.host_registry,
-            target.conn,
-        )
-        if attempt.error is not None:
-            raise RuntimeError(f"host launch failed: {attempt.error}")
+            attempt = await _launch_runner_on_host(
+                target.conv,
+                deps.conversation_store,
+                deps.host_registry,
+                target.conn,
+            )
+            if attempt.error is not None:
+                raise RuntimeError(f"host launch failed: {attempt.error}")
 
-        runner_client = await _wait_for_runner_client(
-            conv.id,
-            deps.runner_router,
-            deps.tunnel_registry,
-            runner_id=attempt.runner_id,
-            timeout_s=_RUNNER_CONNECT_TIMEOUT_S,
-        )
-        if runner_client is None:
-            raise RuntimeError("runner did not connect before timeout")
+            runner_client = await _wait_for_runner_client(
+                conv.id,
+                deps.runner_router,
+                deps.tunnel_registry,
+                runner_id=attempt.runner_id,
+                timeout_s=_RUNNER_CONNECT_TIMEOUT_S,
+            )
+            if runner_client is None:
+                raise RuntimeError("runner did not connect before timeout")
 
-        # Re-read the row: the launch wrote runner_id, and the session-init
-        # handshake wants the current agent binding.
-        fresh = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
+            # Re-read the row: the launch wrote runner_id, and the session-init
+            # handshake wants the current agent binding.
+            fresh = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
         await _send_prompt(deps, fresh or conv, runner_client, task)
 
     return _dispatch
@@ -1791,31 +1818,33 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
             ensure_runner_connected,
         )
 
-        launch = None
-        if conv.host_id is None and task.execution_target == "managed_sandbox":
-            conv, launch = await _await_launch_start(deps, conv)
-        if launch is not None:
-            # The first run's sandbox is still provisioning. Wait for it the way a
-            # user's message does, then read the host and workspace it bound.
-            await _await_settled_managed_launch(launch)
-            conv = (
-                await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id) or conv
+        with fire_stage("runner_start", session_id=conv.id):
+            launch = None
+            if conv.host_id is None and task.execution_target == "managed_sandbox":
+                conv, launch = await _await_launch_start(deps, conv)
+            if launch is not None:
+                # The first run's sandbox is still provisioning. Wait for it the way a
+                # user's message does, then read the host and workspace it bound.
+                await _await_settled_managed_launch(launch)
+                conv = (
+                    await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
+                    or conv
+                )
+            if task.execution_target == "managed_sandbox" and conv.host_id != (
+                continued_sandbox_host_id(task.id, task.workspace_id)
+            ):
+                # A sandbox automation's prompt never goes to a runner outside its
+                # sandbox, such as a local one a hostless session may have.
+                raise RuntimeError(f"session {conv.id} is not bound to the automation's sandbox")
+            runner_client, conv = await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=deps.app_state,
+                conversation_store=deps.conversation_store,
+                runner_router=deps.runner_router,
             )
-        if task.execution_target == "managed_sandbox" and conv.host_id != (
-            continued_sandbox_host_id(task.id, task.workspace_id)
-        ):
-            # A sandbox automation's prompt never goes to a runner outside its
-            # sandbox, such as a local one a hostless session may have.
-            raise RuntimeError(f"session {conv.id} is not bound to the automation's sandbox")
-        runner_client, conv = await ensure_runner_connected(
-            session_id=conv.id,
-            conv=conv,
-            app_state=deps.app_state,
-            conversation_store=deps.conversation_store,
-            runner_router=deps.runner_router,
-        )
-        if runner_client is None:
-            raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
+            if runner_client is None:
+                raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
         await _send_prompt(deps, conv, runner_client, task)
 
     return _dispatch
@@ -1830,20 +1859,29 @@ async def _send_prompt(
         _ensure_runner_session_initialized,
     )
 
-    await _ensure_runner_session_initialized(conv.id, conv, runner_client, deps.conversation_store)
-    await _dispatch_session_event_to_runner(
-        conv.id,
-        conv,
-        _prompt_event(task.prompt),
-        deps.conversation_store,
-        runner_client,
-        agent_name=None,
-        file_store=deps.file_store,
-        artifact_store=deps.artifact_store,
-        created_by=task.user_id or RESERVED_USER_LOCAL,
-        runner_router=deps.runner_router,
-        agent_revision=await _agent_revision(deps, conv),
-    )
+    with fire_stage("runner_start", session_id=conv.id):
+        await _ensure_runner_session_initialized(
+            conv.id, conv, runner_client, deps.conversation_store
+        )
+    with fire_stage("prompt_send", session_id=conv.id):
+        dispatch_id = uuid.uuid4().hex
+        log_delivery(
+            "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
+        )
+        await _dispatch_session_event_to_runner(
+            conv.id,
+            conv,
+            _prompt_event(task.prompt),
+            deps.conversation_store,
+            runner_client,
+            agent_name=None,
+            file_store=deps.file_store,
+            artifact_store=deps.artifact_store,
+            created_by=task.user_id or RESERVED_USER_LOCAL,
+            runner_router=deps.runner_router,
+            agent_revision=await _agent_revision(deps, conv),
+        )
+        log_prompt_sent(conv.id, dispatch_id=dispatch_id)
 
 
 def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
@@ -1972,6 +2010,12 @@ async def _fail_running_run(
     deps: FireDeps, conversation_id: str, error: str, error_code: str
 ) -> None:
     """Fail a fired session's still-``running`` run; a terminal run is left as is."""
+    log_delivery(
+        "scheduled_run_stage_failed",
+        session_id=conversation_id,
+        failure_stage=startup_failure_stage(error_code),
+        error_code=error_code,
+    )
 
     def _transition() -> None:
         run = deps.scheduled_task_store.get_running_run_by_conversation(conversation_id)
@@ -2007,6 +2051,7 @@ class _ClaimedRunRecorder:
         await self._lease.check()
 
     async def session_created(self, conversation_id: str) -> None:
+        set_current_session_id(conversation_id)
         await self._lease.attach_session(conversation_id)
 
     async def finish(
@@ -2018,7 +2063,16 @@ class _ClaimedRunRecorder:
         error_code: str | None = None,
     ) -> None:
         await self._lease.finish(
-            status, conversation_id=conversation_id, error=error, error_code=error_code
+            status,
+            conversation_id=conversation_id,
+            error=error,
+            error_code=error_code,
+            failure_stage=(
+                (startup_failure_stage(error_code) if error_code != "launch_failed" else None)
+                or current_fire_stage()
+            )
+            if status == "failed"
+            else None,
         )
         # The outcome is already recorded; a failed stamp only leaves the task's
         # last-run summary stale.
@@ -2219,8 +2273,22 @@ class ClaimedRunExecutor:
             self._deps, task, lease, registration_timeout_s=self._registration_timeout_s
         )
         async with contextlib.AsyncExitStack() as stack:
+            stack.enter_context(
+                scheduled_run_scope(
+                    ScheduledRunLogContext(
+                        task_id=task.id,
+                        run_id=lease.run.id,
+                        task_workspace_id=lease.run.workspace_id,
+                        scheduled_at=lease.run.scheduled_at,
+                        trigger_key=lease.run.trigger_key,
+                        target=task.execution_target,
+                        session_mode=task.session_mode,
+                    )
+                )
+            )
             try:
-                await self._enter_owner_identity(stack, task)
+                with fire_stage("owner_identity"):
+                    await self._enter_owner_identity(stack, task)
             except FireIdentityRevoked:
                 _logger.warning(
                     "scheduled fire: task %s owner can no longer be acted for",

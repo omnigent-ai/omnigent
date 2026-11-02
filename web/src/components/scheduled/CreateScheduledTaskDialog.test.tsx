@@ -1793,6 +1793,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   async function submittedPrompt(): Promise<string> {
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].templateId).toMatch(/^(jira|slack|github)$/);
     return mutateAsync.mock.calls[0][0].prompt;
   }
 

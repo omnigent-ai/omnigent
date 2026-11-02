@@ -20,6 +20,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pydantic import BaseModel, ConfigDict
+
+
+class ScheduledRunLogContext(BaseModel):
+    """Occurrence identity retained with a saved prompt across replica changes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    run_id: str
+    task_workspace_id: int
+    scheduled_at: int
+    trigger_key: str | None = None
+    target: str
+    session_mode: str
+
 
 @dataclass
 class ScheduledTask:
