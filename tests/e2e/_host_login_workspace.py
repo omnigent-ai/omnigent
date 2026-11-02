@@ -8,7 +8,6 @@ import socket
 import ssl
 import subprocess
 import threading
-import time
 from contextlib import AbstractContextManager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -90,11 +89,9 @@ class HostLoginWorkspace(AbstractContextManager):
         with self._lock:
             return scheme == "Bearer" and token in self.accepted_tokens
 
-    def record(self, method: str, path: str, status: int | str, **detail: object) -> None:
+    def record(self, method: str, path: str, status: int | str) -> None:
         with self._lock:
-            self.edge_log.append(
-                {"time": time.time(), "method": method, "path": path, "status": status, **detail}
-            )
+            self.edge_log.append({"method": method, "path": path, "status": status})
 
     def __enter__(self) -> HostLoginWorkspace:
         self.thread.start()
@@ -163,8 +160,6 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
             self._authorize_and_forward("POST", body)
         elif path == "/oidc/v1/token":
             self.workspace.token_exchanges += 1
-            grant = parse_qs(body.decode(errors="replace")).get("grant_type", [""])[0]
-            self.workspace.record("POST", path, 200, grant_type=grant)
             self._json(
                 200,
                 {
@@ -178,31 +173,17 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
         else:
             self._json(404, {})
 
-    def do_PUT(self) -> None:
-        self._authorize_and_forward("PUT", self._request_body())
-
     def do_PATCH(self) -> None:
         self._authorize_and_forward("PATCH", self._request_body())
 
-    def do_DELETE(self) -> None:
-        self._authorize_and_forward("DELETE", self._request_body())
-
     def _request_body(self) -> bytes:
-        if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
-            return self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        chunks = []
-        while size := int(self.rfile.readline().split(b";")[0], 16):
-            chunks.append(self.rfile.read(size))
-            self.rfile.readline()
-        self.rfile.readline()
-        return b"".join(chunks)
+        return self.rfile.read(int(self.headers.get("Content-Length", "0")))
 
     def _authorize_and_forward(self, method: str, body: bytes) -> None:
-        upgrade = self.headers.get("Upgrade", "").lower() == "websocket"
         if not urlsplit(self.path).path.startswith(MOUNT):
             self._json(404, {})
         elif not self.workspace.accepts(self.headers.get("Authorization")):
-            self.workspace.record(method, self.path, 401, websocket=upgrade)
+            self.workspace.record(method, self.path, 401)
             self._json(401, {}, **{"WWW-Authenticate": 'Bearer realm="DatabricksRealm"'})
         else:
             self._forward(method, body)
@@ -217,7 +198,7 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
         }
         headers["X-Forwarded-Email"] = USER_EMAIL
         if self.headers.get("Upgrade", "").lower() == "websocket":
-            self.workspace.record(method, self.path, "relayed", websocket=True)
+            self.workspace.record(method, self.path, "relayed")
             upstream = urlsplit(self.workspace.upstream_url)
             with socket.create_connection(
                 (upstream.hostname, upstream.port), timeout=10
@@ -240,7 +221,7 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
                 response = client.request(
                     method, self.workspace.upstream_url + relative, headers=headers, content=body
                 )
-            self.workspace.record(method, self.path, response.status_code, websocket=False)
+            self.workspace.record(method, self.path, response.status_code)
             self.send_response(response.status_code)
             self.send_header(
                 "Content-Type", response.headers.get("Content-Type", "application/json")

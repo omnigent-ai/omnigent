@@ -2732,14 +2732,17 @@ class HostProcess:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _REJECTED_TUNNEL_DRAIN_CAP_S
         quiet_since = loop.time()
-        while self._ws is ws and (now := loop.time()) < deadline:
-            if await self._has_starting_runners():
-                quiet_since = now
-            elif now - quiet_since >= _REJECTED_TUNNEL_SETTLE_S:
-                break
-            await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
-        if self._ws is ws:
-            self._abort_live_tunnel()
+        try:
+            while self._ws is ws and (now := loop.time()) < deadline:
+                if await self._has_starting_runners():
+                    quiet_since = now
+                elif now - quiet_since >= _REJECTED_TUNNEL_SETTLE_S:
+                    break
+                await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
+        finally:
+            # A tunnel left marked rejected would refuse every launch while staying online.
+            if self._ws is ws:
+                self._abort_live_tunnel()
 
     async def _has_starting_runners(self) -> bool:
         """Return whether a launch is in progress or a live runner has not connected yet."""
@@ -2750,7 +2753,17 @@ class HostProcess:
             for handle in self._runners.values()
             if handle.connect_marker is not None and not handle.stop_requested
         ]
-        return await asyncio.to_thread(lambda: any(not marker.exists() for marker in markers))
+
+        def any_unconnected() -> bool:
+            for marker in markers:
+                try:
+                    if not marker.exists():
+                        return True
+                except OSError:
+                    _logger.debug("Could not read connect marker %s", marker, exc_info=True)
+            return False
+
+        return await asyncio.to_thread(any_unconnected)
 
     def _credentials_rejected_error(self) -> str:
         """Return the sign-in instruction for a runner the server refused on credentials."""

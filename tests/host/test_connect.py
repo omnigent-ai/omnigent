@@ -2312,6 +2312,53 @@ async def test_rejected_tunnel_refuses_launches_until_starting_runners_settle(
     assert relaunched.error_code == WORKSPACE_MISSING_ERROR_CODE
 
 
+@pytest.mark.parametrize("starting", ["unreadable_marker", "pending_launch", "never_connects"])
+async def test_rejected_tunnel_drain_always_drops_the_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, starting: str
+) -> None:
+    """The drain still drops the tunnel when starting work never settles or cannot be read."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.05)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_DRAIN_CAP_S", 0.3)
+    monkeypatch.setattr(
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _transport, request: httpx.Response(401, request=request),
+    )
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    transport = Mock()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+    marker: Path | Mock = tmp_path / "starting.marker"
+    if starting == "unreadable_marker":
+        marker = Mock(spec=Path)
+        marker.exists.side_effect = PermissionError("denied")
+    if starting == "pending_launch":
+        host._pending_runner_launches["runner_pending"] = set()
+    else:
+        host._runners["runner_starting"] = _RunnerHandle(
+            proc=Mock(), log_path=tmp_path / "starting.log", connect_marker=marker
+        )
+
+    await asyncio.wait_for(host._drop_tunnel_if_credentials_rejected(), timeout=5)
+
+    transport.abort.assert_called_once_with()
+    host._ws = SimpleNamespace(transport=Mock())  # type: ignore[assignment]
+    frame = HostLaunchRunnerFrame(
+        request_id="req_after_drop",
+        binding_token="tok_after_drop",
+        workspace=str(tmp_path / "gone" / "workspace"),
+    )
+    relaunched = await host._handle_launch(frame)
+    assert relaunched.error_code == WORKSPACE_MISSING_ERROR_CODE
+
+
 async def test_credential_check_skips_managed_hosts_overlaps_and_replaced_tunnels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

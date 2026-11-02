@@ -6,21 +6,18 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
-from tests._helpers.live_server import (
-    isolated_local_server,
-    isolated_process_env,
-    terminate_process,
-)
+from tests._helpers.compat import runner_executable
+from tests._helpers.host import Host, isolated_host
+from tests._helpers.live_server import isolated_local_server
 from tests._helpers.polling import poll_until
 from tests.e2e._host_login_workspace import (
     ACCESS_TOKEN,
@@ -32,6 +29,7 @@ from tests.e2e._host_login_workspace import (
 pytestmark = [
     pytest.mark.skipif(not shutil.which("openssl"), reason="openssl required for the test CA"),
     pytest.mark.timeout(240),
+    pytest.mark.min_runner_version("0.21.0"),
 ]
 
 _LAUNCH_LINE = re.compile(r"Launched runner (\S+) for workspace")
@@ -42,7 +40,8 @@ def _write_profile(path: Path, workspace_url: str, token: str) -> None:
     path.write_text(f"[local-test]\nhost = {workspace_url}\nauth_type = pat\ntoken = {token}\n")
 
 
-def _start_host(root: Path, edge: HostLoginWorkspace, host_id: str) -> subprocess.Popen[bytes]:
+@contextmanager
+def _edge_host(root: Path, edge: HostLoginWorkspace, host_id: str) -> Iterator[Host]:
     """Run ``omnigent host`` against the edge with a PAT profile and a stored workspace login."""
     home = root / "home"
     data = home / ".omnigent"
@@ -67,14 +66,11 @@ def _start_host(root: Path, edge: HostLoginWorkspace, host_id: str) -> subproces
     (shim / "sitecustomize.py").write_text(
         "import os, certifi\ncertifi.where = lambda: os.environ['SSL_CERT_FILE']\n"
     )
-    env = isolated_process_env(
-        home,
-        {
-            "OMNIGENT_CONFIG_HOME": str(data),
+    with isolated_host(
+        root,
+        edge.server_url,
+        env={
             "OMNIGENT_NO_UPDATE_CHECK": "1",
-            "OMNIGENT_HOST_ID": host_id,
-            "OMNIGENT_HOST_NAME": f"edge-host-{host_id[:8]}",
-            PROCESS_LOG_FILE_ENV_VAR: str(root / "host.log"),
             "DATABRICKS_CONFIG_FILE": str(home / ".databrickscfg"),
             "DATABRICKS_CONFIG_PROFILE": "local-test",
             "SSL_CERT_FILE": str(edge.cert),
@@ -83,17 +79,11 @@ def _start_host(root: Path, edge: HostLoginWorkspace, host_id: str) -> subproces
                 filter(None, [str(shim), os.environ.get("PYTHONPATH", "")])
             ),
         },
-        None,
-    )
-    with (root / "host-console.txt").open("wb") as console:
-        return subprocess.Popen(
-            [sys.executable, "-m", "omnigent", "host", edge.server_url, "--no-open"],
-            env=env,
-            cwd=home,
-            stdin=subprocess.DEVNULL,
-            stdout=console,
-            stderr=subprocess.STDOUT,
-        )
+        host_id=host_id,
+        name=f"edge-host-{host_id[:8]}",
+        command=[runner_executable(), "-m", "omnigent", "host", edge.server_url, "--no-open"],
+    ) as host:
+        yield host
 
 
 def _host_status(client: httpx.Client, host_id: str) -> str | None:
@@ -153,48 +143,44 @@ def test_host_goes_offline_when_its_credential_is_rejected_and_recovers(tmp_path
     workspace = tmp_path / "project"
     workspace.mkdir()
     host_id = uuid.uuid4().hex
-    host_log = tmp_path / "host" / "host.log"
     with (
         isolated_local_server(
             tmp_path / "server", extra_args=["--agent", str(agent_yaml)]
         ) as base_url,
         HostLoginWorkspace(tmp_path / "workspace", base_url) as edge,
         httpx.Client(base_url=base_url, headers=_USER_HEADERS, timeout=15.0) as client,
+        _edge_host(tmp_path / "host", edge, host_id) as host,
     ):
-        host = _start_host(tmp_path / "host", edge, host_id)
-        try:
-            poll_until(lambda: _host_status(client, host_id) == "online", timeout_s=60)
-            agents = client.get("/v1/agents").json()["data"]
-            agent_id = next(agent["id"] for agent in agents if agent["name"] == agent_name)
-            _, healthy = _launch_runner(client, host_log, agent_id, host_id, workspace)
-            poll_until(lambda: _runner_online(client, healthy), timeout_s=60)
+        poll_until(lambda: _host_status(client, host_id) == "online", timeout_s=60)
+        agents = client.get("/v1/agents").json()["data"]
+        agent_id = next(agent["id"] for agent in agents if agent["name"] == agent_name)
+        _, healthy = _launch_runner(client, host.log_path, agent_id, host_id, workspace)
+        poll_until(lambda: _runner_online(client, healthy), timeout_s=60)
 
-            edge.revoke_issued_tokens()
-            session_id, rejected = _launch_runner(client, host_log, agent_id, host_id, workspace)
-            # A send waiting on the refused runner still learns the cause.
-            send = client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-                },
-                timeout=120.0,
-            )
-            assert send.status_code == 503, send.text
-            assert "rejected this host's credentials" in send.text
-            poll_until(lambda: _host_status(client, host_id) == "offline", timeout_s=60)
-            assert not _runner_online(client, rejected)
-            assert "now rejects this host's credentials" in host_log.read_text(errors="replace")
-            poll_until(lambda: _rejected_host_tunnels(edge, host_id) > 0)
-            assert _host_status(client, host_id) == "offline"
-            assert host.poll() is None
+        edge.revoke_issued_tokens()
+        session_id, rejected = _launch_runner(client, host.log_path, agent_id, host_id, workspace)
+        # A send waiting on the refused runner still learns the cause.
+        send = client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+            timeout=120.0,
+        )
+        assert send.status_code == 503, send.text
+        assert "rejected this host's credentials" in send.text
+        assert " login " in send.text
+        poll_until(lambda: _host_status(client, host_id) == "offline", timeout_s=60)
+        assert not _runner_online(client, rejected)
+        assert _runner_online(client, healthy)
+        assert "now rejects this host's credentials" in host.log_path.read_text(errors="replace")
+        poll_until(lambda: _rejected_host_tunnels(edge, host_id) > 0)
+        assert _host_status(client, host_id) == "offline"
+        assert host.proc.poll() is None
 
-            _write_profile(
-                tmp_path / "host" / "home" / ".databrickscfg", edge.url, edge.issue_token()
-            )
-            poll_until(lambda: _host_status(client, host_id) == "online", timeout_s=60)
-            _, recovered = _launch_runner(client, host_log, agent_id, host_id, workspace)
-            poll_until(lambda: _runner_online(client, recovered), timeout_s=60)
-            assert host.poll() is None
-        finally:
-            terminate_process(host)
+        _write_profile(host.home / ".databrickscfg", edge.url, edge.issue_token())
+        poll_until(lambda: _host_status(client, host_id) == "online", timeout_s=60)
+        _, recovered = _launch_runner(client, host.log_path, agent_id, host_id, workspace)
+        poll_until(lambda: _runner_online(client, recovered), timeout_s=60)
+        assert host.proc.poll() is None
