@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from dev.ci_usage import chat_request, main, ocr_request_headers, probe
-from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, REQUEST_TAGS_HEADER
 from tests.e2e.helpers import harness_model_base_url, model_base_url
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -145,6 +145,53 @@ def test_live_fixture_selects_the_harness_wire_protocol(monkeypatch, harness, pr
     assert harness_model_base_url(host, harness) == host + "/serving-endpoints"
     monkeypatch.setenv("OMNIGENT_CI_PIPELINE", "flake-stress-e2e")
     assert harness_model_base_url(host, harness) == host + "/ai-gateway/" + protocol
+
+
+@pytest.mark.parametrize("ci", [False, True])
+def test_native_reconnect_setup_preserves_ci_context(monkeypatch, tmp_path, ci):
+    from omnigent.databricks_ai_gateway import gateway_request_tag_headers
+    from tests._helpers.live_server import isolated_process_env, local_server_env
+    from tests.e2e import test_native_host_reconnect_e2e as reconnect
+
+    tags = {
+        "pipeline": "flake-stress-e2e",
+        "repository": "example/project",
+        "workflow": "example/project/.github/workflows/flake-stress-e2e.yml",
+        "run_id": "123",
+        "run_attempt": "2",
+        "job": "repro",
+    }
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-be-inherited")
+    if ci:
+        monkeypatch.setenv(CI_CONTEXT_ENV, json.dumps({**tags, "unknown": "must-be-filtered"}))
+
+    class SetupCaptured(Exception):
+        pass
+
+    def capture_setup(root, *, base_env, server_env, **kwargs):
+        native_env = {key: value for key, value in server_env.items() if value is not None}
+        for environment in (
+            isolated_process_env(root / "server-home", server_env, base_env),
+            local_server_env(native_env, base_env=base_env),
+        ):
+            assert json.loads(environment.get(CI_CONTEXT_ENV, "{}")) == (tags if ci else {})
+            assert (CI_CONTEXT_ENV in environment) == ci
+            assert "GITHUB_TOKEN" not in environment
+            assert environment["OPENAI_API_KEY"] == "test-only-secret"
+            with monkeypatch.context() as child:
+                child.setattr("os.environ", environment)
+                headers = gateway_request_tag_headers(environment["OPENAI_BASE_URL"])
+                assert json.loads(headers.get(REQUEST_TAGS_HEADER, "{}")) == (tags if ci else {})
+        raise SetupCaptured
+
+    monkeypatch.setattr(reconnect, "server_runner", capture_setup)
+    with pytest.raises(SetupCaptured):
+        reconnect.test_native_message_survives_host_restart(
+            tmp_path,
+            llm_api_key="test-only-secret",
+            using_mock_llm=False,
+            databricks_workspace_host="https://dbc-1.cloud.databricks.com",
+        )
 
 
 def _workflow(name):

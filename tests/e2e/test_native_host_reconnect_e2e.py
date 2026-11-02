@@ -29,6 +29,7 @@ from typing import TypeVar
 import httpx
 import pytest
 
+from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
 from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 from tests._helpers.live_server import local_server_env, terminate_process
 from tests._helpers.server_runner import server_runner
@@ -164,6 +165,8 @@ def test_native_message_survives_host_restart(
         "OPENAI_BASE_URL": base_url,
         "OPENAI_API_KEY": llm_api_key,
     }
+    if ci_tags := ci_request_tags(strict=True):
+        native_env[CI_CONTEXT_ENV] = json.dumps(ci_tags, separators=(",", ":"))
     evidence: dict = {
         "model": model,
         "test_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
