@@ -2978,6 +2978,7 @@ _CLAUDE_VALUE_FLAGS = frozenset(
         "--agents",
         "--allowed-tools",
         "--allowedTools",
+        "--append-subagent-system-prompt",
         "--append-system-prompt",
         "--append-system-prompt-file",
         "--autocompact",
@@ -3002,6 +3003,7 @@ _CLAUDE_VALUE_FLAGS = frozenset(
         "--permission-mode",
         "--permission-prompt-tool",
         "--permission-prompts",
+        "--plan-mode-instructions",
         "--plugin-dir",
         "--plugin-url",
         "--prefill",
@@ -3019,37 +3021,32 @@ _CLAUDE_VALUE_FLAGS = frozenset(
 
 
 def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
-    """Append ``extra`` to the caller's ``--append-system-prompt`` value.
+    """Append an ``--append-system-prompt`` carrying the caller's prompt and ``extra``.
 
-    Claude Code keeps only the last ``--append-system-prompt``, so adding a
-    second flag would silently drop the caller's prompt.
+    Claude Code keeps only the last ``--append-system-prompt``, so Omnigent's
+    flag repeats the caller's effective value before ``extra``. Caller tokens
+    are never rewritten.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
-    :returns: ``args`` with a single effective prompt flag carrying both values.
+    :returns: ``args`` ending with a prompt flag whose value carries both prompts.
     """
     if not extra:
         return args
     flag = "--append-system-prompt"
     joined_prefix = f"{flag}="
-    effective: tuple[int, bool] | None = None
+    existing = ""
     idx = 0
     while idx < len(args):
         arg = args[idx]
         if arg.startswith(joined_prefix):
-            effective = (idx, True)
+            existing = arg[len(joined_prefix) :]
         elif arg in _CLAUDE_VALUE_FLAGS:
             if arg == flag and idx + 1 < len(args):
-                effective = (idx + 1, False)
+                existing = args[idx + 1]
             idx += 1
         idx += 1
-    if effective is None:
-        args.extend([flag, extra])
-        return args
-    value_idx, joined = effective
-    existing = args[value_idx][len(joined_prefix) :] if joined else args[value_idx]
-    merged = f"{existing}\n\n{extra}" if existing else extra
-    args[value_idx] = f"{joined_prefix}{merged}" if joined else merged
+    args.extend([flag, f"{existing}\n\n{extra}" if existing else extra])
     return args
 
 

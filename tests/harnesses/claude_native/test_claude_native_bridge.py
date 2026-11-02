@@ -4250,58 +4250,52 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
 
 
 @pytest.mark.parametrize(
-    ("user_args", "expected_prompt_args"),
+    ("user_args", "expected_prompt"),
     [
-        ((), ["--append-system-prompt", "Keep framework metadata separate."]),
+        ((), "Keep framework metadata separate."),
         (
             ("--append-system-prompt", "--- Reviewer profile ---"),
-            [
-                "--append-system-prompt",
-                "--- Reviewer profile ---\n\nKeep framework metadata separate.",
-            ],
+            "--- Reviewer profile ---\n\nKeep framework metadata separate.",
         ),
         (
             ("--append-system-prompt=Review carefully.",),
-            ["--append-system-prompt=Review carefully.\n\nKeep framework metadata separate."],
+            "Review carefully.\n\nKeep framework metadata separate.",
+        ),
+        (
+            ("--system-prompt", "--append-system-prompt", "--model", "sonnet"),
+            "Keep framework metadata separate.",
+        ),
+        (("--system-prompt", "--append-system-prompt"), "Keep framework metadata separate."),
+        (
+            ("--system-prompt", "--append-system-prompt=literal"),
+            "Keep framework metadata separate.",
+        ),
+        (
+            ("--plan-mode-instructions", "--append-system-prompt", "--model", "sonnet"),
+            "Keep framework metadata separate.",
+        ),
+        (
+            ("--unlisted-option", "--append-system-prompt", "--model", "sonnet"),
+            "--model\n\nKeep framework metadata separate.",
         ),
     ],
-    ids=["no-user-prompt", "user-prompt-separate-value", "user-prompt-joined-value"],
+    ids=[
+        "no-user-prompt",
+        "user-prompt-separate-value",
+        "user-prompt-joined-value",
+        "owned-flag-before-user-option",
+        "owned-flag-before-omnigent-options",
+        "owned-joined-literal",
+        "owned-by-newer-claude-option",
+        "unlisted-owner-keeps-caller-args",
+    ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
     user_args: tuple[str, ...],
-    expected_prompt_args: list[str],
+    expected_prompt: str,
 ) -> None:
-    """Launcher instructions follow the user's prompt in Claude's one effective flag."""
-    args = augment_claude_args(
-        user_args,
-        bridge_dir=tmp_path,
-        python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
-    )
-
-    prompt_args = [
-        arg
-        for index, arg in enumerate(args)
-        if arg.startswith("--append-system-prompt")
-        or (index > 0 and args[index - 1] == "--append-system-prompt")
-    ]
-    assert prompt_args == expected_prompt_args
-
-
-@pytest.mark.parametrize(
-    "user_args",
-    [
-        ("--system-prompt", "--append-system-prompt", "--model", "sonnet"),
-        ("--system-prompt", "--append-system-prompt"),
-    ],
-    ids=["before-user-option", "before-omnigent-options"],
-)
-def test_augment_claude_args_keeps_prompt_flag_owned_by_another_option(
-    tmp_path: Path,
-    user_args: tuple[str, ...],
-) -> None:
-    """An ``--append-system-prompt`` that is another option's value stays untouched."""
+    """Caller tokens stay intact; Omnigent's later prompt flag carries the caller's prompt."""
     omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
@@ -4316,6 +4310,7 @@ def test_augment_claude_args_keeps_prompt_flag_owned_by_another_option(
         append_system_prompt="Keep framework metadata separate.",
     )
 
+    omnigent_args[omnigent_args.index("--append-system-prompt") + 1] = expected_prompt
     assert args == [*user_args, *omnigent_args]
 
 
