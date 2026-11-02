@@ -12,9 +12,11 @@ Run with ``uv run --no-sync pytest tests/e2e/test_codex_native_supported_efforts
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -138,6 +140,110 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
         finally:
             while _json(rig.model.post("/gate/release"))["released"]:
                 pass
+
+
+@pytest.mark.parametrize("input_kind", ["paste", "text-upload", "aggregate"])
+def test_oversized_input_survives_real_codex_transport(
+    codex_effort_rig: _Rig, input_kind: str
+) -> None:
+    """Keep complete authored bytes and exactly one reply across the native RPC limit."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        marker = f"LARGE_INPUT_{uuid.uuid4().hex}"
+        authored = marker + "\n" + "x" * 1_100_000 + "\nLAST_LINE_preserved"
+        _json(rig.model.post("/mock/configure", json={"key": _STANDARD_MODEL, "responses": []}))
+        _json(rig.model.post("/mock/set_fallback", json={"key": _STANDARD_MODEL, "text": marker}))
+        before = len(_json(rig.model.get("/mock/requests"))["requests"])
+        if input_kind == "text-upload":
+            content = [
+                {
+                    "type": "input_file",
+                    "filename": "large-input.txt",
+                    "file_data": "data:text/plain;base64,"
+                    + base64.b64encode(authored.encode()).decode(),
+                }
+            ]
+        elif input_kind == "aggregate":
+            content = [
+                {"type": "input_text", "text": chunk}
+                for chunk in (authored[:600_000], authored[600_000:])
+            ]
+        else:
+            content = [{"type": "input_text", "text": authored}]
+        _json(
+            rig.api.post(
+                f"/v1/sessions/{session.id}/events",
+                json={"type": "message", "data": {"role": "user", "content": content}},
+            )
+        )
+        deadline = time.monotonic() + 90
+        items = []
+        while time.monotonic() < deadline:
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            assert snapshot.get("status") != "failed", snapshot.get("status_error")
+            state = read_bridge_state(session.bridge)
+            replies = [
+                item
+                for item in items
+                if item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+            ]
+            if replies and state is not None and state.active_turn_id is None:
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                f"No oversized-input reply.\n{session.tmux('capture-pane', '-p')}\n"
+                f"{rig.stack.log_tail()}"
+            )
+        assert len(replies) == 1
+        users = [item for item in items if item.get("role") == "user"]
+        assert len(users) == 1, "native echo must not duplicate the pending authored message"
+        requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
+        assert state is not None
+        own_requests = [
+            request for request in requests if request.get("prompt_cache_key") == state.thread_id
+        ]
+        assert len(own_requests) == 1, "one submitted input must cause one mock inference"
+        assert "[Attached file:" in json.dumps(own_requests[0]["input"])
+        paths = re.findall(r"\[Attached file: ([^\]]+)\]", json.dumps(own_requests[0]["input"]))
+        cached = {Path(path).name: Path(path).read_text() for path in paths}
+        normalized = (
+            authored
+            if input_kind != "aggregate"
+            else authored[:600_000] + "\n" + authored[600_000:]
+        )
+        assert normalized in cached.values(), "spill must preserve every byte of normalized input"
+        if input_kind != "text-upload":
+            assert "".join(block.get("text", "") for block in users[0]["content"]) == normalized
+        (rig.stack.root / f"oversized-{input_kind}-evidence.json").write_text(
+            json.dumps(
+                {
+                    "thread_id": state.thread_id,
+                    "authored_characters": len(authored),
+                    "authored_sha256": hashlib.sha256(authored.encode()).hexdigest(),
+                    "cached_files": {
+                        name: {
+                            "characters": len(text),
+                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        }
+                        for name, text in cached.items()
+                    },
+                    "requests": own_requests,
+                    "user_items": len(users),
+                    "reply_items": len(replies),
+                },
+                indent=2,
+            )
+        )
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium")
+        settled = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+            "data"
+        ]
+        assert len([item for item in settled if item.get("role") == "user"]) == 2
+        assert len([item for item in settled if item.get("role") == "assistant"]) == 2
 
 
 pytestmark = [
