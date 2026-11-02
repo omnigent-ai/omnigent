@@ -92,6 +92,32 @@ point the handoff at the one that shows the failure — don't assume the largest
 As with every lane, recordings are workspace artifacts — leave them
 uncommitted; CI's artifact bundle collects them.
 
+## Native Wayland maximize regression
+
+`desktop_wayland_maximize.e2e.js` launches the shell with
+`--ozone-platform=wayland` against `fixtures/wayland_stub_compositor.py`, a
+headless stub Wayland compositor that rejects zero-sized
+`xdg_surface.set_window_geometry`, then maximizes and restores the main window
+through the compositor and asserts the process survives. Besides Electron and
+Playwright it needs the overlay bundle and pywayland ≥ 0.4.19 (tested with
+0.4.19) importable by `OMNIGENT_PYTHON`. It skips when Electron, Playwright, or
+pywayland is missing and fails fast when the overlay bundle has not been built.
+
+```bash
+# From the repository root:
+pnpm --filter omnigent-desktop-electron run build:overlay
+uv pip install --python .venv/bin/python pywayland==0.4.19
+cd web/electron
+OMNIGENT_PYTHON="$PWD/../../.venv/bin/python" OMNIGENT_PW_NO_SANDBOX=1 \
+  node --test e2e/desktop_wayland_maximize.e2e.js
+```
+
+No X display is needed: the test removes `DISPLAY` so Electron picks the
+Wayland backend. Playwright's per-page recordings land in
+`e2e/recordings/desktop-wayland-maximize/` next to `evidence.json`, which
+records the window bounds, the compositor's geometry events, and the shell's
+exit signal.
+
 ## Floating Design editor inside modal forms
 
 `desktop_design_prompt.e2e.js` exercises the real SPA, desktop, local server,
