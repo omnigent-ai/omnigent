@@ -1151,7 +1151,7 @@ class TestConstructor(unittest.TestCase):
         with patch.dict("os.environ"):
             os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
             executor = ClaudeSDKExecutor(model="claude-sonnet-4-5")
-        self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", executor._extra_env)
+        self.assertEqual(executor._extra_env["CLAUDE_CODE_ENTRYPOINT"], "omnigent")
 
     def test_explicit_family_pins_are_not_overwritten(self):
         """Pre-set ``ANTHROPIC_DEFAULT_*_MODEL`` pins win over the listing.
