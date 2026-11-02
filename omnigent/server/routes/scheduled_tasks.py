@@ -27,6 +27,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
@@ -46,6 +51,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
@@ -283,6 +289,46 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def require_approved_scheduled_task_agent_origin(
+    request: Request,
+    *,
+    owner: str,
+    auth_provider: AuthProvider | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Bind a runner-marked mutation to the owner's source session and runner."""
+    if auth_provider is None:
+        return
+    source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not source_id and not token:
+        # Browser/API saves retain their existing ownership and validation path.
+        return
+    if not source_id or not token or permission_store is None:
+        raise OmnigentError(
+            "Agent automation changes require an approved source session",
+            code=ErrorCode.FORBIDDEN,
+        )
+    try:
+        source = require_owned_session(
+            source_id,
+            owner,
+            conversation_store,
+            permission_store,
+        )
+    except OmnigentError as exc:
+        raise OmnigentError(
+            "Agent automation changes require an owned source session",
+            code=ErrorCode.FORBIDDEN,
+        ) from exc
+    if not source.runner_id or token_bound_runner_id(token) != source.runner_id:
+        raise OmnigentError(
+            "Agent automation changes require the source session's bound runner",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
@@ -492,6 +538,13 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        require_approved_scheduled_task_agent_origin(
+            request,
+            owner=owner,
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
         await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
@@ -762,6 +815,13 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
+        require_approved_scheduled_task_agent_origin(
+            request,
+            owner=owner,
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:

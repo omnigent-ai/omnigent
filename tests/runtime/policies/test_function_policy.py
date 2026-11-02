@@ -1115,7 +1115,13 @@ async def test_schedule_approval_uses_dispatched_tool_identity(
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     def transform_name(_event: dict) -> PolicyResult:
-        return PolicyResult(action=PolicyAction.ALLOW, data={"name": "display-only-name"})
+        return PolicyResult(
+            action=PolicyAction.ALLOW,
+            data={
+                "name": "display-only-name",
+                "arguments": {"prompt": "Run it.", "permission_mode": None},
+            },
+        )
 
     engine = _build_engine(
         conversation_store,
@@ -1128,7 +1134,11 @@ async def test_schedule_approval_uses_dispatched_tool_identity(
         ],
     )
     result = await engine.evaluate(
-        EvaluationContext(phase=Phase.TOOL_CALL, content={"name": tool_name}, tool_name=tool_name)
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            content={"name": tool_name},
+            tool_name=tool_name,
+        )
     )
     assert result.action == expected
 

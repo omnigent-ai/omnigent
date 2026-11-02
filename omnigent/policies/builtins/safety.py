@@ -393,6 +393,8 @@ _SCHEDULED_TASK_SETTINGS = (
 _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
+_SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+
 
 def _clip(value: str) -> str:
     """Bound a preview value, marking the cut so it cannot pass for the whole value."""
@@ -405,15 +407,11 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
     """``key=value`` pairs for every argument but ``skip``, each value bounded.
 
     Known settings come first and are never dropped; other arguments follow and
-    are capped as a group. The free-text prompt can be long enough to push the
-    settings out of the card's truncated argument preview, so it is reported by
-    length only.
+    are capped as a group. The free-text prompt is rendered separately in full.
     """
 
     def pair(key: str) -> str:
         value = str(args[key])
-        if key == "prompt":
-            return f"prompt={len(value)} chars"
         return f"{key}={_clip(value)}"
 
     known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
@@ -430,6 +428,30 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
         extra.append(item)
         remaining -= size
     return ", ".join([*known, *extra])
+
+
+def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str | None:
+    """Render the complete security-relevant task values for approval."""
+    missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
+    if missing:
+        return None
+
+    prompt = str(args["prompt"])
+    raw_permission_mode = args["permission_mode"]
+    permission_mode = (
+        "agent default (no task override)"
+        if raw_permission_mode is None
+        else str(raw_permission_mode)
+    )
+    settings = _scheduled_task_settings(args, skip="prompt")
+    return (
+        f"Agent wants to {action} {subject}.\n"
+        f"Effective task permission mode: {permission_mode}\n"
+        f"Settings: {settings or '(none)'}\n"
+        "Full automation instructions:\n"
+        f"{prompt}\n"
+        "Approve?"
+    )
 
 
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
@@ -455,18 +477,34 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
         args = {}
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     if not args:
-        preview = f"{action} a scheduled task (details unavailable)"
+        review = None
     elif action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))
-        settings = _scheduled_task_settings(args, skip="name")
-        preview = f"create scheduled task {name!r} ({settings or 'no settings'})"
+        review = _scheduled_task_review(
+            args,
+            action="create",
+            subject=f"scheduled task {name!r}",
+        )
     else:
         task_id = _clip(str(args.get("scheduled_task_id") or "(no id)"))
-        settings = _scheduled_task_settings(args, skip="scheduled_task_id")
-        preview = f"update scheduled task {task_id} ({settings or 'no fields'})"
+        review = _scheduled_task_review(
+            args,
+            action="update",
+            subject=f"scheduled task {task_id}",
+        )
+    if review is None:
+        missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
+        fields = ", ".join(missing) or "prompt, permission_mode"
+        return {
+            "result": "DENY",
+            "reason": (
+                f"Cannot {action} a scheduled task without complete review fields "
+                f"({fields}). List the task and retry with its full prompt and permission_mode."
+            ),
+        }
     return {
         "result": "ASK",
-        "reason": f"Agent wants to {preview}. Approve?",
+        "reason": review,
     }
 
 

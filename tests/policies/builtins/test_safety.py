@@ -638,7 +638,12 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
             "target": "sys_scheduled_task_create",
             "data": {
                 "name": data_name,
-                "arguments": {"name": "nightly triage", "rrule": "FREQ=DAILY;BYHOUR=9"},
+                "arguments": {
+                    "name": "nightly triage",
+                    "prompt": "Triage new issues.",
+                    "permission_mode": None,
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                },
             },
         }
     )
@@ -647,8 +652,8 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
     assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
 
 
-def test_ask_on_scheduled_task_change_keeps_settings_visible_behind_a_long_prompt() -> None:
-    """Launch settings stay in the reason however long the prompt is; the prompt is sized only."""
+def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -> None:
+    """Launch settings and every prompt character remain in the approval reason."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     prompt = "Summarize everything. " * 300
@@ -687,11 +692,10 @@ def test_ask_on_scheduled_task_change_keeps_settings_visible_behind_a_long_promp
         "project_name=Nightly triage",
         "permission_mode=bypassPermissions",
         "max_cost_usd=2.5",
-        f"prompt={len(prompt)} chars",
     ):
         assert setting in reason, reason
-    assert "Summarize everything." not in reason
-    assert len(reason) < 800
+    assert prompt in reason
+    assert "Effective task permission mode: bypassPermissions" in reason
 
 
 @pytest.mark.parametrize(
@@ -716,6 +720,8 @@ def test_ask_on_scheduled_task_change_bounds_the_preview(
     arguments = dict(extras)
     arguments["name"] = "N" * 100
     arguments["timezone"] = "UTC"
+    arguments["prompt"] = "Run the review."
+    arguments["permission_mode"] = None
     result = ask_on_scheduled_task_change(
         {
             "type": "tool_call",
@@ -727,8 +733,8 @@ def test_ask_on_scheduled_task_change_bounds_the_preview(
     assert result["result"] == "ASK"
     assert "'" + "N" * 57 + "...'" in reason
     assert reason.count("v" * 58) == 0
-    assert f" (timezone=UTC, {expected}). Approve?" in reason
-    assert len(reason) < 330
+    assert "Settings: name=" in reason
+    assert f"timezone=UTC, permission_mode=None, {expected}" in reason
 
 
 def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
@@ -739,18 +745,32 @@ def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
         {
             "type": "tool_call",
             "target": "sys_scheduled_task_create",
-            "data": {"name": "sys_scheduled_task_create", "arguments": {"rrule": "FREQ=HOURLY"}},
+            "data": {
+                "name": "sys_scheduled_task_create",
+                "arguments": {
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                    "rrule": "FREQ=HOURLY",
+                },
+            },
         }
     )
     update = ask_on_scheduled_task_change(
         {
             "type": "tool_call",
             "target": "sys_scheduled_task_update",
-            "data": {"name": "sys_scheduled_task_update", "arguments": {"state": "paused"}},
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                    "state": "paused",
+                },
+            },
         }
     )
-    assert "'(unnamed)' (rrule=FREQ=HOURLY)" in create["reason"]
-    assert "(no id) (state=paused)" in update["reason"]
+    assert "scheduled task '(unnamed)'" in create["reason"]
+    assert "scheduled task (no id)" in update["reason"]
 
 
 def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
@@ -765,6 +785,8 @@ def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
                 "name": "sys_scheduled_task_update",
                 "arguments": {
                     "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Triage new issues.",
+                    "permission_mode": "auto",
                     "state": "paused",
                 },
             },
@@ -796,8 +818,8 @@ def test_ask_on_scheduled_task_change_allows_non_tool_events() -> None:
     assert result["result"] == "ALLOW"
 
 
-def test_ask_on_scheduled_task_change_handles_missing_arguments() -> None:
-    """Missing or non-dict arguments still ASK, with a readable fallback preview."""
+def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
+    """Missing or non-dict review arguments fail closed."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     result = ask_on_scheduled_task_change(
@@ -807,8 +829,8 @@ def test_ask_on_scheduled_task_change_handles_missing_arguments() -> None:
             "data": {"name": "sys_scheduled_task_update", "arguments": "not-a-dict"},
         }
     )
-    assert result["result"] == "ASK"
-    assert "details unavailable" in result["reason"]
+    assert result["result"] == "DENY"
+    assert "complete review fields" in result["reason"]
 
 
 # ── block_skills: native Skill tool (PreToolUse hook path) ─────────────────

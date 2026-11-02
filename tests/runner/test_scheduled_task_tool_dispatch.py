@@ -18,6 +18,7 @@ import json
 import jsonschema
 import pytest
 
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import (
     _ALL_LOCAL_TOOLS,
     _NATIVE_RELAY_BUILTIN_TOOLS,
@@ -57,6 +58,7 @@ class _RecordingClient:
 
     def __init__(self, response: _Resp | None = None, *, info: _Resp | None = None) -> None:
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+        self.headers: list[dict[str, str] | None] = []
         self._response = response or _Resp(body={"id": "t1"})
         self._info = info or _Resp(
             body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
@@ -66,12 +68,28 @@ class _RecordingClient:
         self.calls.append(("GET", url, None))
         return self._info if url == "/v1/info" else self._response
 
-    async def post(self, url: str, *, json: dict | None = None, timeout: object = None) -> _Resp:
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
         self.calls.append(("POST", url, json))
+        self.headers.append(headers)
         return self._response
 
-    async def patch(self, url: str, *, json: dict | None = None, timeout: object = None) -> _Resp:
+    async def patch(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
         self.calls.append(("PATCH", url, json))
+        self.headers.append(headers)
         return self._response
 
     async def delete(self, url: str, *, timeout: object = None) -> _Resp:
@@ -115,6 +133,35 @@ async def test_create_posts_payload() -> None:
         "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_mutation_identifies_approved_source_session(tool_name: str) -> None:
+    client = _RecordingClient()
+    arguments: dict[str, object] = {
+        "prompt": "Review every issue.",
+        "permission_mode": None,
+    }
+    if tool_name == "sys_scheduled_task_create":
+        arguments.update(
+            {
+                "name": "review",
+                "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                "agent_id": "ag_1",
+            }
+        )
+    else:
+        arguments["scheduled_task_id"] = _TASK_ID
+
+    await _execute_scheduled_task_tool(
+        tool_name,
+        json.dumps(arguments),
+        server_client=client,
+        conversation_id="conv_source",
+    )
+
+    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
 
 
 @pytest.mark.asyncio
@@ -373,7 +420,15 @@ async def test_calls_without_project_args_skip_the_capability_check() -> None:
 def test_update_schema_accepts_a_project_id_or_null(project_id: str | None) -> None:
     """A schema-validating client can move a task's project or clear it with null."""
     parameters = SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
-    jsonschema.validate({"scheduled_task_id": _TASK_ID, "project_id": project_id}, parameters)
+    jsonschema.validate(
+        {
+            "scheduled_task_id": _TASK_ID,
+            "prompt": "Triage new issues.",
+            "permission_mode": None,
+            "project_id": project_id,
+        },
+        parameters,
+    )
 
 
 @pytest.mark.asyncio
@@ -451,7 +506,13 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     assert "base_branch" not in properties
     assert "workspace" not in schema["required"]
     assert "host_id" not in schema["required"]
-    assert set(schema["required"]) == {"name", "prompt", "rrule", "agent_id"}
+    assert set(schema["required"]) == {
+        "name",
+        "prompt",
+        "rrule",
+        "agent_id",
+        "permission_mode",
+    }
 
 
 def test_update_tool_schema_allows_connected_host_changes() -> None:
@@ -463,6 +524,7 @@ def test_update_tool_schema_allows_connected_host_changes() -> None:
     assert "host_id" in properties
     # Switching which agent/harness a task runs is part of the update surface.
     assert "agent_id" in properties
+    assert set(schema["required"]) == {"scheduled_task_id", "prompt", "permission_mode"}
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:

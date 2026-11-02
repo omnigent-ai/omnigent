@@ -20,7 +20,14 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.entities import Conversation, SessionPermission
+from omnigent.errors import OmnigentError
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
@@ -266,6 +273,98 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+
+
+@pytest.mark.parametrize(
+    "missing_header",
+    [None, ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER],
+)
+async def test_agent_mutation_requires_owned_bound_runner_source(
+    missing_header: str | None,
+) -> None:
+    token = "scheduled-approval-token"
+    source_id = uuid.uuid4().hex
+    source = Conversation(
+        id=source_id,
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=source_id,
+        runner_id=token_bound_runner_id(token),
+    )
+    conversations = Mock()
+    conversations.get_conversation.return_value = source
+    permissions = Mock()
+    permissions.get.return_value = SessionPermission("alice@example.com", source_id, 4)
+    headers = {
+        ORCHESTRATION_SOURCE_HEADER: source_id,
+        RUNNER_TUNNEL_TOKEN_HEADER: token,
+    }
+    if missing_header is not None:
+        headers.pop(missing_header)
+    request = SimpleNamespace(headers=headers)
+
+    if missing_header is None:
+        scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
+            request,
+            owner="alice@example.com",
+            auth_provider=Mock(),
+            conversation_store=conversations,
+            permission_store=permissions,
+        )
+    else:
+        with pytest.raises(OmnigentError, match="approved source session"):
+            scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
+                request,
+                owner="alice@example.com",
+                auth_provider=Mock(),
+                conversation_store=conversations,
+                permission_store=permissions,
+            )
+
+
+async def test_agent_mutation_rejects_a_different_runner_token() -> None:
+    source_id = uuid.uuid4().hex
+    conversations = Mock()
+    conversations.get_conversation.return_value = Conversation(
+        id=source_id,
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=source_id,
+        runner_id=token_bound_runner_id("bound-token"),
+    )
+    permissions = Mock()
+    permissions.get.return_value = SessionPermission("alice@example.com", source_id, 4)
+    request = SimpleNamespace(
+        headers={
+            ORCHESTRATION_SOURCE_HEADER: source_id,
+            RUNNER_TUNNEL_TOKEN_HEADER: "different-token",
+        }
+    )
+
+    with pytest.raises(OmnigentError, match="source session's bound runner"):
+        scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
+            request,
+            owner="alice@example.com",
+            auth_provider=Mock(),
+            conversation_store=conversations,
+            permission_store=permissions,
+        )
+
+
+async def test_unmarked_ui_mutation_keeps_the_existing_route() -> None:
+    conversations = Mock()
+    permissions = Mock()
+
+    scheduled_tasks_routes.require_approved_scheduled_task_agent_origin(
+        SimpleNamespace(headers={}),
+        owner="alice@example.com",
+        auth_provider=Mock(),
+        conversation_store=conversations,
+        permission_store=permissions,
+    )
+
+    conversations.get_conversation.assert_not_called()
+    permissions.get.assert_not_called()
 
 
 async def test_automations_gate_is_checked_per_request(
