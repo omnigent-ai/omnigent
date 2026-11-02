@@ -811,10 +811,15 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :returns: List of file-record dicts suitable for the
             ``workspace.changed_files`` API response, newest first.
         """
-        return self._list_observed_files(conversation_id, limit=limit)
+        return self._list_observed_files(conversation_id, limit=limit, check_disk=check_disk)
 
     def _list_observed_files(
-        self, conversation_id: str, *, limit: int, excluded_roots: Collection[str] = ()
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        check_disk: bool,
+        excluded_roots: Collection[str] = (),
     ) -> list[dict[str, Any]]:
         with self._lock:
             events = list(self._session_events.get(conversation_id, []))
@@ -1604,9 +1609,13 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
             else record
         )
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self, conversation_id: str, *, limit: int, check_disk: bool = True
+    ) -> list[dict[str, Any]]:
         roots = self._repository_roots()
-        records = self._list_observed_files(conversation_id, limit=10_001, excluded_roots=roots)
+        records = self._list_observed_files(
+            conversation_id, limit=10_001, check_disk=check_disk, excluded_roots=roots
+        )
         for prefix, root in sorted(roots.items()):
             try:
                 records.extend(
@@ -1624,10 +1633,12 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
         records.sort(key=lambda record: (record["modified_at"] or 0, record["path"]), reverse=True)
         return records[:limit]
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self, session_id: str, path: str, *, check_disk: bool = True
+    ) -> dict[str, Any] | None:
         owner = self._owner(path)
         if owner is None:
-            return super().get_changed_file(session_id, path)
+            return super().get_changed_file(session_id, path, check_disk=check_disk)
         prefix, root = owner
         norm = _normalize_path(path, self._cwd)
         assert norm is not None

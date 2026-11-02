@@ -63,15 +63,18 @@ def _inject(
     registry.record_change(path, operation, conv_id)
 
 
-@pytest.fixture
-def registry(tmp_path: Path) -> AgentEditFilesystemRegistry:
-    """An :class:`AgentEditFilesystemRegistry` rooted at a fresh temp directory.
+@pytest.fixture(params=[AgentEditFilesystemRegistry, MultiRepositoryFilesystemRegistry])
+def registry(request: pytest.FixtureRequest, tmp_path: Path) -> AgentEditFilesystemRegistry:
+    """A non-Git registry rooted at a fresh temp directory.
 
+    Covers the multi-repository subclass too, since it is what non-Git
+    workspaces get and it overrides the change-listing methods.
+
+    :param request: pytest request carrying the registry class.
     :param tmp_path: pytest's built-in temporary directory fixture.
-    :returns: An :class:`AgentEditFilesystemRegistry` instance with in-memory
-        event tracking (no persistence).
+    :returns: A registry instance with in-memory event tracking (no persistence).
     """
-    return AgentEditFilesystemRegistry(watch_path=tmp_path)
+    return request.param(watch_path=tmp_path)
 
 
 def test_created_then_modified_shows_added(registry: AgentEditFilesystemRegistry) -> None:
@@ -420,8 +423,8 @@ def test_a_snapshot_taken_after_the_first_change_never_becomes_the_original(
 
     listed = registry.list_changed_files(conv_id, limit=10)
     assert [(r["path"], r["status"]) for r in listed] == [("notes.md", "modified")]
-    # The diff view still shows the first snapshot any call took.
-    assert registry.get_baseline("notes.md") == "written by a tool call\n"
+    # The diff view has no baseline either, since the late snapshot is not the original.
+    assert registry.get_baseline("notes.md") is None
 
 
 def test_changes_keep_recorded_entries_where_lookups_cannot_be_confined(
