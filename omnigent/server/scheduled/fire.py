@@ -21,7 +21,8 @@ firing:
    task's ``user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
    (single-user / OSS). Without the grant the run is invisible.
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
-   (a seeded prompt with no launched runner would just sit as history).
+   (a seeded prompt with no launched runner would just sit as history). The
+   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
 #. **Records the run** — stamps ``last_run_at`` + ``last_run_conversation_id`` on
    the task row and writes a ``scheduled_task_runs`` history row.
 
@@ -327,11 +328,26 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
+# Follows the prompt in every message a fire sends. No one watches a run, so a
+# question or a permission request stalls it instead of reaching a person. Only
+# the sent message carries it: the task keeps the prompt its owner wrote, so the
+# automation pages never show it.
+UNATTENDED_RUN_NOTE = (
+    "Note: an Omnigent automation sent this message, and no one is watching this run. "
+    "No one can answer questions, approve requests or give input, so work toward the "
+    "goal above on your own. Don't ask questions, wait for confirmation or stop to "
+    "request permission. When something is unclear, make a reasonable choice and keep "
+    "going. If an action needs approval or is denied, skip it and say so in your reply. "
+    "End with a reply that says what you did, what you assumed and anything you couldn't do."
+)
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
+    text = f"{prompt.rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
     return SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        data={"role": "user", "content": [{"type": "input_text", "text": text}]},
     )
 
 
