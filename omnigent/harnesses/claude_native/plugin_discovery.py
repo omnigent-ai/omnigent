@@ -25,7 +25,7 @@ _launch_plugins: tuple[tuple[str, ...], float, dict[str, Path] | Exception] | No
 def claude_launch_is_customized() -> bool:
     """Whether native Claude starts through a configured command, arguments or launcher plugin.
 
-    :raises OSError, yaml.YAMLError: The Omnigent config could not be read.
+    :raises OSError, TypeError, ValueError, yaml.YAMLError: The Omnigent config could not be read.
     """
     from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
     from omnigent.config import load_effective_config

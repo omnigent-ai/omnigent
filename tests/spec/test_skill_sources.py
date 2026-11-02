@@ -1142,13 +1142,38 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
             "Claude plugins added by the configured launch are missing: the launch "
             "did not report its plugins; see the host log for details.",
         ),
+        (
+            "- claude\n",
+            "",
+            "Claude plugins added by a configured launch may be missing: the Omnigent "
+            "config could not be read; see the host log for details.",
+        ),
+        (
+            "- claude\n",
+            "wrapper",
+            "Claude plugins added by the configured launch are missing: the launch "
+            "did not report its plugins; see the host log for details.",
+        ),
+        (
+            b"harness: \x81\n",
+            "",
+            "Claude plugins added by a configured launch may be missing: the Omnigent "
+            "config could not be read; see the host log for details.",
+        ),
     ],
-    ids=["malformed", "unreadable", "malformed-with-launcher"],
+    ids=[
+        "malformed",
+        "unreadable",
+        "malformed-with-launcher",
+        "not-a-mapping",
+        "not-a-mapping-with-launcher",
+        "invalid-utf8",
+    ],
 )
 def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    config_text: str | None,
+    config_text: str | bytes | None,
     launcher: str,
     warning: str,
 ) -> None:
@@ -1159,6 +1184,8 @@ def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
     if config_text is None:
         # Opening a directory fails even as root, which can read a mode-000 file.
         config_path.mkdir()
+    elif isinstance(config_text, bytes):
+        config_path.write_bytes(config_text)
     else:
         config_path.write_text(config_text)
     if launcher:
