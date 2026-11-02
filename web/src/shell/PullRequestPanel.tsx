@@ -1660,6 +1660,9 @@ export function PullRequestPanel({
     }
   }, [selected, associations?.selected_pr_url, linked, changeSelection]);
   const prs = associations?.prs ?? [];
+  useEffect(() => {
+    if (prs.length === 1) setDetailsSession(conversationId);
+  }, [conversationId, prs.length]);
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const detailsInfo =
     linked?.length === 0 && info.data
@@ -1787,7 +1790,7 @@ export function PullRequestPanel({
       {mobileHeaderTarget?.actions && createPortal(headerActions, mobileHeaderTarget.actions)}
       {mobileHeaderTarget?.title &&
         showingDetails &&
-        prs.length > 0 &&
+        prs.length > 1 &&
         createPortal(
           <div data-mobile-panel-title>
             <Button
@@ -1805,9 +1808,9 @@ export function PullRequestPanel({
       {showTrackingControls ? (
         !inMobileDrawer && (
           <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails || prs.length <= 1} />}
             <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-              {prs.length > 0 && showingDetails && (
+              {prs.length > 1 && showingDetails && (
                 <Button variant="ghost" size="sm" onClick={showPullRequestList}>
                   <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
                 </Button>
@@ -1843,7 +1846,7 @@ export function PullRequestPanel({
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
-        {prs.length > 0 && !showingDetails ? (
+        {prs.length > 1 && !showingDetails ? (
           <ul aria-label="Pull requests" className="h-full overflow-y-auto">
             {prs.map((pr) => (
               <PullRequestListRow

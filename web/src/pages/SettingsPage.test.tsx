@@ -3,7 +3,8 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,7 +62,6 @@ vi.mock("next-themes", () => ({
     setTheme: mocks.setTheme,
   }),
 }));
-vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
@@ -230,13 +230,16 @@ function renderPage(path = "/settings") {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  const Embed = mocks.isEmbedded ? EmbeddedProvider : Fragment;
   return render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter initialEntries={[path]}>
-          <SettingsPage />
-          <LocationProbe />
-        </MemoryRouter>
+        <Embed>
+          <MemoryRouter initialEntries={[path]}>
+            <SettingsPage />
+            <LocationProbe />
+          </MemoryRouter>
+        </Embed>
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -559,22 +562,56 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("opens the embedded host's theme settings in a new tab", () => {
+  it("offers explicit modes and links the automatic browser mode to Databricks settings", () => {
     mocks.isEmbedded = true;
     const url = "https://workspace.example.com/settings/user/preferences";
     vi.spyOn(host, "getOmnigentThemeSettingsUrl").mockReturnValue(url);
     renderPage("/settings/appearance");
 
-    expect(screen.queryByTestId("theme-system")).not.toBeInTheDocument();
-    for (const name of [
-      "Click to open Databricks user preferences page.",
-      "Open Databricks preferences",
+    for (const [name, value] of [
+      ["Light", "light"],
+      ["Dark", "dark"],
+      ["Use Databricks setting", "system"],
     ]) {
-      const link = screen.getByRole("link", { name });
-      expect(link).toHaveAttribute("href", url);
-      expect(link).toHaveAttribute("target", "_blank");
-      expect(link).toHaveAttribute("rel", "noreferrer");
+      fireEvent.click(
+        within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+          name,
+        }),
+      );
+      expect(mocks.setTheme).toHaveBeenLastCalledWith(value);
     }
+    const link = screen.getByRole("link", { name: "Databricks appearance settings" });
+    expect(link).toHaveAttribute("href", url);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noreferrer");
+  });
+
+  it("keeps System, Light and Dark in the embedded Electron app", () => {
+    mocks.isEmbedded = true;
+    Object.defineProperty(window, "omnigentDesktop", {
+      value: { kind: "electron" },
+      configurable: true,
+    });
+    renderPage("/settings/appearance");
+
+    expect(
+      within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+        name: "System",
+      }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(
+      within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+        name: "Light",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("radiogroup", { name: "Mode" })).getByRole("radio", {
+        name: "Dark",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Databricks appearance settings" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
