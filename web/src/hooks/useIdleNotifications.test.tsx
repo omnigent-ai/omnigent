@@ -54,6 +54,7 @@ import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
   resetReadStateForTests,
   markConversationSeen,
+  markConversationUnread,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
 import { useIdleNotifications } from "./useIdleNotifications";
@@ -600,6 +601,36 @@ describe("useIdleNotifications badge (native shell)", () => {
     expect(setBadgeMock).toHaveBeenCalledWith(0);
   });
 
+  it("counts the actively-viewed session once the user marks it unread", () => {
+    setWindowFocused(true);
+    markConversationSeen("a", 200);
+    setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
+    renderHook(() => useIdleNotifications("a"));
+    expect(setBadgeMock).toHaveBeenLastCalledWith(0);
+
+    act(() => {
+      markConversationUnread("a", 100);
+    });
+
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
+  });
+
+  it("counts an open session that was already marked unread when the hook mounts", () => {
+    setWindowFocused(true);
+    markConversationSeen("a", 200);
+    markConversationUnread("a", 100);
+    setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
+    renderHook(() => useIdleNotifications("a"));
+
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
+  });
+
   it("counts the open session when the window is blurred", () => {
     setWindowFocused(false);
     setConversations([unseenConv("a")]);
@@ -628,6 +659,28 @@ describe("useIdleNotifications badge (native shell)", () => {
 
     // Focusing on the open conversation marks it read -> badge clears to 0.
     expect(setBadgeMock).toHaveBeenCalledWith(0);
+  });
+
+  it("keeps an explicitly-unread open session counted when the window regains focus", () => {
+    setWindowFocused(false);
+    markConversationSeen("a", 200);
+    setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
+    renderHook(() => useIdleNotifications("a"));
+    act(() => {
+      markConversationUnread("a", 100);
+    });
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
+    setBadgeMock.mockClear();
+
+    setWindowFocused(true);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(setBadgeMock).not.toHaveBeenCalled();
   });
 
   it("keeps other unread sessions when focusing clears only the active one", () => {
