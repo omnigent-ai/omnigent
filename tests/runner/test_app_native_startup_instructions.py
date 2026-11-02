@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from omnigent.runner.app import ResolvedSpec, _native_startup_raw_instructions_from_spec
+from omnigent.runner.native.orchestration import _pi_startup_instructions
+from omnigent.runtime.prompt import AUTOMATION_SESSION_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -62,3 +64,21 @@ def test_native_startup_raw_instructions_from_spec_never_returns_stripped_form()
     """The original resolved text is preserved verbatim, not the stripped form."""
     padded = "  Keep leading/trailing whitespace exactly.  "
     assert _native_startup_raw_instructions_from_spec(_spec(padded)) == padded
+
+
+@pytest.mark.parametrize(
+    ("raw", "mode", "automation", "expected"),
+    [
+        ("Author.", "append", False, "Author."),
+        (None, "append", False, None),
+        ("Author.", "append", True, f"Author.\n\n{AUTOMATION_SESSION_INSTRUCTION}"),
+        (None, "append", True, AUTOMATION_SESSION_INSTRUCTION),
+        ("Author.", "replace", True, f"Author.\n\n{AUTOMATION_SESSION_INSTRUCTION}"),
+        # Replace mode still needs the author's text; the note can't stand in for it.
+        (None, "replace", True, None),
+    ],
+)
+def test_pi_startup_instructions_add_the_automation_note(
+    raw: str | None, mode: str, automation: bool, expected: str | None
+) -> None:
+    assert _pi_startup_instructions(raw, mode, automation_session=automation) == expected

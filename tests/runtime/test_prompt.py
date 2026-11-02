@@ -12,6 +12,7 @@ from omnigent.runner.subagent_work import (
 )
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
+    AUTOMATION_SESSION_INSTRUCTION,
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
@@ -19,6 +20,7 @@ from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
     history_to_input_items,
+    is_automation_session,
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
@@ -460,3 +462,30 @@ def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
     result = build_instructions_nullable(spec, None, [])
     assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({"omnigent.scheduled_task_origin": "task_1"}, True),
+        # An owner-picked session an automation continues carries no origin.
+        ({}, False),
+        (None, False),
+        ({"omnigent.scheduled_task_origin": ""}, False),
+        ({"omnigent.scheduled_task_origin": 1}, False),
+    ],
+)
+def test_is_automation_session_reads_the_server_origin_label(
+    labels: dict[str, object] | None, expected: bool
+) -> None:
+    assert is_automation_session(labels) is expected
+
+
+def test_automation_session_instruction_rules_out_waiting_on_a_person() -> None:
+    # The point of the note: a run has no one to answer it, so it must not stall.
+    for phrase in (
+        "No one is watching",
+        "Don't ask questions, wait for confirmation or stop to request permission.",
+        "End each run with a reply",
+    ):
+        assert phrase in AUTOMATION_SESSION_INSTRUCTION

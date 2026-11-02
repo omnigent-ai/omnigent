@@ -18,10 +18,13 @@ from omnigent.harnesses.opencode_native.bridge import (
 from omnigent.runner.native.orchestration import (
     _opencode_model_options_from_catalog,
     _opencode_model_ref,
+    _opencode_session_instructions_from_spec,
     _OpenCodeNativeLaunchConfig,
     _prepare_opencode_native_fork,
     _sanitize_opencode_tui_args,
 )
+from omnigent.runtime.prompt import AUTOMATION_SESSION_INSTRUCTION
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
 class _Resp:
@@ -73,6 +76,31 @@ async def test_launch_config_without_fork_labels(monkeypatch: Any) -> None:
     assert cfg.fork_source_id is None
     assert cfg.fork_source_external_id is None
     assert cfg.fork_carry_history is False
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [({"omnigent.scheduled_task_origin": "task_1"}, True), ({}, False)],
+)
+async def test_launch_config_reads_the_automation_origin(
+    monkeypatch: Any, labels: dict[str, str], expected: bool
+) -> None:
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    cfg = await orchestration._opencode_native_launch_config(
+        session_id="conv_automation",
+        server_client=_SnapshotClient({"workspace": "/tmp/repo", "labels": labels}),  # type: ignore[arg-type]
+    )
+    assert cfg.automation_session is expected
+
+
+def test_session_instructions_carry_the_automation_note_only_when_asked() -> None:
+    spec = AgentSpec(spec_version=1, name="oc", instructions="Author.", executor=ExecutorSpec())
+    plain = _opencode_session_instructions_from_spec(spec)
+    assert plain is not None and AUTOMATION_SESSION_INSTRUCTION not in plain
+    assert (
+        _opencode_session_instructions_from_spec(spec, automation_session=True)
+        == f"{plain}\n\n{AUTOMATION_SESSION_INSTRUCTION}"
+    )
 
 
 def _fork_config(**overrides: Any) -> _OpenCodeNativeLaunchConfig:

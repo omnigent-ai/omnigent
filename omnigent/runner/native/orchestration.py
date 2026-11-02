@@ -104,6 +104,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.runtime.prompt import AUTOMATION_SESSION_INSTRUCTION, is_automation_session
 from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -685,6 +686,7 @@ class _CodexNativeLaunchConfig:
     turn_routing: bool = False
     reasoning_effort: str | None = None
     bridge_id: str | None = None
+    automation_session: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -733,6 +735,7 @@ class _PiNativeLaunchConfig:
     model_override: str | None = None
     reasoning_effort: str | None = None
     native_usage_baseline: dict[str, int | float] | None = None
+    automation_session: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1353,6 +1356,7 @@ async def _pi_native_launch_config(
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
         native_usage_baseline=native_usage_baseline,
+        automation_session=is_automation_session(labels if isinstance(labels, dict) else None),
     )
 
 
@@ -1505,6 +1509,7 @@ async def _codex_native_launch_config(
         turn_routing=routing_class.turn_routing,
         reasoning_effort=reasoning_effort,
         bridge_id=bridge_id,
+        automation_session=is_automation_session(labels if isinstance(labels, dict) else None),
     )
 
 
@@ -1535,6 +1540,7 @@ class _OpenCodeNativeLaunchConfig:
     fork_carry_history: bool = False
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
+    automation_session: bool = False
 
 
 async def _opencode_native_launch_config(
@@ -1610,6 +1616,7 @@ async def _opencode_native_launch_config(
         fork_carry_history=fork_carry_history,
         fork_source_id=fork_source_id,
         fork_source_external_id=fork_source_external_id,
+        automation_session=is_automation_session(labels if isinstance(labels, dict) else None),
     )
 
 
@@ -1943,7 +1950,10 @@ async def _auto_create_opencode_terminal(
 
     # opencode 2.0 ignores config ``instructions``; the per-session global AGENTS.md is read.
     instructions_path = write_opencode_instructions(
-        xdg_config_home, _opencode_session_instructions_from_spec(agent_spec)
+        xdg_config_home,
+        _opencode_session_instructions_from_spec(
+            agent_spec, automation_session=launch_config.automation_session
+        ),
     )
     config = build_opencode_config(
         model=model_override,
@@ -2890,14 +2900,20 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
     system_prompt_mode = "append"
     if pi_spec is not None:
         context_files = pi_spec.executor.config.get("context_files", True)
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
+    instructions_path = write_agent_instructions(
+        bridge_dir,
+        _pi_startup_instructions(
+            _native_startup_raw_instructions_from_spec(agent_spec),
+            system_prompt_mode,
+            automation_session=launch_config.automation_session,
+        ),
+    )
     provider_args: list[str] = []
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -5781,6 +5797,7 @@ async def _auto_create_codex_terminal(
             for x in [
                 _native_startup_raw_instructions_from_spec(agent_spec),
                 _codex_routing_note,
+                AUTOMATION_SESSION_INSTRUCTION if launch_config.automation_session else None,
             ]
             if x
         )
@@ -7701,16 +7718,21 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
 
 def _opencode_session_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
+    *,
+    automation_session: bool = False,
 ) -> str | None:
     """Compose the session-snapshot instructions written to OpenCode's AGENTS.md.
 
     Author instructions plus the spec-level framework instructions from
-    ``omnigent.runtime.prompt``. No per-request text or turn-bound framework
-    text is included: AGENTS.md is written once per launch and read for every
-    later turn. Tool schemas are empty, matching the runner's own composition.
+    ``omnigent.runtime.prompt``, and the automation note for a session an
+    automation run created, which holds for the whole session. No per-request
+    text or turn-bound framework text is included: AGENTS.md is written once
+    per launch and read for every later turn. Tool schemas are empty, matching
+    the runner's own composition.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
+    :param automation_session: ``True`` when an automation run created the session.
     :returns: The composed text, or ``None`` when there is no spec.
     """
     from omnigent.runtime.prompt import build_instructions_nullable
@@ -7718,7 +7740,12 @@ def _opencode_session_instructions_from_spec(
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
         return None
-    return build_instructions_nullable(spec, None, [])
+    return build_instructions_nullable(
+        spec,
+        None,
+        [],
+        framework_instructions=(AUTOMATION_SESSION_INSTRUCTION,) if automation_session else (),
+    )
 
 
 def _native_startup_raw_instructions_from_spec(
@@ -7746,6 +7773,24 @@ def _native_startup_raw_instructions_from_spec(
     if spec is None:
         return None
     return raw_author_instructions(spec)
+
+
+def _pi_startup_instructions(
+    raw_instructions: str | None, system_prompt_mode: str, *, automation_session: bool
+) -> str | None:
+    """Pi's startup prompt text: the author's, plus the automation note when it applies.
+
+    A replacement prompt still needs the author's text, so the note alone never
+    becomes Pi's whole system prompt.
+
+    :param raw_instructions: The author's instructions, or ``None``.
+    :param system_prompt_mode: ``"append"`` or ``"replace"``.
+    :param automation_session: ``True`` when an automation run created the session.
+    :returns: The text for Pi's prompt file, or ``None`` for none.
+    """
+    if not automation_session or (raw_instructions is None and system_prompt_mode != "append"):
+        return raw_instructions
+    return "\n\n".join(x for x in [raw_instructions, AUTOMATION_SESSION_INSTRUCTION] if x)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -8842,6 +8887,9 @@ class _ClaudeSessionLaunchMetadata:
     #: session carries a routing decision — a web create routes the model
     #: before the pane launches — so no prompt is ever held and replayed.
     turn_routing: bool = False
+    #: An automation run created the session, so its system prompt says that
+    #: no one is watching to answer questions or approve requests.
+    automation_session: bool = False
 
 
 def _claude_launch_metadata_from_envelope(
@@ -8873,6 +8921,7 @@ def _claude_launch_metadata_from_envelope(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        automation_session=is_automation_session(snapshot.labels),
     )
 
 
@@ -8939,6 +8988,7 @@ async def _load_legacy_claude_launch_metadata(
             fork_source if isinstance(fork_source, str) and fork_source else None
         ),
         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+        automation_session=is_automation_session(labels),
     )
     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
     _logger.info(
@@ -9779,7 +9829,11 @@ async def _auto_create_claude_terminal(
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x
-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
+            for x in [
+                _native_startup_raw_instructions_from_spec(agent_spec),
+                routed_spawn_note,
+                AUTOMATION_SESSION_INSTRUCTION if launch_metadata.automation_session else None,
+            ]
             if x
         )
         or None,

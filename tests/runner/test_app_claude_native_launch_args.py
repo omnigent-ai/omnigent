@@ -897,6 +897,41 @@ async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
     assert metadata.auto_harness is expected
 
 
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [({"omnigent.scheduled_task_origin": "task_1"}, True), ({}, False)],
+    ids=["automation", "plain"],
+)
+async def test_launch_metadata_reads_the_automation_origin(
+    labels: dict[str, str], expected: bool
+) -> None:
+    """Both metadata sources mark a session an automation run created."""
+    import httpx
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_abc",
+        agent_id="agent",
+        snapshot={"created_at": 0, "updated_at": 0, "labels": labels},
+    )
+    assert _claude_launch_metadata_from_envelope(envelope).automation_session is expected
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": labels})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
+    assert metadata.automation_session is expected
+
+
 async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

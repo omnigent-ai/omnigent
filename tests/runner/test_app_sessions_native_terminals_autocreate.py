@@ -78,6 +78,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
+from omnigent.runtime.prompt import AUTOMATION_SESSION_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
@@ -2305,9 +2306,16 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "expected_suffix"),
+    [({}, ""), ({"omnigent.scheduled_task_origin": "task_1"}, "automation")],
+    ids=["plain", "automation"],
+)
 async def test_auto_create_claude_terminal_passes_raw_instructions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    labels: dict[str, str],
+    expected_suffix: str,
 ) -> None:
     """
     Host-spawned launch emits ``--append-system-prompt`` with the agent's
@@ -2355,7 +2363,7 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
             )
 
     def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(200, json={"labels": labels})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -2381,7 +2389,11 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
     args = captured["spec"].args
     assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
     idx = args.index("--append-system-prompt")
-    assert args[idx + 1] == "Be a concise, careful coding assistant."
+    expected = "Be a concise, careful coding assistant."
+    # A session an automation started also learns, out of the transcript, that no one is there.
+    if expected_suffix:
+        expected = f"{expected}\n\n{AUTOMATION_SESSION_INSTRUCTION}"
+    assert args[idx + 1] == expected
 
 
 @pytest.mark.asyncio

@@ -96,7 +96,10 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.runtime.prompt import (
+    AUTOMATION_SESSION_INSTRUCTION,
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+)
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -12550,6 +12553,55 @@ async def test_cross_path_resolution_contract(
             f"because their transports report differently, not because they "
             f"answer the same question differently."
         )
+
+
+class _AutomationSnapshotClient(NullServerClient):
+    """Session snapshot for a session an automation run created, or a plain one."""
+
+    def __init__(self, conv: str, *, automation: bool) -> None:
+        super().__init__()
+        self._conv = conv
+        self._labels = {"omnigent.scheduled_task_origin": "task_1"} if automation else {}
+
+    async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+        del kwargs
+        labels = self._labels
+
+        class _Resp(NullServerClient._Response):
+            status_code = 200
+
+            def json(self) -> dict[str, object]:
+                return {"agent_id": "ag_contract_root", "labels": labels}
+
+        if url.endswith(f"/v1/sessions/{self._conv}"):
+            return _Resp()
+        return await super().get(url)
+
+
+@pytest.mark.parametrize("path", ["no_harness", "background"])
+@pytest.mark.parametrize("automation", [True, False], ids=["automation", "plain"])
+async def test_automation_sessions_get_the_unattended_system_instruction(
+    path: str, automation: bool
+) -> None:
+    """A session an automation run created hears, in its system instructions, that no one is there.
+
+    It rides the composed instructions rather than the user's message, so the
+    transcript only ever shows the automation's prompt.
+    """
+    conv = f"conv_automation_{path}_{automation}"
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_contract_resolver_for("child_present", []),
+        server_client=_AutomationSnapshotClient(conv, automation=automation),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+
+    expected = _contract_composed_instructions("Root instructions.")
+    if automation:
+        expected = f"{expected}\n\n{AUTOMATION_SESSION_INSTRUCTION}"
+    assert result["instructions"] == expected
 
 
 # ---------------------------------------------------------------------------

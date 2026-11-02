@@ -428,6 +428,23 @@ async def test_bypass_sandbox_defaults_off_unless_label_is_one(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [({"omnigent.scheduled_task_origin": "task_1"}, True), ({}, False), (None, False)],
+)
+async def test_automation_origin_marks_the_launch(
+    monkeypatch: pytest.MonkeyPatch, labels: Any, expected: bool
+) -> None:
+    """A session an automation run created launches with the automation note."""
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot: dict[str, Any] = {"workspace": "/tmp/repo"}
+    if labels is not None:
+        snapshot["labels"] = labels
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.automation_session is expected
+
+
+@pytest.mark.asyncio
 async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) -> None:
     """A first-attempt read timeout is retried, and a follow-up 200 succeeds.
 
