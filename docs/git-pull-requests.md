@@ -142,6 +142,64 @@ servers the web reads only the live host.
 
 ## Verification
 
+### Inline GitHub conversations
+
+GitHub advertises `review_threads`, `review_thread_replies` and
+`review_thread_creation`. All default to
+false for other providers and older hosts. They use the optional `ReviewThreadsFacet`
+without changing the required methods of `PullRequestFacet`.
+
+While **Changes** is visible, `GET review-threads` fetches the first 25 threads
+with up to 20 published comments each, then polls every 10 seconds. The existing
+PR metadata request continues to use `gh pr view`. Other subtabs and the closed
+panel stop thread polling. Replies and new conversations refresh the thread
+query immediately. Additional thread and comment pages load on demand.
+
+The thread response carries `data`, `has_more`, `next_cursor`, `head_sha`,
+`base_sha` and an optional `warning`. Ordinary polls replace unpaginated comments,
+retaining locally posted replies until observed in a read. Explicitly loaded
+history is retained and marked for manual reload.
+
+Patch reads verify the expected revisions before and
+after fetching; mismatches withhold inline placement. Outdated, hidden-context,
+file-level and unavailable-diff threads remain accessible with their original
+code context. Resolved threads start collapsed.
+
+Fenced `suggestion` blocks render the referenced lines as removals and the
+replacement as additions, with line numbers. They reuse the displayed patch
+and its diff renderer for syntax and word-level highlighting.
+Outdated or hidden-context threads use the saved snippet labeled **Original
+context**. If the complete original range is unavailable, the replacement is
+shown without a comparison. Suggestions are display-only and add no requests.
+
+`POST review-threads/{id}/replies` publishes immediately with the selected host
+account. The host validates thread membership and replies to its published root
+comment. Expanded conversations show a compact **Write a reply…** input. Focus it
+to open the Markdown composer; **Cancel** collapses it while retaining the draft.
+Thread reads include code excerpts and require the same file-sharing permission
+as diff reads. Reply pagination requires session read permission; writes require
+edit permission.
+Runner and host fallback use the same provider implementation. An uncertain
+write is never retried automatically. Drafts and pending/error state stay in
+memory per session, PR and thread, including through tab and layout switches.
+
+Select a line number and use the gutter **+** or **Comment on selected lines**
+to start a separate conversation, even when that line already has a thread.
+The **+** overlays the divider between line numbers and code without widening
+the gutter.
+Drag line numbers or Shift-click to select a range on the same side within one
+diff hunk. `POST review-threads` accepts `pr_url`, `body` and an `anchor` with
+`path`, `side`, `line`, optional `start_line`, `head_sha` and `base_sha`.
+The provider checks both revisions and publishes a one-thread GraphQL review
+with `event: COMMENT` and the displayed commit. Its response identifies the
+canonical thread. New drafts retain text and coordinates per session, PR and
+file; a revision change requires explicit reselection before posting.
+
+Resolving/reopening threads remains follow-up work.
+See the [browser verification recipe](../feature-map/pull-request-conversations.md).
+
+### Provider regression checks
+
 Run the existing GitHub resource and tracking suites together with provider
 dispatcher tests, then the shared panel, composer, and canvas frontend tests.
 For a manual check, open a GitHub session's Pull Requests tab, select a linked

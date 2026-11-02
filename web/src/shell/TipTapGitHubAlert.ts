@@ -45,7 +45,7 @@ interface ExtractedAlert {
  * blockquote child is block-level. `image` counts because the workspace image
  * extension configures it `inline: true`.
  */
-const INLINE_TYPES = new Set(["text", "image", "hardBreak"]);
+export const INLINE_TYPES: ReadonlySet<string> = new Set(["text", "image", "hardBreak"]);
 
 /**
  * Coerce parsed blockquote children into valid `block+` content.

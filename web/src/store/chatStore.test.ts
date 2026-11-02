@@ -39,7 +39,19 @@ import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
-import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
+import {
+  clearUnsentSends,
+  peekQueuedSends,
+  peekUnsentSend,
+  rememberQueuedSends,
+  rememberUnsentSend,
+} from "@/lib/unsentSends";
+import {
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -1430,6 +1442,7 @@ describe("chatStore — switchTo", () => {
     expect(cardOf("conv_vis_elic")[0]!.status).toBe("pending");
 
     // Background it, then the prompt is answered on another surface.
+    saveRegionDraft("elic_vis");
     await useChatStore.getState().switchTo("conv_vis_other");
     seedPendingElicitations("conv_vis_elic", []);
 
@@ -1442,6 +1455,7 @@ describe("chatStore — switchTo", () => {
     expect(reconciled).toHaveLength(1);
     expect(reconciled[0]!.status).toBe("responded");
     expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
+    expect(getAskUserQuestionDraft("elic_vis", regionSignature)).toBeDefined();
   });
 
   it("does not abort a conversation's stream when switching away", async () => {
@@ -10649,6 +10663,26 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
   });
 });
 
+const regionSignature = askUserQuestionSignature([
+  { question: "Pick a region", options: [], multiSelect: false },
+]);
+const savedRegionDrafts = new Set<string>();
+
+afterEach(() => {
+  for (const elicitationId of savedRegionDrafts) clearAskUserQuestionDraft(elicitationId);
+  savedRegionDrafts.clear();
+});
+
+function saveRegionDraft(elicitationId: string): void {
+  savedRegionDrafts.add(elicitationId);
+  saveAskUserQuestionDraft(elicitationId, regionSignature, {
+    currentIndex: 0,
+    selections: { "Pick a region": "" },
+    customSelected: { "Pick a region": true },
+    customInputs: { "Pick a region": "eu-west" },
+  });
+}
+
 function elicitationBlock(id: string): ElicitationBlock {
   return {
     type: "elicitation",
@@ -10725,6 +10759,25 @@ describe("chatStore — submitApproval", () => {
       status: "pending",
       nativeDelivery: { state: "unconfirmed", attempt: "retry-1", action: "decline" },
     });
+  });
+
+  it("keeps an AskUserQuestion draft until the server accepts the verdict", async () => {
+    useChatStore.setState({ conversationId: "conv_abc", blocks: [elicitationBlock("elic_ask")] });
+    saveRegionDraft("elic_ask");
+
+    fetchMock.mockImplementationOnce(() => mockResponse({}, { ok: false, status: 500 }));
+    await useChatStore
+      .getState()
+      .submitApproval("elic_ask", "accept", { "Pick a region": "eu-west" });
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "pending" });
+    expect(getAskUserQuestionDraft("elic_ask", regionSignature)?.customInputs).toEqual({
+      "Pick a region": "eu-west",
+    });
+
+    await useChatStore
+      .getState()
+      .submitApproval("elic_ask", "accept", { "Pick a region": "eu-west" });
+    expect(getAskUserQuestionDraft("elic_ask", regionSignature)).toBeUndefined();
   });
 
   it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
@@ -11128,6 +11181,7 @@ describe("chatStore — elicitation_resolved", () => {
     // ambiguous "Resolved elsewhere" pill, so the user could not tell
     // whether the tool was approved and the session looked stuck.
     useChatStore.setState({ blocks: [elicitationBlock("elic_verdict")] });
+    saveRegionDraft("elic_verdict");
 
     handleSessionEvent(elicitationResolvedEvent("elic_verdict", "accept"));
 
@@ -11137,6 +11191,7 @@ describe("chatStore — elicitation_resolved", () => {
     }
     expect(block.status).toBe("responded");
     expect(block.response).toEqual({ action: "accept" });
+    expect(getAskUserQuestionDraft("elic_verdict", regionSignature)).toBeUndefined();
   });
 
   it("carries the unanswered reason so the card can say the prompt expired", () => {
@@ -15885,6 +15940,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // Every stream is recycled by the ingress at ~5 minutes, so streams opened
     // together drop together. Without a stagger, a tab holding N conversations
     // fires N reconnects — each with a snapshot + items fetch — in one burst.
+    // Mid-range jitter: a random draw under 1 ms would land inside the first tick.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    onTestFinished(() => random.mockRestore());
     seedSession("conv_fg", []);
     seedSession("conv_bg", []);
     const opens: string[] = [];
@@ -17853,6 +17911,30 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     await closeLoop(sinks, loop);
   });
 
+  it("keeps a question draft when a later snapshot reopens the card", async () => {
+    const reopened = pendingElicitationRaw("elic_reopen", "Pick a region?");
+    seedSession("conv_gapreopen", []);
+    seedPendingElicitations("conv_gapreopen", [reopened]);
+    const { sinks, loop } = await openLoop("conv_gapreopen");
+    sinks[0]!.push(elicitationReqFrame("elic_reopen", "Pick a region?"));
+    await drainAsync();
+    saveRegionDraft("elic_reopen");
+
+    seedPendingElicitations("conv_gapreopen", []);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(elicitationCards()[0]!.response).toEqual({ action: "auto_resolved" });
+
+    seedPendingElicitations("conv_gapreopen", [reopened]);
+    sinks[1]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(3);
+    expect(elicitationCards()[0]!.status).toBe("pending");
+    expect(getAskUserQuestionDraft("elic_reopen", regionSignature)).toBeDefined();
+
+    await closeLoop(sinks, loop);
+  });
+
   it("does not duplicate a card when the server re-publishes the same id", async () => {
     seedSession("conv_dup", []);
     const { sinks, controller, loop } = await openLoop("conv_dup");
@@ -17880,6 +17962,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
     sinks[0]!.push(elicitationReqFrame("elic_rev", "Approve revived?"));
     await drainAsync();
+    saveRegionDraft("elic_rev");
     // The deferred clear fired before the harness retry re-parked: the
     // card flips to "Resolved elsewhere" without a user verdict.
     sinks[0]!.push(sse("response.elicitation_resolved", { elicitation_id: "elic_rev" }));
@@ -17897,6 +17980,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     expect(cards).toHaveLength(1);
     expect(cards[0]!.status).toBe("pending");
     expect(cards[0]!.response).toBeNull();
+    expect(getAskUserQuestionDraft("elic_rev", regionSignature)).toBeDefined();
 
     await abortLoop(sinks, controller, loop);
   });
@@ -21239,8 +21323,222 @@ describe("a send cut off by a reload", () => {
       files: [],
       stableId: "stable_reload",
       serverRefused: false,
+      recovered: true,
     });
     expect(peekUnsentSend("conv_reload")).toBeNull();
+  });
+
+  it("keeps each queued message for the next load until it leaves the queue", async () => {
+    seedSession("conv_queue", []);
+    await useChatStore.getState().switchTo("conv_queue");
+    useChatStore.setState({ sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("run the linter next");
+    useChatStore.getState().enqueueMessage("then the type checker");
+
+    const [first, second] = useChatStore.getState().queuedMessages;
+    expect(peekQueuedSends("conv_queue")).toEqual([
+      { stableId: first!.stableId, text: "run the linter next", authorId: "user_a" },
+      { stableId: second!.stableId, text: "then the type checker", authorId: "user_a" },
+    ]);
+    useChatStore.getState().dequeueMessage(first!.queueId);
+    expect(peekQueuedSends("conv_queue").map((send) => send.text)).toEqual([
+      "then the type checker",
+    ]);
+    // Signed out: the record follows the queue but takes no new text.
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    useChatStore.getState().enqueueMessage("and the formatter");
+    expect(peekQueuedSends("conv_queue")).toEqual([]);
+  });
+
+  it("doesn't keep a side chat's queue, which its composer can't take back", () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
+
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(peekQueuedSends("conv_side")).toEqual([]);
+  });
+
+  it("doesn't keep a side chat's send held for its offline host", async () => {
+    seedSession("conv_child");
+    seedSession("conv_parent");
+    await useChatStore.getState().switchTo("conv_child");
+    await useChatStore.getState().switchTo("conv_parent");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_child/events")) {
+        return mockResponse(
+          { error: { code: "host_offline", message: "The host is offline." } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("side follow-up", "agent_xyz", undefined, {
+      pinnedConversationId: "conv_child",
+    });
+
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { conversationId: "conv_child", waitingForHost: true },
+    ]);
+    expect(peekQueuedSends("conv_child")).toEqual([]);
+  });
+
+  it("hands queued text back to the composer on the next load", async () => {
+    seedSession("conv_reload", []);
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_reload",
+      text: "run the linter next",
+      files: [],
+      stableId: "stable_queued",
+      serverRefused: false,
+      recovered: true,
+    });
+    expect(peekQueuedSends("conv_reload")).toEqual([]);
+  });
+
+  it("restores only the queued messages the snapshot doesn't hold", async () => {
+    // The head's POST failed after the server persisted it, so it stayed queued for a retry.
+    seedSession("conv_reload", [
+      { ...userMessage("resp_reload", "rerun the failing test"), id: "stable_delivered" },
+    ]);
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_delivered", text: "rerun the failing test", authorId: "user_a" },
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "run the linter next",
+      stableId: "stable_queued",
+    });
+  });
+
+  it("joins an unanswered send and the queue behind it into one new message, keeping reply cards", async () => {
+    seedSession("conv_reload", []);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+    const reply: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "the lint step" }],
+      text: "run the linter next",
+    };
+    rememberQueuedSends("conv_reload", [
+      {
+        stableId: "stable_queued",
+        text: serializeReplyDraft(reply),
+        replyDraft: reply,
+        authorId: "user_a",
+      },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    const restored = "rerun the failing test\n\n> the lint step\n\nrun the linter next";
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_reload",
+      text: restored,
+      files: [],
+      replyDraft: {
+        version: 1,
+        quotes: [{ before: "rerun the failing test", text: "the lint step" }],
+        text: "run the linter next",
+      },
+      serverRefused: false,
+      recovered: true,
+    });
+    expect(peekUnsentSend("conv_reload")).toBeNull();
+    // Queued again while the agent works, the joined text is kept whole.
+    useChatStore.setState({ sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage(restored);
+    expect(peekQueuedSends("conv_reload").map((send) => send.text)).toEqual([restored]);
+  });
+
+  it("restores the queue once the unanswered send ahead of it proves delivered", async () => {
+    seedSession("conv_reload", [
+      { ...userMessage("resp_reload", "rerun the failing test"), id: "stable_reload" },
+    ]);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "run the linter next",
+      stableId: "stable_queued",
+    });
+    expect(peekUnsentSend("conv_reload")).toBeNull();
+    expect(peekQueuedSends("conv_reload")).toEqual([]);
+  });
+
+  it("keeps an earlier page's queue while this page queues before restoring it", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    seedSession("conv_reload", []);
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+    let identityChanged: (() => void) | undefined;
+    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+      identityChanged = listener;
+      return () => {};
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    useChatStore.setState({ sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("then the type checker");
+    expect(peekQueuedSends("conv_reload").map((send) => send.text)).toEqual([
+      "run the linter next",
+    ]);
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    identityChanged!();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "run the linter next",
+      stableId: "stable_queued",
+    });
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "then the type checker",
+    ]);
+  });
+
+  it("leaves messages this page still queues where they are", async () => {
+    seedSession("conv_reload", []);
+    useChatStore.setState({
+      queuedMessages: [
+        {
+          queueId: "q_held",
+          text: "run the linter next",
+          conversationId: "conv_reload",
+          stableId: "stable_held",
+          requiresRetry: true,
+        },
+      ],
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(peekQueuedSends("conv_reload").map((send) => send.stableId)).toEqual(["stable_held"]);
   });
 
   it("drops a send the snapshot shows persisted", async () => {
