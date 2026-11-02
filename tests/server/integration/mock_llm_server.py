@@ -77,6 +77,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import uvicorn
+import zstandard
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -1124,6 +1125,9 @@ async def create_response(
     Falls back to the ``"default"`` queue when no key matches.
     """
     body = await request.body()
+    if request.headers.get("content-encoding") == "zstd":
+        # Codex compresses request bodies when signed in with ChatGPT.
+        body = zstandard.ZstdDecompressor().decompressobj().decompress(body)
     try:
         parsed = json.loads(body)
     except (json.JSONDecodeError, ValueError):
