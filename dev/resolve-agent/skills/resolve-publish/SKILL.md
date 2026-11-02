@@ -243,8 +243,9 @@ Once the set is genuinely green:
    environment can attach media to the PR; otherwise link where they live (the
    CI run's artifact bundle, or the repro session) so reviewers can watch the
    failure and the fix. For internal/API-only results with no visible user
-   interaction, put the written before/after evidence in **Demo**. If recording
-   was blocked, explain why and include the available evidence. When the bug
+   interaction (as Step 2B.5 judges it), put the written before/after evidence
+   in **Demo**. If recording was blocked, explain why and include the available
+   evidence. When the bug
    is a Linear ticket and a Linear key is available, also attach both recordings
    to the ticket (GraphQL `fileUpload` + `attachmentCreate`).
 
