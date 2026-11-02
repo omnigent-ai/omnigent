@@ -210,9 +210,11 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          {/* The templates live in the Automations page's Templates section;
+              keep old links to the former templates page working. */}
           <Route
             path={`${prefix}/tasks/templates`}
-            element={<TasksPage key="templates" templatesOnly />}
+            element={<AppRedirect to={`${prefix}/tasks`} />}
           />
           <Route
             path={`${prefix}/tasks/:taskId`}

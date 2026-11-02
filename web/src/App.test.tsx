@@ -124,8 +124,6 @@ describe("chunk load recovery", () => {
 
   it.each([
     { path: "/tasks", basename: undefined, needsSetup: false },
-    { path: "/tasks/templates", basename: undefined, needsSetup: false },
-    { path: "/mount/tasks/templates", basename: "/mount", needsSetup: false },
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("recovers from a failed page at $path", async ({ path, basename, needsSetup }) => {
@@ -356,6 +354,19 @@ describe("Automation detail release feature route", () => {
   it("registers /tasks/:taskId while automations_v2 is on", async () => {
     renderRoute("/tasks/st_1", { automations_v2: true });
     expect(await screen.findByText("task detail page")).toBeInTheDocument();
+  });
+
+  // The templates moved into the Automations page; an old link must not read
+  // "templates" as a task id.
+  it("sends the former templates page to the Automations list", async () => {
+    pageFault.error = null;
+    try {
+      renderRoute("/tasks/templates", { automations_v2: true });
+      expect(await screen.findByText("Tasks recovered")).toBeInTheDocument();
+      expect(screen.queryByText("task detail page")).toBeNull();
+    } finally {
+      pageFault.error = undefined;
+    }
   });
 });
 

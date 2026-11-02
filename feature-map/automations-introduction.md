@@ -42,7 +42,7 @@ No agent turn or provider credentials are needed.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_automations_introduction_first_visit`
   covers desktop sidebar entry, mobile direct entry, the examples and Back, all
   four steps, Done, focus returning to New automation, and after a reload,
-  reopening from the info button and selecting Create manually.
+  reopening from the info button and opening New automation.
 - For the command palette, select Go to Automations in a fresh browser context,
   dismiss with Maybe later, navigate away, and return. The guide stays closed.
 - For managed, repeat in a deployment containing this UI version. Check the

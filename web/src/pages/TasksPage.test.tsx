@@ -1,6 +1,6 @@
 // Tests for the Scheduled tasks page (`/tasks`): list rendering, the
 // Active/Paused filter + search, the Paused badge/dimming, the New automation
-// creation menu and templates page, and the pause/delete row actions dispatching the
+// manual create action, and the pause/delete row actions dispatching the
 // mutation hooks.
 //
 // The scheduled-tasks hooks are mocked at their seam; the create dialog is
@@ -135,10 +135,6 @@ function renderPage(path = "/tasks", basename = "") {
       <RoutingProvider value={basenamedRouting(basename)}>
         <Routes>
           <Route path={`${basename}/tasks`} element={<TasksPage />} />
-          <Route
-            path={`${basename}/tasks/templates`}
-            element={<TasksPage key="templates" templatesOnly />}
-          />
         </Routes>
       </RoutingProvider>
     </MemoryRouter>,
@@ -262,7 +258,7 @@ describe("TasksPage list", () => {
     setTasks([]);
     renderPage();
     const suggestions = screen.getByTestId("tasks-suggestions");
-    expect(within(suggestions).queryByText("Suggestions")).toBeNull();
+    expect(within(suggestions).queryByText("Templates")).toBeNull();
     const chips = within(suggestions).getAllByTestId(/^suggestion-/);
     expect(chips).toHaveLength(3);
     expect(chips.map((r) => r.getAttribute("data-testid"))).toEqual([
@@ -279,7 +275,7 @@ describe("TasksPage list", () => {
     setTasks([task()]);
     renderPage();
     const suggestions = screen.getByTestId("tasks-suggestions");
-    expect(within(suggestions).getByText("Suggestions")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Templates")).toBeInTheDocument();
     const chips = within(suggestions).getAllByTestId(/^suggestion-/);
     expect(chips).toHaveLength(3);
     expect(chips.map((c) => c.getAttribute("data-testid"))).toEqual([
@@ -291,7 +287,7 @@ describe("TasksPage list", () => {
     expect(followUp).toHaveTextContent("Follow-up monitor");
   });
 
-  it("hides Suggestions in filtered-empty states after tasks exist", () => {
+  it("hides Templates in filtered-empty states after tasks exist", () => {
     setTasks([task({ state: "active" })]);
     renderPage();
     expect(screen.getByTestId("tasks-filter-all")).toBeInTheDocument();
@@ -370,45 +366,14 @@ describe("filtering + search", () => {
   });
 });
 
-describe("New automation menu", () => {
-  it("opens an empty manual form only after selecting Create manually", () => {
+describe("New automation button", () => {
+  it("opens an empty manual form directly, with no menu", () => {
     setTasks([]);
     renderPage();
-    const button = screen.getByRole("button", { name: "New automation" });
-    fireEvent.pointerDown(button, { button: 0 });
-    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
-      "Create manually",
-      "Create from template",
-    ]);
-    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    expect(screen.queryByRole("menuitem")).toBeNull();
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
-  });
-
-  it.each(["", "/mount"])("opens templates and returns to the list under '%s'", (basename) => {
-    setTasks([task()]);
-    renderPage("/tasks", basename);
-    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
-    const templates = screen.getByRole("menuitem", { name: "Create from template" });
-    expect(templates).toHaveAttribute("href", `${basename}/tasks/templates`);
-    fireEvent.click(templates);
-    expect(screen.getByRole("heading", { name: "Automation templates" })).toBeInTheDocument();
-    expect(screen.queryByTestId("tasks-list")).toBeNull();
-    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
-    fireEvent.click(screen.getByRole("link", { name: "Back to automations" }));
-    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
-  });
-
-  it("opens a template from a direct link even when the task list failed to load", () => {
-    setTasks([], { isError: true });
-    renderPage("/tasks/templates");
-    expect(screen.queryByRole("alert")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "PR sweep" }));
-    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
-      "data-initial-name",
-      "PR sweep",
-    );
   });
 });
 
@@ -423,11 +388,10 @@ describe("suggestion prefill", () => {
     expect(dialog.getAttribute("data-initial-prompt")).toContain("Review recent email");
   });
 
-  it("opens EMPTY from the 'Create manually' menu item (no prefill)", () => {
+  it("opens EMPTY from the plain 'New automation' button (no prefill)", () => {
     setTasks([]);
     renderPage();
-    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    fireEvent.click(screen.getByTestId("new-task-button"));
     const dialog = screen.getByTestId("manual-dialog-open");
     expect(dialog.getAttribute("data-initial-name")).toBe("");
     expect(dialog.getAttribute("data-initial-prompt")).toBe("");
@@ -451,8 +415,7 @@ describe("suggestion prefill", () => {
     );
 
     // Now the plain manual open must be EMPTY — no stale prefill from the chips.
-    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe("");
   });
 });
@@ -495,22 +458,19 @@ describe("trigger templates", () => {
     features: { session_orchestration: true },
   };
 
-  function renderWithSessionModes(
-    info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
-    templatesOnly = false,
-  ) {
+  function renderWithSessionModes(info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO) {
     return render(
       <CapabilitiesProvider info={info}>
         <MemoryRouter initialEntries={["/tasks"]}>
-          <TasksPage templatesOnly={templatesOnly} />
+          <TasksPage />
         </MemoryRouter>
       </CapabilitiesProvider>,
     );
   }
 
-  it.each([false, true])("shows all existing templates (templatesOnly=%s)", (templatesOnly) => {
+  it("lists the trigger templates before the prompt templates", () => {
     setTasks([task()]);
-    renderWithSessionModes(TRIGGER_INFO, templatesOnly);
+    renderWithSessionModes();
     const chips = within(screen.getByTestId("tasks-suggestions")).getAllByTestId(/^suggestion-/);
     expect(chips.map((c) => c.getAttribute("data-testid"))).toEqual([
       "suggestion-trigger-jira",
@@ -534,18 +494,13 @@ describe("trigger templates", () => {
     );
 
     // A later plain open drops the template.
-    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Create manually" }));
+    fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-trigger")).toBe("");
   });
 
-  it.each(["jira", "slack", "github"])("opens the %s builder from the templates page", (source) => {
-    vi.mocked(useViewerId).mockReturnValue("alice");
+  it.each(["jira", "slack", "github"])("opens the %s builder from its chip", (source) => {
     setTasks([]);
-    renderWithSessionModes(TRIGGER_INFO, true);
-    expect(
-      screen.queryByRole("dialog", { name: "Introducing Automations" }),
-    ).not.toBeInTheDocument();
+    renderWithSessionModes();
     fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
       "data-initial-trigger",
@@ -560,7 +515,7 @@ describe("trigger templates", () => {
     ["doesn't report session orchestration", { features: {} }],
   ])("hides the chips when the server %s", (_name, overrides) => {
     setTasks([]);
-    renderWithSessionModes({ ...TRIGGER_INFO, ...overrides }, true);
+    renderWithSessionModes({ ...TRIGGER_INFO, ...overrides });
     expect(screen.getByTestId("suggestion-follow-up-monitor")).toBeInTheDocument();
     expect(screen.queryByTestId("suggestion-trigger-jira")).toBeNull();
   });
