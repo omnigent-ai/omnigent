@@ -3951,6 +3951,121 @@ def test_populate_codex_home_config_minimal_mode_skips_plugins_cache(tmp_path: P
     assert not (target / "plugins" / "cache").exists()
 
 
+@pytest.mark.parametrize("source_has_catalog", [True, False], ids=["existing", "missing"])
+def test_populate_codex_home_config_shares_remote_plugin_catalog(
+    tmp_path: Path, source_has_catalog: bool
+) -> None:
+    """Every session shares the real home's remote plugin catalog cache.
+
+    Codex fetches a ~40 MB catalog into ``cache/remote_plugin_catalog`` on
+    start. The dir is created in the real home when Codex never ran there, so
+    the first session's fetch is reused by the next instead of repeated.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    catalog = source / "cache" / "remote_plugin_catalog"
+    if source_has_catalog:
+        catalog.mkdir(parents=True)
+        (catalog / "existing.json").write_text("{}")
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    link = target / "cache" / "remote_plugin_catalog"
+    assert link.is_symlink()
+    assert link.resolve() == catalog.resolve()
+    (link / "fetched.json").write_text("{}")
+    assert (catalog / "fetched.json").is_file()
+    assert (catalog / "existing.json").is_file() is source_has_catalog
+
+
+def test_populate_codex_home_config_keeps_private_remote_plugin_catalog(tmp_path: Path) -> None:
+    """A reused private home keeps its own catalog dir rather than relinking it."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    target = tmp_path / "temp_codex_home"
+    private_catalog = target / "cache" / "remote_plugin_catalog"
+    private_catalog.mkdir(parents=True)
+    (private_catalog / "private.json").write_text("{}")
+
+    _populate_codex_home_config(target, source)
+
+    assert not private_catalog.is_symlink()
+    assert (private_catalog / "private.json").read_text() == "{}"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="needs POSIX permission enforcement"
+)
+def test_populate_codex_home_config_read_only_source_keeps_private_catalog(
+    tmp_path: Path,
+) -> None:
+    """An unwritable source home still boots; Codex keeps a private catalog."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    source.chmod(0o555)
+    try:
+        _populate_codex_home_config(target, source)
+    finally:
+        source.chmod(0o755)
+
+    assert (target / "auth.json").is_symlink()
+    assert not (source / "cache").exists()
+    assert not (target / "cache" / "remote_plugin_catalog").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="needs POSIX permission enforcement"
+)
+def test_populate_codex_home_config_unwritable_existing_catalog_stays_private(
+    tmp_path: Path,
+) -> None:
+    """An existing but unwritable source catalog isn't shared, so Codex can still refresh."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    catalog = source / "cache" / "remote_plugin_catalog"
+    catalog.mkdir(parents=True)
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+    catalog.chmod(0o555)
+    try:
+        _populate_codex_home_config(target, source)
+    finally:
+        catalog.chmod(0o755)
+
+    assert (target / "auth.json").is_symlink()
+    assert not (target / "cache" / "remote_plugin_catalog").exists()
+
+
+def test_populate_codex_home_config_minimal_mode_skips_remote_plugin_catalog(
+    tmp_path: Path,
+) -> None:
+    """Minimal mode neither links nor creates the catalog dir in the real home."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, minimal_config=True)
+
+    assert not (source / "cache").exists()
+    assert not (target / "cache").exists()
+
+
 def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
