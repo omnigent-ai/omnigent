@@ -52,7 +52,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [introOpens, setIntroOpens] = useState(0);
   const [pointerTabInteraction, setPointerTabInteraction] = useState(false);
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
-  const { trackClick } = useOmnigentAnalytics();
+  const { trackClick, trackValueChange } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
   // labels fresh with ONE interval regardless of how many rows are on screen.
@@ -87,6 +87,10 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   // Workers' links are posted outside Omnigent, so they go through the same
   // share-link path as the Share dialog, host transform included.
   const rebasePath = useRebasePath();
+  const templatesFallbackText =
+    info === "loading"
+      ? "Loading templates…"
+      : "Automation templates are not available on this server. You can still create an automation from scratch.";
   const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
 
   function openManual() {
@@ -230,11 +234,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 
       <Tabs
         value={view}
-        componentId="tasks.view"
         onValueChange={(value) => {
           // Pointer and focus can select the same tab before navigation renders.
           if (requestedView.current === value) return;
           requestedView.current = value;
+          trackValueChange("tasks.view", "tabs", value, { valueHasNoPii: true });
           setSearchParams((current) => {
             const next = new URLSearchParams(current);
             if (value === "templates") next.set("view", "templates");
@@ -250,7 +254,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           onPointerDownCapture={() => setPointerTabInteraction(true)}
           onKeyDownCapture={() => setPointerTabInteraction(false)}
           onFocus={(event) => {
-            // Keyboard entry should land on the selected tab, not its container.
+            // After a pointer click, Radix can leave keyboard re-entry on the container.
             if (event.target === event.currentTarget) {
               event.currentTarget
                 .querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')
@@ -360,13 +364,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         </TabsContent>
         <TabsContent value="templates" className="mt-4">
           {triggersSupported ? (
-            <TemplateGallery onPick={openFromTemplate} triggersSupported={triggersSupported} />
+            <TemplateGallery onPick={openFromTemplate} />
           ) : (
-            <p className="py-8 text-ui text-muted-foreground">
-              {info === "loading"
-                ? "Loading templates…"
-                : "Automation templates are not available on this server. You can still create an automation from scratch."}
-            </p>
+            <p className="py-8 text-ui text-muted-foreground">{templatesFallbackText}</p>
           )}
         </TabsContent>
       </Tabs>
@@ -400,12 +400,8 @@ function EmptyState({
               Create an automation to run an agent session automatically on a recurring schedule.
             </p>
           </div>
-          {showSuggestions && (
-            <TemplateGallery
-              onPick={onPickTemplate}
-              triggersSupported={triggersSupported}
-              preview
-            />
+          {showSuggestions && triggersSupported && (
+            <TemplateGallery onPick={onPickTemplate} preview />
           )}
         </>
       )}
@@ -415,14 +411,11 @@ function EmptyState({
 
 function TemplateGallery({
   onPick,
-  triggersSupported,
   preview = false,
 }: {
   onPick: (id: string) => void;
-  triggersSupported: boolean;
   preview?: boolean;
 }) {
-  if (!triggersSupported) return null;
   return (
     <section
       className={preview ? "mt-6 border-t border-border/60 pt-6" : undefined}

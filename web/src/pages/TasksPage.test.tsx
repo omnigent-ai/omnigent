@@ -1,11 +1,5 @@
-// Tests for the Scheduled tasks page (`/tasks`): list rendering, the
-// Active/Paused filter + search, the Paused badge/dimming, the New automation
-// button and template gallery, and the pause/delete row actions dispatching the
-// mutation hooks.
-//
-// The scheduled-tasks hooks are mocked at their seam; the create dialog is
-// stubbed to a marker so we assert the page opens it without exercising its
-// internals (covered by its own tests).
+// Tests for /tasks: lists, filters, gallery tabs, and row actions.
+// Scheduled-task hooks are mocked; the creation dialog exposes its seed props and close action.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -15,6 +9,7 @@ import { useViewerId } from "@/hooks/useViewerId";
 import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -133,7 +128,10 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  setOmnigentHostConfig({});
+});
 
 const TRIGGER_INFO = {
   ...SERVER_INFO_OFFLINE_FALLBACK,
@@ -141,9 +139,13 @@ const TRIGGER_INFO = {
   features: { session_orchestration: true },
 };
 
-function renderPage(path = "/tasks", basename = "") {
+function renderPage(
+  path = "/tasks",
+  basename = "",
+  info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
+) {
   return render(
-    <CapabilitiesProvider info={TRIGGER_INFO}>
+    <CapabilitiesProvider info={info}>
       <MemoryRouter initialEntries={[`${basename}${path}`]}>
         <RoutingProvider value={basenamedRouting(basename)}>
           <Routes>
@@ -314,6 +316,7 @@ describe("TasksPage list", () => {
     expect(jiraCard).toHaveTextContent("Watch for matching tickets");
     expect(jiraCard).toHaveTextContent("Requires a Jira MCP server.");
     expect(jiraCard).toHaveTextContent("Checks every hour");
+    expect(screen.queryByRole("button", { name: /Show all/ })).not.toBeInTheDocument();
     expect(jiraCard).toHaveAccessibleDescription(
       "Watch for matching tickets and start a session to investigate or work on each one. Checks every hour Requires a Jira MCP server.",
     );
@@ -404,6 +407,7 @@ describe("New automation entry", () => {
     renderPage();
     fireEvent.click(screen.getByRole("button", { name: "New automation" }));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-prompt", "");
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
   });
 
@@ -427,6 +431,30 @@ describe("New automation entry", () => {
 });
 
 describe("automation view navigation", () => {
+  it("reports one analytics event per tab change, including pointer focus activation", () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    setTasks([]);
+    renderPage();
+    selectView("Templates");
+    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+      type: "value_change",
+      componentId: "tasks.view",
+      componentKind: "tabs",
+      value: "templates",
+    });
+    selectView("Templates");
+    expect(analytics).toHaveBeenCalledTimes(1);
+    selectView("Your automations");
+    expect(analytics).toHaveBeenCalledTimes(2);
+    expect(analytics).toHaveBeenLastCalledWith({
+      type: "value_change",
+      componentId: "tasks.view",
+      componentKind: "tabs",
+      value: "yours",
+    });
+  });
+
   it("keeps search and filter selections when switching views", () => {
     setTasks([
       task({ name: "Daily review", state: "paused" }),
@@ -466,15 +494,6 @@ describe("template prefill", () => {
     const dialog = screen.getByTestId("manual-dialog-open");
     expect(dialog.getAttribute("data-initial-name")).toBe("Jira tickets");
     expect(dialog.getAttribute("data-initial-trigger")).toBe("jira");
-    expect(dialog.getAttribute("data-initial-prompt")).toBe("");
-  });
-
-  it("opens EMPTY from New automation (no prefill)", () => {
-    setTasks([]);
-    renderPage();
-    fireEvent.click(screen.getByTestId("new-task-button"));
-    const dialog = screen.getByTestId("manual-dialog-open");
-    expect(dialog.getAttribute("data-initial-name")).toBe("");
     expect(dialog.getAttribute("data-initial-prompt")).toBe("");
   });
 
@@ -534,38 +553,9 @@ describe("row actions", () => {
 });
 
 describe("trigger templates", () => {
-  function renderWithSessionModes(
-    info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
-    templatesOnly = false,
-  ) {
-    return render(
-      <CapabilitiesProvider info={info}>
-        <MemoryRouter initialEntries={["/tasks"]}>
-          <TasksPage templatesOnly={templatesOnly} />
-        </MemoryRouter>
-      </CapabilitiesProvider>,
-    );
-  }
-
-  it("shows only the three integration templates without an expansion button", () => {
-    setTasks([task()]);
-    renderWithSessionModes();
-    selectView("Templates");
-    expect(
-      within(screen.getByTestId("tasks-suggestions")).getAllByTestId(/^suggestion-/),
-    ).toHaveLength(3);
-    expect(screen.queryByRole("button", { name: /Show all/ })).not.toBeInTheDocument();
-    const cards = within(screen.getByTestId("tasks-suggestions")).getAllByTestId(/^suggestion-/);
-    expect(cards.map((c) => c.getAttribute("data-testid"))).toEqual([
-      "suggestion-trigger-jira",
-      "suggestion-trigger-slack",
-      "suggestion-trigger-github",
-    ]);
-  });
-
   it("opens the dialog on the picked template with an absolute session link", () => {
     setTasks([]);
-    renderWithSessionModes();
+    renderPage();
     fireEvent.click(screen.getByTestId("suggestion-trigger-slack"));
     const dialog = screen.getByTestId("manual-dialog-open");
     expect(dialog.getAttribute("data-initial-trigger")).toBe("slack");
@@ -581,8 +571,9 @@ describe("trigger templates", () => {
   });
 
   it.each(["jira", "slack", "github"])("opens the %s builder from its gallery card", (source) => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
     setTasks([]);
-    renderWithSessionModes();
+    renderPage("/tasks?view=templates");
     expect(
       screen.queryByRole("dialog", { name: "Introducing Automations" }),
     ).not.toBeInTheDocument();
@@ -600,8 +591,17 @@ describe("trigger templates", () => {
     ["doesn't report session orchestration", { features: {} }],
   ])("hides the templates when the server %s", (_name, overrides) => {
     setTasks([]);
-    renderWithSessionModes({ ...TRIGGER_INFO, ...overrides }, true);
+    renderPage("/tasks?view=templates", "", { ...TRIGGER_INFO, ...overrides });
+    expect(screen.getByText(/Automation templates are not available on this server/)).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("suggestion-trigger-jira")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog).toHaveAttribute("data-initial-name", "");
+    expect(dialog).toHaveAttribute("data-initial-prompt", "");
+    expect(dialog).toHaveAttribute("data-initial-trigger", "");
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    selectView("Your automations");
+    expect(screen.getByText("No automations yet")).toBeVisible();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
   });
 });
