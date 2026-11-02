@@ -35,6 +35,7 @@ import {
   type Viewport,
 } from "@xyflow/react";
 import {
+  HouseIcon,
   Maximize2Icon,
   PlusIcon,
   RotateCcwIcon,
@@ -73,7 +74,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import { Link, useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { NewProjectButton } from "@/shell/NewProjectButton";
 import { ProjectRowIcon } from "@/shell/ProjectPicker";
@@ -592,6 +593,13 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
             {loadingMore && <Spinner className="size-3.5" aria-label="Loading sessions" />}
           </div>
         </div>
+        {/* Canvas collapses the sidebar on entry, so keep a direct way home on the board. */}
+        <Button asChild variant="ghost" size="sm" className="mt-0.5 text-muted-foreground">
+          <Link to="/" componentId="canvas.home">
+            <HouseIcon className="size-4" />
+            Home
+          </Link>
+        </Button>
       </header>
       <nav
         aria-label="Canvases"
