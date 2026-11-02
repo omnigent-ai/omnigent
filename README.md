@@ -403,7 +403,9 @@ omnigent start   # starts the local server and registers this machine as a host
 
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
-`omnigent stop`.
+`omnigent stop`. Bare `omnigent` in a terminal does the same, and
+`omnigent --server <url>` is `omnigent start --server <url>`: it connects this
+machine as a host for that server and opens its web UI.
 
 Integrations can open the new-chat composer with text already filled in using
 `/?prompt=Explain%20this%20code`. Build links with
