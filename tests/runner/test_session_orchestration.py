@@ -21,10 +21,10 @@ def test_native_message_schema(spec):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("placement", "profile", "capability"),
+    ("placement", "profile", "capability", "numeric_id"),
     [
         *[
-            (placement, profile, "enabled")
+            (placement, profile, "enabled", False)
             for placement in ("child", "same_host", "managed")
             for profile in (
                 None,
@@ -40,7 +40,7 @@ def test_native_message_schema(spec):
             )
         ],
         *[
-            ("managed", {"sandbox_profile_id": "build"}, capability)
+            ("managed", {"sandbox_profile_id": "build"}, capability, False)
             for capability in (
                 "enabled",
                 "missing",
@@ -53,15 +53,16 @@ def test_native_message_schema(spec):
             )
         ],
         *[
-            ("managed", {"sandbox_provider": "company"}, capability)
+            ("managed", {"sandbox_provider": "company"}, capability, False)
             for capability in ("missing", "disabled")
         ],
+        pytest.param("same_host", None, "enabled", True, id="same-host-managed-id"),
     ],
 )
-@pytest.mark.parametrize("session_id", [uuid4().hex, "1234567890123456"], ids=["uuid", "managed"])
-async def test_create_placement(placement, monkeypatch, profile, capability, session_id):
+async def test_create_placement(placement, monkeypatch, profile, capability, numeric_id):
     from omnigent.runner import subagent_work
 
+    session_id = "1234567890123456" if numeric_id else uuid4().hex
     register = Mock()
     monkeypatch.setattr(subagent_work, "register_child_session", register)
     requests = []
@@ -429,6 +430,8 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
         "empty",
         "path",
         "managed_query",
+        "padded_managed",
+        "whitespace",
     ],
 )
 async def test_message_destination_accepts_supported_session_ids(spelling):
@@ -446,6 +449,8 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
         "empty": "",
         "path": "1234567890123456/events",
         "managed_query": "1234567890123456?unexpected",
+        "padded_managed": "1234567890123456" + " " * 16,
+        "whitespace": " " * 32,
     }[spelling]
     requests = []
 
@@ -471,8 +476,32 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
             f"http://server/v1/sessions/{expected_id}/events"
         ]
     else:
-        assert "error" in result
+        assert result == {"error": "Provide a valid session_id (UUID or numeric managed ID)"}
         assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [None, 123, "", " ", "a" * 8001],
+    ids=["missing", "non_text", "empty", "blank", "oversize"],
+)
+async def test_message_content_validation_is_distinct_from_invalid_id(message):
+    def unexpected(request):
+        pytest.fail("Invalid message must not send an HTTP request")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": "1234567890123456", "message": message}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert result == {"error": "Provide a non-blank message of 1–8000 characters"}
 
 
 @pytest.mark.asyncio

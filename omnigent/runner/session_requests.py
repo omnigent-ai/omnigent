@@ -18,7 +18,10 @@ def normalize_session_id(value: object) -> str:
         raise ValueError("Session ID must be a string")
     if value.isascii() and value.isdecimal():
         return value
-    return uuid_to_bytes(value).hex()
+    uuid_bytes = uuid_to_bytes(value)
+    if len(uuid_bytes) != 16:
+        raise ValueError("Session UUID must decode to exactly 16 bytes")
+    return uuid_bytes.hex()
 
 
 async def post_on_host(
