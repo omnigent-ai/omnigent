@@ -329,6 +329,11 @@ providers. See the [OpenCode harness guide](docs/opencode-native.md).
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
+ACP agents that advertise `loadSession` keep their native session reference in
+the existing conversation record and reload it after a host restart. See
+[ACP session resume](docs/acp-session-resume.md) for persistence, reset, and
+pending-input behavior.
+
 <details>
 <summary>Grok Build and Devin</summary>
 
