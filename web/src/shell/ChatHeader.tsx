@@ -20,7 +20,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { ARIA_MOD_KEY, RIGHT_SIDEBAR_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -50,8 +50,6 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
-
-const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -812,7 +810,7 @@ export function ChatHeader({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent shortcut={RIGHT_PANEL_KEYS}>
+            <TooltipContent shortcut={RIGHT_SIDEBAR_TOGGLE_KEYS}>
               <span>{rightPanelOpen ? "Collapse right panel" : "Expand right panel"}</span>
             </TooltipContent>
           </Tooltip>

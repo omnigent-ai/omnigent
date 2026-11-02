@@ -185,7 +185,7 @@ import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
+import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -381,6 +381,7 @@ import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
 import {
   composerSendShortcutKeys,
+  CompactShortcutKeys,
   KeyboardShortcutTooltipContent,
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -1213,6 +1214,7 @@ export function AgentHarnessPicker({
   autoHarnessActive = false,
   onSelectAutoHarness,
   openNonce = 0,
+  shortcutKeys,
   cyclePreview,
   onDismissCyclePreview,
   blockedReasons,
@@ -1293,6 +1295,8 @@ export function AgentHarnessPicker({
   onSelectAutoHarness?: () => void;
   /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
   openNonce?: number;
+  /** The chord that opens this picker, for callers that bind one (the landing). */
+  shortcutKeys?: readonly string[];
   cyclePreview?: ComposerConfigSection;
   onDismissCyclePreview?: () => void;
   /** Agent id → why the target can't run it; those rows render disabled. */
@@ -1793,7 +1797,21 @@ export function AgentHarnessPicker({
         testIdPrefix: "new-chat-landing",
         "data-testid": "new-chat-landing-agent-select",
       }}
-      tooltip={disabledLabel ?? visibleCachedPreview?.label ?? triggerTooltipContent}
+      tooltip={
+        disabledLabel === undefined ? (
+          <>
+            {visibleCachedPreview?.label ?? triggerTooltipContent}
+            {shortcutKeys && (
+              <span className="flex items-center gap-2 pt-1 text-muted-foreground">
+                Open model picker
+                <CompactShortcutKeys keys={shortcutKeys} />
+              </span>
+            )}
+          </>
+        ) : (
+          disabledLabel
+        )
+      }
       tooltipTestId="new-chat-landing-agent-tooltip"
       tooltipVariant="session-info"
       contentAlign={contentAlign}
@@ -7277,6 +7295,7 @@ export function NewChatLandingScreen() {
                     the selected entry's submenu owns run configuration. */}
                       <AgentHarnessPicker
                         openNonce={modelPickerOpenNonce}
+                        shortcutKeys={MODEL_PICKER_KEYS}
                         cyclePreview={
                           preview === "models"
                             ? modelSection

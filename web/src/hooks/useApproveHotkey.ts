@@ -22,11 +22,49 @@
 // prompt that mounted moments earlier.
 
 import { useEffect } from "react";
+import { create } from "zustand";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
+import { ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
-import type { ElicitationBlock } from "@/lib/blocks";
+import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
+
+/** Glyphs for the chord this hook matches; shown on the Approve button it would press. */
+export const APPROVE_KEYS = [MOD_KEY, ENTER_KEY] as const;
+
+/** How many mounted shells bind the chord; the standalone approval page has none. */
+const useApproveHotkeyBindings = create<{ count: number }>(() => ({ count: 0 }));
+
+/**
+ * The prompt the chord would approve: the newest pending prompt in the open chat,
+ * when it takes a plain verdict and has been delivered. A newer form or an
+ * unconfirmed delivery hides every older approval.
+ */
+export function approveHotkeyTarget(blocks: readonly AnyBlock[]): string | null {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (!isPendingElicitation(block)) continue;
+    if (block.nativeDelivery && block.nativeDelivery.state !== "ready") return null;
+    const takesAPlainVerdict =
+      !block.askUserQuestion && schemaFields(block.requestedSchema).length === 0;
+    return takesAPlainVerdict ? block.elicitationId : null;
+  }
+  return null;
+}
+
+function isPendingElicitation(block: AnyBlock | undefined): block is ElicitationBlock {
+  return block?.type === "elicitation" && block.status === "pending";
+}
+
+/** Whether the chord would approve this prompt, so its Approve button can name it. */
+export function useApprovesOnHotkey(elicitationId: string, pending: boolean): boolean {
+  const bound = useApproveHotkeyBindings((state) => state.count > 0);
+  const target = useChatStore(
+    (state) => pending && approveHotkeyTarget(state.blocks) === elicitationId,
+  );
+  return bound && target;
+}
 
 /**
  * Whether the keystroke landed in a text field that holds a draft — the
@@ -67,25 +105,20 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       if (isDraftingTarget(e.target)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
-      // Select the newest pending prompt before checking eligibility, so a
-      // form or an unconfirmed delivery cannot expose an older approval.
-      const newest = [...blocks]
-        .reverse()
-        .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
-      if (!newest) return;
-      if (newest.nativeDelivery && newest.nativeDelivery.state !== "ready") return;
-      const takesAPlainVerdict =
-        !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
-      if (!takesAPlainVerdict) return;
-      const pending = newest;
+      const target = approveHotkeyTarget(blocks);
+      if (target === null) return;
 
       // Intercept before the composer's Enter-to-send handler runs.
       e.preventDefault();
       e.stopPropagation();
-      void submitApproval(pending.elicitationId, "accept");
+      void submitApproval(target, "accept");
     };
 
     window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
+    useApproveHotkeyBindings.setState((state) => ({ count: state.count + 1 }));
+    return () => {
+      window.removeEventListener("keydown", handler, true);
+      useApproveHotkeyBindings.setState((state) => ({ count: state.count - 1 }));
+    };
   }, [isMac]);
 }

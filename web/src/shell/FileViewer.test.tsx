@@ -262,7 +262,7 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
-  /** Esc closes through `onClose` too, as a workspace file tab does. */
+  /** Esc closes through `onClose` too, as a workspace file tab or the narrow-screen overlay does. */
   escapeCloses?: boolean;
 }
 
@@ -1474,6 +1474,28 @@ describe("FileViewer Escape ownership", () => {
 });
 
 describe("FileViewer header close affordance", () => {
+  it("lists Esc on Close only while Esc would close the viewer", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true, mobileOverlay: true, escapeCloses: true }));
+    const closeKeys = async () => {
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Close file viewer" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      const keys = Array.from(tooltip.querySelectorAll("kbd"), (key) => key.textContent);
+      fireEvent.pointerLeave(screen.getByRole("button", { name: "Close file viewer" }));
+      return keys;
+    };
+    expect(await closeKeys()).toEqual(["Esc"]);
+
+    // Find keeps Esc for closing itself.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+    expect(await closeKeys()).toEqual([]);
+  });
+
   it.each([false, true])("invokes onClose for a mobile overlay (frameless=%s)", (frameless) => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     const onClose = vi.fn();

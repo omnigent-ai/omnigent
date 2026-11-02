@@ -26,6 +26,13 @@ import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import {
+  CompactShortcutKeys,
+  newSessionShortcutKeys,
+  RIGHT_SIDEBAR_TOGGLE_KEYS,
+  SETTINGS_KEYS,
+  SIDEBAR_TOGGLE_KEYS,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -46,6 +53,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
+  rightSidebarShortcutEnabled?: boolean;
 }
 
 interface ActionCommand {
@@ -56,6 +65,8 @@ interface ActionCommand {
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
   run: () => void;
+  /** Chord shown beside the row when the same action has a shortcut. */
+  shortcut?: readonly string[];
 }
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
@@ -142,6 +153,7 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  rightSidebarShortcutEnabled = true,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -173,6 +185,7 @@ export function CommandPalette({
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
         run: () => navigate("/"),
+        shortcut: newSessionShortcutKeys(),
       },
       {
         id: "go-inbox",
@@ -194,6 +207,7 @@ export function CommandPalette({
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
         run: () => navigate("/settings"),
+        shortcut: SETTINGS_KEYS,
       },
       {
         id: "toggle-left-sidebar",
@@ -201,6 +215,7 @@ export function CommandPalette({
         icon: PanelLeftIcon,
         keywords: ["panel", "left", "sessions list"],
         run: onToggleLeftSidebar,
+        shortcut: SIDEBAR_TOGGLE_KEYS,
       },
       {
         id: "toggle-right-sidebar",
@@ -208,9 +223,10 @@ export function CommandPalette({
         icon: PanelRightIcon,
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
+        shortcut: rightSidebarShortcutEnabled ? RIGHT_SIDEBAR_TOGGLE_KEYS : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
   );
 
   const filteredActions = useMemo(() => {
@@ -554,6 +570,7 @@ export function CommandPalette({
                     <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
                       <Icon />
                       <span className="flex-1 truncate text-left">{a.label}</span>
+                      {a.shortcut && <CompactShortcutKeys keys={a.shortcut} />}
                     </CommandItem>
                   );
                 })}
