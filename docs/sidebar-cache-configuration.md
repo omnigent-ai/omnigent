@@ -1,5 +1,18 @@
 # Sidebar cache configuration
 
+## Initial presentation
+
+Pass `?sidebar=closed` in a web UI link to start with the global session sidebar
+collapsed, including on desktop. The parameter stays in the URL so reloads and
+navigation to another session carrying it start collapsed too. The sidebar
+toggle and keyboard shortcut still work; workspace panels and session controls
+remain available. Settings retain their navigation sidebar.
+
+Without this parameter, the sidebar starts open on desktop and closed on mobile.
+The existing `?sidebar=open` link still opens it once and removes that parameter.
+
+## Cache configuration
+
 Embedded hosts can pass `sidebarConfig` to `OmnigentApp`. The prop accepts a
 `Partial<SidebarConfig>` and can change at runtime. A host that renders
 `SidebarDataProvider` directly passes a complete configuration through its
