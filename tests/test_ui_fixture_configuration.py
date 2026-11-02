@@ -42,6 +42,9 @@ def test_mock_config_refuses_the_real_config_home(monkeypatch, tmp_path, config_
     with pytest.raises(RuntimeError, match="OMNIGENT_CONFIG_HOME is unset"):
         with configuration.temp_omnigent_mock_config("http://model", "codex"):
             pytest.fail("must not write the real config")
+    # Workflow-owned runs never touch the config, so the guard does not apply.
+    with configuration.temp_omnigent_mock_config("http://model", "codex", workflow_owned=True):
+        pass
     assert real_config.read_text() == "real user config\n"
     assert sorted(path.name for path in real_config.parent.iterdir()) == ["config.yaml"]
 
