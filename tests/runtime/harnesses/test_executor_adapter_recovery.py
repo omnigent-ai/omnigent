@@ -371,7 +371,9 @@ async def test_watchdog_resync_is_idempotent() -> None:
     assert executor.close_calls == 1
 
 
-async def test_wedge_retry_waits_for_executor_close(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_wedge_retry_waits_for_executor_close(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     from omnigent.runtime.harnesses import _scaffold
 
     monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
@@ -413,6 +415,16 @@ async def test_wedge_retry_waits_for_executor_close(monkeypatch: pytest.MonkeyPa
             await task
         assert creations == 2
         assert orphan_result is not None and orphan_result.get("error")
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "harness_watchdog_expired"
+        ]
+        assert record.attributes["executor_type"] == "SlowCloseExecutor"
+        assert record.attributes["executor_stage"] == "executor_stream"
+        assert record.attributes["watchdog_stage"] == "retry"
+        assert record.attributes["observed_tool_count_at_unwind"] == 0
+        assert record.attributes["pending_mcp_call_count_at_unwind"] == 0
     finally:
         release.set()
         await adapter.on_shutdown()

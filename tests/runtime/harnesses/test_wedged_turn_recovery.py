@@ -27,6 +27,7 @@ How to run::
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -40,6 +41,7 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server.schemas import (
+    ElicitationRequestParams,
     HeartbeatEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -316,6 +318,7 @@ async def test_cancelled_turn_is_not_retried(monkeypatch: pytest.MonkeyPatch) ->
 
 async def test_recovered_turn_failure_counts_only_final_attempt_in_message(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The exhausted-recovery error reports the retry count accurately."""
     from omnigent.runtime.harnesses import _scaffold
@@ -333,6 +336,7 @@ async def test_recovered_turn_failure_counts_only_final_attempt_in_message(
         response_id="resp_retry_count",
         event_queue=asyncio.Queue(),
         cancelled=asyncio.Event(),
+        session_id="conv_watchdog",
     )
     async with asyncio.timeout(5):
         with pytest.raises(RuntimeError) as excinfo:
@@ -341,9 +345,26 @@ async def test_recovered_turn_failure_counts_only_final_attempt_in_message(
     message = str(excinfo.value)
     assert "idle watchdog" in message, message
     assert "1 recovery retry was attempted and also wedged" in message, message
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "harness_watchdog_expired"
+    ]
+    assert [record.attributes["watchdog_stage"] for record in records] == ["retry", "terminal"]
+    assert [record.attributes["attempt"] for record in records] == [1, 2]
+    for record in records:
+        assert record.session_id == "conv_watchdog"
+        assert record.attributes["response_id"] == "resp_retry_count"
+        assert record.attributes["max_attempts"] == 2
+        assert record.attributes["progress_event_count"] == 0
+        assert record.attributes["last_progress_age_ms"] is None
+        assert record.attributes["has_replay_blocking_progress"] is False
+        assert record.attributes["absolute_remaining_ms"] > 0
 
 
-async def test_partial_output_is_not_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_partial_output_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     from omnigent.runtime.harnesses import _scaffold
 
     attempts = 0
@@ -365,6 +386,81 @@ async def test_partial_output_is_not_replayed(monkeypatch: pytest.MonkeyPatch) -
     assert queue.get_nowait().delta == "once"
     assert queue.get_nowait() is None
     assert queue.empty()
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "harness_watchdog_expired"
+    ]
+    assert record.attributes["last_event_type"] == "OutputTextDeltaEvent"
+    assert record.attributes["progress_event_count"] == 1
+    assert record.attributes["has_replay_blocking_progress"] is True
+    assert record.attributes["last_progress_age_ms"] >= 40
+    assert "once" not in json.dumps(record.attributes)
+
+
+@pytest.mark.parametrize("wait_kind", ["tool", "human", "policy"])
+async def test_watchdog_preserves_wait_evidence_through_cancellation(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, wait_kind: str
+) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    class WaitingApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            if wait_kind == "tool":
+                await ctx.dispatch_tool("call", "private-tool", "private-arguments", "agent")
+            elif wait_kind == "human":
+                await ctx.elicit(
+                    "elicit", ElicitationRequestParams(mode="form", message="private-question")
+                )
+            else:
+                await ctx.evaluate_policy("policy", "PHASE_TOOL_CALL", {"private": "payload"})
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0 if wait_kind == "human" else 0.02)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 0.05)
+    ctx = TurnContext("resp_wait", asyncio.Queue(), asyncio.Event())
+    with pytest.raises(RuntimeError, match="watchdog"):
+        await WaitingApp()._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "harness_watchdog_expired"
+    ]
+    attrs = record.attributes
+    assert attrs["watchdog_kind"] == ("absolute" if wait_kind == "human" else "idle")
+    assert attrs["watchdog_stage"] == "terminal"
+    assert attrs["progress_event_count"] == 1
+    assert attrs["tool_waits_at_last_event"] == int(wait_kind == "tool")
+    assert attrs["human_waits_at_last_event"] == int(wait_kind != "tool")
+    assert attrs["elicitations_at_last_event"] == int(wait_kind == "human")
+    assert attrs["policy_waits_at_last_event"] == int(wait_kind == "policy")
+    assert attrs["tool_waits_after_unwind"] == attrs["human_waits_after_unwind"] == 0
+    if wait_kind == "tool":
+        assert attrs["last_item_type"] == "function_call"
+        assert attrs["last_item_status"] == "action_required"
+    elif wait_kind == "human":
+        assert attrs["last_event_type"] == "ElicitationRequestEvent"
+        assert attrs["absolute_remaining_ms"] == 0
+    else:
+        assert attrs["last_policy_phase"] == "PHASE_TOOL_CALL"
+    assert "private" not in json.dumps(attrs)
+    assert ctx._watchdog_timeouts is None
+
+
+async def test_watchdog_failure_survives_a_broken_diagnostic_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise ValueError("private sink failure")
+
+    monkeypatch.setattr(_scaffold._logger, "warning", broken)
+    error = HarnessApp()._idle_watchdog_error(
+        TurnContext("resp_failure", asyncio.Queue(), asyncio.Event()), 3600, 1
+    )
+    assert "harness idle watchdog" in str(error)
+    assert "1 recovery retry" in str(error)
+    assert "private" not in str(error)
 
 
 async def test_counting_tool_is_executed_once_before_wedge(
@@ -417,7 +513,9 @@ async def test_counting_tool_is_executed_once_before_wedge(
 
 
 @pytest.mark.parametrize("phase", ["PHASE_LLM_REQUEST", "PHASE_TOOL_CALL"])
-async def test_policy_handshake_replay_gate(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+async def test_policy_handshake_replay_gate(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, phase: str
+) -> None:
     from omnigent.runtime.harnesses import _scaffold
 
     attempts = 0
@@ -455,3 +553,12 @@ async def test_policy_handshake_replay_gate(monkeypatch: pytest.MonkeyPatch, pha
         with pytest.raises(RuntimeError, match="idle watchdog"):
             await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
         assert attempts == 1
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "harness_watchdog_expired"
+    ]
+    assert record.attributes["last_event_type"] == "PolicyEvaluationRequestEvent"
+    assert record.attributes["last_policy_phase"] == phase
+    assert record.attributes["progress_event_count"] == 1
+    assert record.attributes["last_heartbeat_age_ms"] is not None

@@ -51,6 +51,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
@@ -505,6 +506,16 @@ class TurnContext:
         # human wait is pending so the hard cap still bounds the turn.
         self._hold_idle_watchdog: Callable[[], None] | None = None
         self._has_progress = False
+        self._watchdog_timeouts: tuple[asyncio.Timeout, asyncio.Timeout] | None = None
+        self._watchdog_started_at: float | None = None
+        self._watchdog_attempt_started_at: float | None = None
+        self._watchdog_last_progress_at: float | None = None
+        self._watchdog_last_heartbeat_at: float | None = None
+        self._watchdog_progress_events = 0
+        self._watchdog_last_progress: dict[str, str | int] = {}
+        self._watchdog_executor_type: str | None = None
+        self._watchdog_executor_stage: str | None = None
+        self._watchdog_executor_unwind: dict[str, int] = {}
 
     def emit(self, event: HarnessStreamEvent) -> None:
         """
@@ -524,6 +535,7 @@ class TurnContext:
             ``OutputTextDeltaEvent(type="response.output_text.delta",
             delta="hi")``.
         """
+        self._observe_watchdog_event(event)
         # Treat any non-heartbeat event as progress and push the idle
         # watchdog deadline forward. Heartbeats are keep-alive, NOT
         # progress — letting them reset the deadline would defeat the
@@ -544,6 +556,46 @@ class TurnContext:
         elif self._pending_human_waits > 0 and self._hold_idle_watchdog is not None:
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
+
+    def _observe_watchdog_event(self, event: HarnessStreamEvent) -> None:
+        """Retain bounded last-observed state before timeout cancellation unwinds waits."""
+        with contextlib.suppress(Exception):
+            if self._watchdog_timeouts is None or any(
+                timeout.expired() for timeout in self._watchdog_timeouts
+            ):
+                return
+            if isinstance(event, HeartbeatEvent):
+                self._watchdog_last_heartbeat_at = time.monotonic()
+                return
+            self._watchdog_last_progress_at = time.monotonic()
+            self._watchdog_progress_events += 1
+            self._watchdog_last_progress = {
+                "last_event_type": type(event).__name__[:128],
+                "tool_waits_at_last_event": len(self._pending_tool_calls),
+                "elicitations_at_last_event": len(self._pending_elicitations),
+                "policy_waits_at_last_event": len(self._pending_policy_evaluations),
+                "human_waits_at_last_event": self._pending_human_waits,
+            }
+            if isinstance(event, OutputItemDoneEvent):
+                item_type = event.item.get("type")
+                item_status = event.item.get("status")
+                self._watchdog_last_progress["last_item_type"] = (
+                    item_type
+                    if item_type in {"message", "function_call", "function_call_output"}
+                    else "other"
+                )
+                self._watchdog_last_progress["last_item_status"] = (
+                    item_status
+                    if item_status in {"in_progress", "completed", "action_required", "failed"}
+                    else "other"
+                )
+            if isinstance(event, PolicyEvaluationRequestEvent):
+                self._watchdog_last_progress["last_policy_phase"] = (
+                    event.phase
+                    if event.phase
+                    in _HUMAN_GATED_POLICY_PHASES | {"PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"}
+                    else "other"
+                )
 
     async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
         """
@@ -1640,6 +1692,7 @@ class HarnessApp:
         idle_wd: asyncio.Timeout | None = None
         attempt = 0
         loop = asyncio.get_running_loop()
+        ctx._watchdog_started_at = time.monotonic()
         try:
             # Absolute outer (spans every recovery attempt), idle inner
             # (fresh per attempt): ``.expired()`` on each tells which
@@ -1647,6 +1700,15 @@ class HarnessApp:
             async with absolute_wd:
                 for attempt in range(attempts):
                     idle_wd = asyncio.timeout(idle_timeout if idle_timeout > 0 else None)
+                    ctx._watchdog_timeouts = (idle_wd, absolute_wd)
+                    ctx._watchdog_attempt_started_at = time.monotonic()
+                    ctx._watchdog_last_progress_at = None
+                    ctx._watchdog_last_heartbeat_at = None
+                    ctx._watchdog_progress_events = 0
+                    ctx._watchdog_last_progress = {}
+                    ctx._watchdog_executor_type = None
+                    ctx._watchdog_executor_stage = None
+                    ctx._watchdog_executor_unwind = {}
                     if idle_timeout > 0:
 
                         def _reset(idle_wd: asyncio.Timeout = idle_wd) -> None:
@@ -1715,7 +1777,9 @@ class HarnessApp:
                         ):
                             if transport_closed:
                                 raise
-                            raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
+                            raise self._idle_watchdog_error(
+                                ctx, idle_timeout, attempt, absolute_deadline=absolute_wd.when()
+                            ) from exc
                         # Cleanup and retry notices must not extend the absolute ceiling.
                         ctx._reset_idle_watchdog = None
                         ctx._hold_idle_watchdog = None
@@ -1733,13 +1797,23 @@ class HarnessApp:
                         ):
                             if transport_closed:
                                 raise
-                            raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
+                            raise self._idle_watchdog_error(
+                                ctx, idle_timeout, attempt, absolute_deadline=absolute_wd.when()
+                            ) from exc
                         if transport_closed:
                             retry_message = (
                                 f"native harness transport closed before progress ({exc}); "
                                 "the stopped invocation is being retried"
                             )
                         else:
+                            self._log_watchdog_expiry(
+                                ctx,
+                                kind="idle",
+                                stage="retry",
+                                timeout_s=idle_timeout,
+                                attempt=attempt,
+                                absolute_deadline=absolute_wd.when(),
+                            )
                             retry_message = (
                                 f"turn made no progress for {idle_timeout:.0f}s "
                                 "(likely a wedged LLM or tool call); the wedged call "
@@ -1775,13 +1849,17 @@ class HarnessApp:
             # Prefer the idle cause when both timers fire or cleanup reaches
             # the absolute ceiling after an idle expiry.
             if idle_wd is not None and idle_wd.expired():
-                raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
+                raise self._idle_watchdog_error(
+                    ctx, idle_timeout, attempt, absolute_deadline=absolute_wd.when()
+                ) from exc
             if absolute_wd.expired():
-                _logger.warning(
-                    "run_turn for %s exceeded the %.0fs absolute turn ceiling; "
-                    "marking the turn failed",
-                    ctx.response_id,
-                    absolute_timeout,
+                self._log_watchdog_expiry(
+                    ctx,
+                    kind="absolute",
+                    stage="terminal",
+                    timeout_s=absolute_timeout,
+                    attempt=attempt,
+                    absolute_deadline=absolute_wd.when(),
                 )
                 raise RuntimeError(
                     f"turn exceeded the {absolute_timeout:.0f}s harness absolute watchdog "
@@ -1797,6 +1875,7 @@ class HarnessApp:
             # ``response.cancelled`` event.
             raise
         finally:
+            ctx._watchdog_timeouts = None
             # Sentinel that tells ``_stream_turn`` to stop reading
             # the queue and emit the terminal event.
             ctx._event_queue.put_nowait(None)
@@ -1811,7 +1890,12 @@ class HarnessApp:
         return True
 
     def _idle_watchdog_error(
-        self, ctx: TurnContext, idle_timeout: float, attempt: int
+        self,
+        ctx: TurnContext,
+        idle_timeout: float,
+        attempt: int,
+        *,
+        absolute_deadline: float | None = None,
     ) -> RuntimeError:
         """
         Build the terminal error for an idle-watchdog expiry.
@@ -1820,14 +1904,9 @@ class HarnessApp:
         :param idle_timeout: The idle window that expired, in seconds.
         :param attempt: 0-based index of the attempt that wedged, so the
             message can say recovery was already tried.
+        :param absolute_deadline: Current loop-clock ceiling, for diagnostic budget evidence.
         :returns: The ``RuntimeError`` to surface as ``response.failed``.
         """
-        _logger.warning(
-            "run_turn for %s made no progress for %.0fs (idle turn watchdog); "
-            "marking the turn failed",
-            ctx.response_id,
-            idle_timeout,
-        )
         # A native forwarder that can't reach the server (e.g.
         # ``No route to host``) starves the turn of progress events, so
         # the idle watchdog — not the connectivity error — is what fails
@@ -1841,6 +1920,15 @@ class HarnessApp:
         # captures it while still ignoring a long-resolved earlier blip.
         forwarder_failure = native_forwarder_health.recent_post_failure(
             idle_timeout * (attempt + 2)
+        )
+        self._log_watchdog_expiry(
+            ctx,
+            kind="idle",
+            stage="terminal",
+            timeout_s=idle_timeout,
+            attempt=attempt,
+            absolute_deadline=absolute_deadline,
+            recent_forwarder_failure=forwarder_failure is not None,
         )
         cause = (
             f"likely a wedged LLM or tool call; "
@@ -1858,6 +1946,67 @@ class HarnessApp:
             f"turn exceeded the {idle_timeout:.0f}s harness idle watchdog "
             f"(run_turn emitted no events for {idle_timeout:.0f}s; {cause}{retried})"
         )
+
+    def _log_watchdog_expiry(
+        self,
+        ctx: TurnContext,
+        *,
+        kind: str,
+        stage: str,
+        timeout_s: float,
+        attempt: int,
+        absolute_deadline: float | None,
+        recent_forwarder_failure: bool | None = None,
+    ) -> None:
+        """Log observation times and counts, without request, tool, or exception content."""
+        with contextlib.suppress(Exception):
+            now = time.monotonic()
+
+            def age_ms(observed_at: float | None) -> int | None:
+                return (
+                    min(10**12, max(0, int((now - observed_at) * 1000)))
+                    if observed_at is not None
+                    else None
+                )
+
+            _logger.warning(
+                "Harness watchdog expired",
+                extra=debug_event(
+                    "harness_watchdog_expired",
+                    session_id=ctx.session_id,
+                    turn_id=None,
+                    user_id=None,
+                    response_id=ctx.response_id,
+                    harness_type=type(self).__name__[:128],
+                    executor_type=ctx._watchdog_executor_type,
+                    executor_stage=ctx._watchdog_executor_stage,
+                    watchdog_kind=kind,
+                    watchdog_stage=stage,
+                    timeout_ms=min(10**12, max(0, int(timeout_s * 1000))),
+                    attempt=attempt + 1,
+                    max_attempts=1 + max(0, _WEDGED_TURN_RECOVERY_RETRIES),
+                    turn_elapsed_ms=age_ms(ctx._watchdog_started_at),
+                    attempt_elapsed_ms=age_ms(ctx._watchdog_attempt_started_at),
+                    last_progress_age_ms=age_ms(ctx._watchdog_last_progress_at),
+                    last_heartbeat_age_ms=age_ms(ctx._watchdog_last_heartbeat_at),
+                    absolute_remaining_ms=None
+                    if absolute_deadline is None
+                    else min(
+                        10**12,
+                        max(
+                            0, int((absolute_deadline - asyncio.get_running_loop().time()) * 1000)
+                        ),
+                    ),
+                    progress_event_count=min(10**12, ctx._watchdog_progress_events),
+                    has_replay_blocking_progress=ctx._has_progress,
+                    cancelled=ctx.cancelled.is_set(),
+                    tool_waits_after_unwind=len(ctx._pending_tool_calls),
+                    human_waits_after_unwind=ctx._pending_human_waits,
+                    recent_forwarder_failure=recent_forwarder_failure,
+                    **ctx._watchdog_last_progress,
+                    **ctx._watchdog_executor_unwind,
+                ),
+            )
 
     async def _heartbeat_loop(self, ctx: TurnContext) -> None:
         """
