@@ -28,14 +28,17 @@ viewport (1280×720) is desktop, so the sidebar is shown without a toggle.
 
 from __future__ import annotations
 
+import json
+import time
 import uuid
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Page, Request, expect
+from playwright.sync_api import Browser, Locator, Page, Request, WebSocket, expect
 
+from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.conftest import TwoAgentChatSession, _build_hello_world_bundle
 
 
 @pytest.mark.compat_smoke
@@ -216,3 +219,142 @@ def test_session_created_elsewhere_appears_via_push(
         expect(page.locator(f'a[href="/c/{new_id}"]')).to_be_visible(timeout=20_000)
     finally:
         httpx.delete(f"{base_url}/v1/sessions/{new_id}", timeout=10.0)
+
+
+_FOLDER_PAGE_SIZE = 20
+
+
+def _record_sidebar_traffic(page: Page) -> list[tuple[float, str]]:
+    """Log ``page``'s session-list requests and session-update frames in arrival order."""
+    timeline: list[tuple[float, str]] = []
+
+    def on_request(request: Request) -> None:
+        if "/v1/sessions?" in request.url:
+            timeline.append((time.monotonic(), request.url))
+
+    last_rows: dict[str, dict[str, object]] = {}
+
+    def on_frame(payload: str | bytes) -> None:
+        frame = json.loads(payload)
+        rows = []
+        for item in frame.get("items", []):
+            previous = last_rows.get(item["id"])
+            last_rows[item["id"]] = item
+            fields = (
+                sorted(k for k, v in item.items() if previous.get(k) != v) if previous else "new"
+            )
+            kind = "child" if item.get("parent_session_id") else "top"
+            rows.append(f"{item['id'][:8]}({kind},{item.get('status')}) changed={fields}")
+        timeline.append((time.monotonic(), f"frame {frame['type']} {rows}"))
+
+    def on_websocket(socket: WebSocket) -> None:
+        if "/v1/sessions/updates" in socket.url:
+            socket.on("framereceived", on_frame)
+
+    page.on("request", on_request)
+    page.on("websocket", on_websocket)
+    return timeline
+
+
+def _load_folder_second_page(page: Page, project: str, *, expand: bool) -> Locator:
+    """Bring the project folder's first-page end into view so its second page loads."""
+    header = page.get_by_role("button", name=project, exact=True)
+    folder = header.locator("xpath=ancestor::section[1]")
+    with page.expect_request(
+        lambda request: "project=" in request.url and "after=" in request.url, timeout=30_000
+    ):
+        if expand:
+            header.click()
+        folder.locator('a[href^="/c/"]').nth(_FOLDER_PAGE_SIZE - 1).scroll_into_view_if_needed()
+    return folder
+
+
+def _requests_since(timeline: list[tuple[float, str]], start: float) -> list[str]:
+    return [entry for at, entry in timeline if at >= start and not entry.startswith("frame ")]
+
+
+def _timeline_since(timeline: list[tuple[float, str]], start: float) -> str:
+    return "\n".join(f"+{at - start:6.2f}s {entry}" for at, entry in timeline if at >= start)
+
+
+@pytest.mark.timeout(600)
+def test_running_agent_updates_do_not_reload_loaded_folder_pages(
+    browser: Browser,
+    two_agent_chat_session: TwoAgentChatSession,
+) -> None:
+    """Pushed status updates from a running agent don't refetch the sidebar's folder pages.
+
+    Tab A runs an orchestrator that spawns a sub-agent; tab B only shows the
+    orchestrator as a cached folder row. Pushed ``changed`` frames already carry
+    the full row, so neither tab should reload a folder page it has loaded.
+    """
+    chat = two_agent_chat_session
+    base_url = chat.base_url
+    project = f"busy-folder-{uuid.uuid4().hex[:8]}"
+    filler_ids: list[str] = []
+    try:
+        for index in range(_FOLDER_PAGE_SIZE + 2):
+            created = post_session_bundle(
+                httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
+            )
+            created.raise_for_status()
+            filler_ids.append(created.json()["session_id"])
+            httpx.patch(
+                f"{base_url}/v1/sessions/{filler_ids[-1]}",
+                json={"title": f"Filed session {index:02d}", "labels": {"omni_project": project}},
+                timeout=10.0,
+            ).raise_for_status()
+        httpx.patch(
+            f"{base_url}/v1/sessions/{chat.session_id}",
+            json={"title": "Arthur orchestrator", "labels": {"omni_project": project}},
+            timeout=10.0,
+        ).raise_for_status()
+
+        with user_page(browser, headers={}) as tab_a, user_page(browser, headers={}) as tab_b:
+            tab_a_traffic = _record_sidebar_traffic(tab_a)
+            tab_b_traffic = _record_sidebar_traffic(tab_b)
+            tab_a.goto(f"{base_url}/c/{chat.session_id}")
+            # The open session's folder expands on its own.
+            expect(tab_a.get_by_role("button", name=project, exact=True)).to_have_attribute(
+                "aria-expanded", "true"
+            )
+            tab_a_folder = _load_folder_second_page(tab_a, project, expand=False)
+            tab_b.goto(base_url)
+            tab_b_folder = _load_folder_second_page(tab_b, project, expand=True)
+            for folder in (tab_a_folder, tab_b_folder):
+                expect(folder.locator('a[href^="/c/"]')).to_have_count(len(filler_ids) + 1)
+            # Let the initial loads and stream snapshots settle before measuring.
+            tab_a.wait_for_timeout(6_000)
+
+            start = time.monotonic()
+            composer = tab_a.get_by_label("Message the agent")
+            composer.fill(
+                "Ask Deep Thought for the Answer to the Ultimate Question, then tell me "
+                f"exactly what it said. Routing marker: {chat.routing_token}"
+            )
+            tab_a.get_by_role("button", name="Send", exact=True).click()
+            expect(
+                tab_a.locator(
+                    '[data-testid="message-bubble"][data-role="assistant"]',
+                    has_text=chat.verification_code,
+                ).first
+            ).to_be_visible(timeout=240_000)
+            tab_a.wait_for_timeout(6_000)
+
+            folder_requests = {
+                "tab A": [
+                    url for url in _requests_since(tab_a_traffic, start) if "project=" in url
+                ],
+                "tab B": [
+                    url for url in _requests_since(tab_b_traffic, start) if "project=" in url
+                ],
+            }
+            report = (
+                f"folder requests: {folder_requests}\n"
+                f"tab A timeline:\n{_timeline_since(tab_a_traffic, start)}\n"
+                f"tab B timeline:\n{_timeline_since(tab_b_traffic, start)}"
+            )
+            assert not folder_requests["tab A"] and not folder_requests["tab B"], report
+    finally:
+        for session_id in filler_ids:
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)

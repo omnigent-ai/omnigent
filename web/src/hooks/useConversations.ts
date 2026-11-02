@@ -1877,7 +1877,6 @@ function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: stri
       data,
       new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -1912,7 +1911,6 @@ function patchPinnedCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -2397,7 +2395,6 @@ export function useMoveToProject() {
         data,
         itemsById,
         filtersFromConversationQueryKey(key),
-        undefined,
       );
       if (found.has(id) && next?.pages.some((page) => page.data.some((c) => c.id === id))) {
         windowScopes.add(
@@ -2417,12 +2414,7 @@ export function useMoveToProject() {
         const { sortBy, archived } = parseProjectSessionsQueryKey(targetKey);
         const filters = filtersFromProjectQueryKey(targetKey);
         const scope = `${sortBy}:${archived}`;
-        const { data: merged, found } = mergeItemsIntoPages(
-          targetData,
-          itemsById,
-          filters,
-          undefined,
-        );
+        const { data: merged, found } = mergeItemsIntoPages(targetData, itemsById, filters);
         if (filters.includeArchived !== (row.archived === true)) {
           if (merged !== targetData) queryClient.setQueryData(targetKey, merged);
           continue;

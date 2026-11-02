@@ -53,14 +53,13 @@ const DEBOUNCE_MS = 250;
  *
  * @param queryClient - The app QueryClient.
  * @param items - Wire items from a snapshot/changed frame.
- * @returns Ids not found in any cached page and whether any patched row
- *   needs a server refetch to preserve filtered-query membership or sort
- *   order.
+ * @returns Top-level ids not found in any cached page and whether any patched
+ *   row needs a server refetch to preserve filtered-query membership or the
+ *   next-page cursor.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
-  activeId: string | undefined,
   viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
@@ -76,6 +75,7 @@ function applyItemsToCache(
   }
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
+  let titleChanged = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   });
@@ -86,9 +86,11 @@ function applyItemsToCache(
       data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filters, activeId);
+      titleChanged: queryTitleChanged,
+    } = mergeItemsIntoPages(data, itemsById, filters);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
+    if (queryTitleChanged) titleChanged = true;
     // Surface a brand-new watched session (a create here or elsewhere, a share)
     // at the top now, instead of after the debounced refetch (which lags the
     // search index). An unfiled row is fully placed → mark it found so it skips
@@ -124,11 +126,15 @@ function applyItemsToCache(
       data: next,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key), activeId);
+      titleChanged: queryTitleChanged,
+    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
+    if (queryTitleChanged) titleChanged = true;
     if (next !== data) queryClient.setQueryData(key, next);
   }
+  // A rename can move a row into a cached search list that doesn't hold it yet.
+  if (titleChanged && entries.some(([key]) => key[1] !== "")) needsRefetch = true;
   queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (previous) => {
     if (!previous) return previous;
     let changed = false;
@@ -151,10 +157,11 @@ function applyItemsToCache(
       .filter((row) => !row.archived);
     return changed ? { ...previous, conversations } : previous;
   });
-  return {
-    missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
-    needsRefetch,
-  };
+  // Sub-agent rows are listed only under their parent, never in these lists.
+  const missingIds = [...itemsById.values()]
+    .filter((item) => item.parent_session_id == null && !foundAnywhere.has(item.id))
+    .map((item) => item.id);
+  return { missingIds, needsRefetch };
 }
 
 /**
@@ -414,18 +421,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
-            activeIdRef.current,
             getCurrentUserId(),
           );
-          // A watched id absent from every page is a new session whose sort
-          // position we can't place locally. Membership-affecting deltas
-          // (archive/search/connected filters) and updated_at resorting need
-          // the same server-side reconciliation.
-          //
-          // Skip the active session: its updated_at bumps on open before the
-          // initial list fetch returns, so it lands in missingIds even though
-          // it isn't a genuinely new session. Its data is covered by
-          // useSession and it's pinned in the sidebar via ActiveChatOverride.
+          // Refetch for new ids, membership or search deltas, or a moved cursor.
+          // Skip the active session: it bumps on open before the list loads, and
+          // ActiveChatOverride pins it in the sidebar.
           const sidebarMissingIds = activeIdRef.current
             ? missingIds.filter((id) => id !== activeIdRef.current)
             : missingIds;
