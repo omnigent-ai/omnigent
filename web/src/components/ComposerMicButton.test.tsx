@@ -16,13 +16,16 @@
 // an AudioWorklet, and a WebSocket; the full loop runs in the Playwright
 // e2e test against the server's fake engine).
 
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import type { AnyBlock } from "@/lib/blocks";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { DictationSessionEvents } from "@/lib/dictation";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
+import { useChatStore } from "@/store/chatStore";
 import { ComposerMicButton } from "./ComposerMicButton";
 
 /** Hovers the mic button and returns the tooltip it opens. */
@@ -314,6 +317,34 @@ describe("ComposerMicButton", () => {
     expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(onVoiceDiscard).toHaveBeenCalledTimes(1);
     expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("Esc while listening discards dictation without declining a pending approval", () => {
+    const { submitApproval } = useChatStore.getState();
+    const submit = vi.fn();
+    useChatStore.setState({
+      blocks: [{ type: "elicitation", elicitationId: "elic_1", status: "pending" }] as AnyBlock[],
+      submitApproval: submit,
+    });
+    try {
+      // The approval hotkey binds first, as the app shell does.
+      renderHook(() => useApproveHotkey());
+      const onVoiceDiscard = vi.fn();
+      render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+      const mic = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(mic);
+      act(() => handlers.start?.({}));
+      mic.focus();
+      act(() => {
+        mic.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+        );
+      });
+      expect(onVoiceDiscard).toHaveBeenCalledTimes(1);
+      expect(submit).not.toHaveBeenCalled();
+    } finally {
+      useChatStore.setState({ blocks: [], submitApproval });
+    }
   });
 
   it("drops a late transcript that arrives after an Esc discard", () => {

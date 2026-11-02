@@ -217,6 +217,12 @@ describe("AskUserQuestionForm — Escape", () => {
     expect(onReject).not.toHaveBeenCalled();
   });
 
+  it("leaves Escape to an open panel that closes on it", () => {
+    const { onReject } = renderForm([framework], { beside: <aside data-escape-owner="" /> });
+    expect(pressOnPage({ key: "Escape" })).toBe(true);
+    expect(onReject).not.toHaveBeenCalled();
+  });
+
   it("leaves Enter and Escape to the composer's model/effort preview", () => {
     const { onReject } = renderForm([framework, snacks], {
       beside: (

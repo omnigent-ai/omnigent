@@ -10,7 +10,7 @@ import {
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -116,6 +116,37 @@ describe("ApprovalCard — binary approve/reject", () => {
       });
       const tooltip = await screen.findByRole("tooltip");
       expect(tooltip).toHaveTextContent("Approve");
+      const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+      expect(shown.map((key) => key.textContent)).toEqual(keys);
+    });
+
+    it.each([
+      { name: "the prompt Esc declines", blocks: [pending("elic_chord")], keys: [ESC_KEY] },
+      {
+        name: "an older prompt",
+        blocks: [pending("elic_chord"), pending("elic_newer")],
+        keys: [],
+      },
+    ])("names Esc on the Reject button of $name only", async ({ blocks, keys }) => {
+      useChatStore.setState({ blocks: blocks as AnyBlock[] });
+      renderHook(() => useApproveHotkey());
+      render(
+        <ApprovalCard
+          elicitationId="elic_chord"
+          message="Approve running ls?"
+          phase="tool_call"
+          policyName="approve_shell_commands"
+          contentPreview="ls"
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Reject" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("Reject");
       const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
       expect(shown.map((key) => key.textContent)).toEqual(keys);
     });
