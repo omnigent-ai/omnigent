@@ -1089,7 +1089,7 @@ def register_core_routes(
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp, conv = await _create_session_from_existing_agent(
+        resp, conv, effective_git = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -1249,13 +1249,17 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
-                if host_refused and body.git is not None and not body.git.existing_worktree:
+                if (
+                    host_refused
+                    and effective_git is not None
+                    and not effective_git.existing_worktree
+                ):
                     unbound = await _remove_failed_launch_worktree(
                         conversation_store=conversation_store,
                         host_registry=getattr(request.app.state, "host_registry", None),
                         session_id=resp.id,
                         runner_id=runner_id,
-                        delete_branch=not body.git.existing_branch,
+                        delete_branch=not effective_git.existing_branch,
                     )
                     if unbound is not None:
                         resp.runner_id = unbound.runner_id

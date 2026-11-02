@@ -9063,6 +9063,50 @@ def test_clear_host_binding_requires_the_expected_host_and_runner(
     assert conversation_store.get_conversation(session.id) == cleared
 
 
+@pytest.mark.parametrize("host_state", ["live", "deleted", "tombstoned"])
+def test_detach_rollback_restores_only_a_live_host(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, host_state: str
+) -> None:
+    host_id = uuid.uuid4().hex
+    hosts = HostStore(db_uri)
+    if host_state == "tombstoned":
+        hosts.register_managed_host(
+            host_id=host_id,
+            name="managed",
+            user_id=RESERVED_USER_LOCAL,
+            token="launch-token",
+            provider="modal",
+            sandbox_id="sb-detach",
+            token_expires_at=4_102_444_800,
+        )
+    else:
+        _register_host(db_uri, host_id)
+    session = conversation_store.create_conversation()
+    conversation_store.set_host_id(session.id, host_id, "/worktree", git_branch="feature")
+    conversation_store.replace_runner_id(session.id, "failed-runner")
+    previous = conversation_store.get_conversation(session.id)
+    assert previous is not None
+    conversation_store.clear_host_binding(
+        session.id, expected_host_id=host_id, expected_runner_id="failed-runner"
+    )
+    if host_state != "live":
+        hosts.delete_host(host_id)
+
+    restored = conversation_store.rollback_runner_reassignment(
+        previous, expected_runner_id=None, expected_host_id=None
+    )
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    binding = (saved.runner_id, saved.host_id, saved.workspace, saved.git_branch)
+    if host_state == "live":
+        assert restored
+        assert binding == ("failed-runner", host_id, "/worktree", "feature")
+    else:
+        assert not restored
+        assert binding == (None, None, None, None)
+
+
 _ACCEPTED_PROFILE = {
     "id": "build",
     "provider": "company",

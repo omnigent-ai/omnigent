@@ -1885,7 +1885,10 @@ class ConversationStore(ABC):
         expected_runner_id: str | None,
         expected_host_id: str | None,
     ) -> bool:
-        """Restore a failed rotation or detach unless its binding changed or is authoritative."""
+        """Restore a failed rotation or detach.
+
+        Refuses when the binding changed, is authoritative, or names a deleted host.
+        """
         raise NotImplementedError
 
     @abstractmethod

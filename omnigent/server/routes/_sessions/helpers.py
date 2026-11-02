@@ -10315,8 +10315,9 @@ async def _remove_failed_launch_worktree(
     Holds the relaunch lock and detaches the session while the failed runner is
     still bound, before asking the host to remove anything, so a rebind cannot
     hand a live runner the directory. A worktree another live session uses is
-    kept, and the binding is restored whenever the worktree stays so a later
-    delete or archive can retry.
+    kept. Whenever the worktree stays, the binding is restored so a later delete
+    or archive can retry, unless the session was rebound or its host deleted
+    meanwhile; that leftover worktree is logged.
 
     :param conversation_store: Store holding the new session row.
     :param host_registry: The ``HostRegistry`` tracking live host tunnels.
@@ -10363,18 +10364,29 @@ async def _remove_failed_launch_worktree(
                     expected_root_fingerprint=fingerprint,
                 )
             finally:
-                if not removed:
-                    await asyncio.to_thread(
-                        conversation_store.rollback_runner_reassignment,
-                        conv,
-                        expected_runner_id=None,
-                        expected_host_id=None,
+                if not removed and not await asyncio.to_thread(
+                    conversation_store.rollback_runner_reassignment,
+                    conv,
+                    expected_runner_id=None,
+                    expected_host_id=None,
+                ):
+                    _logger.warning(
+                        "Session %s was rebound or lost its host while worktree %s on host %s "
+                        "was kept; remove it manually",
+                        session_id,
+                        conv.workspace,
+                        conv.host_id,
                     )
             if not removed:
                 return None
-            await asyncio.to_thread(
-                conversation_store.delete_label, session_id, WORKTREE_ROOT_LABEL_KEY
-            )
+            try:
+                await asyncio.to_thread(
+                    conversation_store.delete_label, session_id, WORKTREE_ROOT_LABEL_KEY
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Could not clear the worktree label of session %s", session_id, exc_info=True
+                )
             return detached
     except Exception:  # noqa: BLE001
         _logger.warning(

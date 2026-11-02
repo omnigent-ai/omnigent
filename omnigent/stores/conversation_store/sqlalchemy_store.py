@@ -4684,6 +4684,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 session.get(
                     SqlHost, (current_workspace_id(), expected_host_id), with_for_update=True
                 )
+            elif previous.runner_id is not None and previous.host_id is not None:
+                restored_host = session.get(
+                    SqlHost, (current_workspace_id(), previous.host_id), with_for_update=True
+                )
+                if restored_host is None or restored_host.deleted_at is not None:
+                    return False
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), previous.id),
