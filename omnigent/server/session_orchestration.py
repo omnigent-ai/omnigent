@@ -10,9 +10,10 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_PUBLIC
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -47,13 +48,24 @@ def require_owned_session(
         if grant is None or grant.level != LEVEL_OWNER:
             break
         if private:
-            # Child access comes from the root, including public/read-only grants.
-            grants, cursor = permissions.list_for_session(current.id, limit=2)
-            if cursor is not None or any(g.user_id != user_id for g in grants):
-                raise OmnigentError(
-                    "Shared sessions cannot send messages or launch independent sessions",
-                    code=ErrorCode.FORBIDDEN,
+            cursor = None
+            while True:
+                grants, cursor = permissions.list_for_session(
+                    current.id, limit=100, after_user_id=cursor
                 )
+                for grant in grants:
+                    level = (
+                        effective_public_level(grant.level)
+                        if grant.user_id == RESERVED_USER_PUBLIC
+                        else grant.level
+                    )
+                    if grant.user_id != user_id and level is not None and level >= LEVEL_EDIT:
+                        raise OmnigentError(
+                            "Sessions shared for editing cannot orchestrate other sessions",
+                            code=ErrorCode.FORBIDDEN,
+                        )
+                if cursor is None:
+                    break
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
                 # Side chats keep their own grants but inherit source restrictions.
                 source_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)

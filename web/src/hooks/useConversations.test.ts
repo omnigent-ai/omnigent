@@ -3534,6 +3534,34 @@ describe("useDeleteProject", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 
+  it("unfiles the family through its representative before archiving peers", async () => {
+    const family = { id: "family", representative_id: "a", pinned: false };
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "b", family },
+            { id: "a", family },
+          ],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("a"))
+      .mockResolvedValueOnce(archivedConv("b"))
+      .mockResolvedValueOnce(mockResponse({ deleted: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/a");
+    expect(fetchMock.mock.calls[2][0]).toBe("/v1/sessions/b");
+    expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string)).toEqual({
+      archived: true,
+    });
+  });
+
   it("throws with succeeded/failed split when some archives fail", async () => {
     fetchMock
       .mockResolvedValueOnce(

@@ -141,8 +141,6 @@ const SAME_AS_SOURCE = "__same__";
 // on the dropdown content rather than plain inheritance.
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
-const NO_HOSTS: Host[] = [];
-
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
 type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
 const FORK_FIELD_IDS: Record<ForkField, string> = {
@@ -912,10 +910,21 @@ function SupportedForkSessionForm({
   const { data: agents } = useAvailableAgents({ enabled: true });
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
-  // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field). A sandbox-only fork offers none.
-  const { data: fetchedHosts } = useHosts({ enabled: isCodingSource && !sandboxOnly });
-  const hosts = sandboxOnly ? NO_HOSTS : fetchedHosts;
+  const info = useServerInfo();
+  const reusableSourceHostId =
+    info !== "loading" && info.sibling_sessions ? sourceHostId : undefined;
+  // Reuse ephemeral compute only when the server supports shared-sandbox cleanup.
+  const { data: fetchedHosts } = useHosts({
+    enabled: isCodingSource,
+    sourceHostId: reusableSourceHostId,
+  });
+  const hosts = useMemo(
+    () =>
+      sandboxOnly
+        ? (fetchedHosts ?? []).filter((host) => host.host_id === reusableSourceHostId)
+        : fetchedHosts,
+    [fetchedHosts, sandboxOnly, reusableSourceHostId],
+  );
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
@@ -926,7 +935,6 @@ function SupportedForkSessionForm({
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (rows hidden) until the boot probe resolves. Same gate
   // NewChatDialog uses for its own sandbox option.
-  const info = useServerInfo();
   const managedSandboxesEnabled =
     !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
@@ -1832,7 +1840,9 @@ function SupportedForkSessionForm({
                     className="text-sm text-muted-foreground"
                     data-testid="fork-session-sandbox-only-hint"
                   >
-                    This session can only be cloned onto a new{" "}
+                    {reusableSourceHostId
+                      ? "Clone onto this session’s sandbox or a new "
+                      : "Clone onto a new "}
                     {sandboxOptionLabel(sandboxOnlyProvider)}.
                   </p>
                 ) : (

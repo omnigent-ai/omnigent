@@ -176,6 +176,7 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import math
@@ -986,6 +987,8 @@ class ManagedHostLaunch:
 
     host_id: str
     workspace: str
+    sandbox_id: str | None = None
+    sandbox_provider: str | None = None
 
 
 # A full 40-hex object id — rejected as a clone fragment: cloning a
@@ -3919,7 +3922,12 @@ async def launch_managed_host(
         slice_key_enabled=slice_key_enabled,
         owner_credentials=config.owner_credentials,
     )
-    return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+    return ManagedHostLaunch(
+        host_id=host_id,
+        workspace=workspace,
+        sandbox_id=sandbox_id,
+        sandbox_provider=launcher.provider,
+    )
 
 
 async def relaunch_managed_host(
@@ -3930,6 +3938,78 @@ async def relaunch_managed_host(
     repos: Sequence[RepoWorkspace] = (),
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
+    slice_key_enabled: bool = False,
+) -> ManagedHostLaunch:
+    """Recover shared compute once across all bound sessions and server replicas."""
+    token = secrets.token_urlsafe(32)
+    try:
+        claimed = await asyncio.to_thread(host_store.claim_managed_recovery, host, token)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not claimed:
+        for _ in range(MANAGED_HOST_ONLINE_TIMEOUT_S * 2):
+            try:
+                result = await asyncio.to_thread(host_store.managed_recovery_result, host.host_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is not None:
+                return ManagedHostLaunch(
+                    host_id=host.host_id,
+                    workspace=result[0],
+                    sandbox_id=result[1],
+                    sandbox_provider=host.sandbox_provider,
+                )
+            await asyncio.sleep(0.5)
+        raise HTTPException(
+            status_code=409,
+            detail="Another session is recovering this sandbox; retry once it is ready",
+        )
+
+    async def renew() -> None:
+        while True:
+            await asyncio.sleep(20)
+            if not await asyncio.to_thread(
+                host_store.update_managed_recovery, host.host_id, token
+            ):
+                return
+
+    heartbeat = asyncio.create_task(renew())
+    result = None
+    try:
+        result = await _relaunch_managed_host(
+            config=config,
+            host=host,
+            host_store=host_store,
+            repos=repos,
+            agent_name=agent_name,
+            on_stage=on_stage,
+            slice_key_enabled=slice_key_enabled,
+            recovery_token=token,
+        )
+        return result
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        await asyncio.to_thread(
+            host_store.update_managed_recovery,
+            host.host_id,
+            token,
+            finished=True,
+            workspace=result.workspace if result else None,
+            sandbox_id=result.sandbox_id if result else None,
+        )
+
+
+async def _relaunch_managed_host(
+    *,
+    config: ManagedSandboxDeployment,
+    host: Host,
+    host_store: HostStore,
+    repos: Sequence[RepoWorkspace] = (),
+    agent_name: str | None = None,
+    on_stage: SandboxStageObserver | None = None,
+    recovery_token: str | None = None,
     slice_key_enabled: bool = False,
 ) -> ManagedHostLaunch:
     """
@@ -4018,6 +4098,8 @@ async def relaunch_managed_host(
             agent_name=agent_name,
             on_stage=on_stage,
             keep_host_on_failure=True,
+            expected_host=host,
+            recovery_token=recovery_token,
             slice_key_enabled=slice_key_enabled,
         )
     except ValueError as exc:
@@ -4025,7 +4107,12 @@ async def relaunch_managed_host(
             status_code=409,
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
-    return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+    return ManagedHostLaunch(
+        host_id=host.host_id,
+        workspace=workspace,
+        sandbox_id=sandbox_id,
+        sandbox_provider=launcher.provider,
+    )
 
 
 def _apply_git_clone_options(
@@ -4141,6 +4228,8 @@ async def _register_and_start_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     keep_host_on_failure: bool = False,
+    recovery_token: str | None = None,
+    expected_host: Host | None = None,
     slice_key_enabled: bool = False,
     owner_credentials: Mapping[str, Callable[[str], Mapping[str, object] | None]] | None = None,
 ) -> str:
@@ -4194,6 +4283,8 @@ async def _register_and_start_host(
         if keep_host_on_failure:
             record = await asyncio.to_thread(
                 host_store.replace_managed_host_sandbox,
+                expected_host=expected_host,
+                recovery_token=recovery_token,
                 host_id=host_id,
                 user_id=owner,
                 token=token,
@@ -4258,13 +4349,20 @@ async def _register_and_start_host(
             if isinstance(exc, ValueError):
                 raise
         elif keep_host_on_failure:
-            await _terminate_sandbox_best_effort(
-                launcher,
-                sandbox_id,
-                host_id=record.host_id,
-                provider=record.sandbox_provider,
+            # A late connection or a replacement generation owns its credential.
+            detached = await asyncio.to_thread(
+                host_store.detach_stale_managed_sandbox,
+                host_id,
+                sandbox_id=sandbox_id,
+                expected_updated_at=record.updated_at,
+                expected_token=token,
             )
-            await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+            if detached and await _terminate_sandbox_best_effort(
+                launcher, sandbox_id, host_id=record.host_id, provider=record.sandbox_provider
+            ):
+                await asyncio.to_thread(
+                    host_store.mark_sandbox_terminated, host_id, sandbox_id=sandbox_id
+                )
         else:
             # The row was just armed with THIS single-provider config, so a
             # one-provider deployment tears it back down as the same owner.
@@ -4274,6 +4372,7 @@ async def _register_and_start_host(
                 ManagedSandboxDeployment(
                     configs=(config,), owner_credentials=owner_credentials or {}
                 ),
+                only_if_unused=True,
             )
         if isinstance(exc, HTTPException):
             raise
@@ -4566,6 +4665,7 @@ async def terminate_managed_host(
     config: ManagedSandboxDeployment | None,
     *,
     capture_logs: bool = False,
+    only_if_unused: bool = False,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
@@ -4585,7 +4685,12 @@ async def terminate_managed_host(
     :param capture_logs: Log the in-sandbox host and runner log tails before
         terminating, e.g. after a client saw the session's turn fail.
     """
-    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    tombstone = await asyncio.to_thread(
+        host_store.delete_host,
+        host.host_id,
+        only_if_unused=only_if_unused,
+        expected_host=host if only_if_unused else None,
+    )
     if tombstone is None:
         return
     launcher = _launcher_for_teardown(tombstone, config)

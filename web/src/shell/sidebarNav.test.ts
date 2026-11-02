@@ -191,6 +191,19 @@ describe("orderByPinnedTimestamp", () => {
     ]);
   });
 
+  it("uses the family pin position for every member without pinning each member", () => {
+    const member = pinned("peer", undefined, new Date(2026, 4, 14, 9));
+    member.family = {
+      id: "family",
+      representative_id: "representative",
+      pinned: true,
+      pinned_at: "500",
+    };
+    const other = pinned("other", 1000, new Date(2026, 4, 14, 9));
+    expect(orderByPinnedTimestamp([other, member]).map((row) => row.id)).toEqual(["peer", "other"]);
+    expect(member.labels["omnigent.pinned"]).toBeUndefined();
+  });
+
   it("does not mutate the input array", () => {
     const convA = pinned("conv_a", 2000, new Date(2026, 4, 14, 9));
     const convB = pinned("conv_b", 1000, new Date(2026, 4, 14, 8));

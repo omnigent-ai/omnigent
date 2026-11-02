@@ -2383,16 +2383,13 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
 
     async with app.router.lifespan_context(app):
         reaper = getattr(app.state, "managed_sandbox_reaper", None)
-        if enabled:
-            assert isinstance(reaper, ManagedSandboxReaper)
-            assert reaper._sandbox_config is config
-            assert reaper._task is not None
-            assert not reaper._task.done()
-        else:
-            assert reaper is None
+        assert isinstance(reaper, ManagedSandboxReaper)
+        assert reaper._sandbox_config is config
+        assert reaper._reap_offline is enabled
+        assert reaper._task is not None
+        assert not reaper._task.done()
 
-    if enabled:
-        assert reaper._task is None
+    assert reaper._task is None
 
 
 @pytest.mark.parametrize(
@@ -3324,7 +3321,7 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
 
     assert exc.value.status_code == 409
     assert "no longer exists" in exc.value.detail
-    assert fake.terminated == ["sb-deleted-old", "sb-fake-1"]
+    assert fake.terminated == []  # Rejected before provisioning or touching the tombstone.
     assert host_store.get_host(host.host_id) is None
 
 
@@ -6110,3 +6107,64 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+async def test_siblings_share_one_recovery_across_host_stores(db_uri: str) -> None:
+    store = HostStore(db_uri)
+    host = store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="shared-recovery",
+        user_id=_OWNER,
+        token="old-token",
+        provider="modal",
+        sandbox_id="old-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    gate = threading.Event()
+    fake = FakeSandboxLauncher(
+        provision_gate=gate,
+        on_host_start=lambda invocation: store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        ),
+    )
+    first = asyncio.create_task(
+        relaunch_managed_host(
+            config=_injected_config(fake),
+            host=host,
+            host_store=store,
+        )
+    )
+    second_store = HostStore(db_uri)
+    joined = asyncio.Event()
+    original = second_store.claim_managed_recovery
+    loop = asyncio.get_running_loop()
+
+    def claim(snapshot: Host, token: str) -> bool:
+        result = original(snapshot, token)
+        assert not result
+        loop.call_soon_threadsafe(joined.set)
+        return result
+
+    second_store.claim_managed_recovery = claim
+    try:
+        async with asyncio.timeout(10):
+            while not fake.prepared:
+                await asyncio.sleep(0.01)
+            second = asyncio.create_task(
+                relaunch_managed_host(
+                    config=_injected_config(fake),
+                    host=host,
+                    host_store=second_store,
+                )
+            )
+            await joined.wait()
+            gate.set()
+            results = await asyncio.gather(first, second)
+        assert results[0] == results[1]
+        assert len(fake.provisioned_names) == 1
+        assert fake.terminated == ["old-sandbox"]
+    finally:
+        gate.set()
+        await first

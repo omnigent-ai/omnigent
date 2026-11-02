@@ -361,7 +361,7 @@ export function dedupeConversationsById(conversations: readonly Conversation[]):
 // bottom. A missing/unparseable value sinks to the bottom, stably.
 export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
   const pinnedAt = (c: Conversation): number => {
-    const raw = c.labels?.[PINNED_LABEL_KEY];
+    const raw = c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY];
     const ms = raw ? Number(raw) : NaN;
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
   };

@@ -15,9 +15,8 @@ export const SESSION_ACTIONS_UNAVAILABLE =
  */
 const UNSUPPORTED_FORK_PROVIDERS = new Set(["lakebox"]);
 /**
- * Providers whose sessions fork only onto a fresh sandbox from the same
- * provider: an Arclet checks out its own repositories, so a new box needs
- * nothing from the source's.
+ * Providers whose forks use their existing sandbox or a fresh one from the
+ * same provider. An Arclet checks out its own repositories on fresh compute.
  */
 const SAME_PROVIDER_FORK_PROVIDERS = new Set(["arclet"]);
 
@@ -31,7 +30,7 @@ export interface SessionActionSource {
 
 export interface SessionActionRestrictions {
   forkDisabledReason?: string;
-  /** Set when the session can fork only onto a fresh sandbox from this provider. */
+  /** Restricts fresh compute to this provider; source-host reuse remains available. */
   forkSandboxProvider?: string;
   switchHostDisabledReason?: string;
 }
