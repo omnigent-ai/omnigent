@@ -1070,6 +1070,17 @@ class TerminalHost:
         def _insert_newline(event: KeyPressEvent) -> None:
             event.current_buffer.insert_text("\n")
 
+        @self._kb.add("c-g", filter=~is_searching)
+        @self._kb.add("c-x", "c-e", filter=~is_searching)
+        async def _open_prompt_in_editor(event: KeyPressEvent) -> None:
+            self._close_subagent_menu()
+            buffer = event.current_buffer
+            # Edit full pasted content, and keep it available to Undo afterward.
+            buffer.text = self._expand_pasted_blocks(buffer.text)
+            buffer.cursor_position = len(buffer.text)
+            buffer.save_to_undo_stack()
+            await buffer.open_in_editor(validate_and_handle=False)
+
         # Replace prompt-toolkit's default (insert full payload) with
         # the abstraction-aware path. Re-splice on submit happens in
         # ``_expand_pasted_blocks``.
