@@ -114,7 +114,8 @@ registration's daily budget state.
 
 Scheduled-task timers follow the persisted task state:
 
-- Deletion removes the timers already known to the handling server.
+- Deletion removes the timers already known to the handling server. A fire that
+  disables a task because its owner registration is gone does the same.
 - A late registration or another replica's timer unregisters when its next fire
   observes a missing, paused, or deleted task.
 - Skipping an overlapping fire keeps the next occurrence armed. A stale callback
@@ -125,7 +126,10 @@ Scheduled-task timers follow the persisted task state:
 Scheduled work checks registration identity before contacting a host:
 
 1. Compare the saved task generation with the live owner's generation before
-   resolving a host.
+   resolving a host. A missing or deleted owner row disables the task. A task
+   saved without a generation under external authentication needs only a live
+   owner row; under account checks that null still cannot adopt a later
+   registration's generation.
 2. Select or authorize only a host with the same saved generation.
 3. Keep the task's expected host owner in a separate scope through every host
    RPC. Before queuing a frame, compare the connection's workspace, username,
