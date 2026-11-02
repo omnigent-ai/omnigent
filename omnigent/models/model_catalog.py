@@ -179,6 +179,9 @@ _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "nativ
 # provider-config lookup.
 _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
+# SDK harnesses whose CLI-login launch shares a native model-probe catalog.
+_SDK_PROBE_CLI: dict[str, str] = {"claude-sdk": "claude", "claude_sdk": "claude", "codex": "codex"}
+
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -1167,6 +1170,8 @@ def list_models_for_worker(
             listing,
             models=tuple(by_id[mid] for mid in binding.model_allowlist if mid in by_id),
         )
+    if not listing.models:
+        listing = _cli_login_probe_listing(spec, harness, provider) or listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
     return replace(listing, models=filtered)
 
@@ -1472,8 +1477,6 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
     :param provider: A ``kind="cli-config"`` provider descriptor.
     :returns: A probe-backed listing when cached, else an empty static listing.
     """
-    from omnigent.models import model_catalog_store
-
     probe: tuple[str, str, str] | None = None
     if provider.cli == "claude":
         from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
@@ -1493,24 +1496,9 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
         )
         probe = ("codex-native", codex_catalog_fingerprint(launch), "Codex")
     if probe is not None:
-        harness, fingerprint, label = probe
-        rows = model_catalog_store.read_catalog(harness, fingerprint)
-        if rows is not None:
-            stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
-            model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
-            return ModelListing(
-                source="cli",
-                verified=not stale,
-                models=tuple(
-                    ModelEntry(id=model_id, family=model_family_token(model_id))
-                    for model_id in model_ids
-                ),
-                note=(
-                    f"cached {label} model probe; catalog needs refreshing"
-                    if stale
-                    else f"models advertised by the {label} model probe"
-                ),
-            )
+        probed = _probe_catalog_listing(*probe)
+        if probed is not None:
+            return probed
     return ModelListing(
         source="static",
         verified=False,
@@ -1518,6 +1506,185 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
         note=(
             f"{provider.detail} enumerates its models only from the CLI's own "
             "config at launch; the live listing comes from probing the harness"
+        ),
+    )
+
+
+def _cli_login_probe_listing(
+    spec: object, harness: str, provider: ResolvedModelProvider
+) -> ModelListing | None:
+    """Replay the native probe catalog for a CLI-login Claude or Codex SDK worker.
+
+    Subscription and unconfigured SDK workers launch the CLI on its own login,
+    which exposes no listing API; the host caches its native probe of that launch.
+    Native workers are skipped: their launches add routes this readout cannot see.
+
+    :param spec: The worker's (sub-)agent spec.
+    :param harness: The worker's harness id, e.g. ``"claude-sdk"``.
+    :param provider: The worker's resolved provider.
+    :returns: A probe-backed listing, or ``None`` when the worker does not
+        launch on a usable CLI login or its catalog is not cached.
+    """
+    cli = _SDK_PROBE_CLI.get(canonicalize_harness(harness) or harness)
+    if cli is None:
+        return None
+    if provider.kind == SUBSCRIPTION_KIND:
+        if provider.cli != cli:
+            return None
+    elif provider.kind != NONE_KIND:
+        return None
+    try:
+        if cli == "codex":
+            return _codex_login_probe_listing(spec)
+        from omnigent.harnesses.claude_native.main import (
+            claude_ambient_transport,
+            claude_catalog_fingerprint,
+        )
+        from omnigent.onboarding.harness_readiness import _claude_token_env_configured
+
+        if provider.kind == NONE_KIND:
+            from omnigent.runtime.workflow import _resolve_provider_for_build
+
+            # Detection turns a stored login into a subscription, so an
+            # unconfigured child can only run on a token env credential.
+            if not _claude_token_env_configured():
+                return None
+            # "none" also covers resolution failures and launch-only provider
+            # fallbacks; only a launch that resolves no provider uses the login.
+            launch_entry = _resolve_provider_for_build(
+                cast("AgentSpec", spec),
+                harness_type="claude-sdk",
+                for_launch=True,
+                actual_harness=harness,
+            )
+            if launch_entry is not None:
+                return None
+        # Such routes share the CLI-login catalog key but not its model ids.
+        if claude_ambient_transport().leaves_login() or not _claude_probe_runs_sdk_cli():
+            return None
+        return _probe_catalog_listing(
+            "claude-native", claude_catalog_fingerprint(None), "Claude Code"
+        )
+    except Exception:  # an unresolvable launch keeps the existing row
+        _logger.debug(
+            "CLI-login probe catalog lookup failed for harness %r", harness, exc_info=True
+        )
+        return None
+
+
+def _claude_probe_runs_sdk_cli() -> bool:
+    """Whether the host's Claude probe runs the CLI a ``claude-sdk`` child launches.
+
+    The probe honors ``harness.claude-native`` command and args and a launcher
+    plugin; the SDK child runs ``OMNIGENT_CLAUDE_PATH`` or ``claude`` on ``PATH``
+    without them, so any difference means the cached catalog is another CLI's.
+
+    :returns: ``True`` when both resolve to one executable and the probe adds no args.
+    """
+    from omnigent.claude_launcher import CLAUDE_LAUNCHER_ENV_VAR
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+    from omnigent.inner.claude_sdk_executor import _find_system_claude
+    from omnigent.models.model_catalog_store import binary_identity
+
+    if os.environ.get(CLAUDE_LAUNCHER_ENV_VAR, "").strip():
+        return False
+    cfg = load_effective_config()
+    if resolve_harness_args("claude-native", (), cfg=cfg):
+        return False
+    probe = binary_identity(resolve_harness_command("claude-native", default="claude", cfg=cfg))
+    return probe is not None and probe == binary_identity(_find_system_claude())
+
+
+def _codex_login_probe_listing(spec: object) -> ModelListing | None:
+    """Replay the Codex probe catalog for the SDK worker's own-login launch.
+
+    The child's route, pinned provider and binary come from the spawn env its
+    launch sets over this process's environment, read the way the codex wrap reads
+    them. Any launch provider but a subscription routes the child off its login.
+
+    :param spec: The worker's (sub-)agent spec.
+    :returns: A probe-backed listing, or ``None`` when the launch is rerouted,
+        cannot authenticate, or its catalog is not cached.
+    """
+    from omnigent.harness_startup_config import _harness_path_env_var, resolve_harness_path
+    from omnigent.harnesses.codex_native.app_server import (
+        NativeCodexLaunch,
+        _ambient_builtin_codex_provider,
+        _codex_home_config_source_from_env,
+        _codex_login_usable,
+        codex_catalog_fingerprint,
+    )
+    from omnigent.inner.agent_env import declared_passthrough
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.inner.codex_harness import codex_child_model_provider
+    from omnigent.onboarding.codex_auth_readiness import codex_config_effective_auth
+    from omnigent.runtime.workflow import (
+        _apply_codex_provider_env,
+        _apply_harness_path_override,
+        _resolve_provider_for_build,
+    )
+
+    agent_spec = cast("AgentSpec", spec)
+    launch_entry = _resolve_provider_for_build(agent_spec, harness_type="codex", for_launch=True)
+    if launch_entry is not None and launch_entry.kind != SUBSCRIPTION_KIND:
+        return None
+    spawn_env: dict[str, str] = {}
+    _apply_codex_provider_env(spawn_env, agent_spec, launch_entry)
+    _apply_harness_path_override(spawn_env, "codex")
+    pinned = codex_child_model_provider({**os.environ, **spawn_env})
+    if pinned not in (None, "openai"):
+        return None
+    # Codex lists models without credentials, so judge auth as the CLI sees it.
+    cli_env = _clean_codex_env(declared_passthrough(getattr(spec, "os_env", None)))
+    auth = (
+        "codex-login"
+        if pinned
+        else codex_config_effective_auth(
+            _codex_home_config_source_from_env() / "config.toml", env=cli_env
+        )
+    )
+    if auth != "provider-ready" and not (auth == "codex-login" and _codex_login_usable()):
+        return None
+    if pinned:
+        overrides = [f"model_provider={json.dumps(pinned)}"]
+    else:
+        # The native probe pins the built-in provider config.toml selects; the child
+        # runs that same provider from config.toml, so read the pinned catalog.
+        builtin = _ambient_builtin_codex_provider(None)
+        overrides = [f"model_provider={json.dumps(builtin)}"] if builtin else []
+    launch = NativeCodexLaunch(config_overrides=overrides, model=None, profile=None)
+    # The wrap finds its binary the same way: the spawn env's path, else the env's.
+    codex_path = spawn_env.get(_harness_path_env_var("codex")) or resolve_harness_path("codex")
+    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
+    return _probe_catalog_listing("codex-native", fingerprint, "Codex")
+
+
+def _probe_catalog_listing(harness: str, fingerprint: str, label: str) -> ModelListing | None:
+    """Read one cached native model-probe catalog as a listing.
+
+    :param harness: Native harness keying the store, e.g. ``"codex-native"``.
+    :param fingerprint: The launch fingerprint the probe wrote under.
+    :param label: Human-readable CLI name for the note, e.g. ``"Codex"``.
+    :returns: A ``source="cli"`` listing, or ``None`` on a store miss.
+    """
+    from omnigent.models import model_catalog_store
+
+    rows = model_catalog_store.read_catalog(harness, fingerprint)
+    if rows is None:
+        return None
+    stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
+    model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
+    return ModelListing(
+        source="cli",
+        verified=not stale,
+        models=tuple(
+            ModelEntry(id=model_id, family=model_family_token(model_id)) for model_id in model_ids
+        ),
+        note=(
+            f"cached {label} model probe; catalog needs refreshing"
+            if stale
+            else f"models advertised by the {label} model probe"
         ),
     )
 

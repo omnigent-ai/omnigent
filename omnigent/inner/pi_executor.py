@@ -121,6 +121,9 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
+# A refresh before Pi starts has no Pi deadline to fit, so a helper slowed by a busy
+# host (several agents starting at once) gets room instead of failing the turn.
+_GATEWAY_TURN_AUTH_TIMEOUT_S = 30
 # Tool arguments can include files; match the other adapters' bounded stream limit.
 _TOOL_REQUEST_LIMIT = 16 * 1024 * 1024
 _TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
@@ -136,8 +139,10 @@ class _GatewayAuthError(OSError):
 CodexEvent: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 
-async def _fetch_shell_command_token(command: str) -> str:
+async def _fetch_shell_command_token(command: str, *, timeout_s: float | None = None) -> str:
     """Resolve a token with a deadline, without exposing helper output on failure."""
+    if timeout_s is None:
+        timeout_s = _GATEWAY_AUTH_TIMEOUT_S
     process = await asyncio.create_subprocess_exec(
         "sh",
         "-c",
@@ -148,7 +153,7 @@ async def _fetch_shell_command_token(command: str) -> str:
     )
     try:
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), _GATEWAY_AUTH_TIMEOUT_S)
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout_s)
         except (TimeoutError, asyncio.CancelledError):
             # Children may still hold stdout open after the helper shell exits.
             with contextlib.suppress(ProcessLookupError):
@@ -2513,7 +2518,7 @@ class PiExecutor(Executor):
         if self._gateway_model_wire_apis is not None:
             return self._gateway_model_wire_apis
         if self._gateway:
-            await self._get_gateway_token()
+            await self._get_gateway_token(before_turn=True)
         workspace_url = self._gateway_workspace_url if self._gateway else None
         if workspace_url is None:
             self._gateway_model_entries = ()
@@ -2563,17 +2568,29 @@ class PiExecutor(Executor):
         self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
         return self._tool_server.port
 
-    async def _get_gateway_token(self) -> str:
-        """Refresh expired credentials under a lock; never fall back after failure."""
+    async def _get_gateway_token(self, *, before_turn: bool = False) -> str:
+        """Refresh expired credentials under a lock; never fall back after failure.
+
+        A ``before_turn`` refresh runs before Pi starts and takes the longer budget;
+        the default fits the bridge's answer to Pi inside Pi's command deadline.
+        """
+        if before_turn:
+            helper_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S
+            refresh_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S + 1
+        else:
+            helper_timeout_s = _GATEWAY_AUTH_TIMEOUT_S
+            refresh_timeout_s = _GATEWAY_BRIDGE_TIMEOUT_S
         async with self._gateway_auth_lock:
             if time.monotonic() < self._gateway_refresh_after:
                 return self._databricks_token
             self._gateway_refresh_after = 0.0
             try:
-                async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                async with asyncio.timeout(refresh_timeout_s):
                     if self._gateway_host_override is not None:
                         assert self._gateway_auth_command is not None
-                        token = await _fetch_shell_command_token(self._gateway_auth_command)
+                        token = await _fetch_shell_command_token(
+                            self._gateway_auth_command, timeout_s=helper_timeout_s
+                        )
                     else:
                         creds = await run_sync_on_thread(
                             _read_databrickscfg, self._databricks_profile
@@ -2999,7 +3016,7 @@ class PiExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         if self._gateway:
             try:
-                await self._get_gateway_token()
+                await self._get_gateway_token(before_turn=True)
             except OSError as exc:
                 yield ExecutorError(message=str(exc), retryable=False)
                 return
