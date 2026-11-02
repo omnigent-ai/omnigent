@@ -255,6 +255,19 @@ describe("harnessReadinessOnHost", () => {
     }
   });
 
+  it("keeps a CLI that did not answer its version check selectable", () => {
+    // The host still launches a resolved CLI whose probe timed out.
+    const host = hostWith({ "pi-native": "cli-unresponsive" });
+    expect(harnessReadinessOnHost("pi-native", host)).toMatchObject({
+      state: "available",
+      reason: "cli-unresponsive",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+    expect(harnessUnavailableReasonOnHost("pi-native", host)).toBe("cli-unresponsive");
+    expect(harnessWarningBadgeText("cli-unresponsive")).toBe("not responding");
+  });
+
   it("marks host-wide unavailability as irrelevant to harness fallback", () => {
     expect(
       harnessReadinessOnHost("codex-native", {

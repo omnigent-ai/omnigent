@@ -901,6 +901,14 @@ function harnessWarningMessage(
       </>
     );
   }
+  if (reason === "cli-unresponsive") {
+    return (
+      <>
+        {agentName}&apos;s CLI on {hostName} did not respond to a version check — run it on that
+        machine and finish any setup prompt it shows.
+      </>
+    );
+  }
   return (
     <>
       {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.

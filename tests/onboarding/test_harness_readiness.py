@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 from collections import Counter
@@ -13,7 +14,11 @@ import yaml
 
 import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
+    HARNESS_VERSION_TOO_LOW,
+)
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
     _binary_availability_reason,
@@ -270,6 +275,27 @@ def test_pi_readiness_uses_selected_executable(
         assert harness_is_configured(harness) is (expected is True)
     for harness in ("pi", "pi-native"):
         assert (hi.missing_harness_cli(harness) is None) is (expected is True)
+
+
+def test_unanswered_pi_version_probe_is_not_reported_as_outdated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resolvable Pi launcher that never answers ``--version`` is not an outdated CLI."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    launcher = bindir / "pi"
+    launcher.write_text("#!/bin/sh\nprintf 'Workspace URL > '\nexec sleep 600\n")
+    launcher.chmod(0o755)
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr("omnigent.onboarding.harness_readiness.READINESS_CLI_PROBE_TIMEOUT_S", 2.0)
+
+    assert hi.harness_cli_binary(hi.PI_KEY) == str(launcher)
+    result = configured_harness_map()
+    for harness in ("pi", "pi-native", "native-pi"):
+        assert result[harness] == HARNESS_CLI_UNRESPONSIVE, f"{harness}: {result[harness]!r}"
+    assert harness_is_configured("pi-native") is True
 
 
 def test_auth_aware_native_harness_reports_binary_missing(
@@ -912,6 +938,35 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         assert result[harness] == HARNESS_VERSION_TOO_LOW, (
             f"{harness} should report version-too-low, not binary-missing"
         )
+
+
+def test_timed_out_version_probe_reports_cli_unresponsive_and_passes_launch_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolved CLI whose ``--version`` times out is neither outdated nor missing."""
+    _all_clis_installed(monkeypatch)
+    answered_run = hi.subprocess.run
+
+    def _hanging_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["--version"]:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return answered_run(argv, **kwargs)
+
+    monkeypatch.setattr(hi.subprocess, "run", _hanging_version)
+    result = configured_harness_map()
+    for harness in (
+        "pi",
+        "pi-native",
+        "claude-native",
+        "codex",
+        "opencode-native",
+        "cursor-native",
+        "kiro-native",
+    ):
+        assert result[harness] == HARNESS_CLI_UNRESPONSIVE, f"{harness}: {result[harness]!r}"
+        assert harness_is_configured(harness) is True, harness
+        assert hi.missing_harness_cli(harness) is None, harness
+    assert hi.harness_cli_installed(hi.PI_KEY) is False
 
 
 def test_antigravity_native_requires_credential(

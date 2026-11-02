@@ -1593,7 +1593,7 @@ async def _launch_hosts(
 
 @pytest.mark.asyncio
 async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
-    """Readiness follows the server's launch check; auth is advisory."""
+    """Readiness follows the server's launch check; auth and unresponsive CLIs are advisory."""
     hosts = [
         _host("offline", status="offline", harnesses={"claude-sdk": True}),
         _host("sandbox", sandbox_provider="modal", harnesses={"claude-sdk": True}),
@@ -1602,6 +1602,7 @@ async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
         _host("disabled", harnesses={"claude-sdk": False}),
         _host("absent", harnesses={"codex": True}),
         _host("needs_auth", harnesses={"claude-sdk": "needs-auth"}),
+        _host("unresponsive", harnesses={"claude-sdk": "cli-unresponsive"}),
         _host("ready", harnesses={"claude-sdk": True}),
         _host("unknown", harnesses=None),
         _host("future", harnesses={"claude-sdk": {"state": "future"}}),
@@ -1615,6 +1616,7 @@ async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
         ("disabled", False, "unconfigured"),
         ("absent", False, "unconfigured"),
         ("needs_auth", True, None),
+        ("unresponsive", True, None),
         ("ready", True, None),
         ("unknown", True, None),
         ("future", True, None),

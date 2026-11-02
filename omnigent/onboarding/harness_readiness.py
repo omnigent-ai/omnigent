@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -39,6 +40,7 @@ from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonica
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
@@ -322,12 +324,12 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
     # command) require both the binary AND a stored credential. The ``agy`` CLI
     # falls into this category: it has no ``agy login`` subcommand and writes
     # OAuth creds on the first interactive browser run instead.
-    if availability is not True:
+    if availability is not True and availability != HARNESS_CLI_UNRESPONSIVE:
         return availability
     credential_check = _FAMILY_CREDENTIAL_CHECK.get(install_key)
-    if credential_check is not None:
-        return credential_check()
-    return True
+    if credential_check is not None and not credential_check():
+        return False
+    return availability
 
 
 # Native CLI harnesses that authenticate via their own login command and can
@@ -905,10 +907,17 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     Distinguishes a genuinely missing CLI from a selected executable that is
     outside the version range the native harness requires. The latter is
     exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
-    to upgrade rather than "binary-missing".
+    to upgrade rather than "binary-missing". A resolved executable whose
+    ``--version`` probe times out reports ``"cli-unresponsive"``: its version
+    is unknown, not outdated.
     """
-    if harness_cli_installed(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
-        return True
+    try:
+        if harness_cli_installed(
+            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        ):
+            return True
+    except subprocess.TimeoutExpired:
+        return HARNESS_CLI_UNRESPONSIVE
     if harness_cli_binary(install_key) is not None:
         return HARNESS_VERSION_TOO_LOW
     return HARNESS_BINARY_MISSING
@@ -919,6 +928,7 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
     :returns: ``"binary-missing"`` when the CLI isn't installed,
         ``"version-too-low"`` when the CLI is present but too old,
+        ``"cli-unresponsive"`` when its version probe timed out,
         ``"needs-auth"`` when installed but neither a configured provider
         credential nor a CLI login is present, else ``True``.
     """
@@ -1013,7 +1023,8 @@ def harness_is_configured(harness: str) -> bool:
 
     The check is binary-only: an installed-but-not-logged-in CLI still
     returns ``True`` because auth failures surface at run time rather than
-    blocking dispatch.
+    blocking dispatch. A resolved CLI whose ``--version`` probe timed out
+    also returns ``True``; the launch, not this probe, reports a real failure.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
         ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
@@ -1022,7 +1033,13 @@ def harness_is_configured(harness: str) -> bool:
         daemon doesn't gate); ``False`` when the binary is missing or on
         an unsupported version.
     """
-    return _harness_availability_core(harness) is True
+    availability = _harness_availability_core(harness)
+    if availability == HARNESS_CLI_UNRESPONSIVE:
+        _logger.warning(
+            "harness %r CLI did not respond to --version; launching unverified", harness
+        )
+        return True
+    return availability is True
 
 
 def _is_codex_family_harness(canonical: str) -> bool:
