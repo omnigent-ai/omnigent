@@ -184,6 +184,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _build_session_list_item,
     _build_session_response,
     _cancel_pending_archive_stop,
+    _children_dispatched_in_copied_history,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
     _ensure_native_terminal_ready,
@@ -192,9 +193,11 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
+    _persist_fork_running_subagents_note,
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _running_child_conversations,
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
@@ -3854,7 +3857,17 @@ def register_core_routes(
         top-level conversation (no parent, its own spawn-tree root, its
         own owner grant), so it appears in the sidebar and outlives the
         parent. The source keeps running under its parent untouched,
-        and the fork does not adopt the source's own children.
+        and the fork does not adopt the source's own children. Children
+        still in flight when the source is forked therefore keep
+        reporting to the source; the fork's copied history then ends
+        with a hidden agent note and a visible info notice naming them
+        and the source, so neither the user nor the fork's agent waits
+        on results that go to the source's inbox. Only children created
+        no later than the fork's newest copied item are named; a child
+        dispatched and finished entirely during the copy is not, and a
+        native CLI that first resumes a copy of the source's own
+        transcript sees the hidden note only once its transcript is
+        rebuilt from the fork's items.
 
         ``body.host_type: "managed"`` gives the fork its own
         server-provisioned sandbox instead of leaving it unbound for the
@@ -4307,6 +4320,21 @@ def register_core_routes(
                     _delete_stored_session_bundle_after_failure, artifact_store, clone_location
                 )
 
+        # Read the source's in-flight sub-agents before copying its history: one
+        # that finishes during the copy still reported to the source, and the
+        # fork's copied receipt for it still needs the notice appended below.
+        try:
+            running_children = await asyncio.to_thread(
+                _running_child_conversations, source_id, conversation_store
+            )
+        except Exception:
+            running_children = []
+            _logger.warning(
+                "failed to list the running sub-agents of session %s before forking it",
+                source_id,
+                exc_info=True,
+            )
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -4421,6 +4449,46 @@ def register_core_routes(
                         source_id,
                         exc_info=True,
                     )
+
+        # Re-list after the copy too: a child dispatched during it has its receipt
+        # in the fork as well (one that also finished within the copy is missed; its
+        # result still reaches the source). A failed re-list keeps the pre-copy set.
+        try:
+            known_children = {child.id for child in running_children}
+            running_children.extend(
+                child
+                for child in await asyncio.to_thread(
+                    _running_child_conversations, source_id, conversation_store
+                )
+                if child.id not in known_children
+            )
+        except Exception:
+            _logger.warning(
+                "failed to re-list the running sub-agents of session %s after forking it",
+                source_id,
+                exc_info=True,
+            )
+        # Best-effort like the file rows above: the fork already exists, so a
+        # failed notice must not orphan it.
+        if running_children:
+            try:
+                noted_children = await asyncio.to_thread(
+                    _children_dispatched_in_copied_history,
+                    new_conv.id,
+                    running_children,
+                    conversation_store,
+                )
+                if noted_children:
+                    await _persist_fork_running_subagents_note(
+                        new_conv.id, source_id, noted_children, conversation_store
+                    )
+            except Exception:
+                _logger.warning(
+                    "failed to note the running sub-agents of session %s in fork %s",
+                    source_id,
+                    new_conv.id,
+                    exc_info=True,
+                )
 
         # Grant ownership BEFORE scheduling the managed launch, mirroring
         # both create paths: a managed-guard failure (misconfigured server,

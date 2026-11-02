@@ -1,5 +1,6 @@
 import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
 import { StrictMode } from "react";
@@ -27,6 +28,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
+import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import {
   checkHostDirectory,
@@ -63,6 +65,12 @@ vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
+// Keep the real query-key factory so the on-open invalidation is asserted
+// against the cache entry production actually targets.
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: vi.fn(),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -98,12 +106,37 @@ const useHostsMock = vi.mocked(useHosts);
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useSessionMock = vi.mocked(useSession);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
+const useChildSessionsMock = vi.mocked(useChildSessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
 const hostDirectoryMissingMock = vi.mocked(hostDirectoryMissing);
 const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
 const toastMock = vi.mocked(toast);
+
+/** A fully typed child row; mocks override only the fields a test is about. */
+function childSession(overrides: Partial<ChildSessionInfo> & { id: string }): ChildSessionInfo {
+  return {
+    title: null,
+    task_summary: null,
+    tool: null,
+    session_name: null,
+    labels: {},
+    current_task_status: null,
+    last_task_error: null,
+    busy: false,
+    last_message_preview: null,
+    pending_elicitations_count: 0,
+    routed_model: null,
+    ...overrides,
+  };
+}
+
+function childSessionsResult(
+  overrides: Partial<ReturnType<typeof useChildSessions>> = {},
+): ReturnType<typeof useChildSessions> {
+  return { children: [], isLoading: false, isFetching: false, error: null, ...overrides };
+}
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -307,6 +340,7 @@ beforeEach(() => {
     typeof useDirectorySessions
   >);
   useRunnerHealthMock.mockReturnValue(new Map());
+  useChildSessionsMock.mockReturnValue(childSessionsResult());
   useHostFilesystemMock.mockReturnValue({
     data: undefined,
     isLoading: false,
@@ -1021,6 +1055,113 @@ describe("ForkSessionDialog", () => {
     const sameOption = screen.getByTestId("fork-session-agent-option-same");
     expect(sameOption).toHaveTextContent("Claude");
     expect(sameOption).toHaveTextContent("(same as original session)");
+  });
+
+  it("warns up front when the source still has sub-agents running", () => {
+    // Running children stay with the original, so the user must learn before
+    // cloning that their results will not reach the clone.
+    useChildSessionsMock.mockReturnValue(
+      childSessionsResult({
+        children: [
+          childSession({ id: "conv_worker", title: "worker:long-task", busy: true }),
+          childSession({ id: "conv_done", title: "worker:done", busy: false }),
+        ],
+        error: null,
+      }),
+    );
+    const { invalidateSpy } = renderDialog({ sourceTitle: "My session" });
+
+    // Every child is requested, not the server's default first page.
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_src", null, {
+      limit: 1000,
+      allPages: true,
+    });
+    // A cached list can predate a child's turn start, so opening refetches it.
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "conv_src", "child_sessions"],
+    });
+    const hint = screen.getByTestId("fork-session-subagent-hint");
+    expect(hint).toHaveTextContent("1 sub-agent is still running");
+    expect(hint).toHaveTextContent("stays with the original session");
+  });
+
+  it("counts several running sub-agents in the warning", () => {
+    useChildSessionsMock.mockReturnValue(
+      childSessionsResult({
+        children: [
+          childSession({ id: "conv_a", title: "worker:a", busy: true }),
+          childSession({ id: "conv_b", title: "worker:b", busy: true }),
+        ],
+        error: null,
+      }),
+    );
+    renderDialog({ sourceTitle: "My session" });
+
+    expect(screen.getByTestId("fork-session-subagent-hint")).toHaveTextContent(
+      "2 sub-agents are still running",
+    );
+  });
+
+  it("shows the sub-agent check as pending while the child list loads", () => {
+    // An unresolved fetch is not "no running children": the user sees the
+    // check is still running instead of a silently absent warning.
+    useChildSessionsMock.mockReturnValue(
+      childSessionsResult({
+        children: [],
+        isLoading: true,
+        error: null,
+      }),
+    );
+    renderDialog({ sourceTitle: "My session" });
+
+    expect(screen.getByTestId("fork-session-subagent-check-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-subagent-hint")).not.toBeInTheDocument();
+  });
+
+  it("keeps the sub-agent check pending while a cached list refetches", () => {
+    // Reopening the dialog refetches the cached list; until that finishes, the
+    // stale list is still shown but flagged as being re-checked.
+    useChildSessionsMock.mockReturnValue(
+      childSessionsResult({
+        children: [childSession({ id: "conv_worker", title: "worker:long-task", busy: true })],
+        isFetching: true,
+      }),
+    );
+    renderDialog({ sourceTitle: "My session" });
+
+    expect(screen.getByTestId("fork-session-subagent-check-pending")).toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-subagent-hint")).toHaveTextContent(
+      "1 sub-agent is still running",
+    );
+  });
+
+  it("says so when the running sub-agent check itself fails", () => {
+    // A failed child fetch must not silently drop the warning the dialog exists
+    // to give; the user is told the check could not run.
+    useChildSessionsMock.mockReturnValue(
+      childSessionsResult({
+        children: [],
+        error: new Error("503 Service Unavailable"),
+      }),
+    );
+    renderDialog({ sourceTitle: "My session" });
+
+    expect(screen.getByTestId("fork-session-subagent-check-failed")).toHaveTextContent(
+      "Couldn't check whether sub-agents are still running",
+    );
+    expect(screen.queryByTestId("fork-session-subagent-hint")).not.toBeInTheDocument();
+  });
+
+  it("shows no sub-agent warning when every child has finished", () => {
+    useChildSessionsMock.mockReturnValue(
+      childSessionsResult({
+        children: [childSession({ id: "conv_done", title: "worker:done", busy: false })],
+        error: null,
+      }),
+    );
+    renderDialog({ sourceTitle: "My session" });
+
+    expect(screen.queryByTestId("fork-session-subagent-hint")).not.toBeInTheDocument();
   });
 
   describe("missing workspace recovery", () => {
