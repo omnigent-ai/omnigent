@@ -36,6 +36,20 @@ describe("shared composer controls", () => {
     );
     expect(screen.getByTestId("workspace-bar")).not.toHaveClass("items-start", "pt-1.5");
     expect(screen.getByRole("button", { name: "This machine" })).toHaveClass("w-11", "md:h-7");
+    expect(screen.queryByTestId("composer-host-status")).toBeNull();
+  });
+
+  it.each([
+    ["offline", true],
+    ["online", false],
+    ["unknown", false],
+    [undefined, false],
+  ] as const)("renders the offline outline for host status %s", (status, hasIndicator) => {
+    render(<ComposerHostTrigger label="This machine" status={status} />);
+    const indicator = screen.queryByTestId("composer-host-status");
+    if (hasIndicator) expect(indicator).toHaveClass("border-[1.5px]", "border-muted-foreground");
+    else expect(indicator).toBeNull();
+    expect(screen.getByRole("button", { name: "This machine" })).toBeInTheDocument();
   });
 
   it("lets workspace labels use half the bar instead of a fixed pixel cap", () => {
@@ -56,13 +70,13 @@ describe("shared composer controls", () => {
     }
   });
 
-  it("renders a product-icon model trigger instead of a separate settings gear", () => {
+  it("renders an optional warning icon with the model trigger", () => {
     render(
       <ComposerHarnessTrigger
         label="Codex configuration"
         model="GPT-5.6-Sol"
         effort="High"
-        icon={<span data-testid="product-icon" />}
+        icon={<span data-testid="warning-icon" />}
       />,
     );
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
@@ -78,7 +92,7 @@ describe("shared composer controls", () => {
       "GPT-5.6-Sol",
     );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
-    expect(screen.getByTestId("product-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("warning-icon")).toBeInTheDocument();
     expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
       COMPOSER_COLLAPSED_LABEL_CLASS,
     );

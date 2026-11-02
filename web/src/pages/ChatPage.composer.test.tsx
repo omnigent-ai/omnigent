@@ -43,6 +43,7 @@ import { ApiError } from "@/lib/sessionsApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -2173,6 +2174,8 @@ describe("Composer model/effort label", () => {
     );
     expect(label()).toHaveTextContent("Opus");
     expect(label()).toHaveTextContent("High");
+    expect(label()).not.toHaveClass(COMPOSER_COLLAPSED_LABEL_CLASS);
+    expect(screen.getByTestId("composer-config-gear").querySelector("img")).toBeNull();
     // The harness identity ("Claude") is NOT in the label — it lives in the gear tooltip.
     expect(label()).not.toHaveTextContent("Claude");
     // Model black, effort grey.
@@ -2693,7 +2696,7 @@ describe("Composer shared visible controls", () => {
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
-    expect(trigger.querySelector("img")).toBeTruthy();
+    expect(trigger.querySelector("img")).toBeNull();
     expect(trigger.querySelector(".lucide-settings")).toBeNull();
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();

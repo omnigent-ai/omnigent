@@ -1194,7 +1194,6 @@ export function AgentHarnessPicker({
   triggerTooltipRows,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
   modelCatalogAvailability,
-  triggerIcon,
   selectedConfigContent,
   isEntryConfigurable,
   entrySummaries,
@@ -1264,8 +1263,6 @@ export function AgentHarnessPicker({
    * no known catalog because lookup is disabled or still loading; omit it for
    * consumers without catalog state. */
   modelCatalogAvailability?: ModelCatalogAvailability;
-  /** Harness glyph rendered before the joined model / effort label. */
-  triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
   selectedConfigContent?: ReactNode;
   /** Whether an entry has model settings or a configurable agent harness. */
@@ -1753,27 +1750,14 @@ export function AgentHarnessPicker({
             ? (visibleCachedPreview?.effort ?? triggerSecondaryText)
             : undefined,
         icon:
-          disabledLabel !== undefined ? undefined : selectedUnavailable ? (
+          disabledLabel === undefined && selectedUnavailable ? (
             <span
               className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
               data-testid="new-chat-landing-agent-warning"
             >
               <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
             </span>
-          ) : visibleCachedPreview ? (
-            <span
-              className="flex size-4 shrink-0 items-center justify-center"
-              data-testid="new-chat-landing-agent-icon"
-            >
-              {visibleCachedPreview.smartRouting ? (
-                <WandSparklesIcon className="size-4" aria-hidden="true" />
-              ) : (
-                <ComposerAgentIcon agent={visibleCachedPreview.agent} />
-              )}
-            </span>
-          ) : (
-            triggerIcon
-          ),
+          ) : undefined,
         className: cn(
           triggerClassName,
           (loading || disabledLabel !== undefined) && "disabled:opacity-100",
@@ -7306,20 +7290,6 @@ export function NewChatLandingScreen() {
                         }
                         triggerDetails={harnessTriggerDetails}
                         modelCatalogAvailability={modelCatalogAvailability}
-                        triggerIcon={
-                          selectedAgent ? (
-                            <span
-                              className="flex size-4 shrink-0 items-center justify-center"
-                              data-testid="new-chat-landing-agent-icon"
-                            >
-                              {smartRoutingHarnessSelected ? (
-                                <WandSparklesIcon className="size-4" aria-hidden="true" />
-                              ) : (
-                                <ComposerAgentIcon agent={selectedAgent} />
-                              )}
-                            </span>
-                          ) : null
-                        }
                         selectedConfigContent={selectedConfigContent}
                         isEntryConfigurable={isEntryConfigurable}
                         entrySummaries={pickerEntrySummaries}

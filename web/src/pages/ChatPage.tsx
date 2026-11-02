@@ -260,7 +260,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
-import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
+import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
@@ -4275,12 +4275,6 @@ function ComposerImpl(
                   busy={configBusy}
                   busyRef={configBusyRef}
                   setBusy={setConfigBusy}
-                  agentName={
-                    subAgentName ??
-                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                    agents?.[0]?.name ??
-                    null
-                  }
                   harnessLabel={harnessLabel}
                   showModels={showModels}
                   showEffort={showEffort}
@@ -4696,7 +4690,6 @@ function SessionHarnessPicker({
   busy,
   busyRef,
   setBusy,
-  agentName,
   harnessLabel,
   showModels,
   showEffort,
@@ -4717,7 +4710,6 @@ function SessionHarnessPicker({
   busy: boolean;
   busyRef: { current: boolean };
   setBusy: (busy: boolean) => void;
-  agentName: string | null;
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
@@ -4759,7 +4751,6 @@ function SessionHarnessPicker({
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
-  const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
   const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
   const selectedEffort = useSessionEffort();
@@ -4786,10 +4777,6 @@ function SessionHarnessPicker({
   const nativeAgent =
     nativeCodingAgentForHarness(sessionHarness) ??
     (modelPickerKind ? nativeCodingAgentForHarness(modelPickerKind + "-native") : undefined);
-  const iconAgent = {
-    name: nativeAgent?.agentName ?? agentName ?? subAgentName ?? "",
-    harness: nativeAgent?.harness ?? sessionHarness,
-  };
   const summary = useSessionConfigSummary({
     harnessLabel,
     showModels,
@@ -5146,7 +5133,6 @@ function SessionHarnessPicker({
         label: "Configure session",
         model: label,
         effort: effortLabel ?? undefined,
-        icon: <ComposerAgentIcon agent={iconAgent} />,
         disabled: busy || !configurable,
         "aria-disabled": disabled || busy || !configurable,
         className: disabled ? "cursor-default opacity-50" : undefined,

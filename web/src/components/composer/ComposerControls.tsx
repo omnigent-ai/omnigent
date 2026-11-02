@@ -132,14 +132,11 @@ export const ComposerHostTrigger = forwardRef<
       {...props}
     >
       <span className="flex items-center">
-        {status && (
+        {status === "offline" && (
           <span className="flex size-4 shrink-0 items-center justify-center">
             <span
               aria-hidden
-              className={cn(
-                "size-2 rounded-full",
-                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-              )}
+              className="size-2 rounded-full border-[1.5px] border-muted-foreground"
               data-testid={`${testIdPrefix}-host-status`}
             />
           </span>

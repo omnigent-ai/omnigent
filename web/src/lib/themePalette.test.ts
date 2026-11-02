@@ -198,6 +198,20 @@ describe("themePalette", () => {
     expect(omni.tokens.dark.primary).toBe("#df3c85");
   });
 
+  it("uses magenta links with neutral support controls in Omnigent", () => {
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    for (const mode of ["light", "dark"] as const) {
+      const tokens = omni.tokens[mode];
+      const [red, green, blue] = parseColor(tokens.link).rgb;
+      expect(red).toBeGreaterThan(blue);
+      expect(blue).toBeGreaterThan(green);
+      const accent = parseColor(tokens.accent).rgb;
+      expect(Math.max(...accent) - Math.min(...accent)).toBeLessThanOrEqual(8);
+      expect(contrast(parseColor(tokens.accentForeground).rgb, accent)).toBeGreaterThanOrEqual(4.5);
+      expect(tokens.sidebarPrimary).toBe("var(--link)");
+    }
+  });
+
   it.each(PALETTES)("keeps $label links readable on page and table surfaces", (palette) => {
     for (const mode of ["light", "dark"] as const) {
       const { link, background, cardSolid } = palette.tokens[mode];
@@ -223,10 +237,31 @@ describe("themePalette", () => {
     expect(github.tokens.dark.primary).toBe("#58a6ff");
   });
 
-  it.each(PALETTES)("drives $label active sidebar colors from its accent", (palette) => {
+  it.each(PALETTES.filter((palette) => palette.id !== "omni"))(
+    "drives $label active sidebar colors from its accent",
+    (palette) => {
+      for (const mode of ["light", "dark"] as const) {
+        expect(palette.tokens[mode].sidebarActive).toContain("var(--primary)");
+        expect(palette.tokens[mode].sidebarActiveForeground).toBe("var(--primary)");
+      }
+    },
+  );
+
+  it("keeps the Omnigent active sidebar row subtle and readable in both modes", () => {
+    const omni = PALETTES[0];
     for (const mode of ["light", "dark"] as const) {
-      expect(palette.tokens[mode].sidebarActive).toContain("var(--primary)");
-      expect(palette.tokens[mode].sidebarActiveForeground).toBe("var(--primary)");
+      const tokens = omni.tokens[mode];
+      const weight = /var\(--brand-accent\) (\d+)%/.exec(tokens.sidebarActive);
+      expect(weight).not.toBeNull();
+      const activeBackground = composite(
+        { rgb: parseColor(tokens.brandAccent).rgb, alpha: Number(weight![1]) / 100 },
+        parseColor(tokens.sidebar).rgb,
+      );
+      expect(Number(weight![1])).toBeLessThan(12);
+      expect(tokens.sidebarActiveForeground).toBe("var(--sidebar-foreground)");
+      expect(
+        contrast(parseColor(tokens.sidebarForeground).rgb, activeBackground),
+      ).toBeGreaterThanOrEqual(4.5);
     }
   });
 

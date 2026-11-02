@@ -330,6 +330,9 @@ describe("HostBadge", () => {
       useSessionHostOnlineMock.mockReturnValue(online);
       render(<HostBadge sessionId="conv_1" appearance="composer" />);
       const trigger = screen.getByTestId("composer-host-select");
+      const indicator = screen.queryByTestId("composer-host-status");
+      if (online === false) expect(indicator).toHaveClass("border-muted-foreground");
+      else expect(indicator).toBeNull();
       // The styled tooltip replaces the native title hover.
       expect(trigger).not.toHaveAttribute("title");
       fireEvent.focus(trigger);
@@ -734,7 +737,7 @@ describe("HostBadge during a sandbox launch", () => {
     rerender(<HostBadge sessionId="conv_1" appearance="composer" />);
     expect(trigger).toHaveAccessibleName("Host Modal Sandbox, online");
     expect(screen.getByTestId("composer-host-icon")).toHaveClass("lucide-monitor-cloud");
-    expect(screen.getByTestId("composer-host-status")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-host-status")).not.toBeInTheDocument();
   });
 
   it("shows a resolved host rather than an earlier failed launch", () => {

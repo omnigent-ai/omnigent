@@ -186,7 +186,9 @@ describe("ChatComposer", () => {
 
   it("preserves interrupt and pending-creation states", () => {
     const { rerender } = render(<ComposerSendButton label="Interrupt" interrupt />);
-    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+    const interrupt = screen.getByRole("button", { name: "Interrupt" });
+    expect(interrupt).toBeEnabled();
+    expect(interrupt.querySelector(".lucide-square")).toBeInTheDocument();
     rerender(<ComposerSendButton label="Starting session" busy disabled />);
     expect(screen.getByRole("button", { name: "Starting session" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Starting session" })).toHaveAttribute(
@@ -196,13 +198,18 @@ describe("ChatComposer", () => {
   });
 
   it("keeps an enabled send action independent from the theme accent", () => {
-    render(<ComposerSendButton label="Send" />);
-    expect(screen.getByRole("button", { name: "Send" })).toHaveClass(
-      "bg-primary-cta",
-      "text-primary-cta-foreground",
-      "disabled:bg-muted",
-      "disabled:text-muted-foreground",
-    );
+    const { rerender } = render(<ComposerSendButton label="Send" />);
+    for (const label of ["Send", "Interrupt"]) {
+      const button = screen.getByRole("button", { name: label });
+      expect(button).toHaveClass(
+        "bg-primary-cta",
+        "text-primary-cta-foreground",
+        "hover:opacity-80",
+        "disabled:bg-muted",
+        "disabled:text-muted-foreground",
+      );
+      if (label === "Send") rerender(<ComposerSendButton label="Interrupt" interrupt />);
+    }
   });
 
   it("uses the same button size in send and interrupt states", () => {
