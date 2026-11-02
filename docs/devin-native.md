@@ -153,8 +153,8 @@ the executor declares `supports_live_message_queue()`.
   own chain carries no `agent_id`.
 * **Permission mode has two channels.** The New Chat dialog pins Devin's own
   rungs (normal / accept-edits / smart / dangerous) as `terminal_launch_args`,
-  because the create-time `permission_mode` *field* is still hard-gated to
-  `claude-native` (`_PERMISSION_MODE_HARNESS` in
+  because the create-time `permission_mode` *field* is gated to a per-harness
+  allowlist with no `devin-native` entry (`_HARNESS_LAUNCH_PERMISSION_MODES` in
   `server/routes/_session_create_validation.py`). Mid-session, the composer
   control cycles the mode in the TUI (`inject_permission_mode` presses Shift+Tab
   and re-reads the composer marker), so the stored mode is always the one the

@@ -109,6 +109,59 @@ CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
 # ``--permission-mode`` there would be an unknown flag that breaks the launch.
 _PERMISSION_MODE_HARNESS = "claude-native"
 
+_CODEX_NATIVE_HARNESS = "codex-native"
+
+# The cross-harness spelling for "start with no approval prompts at all". Each
+# native CLI names the stance differently, so the mode is translated per harness
+# rather than passed through; ``_derive_terminal_launch_args_from_spec`` already
+# reads it this way for antigravity-native.
+FULL_BYPASS_PERMISSION_MODE = "bypassPermissions"
+
+# Which ``permission_mode`` values each harness can actually launch with.
+# claude-native takes its whole vocabulary verbatim. codex-native has no graded
+# equivalent of ``acceptEdits`` / ``plan``, so it admits only the explicit
+# full-bypass opt-in; accepting a Claude-only mode and then ignoring it would
+# leave an unattended task prompting with nothing to say so.
+_HARNESS_LAUNCH_PERMISSION_MODES: dict[str, frozenset[str]] = {
+    _PERMISSION_MODE_HARNESS: CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES,
+    _CODEX_NATIVE_HARNESS: frozenset({FULL_BYPASS_PERMISSION_MODE}),
+}
+
+
+def permission_mode_launch_args(
+    *, harness: str | None, permission_mode: str | None
+) -> list[str] | None:
+    """
+    Translate a task's ``permission_mode`` into one harness's launch args.
+
+    Shared by the persist-time gate
+    (:func:`validate_permission_mode_agent_support`) and the scheduled-fire
+    launch-arg derivation so the two cannot disagree about which combinations
+    are supported: whatever this returns ``None`` for is what the gate rejects.
+
+    - ``claude-native`` -> ``["--permission-mode", <mode>]``, verbatim, so the
+      graded modes keep working.
+    - ``codex-native`` + ``bypassPermissions`` ->
+      ``["--dangerously-bypass-approvals-and-sandbox"]``, Codex's own
+      non-interactive stance. This is the same flag a headless codex worker
+      already receives through ``terminal_launch_args``.
+
+    :param harness: Canonical harness id, or ``None`` when it could not be
+        resolved.
+    :param permission_mode: The task's persisted mode, or ``None`` for the
+        agent's own default.
+    :returns: Launch args to append to the native CLI's argv, or ``None`` when
+        the combination carries no flag — an unset mode, an unresolved harness,
+        or a mode that harness cannot launch with.
+    """
+    if permission_mode is None or harness is None:
+        return None
+    if permission_mode not in _HARNESS_LAUNCH_PERMISSION_MODES.get(harness, frozenset()):
+        return None
+    if harness == _CODEX_NATIVE_HARNESS:
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return ["--permission-mode", permission_mode]
+
 
 async def validate_permission_mode_agent_support(
     *,
@@ -116,21 +169,24 @@ async def validate_permission_mode_agent_support(
     agent: Any,
     agent_cache: AgentCache | None,
 ) -> None:
-    """Reject a ``permission_mode`` on an agent whose harness has no such flag.
+    """Reject a ``permission_mode`` the agent's harness cannot launch with.
 
     Mirrors the web dialog's capability gate on the server so the REST endpoint
-    and agent tools enforce the same rule the UI does: only a ``claude-native``
-    agent may carry a ``permission_mode``. Without this, a task on a codex /
-    cursor agent could persist a mode the fire path would inject as an unknown
-    ``--permission-mode`` flag, breaking the launch.
+    and agent tools enforce the same rule the UI does. Supported combinations
+    are whatever :func:`permission_mode_launch_args` can translate: a
+    ``claude-native`` agent may carry its whole vocabulary, and a
+    ``codex-native`` agent may carry the explicit ``bypassPermissions`` opt-in
+    that an unattended scheduled run needs. Without this, a task could persist a
+    mode the fire path would inject as a flag its CLI doesn't know, breaking the
+    launch.
 
     This is an early, friendly 4xx at persist time. A ``None`` mode is always
     allowed (nothing to gate). When the harness cannot be resolved (no bundle /
     cache / a load error), this is a no-op rather than a rejection: the value has
     already passed the vocabulary allowlist, and the fire path's launch-arg
-    derivation is itself harness-gated fail-safe (it injects ``--permission-mode``
-    ONLY for a confirmed ``claude-native`` agent, omitting it otherwise), so a
-    non-Claude mode can never actually reach the launch args regardless.
+    derivation is itself harness-gated fail-safe (it derives args only for a
+    confirmed harness/mode pair, omitting them otherwise), so an unsupported
+    mode can never actually reach the launch args regardless.
     """
     if permission_mode is None or agent is None:
         return
@@ -150,12 +206,20 @@ async def validate_permission_mode_agent_support(
         # don't turn an unrelated load error into a permission_mode rejection.
         _logger.exception("Failed to load agent spec for permission_mode gating")
         return
-    if harness != _PERMISSION_MODE_HARNESS:
+    if permission_mode_launch_args(harness=harness, permission_mode=permission_mode) is not None:
+        return
+    supported = _HARNESS_LAUNCH_PERMISSION_MODES.get(harness or "")
+    if supported is None:
         raise OmnigentError(
-            f"permission_mode is only supported for {_PERMISSION_MODE_HARNESS} agents, "
-            f"not {harness!r}",
+            f"permission_mode is not supported for {harness!r} agents "
+            f"(supported: {sorted(_HARNESS_LAUNCH_PERMISSION_MODES)})",
             code=ErrorCode.INVALID_INPUT,
         )
+    raise OmnigentError(
+        f"permission_mode {permission_mode!r} is not supported for {harness!r} agents "
+        f"(supported: {sorted(supported)})",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 def validate_session_permission_mode(permission_mode: str | None) -> str | None:

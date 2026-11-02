@@ -1097,16 +1097,16 @@ async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri:
     assert resp.status_code == 422, resp.text
 
 
-async def test_create_rejects_permission_mode_for_non_claude_agent(
+async def test_create_rejects_claude_only_permission_mode_for_codex_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A valid mode on a non-Claude agent is rejected (server capability gate).
+    """A Claude-only mode on a codex agent is rejected (server capability gate).
 
-    The web dialog only shows the permission control for Claude Code; the server
-    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
-    fire path would inject as an unknown ``--permission-mode`` flag. The value
-    itself is a valid Claude mode — the rejection is purely about the agent's
-    harness.
+    The server gates the field to the modes each harness can actually launch
+    with, so a task can't persist a mode the fire path would have to drop. The
+    value itself is a valid Claude mode — the rejection is purely about codex
+    having no graded equivalent, and accepting-then-ignoring it would leave an
+    unattended task prompting with nothing to say so.
     """
     from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
@@ -1121,6 +1121,34 @@ async def test_create_rejects_permission_mode_for_non_claude_agent(
     )
     assert resp.status_code == 400, resp.text
     assert "permission_mode" in resp.text
+
+
+async def test_create_persists_bypass_permission_mode_for_codex_agent(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A codex task may opt into the explicit bypass so unattended fires run.
+
+    This is the one mode codex accepts: it maps to Codex's own
+    ``--dangerously-bypass-approvals-and-sandbox`` stance at fire time, which is
+    what stops a scheduled run stalling on a file-change approval.
+    """
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
+            permission_mode="bypassPermissions",
+        ),
+        headers=_headers(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["permission_mode"] == "bypassPermissions"
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{resp.json()['id']}", headers=_headers())
+    assert got.status_code == 200, got.text
+    assert got.json()["permission_mode"] == "bypassPermissions"
 
 
 async def test_update_clears_permission_mode_with_explicit_null(
