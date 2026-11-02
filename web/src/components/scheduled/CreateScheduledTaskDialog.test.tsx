@@ -1964,7 +1964,8 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
-    const editedPrompt = prompt.value;
+    const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
+    fireEvent.change(prompt, { target: { value: editedPrompt } });
     expect(await submittedPrompt()).toBe(editedPrompt);
     expect(mutateAsync.mock.calls[0][0].templateId).toBe("github");
   });

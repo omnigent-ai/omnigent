@@ -660,6 +660,17 @@ investigating these cases; they do not replace a durable delivery ledger.
 `interrupted`, `unfinished`, or `cancelled`. `recovered` outcomes are `running`,
 `succeeded`, `failed`, `uncertain`, `superseded`, `timeout`, or `error`.
 
+`scheduled_task_operation_failed.operation` is `poll`, `initialize`, `claim`,
+`recovery`, `cleanup`, or `lease_renewal`. Claim failures and single-task
+initialization failures include `task_id` and `task_workspace_id`; failed scans
+and ownership lookups have neither.
+
+Scheduler claim, session-attachment, and startup delays measure from the scheduled
+time to when recording the step was requested, excluding the corresponding
+database write time. The newer prompt-delivery delay measures the successful
+dispatch return described above. A startup cancelled before its first step emits
+no `startup_ended`; recovery records its outcome later.
+
 Startup and delivery are separate boundaries. A managed startup ends when the
 sandbox binds, before its prompt is sent. The older `prompt_delay_seconds` field
 on `startup_ended` remains for compatibility; it measures that startup boundary.

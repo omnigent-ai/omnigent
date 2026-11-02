@@ -510,6 +510,12 @@ describe("template prefill", () => {
     expect(dialog.getAttribute("data-initial-name")).toBe("Jira tickets");
     expect(dialog.getAttribute("data-initial-trigger")).toBe("jira");
     expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+    expect(dialog).toHaveAttribute("data-initial-template", "jira");
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "tasks.template.jira",
+      componentKind: "button",
+    });
   });
 
   it("reseeds from another card after closing, and starts manual creation empty", () => {

@@ -674,6 +674,7 @@ async def test_midturn_message_not_double_delivered_to_harness(
                 repeated = await client.post(
                     f"/v1/sessions/{sid}/events", json=message("second"), headers=headers(runs[1])
                 )
+                assert repeated.status_code == 202
                 assert repeated.json()["status"] == "duplicate"
             finally:
                 gate.set()

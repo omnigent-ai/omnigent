@@ -97,42 +97,6 @@ class _HeartbeatStreamResponse:
         yield "data: [DONE]\n\n"
 
 
-class _HeartbeatRunnerClient:
-    """
-    Fake runner client whose stream emits a ready heartbeat.
-
-    :param release: Event that lets the fake response finish.
-    """
-
-    def __init__(self, release: asyncio.Event) -> None:
-        """
-        Initialize the fake runner client.
-
-        :param release: Event used to unblock the stream tail.
-        """
-        self._release = release
-        self.stream_calls: list[tuple[str, str, Any]] = []
-
-    def stream(
-        self,
-        method: str,
-        path: str,
-        *,
-        timeout: Any,
-    ) -> _HeartbeatStreamResponse:
-        """
-        Return the scripted streaming response.
-
-        :param method: HTTP method, e.g. ``"GET"``.
-        :param path: Request path, e.g.
-            ``"/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/stream"``.
-        :param timeout: Timeout object passed by the relay.
-        :returns: Fake streaming response.
-        """
-        self.stream_calls.append((method, path, timeout))
-        return _HeartbeatStreamResponse(self._release)
-
-
 @pytest.mark.asyncio
 async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     """
