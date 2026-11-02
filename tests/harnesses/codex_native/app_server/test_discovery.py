@@ -342,6 +342,7 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models import model_catalog_store
 
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     ambient = NativeCodexLaunch(
