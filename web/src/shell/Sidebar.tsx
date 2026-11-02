@@ -216,7 +216,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
-import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -318,14 +319,16 @@ import {
   newSessionAriaShortcut,
   newSessionShortcutKeys,
   PIN_SESSION_KEYS,
+  sessionNumberAriaShortcut,
+  sessionNumberShortcutKeys,
 } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
 // + kebab take its place; on mobile those controls are gone, so the badge holds
-// that edge.
+// that edge. A held pinned-row shortcut hint fades it the same way.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -1226,10 +1229,7 @@ function SidebarImpl({
                     )}
                   />
                   New session
-                  <CompactShortcutKeys
-                    keys={newSessionShortcutKeys()}
-                    className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px] [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
-                  />
+                  <NewSessionShortcutHint />
                 </Link>
               </Button>
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
@@ -1456,6 +1456,7 @@ function ProjectFolder({
   active,
   onToggleCollapsed,
   pinnedConversationIds,
+  sessionShortcutSlots,
   activeOverride,
   frozenSortKeys,
   onRowClick,
@@ -1493,6 +1494,8 @@ function ProjectFolder({
   active: boolean;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
+  /** Jump slot per numbered row (the first ten the sidebar lists). */
+  sessionShortcutSlots: ReadonlyMap<string, number>;
   activeOverride: ActiveChatOverride | null;
   /** Pointer-inside sort-key freeze shared with the flat list (see
       ConversationList); null while the pointer is outside the list. */
@@ -1675,6 +1678,7 @@ function ProjectFolder({
         listRef={listRef}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
+        sessionShortcutSlots={sessionShortcutSlots}
         // Projects default collapsed: shown only when explicitly expanded.
         collapsed={!expanded}
         onToggleCollapsed={onToggleCollapsed}
@@ -2578,8 +2582,8 @@ function ConversationList({
     expandProject(activeProjectName);
   }, [activeId, activeProjectName, pinnedSet, expandProject]);
 
-  // Visible rows in render order (collapsed sections excluded) for the ⌘[ / ⌘]
-  // session hotkey. Titles must match the <ConversationSection> props below.
+  // Visible rows in render order (collapsed sections excluded) for the numbered
+  // and ⌘[ / ⌘] session hotkeys. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list;
@@ -2622,13 +2626,23 @@ function ConversationList({
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
-  // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
-  // see the hook). Empty when the Pinned section is collapsed.
-  const pinnedSessionIds = useMemo(
-    () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
-    [sections.pinned, collapsedSections],
+  // Cmd/Ctrl+1..9/0 opens the first ten sessions the sidebar lists, top to
+  // bottom (see the hook for the chord). A row listed twice keeps its first slot.
+  const numberedSessionIds = useMemo(
+    () => [...new Set(orderedConversationIds)].slice(0, SESSION_HOTKEY_DIGITS.length),
+    [orderedConversationIds],
   );
-  usePinnedSessionHotkeys(pinnedSessionIds, activeId);
+  useSessionNumberHotkeys(numberedSessionIds, activeId);
+  // Holding the command modifier shows each numbered row's jump number. The slots
+  // come from the hotkey's own list, so a badge exists only where the key works.
+  useCommandHoldTracking();
+  const sessionShortcutSlots = useMemo(
+    () =>
+      new Map<string, number>(
+        isMobile ? [] : numberedSessionIds.map((id, slot): [string, number] => [id, slot]),
+      ),
+    [isMobile, numberedSessionIds],
+  );
   const pinOrder = useMemo(
     () =>
       pinReorderEnabled && !pinWriting
@@ -2681,6 +2695,7 @@ function ConversationList({
   const sessionRowProps = {
     activeConversationId: displayedActiveId,
     pinnedConversationIds,
+    sessionShortcutSlots,
     onRowClick,
     onTogglePinned,
     selectionMode: sessionsSelecting,
@@ -2896,6 +2911,7 @@ function ConversationList({
                           conversations={sections.pinned}
                           activeConversationId={displayedActiveId}
                           pinnedConversationIds={pinnedConversationIds}
+                          sessionShortcutSlots={sessionShortcutSlots}
                           collapsed={effectiveCollapsedSections.includes("Pinned")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
                           onRowClick={onRowClick}
@@ -3007,6 +3023,7 @@ function ConversationList({
                             active={newSessionProjectName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                             pinnedConversationIds={pinnedConversationIds}
+                            sessionShortcutSlots={sessionShortcutSlots}
                             activeOverride={activeOverride}
                             frozenSortKeys={frozenKeys}
                             onRowClick={onRowClick}
@@ -3832,6 +3849,7 @@ function ConversationSection({
   persistentHeaderAction,
   afterHeader,
   footer,
+  sessionShortcutSlots,
   onProjectAssigned,
   listRef,
 }: {
@@ -3849,6 +3867,8 @@ function ConversationSection({
       list owner so a row never runs the (multi-step) active-root query itself. */
   activeConversationId: string | null;
   pinnedConversationIds: string[];
+  /** Jump slot per numbered row (the first ten the sidebar lists). */
+  sessionShortcutSlots?: ReadonlyMap<string, number>;
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
@@ -3993,6 +4013,7 @@ function ConversationSection({
                   gridSelected={conv.id === grids?.selectedSessionId}
                   gridsEnabled={grids?.enabled ?? false}
                   isPinned={pinnedConversationIds.includes(conv.id)}
+                  shortcutSlot={sessionShortcutSlots?.get(conv.id)}
                   onClick={onRowClick}
                   onTogglePinned={onTogglePinned}
                   selectionMode={selectionMode}
@@ -4788,6 +4809,7 @@ function ConversationRowImpl({
   gridSelected,
   gridsEnabled,
   isPinned,
+  shortcutSlot,
   onClick,
   onTogglePinned,
   selectionMode,
@@ -4804,6 +4826,8 @@ function ConversationRowImpl({
   gridSelected: boolean;
   gridsEnabled: boolean;
   isPinned: boolean;
+  /** Jump slot of a pinned row that has a number hint; undefined elsewhere. */
+  shortcutSlot?: number;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -5221,6 +5245,11 @@ function ConversationRowImpl({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      aria-keyshortcuts={
+        shortcutSlot !== undefined
+          ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
+          : undefined
+      }
       draggable={gridsEnabled ? false : undefined}
       onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
       className={cn(
@@ -5254,6 +5283,8 @@ function ConversationRowImpl({
         // under it.
         !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
         !selectionMode && menuOpen && "md:pr-20",
+        // Same room as the hover controls, so a held hint never covers the title.
+        shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
@@ -5498,7 +5529,7 @@ function ConversationRowImpl({
           aria-label="Shared session"
           title="Shared with you"
           className={cn(
-            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0",
             overlayTop,
             hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
           )}
@@ -5519,6 +5550,7 @@ function ConversationRowImpl({
               className={cn(
                 "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
                 overlayTop,
+                "group-has-[[data-session-shortcut-hint]]:hidden",
               )}
             >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
@@ -5670,6 +5702,9 @@ function ConversationRowImpl({
             />
           </ContextMenuContent>
         </ContextMenu>
+      )}
+      {shortcutSlot !== undefined && (
+        <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
       )}
       {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
@@ -5891,6 +5926,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.gridSelected === next.gridSelected &&
     prev.gridsEnabled === next.gridsEnabled &&
     prev.isPinned === next.isPinned &&
+    prev.shortcutSlot === next.shortcutSlot &&
     prev.selectionMode === next.selectionMode &&
     prev.isSelected === next.isSelected &&
     prev.onClick === next.onClick &&
@@ -5900,6 +5936,44 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     conversationRenderEqual(prev.conversation, next.conversation)
   );
 });
+
+/**
+ * The New session row's chord, shown on hover, keyboard focus, or while the command
+ * modifier is held (with the numbered rows' chips). Only it subscribes to the hold.
+ */
+function NewSessionShortcutHint() {
+  const held = useCommandHoldStore((state) => state.held);
+  return (
+    <CompactShortcutKeys
+      keys={newSessionShortcutKeys()}
+      className={cn(
+        "pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px] [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
+        held && "opacity-100",
+      )}
+    />
+  );
+}
+
+/**
+ * Jump-number chip for a numbered row, shown only while the command modifier is
+ * held. It subscribes to the hold store alone, so a hold re-renders the chips,
+ * not the list. The row hides its trailing controls while a chip is mounted.
+ */
+function SessionShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: string }) {
+  const held = useCommandHoldStore((state) => state.held);
+  if (!held) return null;
+  return (
+    <span
+      data-session-shortcut-hint
+      className={cn("-translate-y-1/2 pointer-events-none absolute right-1", overlayTop)}
+    >
+      <CompactShortcutKeys
+        keys={sessionNumberShortcutKeys(SESSION_HOTKEY_DIGITS[slot])}
+        className="[&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px]"
+      />
+    </span>
+  );
+}
 
 /**
  * Hover flyout body for a pinned, project-owned conversation row.
