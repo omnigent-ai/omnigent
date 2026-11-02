@@ -9,7 +9,12 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
-import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
+import {
+  useSidebarData,
+  useSidebarMembershipHold,
+  useSidebarView,
+  type SidebarListQuery,
+} from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
@@ -178,7 +183,12 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+  sessionTitleSortSupported,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -226,6 +236,7 @@ import {
 } from "@/lib/sessionFilterPreferences";
 import {
   SIDEBAR_GROUPINGS,
+  SIDEBAR_ORDERINGS,
   SIDEBAR_SHOW_FIELDS,
   type SidebarGrouping,
   type SidebarOrdering,
@@ -257,6 +268,7 @@ import {
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortConversations,
+  type FrozenSortKey,
   STATUS_BUCKETS,
   type StatusBucket,
   statusBucket,
@@ -1492,7 +1504,7 @@ function ProjectFolder({
   activeOverride: ActiveChatOverride | null;
   /** Pointer-inside sort-key freeze shared with the flat list (see
       ConversationList); null while the pointer is outside the list. */
-  frozenSortKeys: Map<string, number> | null;
+  frozenSortKeys: Map<string, FrozenSortKey> | null;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -2030,7 +2042,7 @@ function ConversationList({
   // map accumulates keys lazily inside sortConversations (a render-time ref
   // write) and is cleared once neither hold is active, when the order snaps
   // back to reality.
-  const frozenKeysRef = useRef<Map<string, number>>(new Map());
+  const frozenKeysRef = useRef<Map<string, FrozenSortKey>>(new Map());
   // Status buckets freeze the same way, so a turn finishing under the cursor
   // doesn't move its row to another group.
   const frozenStatusRef = useRef<Map<string, StatusBucket>>(new Map());
@@ -2046,6 +2058,7 @@ function ConversationList({
     });
   }, []);
   const orderFrozen = pointerInside || editingIds.size > 0;
+  useSidebarMembershipHold(orderFrozen);
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
   const frozenStatus = orderFrozen ? frozenStatusRef.current : null;
   useEffect(() => {
@@ -2161,7 +2174,7 @@ function ConversationList({
             : `${GROUPING_LABELS[view.grouping]} ${dateBucket(
                 view.grouping === "created"
                   ? c.created_at
-                  : (frozenKeys?.get(c.id) ??
+                  : (frozenKeys?.get(c.id)?.updatedAt ??
                       (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at)),
                 now,
               )}`,
@@ -2754,6 +2767,11 @@ function ConversationList({
       onChange={onActiveTabChange}
       multiUser={multiUser}
       view={groupingUi ? view : null}
+      orderings={
+        sessionTitleSortSupported(serverInfo)
+          ? SIDEBAR_ORDERINGS
+          : SIDEBAR_ORDERINGS.filter((ordering) => ordering !== "name")
+      }
       onViewChange={updateView}
     />
   );
@@ -3454,7 +3472,11 @@ const GROUPING_LABELS: Record<SidebarGrouping, string> = {
   created: "Created",
   updated: "Updated",
 };
-const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", created: "Created" };
+const ORDERING_LABELS: Record<SidebarOrdering, string> = {
+  updated: "Updated",
+  created: "Created",
+  name: "Name (A to Z)",
+};
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   updated: "Updated",
   environment: "Environment",
@@ -3494,6 +3516,7 @@ function SessionFilterMenu({
   onChange,
   multiUser,
   view,
+  orderings,
   onViewChange,
 }: {
   value: SidebarTab;
@@ -3501,6 +3524,8 @@ function SessionFilterMenu({
   multiUser: boolean;
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
+  /** Orderings the server can list by; older servers can't sort by name. */
+  orderings: readonly SidebarOrdering[];
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
@@ -3591,13 +3616,13 @@ function SessionFilterMenu({
               value={view.ordering}
               onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
             >
-              {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+              {orderings.map((ordering) => (
                 <DropdownMenuRadioItem
                   key={ordering}
                   value={ordering}
                   data-testid={`session-ordering-${ordering}`}
                 >
-                  {label}
+                  {ORDERING_LABELS[ordering]}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>

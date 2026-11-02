@@ -63,8 +63,8 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
-- `project-show-more`: an expanded project folder lists its five newest
-  sessions; each Show more slides five more in until none remain. Re-expanding
+- `project-show-more`: an expanded project folder lists its first five
+  sessions in the selected ordering; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
   attention or is unread. Filing a session into the folder leaves its listed
@@ -156,10 +156,12 @@ the header menu), and each place is a separate entry point.
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
   (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
-  (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
-  saved per device. Created ordering keeps sessions newest-created first as messages
-  arrive;
-  requests, pagination, and project folders use that order too. Switching order
+  (Updated / Created / Name (A to Z)) and Show (Updated / Environment / Repo / Branch)
+  submenus, saved per device. Created ordering keeps sessions newest-created first as
+  messages arrive; Name orders by title A to Z, ignoring case, with untitled
+  sessions (“New session”) last, and holds a hovered or renamed row in place;
+  requests, pagination, and project folders use that order too. A server that
+  can't sort by title lists Name as Updated and keeps the saved choice. Switching order
   clears the cached rows and shows loading while session timestamps refresh,
   including project folders, pins, and Archived. With the flag off,
   sessions always use Updated regardless of the saved preference. Shared sessions
@@ -1003,11 +1005,14 @@ plain `uv run pytest`, which starts a private server for the test.
   (desktop and narrow-browser navigation),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
-  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`,
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_name_ordering_lists_live_sessions_a_to_z_and_persists`
   (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
-- **`project-show-more`:** no browser test drives it. Component tests in
+- **`project-show-more`:** the browser drives it only under Name ordering, in
+  `test_sidebar_view_options.py::test_name_ordering_lists_live_sessions_a_to_z_and_persists`.
+  Component tests in
   `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
   the next server page, the slide and its reduced-motion skip, the open-session
   reveal, row-menu filing leaving the listed rows as they are, the

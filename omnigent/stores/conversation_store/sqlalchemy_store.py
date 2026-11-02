@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import string
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import PureWindowsPath
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     func,
@@ -3032,8 +3034,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``
-            or ``"updated_at"``.
+        :param sort_by: Sort key: ``"created_at"``, ``"updated_at"``,
+            or ``"title"`` (case-insensitive, untitled last when
+            ascending).
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -3080,7 +3083,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        sort_col = self._resolve_sort_column(sort_by)
+        sort_col, tiebreaker_col = self._resolve_sort_columns(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
 
@@ -3156,6 +3159,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     qualifying_ids = list(
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
+
+        # Every listed row carries a grant for this viewer, so a cursor without
+        # one can't come from a page and must not expose its sort key.
+        cursor_viewer = accessible_by if accessible_by is not None else owned_by
+        if cursor_viewer is not None:
+            for cursor_id in (after, before):
+                if cursor_id:
+                    self._require_cursor_grant(cursor_id, cursor_viewer)
 
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
@@ -3399,7 +3410,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     after,
                     sort_col,
                     is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
+                    tiebreaker_col=tiebreaker_col,
                     forward=True,
                 )
             if before:
@@ -3409,12 +3420,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     before,
                     sort_col,
                     is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
+                    tiebreaker_col=tiebreaker_col,
                     forward=False,
                 )
             stmt = stmt.order_by(
                 sort_fn(sort_col),
-                sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
+                sort_fn(tiebreaker_col),
             ).limit(limit + 1)
             rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
@@ -3468,32 +3479,80 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=has_more,
         )
 
-    @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[int]:
+    def _require_cursor_grant(self, cursor_id: str, viewer: str) -> None:
         """
-        Map a ``sort_by`` string to the corresponding
-        :class:`SqlConversation` column.
+        Reject a list cursor naming a session the viewer has no grant on.
 
-        :param sort_by: ``"created_at"`` or ``"updated_at"``.
-        :returns: The mapped column attribute.
-        :raises ValueError: If ``sort_by`` is not a valid column
-            name.
+        The failure matches a deleted cursor, so it doesn't reveal whether the
+        session exists.
+
+        :param cursor_id: The ``after`` or ``before`` session ID.
+        :param viewer: The user whose listing the cursor pages.
+        :raises StaleCursorError: If the viewer has no grant on the session.
         """
-        allowed = {
-            "created_at": SqlConversation.created_at,
-            "updated_at": SqlConversation.updated_at,
-        }
-        col = allowed.get(sort_by)
-        if col is None:
+        with self._session("authorize_session_list_cursor") as meta_sess:
+            granted = meta_sess.execute(
+                select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == cursor_id,
+                    SqlSessionPermission.user_id == viewer,
+                )
+            ).first()
+        if granted is None:
+            raise StaleCursorError(cursor_id)
+
+    def _resolve_sort_columns(self, sort_by: str) -> tuple[ColumnElement[Any], ColumnElement[Any]]:
+        """
+        Map a ``sort_by`` string to the expressions the listing orders on.
+
+        ``"title"`` folds ASCII case only and compares by code point, with
+        untitled conversations after every titled one in ascending order, and
+        breaks ties by id. The web client reproduces this exact order to merge
+        pages, so the key avoids locale collations and Unicode case mapping,
+        which differ between dialects.
+
+        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"title"``.
+        :returns: The primary sort expression and its tiebreaker column.
+        :raises ValueError: If ``sort_by`` is not a valid sort key.
+        """
+        if sort_by == "created_at":
+            return cast(ColumnElement[Any], SqlConversation.created_at), self._tiebreaker_col
+        if sort_by == "updated_at":
+            return cast(ColumnElement[Any], SqlConversation.updated_at), self._tiebreaker_col
+        if sort_by != "title":
             raise ValueError(f"invalid sort_by: {sort_by!r}")
-        return col
+        dialect = self._conv_engine.dialect.name
+        title = cast(ColumnElement[Any], SqlConversation.title)
+        if dialect == "sqlite":
+            # SQLite's built-in lower() folds ASCII only.
+            folded: ColumnElement[Any] = func.lower(title)
+        elif dialect in ("postgresql", "cockroachdb"):
+            folded = func.translate(title, string.ascii_uppercase, string.ascii_lowercase)
+        else:
+            folded = title
+            for upper, lower in zip(string.ascii_uppercase, string.ascii_lowercase, strict=True):
+                folded = func.replace(folded, upper, lower)
+        # One string key keeps the keyset cursor a two-column row comparison.
+        # length() rather than = '' so MySQL's PAD SPACE equality can't treat
+        # a whitespace-only title as untitled.
+        title_key = (case((func.length(title) == 0, "1"), else_="0") + folded).self_group()
+        # Ids are raw uuid bytes, so they order like their lowercase hex form.
+        tiebreaker = cast(ColumnElement[Any], SqlConversation.id)
+        if dialect == "postgresql":
+            return title_key.collate("C"), tiebreaker
+        if dialect in ("mysql", "mariadb"):
+            # Binary strings compare UTF-8 bytes without PAD SPACE, so trailing
+            # spaces still order titles.
+            return title_key.cast(LargeBinary), tiebreaker
+        # SQLite (BINARY) and CockroachDB compare strings bytewise by default.
+        return title_key, tiebreaker
 
     @staticmethod
     def _apply_cursor(
         session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
-        sort_col: QueryableAttribute[int],
+        sort_col: ColumnElement[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
@@ -3517,11 +3576,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
-        :param sort_col: Primary sort column (``created_at`` or ``updated_at``).
+        :param sort_col: Primary sort expression from :meth:`_resolve_sort_columns`.
         :param is_desc: ``True`` for descending, ``False`` for ascending.
         :param tiebreaker_col: Secondary sort column; must match the
-            secondary ORDER BY column. See ``_tiebreaker_col`` in
-            ``__init__`` for the SQLite/non-SQLite choice.
+            secondary ORDER BY column. See :meth:`_resolve_sort_columns`.
         :param forward: ``True`` for ``after`` cursors, ``False`` for
             ``before`` cursors.
         :returns: The statement with the cursor WHERE clause applied.

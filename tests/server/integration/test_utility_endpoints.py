@@ -113,6 +113,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["archive_worktree_cleanup"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
+    # Gates the sidebar's Name ordering; older servers reject sort_by=title.
+    assert data["session_title_sort"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["agent_detail"] is True
