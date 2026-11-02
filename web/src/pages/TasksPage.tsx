@@ -1,8 +1,7 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New automation" menu,
- * and a static Suggestions section below (prompt suggestions plus the
- * Jira/Slack/GitHub trigger templates).
+ * tasks, a search + Active/Paused filter, a "New automation" button,
+ * and tabs for existing automations and reusable templates.
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
  * update/delete mutations, which invalidate the list.
@@ -11,44 +10,21 @@
  * endpoint.
  */
 
-import { useMemo, useRef, useState } from "react";
-import {
-  ArrowLeftIcon,
-  ChevronDownIcon,
-  ClockIcon,
-  InfoIcon,
-  LayoutGridIcon,
-  Loader2Icon,
-  PencilIcon,
-  SearchIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ClockIcon, InfoIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
-import {
-  SCHEDULED_TASK_SUGGESTIONS,
-  type ScheduledTaskSuggestion,
-} from "@/components/scheduled/suggestions";
-import {
-  SESSION_LINK_ID_PLACEHOLDER,
-  TRIGGER_SOURCES,
-  TRIGGER_TEMPLATES,
-  type TriggerSource,
-} from "@/components/scheduled/triggerTemplates";
+import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
+import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { Link, useRebasePath } from "@/lib/routing";
+import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
   useDeleteScheduledTask,
@@ -74,8 +50,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const introButtonRef = useRef<HTMLButtonElement>(null);
   // The guide shows once by itself; each click on the info button reopens it.
   const [introOpens, setIntroOpens] = useState(0);
+  const [pointerTabInteraction, setPointerTabInteraction] = useState(false);
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
-  const { trackClick } = useOmnigentAnalytics();
+  const { trackClick, trackValueChange } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
   // labels fresh with ONE interval regardless of how many rows are on screen.
@@ -88,11 +65,18 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
-  // Prefill for the manual create dialog when opened from a "Suggestions" chip.
-  // Null → the normal manual path (empty fields). Cleared on dialog close so a
-  // stale prefill never leaks into a subsequent plain "New automation" open.
-  const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
-  const [trigger, setTrigger] = useState<TriggerSource | null>(null);
+  const [templateId, setTemplateId] = useState<string | null>(null);
+  const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const view = templatesOnly || searchParams.get("view") === "templates" ? "templates" : "yours";
+  const requestedView = useRef<string>(view);
+  useEffect(() => {
+    requestedView.current = view;
+  }, [view]);
+  useEffect(() => {
+    if (templatesOnly) navigate("/tasks?view=templates", { replace: true });
+  }, [templatesOnly, navigate]);
   // A trigger's manager keeps one session and starts its workers from it, so
   // the templates need "continue in the same session" and session orchestration.
   const info = useServerInfo();
@@ -103,25 +87,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   // Workers' links are posted outside Omnigent, so they go through the same
   // share-link path as the Share dialog, host transform included.
   const rebasePath = useRebasePath();
+  const templatesFallbackText =
+    info === "loading"
+      ? "Loading templates…"
+      : "Automation templates are not available on this server. You can still create an automation from scratch.";
   const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
 
   function openManual() {
-    setPrefill(null);
-    setTrigger(null);
+    setTemplateId(null);
     setEditingTask(null);
     setManualOpen(true);
   }
 
-  function openFromSuggestion(s: ScheduledTaskSuggestion) {
-    setPrefill(s.prefill);
-    setTrigger(null);
-    setEditingTask(null);
-    setManualOpen(true);
-  }
-
-  function openFromTrigger(source: TriggerSource) {
-    setPrefill(null);
-    setTrigger(source);
+  function openFromTemplate(id: string) {
+    setTemplateId(id);
     setEditingTask(null);
     setManualOpen(true);
   }
@@ -129,8 +108,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
     if (!next) {
-      setPrefill(null);
-      setTrigger(null);
+      setTemplateId(null);
       setEditingTask(null);
     }
   }
@@ -195,8 +173,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleEdit(task: ScheduledTask) {
-    setPrefill(null);
-    setTrigger(null);
+    setTemplateId(null);
     setEditingTask(task);
     setManualOpen(true);
   }
@@ -207,41 +184,17 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     <CreateScheduledTaskDialog
       open={manualOpen}
       onOpenChange={handleManualOpenChange}
-      initialName={prefill?.name}
-      initialPrompt={prefill?.prompt}
-      initialTrigger={trigger}
+      initialName={selectedTemplate?.prefill.name}
+      initialPrompt={selectedTemplate?.prefill.prompt}
+      initialTrigger={selectedTemplate?.trigger}
       sessionLink={sessionLink}
       editingTask={editingTask}
     />
   );
 
-  if (templatesOnly) {
-    return (
-      <PageScroll contentClassName="px-4 md:px-6">
-        <Button asChild variant="ghost" size="sm" className="mb-4">
-          <Link to="/tasks" componentId="tasks.templates.back">
-            <ArrowLeftIcon className="size-4" />
-            Back to automations
-          </Link>
-        </Button>
-        <h1 className="text-2xl font-semibold">Automation templates</h1>
-        <p className="mt-1 text-ui text-muted-foreground">
-          Choose a template to customize your automation.
-        </p>
-        <SuggestionsSection
-          onPick={openFromSuggestion}
-          onPickTrigger={triggersSupported ? openFromTrigger : null}
-          showHeading={false}
-          className="mt-6 border-t-0 pt-0"
-        />
-        {createDialog}
-      </PageScroll>
-    );
-  }
-
   return (
-    <PageScroll contentClassName="px-4 md:px-6">
-      {tasks !== undefined && (
+    <PageScroll className="[scrollbar-gutter:stable]" contentClassName="px-4 md:px-6">
+      {tasks !== undefined && (view === "yours" || introOpens > 0) && (
         <AutomationsIntro
           openCount={introOpens}
           onClose={() => (introOpens > 0 ? introButtonRef : newTaskButtonRef).current?.focus()}
@@ -268,133 +221,155 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
             Run agent sessions on a recurring schedule.
           </p>
         </div>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              ref={newTaskButtonRef}
-              data-testid="new-task-button"
-              className="shrink-0"
-              componentId="tasks.new"
-            >
-              New automation
-              <ChevronDownIcon className="size-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onSelect={openManual} data-testid="new-task-manual">
-              <PencilIcon className="size-4" />
-              Create manually
-            </DropdownMenuItem>
-            <DropdownMenuItem asChild>
-              <Link to="/tasks/templates" componentId="tasks.templates">
-                <LayoutGridIcon className="size-4" />
-                Create from template
-              </Link>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-
-      {/* Search + filter tabs. No "Mark all as read" control: there is no unread
-          model for scheduled tasks in this build, so it would act on nothing.
-          Restore it if run-result unread state lands. */}
-      <div className="mb-4 flex flex-col gap-5">
-        <div className="relative">
-          <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search automations…"
-            componentId="tasks.search"
-            data-testid="tasks-search"
-            className="pl-9"
-          />
-        </div>
-        {hasAnyTasks && (
-          <div aria-label="Filter automations" className="flex items-center gap-1">
-            {FILTER_TABS.map((tab) => (
-              <button
-                key={tab.value}
-                type="button"
-                aria-pressed={filter === tab.value}
-                data-testid={`tasks-filter-${tab.value}`}
-                onClick={() => {
-                  trackClick(`tasks.filter_${tab.value}`, "button");
-                  setFilter(tab.value);
-                }}
-                className={cn(
-                  "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                  filter === tab.value
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-                )}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {isError ? (
-        <div
-          role="alert"
-          data-testid="tasks-load-error"
-          className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
+        <Button
+          ref={newTaskButtonRef}
+          data-testid="new-task-button"
+          className="shrink-0"
+          componentId="tasks.new"
+          onClick={openManual}
         >
-          <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
-          <span className="flex-1">Couldn’t load automations.</span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void refetch()}
-            componentId="tasks.retry"
-          >
-            Retry
-          </Button>
-        </div>
-      ) : isLoading ? (
-        <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
-          <Loader2Icon className="size-4 animate-spin" />
-          Loading automations…
-        </div>
-      ) : filtered.length === 0 ? (
-        <EmptyState
-          hasAny={hasAnyTasks}
-          showSuggestions={filter === "all"}
-          onPickSuggestion={openFromSuggestion}
-          onPickTrigger={triggersSupported ? openFromTrigger : null}
-        />
-      ) : (
-        // Card list — each row is a bordered card (see ScheduledTaskRow), stacked
-        // with a gap so there's vertical spacing between cards. The only divider
-        // on the page is the one before the Suggestions section.
-        <div className="flex flex-col gap-2" data-testid="tasks-list">
-          {filtered.map((task) => (
-            <ScheduledTaskRow
-              key={task.id}
-              task={task}
-              now={now}
-              busy={busyId === task.id}
-              onEdit={handleEdit}
-              onPauseToggle={handlePauseToggle}
-              onRunNow={handleRunNow}
-              onDelete={handleDelete}
-            />
-          ))}
-        </div>
-      )}
+          New automation
+        </Button>
+      </div>
 
-      {/* Suggestions show ONLY on the "All" tab and are hidden once a specific
-          filter ("Active" / "Paused") is selected, per the product spec ("when
-          all isn't selected, suggestions should disappear"). Driven by the same
-          `filter` state as the list, so switching tabs toggles it live. */}
-      {filter === "all" && filtered.length > 0 && (
-        <SuggestionsSection
-          onPick={openFromSuggestion}
-          onPickTrigger={triggersSupported ? openFromTrigger : null}
-        />
-      )}
+      <Tabs
+        value={view}
+        onValueChange={(value) => {
+          // Pointer and focus can select the same tab before navigation renders.
+          if (requestedView.current === value) return;
+          requestedView.current = value;
+          trackValueChange("tasks.view", "tabs", value, { valueHasNoPii: true });
+          setSearchParams((current) => {
+            const next = new URLSearchParams(current);
+            if (value === "templates") next.set("view", "templates");
+            else next.delete("view");
+            return next;
+          });
+        }}
+      >
+        <TabsList
+          variant="pill"
+          aria-label="Automation views"
+          // Programmatic tab focus can retain :focus-visible after a pointer click.
+          onPointerDownCapture={() => setPointerTabInteraction(true)}
+          onKeyDownCapture={() => setPointerTabInteraction(false)}
+          onFocus={(event) => {
+            // After a pointer click, Radix can leave keyboard re-entry on the container.
+            if (event.target === event.currentTarget) {
+              event.currentTarget
+                .querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')
+                ?.focus();
+            }
+          }}
+          onBlurCapture={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) setPointerTabInteraction(false);
+          }}
+          className={cn(
+            "gap-1",
+            pointerTabInteraction &&
+              "[&_[role=tab]:focus-visible]:border-transparent [&_[role=tab]:focus-visible]:ring-0 [&_[role=tab]:focus-visible]:outline-none",
+          )}
+        >
+          <TabsTrigger value="yours" className="h-8 flex-none px-3">
+            Your automations
+          </TabsTrigger>
+          <TabsTrigger value="templates" className="h-8 flex-none px-3">
+            Templates
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="yours" className="mt-4">
+          <div className="mb-4 flex flex-col gap-5">
+            <div className="relative">
+              <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search automations…"
+                componentId="tasks.search"
+                data-testid="tasks-search"
+                className="pl-9"
+              />
+            </div>
+            {hasAnyTasks && (
+              <div aria-label="Filter automations" className="flex items-center gap-1">
+                {FILTER_TABS.map((tab) => (
+                  <button
+                    key={tab.value}
+                    type="button"
+                    aria-pressed={filter === tab.value}
+                    data-testid={`tasks-filter-${tab.value}`}
+                    onClick={() => {
+                      trackClick(`tasks.filter_${tab.value}`, "button");
+                      setFilter(tab.value);
+                    }}
+                    className={cn(
+                      "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                      filter === tab.value
+                        ? "bg-muted text-foreground"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                    )}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {isError ? (
+            <div
+              role="alert"
+              data-testid="tasks-load-error"
+              className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
+            >
+              <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
+              <span className="flex-1">Couldn’t load automations.</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void refetch()}
+                componentId="tasks.retry"
+              >
+                Retry
+              </Button>
+            </div>
+          ) : isLoading ? (
+            <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Loading automations…
+            </div>
+          ) : filtered.length === 0 ? (
+            <EmptyState
+              hasAny={hasAnyTasks}
+              showSuggestions={filter === "all"}
+              onPickTemplate={openFromTemplate}
+              triggersSupported={triggersSupported}
+            />
+          ) : (
+            <div className="flex flex-col gap-2" data-testid="tasks-list">
+              {filtered.map((task) => (
+                <ScheduledTaskRow
+                  key={task.id}
+                  task={task}
+                  now={now}
+                  busy={busyId === task.id}
+                  onEdit={handleEdit}
+                  onPauseToggle={handlePauseToggle}
+                  onRunNow={handleRunNow}
+                  onDelete={handleDelete}
+                />
+              ))}
+            </div>
+          )}
+        </TabsContent>
+        <TabsContent value="templates" className="mt-4">
+          {triggersSupported ? (
+            <TemplateGallery onPick={openFromTemplate} />
+          ) : (
+            <p className="py-8 text-ui text-muted-foreground">{templatesFallbackText}</p>
+          )}
+        </TabsContent>
+      </Tabs>
 
       {createDialog}
     </PageScroll>
@@ -404,96 +379,87 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 function EmptyState({
   hasAny,
   showSuggestions,
-  onPickSuggestion,
-  onPickTrigger,
+  onPickTemplate,
+  triggersSupported,
 }: {
   hasAny: boolean;
   showSuggestions: boolean;
-  onPickSuggestion: (s: ScheduledTaskSuggestion) => void;
-  onPickTrigger: ((source: TriggerSource) => void) | null;
+  onPickTemplate: (id: string) => void;
+  triggersSupported: boolean;
 }) {
   return (
     <div className="py-8" data-testid="tasks-empty-state">
-      {hasAny && (
+      {hasAny ? (
         <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
-      )}
-      {!hasAny && (
-        <div className="flex flex-col items-center gap-2 py-12 text-center">
-          <ClockIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">No automations yet</p>
-          <p className="max-w-sm text-sm text-muted-foreground">
-            Create an automation to run an agent session automatically on a recurring schedule.
-          </p>
-          {showSuggestions && (
-            <SuggestionsSection
-              onPick={onPickSuggestion}
-              onPickTrigger={onPickTrigger}
-              showHeading={false}
-              className="mt-3 border-t-0 pt-0"
-            />
+      ) : (
+        <>
+          <div className="flex flex-col items-center gap-2 py-8 text-center">
+            <ClockIcon className="size-8 text-muted-foreground/50" />
+            <p className="text-ui font-medium">No automations yet</p>
+            <p className="max-w-sm text-sm text-muted-foreground">
+              Create an automation to run an agent session automatically on a recurring schedule.
+            </p>
+          </div>
+          {showSuggestions && triggersSupported && (
+            <TemplateGallery onPick={onPickTemplate} preview />
           )}
-        </div>
+        </>
       )}
     </div>
   );
 }
 
-/** Static suggestions rendered below the list. See `suggestions.ts` for the TODO. */
-function SuggestionsSection({
+function TemplateGallery({
   onPick,
-  onPickTrigger,
-  showHeading = true,
-  className,
+  preview = false,
 }: {
-  onPick: (s: ScheduledTaskSuggestion) => void;
-  /** Null hides the trigger chips (the server can't keep a manager session). */
-  onPickTrigger: ((source: TriggerSource) => void) | null;
-  showHeading?: boolean;
-  className?: string;
+  onPick: (id: string) => void;
+  preview?: boolean;
 }) {
   return (
-    // The single divider on the page: a `border-t` separating the task list
-    // from the section. `mt-4 pt-4` keeps the gap tight.
-    <div
-      className={cn("mt-4 border-t border-border/60 pt-4", className)}
+    <section
+      className={preview ? "mt-6 border-t border-border/60 pt-6" : undefined}
       data-testid="tasks-suggestions"
+      aria-label={preview ? "Start from a template" : "Automation templates"}
     >
-      {showHeading && <h2 className="mb-3 text-ui text-muted-foreground">Suggestions</h2>}
-      {/* Compact chips that wrap onto multiple lines. */}
-      <div className="flex flex-wrap gap-2">
-        {onPickTrigger !== null &&
-          TRIGGER_SOURCES.map((source) => {
-            const t = TRIGGER_TEMPLATES[source];
-            const Icon = t.icon;
-            return (
-              <button
-                key={source}
-                type="button"
-                onClick={() => onPickTrigger(source)}
-                data-testid={`suggestion-trigger-${source}`}
-                className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-ui font-normal transition-colors hover:bg-muted hover:text-foreground"
-              >
-                <Icon className={cn("size-4 shrink-0", t.iconClassName)} />
-                <span className="truncate">{t.title}</span>
-              </button>
-            );
-          })}
-        {SCHEDULED_TASK_SUGGESTIONS.map((s) => {
-          const Icon = s.icon;
+      {preview && <h2 className="mb-3 text-base font-semibold">Start from a template</h2>}
+      <div className="grid gap-x-6 gap-y-2 md:grid-cols-2">
+        {AUTOMATION_TEMPLATES.map((template) => {
+          const Icon = template.icon;
+          const detailsId = `automation-template-${template.id}`;
           return (
             <button
-              key={s.id}
+              key={template.id}
               type="button"
-              onClick={() => onPick(s)}
-              data-testid={`suggestion-${s.id}`}
-              className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-ui font-normal transition-colors hover:bg-muted hover:text-foreground"
+              aria-label={template.title}
+              aria-describedby={`${detailsId}-description ${detailsId}-schedule ${detailsId}-requirements`}
+              onClick={() => onPick(template.id)}
+              data-testid={template.testId}
+              className="flex cursor-pointer items-start gap-4 rounded-xl p-4 text-left text-ui transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <Icon className={cn("size-4 shrink-0", s.iconClassName)} />
-              <span className="truncate">{s.title}</span>
+              <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-muted">
+                <Icon className={cn("size-5", template.iconClassName)} />
+              </span>
+              <span className="flex min-w-0 flex-col gap-2">
+                <span className="font-medium">{template.title}</span>
+                <span id={`${detailsId}-description`} className="text-muted-foreground">
+                  {template.description}
+                </span>
+                <span
+                  id={`${detailsId}-schedule`}
+                  className="flex items-center gap-2 text-muted-foreground"
+                >
+                  <ClockIcon className="size-4 shrink-0" />
+                  Checks every hour
+                </span>
+                <span id={`${detailsId}-requirements`} className="text-xs text-muted-foreground">
+                  {template.needs}
+                </span>
+              </span>
             </button>
           );
         })}
       </div>
-    </div>
+    </section>
   );
 }
