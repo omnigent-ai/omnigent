@@ -398,8 +398,9 @@ async def bridge_interaction(
         worker thread.
     :param inject_tui: Types the verdict into the native menu. This is the sole
         delivery channel for persistent approvals; other verdicts use it after
-        RPC delivery only while the step is still WAITING, to dismiss legacy prompts. Failures are logged without
-        retrying or falling back to RPC, since keys may have partially arrived.
+        RPC delivery only while the step is still WAITING, to dismiss legacy prompts.
+        Failures are logged without retrying or falling back to RPC, since keys
+        may have partially arrived.
     :param max_retries: Upper bound on detect→deliver iterations.
     :returns: None. Never raises on the expected timeout/cancel/RPC-error paths —
         all are logged and end the loop so the long-lived caller stays alive.
