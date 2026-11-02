@@ -237,11 +237,12 @@ class AgentStore(ABC):
         after: str | None = None,
     ) -> PagedList[Agent]:
         """
-        List *owner*'s own agents, newest first, each by its own id.
+        List *owner*'s own agents, newest first, preferring shared owner/name IDs.
 
         Returns originals only (a bundle stored under the row's own id; legacy
-        fork and switch copies are skipped). Names may repeat: callers address
-        an agent by id. Reads a bounded number of rows per call, so a page may
+        fork and switch copies are skipped). A shared owner/name ID hides older
+        identities of that exact name. Otherwise legacy originals may repeat names.
+        Reads a bounded number of rows per call, so a page may
         hold fewer than ``limit`` agents; ``last_id`` is the last row read and
         continues the listing.
 

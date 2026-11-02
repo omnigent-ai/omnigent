@@ -10,6 +10,7 @@ import {
   type NativeCodingAgentSpec,
 } from "@/lib/nativeCodingAgents";
 import type { SkillSummary } from "@/lib/types";
+import { currentUserAgents } from "@/lib/userAgents";
 
 export interface AvailableAgent {
   id: string;
@@ -199,36 +200,29 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
   };
 }
 
-/**
- * Fetch the caller's own agents, `GET /v1/agents?scope=user` (installed with
- * `omnigent agent add` or uploaded). Follows the cursor until 50 agent names,
- * since a page can come back empty when the server skipped only copies, or
- * repeat one name (servers before shared uploads kept a row per run).
- */
+/** Read the same owner-scoped catalog Settings uses, through the final page. */
 export async function fetchUserAgents(): Promise<AvailableAgent[]> {
   const rows: BuiltinAgentWire[] = [];
-  const names = new Set<string>();
+  const cursors = new Set<string>();
   let after: string | null = null;
-  // ponytail: 5 pages (250 rows); copies or repeats beyond that can still hide an older agent.
   /* oxlint-disable no-await-in-loop */
-  for (let page = 0; page < 5 && names.size < 50; page++) {
+  do {
     const params = new URLSearchParams({ scope: "user", limit: "50" });
     if (after !== null) params.set("after", after);
     const res = await authenticatedFetch(`/v1/agents?${params}`);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
-    for (const row of body.data) {
-      const name = agentRootName(row.name);
-      if (names.size >= 50 && !names.has(name)) continue;
-      names.add(name);
-      rows.push(row);
+    rows.push(...body.data);
+    after = body.has_more === true && body.last_id ? body.last_id : null;
+    if (after !== null) {
+      if (cursors.has(after)) throw new Error("Agent catalog returned a repeated cursor");
+      cursors.add(after);
     }
-    if (body.has_more !== true || !body.last_id || body.last_id === after) break;
-    after = body.last_id;
-  }
+  } while (after !== null);
   /* oxlint-enable no-await-in-loop */
-  return rows.map((a) => ({
+  return currentUserAgents(rows).map((a) => ({
     ...agentFromWire(a),
+    display_name: a.name,
     updated_at: a.updated_at ?? null,
     mine: true as const,
   }));
@@ -340,15 +334,18 @@ async function fetchAvailableAgents(
       staleTime: AVAILABLE_AGENTS_STALE_MS,
     }),
     includeUserAgents
-      ? queryClient
-          .fetchQuery({
-            queryKey: USER_AGENTS_QUERY_KEY,
-            queryFn: fetchUserAgents,
-            staleTime: AVAILABLE_AGENTS_STALE_MS,
-          })
-          .catch(() => [] as AvailableAgent[])
+      ? queryClient.fetchQuery({
+          queryKey: USER_AGENTS_QUERY_KEY,
+          queryFn: fetchUserAgents,
+          staleTime: AVAILABLE_AGENTS_STALE_MS,
+        })
       : ([] as AvailableAgent[]),
   ]);
+  if (includeUserAgents) {
+    // Session history must not resurrect an old revision, a deleted agent, or
+    // another owner's same-named agent. Settings reads this catalog too.
+    return [...dedupeNativeAgents(catalog.agents), ...userAgents];
+  }
   const discovered = sessionAgents.map((agent) => ({
     agentId: agent.id,
     agentName: agent.name,
@@ -568,13 +565,14 @@ function applyAcpHarnessCatalog(
 
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   const enabled = options.enabled ?? true;
-  const sessionAgents = useSessionAgents(enabled);
   const serverInfo = useServerInfo();
-  const includeUserAgents = serverInfo !== "loading" && serverInfo.agent_install === true;
+  const capabilitiesLoaded = serverInfo !== "loading";
+  const includeUserAgents = capabilitiesLoaded && serverInfo.agent_install === true;
+  const sessionAgents = useSessionAgents(enabled && capabilitiesLoaded && !includeUserAgents);
   // Normalized, order-stable pin key so equivalent pin sets share one cache
   // entry and a caller's fresh array literal doesn't churn the query. Agent
   // ids never contain "," so the join is unambiguous.
-  const pinnedIds = options.pinnedAgentIds;
+  const pinnedIds = capabilitiesLoaded && !includeUserAgents ? options.pinnedAgentIds : undefined;
   const pinnedKey = useMemo(
     () =>
       Array.from(new Set(pinnedIds ?? []))
@@ -609,16 +607,19 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // the discovery lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
   //
-  const placeholderData = useMemo(
-    () =>
-      catalog === undefined
-        ? undefined
-        : mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames),
-    [catalog],
-  );
+  const placeholderData = useMemo(() => {
+    if (catalog === undefined) return undefined;
+    if (includeUserAgents) return dedupeNativeAgents(catalog.agents);
+    return mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames);
+  }, [catalog, includeUserAgents]);
   const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
-    queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null, includeUserAgents],
+    queryKey: [
+      "available-agents",
+      pinnedKey,
+      sessionAgents.data ?? null,
+      capabilitiesLoaded ? includeUserAgents : null,
+    ],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
     // merged fetch reuses (not repeats) the catalog request.
     queryFn: () =>
@@ -628,13 +629,24 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
         sessionAgents.data ?? [],
         includeUserAgents,
       ),
-    enabled: enabled && (sessionAgents.data !== undefined || sessionAgents.isError),
+    enabled:
+      enabled &&
+      capabilitiesLoaded &&
+      (includeUserAgents || sessionAgents.data !== undefined || sessionAgents.isError),
     staleTime: AVAILABLE_AGENTS_STALE_MS,
     placeholderData,
     select,
   });
+  const data = useMemo(
+    () => query.data ?? (query.isError && placeholderData ? select(placeholderData) : undefined),
+    [query.data, query.isError, placeholderData, select],
+  );
   return {
     ...query,
+    data,
+    isPlaceholderData:
+      query.isPlaceholderData ||
+      (query.isError && query.data === undefined && placeholderData !== undefined),
     isLoading: query.isLoading || (enabled && query.isPending && catalogQuery.isPending),
   };
 }

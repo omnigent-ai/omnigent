@@ -11,7 +11,8 @@ send direct links to General settings. When those gates pass but
 `/v1/info.agent_detail` is absent or false, the section shows a server-update
 notice and makes no agent requests.
 
-- List server agents and owned agents separately; retain duplicate names by ID.
+- List server agents and owned agents separately, using the same catalogs as the picker.
+  Show one current owned identity per exact name, including historical duplicate responses.
 - Page through `GET /v1/agents` and `GET /v1/agents?scope=user`.
 - Reuse the new-session creation form and bundle builder. Save with multipart
   `POST /v1/agents`, without creating a session.
@@ -124,7 +125,7 @@ requires explicit reload/discard confirmation on 412. It sends only changed fiel
 and credential keys. Existing MCP names/transports and managed servers are read-only.
 Model/harness compatibility remains server-validated because the projection does
 not expose executor-specific editability. Cancel and the form's back button confirm
-dirty drafts; browser refresh warns, but global history/settings navigation can discard an unsaved draft. Renaming needs identity/collision semantics;
+dirty drafts; browser refresh warns, but global history/settings navigation can discard an unsaved draft. Names are immutable; use a different name to create a separate agent;
 run counts and global sorting require separate server support.
 
 Verification entry points and steps are in

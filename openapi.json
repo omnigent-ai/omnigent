@@ -11180,7 +11180,7 @@
         ]
       },
       "post": {
-        "description": "Install (or reinstall) the caller's user agent from a bundle.\n\nMultipart form with one `bundle` part: a gzipped tarball, the same\nshape multipart `POST /v1/sessions` accepts. The bundle is validated\nlike any tenant upload and never executed here.\n\n**Returns:** The installed agent as an `AgentObject`.",
+        "description": "Install (or reinstall) the caller's user agent from a bundle.\n\nMultipart form with one `bundle` part: a gzipped tarball, the same\nshape multipart `POST /v1/sessions` accepts. The bundle is validated\nlike any tenant upload and never executed here.\nClients that distinguish owned and server names send the form field\n`allow_server_name_collision=true`; older clients retain a 409 on collision.\n\n**Returns:** The installed agent as an `AgentObject`.",
         "operationId": "install_agent_v1_agents_post",
         "responses": {
           "200": {

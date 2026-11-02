@@ -387,6 +387,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
+import { refreshAgents } from "@/hooks/useCustomAgents";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
@@ -1324,6 +1325,23 @@ export function AgentHarnessPicker({
   const selectedEntry = [...harnessEntries, ...agentEntries].find(
     (agent) => agent.id === effectiveAgentId,
   );
+  const duplicateAgentLabels = useMemo(() => {
+    const seen = new Set<string>();
+    const duplicates = new Set<string>();
+    for (const agent of [...harnessEntries, ...agentEntries]) {
+      if (seen.has(agent.display_name)) duplicates.add(agent.display_name);
+      seen.add(agent.display_name);
+    }
+    return duplicates;
+  }, [harnessEntries, agentEntries]);
+  const entryLabel = (agent: AvailableAgent) =>
+    duplicateAgentLabels.has(agent.display_name)
+      ? `${agent.display_name} (${agent.mine ? "yours" : agent.sessionId ? `session ${agent.id}` : "server"})`
+      : agent.display_name;
+  const selectedLabel =
+    !autoHarnessActive && selectedEntry && duplicateAgentLabels.has(selectedEntry.display_name)
+      ? entryLabel(selectedEntry)
+      : agentLabel;
   const selectedReadiness = harnessReadinessOnHost(selectedEntry?.harness, host);
   const selectedUnavailable =
     selectedEntry != null && !selectedReadiness.selectable && selectedReadiness.fallbackRelevant;
@@ -1353,15 +1371,15 @@ export function AgentHarnessPicker({
     )
     .join(", ");
   const triggerAccessibleName = [
-    hasAgents ? agentLabel : "No agents",
+    hasAgents ? selectedLabel : "No agents",
     selectedUnavailable ? "unavailable" : triggerAccessibleDetails,
   ]
     .filter(Boolean)
     .join(", ");
   const triggerText = triggerSdk
-    ? agentLabel
+    ? selectedLabel
     : visibleModelText ||
-      (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "");
+      (triggerModel === undefined ? (hasAgents ? selectedLabel : "No agents") : "");
   const triggerSecondaryText = triggerSdk
     ? compactModelTriggerLabel(triggerSdk.value)
     : visibleEffortText;
@@ -1491,7 +1509,7 @@ export function AgentHarnessPicker({
         }}
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
-        label={agent.display_name}
+        label={entryLabel(agent)}
         summary={summary}
         description={blurb}
         active={active}
@@ -5876,6 +5894,7 @@ export function NewChatLandingScreen() {
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
         );
+        refreshAgents(queryClient);
         data = { id: bundled.id };
         launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —

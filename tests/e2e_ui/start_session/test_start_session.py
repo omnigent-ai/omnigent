@@ -3162,7 +3162,14 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_scan
             )
-            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
+
+            async def info(route: Route) -> None:
+                response = await route.fetch()
+                body = await response.json()
+                body["agent_install"] = False
+                await route.fulfill(response=response, json=body)
+
+            await page.route("**/v1/info", info)
             # Per-agent enrich fetch for whichever agent survives the dedup.
             await page.route(re.compile(r"/v1/sessions/[^/]+/agent$"), handle_enrich)
 

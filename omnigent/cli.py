@@ -12466,6 +12466,7 @@ def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
 def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
     resp = client.post(
         "/v1/agents",
+        data={"allow_server_name_collision": "true"},
         files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
     )
     _raise_for_agent_api(resp)
@@ -12490,7 +12491,9 @@ def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[exp
 def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> None:
     """Install SOURCE: an agent directory, YAML file, .tar.gz bundle, or GitHub repo.
 
-    Re-adding an agent with the same name replaces your copy in place.
+    Adding a name you already own replaces that agent in place, including
+    agents created through sessions or child agents. Existing sessions receive
+    the update. Use a different name to keep a separate agent.
     Workers, skills, guardrails, and supporting files in the directory are
     all kept. For a directory, ``${VAR}`` references are resolved from this
     shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.

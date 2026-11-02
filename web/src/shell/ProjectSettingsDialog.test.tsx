@@ -406,11 +406,19 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
   });
 
-  it("preserves a stored model when the default agent hasn't resolved from discovery", async () => {
+  it.each([
+    ["hidden", "Agent unavailable"],
+    ["partial", "Loading agent…"],
+    ["failed", "Agent list unavailable"],
+  ])("preserves stored defaults with a %s agent catalog", async (state, label) => {
     // While agent discovery is loading/failing, the stored agent's model
     // capability is unknowable — an unrelated save in that window must not
     // silently delete a valid stored default.
-    availableAgentsMock.mockReturnValue({ data: [] });
+    availableAgentsMock.mockReturnValue({
+      data: [pickerAgent()],
+      isPlaceholderData: state === "partial",
+      isError: state === "failed",
+    });
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -422,6 +430,7 @@ describe("ProjectSettingsDialog", () => {
         false,
       ),
     );
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(label);
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
@@ -734,34 +743,41 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(readProjectLaunchDefaults("p_1", { agent_id: "ag_1" })).toBeNull());
   });
 
-  it("saves a last-start agent still resolving with its own model and effort", async () => {
-    // Discovery so far holds only catalog rows, without the remembered agent.
-    availableAgentsMock.mockReturnValue({ data: [claudeAgent()], isPlaceholderData: true });
-    const stored = { agent_id: "ag_claude", model: "opus", effort: "low" };
-    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: stored });
-    writeProjectLaunchDefaults(
-      "p_1",
-      {
-        agentId: "ag_custom",
-        harness: "claude-native",
-        harnessOptions: { model: "sonnet", effort: "high" },
-      },
-      stored,
-    );
-    renderDialog();
+  it.each(["partial", "failed"])(
+    "preserves last-start defaults with a %s catalog",
+    async (state) => {
+      // Discovery so far holds only catalog rows, without the remembered agent.
+      availableAgentsMock.mockReturnValue({
+        data: [claudeAgent()],
+        isPlaceholderData: state === "partial",
+        isError: state === "failed",
+      });
+      const stored = { agent_id: "ag_claude", model: "opus", effort: "low" };
+      getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: stored });
+      writeProjectLaunchDefaults(
+        "p_1",
+        {
+          agentId: "ag_custom",
+          harness: "claude-native",
+          harnessOptions: { model: "sonnet", effort: "high" },
+        },
+        stored,
+      );
+      renderDialog();
 
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
-    );
-    fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", {
-        agent_id: "ag_custom",
-        model: "sonnet",
-        effort: "high",
-      }),
-    );
-  });
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+      );
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          agent_id: "ag_custom",
+          model: "sonnet",
+          effort: "high",
+        }),
+      );
+    },
+  );
 
   it("leaves the last start in place when the filled-in dialog is cancelled", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });

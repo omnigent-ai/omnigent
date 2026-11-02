@@ -444,19 +444,16 @@ async def test_create_failure_never_removes_existing_worktree(
     )
 
 
+@pytest.mark.parametrize("failure", ["persistence", "agent-conflict"])
 async def test_create_failure_rolls_back_omnigent_created_worktree(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
-    """A create_conversation failure DOES clean up an Omnigent-made worktree.
-
-    The counterpart to the data-loss guard: when Omnigent creates the
-    worktree (the ``git`` path) and persistence then fails, the orphan
-    worktree it just made must be force-removed. Proves the narrowed
-    rollback guard (gated on Omnigent having created a worktree) still
-    fires for the case it is meant to clean up.
-    """
+    """Agent-copy conflicts and persistence failures remove newly created worktrees."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes._sessions import orchestration
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
@@ -465,12 +462,22 @@ async def test_create_failure_rolls_back_omnigent_created_worktree(
     agent = await create_test_agent(client, name="wt-rollback-agent")
 
     def _boom(*args: Any, **kwargs: Any) -> Any:
+        if failure == "agent-conflict":
+            raise OmnigentError(
+                "You already have an agent with this name", code=ErrorCode.CONFLICT
+            )
         raise RuntimeError("simulated create_conversation failure")
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", _boom)
-
-    with pytest.raises(RuntimeError, match="simulated create_conversation failure"):
-        await _create_git_session(client, agent["id"], {"branch_name": "feature/orphan"})
+    if failure == "agent-conflict":
+        monkeypatch.setattr(orchestration, "agent_for_user", _boom)
+        response = await _create_git_session(
+            client, agent["id"], {"branch_name": "feature/orphan"}
+        )
+        assert response.status_code == 409, response.text
+    else:
+        monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", _boom)
+        with pytest.raises(RuntimeError, match="simulated create_conversation failure"):
+            await _create_git_session(client, agent["id"], {"branch_name": "feature/orphan"})
 
     # Omnigent created the worktree, so the rollback force-removed it: one
     # remove frame for the worktree it just made, deleting the branch too.

@@ -15,6 +15,7 @@ import {
   useAgentCatalog,
   useAvailableAgents,
   prefetchAvailableAgentDetails,
+  USER_AGENTS_QUERY_KEY,
 } from "./useAvailableAgents";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
@@ -49,17 +50,20 @@ function routeFetch(routes: Record<string, Response>) {
   });
 }
 
-function wrapper({ children }: { children: ReactNode }) {
-  // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
+function wrapper({
+  children,
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+}: {
+  children: ReactNode;
+  client?: QueryClient;
+}) {
   return (
     <QueryClientProvider client={client}>
-      <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
-        {children}
-      </SidebarDataProvider>
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
+          {children}
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -171,7 +175,9 @@ describe("useAvailableAgents", () => {
       {
         wrapper: ({ children }: { children: ReactNode }) => (
           <QueryClientProvider client={client}>
-            <SidebarDataProvider>{children}</SidebarDataProvider>
+            <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+              <SidebarDataProvider>{children}</SidebarDataProvider>
+            </CapabilitiesProvider>
           </QueryClientProvider>
         ),
       },
@@ -1439,9 +1445,10 @@ describe("useAvailableAgents slow discovery scan", () => {
 describe("useAvailableAgents user agents (scope=user)", () => {
   const USER_AGENTS_URL = "/v1/agents?scope=user&limit=50";
 
-  function wrapperWithInfo(agentInstall: boolean) {
+  function wrapperWithInfo(agentInstall: boolean, client?: QueryClient) {
     return function InfoWrapper({ children }: { children: ReactNode }) {
       return wrapper({
+        client,
         children: (
           <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
             {children}
@@ -1461,7 +1468,48 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     has_more: false,
   });
 
-  it("merges the caller's agents in, one per name, keeping built-in names", async () => {
+  it("waits for capabilities before selecting a discovery mode", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: MINE,
+      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+    });
+    let loading = true;
+    const { result, rerender } = renderHook(
+      () => ({
+        ...useAvailableAgents({ pinnedAgentIds: ["ag_orion"] }),
+        history: useAgents().data,
+      }),
+      {
+        wrapper: ({ children }) =>
+          wrapper({
+            client,
+            children: (
+              <CapabilitiesProvider
+                info={loading ? "loading" : { ...FALLBACK_SERVER_INFO, agent_install: true }}
+              >
+                {children}
+              </CapabilitiesProvider>
+            ),
+          }),
+      },
+    );
+    await waitFor(() =>
+      expect(result.current.history?.map((agent) => agent.id)).toContain("ag_orion"),
+    );
+    await waitFor(() =>
+      expect(result.current.data?.map((agent) => agent.id)).toEqual(["ag_polly"]),
+    );
+    expect(result.current.isPlaceholderData).toBe(true);
+    expect(result.current.fetchStatus).toBe("idle");
+    loading = false;
+    rerender();
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    expect(result.current.data?.map((agent) => agent.id)).toEqual(["ag_polly"]);
+  });
+
+  it("uses the same owned catalog as Settings, including names shared with server agents", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       [MINE_URL]: MINE,
@@ -1470,8 +1518,8 @@ describe("useAvailableAgents user agents (scope=user)", () => {
           { id: "ag_vega", name: "vega", harness: "claude-sdk", builtin: false, created_at: 9 },
           // Also used by a recent session: listed once.
           { id: "ag_orion", name: "orion", builtin: false, created_at: 5 },
-          // A built-in's name: the built-in wins.
-          { id: "ag_polly_copy", name: "polly (fork 1a2b)", builtin: false, created_at: 8 },
+          // Server agents have a different owner and do not hide your agent.
+          { id: "ag_polly_copy", name: "polly", builtin: false, created_at: 8 },
           { id: "ag_atlas", name: "atlas", builtin: false, created_at: 1 },
         ],
         has_more: false,
@@ -1487,6 +1535,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
         "ag_polly",
         "ag_vega",
         "ag_orion",
+        "ag_polly_copy",
         "ag_atlas",
       ]);
     });
@@ -1514,9 +1563,33 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
   });
 
+  it("loads the entire catalog without resurrecting session-only agents", async () => {
+    const pages = Object.fromEntries(
+      Array.from({ length: 6 }, (_, index) => [
+        USER_AGENTS_URL + (index ? `&after=page${index}` : ""),
+        mockResponse({
+          data: [{ id: `agent${index}`, name: `agent${index}`, builtin: false }],
+          has_more: index < 5,
+          last_id: `page${index + 1}`,
+        }),
+      ]),
+    );
+    routeFetch({ [BUILTINS_URL]: CATALOG, [MINE_URL]: MINE, ...pages });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.map((a) => a.id)).toEqual([
+      "ag_polly",
+      ...Array.from({ length: 6 }, (_, index) => `agent${index}`),
+    ]);
+  });
+
   it("names your agents by their own name, whatever their harness", async () => {
     routeFetch({
-      [BUILTINS_URL]: CATALOG,
+      [BUILTINS_URL]: mockResponse({
+        data: [{ id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true }],
+      }),
       [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
       [HARNESSES_URL]: mockResponse({
         data: [
@@ -1533,6 +1606,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
             created_at: 2,
           },
           { id: "ag_scout", name: "scout", harness: "grok", builtin: false, created_at: 1 },
+          { id: "ag_my_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: false },
         ],
         has_more: false,
       }),
@@ -1546,9 +1620,11 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     );
     const mine = (result.current.data ?? []).filter((a) => a.mine);
     expect(mine.map((a) => [a.id, a.display_name])).toEqual([
-      ["ag_orion", "Orion"],
-      ["ag_scout", "Scout"],
+      ["ag_orion", "orion"],
+      ["ag_scout", "scout"],
+      ["ag_my_kiro", "kiro-native-ui"],
     ]);
+    expect(result.current.data?.some((a) => a.id === "ag_kiro")).toBe(true);
   });
 
   it("follows the cursor past a page of one name's repeats to older agents", async () => {
@@ -1580,7 +1656,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
   });
 
-  it("shows the most recently changed of same-named agents, so an install is selectable", async () => {
+  it("uses one stable identity for legacy names, even when an older row was edited", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       // A recent session uses an older upload named orion.
@@ -1606,11 +1682,11 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
     await waitFor(() => {
       expect(result.current.isPlaceholderData).toBe(false);
-      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion_installed"]);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     });
   });
 
-  it("ranks the caller's agents by their own changes, not by session activity", async () => {
+  it("does not revive legacy IDs from session activity or configured pins", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       // A fork just started on the older upload named orion.
@@ -1634,12 +1710,15 @@ describe("useAvailableAgents user agents (scope=user)", () => {
       }),
     });
 
-    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
-      wrapper: wrapperWithInfo(true),
-    });
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_orion_installed"] }) }),
+      {
+        wrapper: wrapperWithInfo(true),
+      },
+    );
     await waitFor(() => {
       expect(result.current.isPlaceholderData).toBe(false);
-      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion_installed"]);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     });
   });
 
@@ -1658,24 +1737,65 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("scope=user"))).toBe(false);
   });
 
-  it("keeps the existing list when the caller's agents fail to load", async () => {
-    routeFetch({
-      [BUILTINS_URL]: CATALOG,
-      [MINE_URL]: MINE,
-      [USER_AGENTS_URL]: mockResponse({}, { ok: false, status: 500 }),
-    });
+  it.each(["request", "cursor-cycle", "cached-refetch"])(
+    "keeps available agents and reports a user-catalog %s failure",
+    async (failure) => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const cached = failure === "cached-refetch";
+      const userPages: Record<string, Response> =
+        failure !== "cursor-cycle"
+          ? { [USER_AGENTS_URL]: mockResponse({}, { ok: false, status: 500 }) }
+          : {
+              [USER_AGENTS_URL]: mockResponse({ data: [], has_more: true, last_id: "a" }),
+              [`${USER_AGENTS_URL}&after=a`]: mockResponse({
+                data: [],
+                has_more: true,
+                last_id: "b",
+              }),
+              [`${USER_AGENTS_URL}&after=b`]: mockResponse({
+                data: [],
+                has_more: true,
+                last_id: "a",
+              }),
+            };
+      routeFetch({
+        [BUILTINS_URL]: CATALOG,
+        [MINE_URL]: MINE,
+        ...userPages,
+        ...(cached
+          ? {
+              [USER_AGENTS_URL]: mockResponse({
+                data: [{ id: "ag_orion", name: "orion" }],
+                has_more: false,
+              }),
+            }
+          : {}),
+      });
 
-    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
-      wrapper: wrapperWithInfo(true),
-    });
-    await waitFor(() => {
-      expect(result.current.isSuccess).toBe(true);
-      expect(result.current.isPlaceholderData).toBe(false);
-    });
+      const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+        wrapper: wrapperWithInfo(true, client),
+      });
+      if (cached) {
+        await waitFor(() =>
+          expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]),
+        );
+        routeFetch({ [BUILTINS_URL]: CATALOG, [MINE_URL]: MINE, ...userPages });
+        await act(async () => {
+          await client.invalidateQueries({ queryKey: USER_AGENTS_QUERY_KEY });
+          await result.current.refetch();
+        });
+      }
+      await waitFor(() => {
+        expect(result.current.isError).toBe(true);
+      });
 
-    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
-    expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
-  });
+      expect(result.current.data?.map((a) => a.id)).toEqual(
+        cached ? ["ag_polly", "ag_orion"] : ["ag_polly"],
+      );
+      expect(result.current.isPlaceholderData).toBe(!cached);
+      expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
+    },
+  );
 });
 
 describe("useAgentCatalog", () => {
