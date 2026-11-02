@@ -186,12 +186,12 @@ function StringValue({ text, fieldKey }: { text: string; fieldKey?: string }) {
   }
   // Ids, paths and other single tokens read better in the code face.
   const isToken = !/\s/.test(text) && /[\d/._:-]/.test(text);
-  return isToken ? <span className="font-mono text-[0.92em]">{text}</span> : text;
+  return isToken ? <span className="font-mono">{text}</span> : text;
 }
 
-// Keeps a description's headings near body size; `!` beats the unlayered rules in index.css.
+// Keeps a description's headings at the card's size; `!` beats the unlayered rules in index.css.
 const PROSE_MARKDOWN_CLASS =
-  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-[1.05em]!";
+  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-sm!";
 
 /** Long text written for people, as markdown in the interface font. */
 function ProseValue({ text }: { text: string }) {
