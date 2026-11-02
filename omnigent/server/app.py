@@ -314,7 +314,7 @@ def _resolve_extension_state(
     # Distribution metadata is an external installation boundary. Preserve the
     # rest of the server if global discovery itself fails before per-plugin
     # failure isolation can apply.
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - isolate global discovery failure
         _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
         return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
 
@@ -333,7 +333,7 @@ def _resolve_extension_assets(
                 ", ".join(sorted(overrides)),
             )
         return build_asset_index(state, overrides=overrides)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - isolate asset index failure
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
 
@@ -1369,7 +1369,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # a malformed acp: block must never break startup
+    except Exception:  # noqa: BLE001 - a malformed acp: block must never break startup
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -3731,7 +3731,7 @@ def create_app(
             try:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - keep the admin list readable
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
@@ -4201,7 +4201,7 @@ def create_app(
             return own
         try:
             return await asyncio.to_thread(routing_host_id, convs[0], conversation_store)
-        except Exception:  # an unreadable ancestor leaves the host unknown
+        except Exception:  # noqa: BLE001 - an unreadable ancestor leaves the host unknown
             _logger.warning("Host lookup failed for session=%s", convs[0].id, exc_info=True)
             return None
 
@@ -4247,7 +4247,7 @@ def create_app(
                 ):
                     continue
                 await _launch_runner_on_host(conv, conversation_store, host_registry, host_conn)
-            except Exception:  # a failed relaunch keeps the interruption visible
+            except Exception:  # noqa: BLE001 - a failed relaunch keeps the interruption visible
                 _logger.warning(
                     "Relaunch after host return failed for session=%s", conv.id, exc_info=True
                 )
@@ -4463,7 +4463,9 @@ def create_app(
         instead of spinning on "starting" until a timeout. Only a runner
         that never connected fails an idle top-level session for that
         reason: when the host dies after the runner ran, an idle session
-        lost no work and stays idle (offline via liveness). An idle
+        lost no work and stays idle (offline via liveness). Nor does a runner
+        the server refused on its host's expired sign-in: the send that
+        launched it reports the sign-in instead, and no work was lost. An idle
         sub-agent is not failed either way, since its work finished on a
         runner that was already live.
 
@@ -4475,6 +4477,10 @@ def create_app(
         from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
         from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.routes.sessions.routes_events import (
+            is_host_sign_in_rejection,
+            note_host_sign_in_rejection,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         # The crash report is authoritative and carries the richer cause;
@@ -4489,6 +4495,9 @@ def create_app(
         )
         # Only a runner that never connected failed to start; one that ran and died is a crash.
         failure_code = RUNNER_PROCESS_CRASH if runner_ran else "runner_failed_to_start"
+        sign_in_rejected = not runner_ran and is_host_sign_in_rejection(error)
+        if sign_in_rejected:
+            note_host_sign_in_rejection(host_id, error)
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -4505,7 +4514,7 @@ def create_app(
             affected,
             ErrorDetail(code=failure_code, message=error),
             conversation_store,
-            fail_idle_top_level=not runner_ran,
+            fail_idle_top_level=not runner_ran and not sign_in_rejected,
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:

@@ -70,9 +70,9 @@ import {
   getSessionSlim,
   getSessionUsage,
   fetchSessionItemsPage,
-  HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
+  isHeldSendCode,
   openSessionStream,
   postEvent,
   type SessionItemsPage,
@@ -2967,16 +2967,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // ahead of this conversation's others and send it once the host is back.
       const holdTarget = postedSessionId ?? submitConversationId;
       const heldForHost =
-        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+        err instanceof ApiError && isHeldSendCode(err.code) && holdTarget !== null;
       if (heldForHost) {
-        holdSendForHost(holdTarget, message, {
-          text,
-          stableId,
-          ...(agentId ? { agentId } : {}),
-          ...(files && files.length > 0 ? { files } : {}),
-          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-          ...(sentOnScreen ? {} : { offScreen: true }),
-        });
+        holdSendForHost(
+          holdTarget,
+          message,
+          {
+            text,
+            stableId,
+            ...(agentId ? { agentId } : {}),
+            ...(files && files.length > 0 ? { files } : {}),
+            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            ...(sentOnScreen ? {} : { offScreen: true }),
+          },
+          code,
+        );
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
       if (!heldForHost) opts?.onError?.(message);
@@ -3939,6 +3944,7 @@ function holdSendForHost(
   conversationId: string,
   notice: string,
   message: Omit<QueuedMessage, "queueId" | "conversationId">,
+  code: string,
 ): void {
   queueSeq += 1;
   const held: QueuedMessage = {
@@ -3958,8 +3964,8 @@ function holdSendForHost(
   });
   setterFor(conversationId)((s) => {
     const last = s.blocks[s.blocks.length - 1];
-    if (last?.type === "error" && last.code === HOST_OFFLINE_CODE) return {};
-    return { blocks: [...s.blocks, makeClientErrorBlock(notice, HOST_OFFLINE_CODE)] };
+    if (last?.type === "error" && last.code === code) return {};
+    return { blocks: [...s.blocks, makeClientErrorBlock(notice, code)] };
   });
 }
 
