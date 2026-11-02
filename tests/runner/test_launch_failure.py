@@ -661,6 +661,8 @@ def test_codex_model_rejection_ignores_unrelated_errors(message: str) -> None:
         'access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}',
         '{"error":{"message":"unknown model","code":"model_not_found"}}',
         "The model `gpt-5-nano` does not exist or you do not have access to it.",
+        "HTTP 403 PERMISSION_DENIED: 'databricks-gpt-5-6-luna' is no longer available. "
+        "Use Unity Catalog model services.",
     ],
 )
 def test_model_unavailable_explains_how_to_recover(message: str) -> None:
@@ -702,6 +704,7 @@ def test_model_unavailable_explains_how_to_recover(message: str) -> None:
         '"message":"model: claude-opus-4-8 is rate limited"}}',
         # The same prose about another resource is not a model mismatch.
         "Project abc does not exist or you do not have access to it.",
+        "HTTP 403: This login is no longer available. Contact your administrator.",
     ],
 )
 def test_model_unavailable_ignores_unrelated_errors(message: str) -> None:

@@ -415,7 +415,7 @@ async def _load_runner_catalog(
     for worker_name, row in workers.items():
         if not isinstance(row, dict):
             continue
-        models_raw = row.get("models", [])
+        models_raw = row.get("models")
         if not isinstance(models_raw, list):
             continue
         cost_order = {
@@ -451,9 +451,7 @@ async def _load_runner_catalog(
                 item[0],
             ),
         )
-        models = [model for _, model in ordered_models]
-        if models:
-            result[worker_name] = models
+        result[worker_name] = [model for _, model in ordered_models]
     return result or None
 
 
@@ -1361,6 +1359,7 @@ class TaskV1RouteOptionSource:
     Offers the scenario menu the router demands (injecting arms the workspace
     has no endpoint for), ignores the echoed harness tag — passthrough and
     untrusted — and maps a pick back to a servable catalog id.
+    Without a fixed menu, model IDs pass through unchanged in both directions.
     """
 
     def __init__(
@@ -1402,8 +1401,18 @@ class TaskV1RouteOptionSource:
         :param harnesses: Harnesses the decision may land on; picks the
             scenario (codex-only, claude-only, or mixed).
         :param catalog: Harness → servable model ids.
-        :returns: Candidate options in router vocabulary, catalog first.
+        :returns: Exact catalog IDs when no menu is required; otherwise the
+            catalog and required arms in the legacy router vocabulary.
         """
+        if not self._menus:
+            offered_ids: dict[str, RouteOptionSpec] = {}
+            for harness, models in catalog.items():
+                for model in models:
+                    offered_ids.setdefault(
+                        model,
+                        RouteOptionSpec(model=model, harness=self._router_harness(harness, model)),
+                    )
+            return list(offered_ids.values())
         # Keyed on the comparison spelling so a catalog's ``gpt-5.6-luna`` and the
         # menu's ``gpt-5-6-luna`` are one option, not two; the arm's own spelling
         # wins the collision because the router matches its menu byte-exactly.
@@ -1437,13 +1446,21 @@ class TaskV1RouteOptionSource:
         """Translate *pick* into a servable (harness, model) pair.
 
         :param pick: The router's selection. Its harness tag is ignored; the
-            local harness is derived from the model and catalog. Prefixed model
-            ids are normalized first so resolving an id twice is a no-op.
+            local harness is derived from the model and catalog. Catalog-only
+            routers must return an exact offered ID; fixed menus use aliases.
         :param harnesses: Harnesses the decision may land on.
         :param catalog: Harness → servable model ids.
         :returns: A :class:`ResolvedRoute`, or ``None`` when the pick was
             never offered or nothing servable is close enough.
         """
+        if not self._menus:
+            # The gateway resolves model services and echoes the exact offered ID.
+            for harness in harnesses or list(catalog):
+                if pick.model in catalog.get(harness, ()) and not harness_bars_model(
+                    harness, pick.model, prefixes=self._model_prefixes
+                ):
+                    return ResolvedRoute(model=pick.model, harness=harness, raw_model=pick.model)
+            return None
         raw = self.to_router_id((pick.model or "").strip())
         if not raw:
             return None
@@ -2278,8 +2295,8 @@ async def route_turn(
 
     When *session_id* and *runner_client* are provided, fetches live model
     availability from the runner's ``/v1/sessions/{id}/models`` endpoint.
-    Falls back to the static :func:`infer_models` lookup table if the runner
-    is unreachable or returns no data.
+    Falls back to the static :func:`infer_models` lookup table if no catalog
+    is available. A known catalog without supported candidates declines routing.
 
     :param catalog: The models this session can actually be switched onto,
         when the caller knows them exactly - a native terminal's own picker
@@ -2323,10 +2340,8 @@ async def route_turn(
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
     available: dict[str, list[str]] | None = None
-    if catalog:
-        in_vocabulary = models_in_family(harness, catalog)
-        if in_vocabulary:
-            available = {harness or "self": in_vocabulary}
+    if catalog is not None:
+        available = {harness or "self": models_in_family(harness, catalog)}
     if available is None and session_id and runner_client is not None:
         _catalog_fetched = True
         runner_catalog = await fetch_runner_models(session_id, runner_client)
@@ -2334,9 +2349,15 @@ async def route_turn(
             # A native terminal's own catalog can list models from other
             # families (its gateway serves them all); offering those would
             # route the session onto a model its harness cannot run.
-            in_family = models_in_family(harness, runner_catalog["self"])
-            if in_family:
-                available = {harness or "self": in_family}
+            available = {harness or "self": models_in_family(harness, runner_catalog["self"])}
+    if available is not None and not any(available.values()):
+        _logger.info(
+            "smart_routing: route_turn skipped for session=%s: "
+            "the session catalog has no supported candidates for harness=%s",
+            session_id,
+            harness,
+        )
+        return None, None
     if not available:
         # The static table contains Unity Catalog model-service ids, so off the
         # gateway it names models this pane cannot be switched to. Decline the
@@ -2352,7 +2373,8 @@ async def route_turn(
             return None, None
         available = {harness or "": models}
 
-    prefixes = routing_settings().model_prefixes
+    settings = routing_settings()
+    prefixes = settings.model_prefixes
     # A turn cannot change the harness, so a model its gateway bars is not a
     # candidate at all. The seam still injects whatever arms the router's menu
     # requires, so dropping these rows never makes that menu partial.
@@ -2406,7 +2428,11 @@ async def route_turn(
         ),
         None,
     )
-    if catalog_model is not None:
+    if not scenario_menus(settings.menus, router_name=settings.router_name):
+        if model not in candidates:
+            _logger.warning("smart_routing: ignoring model %r absent from session catalog", model)
+            return None, None
+    elif catalog_model is not None:
         model = apply_servable_alias(catalog_model, prefixes)
     if harness_bars_model(harness, model, prefixes=prefixes):
         substitute = substitute_model(
