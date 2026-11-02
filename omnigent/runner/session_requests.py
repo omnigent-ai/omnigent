@@ -12,6 +12,15 @@ from omnigent.util.uuid import uuid_to_bytes
 REQUEST_HOST_EXTENSION = "omnigent_host_id"
 
 
+def normalize_session_id(value: object) -> str:
+    """Preserve managed numeric IDs and canonicalize OSS UUIDs for session routes."""
+    if not isinstance(value, str):
+        raise ValueError("Session ID must be a string")
+    if value.isascii() and value.isdecimal():
+        return value
+    return uuid_to_bytes(value).hex()
+
+
 async def post_on_host(
     client: httpx.AsyncClient,
     path: str,
@@ -45,7 +54,7 @@ async def session_host_id(client: httpx.AsyncClient, session_id: str) -> str | N
     visited: set[str] = set()
     shared_runner_id: str | None = None
     for _ in range(16):
-        session_id = uuid_to_bytes(session_id).hex()
+        session_id = normalize_session_id(session_id)
         if session_id in visited:
             break
         visited.add(session_id)
