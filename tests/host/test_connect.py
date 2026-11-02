@@ -2391,6 +2391,41 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
     assert relaunched.error_code == WORKSPACE_MISSING_ERROR_CODE
 
 
+@pytest.mark.parametrize(
+    "interruption",
+    [RuntimeError("scan failed"), asyncio.CancelledError()],
+    ids=["error", "cancelled"],
+)
+async def test_rejected_tunnel_drain_drops_the_tunnel_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch, interruption: BaseException
+) -> None:
+    """An error or cancellation during the drain still drops the rejected tunnel."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        httpx.HTTPTransport,
+        "handle_request",
+        lambda _transport, request: httpx.Response(401, request=request),
+    )
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    transport = Mock()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+
+    async def _interrupt() -> bool:
+        raise interruption
+
+    monkeypatch.setattr(host, "_has_starting_runners", _interrupt)
+
+    with pytest.raises(type(interruption)):
+        await host._drop_tunnel_if_credentials_rejected()
+    transport.abort.assert_called_once_with()
+
+
 async def test_credential_check_skips_managed_hosts_overlaps_and_replaced_tunnels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
