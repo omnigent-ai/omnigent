@@ -33,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     TranscriptReadResult,
     _display_text,
     _transcript_items_from_entry,
+    _transcript_source_key,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
     read_active_session_id,
@@ -109,6 +110,10 @@ _COMPACTION_SNAPSHOT_MAX_FAILURES = 8
 
 class _CompactionSnapshotError(ValueError):
     """A retryable failure while reading or reconstructing a local snapshot."""
+
+
+class _TranscriptChangedDuringRecovery(Exception):
+    """The transcript changed while locating a durable native-record cursor."""
 
 
 class _CompactionItemsReadError(httpx.HTTPError):
@@ -1671,6 +1676,12 @@ async def forward_claude_transcript_to_session(
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
+            except _TranscriptChangedDuringRecovery:
+                _logger.debug(
+                    "Claude transcript changed during cursor recovery; "
+                    "retrying next poll; session=%s",
+                    session_id,
+                )
             except TimeoutError:
                 # Every parent HTTP response pushes the deadline forward, so
                 # this is a true no-progress stall rather than a healthy drain.
@@ -4786,7 +4797,8 @@ async def _ensure_state_for_transcript(
     :returns: Cursor state for ``transcript_path``.
     """
     if state is not None and state.transcript_path == transcript_path:
-        validated = _validated_transcript_state(
+        validated = await asyncio.to_thread(
+            _validated_transcript_state,
             state,
             session_id=session_id,
         )
@@ -4795,7 +4807,8 @@ async def _ensure_state_for_transcript(
         return validated
     disk_state = _read_forward_state(bridge_dir)
     if disk_state is not None and disk_state.transcript_path == transcript_path:
-        validated = _validated_transcript_state(
+        validated = await asyncio.to_thread(
+            _validated_transcript_state,
             disk_state,
             session_id=session_id,
         )
@@ -5721,9 +5734,9 @@ def _validated_transcript_state(
     :returns: ``state`` unchanged when its byte cursor still matches
         the file; ``state`` with an adopted fingerprint (no reset)
         when the cursor is at byte 0 / line 0 and the file just
-        appeared; otherwise a cursor skipped to end-of-file with
-        ``seen_source_ids`` preserved so already-forwarded items
-        are not re-posted.
+        appeared; otherwise a cursor recovered at the last posted native
+        record, or the observed complete prefix when that record is unavailable. Recently
+        forwarded source IDs remain available for deduplication.
     """
     if state.byte_offset is None:
         return state
@@ -5732,8 +5745,7 @@ def _validated_transcript_state(
         if not state.transcript_path.exists():
             return state
         _logger.warning(
-            "Claude transcript cursor invalid; skipping to end of transcript; "
-            "session=%s byte_offset=%s",
+            "Claude transcript cursor invalid; recovering cursor; session=%s byte_offset=%s",
             session_id,
             state.byte_offset,
             extra={"session_id": session_id},
@@ -5749,7 +5761,7 @@ def _validated_transcript_state(
                 cursor_fingerprint=current_fingerprint,
             )
         _logger.warning(
-            "Claude transcript cursor missing fingerprint; skipping to end of transcript; "
+            "Claude transcript cursor missing fingerprint; recovering cursor; "
             "session=%s byte_offset=%s",
             session_id,
             state.byte_offset,
@@ -5759,12 +5771,15 @@ def _validated_transcript_state(
         return state
     else:
         _logger.warning(
-            "Claude transcript cursor fingerprint changed; skipping to end of transcript; "
+            "Claude transcript cursor fingerprint changed; recovering cursor; "
             "session=%s byte_offset=%s",
             session_id,
             state.byte_offset,
             extra={"session_id": session_id},
         )
+    recovered = _recover_transcript_cursor_at_native_record(state)
+    if recovered is not None:
+        return recovered
     end_offset = _transcript_end_offset(state.transcript_path)
     return TranscriptForwardState(
         transcript_path=state.transcript_path,
@@ -5773,6 +5788,113 @@ def _validated_transcript_state(
         cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, end_offset),
         seen_source_ids=state.seen_source_ids,
     )
+
+
+def _recover_transcript_cursor_at_native_record(
+    state: TranscriptForwardState,
+) -> TranscriptForwardState | None:
+    """Recover a rewritten file at its most recently mirrored stable native record.
+
+    A fully mirrored record is skipped. A partially mirrored record is read
+    again so its unposted items survive the existing source-ID dedupe.
+    """
+    if not state.seen_source_ids:
+        return None
+    source_id = state.seen_source_ids[-1]
+    source_key = source_id.rsplit(":", 2)[0]
+    if source_key.startswith(("byte-", "line-")):
+        return None
+    try:
+        with state.transcript_path.open("rb") as transcript:
+            initial_stat = os.fstat(transcript.fileno())
+            line_number = 0
+            sample = b""
+            scanned_digest = hashlib.sha256()
+            while True:
+                record_offset = transcript.tell()
+                remaining = initial_stat.st_size - record_offset
+                raw = transcript.readline(remaining) if remaining > 0 else b""
+                scanned_digest.update(raw)
+                if not raw or not raw.endswith(b"\n"):
+                    scanned_end = transcript.tell()
+                    # Validate the observed prefix; appended bytes belong to the next poll.
+                    transcript.seek(0)
+                    verified_digest = hashlib.sha256()
+                    remaining = scanned_end
+                    while remaining:
+                        chunk = transcript.read(min(remaining, 65536))
+                        if not chunk:
+                            raise _TranscriptChangedDuringRecovery
+                        verified_digest.update(chunk)
+                        remaining -= len(chunk)
+                    path_stat = state.transcript_path.stat()
+                    if (
+                        (path_stat.st_dev, path_stat.st_ino)
+                        != (
+                            initial_stat.st_dev,
+                            initial_stat.st_ino,
+                        )
+                        or path_stat.st_size < scanned_end
+                        or (verified_digest.digest() != scanned_digest.digest())
+                    ):
+                        raise _TranscriptChangedDuringRecovery
+                    return TranscriptForwardState(
+                        transcript_path=state.transcript_path,
+                        line_cursor=0,
+                        byte_offset=record_offset,
+                        cursor_fingerprint=_jsonl_fingerprint_from_sample(record_offset, sample),
+                        seen_source_ids=state.seen_source_ids,
+                    )
+                line_number += 1
+                previous_sample = sample
+                sample = (sample + raw)[-_CURSOR_FINGERPRINT_BYTES:]
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if _transcript_source_key(entry, line_number, record_offset) != source_key:
+                    continue
+                _, items = _transcript_items_from_entry(
+                    entry,
+                    line_number=line_number,
+                    record_offset=record_offset,
+                    agent_name="",
+                    current_response_id=state.current_response_id,
+                )
+                # A posted wake advances the response ID, so reparsing no longer emits it.
+                posted_wake = (
+                    source_id == f"{source_key}:0:scheduled_wake"
+                    and entry.get("type") == "assistant"
+                    and bool(items)
+                )
+                if not posted_wake and not any(item.source_id == source_id for item in items):
+                    continue
+                end_offset = transcript.tell()
+                end_fingerprint = _jsonl_fingerprint_from_sample(end_offset, sample)
+                path_stat = state.transcript_path.stat()
+                if (path_stat.st_dev, path_stat.st_ino) != (
+                    initial_stat.st_dev,
+                    initial_stat.st_ino,
+                ) or _jsonl_cursor_fingerprint(
+                    state.transcript_path, end_offset
+                ) != end_fingerprint:
+                    raise _TranscriptChangedDuringRecovery
+                seen = set(state.seen_source_ids)
+                if all(item.source_id in seen for item in items):
+                    record_offset = end_offset
+                else:
+                    line_number -= 1
+                    sample = previous_sample
+                return replace(
+                    state,
+                    line_cursor=line_number,
+                    byte_offset=record_offset,
+                    cursor_fingerprint=_jsonl_fingerprint_from_sample(record_offset, sample),
+                )
+    except FileNotFoundError as exc:
+        raise _TranscriptChangedDuringRecovery from exc
 
 
 async def _post_external_conversation_item(
@@ -8167,6 +8289,11 @@ def _jsonl_cursor_fingerprint(
         if not missing_ok:
             raise
         return None
+    return _jsonl_fingerprint_from_sample(byte_offset, sample)
+
+
+def _jsonl_fingerprint_from_sample(byte_offset: int, sample: bytes) -> str:
+    """Hash a cursor and bytes sampled from the same file read."""
     payload = byte_offset.to_bytes(8, "big", signed=False) + sample
     return hashlib.sha256(payload).hexdigest()
 
