@@ -29,6 +29,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_certificate_failure,
 )
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from tests.budgets import budget
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _fake_trust_policy_hooks,
@@ -679,7 +680,8 @@ async def test_wait_until_ready_releases_stalled_initialize(
     """A stalled initialize cannot outlive its startup deadline or caller cancellation."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
-    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.2)
+    # Scaled: on a loaded runner, connecting alone can outlast an unscaled 0.2s deadline.
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", budget(0.2))
     initialize_received = asyncio.Event()
     connection_closed = asyncio.Event()
 
@@ -707,16 +709,16 @@ async def test_wait_until_ready_releases_stalled_initialize(
         server.listen_url = f"ws://127.0.0.1:{port}"
         task = asyncio.create_task(server._wait_until_ready())
         try:
-            await asyncio.wait_for(initialize_received.wait(), timeout=2)
+            await asyncio.wait_for(initialize_received.wait(), timeout=budget(2))
             if outcome == "cancelled":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
             else:
                 with pytest.raises(CodexAppServerSilentStartTimeout) as excinfo:
-                    await asyncio.wait_for(task, timeout=2)
+                    await asyncio.wait_for(task, timeout=budget(2))
                 assert excinfo.value.last_error_type == "TimeoutError"
-            await asyncio.wait_for(connection_closed.wait(), timeout=2)
+            await asyncio.wait_for(connection_closed.wait(), timeout=budget(2))
             assert len(clients) == 1
             assert clients[0]._pending_requests == {}
             assert clients[0]._reader_task is None

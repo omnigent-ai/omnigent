@@ -1074,6 +1074,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.native import policy_allow_cache
+
+    # Read before the session identity: a session switch picks a new
+    # generation, so an answer for the previous session opens no window.
+    cache_generation = policy_allow_cache.generation(bridge_dir)
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
@@ -1126,6 +1131,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
 
+    requested_at = time.time()
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -1146,6 +1152,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
         return _fail_closed()
 
+    # Through the relay the server evaluated the relay's session, which can
+    # trail a session switch.
+    if relay is None or relay[2] == session_id:
+        policy_allow_cache.record(bridge_dir, cache_generation, eval_response, requested_at)
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))

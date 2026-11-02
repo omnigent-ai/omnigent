@@ -244,7 +244,7 @@ describe("CommandPalette — sessions", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("debounces the typed query into a server search (archived excluded)", () => {
+  it("debounces the typed query into a server search", () => {
     vi.useFakeTimers();
     try {
       setSessions([conv("c1", "Fix the parser")]);
@@ -491,6 +491,33 @@ describe("CommandPalette — title and content groups", () => {
     const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
     expect(options[0]).toContain("Kestrel plan");
     expect(options[1]).toContain("Weekly sync");
+  });
+
+  it("lists archived matches in both groups with an Archived badge", () => {
+    setSearchGroups({
+      title: searchPages([
+        conv("active", "Kestrel plan"),
+        { ...conv("retro", "Kestrel retro"), archived: true },
+      ]),
+      content: searchPages([
+        { ...conv("sync", "Weekly sync", null, "the kestrel checklist"), archived: true },
+      ]),
+    });
+    const { onOpenChange } = renderPalette();
+    search("kestrel");
+
+    const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
+    expect(options).toHaveLength(3);
+    expect(options[0]).toContain("Kestrel plan");
+    expect(options[0]).not.toContain("Archived");
+    expect(options[1]).toContain("Kestrel retro");
+    expect(options[1]).toContain("Archived");
+    expect(options[2]).toContain("Weekly sync");
+    expect(options[2]).toContain("Archived");
+
+    fireEvent.click(labelRow("Kestrel retro"));
+    expect(navigate).toHaveBeenCalledWith("/c/retro");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("does not search while the palette is closed or listing sessions only", () => {

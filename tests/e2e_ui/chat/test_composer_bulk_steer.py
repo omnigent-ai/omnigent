@@ -40,6 +40,8 @@ def test_bulk_steer_retries_the_whole_queue(
         )
 
     page.route("**/v1/sessions/*/events", respond_to_send)
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)

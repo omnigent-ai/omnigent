@@ -167,7 +167,7 @@ export const McpFailureCollapsed: Story = {
   },
 };
 
-// A Claude edit: its line counts on the result line, its diff when expanded.
+// A Claude edit: its line counts after the title, its diff when expanded.
 export const EditExpanded: Story = {
   args: {
     name: "Edit",
@@ -182,6 +182,22 @@ export const EditExpanded: Story = {
     state: "output-available",
     startedAt: null,
     duration: 0.009,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A Claude write that created its file: counted and diffed like an edit.
+export const WriteNewFileExpanded: Story = {
+  args: {
+    name: "Write",
+    arguments: {
+      file_path: "/repo/src/farewell.py",
+      content: "def farewell(name):\n    print(f'Bye {name}')\n    return name\n",
+    },
+    output: "File created successfully at: /repo/src/farewell.py",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.006,
   },
   play: async ({ canvasElement }) => expand(canvasElement),
 };
