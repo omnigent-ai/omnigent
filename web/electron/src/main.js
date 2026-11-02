@@ -288,6 +288,7 @@ const FIND_BAR_INSET = 16;
  * Electron doesn't export the net error codes as named constants.
  */
 const ERR_ABORTED = -3;
+const ERR_TIMED_OUT = -7;
 const ERR_BLOCKED_BY_CLIENT = -20;
 
 /**
@@ -600,6 +601,9 @@ let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
 // `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
 let reconnectSlowDelayMs = 60_000;
+// Chromium waits indefinitely for a server that accepts the connection but never responds.
+// `let` so wiring tests can shrink it via testApi.setServerResponseTimeoutMs.
+let serverResponseTimeoutMs = 30_000;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -2297,7 +2301,7 @@ async function loadServerUrl(
       });
     }
     if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
-    await win.loadURL(target);
+    await loadServerDocument(win, target, signal);
     assertCurrent();
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
@@ -2324,6 +2328,54 @@ async function loadServerUrl(
 }
 
 /**
+ * Load the server document, failing it as ERR_TIMED_OUT when no response commits
+ * within serverResponseTimeoutMs. A committed page is never aborted, however slow.
+ *
+ * @param {BrowserWindow} win
+ * @param {string} target
+ * @param {AbortSignal} signal Aborted when a newer attempt or the setup page takes the window.
+ */
+function loadServerDocument(win, target, signal) {
+  const contents = win.webContents;
+  let timer;
+  let awaitingResponse = true;
+  const settle = () => {
+    awaitingResponse = false;
+    clearTimeout(timer);
+  };
+  const failed = (_event, _code, _description, _url, isMainFrame) => {
+    if (isMainFrame) settle();
+  };
+  let abandon;
+  const stopped = new Promise((_resolve, reject) => {
+    // Stop a stale load at once so a late response can't commit under the newer attempt.
+    abandon = () => {
+      if (!awaitingResponse) return;
+      settle();
+      reject(signal.reason);
+      if (!win.isDestroyed()) contents.stop();
+    };
+    timer = setTimeout(() => {
+      settle();
+      const message = `ERR_TIMED_OUT (${ERR_TIMED_OUT}) loading '${target}'`;
+      reject(Object.assign(new Error(message), { code: "ERR_TIMED_OUT", errno: ERR_TIMED_OUT }));
+      contents.stop();
+      handleServerLoadFailure(win, ERR_TIMED_OUT, "ERR_TIMED_OUT", target);
+    }, serverResponseTimeoutMs);
+  });
+  // Prepended so the load settles before the window's fallbacks return to setup.
+  contents.prependListener("did-navigate", settle);
+  contents.prependListener("did-fail-load", failed);
+  signal.addEventListener("abort", abandon, { once: true });
+  return Promise.race([win.loadURL(target), stopped]).finally(() => {
+    settle();
+    contents.removeListener("did-navigate", settle);
+    contents.removeListener("did-fail-load", failed);
+    signal.removeEventListener("abort", abandon);
+  });
+}
+
+/**
  * Detach the window's embedded-browser view whenever the shell's main frame
  * commits a new document (`did-navigate`: a reload, the session-expiry
  * reload's login-page redirect, an SSO hop). The committing navigation tears
@@ -2347,6 +2399,51 @@ function registerBrowserViewDetachOnNavigate(win) {
 }
 
 /**
+ * Show a main-frame server-load failure: reconnect behind the overlay or return to setup.
+ *
+ * @param {BrowserWindow} win
+ * @param {number} errorCode Chromium net error code.
+ * @param {string} errorDescription
+ * @param {string} validatedURL
+ */
+function handleServerLoadFailure(win, errorCode, errorDescription, validatedURL) {
+  // A failure report for a URL the window is no longer pinned to (the
+  // window was re-pointed while the failing load was in flight) must
+  // not yank the window off its new destination.
+  const failedOrigin = originOf(validatedURL ?? "");
+  if (failedOrigin !== windows.get(win)?.origin) return;
+  diagnostics.record("navigation_failed", {
+    origin: failedOrigin,
+    code: `net_${Math.abs(errorCode)}`,
+  });
+  let error = `${errorDescription || "load failed"} (${errorCode})`;
+  const serverUrl = windows.get(win)?.serverUrl;
+  const reconnectable =
+    Boolean(serverUrl) &&
+    UNREACHABLE_NET_ERRORS.has(errorCode) &&
+    usesBrowserAuth(pinnedOrigin(win));
+  // Prefill setup with the server origin the user connects to, not the deep route
+  // that failed; workspace reconnects keep the mounted server URL.
+  let url = failedOrigin ? failedOrigin + "/" : (validatedURL ?? "");
+  if (reconnectable) {
+    console.warn("[omnigent] databricks auth: page load failed", {
+      origin: failedOrigin,
+      errorCode,
+    });
+    error = unreachableMessage(validatedURL);
+    url = serverUrl;
+    // The error page underneath is no longer trusted or allowed to navigate.
+    databricksAuth?.rejectConnection(win);
+    pinWindow(win, null);
+    // DNS/VPN may still be reconnecting right after wake: retry behind the overlay.
+    const hint = reconnectingHint(validatedURL);
+    const options = { hint, finalMessage: error, network: true };
+    if (scheduleReconnect(win, serverUrl, validatedURL, options)) return;
+  }
+  showConnectFailure(win, url, error);
+}
+
+/**
  * Wire server-load failure fallbacks for a shell window.
  *
  * @param {BrowserWindow} win
@@ -2363,42 +2460,7 @@ function registerNavigationFallbacks(win) {
       if (errorCode === ERR_ABORTED) return;
       // Browser-mode login requests are deliberately blocked while the shell renews the cookie.
       if (errorCode === ERR_BLOCKED_BY_CLIENT && usesBrowserAuth(pinnedOrigin(win))) return;
-      // A failure report for a URL the window is no longer pinned to (the
-      // window was re-pointed while the failing load was in flight) must
-      // not yank the window off its new destination.
-      const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
-      diagnostics.record("navigation_failed", {
-        origin: failedOrigin,
-        code: `net_${Math.abs(errorCode)}`,
-      });
-      let error = `${errorDescription || "load failed"} (${errorCode})`;
-      const serverUrl = windows.get(win)?.serverUrl;
-      const reconnectable =
-        Boolean(serverUrl) &&
-        UNREACHABLE_NET_ERRORS.has(errorCode) &&
-        usesBrowserAuth(pinnedOrigin(win));
-      // The failure often happens on a deep SPA route (e.g. /chat/…);
-      // prefill the setup form with just the server origin — that's what
-      // the user connects to — not the full path that happened to fail.
-      // Workspace reconnects keep the mounted server URL.
-      let url = failedOrigin ? failedOrigin + "/" : (validatedURL ?? "");
-      if (reconnectable) {
-        console.warn("[omnigent] databricks auth: page load failed", {
-          origin: failedOrigin,
-          errorCode,
-        });
-        error = unreachableMessage(validatedURL);
-        url = serverUrl;
-        // The error page underneath is no longer trusted or allowed to navigate.
-        databricksAuth?.rejectConnection(win);
-        pinWindow(win, null);
-        // DNS/VPN may still be reconnecting right after wake: retry behind the overlay.
-        const hint = reconnectingHint(validatedURL);
-        const options = { hint, finalMessage: error, network: true };
-        if (scheduleReconnect(win, serverUrl, validatedURL, options)) return;
-      }
-      showConnectFailure(win, url, error);
+      handleServerLoadFailure(win, errorCode, errorDescription, validatedURL);
     },
   );
 
