@@ -299,16 +299,20 @@ describe("useSessionSearch", () => {
     renderHook(() => useSessionSearch(searchQuery, scope, { limit: 8 }), { wrapper });
   }
 
-  it.each(["title", "content"] as const)("requests the %s group of a search", async (scope) => {
-    renderGroup("kestrel", scope);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+  it.each(["title", "content"] as const)(
+    "requests the %s group of a search, including archived sessions",
+    async (scope) => {
+      renderGroup("kestrel", scope);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
-    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
-    const params = new URL(url, "http://localhost").searchParams;
-    expect(params.get("search_query")).toBe("kestrel");
-    expect(params.get("search_scope")).toBe(scope);
-    expect(params.get("limit")).toBe("8");
-  });
+      const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const params = new URL(url, "http://localhost").searchParams;
+      expect(params.get("search_query")).toBe("kestrel");
+      expect(params.get("search_scope")).toBe(scope);
+      expect(params.get("include_archived")).toBe("true");
+      expect(params.get("limit")).toBe("8");
+    },
+  );
 
   it("does not fetch for an empty query", async () => {
     renderGroup("", "title");
