@@ -1,0 +1,34 @@
+---
+# ClusterRole with the SAME rules as ../role.yaml (the shared-namespace Role),
+# for the per-user namespace strategy (`sandbox.kubernetes.namespace_strategy:
+# per-user`). A ClusterRole is only *definable* cluster-wide; it is BOUND per
+# tenant namespace with a RoleBinding (see example-tenant/rolebinding.yaml, or
+# the one the server creates in `namespace_provisioning: server` mode), so the
+# server's Job/Pod/Secret rights still never reach a namespace it was not bound
+# into. Keep the rules in sync with ../role.yaml.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: omnigent-sandbox-manager
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["create", "get", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "list", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
