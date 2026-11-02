@@ -5892,11 +5892,11 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, "ready")
     except OmnigentError as exc:
         tracker.fail(session_id, str(exc))
-        _publish_sandbox_status(session_id, "failed", str(exc))
+        _publish_sandbox_status(session_id, "failed", str(exc), exception=exc)
     except HTTPException as exc:
         tracker.fail(session_id, str(exc.detail))
-        _publish_sandbox_status(session_id, "failed", str(exc.detail))
-    except Exception:  # noqa: BLE001
+        _publish_sandbox_status(session_id, "failed", str(exc.detail), exception=exc)
+    except Exception as exc:  # noqa: BLE001
         # Fire-and-forget task — settle the tracker (else a waiting message
         # POST hangs to its timeout) and never escape as an unhandled-task
         # traceback. A failed wake leaves the sandbox intact for a retry.
@@ -5906,7 +5906,9 @@ async def _run_managed_wake(
             extra={"session_id": session_id},
         )
         tracker.fail(session_id, "internal error during managed host wake")
-        _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
+        _publish_sandbox_status(
+            session_id, "failed", "internal error during managed host wake", exception=exc
+        )
 
 
 async def _ensure_runner_session_initialized(

@@ -5419,7 +5419,12 @@ def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -
         with caplog.at_level(logging.INFO):
             helpers._publish_sandbox_status_impl(session_id, "provisioning", provider="arclet")
             helpers._publish_sandbox_status_impl(session_id, "starting")
-            helpers._publish_sandbox_status_impl(session_id, "failed", "host never connected")
+            helpers._publish_sandbox_status_impl(
+                session_id,
+                "failed",
+                "host never connected: token=private-synthetic-token https://example.test/private",
+                exception=HTTPException(status_code=504, detail="private-synthetic-token"),
+            )
     finally:
         _session_sandbox_status_cache.pop(session_id, None)
     rows = [
@@ -5430,8 +5435,20 @@ def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -
     assert rows == [
         ("sandbox_launch_stage", {"stage": "provisioning", "provider": "arclet"}),
         ("sandbox_launch_stage", {"stage": "starting", "provider": "arclet"}),
-        ("sandbox_launch_failed", {"stage": "starting", "provider": "arclet"}),
+        (
+            "sandbox_launch_failed",
+            {
+                "stage": "starting",
+                "provider": "arclet",
+                "failure_category": "connectivity",
+                "failure_reason": "host_connect_timeout",
+                "exception_type": "HTTPException",
+                "http_status": "504",
+            },
+        ),
     ]
+    assert "private-synthetic-token" not in caplog.text
+    assert "example.test" not in caplog.text
 
 
 async def test_run_managed_wake_re_stamps_the_woken_runner(
