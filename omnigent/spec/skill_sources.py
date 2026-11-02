@@ -860,9 +860,11 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
     selector) — so the menu draws from the same roots and selection the
-    executor symlinks into ``$CODEX_HOME/skills/``. The menu is the subset of
-    that selection whose ``SKILL.md`` parses: the executor links by existence,
-    so a present-but-unparseable skill is linked but not shown (correct — Codex
+    executor symlinks into ``$CODEX_HOME/skills/``, plus the repo-scope
+    ``.agents/skills`` dirs Codex reads from its workspace cwd (first root),
+    which the executor does not link. The menu is the subset of that selection
+    whose ``SKILL.md`` parses: the executor links by existence, so a
+    present-but-unparseable skill is linked but not shown (correct — Codex
     won't register a malformed skill as a command either).
 
     A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
@@ -888,7 +890,10 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
     host_override = ctx.codex_home if ctx.is_native else None
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
+    cwd = ctx.roots[0] if ctx.roots else None
+    sources = codex_skill_sources(
+        ctx.bundle_dir, ctx.home, codex_home=host_override, workspace=cwd
+    )
     out: list[SkillSpec] = []
     for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
         try:
@@ -897,7 +902,6 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
             continue
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
-    cwd = ctx.roots[0] if ctx.roots else None
     out.extend(
         discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
     )

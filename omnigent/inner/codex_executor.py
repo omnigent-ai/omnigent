@@ -755,11 +755,26 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     return env
 
 
+def _codex_repo_skill_dirs(workspace: Path) -> list[Path]:
+    """
+    The ``.agents/skills`` dirs the Codex CLI loads for *workspace*, nearest first.
+
+    Like Codex, walk from the workspace up to the nearest ``.git`` ancestor;
+    outside a repository only the workspace's own directory is read.
+    """
+    current = workspace.resolve()
+    chain = [current, *current.parents]
+    repo_root = next((directory for directory in chain if (directory / ".git").exists()), None)
+    scoped = chain[: chain.index(repo_root) + 1] if repo_root is not None else [current]
+    return [directory / ".agents" / "skills" for directory in scoped]
+
+
 def codex_skill_sources(
     bundle_dir: Path | None,
     home: Path,
     *,
     codex_home: Path | None = None,
+    workspace: Path | None = None,
 ) -> list[Path]:
     """
     Build the ordered Codex skill-source list: bundle skills, then host skills.
@@ -768,10 +783,11 @@ def codex_skill_sources(
     by :func:`populate_codex_skills_from_bundle` (which symlinks them into
     ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
     provider — so the linked set and the menu cannot drift on which roots
-    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed Codex skills dir, then ``~/.agents/skills`` (a bundled
-    skill shadows a host skill of the same name). Only existing directories
-    are returned.
+    are scanned. Priority order: the agent's own ``<bundle>/skills/``, then
+    the workspace's repo-scope ``.agents/skills`` when *workspace* is given,
+    then the host-installed Codex skills dir, then ``~/.agents/skills`` (an
+    earlier source shadows a later skill of the same name). Only existing
+    directories are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
@@ -782,15 +798,26 @@ def codex_skill_sources(
         ``$CODEX_HOME`` for its config, so the native launch passes the
         resolved home here to keep the seeded skills and the menu in step with
         the CLI's own ``$CODEX_HOME``.
+    :param workspace: Codex's working directory, whose ``.agents/skills`` dirs
+        up to the repository root the menu lists. Launches omit it: Codex loads
+        those from its own cwd, so linking them would register each twice.
     :returns: Existing skill-dir roots in priority order.
     """
     sources: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
         sources.append(bundle_dir / "skills")
+    shared = home / ".agents" / "skills"
+    if workspace is not None:
+        # A home-directory workspace keeps ~/.agents/skills at its user-tier rank.
+        user_tier = shared.resolve()
+        sources.extend(
+            directory
+            for directory in _codex_repo_skill_dirs(workspace)
+            if directory.is_dir() and directory.resolve() != user_tier
+        )
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
-    shared = home / ".agents" / "skills"
     if shared.is_dir():
         sources.append(shared)
     return sources

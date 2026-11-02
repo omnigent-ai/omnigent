@@ -5118,6 +5118,55 @@ def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
     ]
 
 
+def test_codex_skill_sources_workspace_repo_scope_order(tmp_path: Path) -> None:
+    """Workspace ``.agents`` skills up to the git root rank between bundle and host skills."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    bundle = tmp_path / "bundle"
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "pkg" / "app"
+    for directory in (
+        bundle / "skills",
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+        tmp_path / ".agents" / "skills",
+        repo / ".agents" / "skills",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    # A worktree's .git file marks the repository root like a .git directory.
+    (repo / ".git").write_text("gitdir: elsewhere\n")
+    assert codex_skill_sources(bundle, home, workspace=workspace) == [
+        bundle / "skills",
+        workspace.resolve() / ".agents" / "skills",
+        repo.resolve() / ".agents" / "skills",
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+    ]
+
+
+def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
+    """Outside a repo only the workspace's own dir counts; ``$HOME`` keeps its user rank."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    for directory in (
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+        tmp_path / ".agents" / "skills",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    host_tiers = [home / ".codex" / "skills", home / ".agents" / "skills"]
+    assert codex_skill_sources(None, home, workspace=workspace) == [
+        workspace.resolve() / ".agents" / "skills",
+        *host_tiers,
+    ]
+    assert codex_skill_sources(None, home, workspace=home) == host_tiers
+
+
 def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
     """Only existing dirs are returned (bundle absent → host only)."""
     from omnigent.inner.codex_executor import codex_skill_sources
