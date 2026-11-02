@@ -1,18 +1,79 @@
-"""Tell a superseded native session that ``/clear`` moved its terminal.
+"""Create a native ``/clear`` replacement session and tell the old one it moved.
 
 Native ``/clear`` (Claude Code's hook, Codex's new app-server thread) rotates
-the terminal onto a fresh Omnigent session. The old session never sees another
-turn, so its viewers need an explicit notice and redirect.
+the terminal onto a fresh Omnigent session. The replacement keeps the old
+session's title and project; the old session never sees another turn, so its
+viewers need an explicit notice and redirect.
 """
 
 from __future__ import annotations
 
 import logging
 import urllib.parse
+from collections.abc import Mapping
 
 import httpx
 
+from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
+
 _logger = logging.getLogger(__name__)
+
+_PROJECT_CREATE_FIELDS = ("project_id", "workspace", "git")
+
+
+def clear_replacement_create_body(
+    old_session: Mapping[str, object],
+    *,
+    agent_id: str,
+    labels: dict[str, str],
+) -> dict[str, object]:
+    """
+    Build the ``POST /v1/sessions`` body for a native ``/clear`` replacement.
+
+    ``/clear`` resets only the conversation, so the replacement inherits the
+    old session's title and first-class project. Explicit ``workspace`` and
+    ``git`` nulls stop project defaults from starting a new workspace or
+    worktree for the terminal that is being transferred.
+
+    :param old_session: ``GET /v1/sessions/{id}`` snapshot of the session
+        being cleared, e.g. ``{"title": "Fix login", "project_id": "proj_1"}``.
+    :param agent_id: Agent for the replacement, e.g. ``"agent_claude"``.
+    :param labels: Labels for the replacement, including its bridge id.
+    :returns: JSON body for the create request.
+    """
+    body: dict[str, object] = {"agent_id": agent_id, "labels": labels}
+    title = old_session.get("title")
+    if isinstance(title, str) and title:
+        body["title"] = title[:USER_SESSION_TITLE_MAX_CHARS]
+    project_id = old_session.get("project_id")
+    if isinstance(project_id, str) and project_id:
+        body |= {"project_id": project_id, "workspace": None, "git": None}
+    return body
+
+
+def unfiled_clear_replacement_body(
+    create_body: Mapping[str, object],
+    response: httpx.Response,
+) -> dict[str, object] | None:
+    """
+    Return the create body without its project after a project 404.
+
+    The server answers 404 when the project was deleted or belongs to another
+    user (a guest on a shared host). ``/clear`` still needs a continuation
+    session, so the caller retries it unfiled.
+
+    :param create_body: Body from :func:`clear_replacement_create_body`.
+    :param response: Response to the first create request.
+    :returns: Body to retry without project fields, or ``None`` when the
+        first response needs no retry.
+    """
+    if response.status_code != httpx.codes.NOT_FOUND or "project_id" not in create_body:
+        return None
+    _logger.warning(
+        "Could not file /clear replacement session in project %s; creating it unfiled",
+        create_body["project_id"],
+    )
+    return {key: value for key, value in create_body.items() if key not in _PROJECT_CREATE_FIELDS}
 
 
 async def post_clear_supersession(
