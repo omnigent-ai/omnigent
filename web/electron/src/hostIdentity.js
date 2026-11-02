@@ -1,5 +1,7 @@
 "use strict";
 
+const { performance } = require("node:perf_hooks");
+
 const SESSION_HOST_PROTOCOL = 1;
 
 /** Return whether the host is this machine and its live daemon serves the server.
@@ -13,7 +15,7 @@ function isHostThisMachine({ hostId, serverUrl }, cli = require("./omnigent_cli"
 }
 
 /** Cache local identity/enrollment checks for at most one second per host/server pair. */
-function createHostThisMachineChecker({ cli, now = Date.now } = {}) {
+function createHostThisMachineChecker({ cli, now = () => performance.now() } = {}) {
   const snapshots = new Map();
   return ({ hostId, serverUrl }) => {
     if (!hostId) return false;

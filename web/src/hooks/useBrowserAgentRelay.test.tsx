@@ -874,6 +874,35 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     },
   );
 
+  it("does not retry a desktop action after unmount during the retry host lookup", async () => {
+    const browserScreenshot = vi.fn().mockResolvedValue({
+      ok: false,
+      error: "Current session host is required to read this browser view",
+    });
+    const bridge = installBridge({ browserScreenshot });
+    let resolveHost!: (source: unknown) => void;
+    getSessionSlim.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveHost = resolve;
+        }),
+    );
+    const hook = renderRelay();
+    emitBrowserActionRequest(actionEvent("screenshot"), CONV);
+    await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV));
+    expect(browserScreenshot).toHaveBeenCalledExactlyOnceWith(CONV);
+    hook.unmount();
+    resolveHost({ id: CONV, hostId: "local-host", parentSessionId: null });
+    await vi.waitFor(() =>
+      expect(postedResult().result).toEqual({
+        ok: false,
+        error: "browser relay context changed",
+      }),
+    );
+    expect(browserScreenshot).toHaveBeenCalledExactlyOnceWith(CONV);
+    expect(bridge.browserPerformAction).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       privileged: false,

@@ -146,11 +146,13 @@ describe("localServerHealthy", () => {
 
   it("is null for a stale pidfile (dead pid)", async (t) => {
     const pid = 123456;
+    const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: true }));
     t.mock.method(process, "kill", () => {
       throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
     });
     withPidfile(`${pid}\n6767\n`);
     assert.equal(await localServerHealthy(), null);
+    assert.equal(fetch.mock.callCount(), 0);
   });
 
   it("is null when the pid is alive but nothing serves the port", async () => {

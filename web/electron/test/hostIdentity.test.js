@@ -1,6 +1,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
+const { performance } = require("node:perf_hooks");
 const { createHostThisMachineChecker, isHostThisMachine } = require("../src/hostIdentity");
 
 it("imports browser IPC and checks injected identities without desktop js-yaml", () => {
@@ -93,6 +94,34 @@ describe("isHostThisMachine", () => {
 });
 
 describe("cached host eligibility", () => {
+  it("expires grants with the production clock despite a backward wall-clock correction", (t) => {
+    let elapsed = 0;
+    let wallTime = 60_000;
+    let live = true;
+    let enrollmentReads = 0;
+    t.mock.method(performance, "now", () => elapsed);
+    t.mock.method(Date, "now", () => wallTime);
+    const check = createHostThisMachineChecker({
+      cli: {
+        readLocalHostId: () => "local",
+        liveDaemonRecordFor: () => {
+          enrollmentReads++;
+          return live ? { host_id: "local" } : null;
+        },
+      },
+    });
+    const context = { hostId: "local", serverUrl: "https://server.example" };
+    assert.equal(check(context), true);
+    live = false;
+    wallTime -= 60_000;
+    elapsed = 999;
+    assert.equal(check(context), true);
+    assert.equal(enrollmentReads, 1);
+    elapsed = 1001;
+    assert.equal(check(context), false);
+    assert.equal(enrollmentReads, 2);
+  });
+
   it("reuses reads within one second, isolates host/server pairs, and expires grants and denials", () => {
     let now = 0;
     let localId = "local";
