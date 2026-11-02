@@ -26,6 +26,7 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
+from omnigent.errors import ErrorCategory
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
@@ -33,6 +34,8 @@ from omnigent.host.connect import (
     HostRetryableConnectionError,
     ModelOptionsResult,
     _build_runner_env,
+    _host_disk_full,
+    _runner_exit_category,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -2186,7 +2189,7 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    error = _runner_exit_error(3, log)
+    error = _runner_exit_error(3, log, disk_full=False)
 
     assert "sk-live-abc123" not in error
     assert "eyJhbGciOiJIUzI1NiJ9" not in error
@@ -2196,6 +2199,93 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     # Keep the diagnostic cause.
     assert "tunnel rejected: bad frame" in error
     assert "code 3" in error
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "disk_full"),
+    [
+        (0, True),
+        (1024 * 1024 - 1, True),
+        (1024 * 1024, False),
+        (10 * 1024 * 1024, False),
+        (None, False),
+    ],
+    ids=["empty", "just-under-1MiB", "exactly-1MiB", "plenty", "usage-unreadable"],
+)
+def test_runner_exit_error_names_a_full_host_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    free_bytes: int | None,
+    disk_full: bool,
+) -> None:
+    """A runner that dies on a full disk usually logs nothing, so the host says why."""
+
+    def disk_usage(_path: Path) -> SimpleNamespace:
+        if free_bytes is None:
+            raise OSError("statvfs failed")
+        return SimpleNamespace(total=100, used=100, free=free_bytes)
+
+    monkeypatch.setattr("omnigent.host.connect.shutil.disk_usage", disk_usage)
+    log = tmp_path / "runner-x.log"
+
+    assert _host_disk_full(log) is disk_full
+    error = _runner_exit_error(1, log, disk_full=_host_disk_full(log))
+    assert error.startswith("runner process exited with code 1")
+    assert ("no space left on device" in error) is disk_full
+    assert _runner_exit_category(disk_full) is (
+        ErrorCategory.HOST if disk_full else ErrorCategory.RUNNER
+    )
+
+
+async def test_watch_runner_reports_disk_full_and_its_blame_from_one_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Space freed mid-report cannot leave a disk-full note blamed on the runner."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    samples: list[int] = []
+
+    def disk_usage(_path: Path) -> SimpleNamespace:
+        # Full for the first look only, as when cleanup frees space mid-report.
+        samples.append(1)
+        return SimpleNamespace(total=100, used=100, free=0 if len(samples) == 1 else 1 << 30)
+
+    monkeypatch.setattr("omnigent.host.connect.shutil.disk_usage", disk_usage)
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _reason: None)  # type: ignore[assignment]
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that outlives the launch, then exits 1 without logging."""
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 1"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_disk", binding_token="tok_disk", workspace=str(workspace)
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+    ):
+        result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    report = decode_host_frame(tunnel.sent[0])
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert "no space left on device" in report.error
+    died = next(r for r in caplog.records if getattr(r, "event_name", None) == "runner_died")
+    assert died.attributes["error_category"] == ErrorCategory.HOST.value
 
 
 @pytest.mark.parametrize("console_closed", [False, True])
