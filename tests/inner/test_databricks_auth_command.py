@@ -309,15 +309,18 @@ def test_without_a_recorded_command_an_unauthenticated_profile_stays_empty(
     )
 
 
-def _write_broker_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace_host: str):
+def _write_broker_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    workspace_host: str,
+    server: str = "https://omni.example",
+):
     """Point the config file at *tmp_path* and drop a broker sidecar for *workspace_host*."""
     from omnigent.host import databricks_credential as dc
 
     cfg_path = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
-    assert dc._write_sidecar(
-        cfg_path, "https://omni.example", "host-1", "host-tok", workspace_host
-    )
+    assert dc._write_sidecar(cfg_path, server, "host-1", "host-tok", workspace_host)
 
 
 def test_the_broker_sidecar_becomes_the_fallback_for_the_connected_workspace(
@@ -328,7 +331,34 @@ def test_the_broker_sidecar_becomes_the_fallback_for_the_connected_workspace(
 
     _write_broker_sidecar(monkeypatch, tmp_path, "https://example.databricks.com")
     command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
-    assert "python3 -m omnigent.host.databricks_credential token" in command
+    assert "-P -m omnigent.host.databricks_credential token" in command
+
+
+@pytest.mark.posix_only
+def test_the_broker_fallback_runs_under_omnigents_interpreter_not_path_python3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The broker fetch, like the sdk mint, must not run the ``python3`` on ``PATH``."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    # A closed port, so the real broker fetch declines at once and the sdk mint runs.
+    _write_broker_sidecar(
+        monkeypatch, tmp_path, "https://example.databricks.com", server="http://127.0.0.1:9"
+    )
+    bin_dir = tmp_path / "bin"
+    ran = tmp_path / "path-python3-ran"
+    _write_script(bin_dir / "python3", f": > {shlex.quote(str(ran))}\n")
+    command = databricks_bearer_token_command("https://example.databricks.com", "omnigent")
+
+    token = _run_generated_helper(
+        command,
+        bin_dir,
+        force_refresh_works=False,
+        cached_token_works=False,
+        extra_env=_offline_databricks_sdk(tmp_path / "sdk"),
+    )
+    assert token == "sdk-minted"
+    assert not ran.exists()
 
 
 def test_the_broker_sidecar_is_ignored_for_a_different_workspace(

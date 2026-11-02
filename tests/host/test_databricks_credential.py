@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -185,8 +186,8 @@ def test_broker_token_command_bakes_sidecar_path_for_the_connected_workspace(
     # Trailing-slash-insensitive match against the connected workspace host.
     cmd = dc.broker_token_command("https://ws.example/")
     assert cmd is not None
-    assert "python3 -m omnigent.host.databricks_credential token" in cmd
-    assert str(tmp_path / dc._SIDECAR_NAME) in cmd
+    argv = [sys.executable, "-P", "-m", "omnigent.host.databricks_credential", "token"]
+    assert shlex.split(cmd) == [*argv, "--coords", str(tmp_path / dc._SIDECAR_NAME)]
 
 
 def test_broker_token_command_none_for_a_different_workspace(

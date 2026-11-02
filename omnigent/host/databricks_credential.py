@@ -225,14 +225,16 @@ def broker_token_command(host: str, cfg_path: Path | None = None) -> str | None:
 
     The sidecar path is baked as an absolute literal so the command works in the
     harness process regardless of its inherited environment (like git's
-    credential helper baking its coordinates).
+    credential helper baking its coordinates). The fetch runs under omnigent's own
+    interpreter, since the harness's ``PATH`` may find a ``python3`` without
+    omnigent, and ``-P`` keeps the harness cwd off ``sys.path``.
     """
     path = _sidecar_path(cfg_path)
     coords = _read_sidecar(path)
     if coords is None or coords["workspace_host"].rstrip("/") != host.rstrip("/"):
         return None
-    module = "omnigent.host.databricks_credential"
-    return f"python3 -m {module} token --coords {shlex.quote(str(path))}"
+    argv = [sys.executable or "python3", "-P", "-m", "omnigent.host.databricks_credential"]
+    return shlex.join([*argv, "token", "--coords", str(path)])
 
 
 def https_url_on_workspace_host(url: str, workspace_host: str) -> bool:
@@ -335,7 +337,7 @@ def configure_host_databricks(server_url: str, host_id: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     """Print the owner's current Databricks bearer, fetched from the broker.
 
-    Invoked as ``python3 -m omnigent.host.databricks_credential token`` by the
+    Invoked as ``<python> -P -m omnigent.host.databricks_credential token`` by the
     gateway auth command's fallback. Prints the bearer on stdout, or nothing (so
     the caller falls through) when the sidecar is absent or the broker declines.
     """
