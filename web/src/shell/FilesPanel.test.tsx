@@ -475,8 +475,12 @@ describe("FilesPanel on an asleep sandbox", () => {
 
   it("starts the sandbox once when the mobile Files drawer opens and reopens", async () => {
     vi.useFakeTimers();
-    const wakeAnswer = Promise.withResolvers<{ queued: boolean; recovered: boolean }>();
-    retrySessionMock.mockReturnValueOnce(wakeAnswer.promise);
+    let answerWake: (response: { queued: boolean; recovered: boolean }) => void = () => {};
+    retrySessionMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        answerWake = resolve;
+      }),
+    );
     useAsleepMock.mockReturnValue(true);
     useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
     useChangedFilesMock.mockReturnValue(
@@ -519,7 +523,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     await act(async () => rerender(drawer(false)));
     await act(async () => rerender(drawer(true)));
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    await act(async () => wakeAnswer.resolve({ queued: false, recovered: true }));
+    await act(async () => answerWake({ queued: false, recovered: true }));
     act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS / 2));
     await act(async () => rerender(drawer(false)));
     await act(async () => rerender(drawer(true)));
