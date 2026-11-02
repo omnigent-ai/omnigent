@@ -2734,14 +2734,24 @@ describe("automation harness settings", () => {
     expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
   });
 
-  it("keeps Codex permissions hidden on older servers while exposing model settings", () => {
-    useHarness("codex-native");
-    render(
-      <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
-        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
-      </CapabilitiesProvider>,
-    );
-    expect(screen.getByTestId("task-model-trigger")).toBeVisible();
-    expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
-  });
+  it.each([
+    ["codex-native", false],
+    ["claude-native", true],
+  ] as const)(
+    "preserves older-server permission support for %s",
+    (harness, supportsPermissions) => {
+      useHarness(harness);
+      render(
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      if (supportsPermissions) {
+        expect(screen.getByTestId("task-permission-trigger")).toBeVisible();
+      } else {
+        expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+      }
+    },
+  );
 });

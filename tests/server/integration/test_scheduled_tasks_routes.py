@@ -20,12 +20,12 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
@@ -589,24 +589,40 @@ async def test_create_rejects_invalid_reasoning_effort(
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.parametrize(
+    ("agent_name", "mode"),
+    [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
+    + [
+        (CODEX_NATIVE_AGENT_NAME, mode)
+        for mode in ("default", "full-access", "read-only", "bypass")
+    ],
+)
 async def test_create_persists_permission_mode(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
 ) -> None:
-    """A valid permission mode round-trips on create and read."""
+    """A valid permission mode round-trips on create, read, and update."""
     _make_user(db_uri)
     resp = await auth_client.post(
         "/v1/scheduled-tasks",
-        json=_create_body(permission_mode="acceptEdits"),
+        json=_create_body(agent_id=builtin_agent_id(agent_name), permission_mode=mode),
         headers=_headers(),
     )
     assert resp.status_code == 200, resp.text
     created = resp.json()
-    assert created["permission_mode"] == "acceptEdits"
+    assert created["permission_mode"] == mode
     task_id = created["id"]
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
-    assert got.json()["permission_mode"] == "acceptEdits"
+    assert got.json()["permission_mode"] == mode
+    if mode == "full-access":
+        changed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}",
+            json={"permission_mode": "read-only"},
+            headers=_headers(),
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["permission_mode"] == "read-only"
 
 
 @pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
@@ -2775,31 +2791,3 @@ async def test_changing_where_a_task_runs_starts_a_new_session(
 
     assert moved.status_code == 200, moved.text
     assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)
-
-
-@pytest.mark.parametrize("mode", ["default", "full-access", "read-only", "bypass"])
-async def test_codex_permission_round_trip(
-    auth_client: httpx.AsyncClient, db_uri: str, mode: str
-) -> None:
-    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
-
-    _make_user(db_uri)
-    response = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(
-            agent_id=builtin_agent_id(CODEX_NATIVE_AGENT_NAME), permission_mode=mode
-        ),
-        headers=_headers(),
-    )
-    assert response.status_code == 200, response.text
-    task_id = response.json()["id"]
-    loaded = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
-    assert loaded.status_code == 200, loaded.text
-    assert loaded.json()["permission_mode"] == mode
-    if mode != "full-access":
-        return
-    changed = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json={"permission_mode": "read-only"}, headers=_headers()
-    )
-    assert changed.status_code == 200, changed.text
-    assert changed.json()["permission_mode"] == "read-only"

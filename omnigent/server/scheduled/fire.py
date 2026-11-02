@@ -1140,14 +1140,17 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
 async def _permission_mode_launch_options(
     deps: FireDeps, task: ScheduledTask
 ) -> tuple[list[str] | None, dict[str, str]]:
-    """Translate a saved mode only for a confirmed, compatible harness."""
+    """Translate a saved mode, failing if its harness or launch options cannot be resolved."""
     if task.permission_mode is None:
         return None, {}
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
     harness = await scheduled_agent_harness(agent, deps.agent_cache)
     args = PERMISSION_LAUNCH_ARGS.get(harness or "", {}).get(task.permission_mode)
     if args is None:
-        return None, {}
+        raise ValueError(
+            f"Cannot apply saved permission_mode {task.permission_mode!r} "
+            f"for agent {task.agent_id!r}: unresolved or unsupported harness {harness!r}"
+        )
     labels = {}
     if harness == "codex-native" and task.permission_mode == "bypass":
         from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
@@ -1159,10 +1162,8 @@ async def _permission_mode_launch_options(
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
     """Read ``executor.reasoning_effort`` from the task's agent spec.
 
-    Fail-safe like :func:`_permission_mode_launch_options`: a task with no explicit
-    effort inherits the spec default, and any load failure yields ``None`` (the
-    harness default) rather than breaking the fire. The spec value is validated
-    at spec load, so it needs no re-validation here.
+    A task with no explicit effort inherits the spec default; a load failure
+    uses the harness default. The spec value is validated at load time.
     """
     if deps.agent_cache is None:
         return None

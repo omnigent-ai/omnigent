@@ -23,7 +23,7 @@ def validate_scheduled_permission_mode(mode: str | None) -> str | None:
 
 
 async def scheduled_agent_harness(agent: Any, agent_cache: Any) -> str | None:
-    """Resolve the saved agent; unavailable bundles must never receive flags."""
+    """Resolve the saved agent; return None when its harness cannot be determined."""
     if agent is None or agent_cache is None or getattr(agent, "bundle_location", None) is None:
         return None
     try:
