@@ -4085,6 +4085,7 @@ function ConversationSection({
                   reorderGroup={reorderGroup}
                   previousId={reorderNeighbour(conversations[index - 1])}
                   nextId={reorderNeighbour(conversations[index + 1])}
+                  reorderIndex={reorderGroup ? index : undefined}
                 />
               ))}
             </ul>
@@ -4894,6 +4895,7 @@ function ConversationRowImpl({
   reorderGroup,
   previousId,
   nextId,
+  reorderIndex,
 }: {
   conversation: Conversation;
   // Computed by the list owner against the resolved top-level root (so a
@@ -4910,10 +4912,11 @@ function ConversationRowImpl({
   isSelected: boolean;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
-  /** The list this row reorders within (see ConversationSection), and its neighbours there. */
+  /** The list this row reorders within (see ConversationSection), its neighbours and index there. */
   reorderGroup?: string;
   previousId?: string;
   nextId?: string;
+  reorderIndex?: number;
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -5144,15 +5147,26 @@ function ConversationRowImpl({
       isPinned,
       canManage: isOwner,
       reorderGroup: canReorder ? reorderGroup : undefined,
+      reorderIndex,
     },
     disabled:
       (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
-  const { setNodeRef: setSessionOrderNodeRef, isOver: isReorderTarget } = useDroppable({
+  const {
+    setNodeRef: setSessionOrderNodeRef,
+    isOver: isReorderTarget,
+    active: reorderDrag,
+  } = useDroppable({
     id: `session-order:${conversation.id}`,
     data: { type: "session-order", id: conversation.id, group: reorderGroup },
     disabled: reorderGroup === undefined || isEditing || isProvisionalRow,
   });
+  // Like pins, a row dragged down lands below this one; one dragged up, above it.
+  let reorderInsertion: "before" | "after" | undefined;
+  if (isReorderTarget && reorderIndex !== undefined) {
+    const from = reorderDrag?.data.current?.reorderIndex as number;
+    reorderInsertion = from < reorderIndex ? "after" : "before";
+  }
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
@@ -5166,6 +5180,7 @@ function ConversationRowImpl({
     const from = pinOrder.ids.indexOf(pinOrder.draggingId);
     pinInsertion = from >= 0 && from < pinOrder.ids.indexOf(conversation.id) ? "after" : "before";
   }
+  const insertion = (pinOrder?.draggingId !== conversation.id && pinInsertion) || reorderInsertion;
   // Merge the drag/drop node refs with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
     (node: HTMLLIElement | null) => {
@@ -5325,10 +5340,7 @@ function ConversationRowImpl({
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
-        // A valid reorder target gets a faint dashed outline instead of the hover fill.
-        isReorderTarget
-          ? "outline-2 -outline-offset-2 outline-dashed outline-brand-accent/40"
-          : SIDEBAR_HOVER_HIGHLIGHT,
+        SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
@@ -5443,11 +5455,11 @@ function ConversationRowImpl({
       }}
       className={cn("group relative", isDragging && "opacity-40")}
     >
-      {pinInsertion && pinOrder?.draggingId !== conversation.id && (
+      {insertion && (
         <span
-          data-testid="pin-order-insertion"
+          data-testid={pinInsertion ? "pin-order-insertion" : "session-order-insertion"}
           className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
-          style={pinInsertion === "before" ? { top: 0 } : { bottom: 0 }}
+          style={insertion === "before" ? { top: 0 } : { bottom: 0 }}
         />
       )}
       {/* Right-click anywhere on the row opens the same actions as the kebab.
@@ -5989,6 +6001,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.reorderGroup === next.reorderGroup &&
     prev.previousId === next.previousId &&
     prev.nextId === next.nextId &&
+    prev.reorderIndex === next.reorderIndex &&
     conversationRenderEqual(prev.conversation, next.conversation)
   );
 });

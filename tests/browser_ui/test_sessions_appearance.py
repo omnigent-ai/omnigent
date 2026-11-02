@@ -141,16 +141,16 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
 
     # Updated would now be Quiet, Busy, Recent, so this drop leaves a distinct Custom order.
     source = rows.filter(has_text="Recent session").bounding_box()
-    target_row = rows.filter(has_text="Busy session")
-    target = target_row.bounding_box()
+    target = rows.filter(has_text="Busy session").bounding_box()
     assert source and target
     page.mouse.move(source["x"] + 30, source["y"] + source["height"] / 2)
     page.mouse.down()
     page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
-    expect(target_row).to_have_css("outline-style", "dashed")
-    expect(target_row).to_have_css("outline-width", "2px")
-    expect(target_row).to_have_css("outline-color", re.compile(r"/ 0\.4\)$"))
-    expect(target_row).to_have_css("background-color", "rgba(0, 0, 0, 0)")
+    # Like pins, a line marks the slot: above Busy, since Recent moves up.
+    busy_row = page.locator("li[data-sidebar-session-id]", has_text="Busy session")
+    line = busy_row.get_by_test_id("session-order-insertion")
+    expect(line).to_have_css("top", "0px")
+    expect(line).to_have_css("height", "2px")
     expect(rows).to_have_text(updated)
     page.mouse.up()
     custom = titles("Recent session", "Busy session", "Quiet session")

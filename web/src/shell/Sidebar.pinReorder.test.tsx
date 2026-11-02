@@ -273,6 +273,12 @@ describe("Custom session order", () => {
   afterEach(() => {
     localStorage.clear();
   });
+  // The pinned-style line marks the slot: above the target when dragging up, below when down.
+  const expectLine = (id: string, edge: "top" | "bottom") => {
+    const line = screen.getByTestId("session-order-insertion");
+    expect(link(id).closest("li")).toContainElement(line);
+    expect(line).toHaveAttribute("style", `${edge}: 0px;`);
+  };
 
   it("starts from the order on screen on drop, not hover, and never follows the row's link", async () => {
     renderGrouping();
@@ -282,7 +288,7 @@ describe("Custom session order", () => {
       expectTarget: false,
       whileOver: () => {
         expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
-        expect(link("conv_c")).toHaveClass("outline-dashed");
+        expectLine("conv_c", "top");
       },
     });
 
@@ -315,14 +321,17 @@ describe("Custom session order", () => {
 
     await dropOnto("conv_e", "conv_d", {
       expectTarget: false,
-      whileOver: () => expect(link("conv_d")).not.toHaveClass("outline-dashed"),
+      whileOver: () => expect(screen.queryByTestId("session-order-insertion")).toBeNull(),
     });
     expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
     expect(saved().ordering).toBe("created");
 
     await dropOnto("conv_e", "conv_c", { expectTarget: false });
     expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c", "conv_f"]);
-    await dropOnto("conv_c", "conv_f", { expectTarget: false });
+    await dropOnto("conv_c", "conv_f", {
+      expectTarget: false,
+      whileOver: () => expectLine("conv_f", "bottom"),
+    });
     expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_f", "conv_c"]);
   });
 

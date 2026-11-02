@@ -263,8 +263,8 @@ the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
 
 **Custom order:** with `sidebar_grouping_ui` on, drag one of your sessions onto
-another row in the same list, project or group and release it; a faint dashed
-outline marks the rows that accept it. Move up and Move down in the row menu or
+another row in the same list, project or group and release it; a line like the
+Pinned section's marks where it lands. Move up and Move down in the row menu or
 right-click menu do the same. On mobile, press and hold a row in the sidebar
 drawer, then drag it. Ordering → Custom in the filter menu keeps the order shown.
 
@@ -562,7 +562,7 @@ plain `uv run pytest`, which starts a private server for the test.
   Dropping an unpinned row onto a pinned row has web unit coverage only.
 - **`custom-order`:**
   `tests/browser_ui/test_sessions_appearance.py::test_custom_order_keeps_the_list_and_commits_on_drop`
-  (built SPA, mocked backend) covers the menu, the dashed target without a fill,
+  (built SPA, mocked backend) covers the menu, the insertion line,
   committing on drop, reload, new sessions above, per-tab state and the flag-off
   fallback.
   `tests/e2e_ui/sessions/test_sidebar_projects.py::test_move_session_into_new_project`
