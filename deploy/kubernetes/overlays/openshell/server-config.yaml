@@ -13,14 +13,16 @@ data:
       provider: openshell
       # Public URL that sandboxes dial back to (must be reachable from the
       # sandbox network namespace).
-      server_url: https://omnigent.example.com
+      server_url: http://omnigent.omnigent.svc.cluster.local
       openshell:
+        providers:
+          # Give a list of pre-provisioned OpenShell credential Providers in the omnigent workspace
+        workspace: omnigent
+        image: quay.io/aicatalyst/omnigent-host-openshell:latest
         # SERVER env var NAMES whose values are injected into sandboxes
         # at provision time — this is how LLM keys reach the sandbox.
         env:
-          - ANTHROPIC_API_KEY
-          - OPENAI_API_KEY
-          - GEMINI_API_KEY
+          - OMNIGENT_RUNNER_ENV_PASSTHROUGH
         # Gateway name resolved by the SDK's from_active_cluster(); omit
         # to use the active gateway from ~/.config/openshell/active_gateway.
         # cluster: my-gateway

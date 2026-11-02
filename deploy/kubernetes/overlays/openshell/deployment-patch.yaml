@@ -8,6 +8,14 @@ spec:
       serviceAccountName: omnigent
       containers:
         - name: omnigent
+          env:
+            - name: OMNIGENT_RUNNER_ENV_PASSTHROUGH
+              value: "HTTP_PROXY,HTTPS_PROXY,ALL_PROXY,NO_PROXY,http_proxy,https_proxy,all_proxy,no_proxy,GH_TOKEN,SSL_CERT_FILE,NODE_EXTRA_CA_CERTS"
+            # The container runs as root (HOME=/root) but the openshell
+            # SDK config is mounted under /home/omnigent; the SDK reads
+            # XDG_CONFIG_HOME before falling back to ~/.config.
+            - name: XDG_CONFIG_HOME
+              value: /home/omnigent/.config
           volumeMounts:
             - name: openshell-gateway
               mountPath: /home/omnigent/.config/openshell
@@ -21,6 +29,11 @@ spec:
           secret:
             secretName: openshell-gateway-config
             optional: true
+            items:
+              - key: active_gateway
+                path: active_gateway
+              - key: metadata.json
+                path: gateways/openshell/metadata.json
         - name: server-config
           configMap:
             name: omnigent-server-config
