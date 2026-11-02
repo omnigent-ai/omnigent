@@ -93,8 +93,10 @@ class DeviceGrantUnavailableError(OAuthError):
 class TokenResult:
     """A token obtained from a completed login.
 
-    ``refresh_token`` is empty for OIDC session JWTs (the cli-ticket flow
-    issues no refresh token — the bot re-logs-in on expiry).
+    ``refresh_token`` is empty when the server issues none (an OIDC
+    deployment without a login-grant store — the bot re-logs-in on
+    expiry). When ``/auth/cli-poll`` carries one, the poller keeps it so
+    the session can renew silently until the grant ends.
     """
 
     access_token: str
@@ -117,7 +119,12 @@ def _token_from_response(
     try:
         data = resp.json()
         access_token = str(data[access_key])
-        refresh_token = str(data["refresh_token"]) if has_refresh else ""
+        submit_refresh = has_refresh
+        if has_refresh and "refresh_token" not in data:
+            # The server skipped the grant; fall back to standalone-JWT
+            # behaviour instead of failing the whole login.
+            submit_refresh = False
+        refresh_token = str(data["refresh_token"]) if submit_refresh else ""
         expires_in = int(data.get("expires_in", default_expires))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise OAuthError(f"Malformed token response: {exc}") from exc
@@ -371,10 +378,13 @@ async def _poll_cli_ticket(
         if resp.status_code == 202:
             continue  # pending: browser flow not finished
         if resp.status_code == 200:
-            # No refresh token in the ticket flow — the session JWT stands
-            # alone until it expires, then the user re-logs-in.
+            # Keep the login grant when the server issues one: the proxy
+            # adds a session JWT *and* a ``refresh_token`` once a grant
+            # store is wired, so the bot can renew silently instead of
+            # re-prompting a login every session-JWT expiry. A server that
+            # issues none keeps the old standalone-JWT behaviour.
             return _token_from_response(
-                resp, access_key="token", has_refresh=False, default_expires=8 * 3600
+                resp, access_key="token", has_refresh=True, default_expires=8 * 3600
             )
         if resp.status_code in (400, 403, 410):
             raise AuthorizationExpiredError(
