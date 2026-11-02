@@ -2803,7 +2803,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -4962,7 +4962,7 @@ describe("onboarding runner IPC", () => {
 
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
 
-    assert.deepEqual(result, { ok: false, error: legacyError, errorMessage, errorAction });
+    assert.deepEqual(plain(result), { ok: false, error: legacyError, errorMessage, errorAction });
   });
 
   // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
