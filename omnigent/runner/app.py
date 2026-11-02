@@ -148,6 +148,7 @@ from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
+from omnigent.runner.project_setup_gate import wait_for_project_setup
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -5423,6 +5424,8 @@ def create_runner_app(
         conv: str,
         handed_off: list[bool],
     ) -> None:
+        # A fresh worktree's install must finish before the agent works in it.
+        await wait_for_project_setup()
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         await _sync_session_agent(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))

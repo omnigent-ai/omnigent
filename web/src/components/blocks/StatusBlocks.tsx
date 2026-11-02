@@ -14,6 +14,7 @@ import {
   ChevronRightIcon,
   CopyIcon,
   ExternalLinkIcon,
+  FileTextIcon,
   FolderOpenIcon,
   Loader2Icon,
   RotateCcwIcon,
@@ -31,13 +32,15 @@ import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
+import { useIsSessionOwner } from "@/hooks/usePermissions";
 import { copyText } from "@/lib/clipboard";
-import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { getProjectSetupLog, getSessionSignInLink, rerunProjectSetup } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
@@ -284,6 +287,138 @@ function ErrorForkAction({
           {label}
         </Button>
       </DisabledActionTooltip>
+    </div>
+  );
+}
+
+/** Project setup notice codes; env and unsupported-host notices offer no actions. */
+export const PROJECT_SETUP_NOTICE_CODES = {
+  envFailed: "project_env_failed",
+  unsupported: "project_setup_unsupported",
+  failed: "project_setup_failed",
+  running: "project_setup_running",
+  finished: "project_setup_finished",
+} as const;
+
+/** Worktree setup notices that offer the setup log. */
+const PROJECT_SETUP_LOG_CODES: ReadonlySet<string> = new Set([
+  PROJECT_SETUP_NOTICE_CODES.failed,
+  PROJECT_SETUP_NOTICE_CODES.running,
+  PROJECT_SETUP_NOTICE_CODES.finished,
+]);
+
+function errorText(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
+/** Owner-only actions on a worktree setup notice: re-run (on failure) and view its log. */
+function ProjectSetupActions({ code, className }: { code: string; className?: string }) {
+  const conversationId = useScopedConversationId();
+  const isOwner = useIsSessionOwner(conversationId ?? "");
+  if (!conversationId || !isOwner) return null;
+  return (
+    <div
+      className={cn("flex flex-wrap items-start gap-2", className)}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {code === PROJECT_SETUP_NOTICE_CODES.failed ? (
+        <RerunProjectSetupAction conversationId={conversationId} />
+      ) : null}
+      <ProjectSetupLogAction conversationId={conversationId} />
+    </div>
+  );
+}
+
+/** Opens the end of the session worktree's project setup log, read from its host. */
+function ProjectSetupLogAction({ conversationId }: { conversationId: string }) {
+  const [open, setOpen] = useState(false);
+  const [log, setLog] = useState<{ content: string | null } | { error: string } | null>(null);
+  return (
+    <>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        data-testid="error-project-setup-log"
+        componentId="diagnostics.status.project_setup_log"
+        onClick={() => {
+          setOpen(true);
+          setLog(null);
+          getProjectSetupLog(conversationId).then(
+            (content) => setLog({ content }),
+            (reason: unknown) => setLog({ error: errorText(reason) }),
+          );
+        }}
+      >
+        <FileTextIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        View setup log
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Project setup log</DialogTitle>
+          </DialogHeader>
+          {log === null ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : "error" in log ? (
+            <p
+              role="alert"
+              data-testid="project-setup-log-error"
+              className="text-sm text-destructive"
+            >
+              {log.error}
+            </p>
+          ) : log.content === null ? (
+            <p className="text-sm text-muted-foreground">This worktree has no setup log yet.</p>
+          ) : (
+            <div className="max-h-[60vh] overflow-auto">
+              <CodeBlock
+                code={log.content}
+                language="ansi"
+                wrap
+                data-testid="project-setup-log-content"
+              />
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/** A failed worktree setup's "Re-run setup" action; the agent keeps running. */
+function RerunProjectSetupAction({ conversationId }: { conversationId: string }) {
+  const [state, setState] = useState<"idle" | "pending" | "started">("idle");
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        data-testid="error-rerun-project-setup"
+        componentId="diagnostics.status.project_setup_rerun"
+        disabled={state !== "idle"}
+        onClick={() => {
+          setState("pending");
+          setError(null);
+          rerunProjectSetup(conversationId).then(
+            () => setState("started"),
+            (reason: unknown) => {
+              setState("idle");
+              setError(errorText(reason));
+            },
+          );
+        }}
+      >
+        <RotateCwIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        {state === "started" ? "Setup re-running" : "Re-run setup"}
+      </Button>
+      {error ? (
+        <p role="alert" className="mt-1 text-sm text-destructive">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -580,6 +715,9 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {code && PROJECT_SETUP_LOG_CODES.has(code) ? (
+          <ProjectSetupActions code={code} className="mx-[4px] mt-[8px]" />
+        ) : null}
         {workspaceMissing ? (
           <ErrorForkAction
             label="Continue in another directory…"

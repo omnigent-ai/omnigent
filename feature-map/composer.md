@@ -76,6 +76,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`restrict_to_agent_names`, see `native-harnesses.md`) does not offer, which
   New Chat reports as unavailable until the user picks an offered agent while
   project settings keeps storing it.
+- `project-setup`: Project settings store an **Environment commands** script
+  (sourced before every session; its environment reaches the agent), a
+  **Worktree setup** script (run once per new worktree, stopping at the first
+  failure) and **Start agent during setup** (offered only with a setup script).
+  The session transcript reports the outcome as notices; the session owner can
+  **Re-run setup** on a failure and **View setup log** on setup notices. States:
+  env failure (no actions), host too old (no actions), setup running, finished,
+  failed, log missing or unreadable, re-run refused, and a non-owner viewer.
 - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
   in both composers (Ctrl on every platform). The relevant menu briefly opens
   with the selected choice highlighted, preserving draft and input focus. In an
@@ -338,6 +346,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Open a project's actions menu in the sidebar → **Project settings**, pick
   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
   Click **New session in project** and check the pill shows both.
+- In **Project settings**, fill **Environment commands** or **Worktree setup**
+  and, with a setup script, toggle **Start agent during setup**; then start a
+  session in that project.
+- On a project setup notice in the session transcript, click **Re-run setup**
+  (failed setup only) or **View setup log** (owner only).
 - Attach files or type `/` before the first send.
 - For a managed sandbox, submit a prompt and close the browser once the session
   URL appears, while provisioning is still in progress. Reopen that URL after
@@ -499,6 +512,19 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_settings_model_and_effort_defaults_round_trip`;
   ladder and precedence cases in `web/src/shell/ProjectSettingsDialog.test.tsx`
   and `web/src/shell/NewChatDialog.projectPrefill.test.tsx`.
+- **`project-setup`, Project settings fields:** the script round-trip, blank
+  line, and parallel-setup cases in `web/src/shell/ProjectSettingsDialog.test.tsx`;
+  `tests/e2e/test_host_project_setup_e2e.py::test_project_setup_applies_to_a_real_host_session`
+  runs both scripts on a real host.
+  `tests/e2e_ui/sessions/test_project_setup_ui.py` drives the dialog, the
+  notice headlines, the log and a re-run in the browser, with two sessions
+  sharing one setup run.
+- **`project-setup`, Re-run setup / View setup log:** notice-code, owner and
+  error cases in `web/src/components/blocks/StatusBlocks.test.tsx`; server and
+  host paths in
+  `tests/server/integration/test_session_host_launch.py::test_rerun_project_setup_asks_the_host_without_relaunching_the_runner`
+  and
+  `tests/server/integration/test_session_host_launch.py::test_project_setup_log_is_read_from_the_sessions_host`.
 - **`effort-picker`, SDK in-session composer:**
   `tests/e2e_ui/chat/test_sdk_effort_dial.py::test_claude_sdk_session_offers_the_effort_dial`
   covers selection, persistence and reload. The stale-catalog cases in

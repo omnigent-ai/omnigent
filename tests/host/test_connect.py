@@ -11155,3 +11155,100 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     assert host._origin_workspace_id == "1965859176160743"
     assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"
+
+
+@pytest.mark.parametrize("parallel_setup", [False, True], ids=["agent-waits", "parallel"])
+async def test_launch_holds_the_runner_on_worktree_setup_unless_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel_setup: bool
+) -> None:
+    """A new worktree's runner waits for setup; a parallel project's does not."""
+    from omnigent.project_setup import PROJECT_SETUP_MARKER_ENV_VAR, ProjectSetup
+    from tests._helpers.git_repo import repo_with_worktree
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _, worktree = repo_with_worktree(tmp_path / "src")
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    spawned_env: dict[str, str] = {}
+    original_popen = subprocess.Popen
+
+    def fake_spawn(
+        env: dict[str, str], _slug: str, _workspace: Path
+    ) -> tuple[subprocess.Popen[bytes], Path]:
+        spawned_env.update(env)
+        return original_popen(["sleep", "10"]), tmp_path / "runner.log"
+
+    monkeypatch.setattr(host, "_spawn_runner_proc", fake_spawn)
+    frame = HostLaunchRunnerFrame(
+        request_id="req_setup",
+        binding_token="test_token_setup",
+        workspace=str(worktree),
+        session_id="session_setup",
+        project_setup=ProjectSetup(setup_commands=("true",), parallel_setup=parallel_setup),
+    )
+
+    result = await host._handle_launch(frame)
+    setup_runs = [
+        task for task in host._watcher_tasks if task.get_name().startswith("project-setup")
+    ]
+    await asyncio.gather(*setup_runs)
+
+    assert result.status == "launched", result.error
+    assert result.project_setup_running is True
+    assert (PROJECT_SETUP_MARKER_ENV_VAR in spawned_env) is not parallel_setup
+    for runner in host._runners.values():
+        runner.proc.kill()
+
+
+async def test_worktree_setup_without_a_session_still_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no session to notify, setup still runs rather than being marked skipped."""
+    from omnigent.host.project_setup_runner import EnvDelta, pending_setup_marker
+    from omnigent.project_setup import ProjectSetup
+    from tests._helpers.git_repo import repo_with_worktree
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _, worktree = repo_with_worktree(tmp_path / "src")
+    marker = pending_setup_marker(str(worktree))
+    host = _make_host_process()
+    reports: list[object] = []
+    monkeypatch.setattr(host, "_report_project_setup", reports.append)
+
+    started = await host._start_worktree_setup(
+        ProjectSetup(setup_commands=("touch ran",)), None, worktree, EnvDelta()
+    )
+    await asyncio.gather(*host._watcher_tasks)
+
+    assert started is True and (worktree / "ran").exists()
+    assert marker is not None and json.loads(marker.read_text())["status"] == "succeeded"
+    assert reports == []
+
+
+async def test_launch_with_a_malformed_project_setup_still_launches_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    original_popen = subprocess.Popen
+    monkeypatch.setattr(
+        host,
+        "_spawn_runner_proc",
+        lambda *_args: (original_popen(["sleep", "10"]), tmp_path / "runner.log"),
+    )
+    frame = HostLaunchRunnerFrame(
+        request_id="req_bad_setup",
+        binding_token="test_token_bad_setup",
+        workspace=str(tmp_path),
+        session_id="session_bad_setup",
+        project_setup_invalid=True,
+    )
+
+    result = await host._handle_launch(frame)
+
+    assert result.status == "launched", result.error
+    assert result.project_setup_warnings == ("the project's setup was malformed and was skipped",)
+    for runner in host._runners.values():
+        runner.proc.kill()

@@ -32,6 +32,7 @@ from datetime import UTC
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     HTTPException,
@@ -139,6 +140,10 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
+)
+from omnigent.server.routes._host_launch import (
+    LaunchProjectSetup,
+    resolve_launch_project_setup,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
@@ -6243,6 +6248,64 @@ def _spawn_superseded_runner_stop(
 #: session workspace deleted and the host recreated it empty.
 _WORKSPACE_RECREATED_NOTICE_CODE = "workspace_recreated"
 
+#: Codes of the notices that report a project's setup. The web UI offers its
+#: actions by code: re-run on a failed setup, the log on any setup notice.
+PROJECT_ENV_FAILED_NOTICE_CODE = "project_env_failed"
+PROJECT_SETUP_UNSUPPORTED_NOTICE_CODE = "project_setup_unsupported"
+PROJECT_SETUP_FAILED_NOTICE_CODE = "project_setup_failed"
+PROJECT_SETUP_RUNNING_NOTICE_CODE = "project_setup_running"
+PROJECT_SETUP_FINISHED_NOTICE_CODE = "project_setup_finished"
+
+#: Last env-command failure told to each session, so relaunches don't repeat it.
+_last_env_failure: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096), reset_on_error=True
+)
+
+
+async def _append_launch_notice(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    code: str,
+    message: str,
+    level: Literal["error", "info"],
+    title: str | None = None,
+) -> None:
+    """
+    Persist and publish a transcript notice about a runner launch.
+
+    Never raises: the runner is already starting and the turn should proceed,
+    so any failure is logged instead.
+
+    :param conv: The launched session.
+    :param conversation_store: Store used for the durable append.
+    :param code: Notice code, e.g. ``"workspace_recreated"``.
+    :param message: User-facing text.
+    :param level: ``"info"`` for a heads-up, ``"error"`` for something that failed.
+    :param title: Short headline shown collapsed, e.g. ``"Project setup failed"``;
+        the message is shown when expanded.
+    """
+    try:
+        item = NewConversationItem(
+            type="error",
+            response_id=generate_task_id(),
+            data=ErrorData(
+                source="execution", code=code, message=message, level=level, title=title
+            ),
+        )
+        persisted = await asyncio.to_thread(conversation_store.append, conv.id, [item])
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist %s notice for session %s",
+            code,
+            conv.id,
+            exc_info=True,
+            extra={"session_id": conv.id},
+        )
+        return
+    if persisted:
+        _publish_external_conversation_item(conv.id, persisted[0])
+
 
 async def _note_workspace_recreated_on_host(
     conv: Conversation,
@@ -6252,39 +6315,139 @@ async def _note_workspace_recreated_on_host(
     Persist and publish the notice that the host recreated the session workspace.
 
     Runs once per launch, under the relaunch lock, so riders of the same
-    flight never duplicate it. A persistence failure is logged, not raised:
-    the runner is already starting and the turn should proceed.
+    flight never duplicate it.
 
     :param conv: The relaunched session row (supplies ``workspace``).
     :param conversation_store: Store used for the durable append.
     """
-    item = NewConversationItem(
-        type="error",
-        response_id=generate_task_id(),
-        data=ErrorData(
-            source="execution",
-            code=_WORKSPACE_RECREATED_NOTICE_CODE,
-            message=(
-                f"The session workspace {conv.workspace} no longer existed on the "
-                "host, so it was recreated as an empty directory. Anything it used "
-                "to contain is gone; restore the checkout or worktree if the agent "
-                "needs it."
-            ),
-            level="info",
+    await _append_launch_notice(
+        conv,
+        conversation_store,
+        code=_WORKSPACE_RECREATED_NOTICE_CODE,
+        message=(
+            f"The session workspace {conv.workspace} no longer existed on the "
+            "host, so it was recreated as an empty directory. Anything it used "
+            "to contain is gone; restore the checkout or worktree if the agent "
+            "needs it."
         ),
+        level="info",
     )
-    try:
-        persisted = await asyncio.to_thread(conversation_store.append, conv.id, [item])
-    except Exception:  # noqa: BLE001
-        _logger.warning(
-            "Failed to persist workspace-recreated notice for session %s",
-            conv.id,
-            exc_info=True,
-            extra={"session_id": conv.id},
+
+
+async def note_launch_project_setup(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    project_setup: LaunchProjectSetup,
+    launch_result: HostLaunchResult,
+    *,
+    notify_unsupported: bool = True,
+) -> None:
+    """
+    Tell the user how a successful launch applied the session's project setup.
+
+    :param conv: The launched session.
+    :param conversation_store: Store used for the durable append.
+    :param project_setup: What the launch sent.
+    :param launch_result: The host's launch result.
+    :param notify_unsupported: Say that the host is too old. Launches that start
+        a session do; relaunches don't repeat it.
+    """
+    if project_setup.unsupported and notify_unsupported:
+        await _append_launch_notice(
+            conv,
+            conversation_store,
+            code=PROJECT_SETUP_UNSUPPORTED_NOTICE_CODE,
+            title="Host too old for project setup",
+            message=(
+                "This session's project has setup commands, but its host is too old "
+                "to run them. Update Omnigent on the host to apply them."
+            ),
+            level="error",
+        )
+    warnings = launch_result.get("project_setup_warnings", ())
+    env_failure = "\n".join(warnings)
+    # A broken env command fails every relaunch; say so again only when it changes.
+    if env_failure and _last_env_failure.get(conv.id) != env_failure:
+        _last_env_failure[conv.id] = env_failure
+        for warning in warnings:
+            await _append_launch_notice(
+                conv,
+                conversation_store,
+                code=PROJECT_ENV_FAILED_NOTICE_CODE,
+                title="Project env commands failed",
+                message=f"Project env commands did not apply: {warning}",
+                level="error",
+            )
+    elif not env_failure:
+        _last_env_failure.pop(conv.id, None)
+    if launch_result.get("project_setup_running", False):
+        await note_project_setup_running(
+            conv,
+            conversation_store,
+            message=(
+                "Project setup commands are running for this worktree. The agent "
+                "will start when they finish."
+                if project_setup.agent_waits
+                else "Project setup commands are running for this worktree. The agent "
+                "can start now; installs may still be in progress."
+            ),
+        )
+
+
+async def note_project_setup_running(
+    conv: Conversation, conversation_store: ConversationStore, *, message: str
+) -> None:
+    """
+    Tell the user a worktree's setup commands started.
+
+    :param conv: The session the setup runs for.
+    :param conversation_store: Store used for the durable append.
+    :param message: User-facing text.
+    """
+    await _append_launch_notice(
+        conv,
+        conversation_store,
+        code=PROJECT_SETUP_RUNNING_NOTICE_CODE,
+        title="Project setup running",
+        message=message,
+        level="info",
+    )
+
+
+async def note_project_setup_finished(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    *,
+    warning: str | None,
+    log_path: str | None,
+) -> None:
+    """
+    Tell the user that a worktree's background setup finished.
+
+    :param conv: The session whose launch started the setup.
+    :param conversation_store: Store used for the durable append.
+    :param warning: Failure description, or ``None`` on success.
+    :param log_path: Host path of the full setup log.
+    """
+    log_hint = f" Log on the host: {log_path}" if log_path else ""
+    if warning is None:
+        await _append_launch_notice(
+            conv,
+            conversation_store,
+            code=PROJECT_SETUP_FINISHED_NOTICE_CODE,
+            title="Project setup finished",
+            message=f"Project setup commands finished.{log_hint}",
+            level="info",
         )
         return
-    if persisted:
-        _publish_external_conversation_item(conv.id, persisted[0])
+    await _append_launch_notice(
+        conv,
+        conversation_store,
+        code=PROJECT_SETUP_FAILED_NOTICE_CODE,
+        title="Project setup failed",
+        message=f"Project setup failed: {warning}{log_hint}",
+        level="error",
+    )
 
 
 async def _launch_runner_on_host_impl(
@@ -6417,6 +6580,7 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
+        project_setup = await resolve_launch_project_setup(conv, host_conn)
         request_id = secrets.token_hex(8)
         launch_future: asyncio.Future[HostLaunchResult] = (
             asyncio.get_running_loop().create_future()
@@ -6438,6 +6602,7 @@ async def _launch_runner_on_host_locked(
                 # Only the binding we just replaced: an unbound session's old
                 # runner may now serve its /clear or /switch successor.
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
+                project_setup=project_setup.setup,
             )
         )
         try:
@@ -6515,6 +6680,9 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             await _note_workspace_recreated_on_host(conv, conversation_store)
+        await note_launch_project_setup(
+            conv, conversation_store, project_setup, result, notify_unsupported=False
+        )
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 

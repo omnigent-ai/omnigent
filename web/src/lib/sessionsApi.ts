@@ -1273,6 +1273,29 @@ export async function getSessionSignInLink(
   return readJsonOrThrow<SessionSignInLink>(res);
 }
 
+/**
+ * Run a session's worktree setup again (owner only). The agent keeps running;
+ * the outcome arrives as the session's project-setup notices.
+ */
+export async function rerunProjectSetup(sessionId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/project-setup/rerun`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/**
+ * The end of a session worktree's latest project setup log (owner only), or
+ * `null` when the worktree has none.
+ */
+export async function getProjectSetupLog(sessionId: string): Promise<string | null> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/project-setup/log`,
+  );
+  return (await readJsonOrThrow<{ content: string | null }>(res)).content;
+}
+
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;

@@ -705,6 +705,42 @@ def _create_worktree(
     )
 
 
+@dataclass(frozen=True)
+class LinkedWorktree:
+    """Git directories of a linked worktree.
+
+    :param git_dir: The worktree's private git dir, e.g.
+        ``Path("/Users/alice/myrepo/.git/worktrees/feature")``.
+    :param main_work_tree: The main checkout the worktree belongs to, e.g.
+        ``Path("/Users/alice/myrepo")``.
+    """
+
+    git_dir: Path
+    main_work_tree: Path
+
+
+def linked_worktree(path: str) -> LinkedWorktree | None:
+    """Describe the linked worktree containing *path*, if it is one.
+
+    :param path: Any directory inside a checkout, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature/src"``.
+    :returns: Its git dirs, or ``None`` for a main checkout, a directory
+        outside git, or when git fails.
+    """
+    try:
+        result = _run_git(["rev-parse", "--absolute-git-dir", "--git-common-dir"], cwd=path)
+    except WorktreeError:
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 2:
+        return None
+    git_dir = Path(lines[0]).resolve()
+    common_dir = (Path(path) / lines[1]).resolve()
+    if git_dir == common_dir:
+        return None
+    return LinkedWorktree(git_dir=git_dir, main_work_tree=common_dir.parent)
+
+
 def _main_repo_for_worktree(worktree_path: str, *, timeout: float | None = None) -> str:
     """Find the main repository work tree for a linked worktree.
 

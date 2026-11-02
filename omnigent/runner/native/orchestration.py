@@ -83,6 +83,7 @@ from omnigent.native.native_coding_agents import (
 from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
+from omnigent.runner.project_setup_gate import wait_for_project_setup
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -10760,6 +10761,9 @@ async def _launch_native_terminal(
             return None
         _publish_terminal_pending(ctx.publish_event, ctx.session_id, True)
         try:
+            # The CLI accepts typed input as soon as it starts, so it starts only
+            # once a new worktree's project setup has finished.
+            await wait_for_project_setup()
             if build_context is not None:
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
@@ -10912,6 +10916,7 @@ async def _ensure_native_terminal(
         if adapter is None:
             return None
         try:
+            await wait_for_project_setup()
             if build_context is not None:
                 ctx = await build_context(ctx)
             _logger.info(
