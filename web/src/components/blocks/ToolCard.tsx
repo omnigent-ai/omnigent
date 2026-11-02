@@ -499,9 +499,14 @@ function ToolTriggerRow({
         <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
         {/* Only the title truncates, so the counts beside it stay visible. */}
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
-          <span className="min-w-0 truncate">
+          <span
+            className={cn(
+              "min-w-0 truncate",
+              onBodyClick && "mobile-app:flex mobile-app:items-center mobile-app:gap-1",
+            )}
+          >
             {title.verb !== null && (
-              <span className="font-medium text-foreground">{title.verb}</span>
+              <span className="font-medium text-foreground mobile-app:shrink-0">{title.verb}</span>
             )}
             {title.verb !== null && title.body.length > 0 && " "}
             <ToolTitleBody title={title} displayPath={displayPath} onBodyClick={onBodyClick} />
@@ -572,7 +577,7 @@ function ToolTitleBody({
         }
       }}
     >
-      {displayPath ?? title.body}
+      <span className="mobile-app:truncate">{displayPath ?? title.body}</span>
     </span>
   );
 }
