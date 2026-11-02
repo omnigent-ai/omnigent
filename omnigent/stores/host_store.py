@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
@@ -93,6 +94,8 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param connect_generation: Per-connect token that guards offline cleanup;
+        ``None`` on legacy rows.
     """
 
     host_id: str
@@ -105,6 +108,7 @@ class Host:
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
+    connect_generation: int | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
 
@@ -182,6 +186,7 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        connect_generation=row.connect_generation,
     )
 
 
@@ -314,15 +319,18 @@ class HostStore:
         :param managed_token: Raw launch token for a managed host. When set,
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
-        :returns: The upserted :class:`Host`.
+        :returns: The upserted :class:`Host` with this connect's token.
         """
         now = now_epoch()
+        # Equality-only guard token; random so same-microsecond connects and
+        # replica clock skew cannot collide.
+        connect_generation = secrets.randbits(63)
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
         )
 
         def write(session: Session) -> Host:
-            generation = require_active_account(session, user_id)
+            account_generation = require_active_account(session, user_id)
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -343,6 +351,7 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
+                            connect_generation=connect_generation,
                         )
                     ),
                 )
@@ -370,11 +379,12 @@ class HostStore:
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
                 row.user_id = user_id
-                row.account_generation = generation
+                row.account_generation = account_generation
                 row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.connect_generation = connect_generation
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -388,9 +398,10 @@ class HostStore:
                     host_id=host_id,
                     name=name,
                     user_id=user_id,
-                    generation=generation,
+                    account_generation=account_generation,
                     now=now,
                     configured_harnesses_json=harnesses_json,
+                    connect_generation=connect_generation,
                 )
                 if reowned is not None:
                     return reowned
@@ -414,12 +425,13 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    connect_generation,
                 )
                 return _row_to_host(row)
 
             # Genuinely new host: plain INSERT.
             row = SqlHost(
-                account_generation=generation,
+                account_generation=account_generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,
@@ -427,6 +439,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                connect_generation=connect_generation,
             )
             session.add(row)
             return _row_to_host(row)
@@ -447,6 +460,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        connect_generation: int,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -467,13 +481,14 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param connect_generation: Connect token for the new row.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
         # Preserve durable fields from the outgoing row before deletion.
         created_at = row.created_at
         user_id = row.user_id
-        generation = row.account_generation
+        account_generation = row.account_generation
         name = row.name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
@@ -510,7 +525,7 @@ class HostStore:
         session.flush()
 
         new_row = SqlHost(
-            account_generation=generation,
+            account_generation=account_generation,
             workspace_id=current_workspace_id(),
             host_id=new_host_id,
             user_id=user_id,
@@ -524,6 +539,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
+            connect_generation=connect_generation,
         )
         session.add(new_row)
         session.flush()
@@ -548,9 +564,10 @@ class HostStore:
         host_id: str,
         name: str,
         user_id: str,
-        generation: str | None,
+        account_generation: str | None,
         now: int,
         configured_harnesses_json: str | None = None,
+        connect_generation: int,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -575,6 +592,8 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param connect_generation: Connect token to stamp, like the normal
+            connect paths.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -597,11 +616,12 @@ class HostStore:
             )
             .values(
                 user_id=user_id,
-                account_generation=generation,
+                account_generation=account_generation,
                 name=name,
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                connect_generation=connect_generation,
             )
         )
         return Host(
@@ -611,18 +631,20 @@ class HostStore:
             status="online",
             created_at=created_at,
             updated_at=now,
-            account_generation=generation,
+            account_generation=account_generation,
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            connect_generation=connect_generation,
         )
 
     def set_offline(self, host_id: str, *, cancelled: Callable[[], bool] | None = None) -> None:
         """
-        Mark a host as offline when its WebSocket disconnects.
+        Unconditionally mark a host offline; retained for operator tooling.
 
-        No-op if the host does not exist (the disconnect callback
-        may fire after a failed registration).
+        Tunnel disconnect cleanup must use :meth:`set_offline_if_generation`
+        so a superseded connection cannot clobber a live one. No-op for
+        unknown hosts.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
@@ -647,6 +669,44 @@ class HostStore:
                 row.updated_at = updated_at
 
         run_write_transaction(self._session_immediate, "set_host_offline", write)
+
+    def set_offline_if_generation(
+        self,
+        host_id: str,
+        generation: int | None,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Offline only this connect's row, returning whether the DB row changed.
+
+        The SQL comparison works across replicas; ``None`` never matches.
+
+        :param cancelled: Optional abandonment check after acquiring the row lock.
+        """
+        if generation is None:
+            return False
+        updated_at = now_epoch()
+
+        def write(session: Session) -> bool:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.connect_generation == generation,
+                    SqlHost.deleted_at.is_(None),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or (cancelled is not None and cancelled()):
+                return False
+            row.status = encode_host_status("offline")
+            row.updated_at = updated_at
+            return True
+
+        return run_write_transaction(
+            self._session_immediate, "set_host_offline_if_generation", write
+        )
 
     def update_harness_readiness(
         self,

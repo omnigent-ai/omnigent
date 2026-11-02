@@ -472,15 +472,156 @@ def test_set_offline_noop_for_unknown_host(
     host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
 
 
+def test_upsert_stamps_a_fresh_connect_generation(
+    host_store: HostStore,
+) -> None:
+    """Reconnects stamp distinct tokens for guarded cleanup."""
+    first = host_store.upsert_on_connect(
+        host_id="5f2e1d0c9b8a77665544332211009988",
+        name="laptop",
+        user_id="dana@example.com",
+    )
+    assert first.connect_generation is not None
+    assert 0 <= first.connect_generation < 2**63
+
+    second = host_store.upsert_on_connect(
+        host_id="5f2e1d0c9b8a77665544332211009988",
+        name="laptop",
+        user_id="dana@example.com",
+    )
+    assert second.connect_generation is not None
+    # Equality drives the guard; tokens are random, not ordered.
+    assert second.connect_generation != first.connect_generation
+
+
+def test_set_offline_if_generation_matches_current_row(
+    host_store: HostStore,
+) -> None:
+    """Guarded cleanup offlines its still-current row."""
+    host = host_store.upsert_on_connect(
+        host_id="6a3f2e1d0c9b88776655443322110099",
+        name="laptop",
+        user_id="erin@example.com",
+    )
+
+    assert host_store.set_offline_if_generation(host.host_id, host.connect_generation) is True
+    fetched = host_store.get_host(host.host_id)
+    assert fetched is not None
+    assert fetched.status == "offline"
+
+
+def test_set_offline_if_generation_skips_superseded_writer(
+    host_store: HostStore,
+) -> None:
+    """A stale token cannot offline a newer connect's row."""
+    stale = host_store.upsert_on_connect(
+        host_id="7b4a3f2e1d0c99887766554433221100",
+        name="laptop",
+        user_id="finn@example.com",
+    )
+    current = host_store.upsert_on_connect(
+        host_id="7b4a3f2e1d0c99887766554433221100",
+        name="laptop",
+        user_id="finn@example.com",
+    )
+
+    assert host_store.set_offline_if_generation(stale.host_id, stale.connect_generation) is False
+    fetched = host_store.get_host(stale.host_id)
+    assert fetched is not None
+    assert fetched.status == "online"
+    assert fetched.connect_generation == current.connect_generation
+
+
+def test_set_offline_if_generation_honors_cancellation(
+    host_store: HostStore,
+) -> None:
+    """An abandoned cleanup leaves its row for the liveness TTL."""
+    host = host_store.upsert_on_connect(
+        host_id="1e7d6c5b4a3f22110099887766554433",
+        name="laptop",
+        user_id="ivy@example.com",
+    )
+
+    assert (
+        host_store.set_offline_if_generation(
+            host.host_id, host.connect_generation, cancelled=lambda: True
+        )
+        is False
+    )
+    fetched = host_store.get_host(host.host_id)
+    assert fetched is not None
+    assert fetched.status == "online"
+
+
+def test_set_offline_if_generation_rejects_none_token(
+    host_store: HostStore,
+) -> None:
+    """A missing token cannot authorize an offline write."""
+    host = host_store.upsert_on_connect(
+        host_id="8c5b4a3f2e1d00998877665544332211",
+        name="laptop",
+        user_id="gale@example.com",
+    )
+
+    assert host_store.set_offline_if_generation(host.host_id, None) is False
+    fetched = host_store.get_host(host.host_id)
+    assert fetched is not None
+    assert fetched.status == "online"
+
+
+def test_set_offline_if_generation_false_for_unknown_host(
+    host_store: HostStore,
+) -> None:
+    """An unknown host_id matches no row and reports the write skipped."""
+    assert host_store.set_offline_if_generation("9d6c5b4a3f2e11009988776655443322", 12345) is False
+
+
+def test_managed_connect_stamps_fresh_connect_generation(db_uri: str) -> None:
+    """Managed-token connects also stamp fresh cleanup tokens."""
+    store = HostStore(db_uri)
+    store.register_managed_host(
+        host_id="ad7e6f5a4b3c22110099887766554433",
+        name="managed-gen",
+        user_id="hana@example.com",
+        token="raw-launch-token-gen",
+        provider="modal",
+        sandbox_id="sb-gen",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    first = store.upsert_on_connect(
+        host_id="ad7e6f5a4b3c22110099887766554433",
+        name="managed-gen",
+        user_id="hana@example.com",
+        managed_token="raw-launch-token-gen",
+    )
+    assert first.connect_generation is not None
+
+    second = store.upsert_on_connect(
+        host_id="ad7e6f5a4b3c22110099887766554433",
+        name="managed-gen",
+        user_id="hana@example.com",
+        managed_token="raw-launch-token-gen",
+    )
+    assert second.connect_generation is not None
+    assert second.connect_generation != first.connect_generation
+
+    assert store.set_offline_if_generation(first.host_id, first.connect_generation) is False
+    fetched = store.get_host(first.host_id)
+    assert fetched is not None
+    assert fetched.status == "online"
+
+
+@pytest.mark.parametrize("guarded", [False, True], ids=["unguarded", "generation_guarded"])
 def test_reconnect_waits_for_offline_transaction(
-    host_store: HostStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    host_store: HostStore, db_uri: str, monkeypatch: pytest.MonkeyPatch, guarded: bool
 ) -> None:
     """A reconnect must read the status after a pending offline write commits."""
     now = now_epoch()
     monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
     host_id = uuid.uuid4().hex
     workspace_id = current_workspace_id()
-    host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+    original = host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
     offline_written = threading.Event()
     release_offline = threading.Event()
     reconnect_started = threading.Event()
@@ -502,7 +643,10 @@ def test_reconnect_waits_for_offline_transaction(
     def disconnect() -> None:
         worker_ids["offline"] = threading.get_ident()
         with workspace_scope(workspace_id):
-            host_store.set_offline(host_id)
+            if guarded:
+                assert host_store.set_offline_if_generation(host_id, original.connect_generation)
+            else:
+                host_store.set_offline(host_id)
 
     def reconnect() -> Host:
         worker_ids["reconnect"] = threading.get_ident()

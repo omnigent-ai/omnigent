@@ -655,17 +655,17 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
     offline_release = threading.Event()
     offline_finished = threading.Event()
     offline_errors: list[Exception] = []
-    real_set_offline = store.set_offline
+    real_set_offline = store.set_offline_if_generation
     if offline_result in {"failure", "blocked"}:
 
-        def interrupted_offline(host_id: str, **kwargs) -> None:
+        def interrupted_offline(host_id: str, *args, **kwargs) -> bool:
             assert host_id == _HOST_ID
             if offline_result == "failure":
                 raise RuntimeError("test offline persistence failure")
             offline_started.set()
             try:
                 assert offline_release.wait(timeout=budget(5.0))
-                real_set_offline(host_id, **kwargs)
+                return real_set_offline(host_id, *args, **kwargs)
             except Exception as exc:
                 offline_errors.append(exc)
                 raise
@@ -673,7 +673,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
                 offline_finished.set()
 
         # Hold only the persistence boundary; registration and reads remain real.
-        monkeypatch.setattr(store, "set_offline", interrupted_offline)
+        monkeypatch.setattr(store, "set_offline_if_generation", interrupted_offline)
     if offline_result in {"blocked", "diagnostics_blocked", "callback_blocked"}:
         monkeypatch.setattr(
             host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.5), raising=False
@@ -753,7 +753,7 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             assert await asyncio.to_thread(offline_started.wait, budget(2.0))
             assert not offline_release.is_set()
             assert "Timed out cleaning up host" in caplog.text
-            monkeypatch.setattr(store, "set_offline", real_set_offline)
+            monkeypatch.setattr(store, "set_offline_if_generation", real_set_offline)
             replacement = await _connect_route(cancellable_app, _TUNNEL_PATH)
             await _send_hello_and_wait(replacement, registry, connection_id="replacement")
             assert store.is_online(_HOST_ID)
