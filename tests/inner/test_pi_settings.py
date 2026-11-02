@@ -90,7 +90,7 @@ def test_prepare_managed_pi_agent_dir_deep_merges_nested_overlay(tmp_path: Path)
 
 
 def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: Path) -> None:
-    """Supported resources are linked; instructions and session state stay isolated."""
+    """Supported resources and context files are linked; prompts and session state are not."""
     global_agent = tmp_path / "global-agent"
     for directory in (
         "npm",
@@ -108,7 +108,9 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "keybindings.json",
         "auth.json",
         "models.json",
+        "AGENTS.override.md",
         "AGENTS.md",
+        "CLAUDE.md",
         "SYSTEM.md",
         "APPEND_SYSTEM.md",
     ):
@@ -128,13 +130,15 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "prompts",
         "themes",
         "keybindings.json",
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "CLAUDE.md",
     ):
         assert (managed / name).readlink() == global_agent / name
     for name in (
         "sessions",
         "auth.json",
         "models.json",
-        "AGENTS.md",
         "SYSTEM.md",
         "APPEND_SYSTEM.md",
     ):
@@ -165,6 +169,22 @@ def test_prepare_managed_pi_agent_dir_replaces_stale_links_on_reuse(tmp_path: Pa
     assert (managed / "mcp-auth.json").readlink() == global_agent / "mcp-auth.json"
     assert not (managed / "git").is_symlink() and not (managed / "git").exists()
     assert not (managed / "npm").is_symlink() and (managed / "npm").is_dir()
+
+
+def test_prepare_managed_pi_agent_dir_keeps_links_resolving_to_the_source(tmp_path: Path) -> None:
+    """A link to an alias of its source (as AGENTS.MD is on macOS) is not replaced."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    (global_agent / "AGENTS.md").write_text("global", encoding="utf-8")
+    alias = tmp_path / "alias.md"
+    alias.symlink_to(global_agent / "AGENTS.md")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "AGENTS.md").symlink_to(alias)
+
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+
+    assert (managed / "AGENTS.md").readlink() == alias
 
 
 @pytest.mark.parametrize("parent_relative_root", [False, True])
