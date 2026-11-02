@@ -8,11 +8,13 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
+    PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    TEAM_ROLE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -1170,3 +1172,255 @@ async def test_same_host_creation_across_replicas(
         assert worker.parent_conversation_id is None
         assert worker.host_id == host_id and worker.workspace == "/worker"
         assert len(launches) == 1 and launches[0].session_id == worker.id
+
+
+async def _create_project(client, name):
+    response = await client.post("/v1/projects", json={"name": name})
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+@pytest.mark.parametrize("canvas_enabled", [True, False])
+async def test_project_boundary_scopes_agent_tools_when_canvas_is_enabled(
+    auth_client, auth_app, peers, db_uri, canvas_enabled
+):
+    source, same_project, _ = peers
+    other_project = await _create_session_as(auth_client, "", "alice")
+    unfiled = await _create_session_as(auth_client, "", "alice")
+    child_response = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+    )
+    assert child_response.status_code == 201, child_response.text
+    child = child_response.json()
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, *([Feature.CANVAS] if canvas_enabled else [])})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    project_a = await _create_project(auth_client, "Project A")
+    project_b = await _create_project(auth_client, "Project B")
+    store.set_conversation_project(source["id"], project_a)
+    # A legacy label of the same name is the same project, as in the sidebar.
+    store.set_labels(same_project["id"], {PROJECT_LABEL_KEY: "Project A"})
+    store.set_conversation_project(other_project["id"], project_b)
+
+    async def call(tool_name, **arguments):
+        return json.loads(
+            await execute_tool(
+                tool_name=tool_name,
+                arguments=json.dumps(arguments),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+
+    assert (await _send(auth_client, source, same_project)).get("queued") is True
+    assert "error" not in await call("sys_session_get_history", conversation_id=child["id"])
+    for outside in (other_project, unfiled):
+        sent = await _send(auth_client, source, outside)
+        history = await call("sys_session_get_history", conversation_id=outside["id"])
+        info = await call("sys_session_get_info", session_id=outside["id"])
+        agent = await call("sys_agent_get", session_id=outside["id"])
+        if canvas_enabled:
+            assert "outside this session's project" in sent["detail"]
+            assert history["error"] == "session_out_of_tree"
+            assert "error" in info
+            assert agent["error"] == "access_denied"
+        else:
+            assert sent.get("queued") is True
+            assert "error" not in history
+            assert "error" not in info
+            assert "error" not in agent
+    listed = {row["session_id"] for row in (await call("sys_session_list"))["sessions"]}
+    assert {source["id"], same_project["id"]} <= listed
+    assert (other_project["id"] in listed) is not canvas_enabled
+    assert (unfiled["id"] in listed) is not canvas_enabled
+
+    shared = await auth_client.put(
+        f"/v1/sessions/{other_project['id']}/permissions",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"user_id": "bob", "level": LEVEL_READ},
+    )
+    assert shared.status_code == (403 if canvas_enabled else 200), shared.text
+
+    # Requests from outside an agent tool call keep the owner's full access.
+    response = await auth_client.get(f"/v1/sessions/{other_project['id']}/items")
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("filing", ["project_id", "legacy_label", "unfiled"])
+async def test_independent_session_joins_creator_project(
+    auth_client, auth_app, peers, db_uri, monkeypatch, filing
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.CANVAS})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    auth_app.state.host_store.upsert_on_connect(host_id, host_id, "alice")
+    store.set_host_id(source["id"], host_id, workspace="/worker")
+    project_a = await _create_project(auth_client, "Project A")
+    project_other = await _create_project(auth_client, "Project Other")
+    if filing == "project_id":
+        store.set_conversation_project(source["id"], project_a)
+    if filing == "legacy_label":
+        store.set_labels(source["id"], {PROJECT_LABEL_KEY: "Legacy team"})
+
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"agent_id": source["agent_id"], "project_id": project_other},
+    )
+
+    assert response.status_code == 201, response.text
+    created = store.get_conversation(response.json()["id"])
+    assert created.workspace == "/worker"
+    assert created.project_id == (project_a if filing == "project_id" else None)
+    assert created.labels.get(PROJECT_LABEL_KEY) == (
+        "Legacy team" if filing == "legacy_label" else None
+    )
+
+
+async def test_same_host_worker_can_start_in_its_own_worktree(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+):
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostLaunchRunnerFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    auth_app.state.host_store.upsert_on_connect(host_id, host_id, "alice")
+    store.set_host_id(source["id"], host_id, workspace="/repo")
+    worktree_requests = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostCreateWorktreeFrame):
+            worktree_requests.append(frame)
+            connection.pending_create_worktrees[frame.request_id].set_result(
+                {
+                    "status": "ok",
+                    "worktree_path": "/worktrees/team-backend",
+                    "branch": frame.branch_name,
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+
+    async def create(**arguments):
+        return json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": source["agent_id"], **arguments}),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+
+    created = await create(placement="same_host", branch_name="team/backend", base_branch="main")
+    worker = store.get_conversation(created["conversation_id"])
+    assert worker.workspace == "/worktrees/team-backend"
+    assert worker.git_branch == "team/backend"
+    assert worker.parent_conversation_id is None
+    assert [(f.branch_name, f.base_branch) for f in worktree_requests] == [
+        ("team/backend", "main")
+    ]
+    assert store.get_conversation(source["id"]).workspace == "/repo"
+
+    for arguments, refusal in (
+        ({"placement": "child", "branch_name": "x"}, "requires placement='same_host'"),
+        ({"placement": "same_host", "base_branch": "main"}, "base_branch requires branch_name"),
+        ({"placement": "same_host", "branch_name": " "}, "must be nonempty"),
+    ):
+        assert refusal in (await create(**arguments))["error"]
+    assert len(worktree_requests) == 1
+
+
+@pytest.mark.parametrize("canvas_enabled", [True, False])
+async def test_team_role_briefs_the_first_message_once(
+    auth_client, auth_app, peers, db_uri, canvas_enabled
+):
+    source, target, captured = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, *([Feature.CANVAS] if canvas_enabled else [])})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(target["id"], {TEAM_ROLE_LABEL_KEY: "Backend"})
+
+    assert (await _send(auth_client, source, target, "First task")).get("queued") is True
+    assert (await _send(auth_client, source, target, "Second task")).get("queued") is True
+
+    delivered = [json.dumps(post) for post in captured["posts"]]
+    assert "First task" in delivered[0] and "Second task" in delivered[1]
+    assert ("the Backend on this project" in delivered[0]) is canvas_enabled
+    assert "on this project" not in delivered[1]
+
+    # An unrelated session with no role is never briefed.
+    captured.clear()
+    other = await _create_session_as(auth_client, "", "alice")
+    await _send(auth_client, source, other, "Plain task")
+    assert "on this project" not in json.dumps(captured["posts"])
+
+
+async def test_team_role_is_validated_and_reported(auth_client, auth_app, peers, db_uri):
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.CANVAS})
+    )
+
+    async def create(role):
+        return await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": source["agent_id"], "labels": {TEAM_ROLE_LABEL_KEY: role}},
+        )
+
+    for rejected in (" ", "x" * 41, "two\nlines"):
+        assert (await create(rejected)).status_code == 400
+    created = await create("Team lead")
+    assert created.status_code == 201, created.text
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": created.json()["id"]}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert info["team_role"] == "Team lead"
+
+
+def test_team_brief_names_each_roles_duties():
+    from omnigent.server.session_orchestration import team_brief
+
+    lead = team_brief(" Team LEAD ")
+    assert "the Team LEAD on" in lead and "report back" in lead
+    teammate = team_brief("Backend")
+    assert "the Backend on" in teammate and "report back" not in teammate

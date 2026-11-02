@@ -150,6 +150,11 @@ the header menu), and each place is a separate entry point.
 - `canvas-navigation`: Canvas uses the same collapsed-sidebar button and hover
   preview as other pages, including the macOS titlebar controls. Opening it
   reveals the shared destinations, including Usage when enabled.
+- `canvas-team`: each card's add-agent button creates a teammate in the same project
+  and folder with a role and, optionally, its own worktree. Project boards add
+  existing sessions through Add sessions. Role badges show on cards, and lines join
+  the team lead to the board's other cards. See `project-boundary` and `team-updates`
+  in [session orchestration](session-orchestration.md).
 - `canvas-create`: the plus button on Main or a project opens the new-session
   composer; sending returns to that board with the new session selected.
 - `canvas-session-health`: an opened Canvas session receives host health and

@@ -84,6 +84,22 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useProjects: vi.fn(),
 }));
 vi.mock("@/canvas/canvasSessions", () => ({ useCanvasSessions: vi.fn() }));
+vi.mock("@/canvas/AddAgentDialog", () => ({
+  AddAgentDialog: ({ session }: { session: Conversation | null }) =>
+    session ? <div data-testid="add-agent-dialog">{session.id}</div> : null,
+}));
+vi.mock("@/canvas/BringSessionsDialog", () => ({
+  BringSessionsDialog: ({
+    open,
+    sessions,
+  }: {
+    open: boolean;
+    sessions: readonly Conversation[];
+  }) =>
+    open ? (
+      <div data-testid="bring-sessions-dialog">{sessions.map((row) => row.id).join(",")}</div>
+    ) : null,
+}));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => viewerIdRef.current }));
 vi.mock("@/shell/NewProjectButton", () => ({
   NewProjectButton: ({ onCreated }: { onCreated: (name: string) => void }) => (
@@ -267,6 +283,29 @@ describe("CanvasPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(3));
+  });
+
+  it("joins the board's team lead to its cards and offers other boards' sessions", () => {
+    vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([
+        conversation("conv_loose", 3),
+        conversation("conv_lead", 2, {
+          project_id: "proj_a",
+          labels: { "omnigent.team_role": "Team lead" },
+        }),
+        conversation("conv_work", 1, { project_id: "proj_a" }),
+      ]),
+    );
+    renderPage();
+    expect(flowProps.current?.edges).toEqual([]);
+    expect(screen.queryByTestId("canvas-add-sessions")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Alpha/ }));
+
+    expect(flowProps.current?.edges).toMatchObject([{ source: "conv_lead", target: "conv_work" }]);
+    fireEvent.click(screen.getByTestId("canvas-add-sessions"));
+    expect(screen.getByTestId("bring-sessions-dialog")).toHaveTextContent("conv_loose");
   });
 
   it("groups sessions into Main and project canvases and switches between them", () => {

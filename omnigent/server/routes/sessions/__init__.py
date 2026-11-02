@@ -678,6 +678,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_reconnect as _wait_for_host_reconnect,
     _wake_parent_for_blocked_child as _wake_parent_for_blocked_child,
     configure_subagent_block_notifier as configure_subagent_block_notifier,
+    configure_team_updates,
     ensure_runner_connected as ensure_runner_connected,
 )
 from omnigent.server.routes._sessions.orchestration import (

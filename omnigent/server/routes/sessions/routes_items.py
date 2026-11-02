@@ -44,6 +44,7 @@ from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
 )
+from omnigent.server.session_orchestration import require_project_read_access
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -93,6 +94,9 @@ def register_items_routes(
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        await asyncio.to_thread(
+            require_project_read_access, request, user_id, conversation_store, session_id
         )
         if access.conversation is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)

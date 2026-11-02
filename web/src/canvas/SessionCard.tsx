@@ -3,8 +3,8 @@
 // label, the working directory, the worktree branch, and the open PR.
 
 import { memo, type KeyboardEvent, type MouseEvent } from "react";
-import type { Node, NodeProps } from "@xyflow/react";
-import { FolderIcon, GitBranchIcon, GitPullRequestIcon } from "lucide-react";
+import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
+import { FolderIcon, GitBranchIcon, GitPullRequestIcon, UserPlusIcon } from "lucide-react";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
@@ -14,12 +14,14 @@ import { gitProviderCopy } from "@/lib/gitProviders";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { isTeamLeadRole, teamRole } from "./canvasTeam";
 import type { CanvasPullRequest } from "./pullRequests";
 
 export type SessionCardData = {
   conversation: Conversation;
   pullRequest: CanvasPullRequest | null;
   onOpen: (sessionId: string) => void;
+  onAddAgent: (conversation: Conversation) => void;
 } & Record<string, unknown>;
 
 export type SessionCardNode = Node<SessionCardData, "session">;
@@ -46,7 +48,8 @@ function pullRequestTooltip(pr: CanvasPullRequest): string {
 }
 
 function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
-  const { conversation, pullRequest, onOpen } = data;
+  const { conversation, pullRequest, onOpen, onAddAgent } = data;
+  const role = teamRole(conversation);
   const optimisticTitle = useOptimisticTitle(conversation.id);
   const readState = useConversationReadState(
     conversation.id,
@@ -92,6 +95,13 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
       }}
       onKeyDown={openFromKeyboard}
     >
+      <Handle type="target" position={Position.Top} isConnectable={false} className="invisible" />
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        isConnectable={false}
+        className="invisible"
+      />
       <div className="flex min-w-0 items-center gap-2">
         {state ? (
           <SessionStateBadge state={state} />
@@ -107,7 +117,35 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
         >
           {title}
         </strong>
+        <button
+          type="button"
+          // `nodrag` keeps React Flow from turning a click on the button into a card drag.
+          className="nodrag ml-auto flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+          aria-label={`Add agent to ${title}`}
+          title="Add agent"
+          data-testid="session-card-add-agent"
+          onClick={(event) => {
+            event.stopPropagation();
+            onAddAgent(conversation);
+          }}
+          onDoubleClick={stopCardEvents}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <UserPlusIcon aria-hidden className="size-3.5" />
+        </button>
       </div>
+      {role && (
+        <span
+          className={cn(
+            "w-fit max-w-full truncate rounded-full border px-2 py-0.5 text-xs font-medium",
+            isTeamLeadRole(role) && "border-brand-accent text-brand-accent",
+          )}
+          title={role}
+          data-testid="session-card-role"
+        >
+          {role}
+        </span>
+      )}
       <span className="text-xs text-muted-foreground">{label}</span>
       <span
         className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-muted-foreground"

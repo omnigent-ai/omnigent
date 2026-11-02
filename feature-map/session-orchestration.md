@@ -25,6 +25,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
+  `same_host` accepts `branch_name` and `base_branch` to start the worker in its
+  own git worktree instead of the sender's checkout.
 - `sharing`: sharing the sender blocks subsequent sends and independent creates.
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
@@ -34,6 +36,21 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+- `project-boundary`: with `canvas` enabled, agent messages, history/info reads,
+  agent lookups, sharing and session lists stay inside the caller's project, and
+  independent sessions join it. Children and side chats use their top-level
+  session's project; unfiled sessions form their own group. Automations follow the
+  same rule and file into the caller's project, except that a legacy-label project
+  can only continue its own sessions. Agent tools only: a shell can still reach the
+  host's files and server.
+- `team-updates`: with `canvas` enabled, a session that receives peer work, or is
+  created with a first task, wakes the sender once with a system notice when it
+  finishes or fails, and also when it starts waiting on an approval. Notices stop
+  when either session leaves the project. Other sessions are not told.
+- `team-roles`: with `canvas` enabled, a session created with a team role, from the
+  Canvas or `sys_session_create`'s `team_role`, gets a brief explaining its team and
+  duties ahead of its first message; text typed directly into a native terminal skips
+  it. `sys_session_list` and `sys_session_get_info` report each `team_role`.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid

@@ -10718,6 +10718,52 @@ def configure_subagent_block_notifier(
     return _uninstall
 
 
+def configure_team_updates(
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    agent_store: AgentStore | None = None,
+) -> Callable[[], None]:
+    """
+    Install the notifier that wakes an asking session when its teammate settles.
+
+    :param conversation_store: Store for sessions, labels and wake messages.
+    :param runner_router: Router used to reach the asking session's runner.
+    :param agent_store: Lets each wake name the asking agent's current bundle.
+    :returns: A callable that uninstalls the notifier. Call from lifespan teardown.
+    """
+    from omnigent.server import team_updates
+
+    async def wake(asker_id: str, teammate: Conversation, notice: str) -> bool:
+        return await _wake_parent_for_blocked_child(
+            asker_id,
+            teammate,
+            notice,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            agent_store=agent_store,
+        )
+
+    def turn_answered(store: ConversationStore, session_id: str) -> bool:
+        return (
+            _latest_assistant_text_from_store(store, session_id, stop_at_user_message=True)
+            is not None
+        )
+
+    notifier = team_updates.TeamUpdateNotifier(
+        conversation_store=conversation_store,
+        wake_dispatch=wake,
+        turn_answered=turn_answered,
+        loop=asyncio.get_running_loop(),
+    )
+    team_updates.install_notifier(notifier)
+
+    def uninstall() -> None:
+        team_updates.install_notifier(None)
+        notifier.close()
+
+    return uninstall
+
+
 def _native_subagent_wrapper_labels(
     *,
     agent: Agent,
@@ -13947,5 +13993,6 @@ __all__ = [
     "_wait_for_host_reconnect",
     "_wake_parent_for_blocked_child",
     "configure_subagent_block_notifier",
+    "configure_team_updates",
     "ensure_runner_connected",
 ]

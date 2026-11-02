@@ -294,7 +294,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
-from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_orchestration import require_orchestration_source, with_team_brief
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
@@ -1195,9 +1195,15 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
-            from omnigent.server.session_orchestration import orchestration_message
+            from omnigent.server.session_orchestration import (
+                orchestration_message,
+                record_team_asker,
+            )
 
             body = orchestration_message(source.id, body.data.get("message"))
+            await asyncio.to_thread(
+                record_team_asker, request, conversation_store, source.id, session_id
+            )
         native_shell_authorized = False
         if (
             body.type == "message"
@@ -1451,6 +1457,12 @@ def register_events_routes(
 
             await validate_saved_selection(cast("Request", request), conv, conv.model_override)
 
+        if isinstance(request, Request) and (
+            shell_command_from_input(body.data.get("content")) is None
+        ):
+            body = await asyncio.to_thread(
+                with_team_brief, request, conversation_store, conv, body
+            )
         startup = getattr(request.app.state, "startup_inputs", None)
         if (
             not isinstance(request, (StartupInputContext, _RunnerEventContext))

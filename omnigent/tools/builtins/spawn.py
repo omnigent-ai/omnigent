@@ -937,6 +937,8 @@ class SysSessionCreateTool(Tool):
             "on the caller's host/workspace; placement='managed' provisions a new sandbox "
             "using the server's configured default provider. Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
+            "With placement='same_host', branch_name gives the session its own git "
+            "worktree on a new branch, so its edits stay apart from the caller's checkout. "
             "These placements require orchestration enabled "
             "and a private sending session, including its side-chat source chain. "
             "An independent worker's optional "
@@ -973,6 +975,28 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Default child; same_host or managed launches a private "
                                 "top-level session (agent_id only)."
+                            ),
+                        },
+                        "branch_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional with placement='same_host'. New branch to create "
+                                "in the session's own git worktree, e.g. 'team/backend-api'."
+                            ),
+                        },
+                        "team_role": {
+                            "type": "string",
+                            "description": (
+                                "Optional with an independent placement. The session's role on "
+                                "this project's team, e.g. 'Backend'; one line, at most 40 "
+                                "characters. It is shown on the Canvas and in sys_session_list."
+                            ),
+                        },
+                        "base_branch": {
+                            "type": "string",
+                            "description": (
+                                "Optional with branch_name. Ref to branch from, e.g. 'main'; "
+                                "defaults to the caller's repository HEAD."
                             ),
                         },
                         "sandbox_provider": {

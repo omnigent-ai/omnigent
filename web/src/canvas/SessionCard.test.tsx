@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import type { NodeProps } from "@xyflow/react";
+import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -36,17 +36,23 @@ function renderCard(
 ) {
   const props = {
     id: data.conversation.id,
-    data: { pullRequest: null, onOpen: vi.fn(), ...data },
+    data: { pullRequest: null, onOpen: vi.fn(), onAddAgent: vi.fn(), ...data },
     selected,
   } as unknown as NodeProps<SessionCardNode>;
   render(
-    <TooltipProvider>
-      <div onClick={onParentClick}>
-        <SessionCard {...props} />
-      </div>
-    </TooltipProvider>,
+    <ReactFlowProvider>
+      <TooltipProvider>
+        <div onClick={onParentClick}>
+          <SessionCard {...props} />
+        </div>
+      </TooltipProvider>
+    </ReactFlowProvider>,
   );
-  return { card: screen.getByTestId("session-card"), onOpen: props.data.onOpen };
+  return {
+    card: screen.getByTestId("session-card"),
+    onOpen: props.data.onOpen,
+    onAddAgent: props.data.onAddAgent,
+  };
 }
 
 afterEach(() => {
@@ -172,5 +178,21 @@ describe("SessionCard", () => {
     expect(onOpen).toHaveBeenCalledTimes(2);
     expect(onOpen).toHaveBeenCalledWith("conv_1");
     expect(onParentClick).toHaveBeenCalledOnce();
+  });
+
+  it("shows a team role and adds an agent without opening the session", () => {
+    const session = conversation({ labels: { "omnigent.team_role": "Team lead" } });
+    const { onOpen, onAddAgent } = renderCard({ conversation: session });
+
+    expect(screen.getByTestId("session-card-role")).toHaveTextContent("Team lead");
+    fireEvent.click(screen.getByTestId("session-card-add-agent"));
+
+    expect(onAddAgent).toHaveBeenCalledWith(session);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("shows no role badge for a session outside a team", () => {
+    renderCard({ conversation: conversation() });
+    expect(screen.queryByTestId("session-card-role")).not.toBeInTheDocument();
   });
 });

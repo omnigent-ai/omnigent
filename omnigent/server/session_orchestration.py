@@ -1,5 +1,7 @@
 """Owner-authorized orchestration from private sessions using existing delivery."""
 
+from typing import Any
+
 from fastapi import Request
 
 from omnigent.db.db_models import normalize_uuid
@@ -14,12 +16,225 @@ from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
 from omnigent.stores.conversation_store import (
+    PROJECT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    TEAM_BRIEFED_LABEL_KEY,
+    TEAM_REPLY_TO_LABEL_KEY,
+    TEAM_ROLE_LABEL_KEY,
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
+
+_MAX_TEAM_ROLE_LENGTH = 40
+_TEAM_LEAD_ROLE = "team lead"
+OUTSIDE_PROJECT_MESSAGE = "That session is outside this session's project"
+
+
+def _project_root(session: Conversation, conversations: ConversationStore) -> Conversation:
+    """Follow children and side chats to the session whose filing governs them."""
+    current, seen = session, {session.id}
+    while True:
+        source_id = current.parent_conversation_id or (
+            current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+            else None
+        )
+        source = conversations.get_conversation(source_id) if source_id else None
+        if source is None or source.id in seen or len(seen) >= 32:
+            return current
+        seen.add(source.id)
+        current = source
+
+
+def _project_id_name(request: Request, project_id: str, user_id: str | None) -> str:
+    """Name a first-class project, falling back to its id when it cannot be read."""
+    project_store = getattr(request.app.state, "project_store", None)
+    project = project_store.get(project_id, user_id=user_id) if project_store else None
+    return project.name if project is not None else project_id
+
+
+def _project_name(request: Request, session: Conversation, user_id: str | None) -> str | None:
+    """Name a session's project, matching first-class and legacy-label filing alike."""
+    if session.project_id is None:
+        return session.labels.get(PROJECT_LABEL_KEY)
+    return _project_id_name(request, session.project_id, user_id)
+
+
+def _require_same_project(
+    request: Request,
+    user_id: str | None,
+    conversations: ConversationStore,
+    source: Conversation,
+    target: Conversation,
+) -> None:
+    """Refuse a target in another project; unfiled sessions form their own group."""
+    source_project = _project_name(request, _project_root(source, conversations), user_id)
+    target_project = _project_name(request, _project_root(target, conversations), user_id)
+    if source_project != target_project:
+        raise OmnigentError(OUTSIDE_PROJECT_MESSAGE, code=ErrorCode.FORBIDDEN)
+
+
+def _boundary_source(request: Request, conversations: ConversationStore) -> Conversation | None:
+    """Return the agent session behind a tool request, or ``None`` when no boundary applies."""
+    source_header = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if source_header is None or not request.app.state.feature_flags.enabled(Feature.CANVAS):
+        return None
+    source_id = normalize_uuid(source_header)
+    source = conversations.get_conversation(source_id) if source_id else None
+    if source is None:
+        raise OmnigentError(OUTSIDE_PROJECT_MESSAGE, code=ErrorCode.FORBIDDEN)
+    return source
+
+
+def require_project_read_access(
+    request: Request,
+    user_id: str | None,
+    conversations: ConversationStore,
+    target_id: str,
+) -> None:
+    """Keep an agent's session reads inside its project when Canvas teams are enabled."""
+    source = _boundary_source(request, conversations)
+    if source is None:
+        return
+    target_key = normalize_uuid(target_id)
+    target = conversations.get_conversation(target_key) if target_key else None
+    # A missing target keeps the route's own not-found response.
+    if target is not None:
+        _require_same_project(request, user_id, conversations, source, target)
+
+
+def project_list_scope(
+    request: Request, user_id: str | None, conversations: ConversationStore
+) -> str | None:
+    """Return the listing filter for an agent: its project's name, ``""`` when unfiled."""
+    source = _boundary_source(request, conversations)
+    if source is None:
+        return None
+    root = _project_root(source, conversations)
+    return _project_name(request, root, user_id) or ""
+
+
+def same_project_filing(
+    conversations: ConversationStore, first: Conversation, second: Conversation
+) -> bool:
+    """Say whether two sessions' top-level sessions are filed identically."""
+    first_root = _project_root(first, conversations)
+    second_root = _project_root(second, conversations)
+    return (first_root.project_id, first_root.labels.get(PROJECT_LABEL_KEY)) == (
+        second_root.project_id,
+        second_root.labels.get(PROJECT_LABEL_KEY),
+    )
+
+
+def team_brief(role: str) -> str:
+    """Explain a team member's position, ahead of its first message."""
+    duties = (
+        "The user talks to you about this project. Break their requests down, hand the work to "
+        "teammates, create more with sys_session_create (placement='same_host', with a "
+        "branch_name so each one gets its own worktree), combine the results, and report back."
+        if role.strip().casefold() == _TEAM_LEAD_ROLE
+        else "Do the work teammates hand you, and tell them when you need something from them."
+    )
+    return (
+        f"[System: You are the {role.strip()} on this project's team. Your teammates are the "
+        "other sessions in this project: find them and their roles with sys_session_list, read "
+        "their work with sys_session_get_history, and send them work with sys_session_message. "
+        f"You are told when a teammate you messaged finishes. {duties} You cannot reach other "
+        "projects or answer approvals, which stay with the user. Your first task follows.]"
+    )
+
+
+def validate_team_role(request: Request, labels: dict[str, str]) -> None:
+    """Refuse a team role that could not be shown on one line or placed in a brief."""
+    role = labels.get(TEAM_ROLE_LABEL_KEY)
+    if role is None or not request.app.state.feature_flags.enabled(Feature.CANVAS):
+        return
+    if not role.strip() or len(role) > _MAX_TEAM_ROLE_LENGTH or not role.isprintable():
+        raise OmnigentError(
+            f"A team role must be one line of 1–{_MAX_TEAM_ROLE_LENGTH} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def with_team_brief(
+    request: Request, conversations: ConversationStore, session: Conversation, body: Any
+) -> Any:
+    """Put a team member's brief ahead of its first message, once."""
+    role = session.labels.get(TEAM_ROLE_LABEL_KEY)
+    content = body.data.get("content")
+    if (
+        role is None
+        or TEAM_BRIEFED_LABEL_KEY in session.labels
+        or not request.app.state.feature_flags.enabled(Feature.CANVAS)
+        or body.type != "message"
+        or body.data.get("role", "user") != "user"
+        or not isinstance(content, list)
+    ):
+        return body
+    conversations.set_labels(session.id, {TEAM_BRIEFED_LABEL_KEY: "1"})
+    brief = {"type": "input_text", "text": team_brief(role)}
+    return body.model_copy(update={"data": {**body.data, "content": [brief, *content]}})
+
+
+def record_team_asker(
+    request: Request, conversations: ConversationStore, asker_id: str, teammate_id: str
+) -> None:
+    """Remember who to tell when a teammate settles, where Canvas teams are enabled."""
+    if request.app.state.feature_flags.enabled(Feature.CANVAS):
+        conversations.set_labels(teammate_id, {TEAM_REPLY_TO_LABEL_KEY: asker_id})
+
+
+def scheduled_task_in_project(
+    request: Request,
+    user_id: str | None,
+    conversations: ConversationStore,
+    *,
+    project_id: str | None,
+    session_id: str | None,
+) -> bool:
+    """Say whether an automation stays in the calling agent's project.
+
+    A task continuing a session belongs to that session's project; any other
+    task runs in the project it is filed under.
+    """
+    source = _boundary_source(request, conversations)
+    if source is None:
+        return True
+    source_project = _project_name(request, _project_root(source, conversations), user_id)
+    if session_id is not None:
+        target_key = normalize_uuid(session_id)
+        target = conversations.get_conversation(target_key) if target_key else None
+        if target is None:
+            return False
+        target_project = _project_name(request, _project_root(target, conversations), user_id)
+        if target_project != source_project:
+            return False
+    task_project = _project_id_name(request, project_id, user_id) if project_id else None
+    return task_project == source_project or (project_id is None and session_id is not None)
+
+
+def agent_task_project_id(request: Request, conversations: ConversationStore) -> str | None:
+    """Return the project an agent's new automation is filed under, if any."""
+    source = _boundary_source(request, conversations)
+    return _project_root(source, conversations).project_id if source is not None else None
+
+
+def inherited_project_fields(
+    request: Request,
+    conversations: ConversationStore,
+    source: Conversation,
+) -> dict[str, Any]:
+    """Return create fields that file an independent session in its creator's project."""
+    if not request.app.state.feature_flags.enabled(Feature.CANVAS):
+        return {}
+    root = _project_root(source, conversations)
+    legacy_project = root.labels.get(PROJECT_LABEL_KEY) if root.project_id is None else None
+    return {
+        "project_id": root.project_id,
+        **({"labels": {PROJECT_LABEL_KEY: legacy_project}} if legacy_project else {}),
+    }
 
 
 def require_owned_session(
@@ -93,6 +308,8 @@ def require_orchestration_source(
         target = require_owned_session(target_id, user_id, conversations, permissions)
         if source.id == target.id:
             raise OmnigentError("Choose another session", code=ErrorCode.INVALID_INPUT)
+        if request.app.state.feature_flags.enabled(Feature.CANVAS):
+            _require_same_project(request, user_id, conversations, source, target)
     return source
 
 
