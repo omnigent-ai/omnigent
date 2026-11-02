@@ -4175,7 +4175,7 @@ function ConversationMenuItems({
       <>
         <C.Item
           data-testid="project-picker-back"
-          className="whitespace-nowrap"
+          className="mobile-touch-target whitespace-nowrap"
           // Keep the menu open — just flip back to the main actions.
           onSelect={(e) => {
             e.preventDefault();
@@ -4202,10 +4202,11 @@ function ConversationMenuItems({
           outranks pin). */}
       {!isArchived && gridOptions.length > 0 && (
         <C.Sub>
-          <C.SubTrigger>Open in grid</C.SubTrigger>
+          <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
           <C.SubContent>
             {gridOptions.map(({ targetId, edge, label }) => (
               <C.Item
+                className="mobile-touch-target"
                 key={`${targetId}:${edge}`}
                 onSelect={() => grids?.split(targetId, conversation.id, edge)}
               >
@@ -4219,7 +4220,7 @@ function ConversationMenuItems({
         <C.Item
           data-testid="pin-conversation"
           disabled={pinSaving || (!isPinned && atPinCap)}
-          className="md:hidden"
+          className="mobile-touch-target md:hidden"
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -4230,7 +4231,11 @@ function ConversationMenuItems({
           entirely rather than showing it disabled. */}
       {!isSingleUser &&
         (isOwner && !sharingOff ? (
-          <C.Item data-testid="share-conversation" onSelect={() => setShareOpen(true)}>
+          <C.Item
+            className="mobile-touch-target"
+            data-testid="share-conversation"
+            onSelect={() => setShareOpen(true)}
+          >
             <ShareIcon className="size-3.5" />
             Share
           </C.Item>
@@ -4238,7 +4243,7 @@ function ConversationMenuItems({
           <Tooltip>
             <TooltipTrigger asChild>
               <div>
-                <C.Item data-testid="share-conversation" disabled>
+                <C.Item className="mobile-touch-target" data-testid="share-conversation" disabled>
                   <ShareIcon className="size-3.5" />
                   Share
                 </C.Item>
@@ -4254,6 +4259,7 @@ function ConversationMenuItems({
           </Tooltip>
         ))}
       <SessionActionMenuItem
+        className="mobile-touch-target"
         Item={C.Item}
         data-testid="fork-conversation"
         disabledReason={forkDisabledReason}
@@ -4264,6 +4270,7 @@ function ConversationMenuItems({
       </SessionActionMenuItem>
       {isOwner ? (
         <C.Item
+          className="mobile-touch-target"
           data-testid="rename-conversation"
           onSelect={() => {
             trackClick("sidebar.conversation.rename", "button");
@@ -4277,7 +4284,7 @@ function ConversationMenuItems({
         <Tooltip>
           <TooltipTrigger asChild>
             <div>
-              <C.Item data-testid="rename-conversation" disabled>
+              <C.Item className="mobile-touch-target" data-testid="rename-conversation" disabled>
                 <PencilIcon className="size-3.5" />
                 Rename
               </C.Item>
@@ -4294,6 +4301,7 @@ function ConversationMenuItems({
           the reverse, "Mark as read", which clears it. */}
       {canMarkUnread ? (
         <C.Item
+          className="mobile-touch-target"
           data-testid="mark-unread-conversation"
           onSelect={() => {
             onMarkUnread();
@@ -4305,6 +4313,7 @@ function ConversationMenuItems({
         </C.Item>
       ) : (
         <C.Item
+          className="mobile-touch-target"
           data-testid="mark-read-conversation"
           onSelect={() => {
             onMarkRead();
@@ -4324,7 +4333,7 @@ function ConversationMenuItems({
           // branch above). `preventDefault` keeps the menu open on select.
           <C.Item
             data-testid="move-to-project"
-            className="whitespace-nowrap"
+            className="mobile-touch-target whitespace-nowrap"
             onSelect={(e) => {
               e.preventDefault();
               setView("projects");
@@ -4337,7 +4346,10 @@ function ConversationMenuItems({
           </C.Item>
         ) : (
           <C.Sub>
-            <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
+            <C.SubTrigger
+              data-testid="move-to-project"
+              className="mobile-touch-target whitespace-nowrap"
+            >
               <FolderInputIcon className="size-3.5" />
               {currentProject ? "Move session" : "Add to project"}
             </C.SubTrigger>
@@ -4362,6 +4374,7 @@ function ConversationMenuItems({
       {canStop &&
         (isOwner ? (
           <C.Item
+            className="mobile-touch-target"
             data-testid="stop-conversation"
             variant="destructive"
             onSelect={() => setStopOpen(true)}
@@ -4373,7 +4386,7 @@ function ConversationMenuItems({
           <Tooltip>
             <TooltipTrigger asChild>
               <div>
-                <C.Item data-testid="stop-conversation" disabled>
+                <C.Item className="mobile-touch-target" data-testid="stop-conversation" disabled>
                   <CircleStopIcon className="size-3.5" />
                   Stop session
                 </C.Item>
@@ -4385,7 +4398,11 @@ function ConversationMenuItems({
           </Tooltip>
         ))}
       {isOwner ? (
-        <C.Item data-testid="archive-conversation" onSelect={runArchive}>
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="archive-conversation"
+          onSelect={runArchive}
+        >
           {isArchived ? (
             <ArchiveRestoreIcon className="size-3.5" />
           ) : (
@@ -4397,7 +4414,7 @@ function ConversationMenuItems({
         <Tooltip>
           <TooltipTrigger asChild>
             <div>
-              <C.Item data-testid="archive-conversation" disabled>
+              <C.Item className="mobile-touch-target" data-testid="archive-conversation" disabled>
                 {isArchived ? (
                   <ArchiveRestoreIcon className="size-3.5" />
                 ) : (
@@ -4421,6 +4438,7 @@ function ConversationMenuItems({
           sharing, so it keeps the plain owner Delete. */}
       {isOwner || isSingleUser ? (
         <C.Item
+          className="mobile-touch-target"
           data-testid="delete-conversation"
           variant="destructive"
           onSelect={() => setDeleteOpen(true)}
@@ -4430,6 +4448,7 @@ function ConversationMenuItems({
         </C.Item>
       ) : (
         <C.Item
+          className="mobile-touch-target"
           data-testid="leave-conversation"
           variant="destructive"
           onSelect={() => setLeaveOpen(true)}
