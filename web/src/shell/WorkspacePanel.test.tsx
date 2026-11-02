@@ -50,11 +50,20 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+  FilesPanel: ({
+    flatView,
+    conversationId,
+    active,
+  }: {
+    flatView: boolean;
+    conversationId: string;
+    active?: boolean;
+  }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
+      data-active={String(active)}
     />
   ),
 }));
@@ -685,6 +694,7 @@ describe("WorkspacePanel content area", () => {
     });
     const panel = screen.getByTestId("files-panel-stub");
     expect(panel.parentElement).not.toHaveClass("invisible");
+    expect(panel).toHaveAttribute("data-active", "true");
 
     rerender({ selectedFilePath: "src/App.tsx" });
     // The viewer owns the slot; the scope panel stays mounted (same node, so
@@ -692,10 +702,22 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
     expect(panel.parentElement).toHaveClass("invisible");
+    // A hidden panel must not act as if the user opened it (e.g. wake a sandbox).
+    expect(panel).toHaveAttribute("data-active", "false");
 
     rerender({ selectedFilePath: null });
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
     expect(panel.parentElement).not.toHaveClass("invisible");
+    expect(panel).toHaveAttribute("data-active", "true");
+  });
+
+  it.each([
+    ["collapsed", { open: false }],
+    ["inert", { inert: true }],
+  ])("marks the FilesPanel inactive while the rail is %s", (_label, override) => {
+    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, ...override });
+
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", "false");
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {

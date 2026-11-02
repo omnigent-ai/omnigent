@@ -1801,6 +1801,7 @@ function WorkspacePanelImpl({
               <FilesPanel
                 conversationId={contained ? conversationId : undefined}
                 frameless
+                active={open && !inert && filesPanelActive}
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}

@@ -15,7 +15,8 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -81,6 +82,12 @@ interface FilesPanelProps {
    * split layout rather than a drawer.
    */
   frameless?: boolean;
+  /**
+   * Whether the panel is visible to the user. A hidden pre-mounted panel
+   * (behind a file tab, a collapsed rail) must not wake an asleep sandbox.
+   * Default true.
+   */
+  active?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +260,7 @@ export function FilesPanel({
   onSortChange,
   onClose,
   frameless,
+  active = true,
 }: FilesPanelProps) {
   const { conversationId: routeId } = useParams<{ conversationId: string }>();
   const conversationId = sessionId ?? routeId;
@@ -485,6 +493,15 @@ export function FilesPanel({
   // lists can't load. Say so rather than "No files in workspace"; a list
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
+  // Opening the panel on an asleep sandbox starts it, as Reconnect host does,
+  // so its files load without a chat message. Restarting needs edit access.
+  const canWake = isEditorLevel(session?.permissionLevel ?? null);
+  const sandboxWake = useSandboxAutoWake({
+    conversationId,
+    asleep: showAsleepHint,
+    active,
+    canWake,
+  });
 
   return (
     <div
@@ -675,7 +692,20 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
+        {showAsleepHint && (
+          <RunnerAsleepHint
+            sandboxOffline
+            wake={
+              canWake
+                ? {
+                    phase: sandboxWake.phase,
+                    error: sandboxWake.error,
+                    onWake: () => void sandboxWake.wake(),
+                  }
+                : undefined
+            }
+          />
+        )}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
