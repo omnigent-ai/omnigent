@@ -679,10 +679,9 @@ class ReachableRoot:
     """
     One path an environment's file tools are permitted to reach.
 
-    Produced by :func:`reachable_roots`, which is the single source of
-    truth for the grant boundary: the same list drives enforcement (in
-    :func:`omnigent.inner.os_env._assert_within_reach`) and the reach
-    the file-browsing APIs advertise, so the two cannot drift.
+    Produced from runtime policy by :func:`reachable_roots` or from remote
+    declarations by :func:`declared_filesystem_reach`. Both use the same
+    grant assembly for enforcement and file-browsing metadata.
 
     :param path: Resolved absolute path of the grant, e.g.
         ``Path("/Users/corey/data")``.
@@ -752,6 +751,39 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     :param policy: Resolved sandbox policy carrying the declared grants.
     :returns: Grants in precedence order, cwd first. Never empty.
     """
+    return _filesystem_reach_roots(
+        cwd, policy.write_roots, policy.write_files, policy.read_roots or []
+    )
+
+
+def declared_filesystem_reach(cwd: Path, spec: OSEnvSpec) -> tuple[list[ReachableRoot], bool]:
+    """Describe declared file grants without preparing a local sandbox.
+
+    Remote metadata readers need neither sandbox binaries nor runtime mounts.
+    Only an explicitly unconfined spec permits browsing beyond these grants.
+
+    :returns: Declared reachable roots and whether the spec is unconfined.
+    """
+    sandbox = spec.sandbox
+    if sandbox is None:
+        return _filesystem_reach_roots(cwd, [], [], []), False
+    return (
+        _filesystem_reach_roots(
+            cwd,
+            [_resolve_grant_root(cwd, grant.path) for grant in sandbox.write_path_specs],
+            [_resolve_grant_root(cwd, root) for root in sandbox.write_files or []],
+            [_resolve_grant_root(cwd, root) for root in sandbox.read_paths or []],
+        ),
+        sandbox.type == "none",
+    )
+
+
+def _filesystem_reach_roots(
+    cwd: Path,
+    write_roots: Sequence[Path],
+    write_files: Sequence[Path],
+    read_roots: Sequence[Path],
+) -> list[ReachableRoot]:
     # Resolving cwd is what makes the grants comparable to a resolved
     # candidate path. Callers pass a root that is already contained — see
     # `_session_workspace` / `compute_default_env_root`, which vet it against
@@ -759,15 +791,15 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
     roots += [
         ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
-        for root in policy.write_roots
+        for root in write_roots
     ]
     roots += [
         ReachableRoot(path=grant, access="write", origin="write_files", kind="file")
-        for grant in policy.write_files
+        for grant in write_files
     ]
     roots += [
         ReachableRoot(path=root, access="read", origin="read_paths", kind="tree")
-        for root in (policy.read_roots or [])
+        for root in read_roots
     ]
     return roots
 
