@@ -16,6 +16,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
 import { useCreateHostDirectory } from "@/hooks/useHostFilesystem";
+import type { Host } from "@/hooks/useHosts";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { joinPath } from "./WorkspacePicker";
@@ -87,6 +88,19 @@ function friendlyProjectError(error: unknown): string {
 }
 
 /**
+ * The host a new project's working directory defaults to: the first online,
+ * non-sandbox host.
+ *
+ * @param hosts - The user's hosts, e.g. from `useHosts({ includeSandbox: true })`.
+ * @returns Its id, e.g. `"host_abc"`, or `null` when none is online.
+ */
+export function defaultProjectHostId(
+  hosts: readonly Pick<Host, "host_id" | "status" | "sandbox_provider">[],
+): string | null {
+  return hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
+}
+
+/**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
  * the legacy label model can't express. On success the new folder is expanded
@@ -102,7 +116,59 @@ export function NewProjectButton({
   hostsLoading: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const [name, setName] = useState("");
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="New project"
+            data-testid="new-project"
+            className="text-muted-foreground mobile-touch-target"
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(true);
+            }}
+          >
+            <PlusIcon className="size-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">New project</TooltipContent>
+      </Tooltip>
+      <NewProjectDialog
+        open={open}
+        onOpenChange={setOpen}
+        onCreated={onCreated}
+        hostId={hostId}
+        hostsLoading={hostsLoading}
+      />
+    </>
+  );
+}
+
+/**
+ * The create-project modal; each open starts from `initialName`, with no icon
+ * and the working directory defaulting to `hostId`.
+ */
+export function NewProjectDialog({
+  open,
+  onOpenChange,
+  initialName = "",
+  onCreated,
+  hostId,
+  hostsLoading,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  initialName?: string;
+  onCreated?: (name: string) => void;
+  hostId: string | null;
+  hostsLoading: boolean;
+}) {
+  const [name, setName] = useState(initialName);
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [dialogHostId, setDialogHostId] = useState<string | null>(null);
@@ -124,6 +190,21 @@ export function NewProjectButton({
   const createDirectory = useCreateHostDirectory();
   const isPending = createProject.isPending || createDirectory.isPending;
   const folderCreationDisabled = isPending || (!hostsLoading && dialogHostId === null);
+
+  // Each open starts a fresh form; a submission still in flight no longer applies.
+  useEffect(() => {
+    if (!open) return;
+    submissionGeneration.current += 1;
+    setName(initialName);
+    setIcon(undefined);
+    // The effect below fills in the current default host.
+    setDialogHostId(null);
+    setWorkspace(null);
+    setCreatedWorkspace(null);
+    setWorkspacePickerOpen(false);
+    setCreateWorkspaceFolder(false);
+    setSubmitError(null);
+  }, [open, initialName]);
 
   useEffect(() => {
     if (open && dialogHostId === null && hostId !== null) {
@@ -179,35 +260,24 @@ export function NewProjectButton({
         onSuccess: (project) => {
           if (submission !== submissionGeneration.current) return;
           submissionGeneration.current += 1;
-          setOpen(false);
-          setName("");
-          setIcon(undefined);
-          setDialogHostId(null);
-          setWorkspace(null);
-          setCreatedWorkspace(null);
-          setWorkspacePickerOpen(false);
-          setCreateWorkspaceFolder(false);
-          setSubmitError(null);
-          onCreated(project.name);
+          onOpenChange(false);
+          onCreated?.(project.name);
         },
       },
     );
   };
 
-  const dialog = (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) {
-          submissionGeneration.current += 1;
-        }
-        setOpen(next);
-        if (!next) {
-          setEmojiOpen(false);
-          setWorkspacePickerOpen(false);
-        }
-      }}
-    >
+  const handleOpenChange = (next: boolean) => {
+    if (!next) {
+      submissionGeneration.current += 1;
+      setEmojiOpen(false);
+      setWorkspacePickerOpen(false);
+    }
+    onOpenChange(next);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
         className="sm:max-w-lg"
         onClick={(e) => e.stopPropagation()}
@@ -370,7 +440,12 @@ export function NewProjectButton({
           </p>
         )}
         <DialogFooter className="border-t-0 bg-transparent">
-          <Button type="button" variant="ghost" onClick={() => setOpen(false)} disabled={isPending}>
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => handleOpenChange(false)}
+            disabled={isPending}
+          >
             Cancel
           </Button>
           <Button
@@ -385,39 +460,5 @@ export function NewProjectButton({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  );
-
-  return (
-    <>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label="New project"
-            data-testid="new-project"
-            className="text-muted-foreground mobile-touch-target"
-            onClick={(e) => {
-              e.stopPropagation();
-              submissionGeneration.current += 1;
-              setName("");
-              setIcon(undefined);
-              setDialogHostId(hostId);
-              setWorkspace(null);
-              setCreatedWorkspace(null);
-              setWorkspacePickerOpen(false);
-              setCreateWorkspaceFolder(false);
-              setSubmitError(null);
-              setOpen(true);
-            }}
-          >
-            <PlusIcon className="size-3.5" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">New project</TooltipContent>
-      </Tooltip>
-      {dialog}
-    </>
   );
 }

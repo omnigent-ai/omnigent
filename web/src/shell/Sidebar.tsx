@@ -267,7 +267,7 @@ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
-import { NewProjectButton } from "./NewProjectButton";
+import { defaultProjectHostId, NewProjectButton } from "./NewProjectButton";
 import { SessionImportStatus } from "./SessionImportStatus";
 import { useSessionImportStore } from "@/store/sessionImport";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
@@ -2121,8 +2121,7 @@ function ConversationList({
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
-  const defaultProjectHostId =
-    hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
+  const projectHostId = defaultProjectHostId(hosts);
   // Grouping / ordering / show options from the filter menu, seeded from the
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
@@ -3320,7 +3319,7 @@ function ConversationList({
                         !selectionMode ? (
                           <>
                             <ProjectHeaderActions
-                              hostId={defaultProjectHostId}
+                              hostId={projectHostId}
                               hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
