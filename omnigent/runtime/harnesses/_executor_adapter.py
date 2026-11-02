@@ -1606,8 +1606,8 @@ def _extract_role_keyed_messages(
 
     With *include_tool_history*, ``function_call`` / ``function_call_output`` items
     become ``tool_call`` / ``tool_result`` messages for an executor that replays them
-    into a fresh inner session (a fork or restart). Returns an empty list for
-    non-history inputs.
+    into a fresh inner session (a fork or restart), keeping only the most recent ones
+    within the total replay budget. Returns an empty list for non-history inputs.
     """
     messages: list[Message] = []
     seen_call_ids: set[str] = set()
@@ -1638,12 +1638,63 @@ def _extract_role_keyed_messages(
         if not content:
             continue
         messages.append({"role": role, "content": content})
-    return messages
+    return _keep_recent_tool_history(messages) if include_tool_history else messages
 
 
 # Per-output budget for replayed tool history: a fresh session gets the gist of
 # each result without one large read crowding out the conversation.
 _REPLAYED_TOOL_OUTPUT_MAX_BYTES = 16 * 1024
+# Total budget across replayed tool calls and outputs, which bounds how much a long
+# session's tool history adds to a fresh session's first prompt.
+_REPLAYED_TOOL_HISTORY_MAX_BYTES = 128 * 1024
+# A call id, or the position of a call without one; tagged so the two never collide.
+_ToolHistoryKey = tuple[str, str | int]
+
+
+def _keep_recent_tool_history(messages: list[Message]) -> list[Message]:
+    """Keep the newest tool calls and outputs that fit the budget, skipping any one over it."""
+    keys = _tool_history_keys(messages)
+    sizes: dict[_ToolHistoryKey, int] = {}
+    for key, message in zip(keys, messages, strict=True):
+        if key is not None:
+            sizes[key] = sizes.get(key, 0) + len(json.dumps(message.get("content")).encode())
+    kept: set[_ToolHistoryKey] = set()
+    remaining = _REPLAYED_TOOL_HISTORY_MAX_BYTES
+    for key, size in reversed(sizes.items()):
+        # Call arguments are not capped, so one call can exceed the whole budget.
+        if size > _REPLAYED_TOOL_HISTORY_MAX_BYTES:
+            continue
+        if size > remaining:
+            break
+        kept.add(key)
+        remaining -= size
+    return [
+        message for key, message in zip(keys, messages, strict=True) if key is None or key in kept
+    ]
+
+
+def _tool_history_keys(messages: list[Message]) -> list[_ToolHistoryKey | None]:
+    """Group tool messages by call id, else by position; ``None`` marks a conversation message."""
+    keys: list[_ToolHistoryKey | None] = []
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        metadata = message.get("metadata")
+        call_id = metadata.get("call_id") if isinstance(metadata, dict) else None
+        if role not in ("tool_call", "tool_result"):
+            keys.append(None)
+        elif isinstance(call_id, str) and call_id:
+            keys.append(("call_id", call_id))
+        elif (
+            role == "tool_result"
+            and index
+            and keys[-1] == ("position", index - 1)
+            and messages[index - 1].get("role") == "tool_call"
+        ):
+            # Without ids, a result belongs to the call just before it.
+            keys.append(keys[-1])
+        else:
+            keys.append(("position", index))
+    return keys
 
 
 def _tool_call_message(item: dict[str, Any]) -> Message | None:
@@ -1670,7 +1721,8 @@ def _tool_call_message(item: dict[str, Any]) -> Message | None:
 def _tool_result_message(item: dict[str, Any]) -> Message:
     """Translate a ``function_call_output`` input item into a ``tool_result`` message.
 
-    The output is image-stripped and capped: a fresh session replays every one.
+    The output is image-stripped and capped, so one large result cannot crowd out
+    the rest of the replay.
     """
     output = item.get("output")
     if not isinstance(output, str):
