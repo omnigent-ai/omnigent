@@ -525,11 +525,13 @@ def test_native_codex_launch_summary_defaults_empty() -> None:
 
 def test_resolve_native_codex_launch_no_provider_sets_login_fallback_summary(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """No configured provider -> summary names the login fallback (#2745)."""
     from omnigent.onboarding import ambient, detected, provider_config
     from omnigent.runtime import workflow
 
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-config"))
     monkeypatch.setattr(provider_config, "load_config", dict)
     monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
     monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
@@ -604,6 +606,7 @@ def test_resolve_native_codex_launch_connect_broker_managed_host(
 
 def test_resolve_native_codex_launch_no_broker_sidecar_falls_back_to_login(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """No broker sidecar (e.g. a laptop) → connect-broker branch is skipped and
     Codex falls back to CLI login, so non-sandbox auth is untouched."""
@@ -611,6 +614,7 @@ def test_resolve_native_codex_launch_no_broker_sidecar_falls_back_to_login(
     from omnigent.onboarding import ambient, detected, provider_config
     from omnigent.runtime import workflow
 
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-config"))
     monkeypatch.setattr(provider_config, "load_config", dict)
     monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
     monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
