@@ -78,6 +78,7 @@ from omnigent.harnesses.pi_native.credentials import (
     resolve_pi_native_provider,
 )
 from omnigent.harnesses.pi_native.main import pi_bridge_dir_for_session
+from omnigent.process_logging import data_dir
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import POLL_INTERVAL_S
@@ -481,7 +482,7 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
                 lambda: _match_conv(_output()), timeout=160, what="conversation id", tail=_output
             )
         )
-        bridge = home / pi_bridge_dir_for_session(conv).relative_to(Path.home())
+        bridge = config_home / pi_bridge_dir_for_session(conv).relative_to(data_dir())
         models_path = bridge / "pi-agent" / "models.json"
 
         # 2. Wait for the runner to render the managed per-session models.json.

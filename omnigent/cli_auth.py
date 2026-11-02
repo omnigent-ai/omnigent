@@ -868,6 +868,9 @@ def open_server_client(
         **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
     }
     kwargs: dict[str, Any] = {}
+    from omnigent.session_host import route_known_session_request
+
+    kwargs["event_hooks"] = {"request": [route_known_session_request]}
     if timeout is not _TIMEOUT_UNSET:
         kwargs["timeout"] = timeout
     if transport is not None:

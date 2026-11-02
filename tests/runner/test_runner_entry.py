@@ -12,6 +12,7 @@ import queue
 import signal
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +72,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.terminals.pane_reaper import PaneRef
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
@@ -2030,6 +2032,39 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
     )
 
     assert _load_runner_idle_timeout_s_from_config() == 12.5
+
+
+@pytest.mark.parametrize("timeout_s", [86400, 0])
+def test_create_app_native_panes_inherit_runner_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_s: int
+) -> None:
+    """Native terminals must survive the runner's configured idle window."""
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = tmp_path
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
+    (tmp_path / "config.yaml").write_text(f"runner:\n  idle_timeout_s: {timeout_s}\n")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    app = entry_mod.create_app(auth_resolved=True)
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    assert reaper._idle_timeout_s == timeout_s
+    if timeout_s:
+        pane = PaneRef("conv_idle", "terminal:codex:main", "codex", tmp_path / "tmux.sock")
+        assert reaper._classify(0.0, [pane], busy_convs=set()) == []
+        assert reaper._classify(3601.0, [pane], busy_convs=set()) == []
+        assert reaper._classify(float(timeout_s), [pane], busy_convs=set()) == [pane]
 
 
 def test_load_runner_idle_timeout_zero_disables_watchdog(

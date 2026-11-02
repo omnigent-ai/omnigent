@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import urllib.error
 import urllib.request
 from collections import deque
@@ -79,6 +80,7 @@ from omnigent.native._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -565,6 +567,8 @@ class _CodexForwarderState:
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
+    # User shell commands whose input was mirrored at item start.
+    started_user_shell_items: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
@@ -1190,7 +1194,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     message for versions/shapes that omit it, unless the message is a 429.
 
     Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
-    for these, which the auth checks below would otherwise misclassify.
+    for these, which the auth checks below would otherwise misclassify. So is a
+    failed model provider token command, which ``codex login`` cannot renew.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -1198,7 +1203,9 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     lowered = message.lower()
-    if any(fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS):
+    if any(
+        fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS
+    ) or is_codex_provider_auth_failure(message):
         return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None
@@ -2399,6 +2406,7 @@ async def supervise_forwarder(
             name="codex-native-forwarder-side-chat",
         )
         await _sleep(0)
+        stream_error: BaseException | None = None
         try:
             async for event in client.iter_events():
                 try:
@@ -2462,22 +2470,41 @@ async def supervise_forwarder(
                     )
                 except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
+        except BaseException as exc:
+            stream_error = exc
+            raise
         finally:
+            # Stop producers before draining their output while the HTTP client is open.
+            background_tasks = [subscribe_task, side_chat_task]
             if mcp_settle_timer is not None:
-                mcp_settle_timer.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mcp_settle_timer
-            await target.delta_coalescer.close()
-            await target.usage_coalescer.close()
-            await target.elicitation_tracker.close()
-            subscribe_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await subscribe_task
-            side_chat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await side_chat_task
-            await forwarder_state.close_child_streams()
-            await client.close()
+                background_tasks.append(mcp_settle_timer)
+            for task in background_tasks:
+                task.cancel()
+            results = await asyncio.gather(*background_tasks, return_exceptions=True)
+            cleanup_errors = [
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            ]
+            for close in (
+                target.delta_coalescer.close,
+                target.usage_coalescer.close,
+                target.elicitation_tracker.close,
+                forwarder_state.close_child_streams,
+                client.close,
+            ):
+                try:
+                    await close()
+                except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
+                    cleanup_errors.append(exc)
+            for error in cleanup_errors[1 if stream_error is None else 0 :]:
+                _logger.warning(
+                    "Codex forwarder cleanup failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            if stream_error is None and cleanup_errors:
+                raise cleanup_errors[0]
 
 
 async def _drive_side_chat_requests(
@@ -2871,12 +2898,17 @@ async def _subscribe_until_ready_inner(
         if bridge_state is not None and bridge_state.thread_id == thread_id
         else None
     )
+    shell_pending = (
+        bridge_state is not None
+        and bridge_state.thread_id == thread_id
+        and bridge_state.pending_shell_command_id is not None
+    )
     saw_not_ready = False
     while True:
         received_live_items = client.is_subscribed_to_thread(thread_id)
         try:
             params: _JsonObject = {"threadId": thread_id}
-            if not saw_not_ready and replay_from_turn_id is None:
+            if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
                 params["excludeTurns"] = True
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
@@ -3057,7 +3089,12 @@ async def _replay_resume_response(
                     session_id=session_id,
                     bridge_dir=bridge_dir,
                     event={
-                        "method": "item/completed",
+                        "method": (
+                            "item/started"
+                            if _user_shell_command(item) is not None
+                            and item.get("status") == "inProgress"
+                            else "item/completed"
+                        ),
                         "params": {
                             "threadId": thread_id,
                             "turnId": turn_id,
@@ -3334,6 +3371,10 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, event_state)
+        elif isinstance(item, dict) and _user_shell_command(item) is not None:
+            if await _post_user_shell_input(client, route_session_id, params, item):
+                if event_state is not None and isinstance(item_id := item.get("id"), str):
+                    event_state.started_user_shell_items.add(item_id)
         elif isinstance(item, dict) and item.get("type") == "commandExecution":
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
             if call_id is not None and event_state is not None:
@@ -4178,6 +4219,10 @@ async def _maybe_handle_delta_event(
         if not isinstance(delta, str):
             _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
             return True
+        if forwarder_state is not None and call_id in forwarder_state.started_user_shell_items:
+            # A user shell command has no tool call to stream into; its output
+            # is mirrored whole when the item completes.
+            return True
         turn_id = _turn_id_from_payload(params)
         if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
@@ -4675,7 +4720,11 @@ def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
     if not isinstance(item, dict):
         return False
     item_type = item.get("type")
-    return isinstance(item_type, str) and item_type != "userMessage"
+    return (
+        isinstance(item_type, str)
+        and item_type != "userMessage"
+        and _user_shell_command(item) is None
+    )
 
 
 async def _post_mcp_startup(
@@ -5582,6 +5631,16 @@ async def _handle_completed_item_inner(
         return
     if item_type == "plan":
         await _post_plan_item(client, session_id, params, item, source_id=source_id)
+        return
+    if _user_shell_command(item) is not None:
+        await _post_user_shell_item(
+            client,
+            session_id,
+            params,
+            item,
+            forwarder_state=forwarder_state,
+            source_id=source_id,
+        )
         return
     if item_type in _REVIEW_MODE_ITEM_TYPES:
         await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
@@ -6660,6 +6719,111 @@ async def _post_tool_call_item(
     return tool_call.call_id if posted else None
 
 
+def _user_shell_command(item: _JsonObject) -> str | None:
+    """
+    Return the command a person ran through Codex shell mode.
+
+    Codex reports the typed text wrapped as ``<shell> -lc '<command>'``; unwrap
+    it so the mirror matches the web ``!command`` that requested it.
+
+    :param item: Codex thread item, e.g. ``{"type": "commandExecution",
+        "source": "userShell", "command": "/bin/bash -lc 'ls -la'"}``.
+    :returns: The typed command, e.g. ``"ls -la"``, or ``None`` for any item
+        that is not a user shell command.
+    """
+    if item.get("type") != "commandExecution" or item.get("source") != "userShell":
+        return None
+    command = item.get("command")
+    if not isinstance(command, str) or not command:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    if len(argv) == 3 and argv[1] in {"-c", "-lc"}:
+        return argv[2]
+    return command
+
+
+async def _post_user_shell_input(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+    *,
+    source_id: str | None = None,
+) -> bool:
+    """
+    Mirror a user shell command's input as a ``terminal_command`` item.
+
+    Persisting it settles the matching web ``!command`` pending input.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex ``item/started`` or ``item/completed`` params.
+    :param item: Codex user-shell ``commandExecution`` item.
+    :param source_id: Stable native item id; derived from ``params`` when omitted.
+    :returns: Whether the item was accepted by the server.
+    """
+    command = _user_shell_command(item)
+    if command is None:
+        return False
+    return await _post_external_item(
+        client,
+        session_id,
+        item_type="terminal_command",
+        item_data={"kind": "input", "input": command},
+        response_id=_response_id(params),
+        source_id=f"{source_id or _source_id(params, item)}:input",
+    )
+
+
+async def _post_user_shell_item(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+    *,
+    forwarder_state: _CodexForwarderState | None,
+    source_id: str,
+) -> None:
+    """
+    Mirror one completed user shell command as ``terminal_command`` items.
+
+    The input half is posted here only when ``item/started`` did not already
+    post it (e.g. resume backfill); the output half carries the aggregated
+    output and any non-zero exit code.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex ``item/completed`` params.
+    :param item: Codex user-shell ``commandExecution`` item.
+    :param forwarder_state: Optional state tracking inputs posted at item start.
+    :param source_id: Stable native item id used for server-side deduplication.
+    :returns: None.
+    """
+    item_id = item.get("id")
+    started = forwarder_state is not None and item_id in forwarder_state.started_user_shell_items
+    if started:
+        assert forwarder_state is not None
+        forwarder_state.started_user_shell_items.discard(item_id)
+    elif not await _post_user_shell_input(client, session_id, params, item, source_id=source_id):
+        return
+    tool_call = _codex_tool_call_from_item(item)
+    await _post_external_item(
+        client,
+        session_id,
+        item_type="terminal_command",
+        item_data={
+            "kind": "output",
+            "stdout": tool_call.output if tool_call is not None else "",
+            "stderr": None,
+        },
+        response_id=_response_id(params),
+        source_id=f"{source_id}:output",
+    )
+
+
 async def _post_tool_item(
     client: httpx.AsyncClient,
     session_id: str,
@@ -6924,9 +7088,18 @@ def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | 
 
 def _post_file_change_observer(url: str, token: str, payload: _JsonObject) -> None:
     """POST one observer payload without the server client's auth middleware."""
+    encoded = json.dumps(payload).encode("utf-8")
+    if len(encoded) > 1_048_576:
+        # Preserve paths when original evidence exceeds the relay body limit.
+        tool_input = payload.get("tool_input")
+        changes = tool_input.get("changes") if isinstance(tool_input, dict) else None
+        for change in changes if isinstance(changes, list) else []:
+            if isinstance(change, dict):
+                change.pop("diff", None)
+        encoded = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
+        data=encoded,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -6941,13 +7114,13 @@ async def _observe_file_change(bridge_dir: Path | None, item: _JsonObject) -> No
     """Send a completed Codex fileChange through the runner's file observer."""
     if bridge_dir is None:
         return
-    if item.get("status") in {"failed", "declined"}:
+    if item.get("status") != "completed":
         return
     changes = item.get("changes")
     if not isinstance(changes, list):
         return
     observed_changes = [
-        {"path": change.get("path"), "kind": change.get("kind")}
+        {key: change[key] for key in ("path", "kind", "diff") if key in change}
         for change in changes
         if isinstance(change, dict) and isinstance(change.get("path"), str)
     ]
