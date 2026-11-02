@@ -4793,16 +4793,11 @@ def _codex_config_string(raw_value: str) -> str:
 def codex_mcp_tool_approval_overrides(
     terminal_launch_args: Sequence[str] | None,
 ) -> list[str]:
-    """Carry explicit Omnigent MCP tool approvals into the app-server config.
+    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
 
-    A session's persisted ``terminal_launch_args`` can pre-approve specific
-    Omnigent tools (for example ``sys_session_send``) through Codex's
-    ``mcp_servers.omnigent.tools.<tool>.approval_mode`` config keys. The TUI
-    honors those keys, but the app-server that runs web-chat turns only sees
-    ``extra_config_overrides``, so without this bridge an orchestrated session
-    stops on a redundant approval prompt. Only explicit Omnigent ``sys_*``
-    tool assignments with a recognized mode are propagated; arbitrary MCP
-    servers and the global approval policy are untouched.
+    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
+    also reach the app-server that runs web-chat turns. Other MCP servers,
+    config keys, and the global approval policy are left untouched.
 
     :param terminal_launch_args: Persisted Codex launch arguments.
     :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
@@ -4829,10 +4824,9 @@ def codex_mcp_tool_approval_overrides(
             if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
                 modes[key] = _codex_config_string(raw_value)
         index += 1
+    # Only explicit grants and prompts are carried; Codex rejects "deny" at startup.
     return [
-        f"{key}={json.dumps(mode)}"
-        for key, mode in modes.items()
-        if mode in {"approve", "prompt", "deny"}
+        f"{key}={json.dumps(mode)}" for key, mode in modes.items() if mode in {"approve", "prompt"}
     ]
 
 

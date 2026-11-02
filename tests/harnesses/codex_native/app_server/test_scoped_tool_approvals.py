@@ -26,7 +26,7 @@ def test_carries_explicit_omnigent_tool_approvals(args: list[str]) -> None:
 
 
 def test_carries_only_recognized_omnigent_sys_tool_approvals() -> None:
-    """Arbitrary MCP servers, non-sys tools, and unknown modes are ignored."""
+    """Other MCP servers, non-sys tools, and modes Codex rejects are ignored."""
     args = [
         "-c",
         'mcp_servers.omnigent.tools.sys_read_inbox.approval_mode="approve"',
@@ -45,7 +45,6 @@ def test_carries_only_recognized_omnigent_sys_tool_approvals() -> None:
     ]
     assert codex_mcp_tool_approval_overrides(args) == [
         'mcp_servers.omnigent.tools.sys_read_inbox.approval_mode="approve"',
-        'mcp_servers.omnigent.tools.sys_os_shell.approval_mode="deny"',
     ]
 
 
@@ -54,6 +53,7 @@ def test_carries_only_recognized_omnigent_sys_tool_approvals() -> None:
     [
         (['"approve"', '"auto"'], []),
         (['"approve"', '"invented"'], []),
+        (['"approve"', '"deny"'], []),
         (['"prompt"', '"approve"'], [f'{_TOOL}="approve"']),
         (['"approve"', '"prompt"'], [f'{_TOOL}="prompt"']),
     ],
@@ -91,7 +91,7 @@ def test_no_implicit_approvals_when_args_are_empty_or_truncated() -> None:
 def test_build_carries_launch_approvals_into_the_app_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The app-server config receives the same explicit approvals as the TUI."""
+    """Launch approvals reach the app-server after generated MCP overrides."""
     monkeypatch.setattr(codex_native_app_server, "_find_codex_cli", lambda: sys.executable)
     server = codex_native_app_server.build_codex_native_server(
         socket_path=tmp_path / "codex.sock",
@@ -102,6 +102,11 @@ def test_build_carries_launch_approvals_into_the_app_server(
         bridge_dir=tmp_path / "bridge",
         ap_server_url=None,
         ap_auth_headers={},
+        extra_config_overrides=['mcp_servers.omnigent.command="python"', f'{_TOOL}="prompt"'],
         terminal_launch_args=["-c", f'{_TOOL}="approve"'],
     )
-    assert f'{_TOOL}="approve"' in server.config_overrides
+    assert server.config_overrides == [
+        'mcp_servers.omnigent.command="python"',
+        f'{_TOOL}="prompt"',
+        f'{_TOOL}="approve"',
+    ]
