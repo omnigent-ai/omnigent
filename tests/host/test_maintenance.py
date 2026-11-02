@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.host.maintenance import HostMaintenanceJanitor
+from omnigent.host.maintenance import HostMaintenanceJanitor, prune_stale_process_logs
 
 
 def test_host_janitor_covers_global_runner_cleanup() -> None:
@@ -19,10 +19,53 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
         "codex_process_registry",
         "terminal_orphans",
         "native_bridge_orphans",
+        "process_log_retention",
     ]
     assert janitor._stage_skip_reasons == {
         "native_bridge_orphans": frozenset({"runner_superseded"})
     }
+
+
+def test_prune_stale_process_logs_removes_only_idle_unheld_matches(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    day = 24 * 3600.0
+    log_dir = tmp_path / "runner"
+    log_dir.mkdir()
+
+    def make(name: str, age_days: float) -> Path:
+        path = log_dir / name
+        path.write_text("log\n", encoding="utf-8")
+        os.utime(path, (now - age_days * day, now - age_days * day))
+        return path
+
+    stale = make("runner-conv_a-20260101-000000-000000.log", 30)
+    recent = make("runner-conv_b-20260920-000000-000000.log", 2)
+    foreign = make("host-conv_c-20260101-000000-000000.log", 30)
+    target = make("runner-conv_target.log", 1)
+    held_path = make("runner-conv_held-20260101-000000-000000.log", 30)
+    link = log_dir / "runner-conv_link-20260101-000000-000000.log"
+    link.symlink_to(stale)
+    os.utime(link, (now - 30 * day, now - 30 * day), follow_symlinks=False)
+
+    with held_path.open("rb"):
+        removed = prune_stale_process_logs(log_dir, "runner-*.log", max_age_s=14 * day, now=now)
+
+    assert removed == 1
+    assert not stale.exists()
+    assert recent.exists()
+    assert foreign.exists()
+    assert target.exists()
+    assert held_path.exists(), "a log a live runner still holds open must survive"
+    assert link.is_symlink()
+
+    with held_path.open("rb"):
+        removed_host = prune_stale_process_logs(log_dir, "host-*.log", max_age_s=14 * day, now=now)
+    assert removed_host == 1
+    assert not foreign.exists()
+
+
+def test_prune_stale_process_logs_handles_missing_directory(tmp_path: Path) -> None:
+    assert prune_stale_process_logs(tmp_path / "absent", "runner-*.log") == 0
 
 
 async def test_start_runs_stages_in_background_and_in_order(tmp_path: Path) -> None:
