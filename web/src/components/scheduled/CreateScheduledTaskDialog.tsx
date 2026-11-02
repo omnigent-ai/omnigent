@@ -121,22 +121,9 @@ export function CreateScheduledTaskDialog({
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
 
-  // ── Agent / harness picker (shared with NewChatDialog) ─────────────────────
-  // The picker's "Harnesses" (Claude Code / Codex / Pi …) and "Agents"
-  // (Polly / Debby / custom) rows are all real AvailableAgents with ids, so a
-  // single `pickedAgentId` covers both cases — for a bare-harness pick it's the
-  // `*-native-ui` agent's id, exactly what the interactive dialog sends.
-  //
-  // Scheduled tasks create sessions from the selected agent. Model + effort are
-  // offered for native coding agents that support them (see `showModelEffort`
-  // below), reusing lightweight scheduled-local pickers rather than the
-  // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
-  // cost-control / per-turn model loading — disproportionate for a saved task).
-  // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
-  // are omitted so the fire path uses the agent's configured defaults. Permission
-  // mode is offered for native coding agents that support it (Claude Code).
-  // It is a session launch setting, so the whole launch vocabulary is valid —
-  // including the launch-only `dontAsk` / `bypassPermissions`.
+  // Harnesses and custom agents both use agent IDs in the shared picker.
+  // Empty launch settings use the agent's defaults when creating a session.
+  // Permission mode also accepts launch-only `dontAsk` / `bypassPermissions`.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(true);
   const [pickedModel, setPickedModel] = useState<string>("");
@@ -261,15 +248,16 @@ export function CreateScheduledTaskDialog({
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
-  // Changing the agent, host, workspace, or execution target clears the session binding.
+  // Agent, host, and execution-target changes clear the binding. Workspace-only
+  // edits stay locked: the server may resolve a symlink to the same directory.
   const reusesExistingSession =
     sessionMode === "continue" &&
-    editingTask?.sessionId != null &&
+    editingTask !== null &&
+    editingTask.sessionId !== null &&
     !startNewSession &&
     !agentChanged &&
     executionTarget === editingTask.executionTarget &&
-    (hostId === "" || hostId === editingTask.hostId) &&
-    (workspace.trim() === "" || workspace.trim() === editingTask.workspace);
+    (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
