@@ -56,7 +56,10 @@ class _RecordingStore:
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
 
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def set_session_live_status(
+        self, conversation_id: str, status: str, *, observed_at: int | None = None
+    ) -> None:
+        del observed_at
         self.status_writes.append((conversation_id, status))
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
@@ -202,8 +205,8 @@ def test_write_runs_in_callers_workspace_scope(recording_store: _RecordingStore)
 
     seen: list[int] = []
 
-    def _record_ws(conversation_id: str, status: str) -> None:
-        del conversation_id, status
+    def _record_ws(conversation_id: str, status: str, *, observed_at: int | None = None) -> None:
+        del conversation_id, status, observed_at
         seen.append(current_workspace_id())
 
     recording_store.set_session_live_status = _record_ws  # type: ignore[method-assign]
@@ -231,11 +234,13 @@ def test_dropped_write_evicts_dedupe_entry_for_retry() -> None:
     calls: list[tuple[str, str]] = []
 
     class _FlakyStore(_RecordingStore):
-        def set_session_live_status(self, conversation_id: str, status: str) -> None:
+        def set_session_live_status(
+            self, conversation_id: str, status: str, *, observed_at: int | None = None
+        ) -> None:
             calls.append((conversation_id, status))
             if len(calls) == 1:
                 raise RuntimeError("boom")  # first attempt fails
-            super().set_session_live_status(conversation_id, status)
+            super().set_session_live_status(conversation_id, status, observed_at=observed_at)
 
     store = _FlakyStore()
     session_live_state.configure(store)  # type: ignore[arg-type]
