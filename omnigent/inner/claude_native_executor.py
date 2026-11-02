@@ -87,6 +87,14 @@ _HOST_DISK_FULL_MESSAGE = (
     "The host's disk is full, so Claude Code can't save this conversation and the "
     "message was not sent."
 )
+_INACTIVE_SESSION_MESSAGE = (
+    "Claude native session is no longer active after /clear; "
+    "open the latest conversation and retry."
+)
+
+
+class _ClaudeSessionInactive(RuntimeError):
+    """The shared Claude pane belongs to a different conversation."""
 
 
 class ClaudeNativeExecutor(Executor):
@@ -178,6 +186,7 @@ class ClaudeNativeExecutor(Executor):
     ) -> None:
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
+            self._check_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
             if wanted_model_arg is not None:
@@ -246,6 +255,7 @@ class ClaudeNativeExecutor(Executor):
         next_repaint = loop.time()
         while loop.time() < deadline:
             await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+            self._check_active_session()
             repaint = loop.time() >= next_repaint
             if repaint:
                 next_repaint = loop.time() + _INPUT_BOX_REPAINT_INTERVAL_S
@@ -258,6 +268,11 @@ class ClaudeNativeExecutor(Executor):
             if clear:
                 return True
         return False
+
+    def _check_active_session(self) -> None:
+        """Reject old work after a wait or before changing the shared pane."""
+        if not _session_is_active(self._bridge_dir, self._request_session_id):
+            raise _ClaudeSessionInactive(_INACTIVE_SESSION_MESSAGE)
 
     async def _wait_for_answer(self, deadline: float) -> bool:
         """
@@ -278,6 +293,7 @@ class ClaudeNativeExecutor(Executor):
         )
         while loop.time() < deadline:
             await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+            self._check_active_session()
             try:
                 pending = await asyncio.to_thread(has_pending_user_prompt, self._bridge_dir)
             except (OSError, RuntimeError):
@@ -288,6 +304,7 @@ class ClaudeNativeExecutor(Executor):
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
+        self._check_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
@@ -336,16 +353,16 @@ class ClaudeNativeExecutor(Executor):
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             yield ExecutorError(
-                message=(
-                    "Claude native session is no longer active after /clear; "
-                    "open the latest conversation and retry."
-                )
+                message=_INACTIVE_SESSION_MESSAGE,
+                undelivered=True,
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)
         if not text:
-            yield ExecutorError(message="Claude native turn had no user text to send")
+            yield ExecutorError(
+                message="Claude native turn had no user text to send", undelivered=True
+            )
             return
         if is_auth_slash_command(text):
             # Claude Code's sign-in is an interactive TUI handoff the bridge
@@ -410,6 +427,9 @@ class ClaudeNativeExecutor(Executor):
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
+        except _ClaudeSessionInactive as exc:
+            yield ExecutorError(message=str(exc), undelivered=True)
+            return
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that

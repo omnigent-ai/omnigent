@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -389,6 +390,39 @@ def test_resolve_removes_entry_idempotently() -> None:
     # Idempotent — resolving an already-removed id does nothing and returns None.
     assert pending_inputs.resolve("conv_a", drop) is None
     assert [e["pending_id"] for e in pending_inputs.snapshot_for("conv_a")] == [keep]
+
+
+@pytest.mark.parametrize("with_client_id", [False, True])
+def test_resolve_does_not_consume_a_newer_delivery_attempt(with_client_id: bool) -> None:
+    stable_id = "a" * 32 if with_client_id else None
+    pending_id = pending_inputs.record("conv_a", [_text_block("retry")], stable_id=stable_id)
+    first = pending_inputs.delivery_attributes_for("conv_a", pending_id)
+    drained = pending_inputs.resolve("conv_a", pending_id)
+    assert drained is not None
+    if with_client_id:
+        assert (
+            pending_inputs.record("conv_a", [_text_block("retry")], stable_id=stable_id)
+            == pending_id
+        )
+    else:
+        pending_inputs.restore("conv_a", replace(drained, delivery_attempt_id="b" * 32))
+    retry = pending_inputs.delivery_attributes_for("conv_a", pending_id)
+    assert retry["delivery_attempt_id"] != first["delivery_attempt_id"]
+
+    assert (
+        pending_inputs.resolve(
+            "conv_a", pending_id, delivery_attempt_id=str(first["delivery_attempt_id"])
+        )
+        is None
+    )
+    assert pending_inputs.delivery_attributes_for("conv_a", pending_id) == retry
+    assert (
+        pending_inputs.resolve(
+            "conv_a", pending_id, delivery_attempt_id=str(retry["delivery_attempt_id"])
+        )
+        is not None
+    )
+    assert pending_inputs.snapshot_for("conv_a") == []
 
 
 def test_entries_are_scoped_per_conversation() -> None:

@@ -67,7 +67,12 @@ from omnigent.harnesses.pi_native.bridge import (
 from omnigent.harnesses.qwen_native.bridge import (
     bridge_dir_for_session_id as qwen_bridge_dir,
 )
-from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
+from omnigent.inner.native_attachments import (
+    attachment_cache_dir,
+    materialize_attachment,
+    materialize_text,
+    pasted_text_cache_dir,
+)
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import _runner_client
@@ -125,12 +130,15 @@ async def test_delete_session_removes_native_bridge_dir(
         bridge_dir,
     )
     assert cached is not None
+    pasted = materialize_text("a cached paste", bridge_dir)
+    assert pasted is not None
 
     resp = await client.delete(f"/v1/sessions/{session_id}")
     assert resp.status_code == 200
 
     assert not bridge_dir.exists(), "bridge dir (with token) must be deleted"
     assert not cached.exists()
+    assert not pasted.exists()
 
 
 @pytest.mark.parametrize("family", sorted(BRIDGE_DIR_RESOLVERS))
@@ -163,6 +171,8 @@ async def test_cleanup_resources_removes_native_bridge_dir(
         bridge_dir,
     )
     assert cached is not None
+    pasted = materialize_text("a cached paste", bridge_dir)
+    assert pasted is not None
 
     resp = await client.delete(f"/v1/sessions/{session_id}/resources")
     assert resp.status_code == 200
@@ -171,6 +181,7 @@ async def test_cleanup_resources_removes_native_bridge_dir(
         f"{family} bridge dir must be deleted on the real /resources path"
     )
     assert not attachment_cache_dir(bridge_dir).exists()
+    assert not pasted_text_cache_dir(bridge_dir).exists()
 
 
 # ── #3728: spec-fill generation guard ───────────────────────────────────────
