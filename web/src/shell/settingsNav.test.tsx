@@ -135,6 +135,16 @@ describe("settingsNavGroups", () => {
     ]);
   });
 
+  it("shows Notifications only in the macOS desktop navigation", () => {
+    const ids = (desktop: boolean, mac: boolean) =>
+      settingsNavGroups(false, desktop, false, false, false, false, false, mac).flatMap((group) =>
+        group.items.map((item) => item.id),
+      );
+    expect(ids(true, true)).toContain("notifications");
+    expect(ids(true, false)).not.toContain("notifications");
+    expect(ids(false, false)).not.toContain("notifications");
+  });
+
   it("includes the Admin group (Members / Policies / Sharing) for any admin, in accounts OR OIDC mode", () => {
     const ids = (accountsEnabled: boolean, isAdmin: boolean) =>
       settingsNavGroups(accountsEnabled, false, isAdmin)
