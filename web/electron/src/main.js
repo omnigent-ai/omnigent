@@ -56,12 +56,13 @@ const {
   normalizeSavedServerUrl,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
+  isLoopbackServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
   sanitizeServerName,
 } = require("./url");
-const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
+const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
 const {
   parseServerLabels,
   serverLabel,
@@ -77,6 +78,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
+const { isHostThisMachine, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -121,6 +123,7 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
+
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
 
@@ -597,6 +600,10 @@ let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
 // `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
 let reconnectSlowDelayMs = 60_000;
+// A silent reconnect's IP access list refusals are usually the VPN still connecting
+// after wake or idle, so the overlay says the network is blocked only once they have
+// lasted this long. `let` so wiring tests can shrink it via testApi.setBlockedHintDelayMs.
+let blockedHintDelayMs = 30_000;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -939,12 +946,14 @@ const UNREACHABLE_NET_ERRORS = new Set([
   -137, // NAME_RESOLUTION_FAILED
 ]);
 
-// Pending silent reconnects behind the overlay:
-// win → { serverUrl, returnUrl, attempt, timer, hint, finalMessage, network }.
+// Pending silent reconnects behind the overlay: win → { serverUrl, returnUrl,
+// attempt, timer, hint, finalMessage, network, blocked, blockedHintAt, hintTimer }.
 const reconnects = new WeakMap();
 
 function cancelReconnect(win) {
-  clearTimeout(reconnects.get(win)?.timer);
+  const state = reconnects.get(win);
+  clearTimeout(state?.timer);
+  clearTimeout(state?.hintTimer);
   reconnects.delete(win);
   reconnectOverlay.hide(win);
 }
@@ -976,25 +985,39 @@ function stopReconnect(win) {
  * Arm the next silent reconnect for a transient failure and show the overlay;
  * false once the schedule runs out. `finalMessage` is what Cancel shows. A
  * `network` failure (unreachable, or blocked by the IP access list) never runs
- * out: past the fast schedule it retries every reconnectSlowDelayMs.
+ * out: past the fast schedule it retries every reconnectSlowDelayMs. A `blocked`
+ * failure's hint waits until the refusals have lasted blockedHintDelayMs, unless
+ * they started with an explicit Connect.
  */
-function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, network = false }) {
+function scheduleReconnect(
+  win,
+  serverUrl,
+  returnUrl,
+  { hint, finalMessage, network = false, blocked = false, interactive = false },
+) {
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
   clearTimeout(previous?.timer);
+  clearTimeout(previous?.hintTimer);
   const attempt = same ? previous.attempt : 0;
   const delayMs = reconnectDelaysMs[attempt] ?? (network ? reconnectSlowDelayMs : undefined);
   if (delayMs === undefined) return false;
+  const now = Date.now();
+  const previousHintAt = same ? previous.blockedHintAt : null;
+  const blockedHintAt = interactive ? now : (previousHintAt ?? now + blockedHintDelayMs);
   const state = {
     serverUrl,
     // Never logged: it can name a conversation.
     returnUrl: returnUrl ?? (same ? previous.returnUrl : undefined) ?? serverUrl,
     attempt: attempt + 1,
     timer: null,
+    hintTimer: null,
     hint,
     finalMessage,
     network,
+    blocked,
+    blockedHintAt: blocked ? blockedHintAt : null,
   };
   const origin = originOf(serverUrl);
   console.log("[omnigent] databricks auth: reconnect scheduled", {
@@ -1020,15 +1043,22 @@ function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, netw
   };
   state.timer = setTimeout(fire, delayMs);
   reconnects.set(win, state);
-  reconnectOverlay.show(win, hint);
+  const hintDelayMs = blocked ? state.blockedHintAt - now : 0;
+  reconnectOverlay.show(win, hintDelayMs > 0 ? "" : hint);
+  if (hintDelayMs > 0) {
+    state.hintTimer = setTimeout(() => {
+      if (reconnects.get(win) === state) reconnectOverlay.show(win, hint);
+    }, hintDelayMs);
+  }
   return true;
 }
 
 let restartsReconnectsOnWake = false;
 
 /**
- * Waking or unlocking the Mac starts pending reconnects' fast schedule over, so
- * a VPN that comes back after wake is picked up within seconds.
+ * Waking or unlocking the Mac starts pending reconnects' fast schedule (and the
+ * wait before a blocked-network hint) over, so a VPN that comes back after wake
+ * is picked up within seconds.
  */
 function restartReconnectsOnWake() {
   if (restartsReconnectsOnWake) return;
@@ -1042,6 +1072,7 @@ function restartReconnectsOnWake() {
         reason,
       });
       state.attempt = 0;
+      state.blockedHintAt = null;
       if (!scheduleReconnect(win, state.serverUrl, state.returnUrl, state)) stopReconnect(win);
     }
   };
@@ -1071,7 +1102,12 @@ function unreachableMessage(serverUrl, blocked = false) {
 
 const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
-function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
+function showDatabricksAuthRequired(
+  win,
+  failedUrl,
+  error,
+  { returnUrl: failedReturnUrl, interactive = false } = {},
+) {
   if (win.isDestroyed()) return;
   diagnostics.record("auth_required", {
     origin: originOf(failedUrl),
@@ -1117,6 +1153,8 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
       hint: unreachable ? reconnectingHint(serverUrl, blocked) : UNAVAILABLE_HINT,
       finalMessage: message,
       network: unreachable,
+      blocked,
+      interactive,
     });
   if (!retrying) showConnectFailure(win, serverUrl, message);
 }
@@ -2237,9 +2275,10 @@ async function loadServerUrl(
           } else {
             // The account URL's workspace was unreachable: reconnect to that workspace.
             const workspaceUrl = error.storedOrigin && databricksWorkspaceUiUrl(error.storedOrigin);
-            if (workspaceUrl) {
-              showDatabricksAuthRequired(win, workspaceUrl, error, { returnUrl: workspaceUrl });
-            } else showDatabricksAuthRequired(win, serverUrl, error, { returnUrl: target });
+            showDatabricksAuthRequired(win, workspaceUrl || serverUrl, error, {
+              returnUrl: workspaceUrl || target,
+              interactive,
+            });
           }
         }
         throw error;
@@ -2772,6 +2811,9 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  // The menu item opens the bar without a page keydown; the page must still
+  // render every transcript row for find to reach off-screen messages.
+  target.webContents.send("omnigent:find-opened");
   const existing = findBars.get(target);
   if (existing && !existing.isDestroyed()) {
     existing.focus();
@@ -2806,9 +2848,15 @@ function openFindBar(target) {
       matches: result.matches,
     });
   };
+  // Results belong to the searched conversation, so switching closes the bar.
+  const openedIn = findConversationId(target.webContents.getURL());
+  const onNavigate = (_event, url, isMainFrame) => {
+    if (isMainFrame && findConversationId(url) !== openedIn) bar.close();
+  };
   target.on("resize", reposition);
   target.on("move", reposition);
   target.webContents.on("found-in-page", onFound);
+  target.webContents.on("did-navigate-in-page", onNavigate);
 
   bar.once("ready-to-show", () => {
     reposition();
@@ -2820,12 +2868,18 @@ function openFindBar(target) {
     target.removeListener("resize", reposition);
     target.removeListener("move", reposition);
     target.webContents.removeListener("found-in-page", onFound);
+    target.webContents.removeListener("did-navigate-in-page", onNavigate);
     // Closing the parent (Cmd+W) destroys its webContents before this child's
     // "closed" fires, while the parent window itself is not yet destroyed.
     if (target.webContents.isDestroyed()) return;
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+/** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
+function findConversationId(url) {
+  return /\/c\/([^/]+)\/?$/.exec(URL.parse(url)?.pathname ?? "")?.[1] ?? null;
 }
 
 /**
@@ -3770,15 +3824,13 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 // the registry attribute each request to its view.
 const guardedAgentSessions = new WeakSet();
 
-/** Enforce the agent navigation policy on document requests at the network layer. */
+/** Enforce the agent network policy on documents, subresources, and workers. */
 function guardAgentPartitionRequests(partition, registry) {
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
-  // Documents only: frames plus <object>/<embed> content, which also renders.
   const filter = {
-    urls: ["http://*/*", "https://*/*"],
-    types: ["mainFrame", "subFrame", "object"],
+    urls: ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"],
   };
   const answer = (decision, callback) =>
     decision.then(
@@ -3786,13 +3838,13 @@ function guardAgentPartitionRequests(partition, registry) {
       () => callback({ cancel: true }),
     );
   ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
+    answer(registry.shouldCancelAgentRequest(details, partition), callback),
   );
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
+    callback(registry.agentRequestHeaders(details, partition)),
   );
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
+    answer(registry.shouldCancelAgentResponse(details, partition), callback),
   );
 }
 
@@ -3906,15 +3958,18 @@ function createBrowserRegistryForWindow(win) {
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
-    isArcaAgentContext: (context) => {
+    allowsLocalhost: (context) => {
+      if (context?.revoked || win.isDestroyed() || !pinnedOrigin(win)) return false;
       const target = windowArcaServerUrl(win);
-      return isArcaAgentContext(arcaIdentities.get(target), context, {
-        enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
-        managed:
-          isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
-          isDatabricksManagedServerUrl(target),
-        serverTarget: target,
-      });
+      return (
+        isArcaAgentContext(arcaIdentities.get(target), context, {
+          enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
+          managed:
+            isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
+            isDatabricksManagedServerUrl(target),
+          serverTarget: target,
+        }) || context?.hostIsThisMachine === true
+      );
     },
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
@@ -4900,6 +4955,14 @@ function registerIpc() {
     } catch (error) {
       return { ok: false, error: error.message };
     }
+    // On the remote machine, localhost is that machine, so this server is out of
+    // its reach; refuse before the install and sign-in rather than after.
+    if (isLoopbackServerUrl(serverUrl)) {
+      return {
+        ok: false,
+        error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
+      };
+    }
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
@@ -5052,10 +5115,21 @@ function registerIpc() {
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
-    getAgentContextForEvent: (event, sourceHostId) => ({
-      serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
-      sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
-    }),
+    getAgentContextForEvent: (event, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Main derives the server target and local-machine eligibility; the page only routes.
+      return {
+        serverTarget: arcaTarget(windowArcaServerUrl(win)),
+        sourceHostId,
+        hostIsThisMachine:
+          opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+          isHostThisMachine({
+            hostId: sourceHostId,
+            serverUrl: windows.get(win)?.serverUrl,
+          }),
+      };
+    },
     recoverAgentNavigationForEvent: async (
       event,
       url,
@@ -5265,7 +5339,7 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     title: "Omnigent",
     message: `Open this Omnigent link?`,
     detail:
-      `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
+      `This link will connect Omnigent to ${host}.\n\n` +
       `Only open links from a server you trust — once connected, it can show ` +
       `notifications and (when you allow it) manage this machine as a runner.`,
     buttons: ["Cancel", "Open"],
@@ -5345,7 +5419,7 @@ function drainPendingDeepLinks() {
  */
 async function handleDeepLink(raw) {
   const parsed = parseOmnigentDeepLink(raw);
-  if (!parsed) return;
+  if (!parsed || !(await acceptCliDeepLink(raw))) return;
 
   // The origin is fixed by the link itself — no network request needed for the
   // decision. expandDatabricksWorkspaceUrl only appends a mount path under this
