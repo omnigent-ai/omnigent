@@ -14,7 +14,10 @@ import httpx
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode, ErrorImpact
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_ATTEMPT_HEADER,
+    build_runner_session_init_payload,
+)
 from omnigent.update_check import _read_build_info
 
 if TYPE_CHECKING:
@@ -405,6 +408,7 @@ class RunnerSessionInitializer:
                     "/v1/sessions",
                     json=payload,
                     timeout=timeout,
+                    headers={SESSION_INIT_ATTEMPT_HEADER: init_attempt_id},
                     extensions={"runner_tunnel_generation": generation},
                 )
             except (httpx.TransportError, ConnectionError) as exc:

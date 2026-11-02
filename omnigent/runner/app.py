@@ -157,7 +157,12 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.runner.resource_routes import register_resource_routes
 from omnigent.runner.session_history import build_session_history
+from omnigent.runner.session_init_diagnostics import (
+    SessionInitDiagnostics,
+    session_init_exception_fields,
+)
 from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_ATTEMPT_HEADER,
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
@@ -2559,11 +2564,41 @@ def create_runner_app(
             title=" ".join(title.split()),
         )
 
-    async def _initialize_session(body: _JsonObject) -> JSONResponse:
-        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
-
+    async def _initialize_session(body: _JsonObject, init_attempt_id: str | None) -> JSONResponse:
         raw_id = body.get("session_id")
         set_current_session_id(raw_id if isinstance(raw_id, str) else None)
+        diagnostics = SessionInitDiagnostics()
+        started_at = time.monotonic()
+        try:
+            return await _initialize_session_impl(body, diagnostics)
+        except Exception as exc:
+            # Logging must preserve the original exception and HTTP handler behavior.
+            with contextlib.suppress(Exception):
+                _logger.error(
+                    "Runner session initialization raised an exception",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        failure_kind="exception",
+                        init_phase=diagnostics.phase,
+                        init_attempt_id=init_attempt_id
+                        if init_attempt_id is not None
+                        and re.fullmatch(r"[0-9a-f]{32}", init_attempt_id)
+                        else None,
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        **{
+                            key: str(value)
+                            for key, value in session_init_exception_fields(exc).items()
+                        },
+                    ),
+                )
+            raise
+
+    async def _initialize_session_impl(
+        body: _JsonObject, diagnostics: SessionInitDiagnostics
+    ) -> JSONResponse:
+        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+
         _logger.info(
             "Runner session initialization started",
             extra=debug_event("runner_session_init_started", stage="session_init"),
@@ -2618,6 +2653,7 @@ def create_runner_app(
         # memoizing writes at the end of init.
         spec_cache_generation = _session_cache_generation(session_id)
 
+        diagnostics.phase = "load_context"
         try:
             init_context = await _load_session_init_context(
                 body,
@@ -2673,6 +2709,7 @@ def create_runner_app(
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
+        diagnostics.phase = "resolve_spec"
         if spec_resolver is not None:
             try:
                 spec_entry = await spec_resolver(agent_id, session_id)
@@ -2723,6 +2760,7 @@ def create_runner_app(
 
             from omnigent.runner.policy import AgentStartPolicyError
 
+            diagnostics.phase = "agent_start_policy"
             try:
                 _start_data = await _evaluate_agent_start_gate(spec, harness_name)
             except AgentStartPolicyError as exc:
@@ -2750,6 +2788,7 @@ def create_runner_app(
             if _start_data is not None:
                 _apply_sandbox_override_from_start_data(spec, _start_data)
 
+            diagnostics.phase = "subagent_router"
             await _ensure_session_subagent_router(
                 session_id,
                 harness_name,
@@ -2763,11 +2802,13 @@ def create_runner_app(
             # fall back to a one-shot uncached GET. Both sources are read fresh
             # so a later /model switch can't reseed a stale model. Native
             # harnesses no-op (_build_spawn_env_from_spec guards on env=None).
+            diagnostics.phase = "model_override"
             _model_override = (
                 init_context.envelope.snapshot.model_override
                 if init_context.envelope is not None
                 else await _fetch_session_model_override(session_id)
             )
+            diagnostics.phase = "spawn_environment"
             try:
                 spawn_env = _build_spawn_env_from_spec(
                     spec,
@@ -2824,6 +2865,7 @@ def create_runner_app(
             harness_name = "runner-test-default"
             spawn_env = None
 
+        diagnostics.phase = "harness_spawn"
         try:
             await process_manager.get_client(
                 session_id,
@@ -2848,6 +2890,7 @@ def create_runner_app(
                 },
             )
 
+        diagnostics.phase = "session_state"
         _session_start_cache.setdefault(session_id, time.time())
         # Keep the binding and cached spec in the same generation; an older
         # initialization must not restore the superseded agent after a reset.
@@ -2890,6 +2933,7 @@ def create_runner_app(
 
         terminal_ready: bool | None = None
 
+        diagnostics.phase = "native_terminal"
         _native_agent = native_coding_agent_for_harness(harness_name)
         if _native_agent is not None:
             # Each native harness contributes only its launch parameters here;
@@ -3147,6 +3191,7 @@ def create_runner_app(
                 _relay_task.add_done_callback(_background_tasks.discard)
                 _background_tasks.add(_relay_task)
 
+        diagnostics.phase = "repl_terminal"
         if (
             spec is not None
             and not is_native_harness(harness_name)
@@ -3185,6 +3230,7 @@ def create_runner_app(
         # Preserve the initialization contract: undrained child results are
         # recovered before POST /sessions returns. The scan no longer delays
         # native terminal registration because it ran concurrently above.
+        diagnostics.phase = "subagent_recovery"
         await asyncio.shield(_subagent_recovery_task)
 
         # Crash recovery (Step 8.5 Scenario A): if the session
@@ -3214,6 +3260,7 @@ def create_runner_app(
             and not _suppress_recovery
             else None
         )
+        diagnostics.phase = "load_history"
         history: list[_JsonObject]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
@@ -3225,6 +3272,7 @@ def create_runner_app(
         # active-turn check starts the turn itself; a recovery turn started now
         # would be a second turn-start, which the harness answers with a 204
         # injection that surfaces as "turn failed (status 204)".
+        diagnostics.phase = "recovery_turn"
         forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
             session_id, 0
         )
@@ -3312,6 +3360,7 @@ def create_runner_app(
                 _background_tasks.add(recovery_task)
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
+        diagnostics.phase = "response"
         status = "running" if session_id in _active_turns else "idle"
         # The recovery decision and its inputs, so a turn that restarted after a
         # reconnect can be attributed to the history heuristic, the server's
@@ -3369,6 +3418,7 @@ def create_runner_app(
     @app.post("/v1/sessions")
     async def create_session(request: Request) -> JSONResponse:
         body = await request.json()
+        init_attempt_id = request.headers.get(SESSION_INIT_ATTEMPT_HEADER)
         if not isinstance(body, dict):
             return JSONResponse(
                 status_code=400,
@@ -3380,12 +3430,12 @@ def create_runner_app(
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
-            return await _initialize_session(body)
+            return await _initialize_session(body, init_attempt_id)
         sub_agent_name = body.get("sub_agent_name")
         try:
             envelope = parse_runner_session_init_envelope(body)
         except ValueError:
-            return await _initialize_session(body)
+            return await _initialize_session(body, init_attempt_id)
         key = (
             session_id,
             agent_id,
@@ -3395,7 +3445,7 @@ def create_runner_app(
         task = _session_init_tasks.get(key)
         if task is None:
             task = asyncio.create_task(
-                _initialize_session(body),
+                _initialize_session(body, init_attempt_id),
                 name=f"session-init-{session_id}",
             )
             _session_init_tasks[key] = task

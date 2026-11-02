@@ -12,6 +12,7 @@ from omnigent.entities import Conversation
 SessionInitProtocolVersion: TypeAlias = Literal[2]
 SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
 SESSION_INIT_PAYLOAD_KEY = "session_init"
+SESSION_INIT_ATTEMPT_HEADER = "x-omnigent-session-init-attempt-id"
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
