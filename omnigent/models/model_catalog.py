@@ -1597,7 +1597,7 @@ def _claude_probe_runs_sdk_cli() -> bool:
 
 
 def _codex_login_probe_listing(spec: object) -> ModelListing | None:
-    """Replay the Codex probe catalog for the SDK worker's own-login launch.
+    """Replay the Codex probe catalog for the SDK worker's effective CLI launch.
 
     The child's route, pinned provider and binary come from the spawn env its
     launch sets over this process's environment, read the way the codex wrap reads
@@ -1611,6 +1611,7 @@ def _codex_login_probe_listing(spec: object) -> ModelListing | None:
     from omnigent.harnesses.codex_native.app_server import (
         NativeCodexLaunch,
         _ambient_builtin_codex_provider,
+        _ambient_custom_codex_launch,
         _codex_home_config_source_from_env,
         _codex_login_usable,
         codex_catalog_fingerprint,
@@ -1649,10 +1650,13 @@ def _codex_login_probe_listing(spec: object) -> ModelListing | None:
     if pinned:
         overrides = [f"model_provider={json.dumps(pinned)}"]
     else:
-        # The native probe pins the built-in provider config.toml selects; the child
-        # runs that same provider from config.toml, so read the pinned catalog.
+        # Match the native probe's provider pin after verifying the child's auth.
         builtin = _ambient_builtin_codex_provider(None)
-        overrides = [f"model_provider={json.dumps(builtin)}"] if builtin else []
+        if builtin:
+            overrides = [f"model_provider={json.dumps(builtin)}"]
+        else:
+            custom = _ambient_custom_codex_launch(())
+            overrides = custom.config_overrides if custom is not None else []
     launch = NativeCodexLaunch(config_overrides=overrides, model=None, profile=None)
     # The wrap finds its binary the same way: the spawn env's path, else the env's.
     codex_path = spawn_env.get(_harness_path_env_var("codex")) or resolve_harness_path("codex")

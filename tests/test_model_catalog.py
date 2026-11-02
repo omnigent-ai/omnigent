@@ -1676,6 +1676,13 @@ _ENV_KEY_CODEX_TOML = (
     'base_url = "https://custom.example/v1"\nenv_key = "CUSTOM_CODEX_TOKEN"\n'
 )
 
+_ENV_KEY_PROFILE_CODEX_TOML = (
+    _ENV_KEY_CODEX_TOML.replace(
+        'model_provider = "custom"', 'model_provider = "openai"\nprofile = "worker"'
+    )
+    + '\n[profiles.worker]\nmodel_provider = "custom"\n'
+)
+
 
 @pytest.mark.parametrize(
     ("provider_config", "config_toml", "passthrough", "listed"),
@@ -1685,6 +1692,35 @@ _ENV_KEY_CODEX_TOML = (
         pytest.param("{}", 'model_provider = "ollama"\n', False, True, id="self-auth-toml"),
         pytest.param("{}", _ENV_KEY_CODEX_TOML, False, False, id="env-key-filtered"),
         pytest.param("{}", _ENV_KEY_CODEX_TOML, True, True, id="env-key-passed-through"),
+        pytest.param(
+            "{}",
+            _ENV_KEY_CODEX_TOML.replace(
+                'env_key = "CUSTOM_CODEX_TOKEN"', 'experimental_bearer_token = "test-token"'
+            ),
+            False,
+            True,
+            id="self-auth-custom-toml",
+        ),
+        pytest.param(
+            "{}", _ENV_KEY_PROFILE_CODEX_TOML, False, False, id="profile-env-key-filtered"
+        ),
+        pytest.param(
+            "{}", _ENV_KEY_PROFILE_CODEX_TOML, True, True, id="profile-env-key-passed-through"
+        ),
+        pytest.param(
+            "{}",
+            _ENV_KEY_CODEX_TOML + "requires_openai_auth = true\n",
+            True,
+            False,
+            id="custom-requires-login",
+        ),
+        pytest.param(
+            _CODEX_SUBSCRIPTION_CONFIG,
+            _ENV_KEY_CODEX_TOML,
+            True,
+            False,
+            id="subscription-keeps-login",
+        ),
     ],
 )
 def test_codex_login_catalog_requires_a_usable_child_launch(
@@ -1719,6 +1755,15 @@ def test_codex_login_catalog_requires_a_usable_child_launch(
             app_server.codex_catalog_fingerprint(launch),
             [{"id": model_id} for model_id in _CLI_LOGIN_CODEX_IDS],
         )
+        # Another route's cached catalog must not satisfy this child launch.
+        decoy = app_server.NativeCodexLaunch(
+            config_overrides=[] if launch.config_overrides else [_OPENAI_PIN],
+            model=None,
+            profile=None,
+        )
+        model_catalog_store.write_catalog(
+            "codex-native", app_server.codex_catalog_fingerprint(decoy), [{"id": "gpt-decoy"}]
+        )
     spec = AgentSpec(
         spec_version=1,
         name="worker",
@@ -1733,6 +1778,9 @@ def test_codex_login_catalog_requires_a_usable_child_launch(
     row = catalog_for_spec(spec)["self"]
 
     assert [model["id"] for model in row["models"]] == (_CLI_LOGIN_CODEX_IDS if listed else [])
+    if listed:
+        assert row["source"] == "cli"
+        assert row["verified"] is True
 
 
 @pytest.mark.parametrize(
