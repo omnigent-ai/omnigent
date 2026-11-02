@@ -21,6 +21,7 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.git_providers import provider_display
 from omnigent.server.schemas import SessionPullRequest, SessionPullRequestList
 from omnigent.stores.session_pull_request_store import (
@@ -277,7 +278,9 @@ class PullRequestRefresher:
     unless a client read already covered the turn, and a turn that ends during
     a refresh gets one more. Listed sessions are refreshed at most once per
     :data:`FRESHNESS_S` each. Jobs run in a copy of the scheduling context, so
-    workspace scoping holds, and at most ``concurrency`` run at once.
+    workspace scoping holds, and at most ``concurrency`` run at once. Sessions
+    are tracked by workspace and id, since session ids are unique only within
+    a workspace.
     """
 
     def __init__(self, *, concurrency: int = 4, turn_end_delay_s: float = 5.0) -> None:
@@ -289,10 +292,10 @@ class PullRequestRefresher:
         self._semaphore = asyncio.Semaphore(concurrency)
         self._delay_s = turn_end_delay_s
         # Sessions with a turn no read has covered yet, by when that turn ended.
-        self._turn_ended: dict[str, float] = {}
+        self._turn_ended: dict[tuple[int, str], float] = {}
         # When each listed session was last refreshed, on the monotonic clock.
-        self._attempted: dict[str, float] = {}
-        self._running: dict[str, asyncio.Task[None]] = {}
+        self._attempted: dict[tuple[int, str], float] = {}
+        self._running: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._closed = False
 
     def bind(self, refresh: Callable[[str], Awaitable[None]]) -> None:
@@ -306,49 +309,53 @@ class PullRequestRefresher:
         """Refresh after a turn ends; a no-op outside an event loop."""
         if self._refresh is None or self._closed:
             return
-        self._turn_ended[session_id] = time.time()
-        self._start(session_id, refresh_now=False)
+        key = (current_workspace_id(), session_id)
+        self._turn_ended[key] = time.time()
+        self._start(key, refresh_now=False)
 
     def note_read(self, session_id: str, requested_at: float) -> None:
         """Mark a session's ended turn as covered by a read sent after it ended."""
-        ended = self._turn_ended.get(session_id)
+        key = (current_workspace_id(), session_id)
+        ended = self._turn_ended.get(key)
         if ended is not None and requested_at >= ended:
-            del self._turn_ended[session_id]
+            del self._turn_ended[key]
 
     def request(self, session_id: str) -> None:
         """Refresh a listed session that needs it, at most once per :data:`FRESHNESS_S`."""
-        if self._refresh is None or self._closed or session_id in self._running:
+        key = (current_workspace_id(), session_id)
+        if self._refresh is None or self._closed or key in self._running:
             return
         now = time.monotonic()
-        last = self._attempted.get(session_id)
+        last = self._attempted.get(key)
         if last is not None and now - last < FRESHNESS_S:
             return
         if len(self._attempted) >= _ATTEMPTS_MAX:
             self._attempted = {
                 key: value for key, value in self._attempted.items() if now - value < FRESHNESS_S
             }
-        self._attempted[session_id] = now
-        self._start(session_id, refresh_now=True)
+        self._attempted[key] = now
+        self._start(key, refresh_now=True)
 
-    def _start(self, session_id: str, *, refresh_now: bool) -> None:
-        if session_id in self._running:
+    def _start(self, key: tuple[int, str], *, refresh_now: bool) -> None:
+        if key in self._running:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._running[session_id] = loop.create_task(self._run(session_id, refresh_now))
+        self._running[key] = loop.create_task(self._run(key, refresh_now))
 
-    async def _run(self, session_id: str, refresh_now: bool) -> None:
+    async def _run(self, key: tuple[int, str], refresh_now: bool) -> None:
+        session_id = key[1]
         try:
             if refresh_now:
                 await self._refresh_once(session_id)
-            while session_id in self._turn_ended:
+            while key in self._turn_ended:
                 await asyncio.sleep(self._delay_s)
-                if self._turn_ended.pop(session_id, None) is not None:
+                if self._turn_ended.pop(key, None) is not None:
                     await self._refresh_once(session_id)
         finally:
-            self._running.pop(session_id, None)
+            self._running.pop(key, None)
 
     async def _refresh_once(self, session_id: str) -> None:
         assert self._refresh is not None
