@@ -1860,7 +1860,11 @@ class TestPiExecutorConstructor(unittest.TestCase):
             _run(executor._get_gateway_token())
 
         read_cfg.assert_not_called()
-        fetch_command_token.assert_awaited_once_with("printf token")
+        from omnigent.inner.pi_executor import _GATEWAY_AUTH_TIMEOUT_S
+
+        fetch_command_token.assert_awaited_once_with(
+            "printf token", timeout_s=_GATEWAY_AUTH_TIMEOUT_S
+        )
         self.assertEqual(executor._databricks_host, "https://example.databricks.com")
         self.assertEqual(executor._databricks_token, "command-token")
         self.assertEqual(
@@ -2266,7 +2270,7 @@ async def test_gateway_refresh_reuses_process_and_fails_closed(
     monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
     current_token = "initial-token"
 
-    async def fetch_token(_):
+    async def fetch_token(_, **_kwargs):
         return current_token
 
     monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch_token)
@@ -2395,6 +2399,26 @@ async def test_gateway_helper_failure_is_bounded_and_redacted(monkeypatch, comma
     assert "secret" not in str(failure.value)
 
 
+async def test_gateway_refresh_before_turn_outlasts_the_bridge_deadline(monkeypatch):
+    # A helper slower than Pi's bridge budget (a host busy starting other agents)
+    # must not fail the turn: the refresh before Pi starts has no Pi deadline.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="sleep 0.5; printf slow-token",
+        gateway_auth_refresh_interval_ms="0",
+    )
+    with pytest.raises(OSError, match="timed out"):
+        await executor._get_gateway_token()
+    assert await executor._get_gateway_token(before_turn=True) == "slow-token"
+
+
 async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
     pid_file = tmp_path / "helper pid"
     executor = PiExecutor(
@@ -2446,7 +2470,8 @@ async def test_gateway_profile_timeout_does_not_publish_a_late_result(monkeypatc
         return DatabricksCredentials(host="https://example.test", token="late-token")
 
     monkeypatch.setattr(pi_executor, "_read_databrickscfg", resolve)
-    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 0.05)
+    # run_turn refreshes with the before-turn budget (this + 1s), still short of resolve's 2s.
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 0.05)
     executor = PiExecutor(pi_path="/usr/bin/pi", gateway=True, model="mock-model")
     try:
         events = [e async for e in executor.run_turn([], [], "")]

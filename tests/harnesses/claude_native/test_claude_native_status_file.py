@@ -25,6 +25,7 @@ from omnigent.harnesses.claude_native.status_file import (
     read_session_status,
     resolve_status_file,
     session_has_live_process,
+    session_pids,
     sessions_dir,
 )
 
@@ -195,8 +196,11 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     assert published == [RUNNING, IDLE]
 
 
-def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:
-    """A forwarded idle edge cannot be lost to a concurrent file poll."""
+@pytest.mark.parametrize("transition", ["resync", "retire"])
+def test_lifecycle_change_during_tick_survives_the_in_flight_read(
+    tmp_path: Path, monkeypatch, transition: str
+) -> None:
+    """Reconnect survives an in-flight read; retirement prevents its publication."""
     path = _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
@@ -208,7 +212,13 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     poller.tick()
     assert published == [RUNNING]
 
-    _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
+    _write_session_file(
+        tmp_path / "sessions",
+        pid=1,
+        session_id="s",
+        status="waiting" if transition == "retire" else "busy",
+        blocked_on="input needed" if transition == "retire" else None,
+    )
     old_mtime = path.stat().st_mtime
     os.utime(path, (old_mtime + 2, old_mtime + 2))
     entered = threading.Event()
@@ -227,12 +237,19 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     worker.start()
     try:
         assert entered.wait(5), "poller did not reach the file read"
-        poller.resync()
+        getattr(poller, transition)()
     finally:
         release.set()
         worker.join(timeout=5)
     assert not worker.is_alive()
     assert published == [RUNNING]
+    if transition == "retire":
+        poller.resync()
+        poller.tick()
+        assert poller.active is False
+        assert poller.blocked_on is None
+        assert published == [RUNNING]
+        return
     poller.tick()
     assert published == [RUNNING, RUNNING]
     poller.tick()
@@ -377,6 +394,7 @@ def test_retire_stops_the_file_owning_status(tmp_path: Path) -> None:
 
     poller.retire()
     assert poller.active is False
+    assert poller.blocked_on is None
 
     # The file is still there and still readable; a retired poller reads it no
     # more, so its stale value cannot keep owning the session's status.
@@ -613,6 +631,19 @@ def test_session_has_live_process_counts_interactive_holders(tmp_path: Path) -> 
     assert session_has_live_process("SID-1", config_dir=tmp_path) is True
     assert session_has_live_process("sid-2", config_dir=tmp_path) is False
     assert session_has_live_process("sid-3", config_dir=tmp_path) is False
+
+
+def test_session_pids_names_the_live_processes_holding_a_session(tmp_path: Path) -> None:
+    """Every live record naming the session counts; dead and other sessions don't."""
+    sessions = tmp_path / "sessions"
+    _write_registry_record(
+        sessions, str(os.getppid()), {"sessionId": "sid-1", "kind": "interactive"}
+    )
+    _write_registry_record(sessions, "999999999", {"sessionId": "sid-1", "kind": "interactive"})
+    _write_registry_record(sessions, "1", {"sessionId": "sid-2", "kind": "interactive"})
+
+    assert session_pids("SID-1", config_dir=tmp_path) == [os.getppid()]
+    assert session_pids("sid-3", config_dir=tmp_path) == []
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs procfs")

@@ -7,7 +7,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import {
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  UNRESTRICTED_PICKER,
+} from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -371,4 +376,46 @@ describe("custom agents settings capability", () => {
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },
   );
+});
+
+describe("picker curation", () => {
+  it("reads the names and the default off the probe", async () => {
+    const parsed = await probe({
+      picker: { restrict_to_agent_names: ["polly", "debby"], default_agent_name: "debby" },
+    });
+
+    expect([...parsed.picker!.restrictToAgentNames]).toEqual(["polly", "debby"]);
+    expect(parsed.picker!.defaultAgentName).toBe("debby");
+  });
+
+  it("reads an older server, which reports nothing, as unrestricted", async () => {
+    const parsed = await probe({});
+
+    expect(parsed.picker).toEqual(UNRESTRICTED_PICKER);
+  });
+
+  it("drops a default the restriction does not offer", async () => {
+    // It could never be selected; pinning it would strand the picker.
+    const parsed = await probe({
+      picker: { restrict_to_agent_names: ["polly"], default_agent_name: "debby" },
+    });
+
+    expect(parsed.picker!.defaultAgentName).toBeNull();
+  });
+
+  it.each([
+    { restrict_to_agent_names: "polly", default_agent_name: 7 },
+    // A list with one bad member is dropped whole, as the server drops it.
+    { restrict_to_agent_names: ["polly", 42], default_agent_name: 7 },
+  ])("ignores malformed values rather than emptying the picker: %j", async (picker) => {
+    const parsed = await probe({ picker });
+
+    expect(parsed.picker!.restrictToAgentNames.size).toBe(0);
+    expect(parsed.picker!.defaultAgentName).toBeNull();
+  });
+
+  it("treats a loading probe and a missing block as unrestricted", () => {
+    expect(pickerCuration("loading").restrictToAgentNames.size).toBe(0);
+    expect(pickerCuration(info({})).defaultAgentName).toBeNull();
+  });
 });

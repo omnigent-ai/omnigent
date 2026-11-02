@@ -131,6 +131,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
     assert data["single_user"] is True
+    # Without the curation keys the picker block is present and empty, never missing.
+    assert data["picker"] == {"restrict_to_agent_names": [], "default_agent_name": None}
 
     # Older servers omit capabilities they do not support.
     del data["agent_detail"]

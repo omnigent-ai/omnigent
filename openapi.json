@@ -4793,6 +4793,34 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PickerInfo": {
+        "description": "How a deployment curates what the New Chat picker shows.\n\nDisplay only: it narrows the picker, never what exists. Every agent stays\nseeded, forkable and reachable through the API.",
+        "properties": {
+          "default_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name a fresh New Chat starts on, or `None`. A user's remembered pick wins over it.",
+            "title": "Default Agent Name"
+          },
+          "restrict_to_agent_names": {
+            "default": [],
+            "description": "Names the picker may offer; empty means the full roster.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Restrict To Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "PickerInfo",
+        "type": "object"
+      },
       "PluginAsset": {
         "properties": {
           "id": {
@@ -6088,6 +6116,12 @@
           "needs_setup": {
             "title": "Needs Setup",
             "type": "boolean"
+          },
+          "picker": {
+            "$ref": "#/components/schemas/PickerInfo",
+            "default": {
+              "restrict_to_agent_names": []
+            }
           },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",

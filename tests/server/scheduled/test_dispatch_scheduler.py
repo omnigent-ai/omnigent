@@ -1996,9 +1996,7 @@ def test_dispatch_hooks_replace_the_built_in_executor_only_as_a_whole() -> None:
         ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(), fire_identity=AsyncMock())
 
 
-async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
-    store, monkeypatch
-) -> None:
+async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> None:
     task = store.update(_task(store).id, state="paused")
     clock = FakeClock(task.created_at + 60)
     fired = []
@@ -2008,12 +2006,15 @@ async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
         await lease.finish("running")
 
     scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
-    # Only the request itself may start the run in this test.
-    monkeypatch.setattr(scheduler, "_claim_pending", AsyncMock())
     await scheduler.start()
     try:
+        # The request only records the run, even on the replica that owns its host.
         run = await scheduler.run_now(task)
-        await asyncio.gather(*list(scheduler._startups.values()))
+        assert run.status == "scheduled"
+        assert scheduler._startups == {}
+        assert fired == []
+        await scheduler.poll_once()
+        await _drain(scheduler)
     finally:
         await scheduler.stop()
 
@@ -2053,35 +2054,6 @@ async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
     assert store.list_pending_runs() == []
     # Run now never moves the schedule of an active task.
     assert store.get(task.id).next_run_at == task.next_run_at
-
-
-async def test_run_now_keeps_a_recorded_request_when_starting_it_here_fails(store) -> None:
-    task = _task(store)
-    clock = FakeClock(task.created_at + 60)
-    calls = 0
-
-    async def owned_hosts(keys):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("ownership lookup unavailable")
-        return keys
-
-    fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(), owned_hosts=owned_hosts, now=clock.now, poll_seconds=3600
-    )
-    await scheduler.start()
-    try:
-        # Recorded, so the caller must not retry and create a second run.
-        run = await scheduler.run_now(task)
-        assert run is not None
-        await scheduler.poll_once()
-        await _drain(scheduler)
-    finally:
-        await scheduler.stop()
-    [(_snapshot, lease)] = [call.args for call in fire.await_args_list]
-    assert lease.run.id == run.id
 
 
 async def test_pending_runs_cost_each_poll_one_page_and_still_make_progress(store) -> None:
