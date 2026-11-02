@@ -8,6 +8,7 @@ import {
   HarnessPickerEntry,
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
+  ignorePointerLeaveIntoSubmenu,
 } from "@/components/composer/HarnessPicker";
 import {
   type ReactNode,
@@ -1398,6 +1399,13 @@ export function AgentHarnessPicker({
   useEffect(() => {
     if (!loading) writeNewChatPickerCache(cacheKey, resolvedPreview);
   }, [cacheKey, loading, resolvedPreview]);
+  // Keep a showing menu mounted while a newly picked harness loads its models,
+  // so open flyouts such as "Other..." don't collapse behind the placeholder.
+  const [menuShown, setMenuShown] = useState(false);
+  const showLoadingPlaceholder = previewOnly && cachedPreview === null && !menuShown;
+  useEffect(() => {
+    setMenuShown(open && !showLoadingPlaceholder);
+  }, [open, showLoadingPlaceholder]);
 
   const isMobile = useIsMobileViewport();
   const hasSelectedConfig = selectedConfigContent != null;
@@ -1723,7 +1731,7 @@ export function AgentHarnessPicker({
     triggerTooltip || null
   );
 
-  if (previewOnly && cachedPreview === null) {
+  if (showLoadingPlaceholder) {
     return (
       <NewChatPickerLoading
         label="Loading session configuration"
@@ -1945,16 +1953,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSubTrigger
                       data-testid="new-chat-landing-harness-more"
                       className="cursor-pointer items-center"
-                      onPointerLeave={(event) => {
-                        const target = event.relatedTarget;
-                        if (
-                          target instanceof Element &&
-                          target.closest('[role="menu"]')?.getAttribute("aria-labelledby") ===
-                            event.currentTarget.id
-                        ) {
-                          event.preventDefault();
-                        }
-                      }}
+                      onPointerLeave={ignorePointerLeaveIntoSubmenu}
                     >
                       <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     </DropdownMenuSubTrigger>
@@ -2004,6 +2003,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSubTrigger
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
+                  onPointerLeave={ignorePointerLeaveIntoSubmenu}
                 >
                   <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
