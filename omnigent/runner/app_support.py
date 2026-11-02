@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, overload
 
@@ -40,6 +40,16 @@ class _TurnMessage(dict[str, Any]):
 def _message_scheduled_run(body: Mapping[str, Any] | None) -> ScheduledRunLogContext | None:
     """Internal wakes and ordinary dictionaries have no automation attribution."""
     return body.scheduled_run if isinstance(body, _TurnMessage) else None
+
+
+def _shared_scheduled_run(
+    bodies: Sequence[Mapping[str, Any]],
+) -> ScheduledRunLogContext | None:
+    """Mixed input batches have input-level attribution, not a single owning occurrence."""
+    if not bodies:
+        return None
+    run = _message_scheduled_run(bodies[0])
+    return run if all(_message_scheduled_run(body) == run for body in bodies) else None
 
 
 def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:

@@ -5424,10 +5424,6 @@ def _publish_sandbox_status_impl(
         ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for
         other stages.
     """
-    # "ready" evicts: from then on the session looks like any
-    # host-bound session and the snapshot carries no launch state.
-    # Failures stay cached (mirroring ManagedLaunchTracker retention)
-    # so a reload after a dead launch still shows the reason.
     from omnigent.server.scheduled.telemetry import start_fire_stage
 
     if stage in {"provisioning", "cloning", "action_required"}:
@@ -5457,6 +5453,10 @@ def _publish_sandbox_status_impl(
             provider=status.provider,
         ),
     )
+    # "ready" evicts: from then on the session looks like any
+    # host-bound session and the snapshot carries no launch state.
+    # Failures stay cached (mirroring ManagedLaunchTracker retention)
+    # so a reload after a dead launch still shows the reason.
     if status.stage == "ready":
         _session_sandbox_status_cache.pop(session_id, None)
     else:

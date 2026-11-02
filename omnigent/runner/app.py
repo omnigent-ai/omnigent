@@ -92,6 +92,7 @@ from omnigent.runner.app_support import (
     _message_scheduled_run,
     _require_full_native_lock_coverage,
     _resolve_forwarded_message_content,
+    _shared_scheduled_run,
     _SpecEntry,
     _TurnMessage,
     _unwrap_spec_entry,
@@ -4034,7 +4035,44 @@ def create_runner_app(
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
     _post_sign_in_hold_notice = _sign_in_watch.post_sign_in_hold_notice
 
-    def _begin_turn_slot(conv_id: str, body: Mapping[str, Any] | None = None) -> None:
+    def _log_input_assignment(
+        conv_id: str,
+        body: Mapping[str, Any],
+        delivery_mode: str,
+        *,
+        batch_has_scheduled_input: bool = False,
+    ) -> None:
+        input_run = _message_scheduled_run(body)
+        turn_run = _turn_occurrences.get(conv_id)
+        if (
+            input_run is None
+            and turn_run is None
+            and not batch_has_scheduled_input
+            and delivery_mode != "steering"
+        ):
+            return
+        with contextlib.suppress(Exception), scheduled_run_scope(input_run, session_id=conv_id):
+            _logger.info(
+                "Input assigned to runner turn",
+                extra=debug_event(
+                    "runner_input_assigned",
+                    session_id=conv_id,
+                    input_source="scheduled" if input_run is not None else "unscheduled",
+                    delivery_mode=delivery_mode,
+                    pending_id=body.get("pending_id"),
+                    injection_id=body.get("injection_id"),
+                    turn_epoch=_turn_bind_epoch.get(conv_id),
+                    response_id=_live_response_id.get(conv_id),
+                    turn_run_id=turn_run.run_id if turn_run is not None else None,
+                ),
+            )
+
+    def _begin_turn_slot(
+        conv_id: str,
+        body: Mapping[str, Any] | None = None,
+        *,
+        inputs: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
 
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
@@ -4042,15 +4080,27 @@ def create_runner_app(
 
         :param conv_id: Session whose turn slot is bound.
         :param body: Forwarded message that starts the turn, when there is one.
+        :param inputs: Original inputs when the existing queue drain coalesces a batch.
         """
         _active_turns[conv_id] = None
-        _turn_occurrences[conv_id] = _message_scheduled_run(body)
+        turn_inputs = inputs if inputs is not None else [body] if body is not None else []
+        _turn_occurrences[conv_id] = _shared_scheduled_run(turn_inputs)
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
         pending_id = body.get("pending_id") if body is not None else None
         if isinstance(pending_id, str):
             _turn_pending_ids[conv_id] = {pending_id}
         else:
             _turn_pending_ids.pop(conv_id, None)
+        batch_has_scheduled_input = any(
+            _message_scheduled_run(item) is not None for item in turn_inputs
+        )
+        for item in turn_inputs:
+            _log_input_assignment(
+                conv_id,
+                item,
+                "coalesced" if len(turn_inputs) > 1 else "turn_start",
+                batch_has_scheduled_input=batch_has_scheduled_input,
+            )
 
     def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
         """Whether a forward repeats a message that is still queued or running.
@@ -4798,14 +4848,9 @@ def create_runner_app(
                     }
                 )
             else:
-                # Only merge inputs from the same occurrence (or interactive scope).
-                context = _message_scheduled_run(buf[0])
-                all_bodies = list(
-                    itertools.takewhile(lambda body: _message_scheduled_run(body) == context, buf)
-                )
-                del buf[: len(all_bodies)]
-                if not buf:
-                    _session_message_buffers.pop(session_id, None)
+                all_bodies = list(buf)
+                buf.clear()
+                _session_message_buffers.pop(session_id, None)
 
                 for body in all_bodies:
                     _session_histories.setdefault(session_id, []).append(
@@ -4817,7 +4862,7 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
-            with scheduled_run_scope(_message_scheduled_run(next_body), session_id=session_id):
+            with scheduled_run_scope(_shared_scheduled_run(all_bodies), session_id=session_id):
                 if _is_sdk_compact_body(next_body):
                     # This buffered /compact now dispatches as its own turn. Mirror the
                     # idle path: publish the spinner up front AND set the flag, so
@@ -4832,7 +4877,7 @@ def create_runner_app(
                         {"type": "response.compaction.in_progress", "task_id": session_id},
                     )
                     _sdk_compact_inprogress.add(session_id)
-                _begin_turn_slot(session_id, next_body)
+                _begin_turn_slot(session_id, next_body, inputs=all_bodies)
                 _turn_pending_ids[session_id] = {
                     pending_id
                     for body in all_bodies
@@ -5362,7 +5407,7 @@ def create_runner_app(
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
         with (
-            scheduled_run_scope(_message_scheduled_run(msg_body), session_id=conv),
+            scheduled_run_scope(_turn_occurrences.get(conv), session_id=conv),
             phase_scope(ErrorPhase.TURN),
         ):
             try:
@@ -6434,6 +6479,7 @@ def create_runner_app(
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
+                                            _log_input_assignment(conv_id, _m, "steering")
                                             _pending_id = _m.get("pending_id")
                                             if isinstance(_pending_id, str):
                                                 _turn_pending_ids.setdefault(conv_id, set()).add(
@@ -7151,8 +7197,6 @@ def create_runner_app(
                         not _native
                         and not _awaiting_approval
                         and conversation_id in _live_response_id
-                        and _message_scheduled_run(message_body)
-                        == _turn_occurrences.get(conversation_id)
                     )
                     if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"

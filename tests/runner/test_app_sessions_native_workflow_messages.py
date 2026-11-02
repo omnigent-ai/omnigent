@@ -582,17 +582,33 @@ def _build_handshake_app(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("runs", [(None, None), ("A", "A"), ("A", "B"), ("A", None), (None, "A")])
+@pytest.mark.parametrize(
+    "runs,fail_assignment_log",
+    [(runs, False) for runs in [(None, None), ("A", "A"), ("A", "B"), ("A", None), (None, "A")]]
+    + [(("A", None), True)],
+)
 @pytest.mark.parametrize("stream_response", [False, True], ids=["background", "stream"])
 async def test_midturn_message_not_double_delivered_to_harness(
-    monkeypatch, runs, stream_response
+    monkeypatch, runs, stream_response, fail_assignment_log
 ) -> None:
-    """Same-scope steering is consumed once; different occurrences wait for their own turn."""
+    """Live steering stays unchanged; input attribution is separate from turn attribution."""
     gate = asyncio.Event()
     completion_gate = asyncio.Event()
     app, _pm, hc = _build_handshake_app(gate, completion_gate)
     sid = "ede98a0180773a70b1e81cc854ff7d8a"
-    same_occurrence = runs[0] == runs[1]
+    rejected_events = []
+    if fail_assignment_log:
+        logger = logging.getLogger("omnigent.runner.app")
+        info = logger.info
+
+        def fail_assignment(message, *args, **kwargs):
+            extra = kwargs.get("extra", {})
+            if extra.get("event_name") == "runner_input_assigned":
+                rejected_events.append(extra["attributes"]["delivery_mode"])
+                raise RuntimeError("telemetry sink unavailable")
+            return info(message, *args, **kwargs)
+
+        monkeypatch.setattr(logger, "info", fail_assignment)
     stream = hc.stream
 
     def record_turn(*args, **kwargs):
@@ -647,16 +663,12 @@ async def test_midturn_message_not_double_delivered_to_harness(
                 )
                 assert second.status_code == 202
                 assert second.json()["status"] == "buffered"
-                assert len(hc.patched_events) == int(same_occurrence)
+                assert len(hc.patched_events) == 1
                 gate.set()
-                if same_occurrence:
-                    await poll_until_async(
-                        lambda: not app.state.session_message_buffers.get(sid), timeout_s=budget(5)
-                    )
-                    assert _body_contains_text(hc.patched_events[0], "second")
-                else:
-                    [queued] = app.state.session_message_buffers[sid]
-                    assert "injection_id" not in queued
+                await poll_until_async(
+                    lambda: not app.state.session_message_buffers.get(sid), timeout_s=budget(5)
+                )
+                assert _body_contains_text(hc.patched_events[0], "second")
                 # Consumed and queued inputs both retain their IDs until delivery completes.
                 assert app.state.active_turns
                 repeated = await client.post(
@@ -674,16 +686,35 @@ async def test_midturn_message_not_double_delivered_to_harness(
                 ),
                 timeout_s=budget(5),
             )
-    assert len(hc.posted_bodies) == (1 if same_occurrence else 2)
-    if not same_occurrence:
-        assert _body_contains_text(hc.posted_bodies[1], "second")
+    assert len(hc.posted_bodies) == 1
     probes = [row for row in rows if row["message"] == "steering turn dispatched"]
-    expected = [runs[0]] if same_occurrence else list(runs)
+    expected = [runs[0]]
     assert [row["attributes"].get("run_id") for row in probes] == expected
     assert [row["attributes"].get("task_id") for row in probes] == [
         "task-" + run if run else None for run in expected
     ]
     assert all(row["session_id"] == sid for row in probes)
+
+    if fail_assignment_log:
+        assert rejected_events == ["turn_start", "steering"]
+        return
+    [steer] = [
+        row
+        for row in rows
+        if row["event_name"] == "runner_input_assigned"
+        and row["attributes"]["delivery_mode"] == "steering"
+    ]
+    assert steer["attributes"].get("run_id") == runs[1]
+    assert steer["attributes"].get("task_id") == ("task-" + runs[1] if runs[1] else None)
+    assert steer["attributes"].get("turn_run_id") == runs[0]
+    assert steer["attributes"]["input_source"] == ("scheduled" if runs[1] else "unscheduled")
+    assert steer["attributes"]["pending_id"] == "pending_second"
+    assert steer["attributes"]["response_id"] == "resp_1"
+    assert steer["attributes"]["injection_id"] == hc.patched_events[0]["injection_id"]
+    assert "first" not in json.dumps(steer["attributes"])
+    assert "second" not in {
+        value for key, value in steer["attributes"].items() if key != "pending_id"
+    }
 
 
 class _RefusingSteerHarnessClient(_HandshakeHarnessClient):

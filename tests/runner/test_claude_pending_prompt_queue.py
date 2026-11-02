@@ -324,20 +324,21 @@ async def test_stop_during_drain_probe_does_not_restart_session(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness_name", ["claude-native", "claude-sdk"])
-@pytest.mark.parametrize("runs", [("A", None), ("A", "B"), (None, "A")])
+@pytest.mark.parametrize("runs", [("A", None), ("A", "B"), (None, "A"), ("A", "A")])
 async def test_buffered_turn_restores_its_own_occurrence(
     monkeypatch,
     pending_prompt,
     harness_name,
     runs,
 ):
-    """Real completion drains buffered input with its own metadata, including no run."""
+    """Attribution preserves native FIFO and SDK coalescing, including mixed input contexts."""
     pending_prompt["pending"] = False
     app, harness = _build_app(harness_name)
     sid = uuid.uuid4().hex
     release = asyncio.Event()
     original_stream = _ScriptedHarnessClient._StreamHandle.aiter_text
     first = True
+    expected_turns = 3 if harness_name == "claude-native" else 2
 
     async def blocked_stream(handle):
         nonlocal first
@@ -377,7 +378,7 @@ async def test_buffered_turn_restores_its_own_occurrence(
             assert response.status_code == 202
             await _until(lambda: len(harness.posted_bodies) == 1)
             try:
-                # Two distinct queued scopes must not be coalesced on the SDK path.
+                # Attribution must not change the existing SDK batch drain.
                 for text, run in [("second", runs[1]), ("third", runs[0])]:
                     response = await client.post(
                         f"/v1/sessions/{sid}/events", json=_message(text), headers=headers(run)
@@ -386,11 +387,37 @@ async def test_buffered_turn_restores_its_own_occurrence(
             finally:
                 release.set()
             await _until(
-                lambda: len(harness.posted_bodies) == 3 and sid not in app.state.active_turns
+                lambda: (
+                    len(harness.posted_bodies) == expected_turns
+                    and sid not in app.state.active_turns
+                )
             )
     probes = [row for row in rows if row["message"] == "executing queued input"]
-    assert [row["attributes"].get("run_id") for row in probes] == [runs[0], runs[1], runs[0]]
+    expected_runs = (
+        [runs[0], runs[1], runs[0]]
+        if harness_name == "claude-native"
+        else [runs[0], runs[0] if runs[0] == runs[1] else None]
+    )
+    assert [row["attributes"].get("run_id") for row in probes] == expected_runs
     assert all(row["session_id"] == sid for row in probes)
     assert [row["attributes"].get("task_id") for row in probes] == [
-        "task-" + run if run else None for run in (runs[0], runs[1], runs[0])
+        "task-" + run if run else None for run in expected_runs
     ]
+    if harness_name == "claude-sdk":
+        batch = [
+            row
+            for row in rows
+            if row["event_name"] == "runner_input_assigned"
+            and row["attributes"]["delivery_mode"] == "coalesced"
+        ]
+        assert [row["attributes"].get("run_id") for row in batch] == [runs[1], runs[0]]
+        assert len({row["attributes"]["turn_epoch"] for row in batch}) == 1
+        assert [row["attributes"].get("turn_run_id") for row in batch] == [
+            runs[0] if runs[0] == runs[1] else None
+        ] * 2
+        texts = [
+            item["content"][0]["text"]
+            for item in harness.posted_bodies[1]["content"]
+            if item.get("type") == "message"
+        ]
+        assert texts[-2:] == ["second", "third"]

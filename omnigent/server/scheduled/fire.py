@@ -1883,9 +1883,16 @@ async def _send_prompt(
             runner_router=deps.runner_router,
             agent_revision=agent_revision,
         )
-        if not result.accepted:
-            raise RuntimeError("runner did not accept the scheduled prompt")
-        log_prompt_sent(conv.id, dispatch_id=dispatch_id)
+        if result.accepted:
+            log_prompt_sent(conv.id, dispatch_id=dispatch_id)
+        else:
+            log_delivery(
+                "scheduled_run_prompt_not_accepted",
+                session_id=conv.id,
+                dispatch_id=dispatch_id,
+                failure_stage="prompt_send",
+                outcome="not_sent",
+            )
 
 
 def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:

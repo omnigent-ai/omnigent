@@ -185,7 +185,7 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
         ("new", stage)
         for stage in [None, "runner_start", "prompt_prepare", "prompt_send", "native_refusal"]
     ]
-    + [("continue", None)],
+    + [("continue", None), ("continue", "native_refusal")],
 )
 async def test_prompt_logs_measure_delivery_and_locate_failures(
     store, monkeypatch, caplog, session_mode, failed_stage
@@ -267,13 +267,26 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         assert created[0].attributes["session_delay_seconds"] == 15
     if native_refusal:
         persisted_failure.assert_awaited_once()
-        failed_stage = "prompt_send"
+        assert not sent
+        assert not failed
+        [refusal] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_not_accepted"
+        ]
+        assert refusal.attributes["run_id"] == claimed.lease.run.id
+        assert refusal.attributes["failure_stage"] == "prompt_send"
+        assert refusal.attributes["outcome"] == "not_sent"
+        # Match the pre-telemetry normal return; actual failure persistence is separate.
+        assert _runs(store, claimed.task)[0].status == (
+            "running" if session_mode == "new" else "succeeded"
+        )
     if failed_stage in {"runner_start", "prompt_prepare"}:
         assert not any(
             getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
             for r in caplog.records
         )
-    if failed_stage:
+    if failed_stage and not native_refusal:
         assert not sent
         assert len(failed) == 1
         assert failed[0].attributes["failure_stage"] == failed_stage
@@ -290,7 +303,7 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         )
         assert failed[0].attributes["run_id"] == claimed.lease.run.id
         assert _runs(store, claimed.task)[0].status == "failed"
-    else:
+    elif not native_refusal:
         assert not failed
         assert len(sent) == 1
         assert sent[0].attributes["prompt_delay_seconds"] == 15
@@ -1384,6 +1397,9 @@ async def test_late_startup_failure_logs_only_a_transition(store, caplog, monkey
         ("ui", "jira", "ui", "jira"),
         ("ui", "slack", "ui", "slack"),
         ("ui", "github", "ui", "github"),
+        ("ui", "follow-up-monitor", "ui", "follow-up-monitor"),
+        ("ui", "pr-sweep", "ui", "pr-sweep"),
+        ("ui", "news-digest", "ui", "news-digest"),
         ("agent", None, "agent", "unknown"),
         ("private source", "private prompt", "api", "unknown"),
     ],

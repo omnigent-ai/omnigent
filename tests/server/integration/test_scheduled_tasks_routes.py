@@ -257,18 +257,21 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
         "x-omnigent-automation-template": "jira",
     }
     with capture_debug_rows("server") as rows:
-        resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(name="private-name", prompt="private-prompt"),
+            headers=headers,
+        )
+    assert resp.status_code == 200, resp.text
     [event] = [row for row in rows if row["event_name"] == "scheduled_task_created"]
     assert event["user_id"] == "alice@example.com"
     assert event["attributes"]["task_id"] == resp.json()["id"]
     assert event["attributes"]["creation_source"] == "ui"
     assert event["attributes"]["template_id"] == "jira"
-    assert "private" not in json.dumps(event)
-    assert _create_body()["prompt"] not in json.dumps(event)
-
-    assert resp.status_code == 200, resp.text
+    assert "private-name" not in json.dumps(event)
+    assert "private-prompt" not in json.dumps(event)
     created = resp.json()
-    assert created["name"] == "nightly triage"
+    assert created["name"] == "private-name"
     assert created["rrule"] == _VALID_RRULE
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"

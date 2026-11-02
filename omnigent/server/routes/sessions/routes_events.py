@@ -2781,11 +2781,11 @@ def register_events_routes(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
             return {"queued": True, "item_id": body.data["call_id"]}
+        start_fire_stage("runner_start", session_id=session_id)
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
         # a replacement.
-        start_fire_stage("runner_start", session_id=session_id)
         _runner_needs_session_init = False
         # Item event (message, function_call_output, etc.).
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
