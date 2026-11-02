@@ -5453,9 +5453,7 @@ def _publish_sandbox_status_impl(
             provider=status.provider,
         ),
     )
-    # "ready" evicts: from then on the session looks like any
-    # host-bound session and the snapshot carries no launch state.
-    # Failures stay cached (mirroring ManagedLaunchTracker retention)
+    # "ready" evicts launch state; failures stay cached (like ManagedLaunchTracker)
     # so a reload after a dead launch still shows the reason.
     if status.stage == "ready":
         _session_sandbox_status_cache.pop(session_id, None)

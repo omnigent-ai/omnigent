@@ -687,6 +687,8 @@ async def test_midturn_message_not_double_delivered_to_harness(
                 timeout_s=budget(5),
             )
     assert len(hc.posted_bodies) == 1
+    assert len(hc.patched_events) == 1
+    assert _body_contains_text(hc.patched_events[0], "second")
     probes = [row for row in rows if row["message"] == "steering turn dispatched"]
     expected = [runs[0]]
     assert [row["attributes"].get("run_id") for row in probes] == expected

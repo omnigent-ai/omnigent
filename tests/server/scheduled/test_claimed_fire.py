@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -40,6 +41,7 @@ from omnigent.server.scheduled.schedule import (
     scheduled_trigger_key,
 )
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
@@ -183,12 +185,19 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
     "session_mode,failed_stage",
     [
         ("new", stage)
-        for stage in [None, "runner_start", "prompt_prepare", "prompt_send", "native_refusal"]
+        for stage in [
+            None,
+            "runner_start",
+            "prompt_prepare",
+            "prompt_send",
+            "native_refusal",
+            "dispatch_bookkeeping",
+        ]
     ]
     + [("continue", None), ("continue", "native_refusal")],
 )
 async def test_prompt_logs_measure_delivery_and_locate_failures(
-    store, monkeypatch, caplog, session_mode, failed_stage
+    store, monkeypatch, caplog, session_mode, failed_stage, db_uri
 ) -> None:
     from omnigent.server.routes import sessions
 
@@ -205,6 +214,9 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         if session_mode == "continue"
         else _ConversationStore()
     )
+    post_acceptance = failed_stage == "dispatch_bookkeeping"
+    if post_acceptance:
+        conversations = SqlAlchemyConversationStore(db_uri)
     deps = _deps(store, conversation_store=conversations)
     monkeypatch.setattr(telemetry, "time", SimpleNamespace(time=lambda: claimed.clock.now() + 15))
     initialize = AsyncMock(
@@ -230,6 +242,13 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         )
         persisted_failure = AsyncMock(return_value="failure-item")
         monkeypatch.setattr(orchestration, "_persist_native_terminal_failure", persisted_failure)
+    elif post_acceptance:
+        from omnigent.server.routes._sessions import orchestration
+
+        def fail_acknowledgement(*args, **kwargs):
+            raise RuntimeError("bookkeeping failed after acceptance")
+
+        monkeypatch.setattr(orchestration, "_publish_input_consumed", fail_acknowledgement)
     else:
         monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
     monkeypatch.setattr(
@@ -247,9 +266,24 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         if native_refusal:
             conv = SimpleNamespace(**vars(conv), kind="default", harness_override="claude-native")
             conv.labels = {**conv.labels, "omnigent.wrapper": "claude-native"}
-        await fire_mod._send_prompt(deps, conv, object(), task)
+        if post_acceptance:
+            async with httpx.AsyncClient(
+                base_url="http://runner", transport=httpx.MockTransport(accept)
+            ) as runner:
+                await fire_mod._send_prompt(deps, conv, runner, task)
+        else:
+            await fire_mod._send_prompt(deps, conv, object(), task)
+
+    accepted = []
+
+    def accept(request):
+        accepted.append(request)
+        return httpx.Response(202, json={"queued": True})
 
     await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+    if post_acceptance:
+        assert len(accepted) == 1
+    reported_stage = "prompt_send" if post_acceptance else failed_stage
     sent = [
         r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
     ]
@@ -277,7 +311,7 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         assert refusal.attributes["run_id"] == claimed.lease.run.id
         assert refusal.attributes["failure_stage"] == "prompt_send"
         assert refusal.attributes["outcome"] == "not_sent"
-        # Match the pre-telemetry normal return; actual failure persistence is separate.
+        # A native refusal persists its own failure item; dispatch still returns normally.
         assert _runs(store, claimed.task)[0].status == (
             "running" if session_mode == "new" else "succeeded"
         )
@@ -289,16 +323,16 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
     if failed_stage and not native_refusal:
         assert not sent
         assert len(failed) == 1
-        assert failed[0].attributes["failure_stage"] == failed_stage
+        assert failed[0].attributes["failure_stage"] == reported_stage
         outcome = next(
             r
             for r in caplog.records
             if getattr(r, "event_name", None) == "scheduled_run_startup_ended"
         )
-        assert outcome.attributes["failure_stage"] == failed_stage
+        assert outcome.attributes["failure_stage"] == reported_stage
         assert any(
             getattr(r, "event_name", None) == "scheduled_run_stage_started"
-            and r.attributes["fire_stage"] == failed_stage
+            and r.attributes["fire_stage"] == reported_stage
             for r in caplog.records
         )
         assert failed[0].attributes["run_id"] == claimed.lease.run.id

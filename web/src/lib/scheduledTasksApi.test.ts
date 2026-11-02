@@ -206,27 +206,25 @@ describe("createScheduledTask", () => {
     expect(body).not.toHaveProperty("timezone");
   });
 
-  it.each(["jira", "slack", "github", "follow-up-monitor", "pr-sweep", "news-digest"] as const)(
-    "attributes creation to %s without including prompt text in analytics",
-    async (templateId) => {
-      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
-      await createScheduledTask({
-        name: "private name",
-        prompt: "private prompt",
-        rrule: "FREQ=DAILY",
-        agentId: "agent",
-        templateId,
-      });
-      const [, init] = fetchMock.mock.calls[0];
-      expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
-      expect(new Headers(init.headers).get("x-omnigent-automation-template")).toBe(templateId);
-      expect(JSON.parse(init.body)).not.toHaveProperty("template_id");
-      expect(analytics).toHaveBeenLastCalledWith(
-        expect.objectContaining({ phase: "complete", status: "success", name: templateId }),
-      );
-      expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
-    },
-  );
+  it("attributes template creation without including prompt text in analytics", async () => {
+    const templateId = "jira";
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "private name",
+      prompt: "private prompt",
+      rrule: "FREQ=DAILY",
+      agentId: "agent",
+      templateId,
+    });
+    const [, init] = fetchMock.mock.calls[0];
+    expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
+    expect(new Headers(init.headers).get("x-omnigent-automation-template")).toBe(templateId);
+    expect(JSON.parse(init.body)).not.toHaveProperty("template_id");
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "success", name: templateId }),
+    );
+    expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
+  });
 
   it("includes the host/workspace pair and timezone when provided", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));

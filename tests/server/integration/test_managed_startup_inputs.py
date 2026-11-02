@@ -1120,7 +1120,8 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
 
 
 @pytest.mark.parametrize(
-    "failed_stage", ["runner_start", "input_claim", "prompt_send", "post_delivery"]
+    "failed_stage",
+    ["runner_start", "input_claim", "prompt_send", "dispatch_bookkeeping", "post_delivery"],
 )
 async def test_saved_delivery_identifies_failed_boundary(
     startup_env, monkeypatch, scheduled_run_context, caplog, failed_stage
@@ -1148,6 +1149,14 @@ async def test_saved_delivery_identifies_failed_boundary(
             return original(*args, **kwargs)
 
         monkeypatch.setattr(env.conv_store, "transition_pending_input", fail_claim)
+    elif failed_stage == "dispatch_bookkeeping":
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(
+            orchestration,
+            "_publish_input_consumed",
+            Mock(side_effect=RuntimeError("bookkeeping failed after acceptance")),
+        )
     elif failed_stage == "post_delivery":
         monkeypatch.setattr(
             env.conv_store, "set_labels", Mock(side_effect=RuntimeError("bookkeeping failed"))
@@ -1160,12 +1169,16 @@ async def test_saved_delivery_identifies_failed_boundary(
         r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
     ]
     assert len(failures) == 1
-    assert failures[0].attributes["failure_stage"] == failed_stage
+    assert failures[0].attributes["failure_stage"] == (
+        "prompt_send" if failed_stage == "dispatch_bookkeeping" else failed_stage
+    )
+    if failed_stage == "dispatch_bookkeeping":
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
     assert failures[0].attributes["outcome"] == (
         "sent"
         if failed_stage == "post_delivery"
         else "uncertain"
-        if failed_stage == "prompt_send"
+        if failed_stage in {"prompt_send", "dispatch_bookkeeping"}
         else "not_sent"
     )
     assert len(

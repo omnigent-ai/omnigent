@@ -127,6 +127,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
+from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -10096,7 +10097,7 @@ def _ensure_runner_relay(
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
-    with runner_log_scope(session_id, runner_id):
+    with scheduled_run_scope(None, session_id=session_id), runner_log_scope(session_id, runner_id):
         task = asyncio.create_task(
             _relay_runner_stream(
                 session_id,

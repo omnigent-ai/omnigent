@@ -16,6 +16,13 @@ import httpx
 import pytest
 
 from omnigent.entities import Conversation
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
+from omnigent.scheduled_context import (
+    SCHEDULED_RUN_HEADER,
+    add_scheduled_run_header,
+    current_scheduled_run,
+    scheduled_run_scope,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -141,37 +148,72 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
 
     sessions_module._runner_relay_tasks.clear()
     release = asyncio.Event()
-    fake_runner = _HeartbeatRunnerClient(release)
+    requests: list[httpx.Request] = []
+    occurrence = ScheduledRunLogContext(
+        task_id="scheduled-task",
+        run_id="scheduled-run",
+        task_workspace_id=0,
+        scheduled_at=1000,
+        target="managed_sandbox",
+        session_mode="new",
+    )
 
-    try:
+    class HeartbeatStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            async for chunk in _HeartbeatStreamResponse(release).aiter_text():
+                if release.is_set():
+                    logging.getLogger("omnigent.server.relay_test").info(
+                        "relay finished after delivery scope"
+                    )
+                yield chunk.encode()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, stream=HeartbeatStream())
+
+    async with httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(respond),
+        event_hooks={"request": [add_scheduled_run_header]},
+    ) as runner:
         with capture_debug_rows("server") as rows:
-            handle = await sessions_module._ensure_runner_relay_ready(
-                "a7f039e9f1311474878eb7d4699c1013",
-                "runner_ready",
-                fake_runner,  # type: ignore[arg-type]
-                conversation_store=None,
-            )
+            try:
+                with scheduled_run_scope(occurrence):
+                    handle = await sessions_module._ensure_runner_relay_ready(
+                        "a7f039e9f1311474878eb7d4699c1013",
+                        "runner_ready",
+                        runner,
+                        conversation_store=None,
+                    )
+                    assert current_scheduled_run() == occurrence
+                assert handle is not None
+                assert handle.ready.is_set()
+            finally:
+                release.set()
+                handle = sessions_module._runner_relay_tasks.get(
+                    "a7f039e9f1311474878eb7d4699c1013"
+                )
+                if handle is not None:
+                    await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+                sessions_module._runner_relay_tasks.clear()
 
-        assert handle is not None
-        assert handle.ready.is_set()
-        ready_row = next(row for row in rows if row["event_name"] == "runner_stream_ready")
-        assert ready_row["session_id"] == "a7f039e9f1311474878eb7d4699c1013"
-        assert ready_row["attributes"]["runner_id"] == "runner_ready"
-        assert ready_row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
-        connected_row = next(row for row in rows if row["event_name"] == "runner_stream_connected")
-        assert connected_row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
-        assert not any(row["event_name"] == "runner_stream_recovered" for row in rows)
-        assert fake_runner.stream_calls[0][0] == "GET"
-        assert (
-            fake_runner.stream_calls[0][1]
-            == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
-        )
-    finally:
-        release.set()
-        handle = sessions_module._runner_relay_tasks.get("a7f039e9f1311474878eb7d4699c1013")
-        if handle is not None:
-            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
-        sessions_module._runner_relay_tasks.clear()
+    ready_row = next(row for row in rows if row["event_name"] == "runner_stream_ready")
+    assert ready_row["session_id"] == "a7f039e9f1311474878eb7d4699c1013"
+    assert ready_row["attributes"]["runner_id"] == "runner_ready"
+    assert ready_row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+    connected_row = next(row for row in rows if row["event_name"] == "runner_stream_connected")
+    assert connected_row["attributes"]["telemetry_schema"] == "runner_stream_recovery.v1"
+    assert not any(row["event_name"] == "runner_stream_recovered" for row in rows)
+    [finished] = [row for row in rows if row["message"] == "relay finished after delivery scope"]
+    assert finished["session_id"] == ready_row["session_id"]
+    assert finished["attributes"]["runner_id"] == "runner_ready"
+    for row in (ready_row, connected_row, finished):
+        assert row["attributes"].get("run_id") is None
+        assert row["attributes"].get("task_id") is None
+    [request] = requests
+    assert request.method == "GET"
+    assert request.url.path == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+    assert SCHEDULED_RUN_HEADER not in request.headers
 
 
 class _ScriptedStreamResponse:

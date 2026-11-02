@@ -631,7 +631,7 @@ not have the new delivery correlation.
 | `scheduled_run_session_attached` | The executor attached or replaced its session. | `target`, `session_delay_seconds` |
 | `scheduled_run_startup_ended` | Startup ended on its executing server. | `target`, `outcome`, `error_code`, known `failure_stage`, `startup_delay_seconds` |
 | `scheduled_run_prompt_dispatch_started` | The server begins a direct send or processes a saved input through normal dispatch. A competing saved-input worker may lose the claim and send nothing. | `session_id`, `dispatch_id`, saved `input_id` when applicable |
-| `scheduled_run_prompt_sent` | The runner accepted a prompt. Emitted only after explicit dispatch acceptance, before saved-input housekeeping. Handled native startup refusals do not count. | `session_id`, `dispatch_id`, `input_id` when saved, `prompt_delay_seconds`, `target`, `session_mode` |
+| `scheduled_run_prompt_sent` | Dispatch returned explicit runner acceptance, before saved-input housekeeping. Failures inside dispatch after acceptance can suppress this event (see below). Handled native startup refusals do not count. | `session_id`, `dispatch_id`, `input_id` when saved, `prompt_delay_seconds`, `target`, `session_mode` |
 | `scheduled_run_prompt_not_accepted` | Direct dispatch returns a handled refusal. Logs the non-delivery without raising or changing the existing run-status flow. | `session_id`, `dispatch_id`, `failure_stage=prompt_send`, `outcome=not_sent` |
 | `runner_input_assigned` | An automation-bearing turn starts, a queued batch containing scheduled input is assigned, or a live steer is consumed. Assignment is not proof of successful execution. | Input `task_id`/`run_id` when scheduled, `input_source`, `delivery_mode` (`turn_start`, `coalesced`, `steering`), `pending_id`, `injection_id`, `turn_epoch`, `response_id` when live, initiating `turn_run_id` when unambiguous |
 | `scheduled_run_stage_started` | A fire enters a new stage, before potentially blocking/failing work. Consecutive nested entries into the same stage are suppressed per run. Gives the last observed boundary when a process dies. | `fire_stage` |
@@ -643,6 +643,17 @@ not have the new delivery correlation.
 
 `session_id` is a top-level log field; other dimensions are attributes. Attribute
 values in the sink are strings; cast delays before computing percentiles.
+
+`prompt_sent` observes a successful dispatch return, which includes work after
+runner acceptance. If that work fails (for example, publishing input consumption
+or writing a smart-routing label), the prompt may already be running without a
+`prompt_sent` event. Direct delivery records a `prompt_send` stage failure;
+saved-input delivery reports `outcome=uncertain`. Existing exception propagation,
+run statuses, and retry behavior remain unchanged. Thus accepted-delivery counts
+are a lower bound, and missing sent events cannot establish non-delivery or zero
+duplicates. Delivery latency also includes dispatch bookkeeping time. Correlate
+`turn_dispatched` or `native_input_forward_finished` and runner records when
+investigating these cases; they do not replace a durable delivery ledger.
 
 `startup_ended` outcomes are `running`, `succeeded` (continued-session delivery),
 `failed`, or `skipped`; unresolved startup paths report `lease_lost`,
