@@ -1,6 +1,6 @@
 # Automations introduction
 
-The first visit to Automations opens a short walkthrough of recurring runs and
+The first visit to the Your automations tab opens a short walkthrough of recurring runs and
 the deployment's available features. Finishing or dismissing it is remembered
 in this browser for the current user, server, and app mount. The info button
 beside the Automations heading reopens it.
@@ -42,7 +42,7 @@ No agent turn or provider credentials are needed.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_automations_introduction_first_visit`
   covers desktop sidebar entry, mobile direct entry, the examples and Back, all
   four steps, Done, focus returning to New automation, and after a reload,
-  reopening from the info button and selecting Create manually.
+  reopening from the info button and opening New automation.
 - For the command palette, select Go to Automations in a fresh browser context,
   dismiss with Maybe later, navigate away, and return. The guide stays closed.
 - For managed, repeat in a deployment containing this UI version. Check the
@@ -66,7 +66,7 @@ No agent turn or provider credentials are needed.
   Payments API, `acme/web`); nothing copies them into the create dialog.
 - Trigger templates check services periodically; this guide does not promise
   webhook delivery or a separate persistent memory store.
-- The template browser and task detail pages do not open the guide or show the
-  info button; returning to the Automations list does if it has not been
-  dismissed.
+- Opening the Templates tab directly does not automatically show the guide.
+  Its info button still opens it. Task detail pages do not show the guide or
+  info button; returning to Your automations opens the guide if not dismissed.
 - Automations task creation, execution, and detail pages are separate journeys.
