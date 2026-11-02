@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shlex
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -245,6 +248,53 @@ def test_build_codex_native_server_preserves_structured_ucode_auth(
     provider = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]
     assert provider["auth"] == auth
     assert provider["base_url"] == _UCODE_BASE_URL
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uv POSIX archive layout and shell helper")
+@pytest.mark.parametrize("auth_form", ["direct", "shell"])
+def test_build_codex_native_server_repairs_archived_ucode_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_form: str
+) -> None:
+    """Codex's emitted auth helper works after the generated uv archive is removed."""
+    archived = tmp_path / "archive-v0" / "removed" / "bin" / "ucode"
+    launcher = tmp_path / "ucode"
+    launcher.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    args = [
+        "auth-token",
+        "--host",
+        _UCODE_HOST,
+        "--profile",
+        'gateway "profile"',
+        "--browser-login",
+    ]
+    command = shlex.join([str(archived), *args])
+    auth = {
+        "command": str(archived) if auth_form == "direct" else "/bin/sh",
+        "args": args if auth_form == "direct" else ["-c", command],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 60000,
+    }
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": command, "auth": auth},
+    )
+    emitted_auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert emitted_auth == {
+        **auth,
+        "command": str(launcher) if auth_form == "direct" else "/bin/sh",
+        "args": args if auth_form == "direct" else ["-c", shlex.join([str(launcher), *args])],
+    }
+    result = subprocess.run(
+        [emitted_auth["command"], *emitted_auth["args"]],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    assert result.stdout.splitlines() == args
 
 
 def test_build_codex_native_server_preserves_legacy_auth_timeout(
