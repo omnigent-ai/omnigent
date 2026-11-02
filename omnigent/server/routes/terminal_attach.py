@@ -71,6 +71,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
+from collections.abc import Callable
 from typing import Final
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
@@ -167,6 +169,7 @@ def create_terminal_attach_router(
         # WebSockets bypass the HTTP middleware that attributes debug-log rows
         # to the request's user; this handler task is per-connection.
         set_current_user_id(user_id)
+        attach_started_at = time.monotonic()
         await websocket.accept()
         _logger.info(
             "terminal attach connected for session %s terminal %s",
@@ -224,7 +227,13 @@ def create_terminal_attach_router(
                     },
                 ):
                     async with runner_cm as runner_ws:
-                        await _shuttle_ws_frames(websocket, runner_ws)
+                        await _shuttle_ws_frames(
+                            websocket,
+                            runner_ws,
+                            on_first_runner_frame=lambda: _log_attach_first_output(
+                                session_id, terminal_id, attach_started_at
+                            ),
+                        )
             except _RunnerWSClosed as closed:
                 code = (
                     closed.code
@@ -376,6 +385,19 @@ async def _authorize_terminal_attach(
     return user_id
 
 
+def _log_attach_first_output(session_id: str, terminal_id: str, started_at: float) -> None:
+    """Log how long an attach took to deliver its first terminal output."""
+    _logger.info(
+        "terminal attach delivered first output",
+        extra=debug_event(
+            "terminal_attach_first_output",
+            session_id=session_id,
+            terminal_id=terminal_id,
+            first_output_ms=round((time.monotonic() - started_at) * 1000),
+        ),
+    )
+
+
 class _RunnerWSClosed(Exception):
     """Carries a runner-side close so the browser side mirrors it."""
 
@@ -385,7 +407,11 @@ class _RunnerWSClosed(Exception):
         self.reason = reason
 
 
-async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
+async def _shuttle_ws_frames(
+    browser_ws: WebSocket,
+    runner_ws: object,
+    on_first_runner_frame: Callable[[], None] | None = None,
+) -> None:
     """
     Forward frames between *browser_ws* (FastAPI) and *runner_ws*
     (websockets client connection) until either side closes.
@@ -404,6 +430,8 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
 
     :param browser_ws: The browser-facing FastAPI WebSocket.
     :param runner_ws: The runner-facing websockets client.
+    :param on_first_runner_frame: Called once, after the first runner frame
+        reaches the browser.
     """
     from websockets.exceptions import ConnectionClosed
 
@@ -426,6 +454,7 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
             return
 
     async def _runner_to_browser() -> None:
+        first_frame_callback = on_first_runner_frame
         try:
             while True:
                 msg = await runner_ws.recv()  # type: ignore[attr-defined]
@@ -433,6 +462,9 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
                     await browser_ws.send_bytes(bytes(msg))
                 else:
                     await browser_ws.send_text(msg)
+                if first_frame_callback is not None:
+                    first_frame_callback()
+                    first_frame_callback = None
         except ConnectionClosed as cc:
             # Surface the runner-side close code so the browser
             # mirrors it (4404 for missing terminal, etc.). Use

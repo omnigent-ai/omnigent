@@ -23,6 +23,7 @@ CreationStageAttribute = Literal[
     "create_persistence_ms",
     "create_identity_ms",
     "create_acl_ms",
+    "create_host_launch_ms",
 ]
 
 

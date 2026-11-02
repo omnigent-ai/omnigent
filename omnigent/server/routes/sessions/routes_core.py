@@ -1219,18 +1219,19 @@ def register_core_routes(
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
         if launch_host_id is not None and resp.runner_id is None:
-            launched = await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=resp.id,
-                host_id=launch_host_id,
-                # Already written by _create_session_from_existing_agent;
-                # only runner_id still needs the atomic set inside.
-                workspace=resp.workspace,
-                # Already canonical (see _resolve_harness).
-                harness=resp.harness,
-                conversation=conv,
-            )
+            with creation_stage("create_host_launch_ms"):
+                launched = await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=resp.id,
+                    host_id=launch_host_id,
+                    # Already written by _create_session_from_existing_agent;
+                    # only runner_id still needs the atomic set inside.
+                    workspace=resp.workspace,
+                    # Already canonical (see _resolve_harness).
+                    harness=resp.harness,
+                    conversation=conv,
+                )
             if launched is not None:
                 runner_id, launch_failed = launched
                 if launch_failed and _terminal_first_create:
@@ -1516,14 +1517,15 @@ def register_core_routes(
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
-            await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=result.session_id,
-                host_id=parsed_metadata.host_id,
-                workspace=parsed_metadata.workspace,
-                harness=canonicalize_harness(raw_harness) or raw_harness,
-            )
+            with creation_stage("create_host_launch_ms"):
+                await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=result.session_id,
+                    host_id=parsed_metadata.host_id,
+                    workspace=parsed_metadata.workspace,
+                    harness=canonicalize_harness(raw_harness) or raw_harness,
+                )
         # Default-public grant only after the launch steps were accepted (see the
         # JSON path). Sub-agent children follow their parent's grants, whether or
         # not they inherited its runner.

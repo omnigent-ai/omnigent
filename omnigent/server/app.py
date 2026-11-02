@@ -2712,6 +2712,7 @@ def create_app(
                         create_persistence_ms=_bag.get("create_persistence_ms"),
                         create_identity_ms=_bag.get("create_identity_ms"),
                         create_acl_ms=_bag.get("create_acl_ms"),
+                        create_host_launch_ms=_bag.get("create_host_launch_ms"),
                         stage="create_request",
                         status_code=status_code,
                         error_code=(

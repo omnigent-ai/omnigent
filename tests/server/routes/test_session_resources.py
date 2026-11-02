@@ -11,7 +11,7 @@ import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 from urllib.parse import quote
 
@@ -46,6 +46,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
@@ -1511,16 +1512,24 @@ async def test_create_terminal_proxies_to_runner(
     fake_runner = _FakeRunnerClient(payload=terminal_resource)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.post(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
-        json={"terminal": "bash", "session_key": "s1"},
-    )
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            json={"terminal": "bash", "session_key": "s1"},
+        )
 
     assert resp.status_code == 200
     assert resp.json()["id"] == "terminal_bash_s1"
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+    (finished,) = [row for row in rows if row["event_name"] == "terminal_create_finished"]
+    attributes = cast(dict[str, str], finished["attributes"])
+    assert finished["session_id"] == "79b22ebd2309e48fdeb450c65611d51b"
+    assert attributes["terminal"] == "bash"
+    assert attributes["status_code"] == "200"
+    for stage in ("authorize_ms", "ensure_runner_ms", "runner_launch_ms", "total_ms"):
+        assert int(attributes[stage]) >= 0
 
 
 @pytest.mark.asyncio
