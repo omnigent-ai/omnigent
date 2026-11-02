@@ -32,7 +32,7 @@ _FIRST_TURN_TIMEOUT_MS = 180_000
 _SETTLE_TIMEOUT_MS = 30_000
 _MOCK_REQUEST_TIMEOUT_S = 30.0
 _IDLE_HOLD_S = 3.0
-_CONTINUATION_DELAY_S = 10
+_CONTINUATION_GATE = "stop-hook-continuation"
 
 # Blocks the first main-session Stop that leaves an agent running; Claude then continues the turn.
 _BLOCK_ONCE_STOP_HOOK = """
@@ -66,6 +66,13 @@ def _release_all_gates(mock_llm_server_url: str) -> None:
             httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).json().get("released")
         ):
             pass
+
+
+def _release_gate(mock_llm_server_url: str, gate: str) -> bool:
+    response = httpx.post(
+        f"{mock_llm_server_url}/gate/release", params={"gate": gate}, timeout=5.0
+    )
+    return bool(response.json().get("released"))
 
 
 def _send(page: Page, text: str) -> None:
@@ -244,7 +251,7 @@ def test_blocked_stop_keeps_working_until_claude_stops_with_the_agent_running(
     _configure_background_agent_launch(mock_llm_server_url, nonce)
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": continuation_reply, "delay": _CONTINUATION_DELAY_S}],
+        [{"text": continuation_reply, "block": True, "gate": _CONTINUATION_GATE}],
         match=continue_token,
         required_tools=["Bash"],
     )
@@ -274,8 +281,14 @@ def test_blocked_stop_keeps_working_until_claude_stops_with_the_agent_running(
     assert not _user_text_seen(mock_llm_server_url, queued_token)
     assert _session_status(base_url, session_id) == "running"
 
+    # The background agent's request stays held; only the continuation resumes.
+    poll_until(
+        lambda: _release_gate(mock_llm_server_url, _CONTINUATION_GATE),
+        timeout_s=_MOCK_REQUEST_TIMEOUT_S,
+        interval_s=0.2,
+    )
     expect(page.locator(_ASSISTANT, has_text=continuation_reply).first).to_be_visible(
-        timeout=_SETTLE_TIMEOUT_MS + _CONTINUATION_DELAY_S * 1000
+        timeout=_SETTLE_TIMEOUT_MS
     )
     expect(page.locator(_ASSISTANT, has_text=queued_reply).first).to_be_visible(
         timeout=_SETTLE_TIMEOUT_MS

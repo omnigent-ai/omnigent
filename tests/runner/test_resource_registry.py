@@ -957,7 +957,7 @@ async def _observe_native_with_real_poller(
     """Observe a Claude terminal with a real poller and caller-written status file."""
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
-    status_file.parent.mkdir(parents=True)
+    status_file.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
@@ -1274,8 +1274,8 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     """A Stop that leaves a background agent running settles the turn despite a busy file.
 
     Claude keeps its status file busy for the agent's lifetime, so the idle
-    edge's resync must not republish running; a blocking Stop hook's
-    continuation or the next prompt's turn does.
+    edge's resync must not republish running, nor may a restarted runner;
+    a blocking Stop hook's continuation or the next prompt's turn does.
     """
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_conversation_id,
@@ -1327,6 +1327,14 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     await stop_leaving_the_agent_running()
     settled = ["running", "idle"] if poll_before_idle_edge else ["running"]
     assert statuses == settled
+
+    restarted_tick, restarted_statuses, restarted, _ = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    restarted_tick()
+    await asyncio.sleep(0)
+    assert restarted_statuses == ["idle"]
+    assert restarted.session_has_background_agents(session_id)
 
     feedback = {
         "type": "user",

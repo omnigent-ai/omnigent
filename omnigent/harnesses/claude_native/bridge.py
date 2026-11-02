@@ -3102,35 +3102,63 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     return raw
 
 
-def read_background_agents_after_turn(bridge_dir: Path) -> bool:
+class BackgroundAgentsAfterTurnReader:
     """
-    Return whether the main session's last turn ended with a background agent running.
+    Read whether the main session's last turn ended with a background agent running.
 
     Claude keeps reporting itself busy for as long as such an agent runs,
     although its prompt is free. Set by the main session's ``Stop`` hook and
     cleared by its next ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
     A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
-    conversation entry after that turn's last reply also ends it.
+    conversation entry after that turn's last reply also ends it. Each read
+    parses only the complete transcript lines appended since the previous one.
 
     :param bridge_dir: Bridge directory path.
-    :returns: ``True`` between that ``Stop`` and the next main-session turn.
     """
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    hold = state.get("background_agents_after_turn") if isinstance(state, dict) else None
-    if not isinstance(hold, dict):
-        return False
-    transcript_path = hold.get("transcript_path")
-    offset = hold.get("transcript_offset")
-    if not isinstance(transcript_path, str) or not isinstance(offset, int):
-        return False
-    try:
-        with open(transcript_path, "rb") as handle:
-            handle.seek(offset)
-            return not any(
-                _main_conversation_entry_type(line) in {"user", "assistant"} for line in handle
-            )
-    except OSError:
-        return False
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._hold: tuple[str, int] | None = None
+        self._transcript_identity: tuple[int, int] | None = None
+        self._scanned_to = 0
+        self._continued = False
+
+    def read(self) -> bool:
+        """
+        Return whether the last ``Stop`` still holds the session idle.
+
+        :returns: ``True`` between that ``Stop`` and the next main-session turn.
+        """
+        state = _read_json_file(self._bridge_dir / _STATE_FILE)
+        raw = state.get("background_agents_after_turn") if isinstance(state, dict) else None
+        transcript_path = raw.get("transcript_path") if isinstance(raw, dict) else None
+        offset = raw.get("transcript_offset") if isinstance(raw, dict) else None
+        if not isinstance(transcript_path, str) or not isinstance(offset, int):
+            self._hold = None
+            return False
+        if self._hold != (transcript_path, offset):
+            self._hold = (transcript_path, offset)
+            self._transcript_identity = None
+            self._continued = False
+        if self._continued:
+            return False
+        try:
+            with open(transcript_path, "rb") as handle:
+                status = os.fstat(handle.fileno())
+                identity = (status.st_dev, status.st_ino)
+                if identity != self._transcript_identity or status.st_size < self._scanned_to:
+                    self._transcript_identity, self._scanned_to = identity, offset
+                handle.seek(self._scanned_to)
+                appended = handle.read()
+        except OSError:
+            return False
+        complete = appended[: appended.rfind(b"\n") + 1]
+        self._scanned_to += len(complete)
+        self._continued = any(
+            _main_conversation_entry_type(line) in {"user", "assistant"}
+            for line in complete.splitlines()
+        )
+        return not self._continued
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -4017,14 +4045,15 @@ def _offset_after_last_main_reply(transcript_path: str) -> int | None:
     return found
 
 
-def _main_conversation_entry_type(line: bytes) -> object:
+def _main_conversation_entry_type(line: bytes) -> str | None:
     try:
         entry = json.loads(line)
     except ValueError:
         return None
     if not isinstance(entry, dict) or entry.get("isSidechain"):
         return None
-    return entry.get("type")
+    entry_type = entry.get("type")
+    return entry_type if isinstance(entry_type, str) else None
 
 
 def _normalize_background_task(raw: object) -> _JsonObject | None:

@@ -37,6 +37,8 @@ from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
+    _TURN_END_SCAN_BYTES,
+    BackgroundAgentsAfterTurnReader,
     _build_tools,
     _claude_prompt_rendered,
     _escape_slash_command_text,
@@ -59,7 +61,6 @@ from omnigent.harnesses.claude_native.bridge import (
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
-    read_background_agents_after_turn,
     read_claude_session_id,
     read_hook_events_from_offset,
     read_launch_model,
@@ -862,6 +863,12 @@ def _stop_leaving_agent_running(transcript_path: Path) -> dict[str, Any]:
     }
 
 
+def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        for entry in entries:
+            transcript.write(json.dumps(entry) + "\n")
+
+
 @pytest.mark.parametrize(
     ("background_tasks", "agent_running"),
     [
@@ -889,7 +896,7 @@ def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
 
     record_hook_event(bridge_dir, stop)
 
-    assert read_background_agents_after_turn(bridge_dir) is agent_running
+    assert BackgroundAgentsAfterTurnReader(bridge_dir).read() is agent_running
 
 
 @pytest.mark.parametrize("next_event", ["UserPromptSubmit", "StopFailure", "SessionStart"])
@@ -901,16 +908,17 @@ def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path)
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
     for child_event in ("UserPromptSubmit", "Stop"):
         record_hook_event(
             bridge_dir,
             {"hook_event_name": child_event, "session_id": "claude-session", "agent_id": "a1"},
         )
-    assert read_background_agents_after_turn(bridge_dir) is True
+    assert reader.read() is True
 
     record_hook_event(bridge_dir, {"hook_event_name": next_event, "session_id": "claude-session"})
 
-    assert read_background_agents_after_turn(bridge_dir) is False
+    assert reader.read() is False
 
 
 @pytest.mark.parametrize(
@@ -921,6 +929,8 @@ def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
                 {"type": "attachment", "attachment": {"type": "hook_success"}},
                 {"type": "system", "subtype": "stop_hook_summary"},
                 {"type": "user", "isSidechain": True, "message": {"content": "agent step"}},
+                {"type": {}},
+                {"type": ["user"]},
             ],
             True,
         ),
@@ -936,13 +946,14 @@ def test_background_agent_mark_ends_when_the_main_conversation_continues(
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path)
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    assert reader.read() is True
 
     with transcript_path.open("a", encoding="utf-8") as transcript:
         transcript.write("not json\n")
-        for entry in appended_entries:
-            transcript.write(json.dumps(entry) + "\n")
+    _append_entries(transcript_path, *appended_entries)
 
-    assert read_background_agents_after_turn(bridge_dir) is still_held
+    assert reader.read() is still_held
 
 
 def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(
@@ -955,23 +966,88 @@ def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(
 
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
 
-    assert read_background_agents_after_turn(bridge_dir) is False
+    assert BackgroundAgentsAfterTurnReader(bridge_dir).read() is False
 
 
-@pytest.mark.parametrize("transcript", ["missing", "no_reply"])
+@pytest.mark.parametrize(
+    "transcript", ["missing_at_stop", "deleted_after_stop", "no_reply", "reply_beyond_scan"]
+)
 def test_background_agent_mark_needs_a_readable_turn_end(tmp_path: Path, transcript: str) -> None:
     """Without the turn's last reply in the transcript, a busy session stays running."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
-    _write_turn(transcript_path)
     if transcript == "no_reply":
         transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
+    elif transcript == "reply_beyond_scan":
+        _write_turn(transcript_path, {"type": "attachment", "padding": "x" * _TURN_END_SCAN_BYTES})
+    elif transcript == "deleted_after_stop":
+        _write_turn(transcript_path)
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
-    if transcript == "missing":
-        assert read_background_agents_after_turn(bridge_dir) is True
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    if transcript == "deleted_after_stop":
+        assert reader.read() is True
         transcript_path.unlink()
 
-    assert read_background_agents_after_turn(bridge_dir) is False
+    assert reader.read() is False
+
+
+def test_background_agent_mark_parses_each_complete_appended_line_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polling through a long agent run parses only new lines, each once it is complete."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    parsed: list[bytes] = []
+    entry_type = claude_native_bridge._main_conversation_entry_type
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_main_conversation_entry_type",
+        lambda line: parsed.append(line) or entry_type(line),
+    )
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    progress = json.dumps({"type": "progress", "data": {"type": "agent_progress"}})
+    reply = json.dumps({"type": "assistant", "message": {"content": []}})
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write(progress + "\n")
+        transcript.flush()
+        assert reader.read() is True
+        assert reader.read() is True
+        transcript.write(reply)
+        transcript.flush()
+        assert reader.read() is True
+        transcript.write("\n")
+        transcript.flush()
+        assert reader.read() is False
+        assert reader.read() is False
+
+    assert parsed == [progress.encode(), reply.encode()]
+
+
+@pytest.mark.parametrize("rewrite", ["replaced", "truncated"])
+def test_background_agent_mark_rescans_a_rewritten_transcript(
+    tmp_path: Path, rewrite: str
+) -> None:
+    """A transcript replaced or cut short is rescanned from the turn's last reply."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    padding = {"type": "attachment", "padding": "x" * 1000}
+    _append_entries(transcript_path, padding)
+    assert reader.read() is True
+
+    if rewrite == "replaced":
+        replacement = tmp_path / "replacement.jsonl"
+        _write_turn(replacement, _STOP_HOOK_FEEDBACK, padding)
+        os.replace(replacement, transcript_path)
+    else:
+        _write_turn(transcript_path, _STOP_HOOK_FEEDBACK)
+
+    assert reader.read() is False
 
 
 @pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])

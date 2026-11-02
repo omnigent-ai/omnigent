@@ -1800,13 +1800,14 @@ class SessionResourceRegistry:
     ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
         """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
         from omnigent.harnesses.claude_native.bridge import (
+            BackgroundAgentsAfterTurnReader,
             bridge_dir_for_conversation_id,
-            read_background_agents_after_turn,
             read_claude_session_id,
         )
         from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
+        background_agents = BackgroundAgentsAfterTurnReader(bridge_dir)
 
         def _session_id_getter() -> str | None:
             # Best-effort: the bridge records Claude's uuid only after the
@@ -1820,7 +1821,7 @@ class SessionResourceRegistry:
 
         def _background_agents_after_turn() -> bool:
             try:
-                return read_background_agents_after_turn(bridge_dir)
+                return background_agents.read()
             except Exception:  # noqa: BLE001 - an unreadable mark reports Claude's status as is.
                 return False
 
