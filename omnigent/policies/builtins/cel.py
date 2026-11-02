@@ -51,17 +51,19 @@ NOT read ``factory_params``)::
                 ? {"result": "DENY"} : {"result": "ALLOW"}
               reason: Shell access is blocked.
 
-Dynamic, via the session policy API::
+Dynamic, via the session policy API:
 
-    POST / v1 / sessions / {session_id} / policies
+.. code-block:: http
+
+    POST /v1/sessions/{session_id}/policies
     {
         "name": "block_shell",
         "type": "python",
         "handler": "omnigent.policies.builtins.cel.cel_policy",
         "factory_params": {
             "expression": "event.target == 'sys_os_shell' ? {'result': 'DENY'} : null",
-            "reason": "Shell access is blocked.",
-        },
+            "reason": "Shell access is blocked."
+        }
     }
 
 CEL reference: https://cel.dev/overview/cel-overview
@@ -188,7 +190,9 @@ def cel_policy(
             return None
         verdict = str(result[_result_key]).upper()
         if verdict not in ("DENY", "ASK", "ALLOW"):
-            _warn_non_decision(expression, f"an unknown result {verdict!r}")
+            # Name only the type: the value can carry event content.
+            result_type = type(result[_result_key]).__name__
+            _warn_non_decision(expression, f"a {result_type} result other than DENY, ASK or ALLOW")
             return None
 
         out: PolicyResponse = {"result": verdict}  # type: ignore[typeddict-item]
@@ -242,7 +246,7 @@ def _warn_non_decision(expression: str, description: str) -> None:
         ``"a BoolType instead of a map"``.
     """
     _log.warning(
-        "CEL policy expression returned %s, so it abstains on every event. "
+        "CEL policy expression returned %s, so the policy abstained. "
         'Return a map such as {"result": "DENY"}. Expression: %.200s',
         description,
         expression,

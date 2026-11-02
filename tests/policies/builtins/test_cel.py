@@ -227,7 +227,7 @@ def test_state_updates_must_be_a_list() -> None:
     [
         ('event.type == "tool_call"', "BoolType instead of a map"),
         ('"DENY"', "StringType instead of a map"),
-        ('{"result": "BLOCK"}', "unknown result 'BLOCK'"),
+        ('{"result": "BLOCK"}', "StringType result other than DENY, ASK or ALLOW"),
     ],
 )
 def test_non_decision_return_abstains_with_one_warning(
@@ -243,6 +243,31 @@ def test_non_decision_return_abstains_with_one_warning(
     assert len(warnings) == 1
     assert expected_fragment in warnings[0]
     assert expression in warnings[0]
+
+
+def test_non_decision_warning_omits_event_content(caplog: pytest.LogCaptureFixture) -> None:
+    """A result echoed from the event is reported by type, never by value."""
+    _warn_non_decision.cache_clear()
+    evaluate = cel_policy(expression="event.data")
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        assert evaluate({"type": "tool_call", "data": {"result": "synthetic_secret"}}) is None
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert "synthetic_secret" not in warnings[0].lower()
+
+
+def test_mixed_outcome_expression_still_decides_after_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A warning for one event does not stop later events from getting a verdict."""
+    _warn_non_decision.cache_clear()
+    evaluate = cel_policy(expression='event.type == "tool_call" ? {"result": "DENY"} : false')
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        assert evaluate({"type": "request", "data": "hi"}) is None
+        assert evaluate({"type": "tool_call", "data": {"name": "x"}})["result"] == "DENY"
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert "abstained" in warnings[0]
 
 
 @pytest.mark.parametrize("expression", ["null", '{"reason": "no verdict"}'])
