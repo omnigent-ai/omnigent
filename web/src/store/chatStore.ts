@@ -6211,11 +6211,24 @@ export async function startStreamPump(
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
+        // An open the network never answers would otherwise park a visible
+        // tab here; the wake fast-path only runs on visibility/online events.
+        let openTimedOut = false;
+        const openTimer = setTimeout(() => {
+          openTimedOut = true;
+          attempt.abort();
+        }, SSE_STALL_TIMEOUT_MS);
         try {
           streamRes = await openSessionStream(id, attempt.signal, { idle });
         } catch (err) {
           if (err instanceof Error && err.name === "AbortError") {
             if (controller.signal.aborted || isConversationDisposed(id)) break;
+            if (openTimedOut) {
+              console.warn(
+                `Session ${id}: stream open got no response in ${SSE_STALL_TIMEOUT_MS} ms, will retry`,
+              );
+              failedOpens += 1;
+            }
             // Only the attempt was aborted; reopen with current presence
             // and host routing without discarding the stream binding.
             continue;
@@ -6224,6 +6237,8 @@ export async function startStreamPump(
           console.warn(`Session ${id}: stream connect failed, will retry`, err);
           failedOpens += 1;
           continue;
+        } finally {
+          clearTimeout(openTimer);
         }
 
         if (controller.signal.aborted || isConversationDisposed(id)) break;
