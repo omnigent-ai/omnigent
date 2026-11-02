@@ -627,6 +627,7 @@ function loadNavigationHarness({
             return {
               closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+              setRecentSessionSwitchSupported: () => {},
             };
           },
         },
@@ -5740,5 +5741,93 @@ describe("main-owned local host eligibility", () => {
         .hostIsThisMachine,
       false,
     );
+  });
+});
+
+describe("Close Tab menu item", () => {
+  const server = "https://host.example";
+
+  function loadCloseTabHarness(t, options = {}) {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server, ...options });
+    t.after(h.cleanup);
+    let closes = 0;
+    h.win.close = () => {
+      closes++;
+    };
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.registerIpc();
+    h.api.buildMenu();
+    h.setUrl(server);
+    return {
+      h,
+      pageEvent: { sender: h.webContents, senderFrame: { url: server } },
+      closes: () => closes,
+      closeTabRequests: () =>
+        h.calls.progress.filter((message) => message.channel === "omnigent:close-tab").length,
+      clickMenuItem: (id) => h.calls.appMenu.getMenuItemById(id).click(),
+    };
+  }
+
+  it("binds CmdOrCtrl+W to Close Tab and CmdOrCtrl+Shift+W to Close Window", (t) => {
+    const { h, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    assert.equal(h.calls.appMenu.getMenuItemById("close_tab").accelerator, "CmdOrCtrl+W");
+    assert.equal(h.calls.appMenu.getMenuItemById("close_window").accelerator, "CmdOrCtrl+Shift+W");
+    clickMenuItem("close_window");
+    assert.equal(closes(), 1);
+    assert.equal(closeTabRequests(), 0);
+  });
+
+  it("closes the window when the page never opted in", (t) => {
+    const { closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    clickMenuItem("close_tab");
+    assert.equal(closes(), 1);
+    assert.equal(closeTabRequests(), 0);
+  });
+
+  it("forwards Close Tab to an opted-in page until it opts out", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 0);
+
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, false);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 1);
+  });
+
+  it("ignores opt-in and close requests from a page off the pinned server", (t) => {
+    const { h, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.setUrl("https://evil.example");
+    const foreignEvent = { sender: h.webContents, senderFrame: { url: "https://evil.example" } };
+    h.ipc.get("omnigent:set-close-tab-supported")(foreignEvent, true);
+    h.ipc.get("omnigent:close-window")(foreignEvent);
+    assert.equal(closes(), 0);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 0);
+    assert.equal(closes(), 1);
+  });
+
+  it("lets the page close its own window", (t) => {
+    const { h, pageEvent, closes } = loadCloseTabHarness(t);
+    h.ipc.get("omnigent:close-window")(pageEvent);
+    assert.equal(closes(), 1);
+  });
+
+  it("drops the opt-in on a main-frame navigation but not an in-page one", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.api.createWindow();
+    h.setUrl(server);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+
+    h.emit("did-start-navigation", `${server}/c/other`, true, true);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+
+    h.emit("did-start-navigation", `${server}/`, false, true);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 1);
   });
 });

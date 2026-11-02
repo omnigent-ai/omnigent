@@ -709,6 +709,11 @@ interface WorkspacePanelProps {
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
+  /**
+   * Filled with a function that closes the selected rail tab (the desktop
+   * Close Tab shortcut); it returns false when no closable tab is selected.
+   */
+  closeSelectedTabRef?: RefObject<(() => boolean) | null>;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   showContentSearch?: boolean;
@@ -834,6 +839,7 @@ function WorkspacePanelImpl({
   onRightRailTabChange,
   openPanels,
   onClosePanel,
+  closeSelectedTabRef,
   showFilesPanel,
   showContentSearch = false,
   showGithubTab,
@@ -1181,6 +1187,43 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
+  // Mirrors the tab strip's own `active` rules, so Close Tab closes exactly
+  // the tab drawn as selected.
+  const closeSelectedTab = (): boolean => {
+    if (selectedFilePath !== null) {
+      onCloseFile(selectedFilePath);
+      return true;
+    }
+    if (terminalShown && selectedTerminalKey !== null) {
+      // A viewer can't close terminals; still swallow the shortcut so it
+      // doesn't fall through to leaving the session.
+      if (isEditorLevel(permissionLevel) && closingTerminalKey !== selectedTerminalKey) {
+        onCloseTerminal(selectedTerminalKey);
+      }
+      return true;
+    }
+    if (browserSelected && browsers.selected !== null) {
+      void closeBrowserTab(browsers.selected);
+      return true;
+    }
+    if (sideChatSelected && sideChats.selected !== null) {
+      void closeSideChat(sideChats.selected);
+      return true;
+    }
+    const panel = visibleOpenPanels.find((tab) => tab === rightRailTab);
+    if (panel !== undefined) {
+      onClosePanel(panel);
+      return true;
+    }
+    return false;
+  };
+  if (closeSelectedTabRef) closeSelectedTabRef.current = closeSelectedTab;
+  useEffect(() => {
+    if (!closeSelectedTabRef) return;
+    return () => {
+      closeSelectedTabRef.current = null;
+    };
+  }, [closeSelectedTabRef]);
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
     activePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });

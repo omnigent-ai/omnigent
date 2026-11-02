@@ -15,6 +15,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { browserViewId } from "@/lib/browserTabs";
+import { LEVEL_EDIT } from "@/lib/permissionsApi";
 import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
 import type { ChangedSort } from "./FlatFileList";
@@ -183,6 +184,8 @@ function renderWorkspace(
     mobileSideChatsOpen?: boolean;
     queryClient?: QueryClient;
     initialPath?: string;
+    closeSelectedTabRef?: { current: (() => boolean) | null };
+    permissionLevel?: number | null;
   } = {},
 ) {
   let overrides = initialOverrides;
@@ -219,6 +222,7 @@ function renderWorkspace(
         onRightRailTabChange={onRightRailTabChange}
         openPanels={overrides.openPanels ?? []}
         onClosePanel={onClosePanel}
+        closeSelectedTabRef={overrides.closeSelectedTabRef}
         showFilesPanel={overrides.showFilesPanel ?? true}
         showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
@@ -240,7 +244,7 @@ function renderWorkspace(
         onCloseTerminal={onCloseTerminal}
         maximized={overrides.maximized ?? false}
         onToggleMaximized={onToggleMaximized}
-        permissionLevel={null}
+        permissionLevel={overrides.permissionLevel ?? null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
         filesPanelShowHidden={false}
@@ -277,6 +281,74 @@ function renderWorkspace(
     view,
   };
 }
+
+describe("WorkspacePanel Close Tab", () => {
+  function renderWithCloser(overrides: Parameters<typeof renderWorkspace>[0]) {
+    const closeSelectedTabRef: { current: (() => boolean) | null } = { current: null };
+    const rendered = renderWorkspace({ ...overrides, closeSelectedTabRef });
+    return { ...rendered, closeSelectedTab: () => closeSelectedTabRef.current?.() };
+  }
+
+  it("closes the selected file tab", () => {
+    const { closeSelectedTab, onCloseFile, onClosePanel } = renderWithCloser({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onCloseFile).toHaveBeenCalledWith("README.md");
+    expect(onClosePanel).not.toHaveBeenCalled();
+  });
+
+  it("closes the selected unpinned page tab", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { closeSelectedTab, onClosePanel } = renderWithCloser({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+  });
+
+  it("closes the selected terminal tab", () => {
+    const { closeSelectedTab, onCloseTerminal } = renderWithCloser({
+      openTerminals: ["terminal:main"],
+      selectedTerminalKey: "terminal:main",
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onCloseTerminal).toHaveBeenCalledWith("terminal:main");
+  });
+
+  it("swallows Close Tab on a terminal a viewer can't close", () => {
+    const { closeSelectedTab, onCloseTerminal } = renderWithCloser({
+      openTerminals: ["terminal:main"],
+      selectedTerminalKey: "terminal:main",
+      permissionLevel: LEVEL_EDIT - 1,
+    });
+    expect(closeSelectedTab()).toBe(true);
+    expect(onCloseTerminal).not.toHaveBeenCalled();
+  });
+
+  it("reports nothing to close on a pinned nav tab", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { closeSelectedTab, onClosePanel, onCloseFile } = renderWithCloser({
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+    });
+    expect(closeSelectedTab()).toBe(false);
+    expect(onClosePanel).not.toHaveBeenCalled();
+    expect(onCloseFile).not.toHaveBeenCalled();
+  });
+
+  it("clears the closer on unmount", () => {
+    const closeSelectedTabRef: { current: (() => boolean) | null } = { current: null };
+    const { view } = renderWorkspace({ closeSelectedTabRef });
+    expect(closeSelectedTabRef.current).not.toBeNull();
+    view.unmount();
+    expect(closeSelectedTabRef.current).toBeNull();
+  });
+});
 
 describe("WorkspacePanel surface presentation", () => {
   it("offers unpinned pages in + without requiring shell or browser support", () => {
