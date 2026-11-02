@@ -2030,15 +2030,20 @@ def register_core_routes(
         # here and never reaches the probe. Only stamp-stale candidates fall
         # through to liveness_lookup, which additionally rules out a runner
         # whose tunnel is live on THIS replica before we settle.
+        offline_runner_ids: set[str] = set()
         if liveness_lookup is not None:
-            orphan_suspects = [
+            stale_runner_rows = [
                 conv
                 for conv in page.data
                 if conv.agent_id is not None
                 and conv.runner_id is not None
-                and conv.live_status in ("running", "waiting")
-                and _session_status_cache.get(conv.id) is None
                 and not runner_seen_is_fresh(conv.runner_last_seen)
+            ]
+            orphan_suspects = [
+                conv
+                for conv in stale_runner_rows
+                if conv.live_status in ("running", "waiting")
+                and _session_status_cache.get(conv.id) is None
                 and (
                     permission_store is None
                     or _permission_level_from_grants(
@@ -2049,17 +2054,27 @@ def register_core_routes(
                     == LEVEL_OWNER
                 )
             ]
-            if orphan_suspects:
-                orphan_liveness = await asyncio.to_thread(
-                    liveness_lookup, [conv.id for conv in orphan_suspects]
-                )
+            # Also probe stale-stamp rows with pending prompts; offline runners read 0 (WS rule).
+            pending_suspect_ids = {
+                conv.id
+                for conv in stale_runner_rows
+                if pending_counts.get(conv.id, 0) > 0 or (conv.pending_elicitation_count or 0) > 0
+            }
+            probe_ids = list(
+                dict.fromkeys([*(conv.id for conv in orphan_suspects), *pending_suspect_ids])
+            )
+            if probe_ids:
+                stale_liveness = await asyncio.to_thread(liveness_lookup, probe_ids)
+                # runner_online is False only when no replica holds the runner's tunnel and
+                # its stamp is cleared or past the TTL.
+                offline_runner_ids = {
+                    session_id
+                    for session_id in probe_ids
+                    if (result := stale_liveness.get(session_id)) is not None
+                    and not result.runner_online
+                }
                 for conv in orphan_suspects:
-                    result = orphan_liveness.get(conv.id)
-                    # runner_online is False only once the runner is gone from
-                    # every replica (no tunnel anywhere AND runner_last_seen
-                    # stale past the TTL), so this fires for a genuinely
-                    # orphaned runner, never one mid-reconnect within grace.
-                    if result is not None and not result.runner_online:
+                    if conv.id in offline_runner_ids:
                         await asyncio.to_thread(
                             reconcile_orphaned_running_status,
                             conv.id,
@@ -2086,14 +2101,12 @@ def register_core_routes(
             for conv in page.data
             if conv.agent_id is not None
         ]
-        # Apart from the bounded orphan-suspect probe above, the list does not
-        # compute per-item liveness
-        # (runner_online / host_online). No list consumer reads it: the
-        # sidebar no longer surfaces connection state, and the only live
-        # consumer — the open-session view — sources liveness from the
-        # single-session snapshot, the WS stream, and the /health poll, not
-        # from list rows. Skipping it here removes the session-connectivity
-        # and hosts-table queries from every GET /v1/sessions.
+        for item in items:
+            if item.id in offline_runner_ids:
+                item.pending_elicitations_count = 0
+        # Beyond the stale-runner probe above, list rows skip per-item liveness
+        # (runner_online / host_online): no list consumer reads it, and skipping it saves
+        # the session-connectivity and hosts-table queries on every GET /v1/sessions.
         return PaginatedList(
             data=[item.model_dump(exclude_none=True) for item in items],
             first_id=page.first_id,

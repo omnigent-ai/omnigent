@@ -1473,9 +1473,9 @@ async def _apply_liveness_to_items(
     Attach runner + host liveness to session-list items when a lookup is
     wired.
 
-    Both ``GET /v1/sessions`` and ``WS /v1/sessions/updates`` use this so
-    HTTP reconciliation preserves the same ``runner_online`` /
-    ``host_online`` fields that push frames patch into the web cache.
+    ``WS /v1/sessions/updates`` uses this. ``GET /v1/sessions`` omits the
+    liveness fields and applies only the offline-runner pending-count rule
+    below, to rows whose ``runner_last_seen`` stamp is stale.
 
     :param items: Session-list rows to annotate.
     :param liveness_lookup: Bulk liveness lookup from session id to a
