@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from time import time
+from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -14,7 +16,14 @@ _COMPOSER = "Send a message…"
 
 
 @pytest.fixture
-def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
+def appearance_features() -> dict[str, bool]:
+    return {}
+
+
+@pytest.fixture
+def appearance_url(
+    browser_contract: BrowserContract, appearance_features: dict[str, bool]
+) -> Iterator[str]:
     empty_list = {
         "object": "list",
         "data": [],
@@ -40,7 +49,7 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {},
+            "features": appearance_features,
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -67,6 +76,115 @@ def appearance_url(browser_contract: BrowserContract) -> Iterator[str]:
         "**/v1/sessions/updates*", lambda ws: ws.on_message(lambda _message: None)
     )
     yield browser_contract.base_url
+
+
+def test_custom_order_commits_on_drop_and_survives_grouping_and_reload(
+    page: Page,
+    appearance_url: str,
+    appearance_features: dict[str, bool],
+    browser_contract: BrowserContract,
+) -> None:
+    """Custom retains Created's order until a drop; new sessions precede it."""
+    appearance_features["sidebar_grouping_ui"] = True
+    sessions = [
+        {
+            "id": f"{index + 1:032x}",
+            "object": "conversation",
+            "title": title,
+            "created_at": (index + 1) * 10,
+            "updated_at": (3 - index) * 100,
+            "status": "idle",
+            "permission_level": None,
+            "labels": {},
+        }
+        for index, title in enumerate(("Running session", "Awaiting session", "Idle session"))
+    ]
+    sessions[0]["status"] = "running"
+    sessions[1]["pending_elicitations_count"] = 1
+
+    def session_list(request: Request) -> dict:
+        params = parse_qs(urlparse(request.url).query)
+        rows = (
+            []
+            if "pinned" in params
+            else sorted(
+                sessions,
+                key=lambda row: (row[params.get("sort_by", ["created_at"])[0]], row["id"]),
+                reverse=True,
+            )
+        )
+        return {
+            "data": rows,
+            "has_more": False,
+            "first_id": rows[0]["id"] if rows else None,
+            "last_id": rows[-1]["id"] if rows else None,
+        }
+
+    browser_contract.json("/v1/sessions", session_list)
+    browser_contract.json(
+        re.compile(r"/v1/sessions/[0-9a-f]{32}/items(?:\?.*)?$"),
+        {"data": [], "has_more": False},
+    )
+    page.goto(appearance_url)
+    rows = page.locator("li[data-sidebar-session-id]").get_by_role("link")
+    expect(rows).to_have_count(3)
+
+    def open_submenu(test_id: str) -> None:
+        page.get_by_test_id("session-filter").press("ArrowDown")
+        page.get_by_test_id(test_id).click()
+
+    open_submenu("session-ordering-menu")
+    page.get_by_role("menuitemradio", name="Created", exact=True).click()
+    page.keyboard.press("Escape")
+    initial = ["Idle session", "Awaiting session", "Running session"]
+    expect(rows).to_have_text(initial)
+    source = page.get_by_role("link", name="Running session").bounding_box()
+    target = page.get_by_role("link", name="Idle session").bounding_box()
+    assert source and target
+    page.mouse.move(source["x"] + 30, source["y"] + source["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    hovered = page.locator('[data-session-order-over="true"]')
+    expect(hovered).to_have_attribute("data-sidebar-session-id", sessions[2]["id"])
+    indicator = hovered.get_by_role("link")
+    expect(indicator).to_have_css("outline-width", "2px")
+    expect(indicator).to_have_css("outline-style", "dashed")
+    expect(indicator).to_have_css("outline-offset", "-2px")
+    expect(indicator).to_have_css("outline-color", re.compile(r"/ 0\.4\)$"))
+    expect(indicator).to_have_css("background-color", "rgba(0, 0, 0, 0)")
+    expect(rows).to_have_text(initial)
+    page.mouse.up()
+    reordered = ["Running session", "Idle session", "Awaiting session"]
+    expect(rows).to_have_text(reordered)
+    open_submenu("session-ordering-menu")
+    expect(page.get_by_role("menuitemradio", name="Custom")).to_be_checked()
+    page.keyboard.press("Escape")
+
+    for row in sessions:
+        row.update(status="running", pending_elicitations_count=0)
+    for grouping in ("Status", "Harness", "Created", "Updated"):
+        open_submenu("session-grouping-menu")
+        page.get_by_role("menuitemradio", name=grouping, exact=True).click()
+        page.keyboard.press("Escape")
+        page.reload()
+        expect(rows).to_have_text(reordered)
+
+    sessions.append(
+        {
+            **sessions[0],
+            "id": f"{4:032x}",
+            "title": "New session",
+            "created_at": time(),
+            "updated_at": time(),
+        }
+    )
+    page.reload()
+    expect(rows).to_have_text(["New session", *reordered])
+    appearance_features["sidebar_grouping_ui"] = False
+    page.reload()
+    expect(rows).to_have_text(
+        ["New session", "Running session", "Awaiting session", "Idle session"]
+    )
 
 
 @pytest.fixture
