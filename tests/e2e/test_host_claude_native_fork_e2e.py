@@ -61,6 +61,7 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.helpers import POLL_INTERVAL_S
 from tests.e2e.test_host_claude_native_e2e import (
+    _assistant_text,
     _claude_native_agent_id,
     _online_host_id,
     _poll_for_assistant_marker,
@@ -886,4 +887,116 @@ def test_fork_native_source_into_sdk_carries_history(
             assert marker in text, (
                 f"SDK clone did not recall {marker!r} (got {text!r}) — the native "
                 "source's transcript was not replayed as context into the SDK clone"
+            )
+
+
+def _response_id_of_assistant_marker(client: httpx.Client, *, session_id: str, marker: str) -> str:
+    """
+    Return the response id of the assistant message that contains *marker*.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session to search.
+    :param marker: Text the assistant replied with, e.g. ``"ACK_BRAVO_1A2B3C"``.
+    :returns: That message's ``response_id``, the fork-from-here cutoff.
+    :raises AssertionError: If no assistant message with a response id has it.
+    """
+    resp = client.get(
+        f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}, timeout=30.0
+    )
+    resp.raise_for_status()
+    for item in resp.json().get("data", []):
+        if marker in _assistant_text(item) and item.get("response_id"):
+            return str(item["response_id"])
+    raise AssertionError(f"no assistant message in {session_id} contains {marker!r}")
+
+
+def test_truncated_fork_of_fork_resumes_its_own_history(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork-from-here of a forked session resumes the forked session's turns.
+
+    The forked parent carries its source's Claude session id as its own
+    one-shot fork directive. A truncated fork of that parent must not inherit
+    the directive; otherwise its Claude resumes the grandparent's transcript
+    and cannot recall the parent's own turns that the Web UI shows.
+    """
+    workspace = tmp_path / "fork_of_fork_ws"
+    workspace.mkdir()
+    suffix = uuid.uuid4().hex[:6].upper()
+    alpha, bravo, charlie = (f"{word}_{suffix}" for word in ("ALPHA", "BRAVO", "CHARLIE"))
+
+    with _workspaces_trusted_in_claude_config([workspace]):
+        with _host_daemon(tmp_path, live_server):
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+
+            # 1. The base session learns ALPHA and records its Claude session.
+            base_id = _create_native_session(
+                http_client, agent_id=agent_id, host_id=host_id, workspace=workspace
+            )
+            _send_user_message(
+                http_client,
+                session_id=base_id,
+                text=f"Remember code word {alpha}. Reply with exactly: ACK_{alpha}",
+            )
+            _poll_for_assistant_marker(
+                http_client, session_id=base_id, marker=f"ACK_{alpha}", timeout=180.0
+            )
+            _wait_for_external_session_id(http_client, session_id=base_id, timeout=60.0)
+
+            # 2. Fork A learns BRAVO, then CHARLIE, on its own Claude session.
+            parent_id = _fork_session(http_client, source_id=base_id, title="fork A")
+            _launch_runner(http_client, host_id=host_id, session_id=parent_id, workspace=workspace)
+            for word in (bravo, charlie):
+                _send_user_message(
+                    http_client,
+                    session_id=parent_id,
+                    text=f"Remember code word {word}. Reply with exactly: ACK_{word}",
+                )
+                _poll_for_assistant_marker(
+                    http_client, session_id=parent_id, marker=f"ACK_{word}", timeout=180.0
+                )
+            parent_claude_id = _wait_for_external_session_id(
+                http_client, session_id=parent_id, timeout=60.0
+            )
+            base_claude_id = http_client.get(f"/v1/sessions/{base_id}").json()[
+                "external_session_id"
+            ]
+            assert parent_claude_id != base_claude_id
+
+            # 3. Fork B from A's BRAVO response, as "fork from here" does.
+            cutoff = _response_id_of_assistant_marker(
+                http_client, session_id=parent_id, marker=f"ACK_{bravo}"
+            )
+            resp = http_client.post(
+                f"/v1/sessions/{parent_id}/fork",
+                json={"title": "fork B", "up_to_response_id": cutoff},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            child_id = str(resp.json()["id"])
+            _launch_runner(http_client, host_id=host_id, session_id=child_id, workspace=workspace)
+
+            # 4. B's Claude must know exactly the turns its copied items show.
+            _send_user_message(
+                http_client,
+                session_id=child_id,
+                text=(
+                    "List every code word I asked you to remember in this conversation. "
+                    "Reply with RECALL: followed by the code words separated by spaces."
+                ),
+            )
+            text = _poll_for_assistant_marker(
+                http_client, session_id=child_id, marker="RECALL:", timeout=180.0
+            )
+            assert alpha in text and bravo in text, (
+                f"fork B's Claude did not resume fork A's history up to BRAVO: {text!r}"
+            )
+            assert charlie not in text, f"fork B's Claude saw a turn after the cutoff: {text!r}"
+            child_labels = http_client.get(f"/v1/sessions/{child_id}").json().get("labels", {})
+            assert "omnigent.fork.source_external_session_id" not in child_labels, (
+                f"truncated fork inherited a native resume directive: {child_labels!r}"
             )
