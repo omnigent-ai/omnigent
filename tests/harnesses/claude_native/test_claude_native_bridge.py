@@ -1394,6 +1394,17 @@ _TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-mes
 _TASK_COMPLETION = (
     "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"
 )
+_BACKGROUND_TASK_REMINDER = (
+    "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n"
+    "This is an automated background-task event, NOT a message from the user.\n\n"
+    "<task-notification>\n<task-id>bx1</task-id>\n<status>completed</status>\n"
+    '<summary>Background command "Run triage" completed (exit code 0)</summary>\n'
+    "</task-notification>\n</system-reminder>"
+)
+_NESTED_RULES_REMINDER = (
+    "<system-reminder>\nContents of /repo/.claude/rules/general.md:\n\n"
+    "# Rules\nKeep changes focused.\n</system-reminder>"
+)
 
 
 def _read_native_user(
@@ -1481,6 +1492,9 @@ def test_team_markup_needs_provenance(
             "<task-notification><task-id>agent-1</task-id><status>completed</status>",
             {"isMeta": True},
         ),
+        (None, _BACKGROUND_TASK_REMINDER, {}),
+        (None, _NESTED_RULES_REMINDER + "\n" + _NESTED_RULES_REMINDER, {}),
+        ("prompt", _BACKGROUND_TASK_REMINDER, {}),
     ],
 )
 def test_internal_scaffolding_does_not_split_parent_response(
@@ -1489,6 +1503,40 @@ def test_internal_scaffolding_does_not_split_parent_response(
     _, response_id, items = _read_native_user(tmp_path, text, queued=queued, **metadata)
     assert items == []
     assert response_id == "active"
+
+
+@pytest.mark.parametrize(
+    "content,origin,visible",
+    [
+        ([{"type": "text", "text": _NESTED_RULES_REMINDER}], None, []),
+        (
+            [
+                {"type": "text", "text": _BACKGROUND_TASK_REMINDER},
+                {"type": "text", "text": "Push the branch"},
+            ],
+            None,
+            ["Push the branch"],
+        ),
+        (_NESTED_RULES_REMINDER, {"kind": "human"}, [_NESTED_RULES_REMINDER]),
+        (
+            [{"type": "text", "text": _NESTED_RULES_REMINDER}],
+            {"kind": "human"},
+            [_NESTED_RULES_REMINDER],
+        ),
+        (
+            _NESTED_RULES_REMINDER + "\nWhat do these rules mean?",
+            None,
+            [_NESTED_RULES_REMINDER + "\nWhat do these rules mean?"],
+        ),
+    ],
+)
+def test_claude_system_reminders_stay_out_of_user_messages(
+    tmp_path: Path, content: Any, origin: dict[str, str] | None, visible: list[str]
+) -> None:
+    _, response_id, items = _read_native_user(tmp_path, content, origin=origin)
+    assert [block["text"] for item in items for block in item.data["content"]] == visible
+    assert not any(item.data.get("is_meta") for item in items)
+    assert response_id == (None if visible else "active")
 
 
 @pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])

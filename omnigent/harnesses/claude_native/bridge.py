@@ -9270,7 +9270,10 @@ def _attachment_transcript_items_from_entry(
         return current_response_id, []
     if attachment.get("isMeta") is True:
         return current_response_id, []
-    if _is_trusted_agent_notification_text(prompt, origin=attachment.get("origin")):
+    origin = attachment.get("origin")
+    if _is_trusted_agent_notification_text(prompt, origin=origin) or _is_system_reminder_text(
+        prompt, origin=origin
+    ):
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     item = ClaudeTranscriptItem(
@@ -9351,6 +9354,7 @@ _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-id>",
     "</task-notification>",
 )
+_SYSTEM_REMINDER_BLOCK_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
 _TEAMMATE_MESSAGE_RE = re.compile(
     r'(?:<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>.*?</teammate-message>'
     r'|<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>.*?</agent-message>)',
@@ -9722,6 +9726,16 @@ def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> 
     )
 
 
+def _is_system_reminder_text(text: str, *, origin: object = None) -> bool:
+    """Recognize Claude-injected reminder blocks, which Claude's own UI never shows."""
+    if isinstance(origin, dict) and origin.get("kind") == "human":
+        return False
+    return (
+        text.lstrip().startswith("<system-reminder>")
+        and not _SYSTEM_REMINDER_BLOCK_RE.sub("", text).strip()
+    )
+
+
 def _peer_message_wake_marker(
     entry: _JsonObject,
     line_number: int,
@@ -10076,6 +10090,8 @@ def _user_transcript_items_from_entry(
                 else current_response_id,
                 items,
             )
+        if _is_system_reminder_text(content, origin=entry.get("origin")):
+            return current_response_id, []
         stripped = content.lstrip()
         if _is_slash_command_echo(content):
             # Drop unparseable markup rather than letting it fall through
@@ -10169,8 +10185,10 @@ def _user_transcript_items_from_entry(
             # Claude may emit CLI scaffolding as text blocks; never render it
             # as user input when the transcript shape changes.
             stripped = text.lstrip()
-            if "<command-name>" in stripped or any(
-                stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
+            if (
+                "<command-name>" in stripped
+                or any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS)
+                or _is_system_reminder_text(text, origin=entry.get("origin"))
             ):
                 continue
             user_blocks.append(
