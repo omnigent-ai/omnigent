@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import shlex
 import sys
 from collections.abc import Callable
 
@@ -56,6 +57,26 @@ def test_store_and_erase_are_noops(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     for op in ("store", "erase"):
         assert h.main(["--server", "http://s", "--host-id", "h", "--host-token", "t", op]) == 0
+
+
+def test_installed_helper_passes_a_dash_leading_launch_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``secrets.token_urlsafe`` launch tokens can start with ``-``; the helper git
+    # runs must still hand the whole token to ``main``.
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    h._install_broker_helper("http://s", "hid", "-tok")
+    helper = calls[-1][-1]
+    seen: list[str] = []
+    monkeypatch.setattr(
+        h, "_fetch", lambda *a: seen.append(a[2]) or {"connected": True, "token": "T"}
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO("protocol=https\nhost=github.com\n\n"))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    # Git appends the credential operation to the shell helper's arguments.
+    assert h.main([*shlex.split(helper.removeprefix("!"))[3:], "get"]) == 0
+    assert seen == ["-tok"]
 
 
 def test_configure_host_git_resets_then_adds_broker_helper(
