@@ -11,6 +11,8 @@ so each harness names the coding agent and client surfaces the same way.
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
@@ -91,6 +93,84 @@ def is_databricks_ai_gateway_url(base_url: str) -> bool:
     # Shape 2: workspace hostname + /ai-gateway/ path prefix.
     path = parsed.path or ""
     return path.startswith("/ai-gateway/")
+
+
+# Unity Gateway routes a request to the model provider service (an external
+# provider such as Amazon Bedrock or Azure OpenAI) named in this header; the
+# request's ``model`` is then the provider's own model id, e.g.
+# ``us.anthropic.claude-sonnet-5``.
+MODEL_PROVIDER_SERVICE_HEADER: Final = "Databricks-Model-Provider-Service"
+
+# Spawn-env var carrying an agent's ``executor.config.model_provider_service``
+# from the runner to the SDK harness processes.
+MODEL_PROVIDER_SERVICE_ENV_VAR: Final = "HARNESS_DATABRICKS_MODEL_PROVIDER_SERVICE"
+
+# Harnesses that send the provider-service header on their gateway requests.
+MODEL_PROVIDER_SERVICE_HARNESSES: Final = frozenset({"claude-sdk", "openai-agents"})
+
+# Three-part Unity Catalog name, e.g. ``main.ai.bedrock_prod``.
+# Restricted to safe identifier characters because the value is sent as an HTTP
+# header (and joined into Claude Code's newline-separated header list).
+_MODEL_PROVIDER_SERVICE_NAME = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+
+def validate_model_provider_service(name: str) -> str:
+    """Return *name* stripped, or raise if it is not a three-part UC name.
+
+    :param name: The configured model provider service, e.g.
+        ``"main.ai.bedrock_prod"``.
+    :returns: The stripped name.
+    :raises ValueError: If *name* is not ``catalog.schema.service`` made of
+        letters, digits, ``_`` and ``-``.
+    """
+    stripped = name.strip()
+    if not _MODEL_PROVIDER_SERVICE_NAME.fullmatch(stripped):
+        raise ValueError(
+            f"model_provider_service must be a three-part Unity Catalog name "
+            f"(catalog.schema.service), got {name!r}"
+        )
+    return stripped
+
+
+def model_provider_service_headers() -> dict[str, str]:
+    """Return the provider-service routing header for this harness process.
+
+    :returns: ``{MODEL_PROVIDER_SERVICE_HEADER: name}`` when
+        :data:`MODEL_PROVIDER_SERVICE_ENV_VAR` holds a valid name, else ``{}``.
+    :raises ValueError: If the variable is set to an invalid name.
+    """
+    raw = os.environ.get(MODEL_PROVIDER_SERVICE_ENV_VAR, "")
+    if not raw.strip():
+        return {}
+    return {MODEL_PROVIDER_SERVICE_HEADER: validate_model_provider_service(raw)}
+
+
+def provider_pinned_override_ignored(provider_service: object, model_override: object) -> bool:
+    """Return whether a provider-pinned agent must ignore *model_override*.
+
+    An agent pinned to a model provider service keeps its own provider model: the
+    provider cannot serve a Databricks-hosted id, and sending one with the
+    provider header fails the turn (``NOT_FOUND`` / ``403``).
+
+    :param provider_service: The agent's ``executor.config.model_provider_service``,
+        e.g. ``"main.ai.bedrock_prod"``, or ``None``.
+    :param model_override: The session or dispatch model override, e.g.
+        ``"system.ai.claude-opus-5"`` or ``"databricks-claude-opus-5"``, or ``None``.
+    :returns: ``True`` when both are set and the override is a Databricks-hosted id
+        (Unity Catalog ``system.ai.*``, legacy ``databricks-*`` or
+        ``databricks/``-routed); a provider's own id such as
+        ``"us.anthropic.claude-opus-5-5"`` is kept.
+    """
+    if not provider_service or not isinstance(model_override, str):
+        return False
+    override = model_override.strip()
+    if not override:
+        return False
+    # Imported lazily: this module is a dependency-free leaf that the harness
+    # and model modules import.
+    from omnigent.models.model_override import is_databricks_model_id
+
+    return is_databricks_model_id(override)
 
 
 # Usage-attribution headers the Unity Gateway reads: the coding agent, and the

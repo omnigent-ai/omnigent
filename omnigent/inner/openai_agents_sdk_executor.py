@@ -30,6 +30,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.databricks_ai_gateway import model_provider_service_headers
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
@@ -523,6 +524,7 @@ def _get_openai_async_client(
             base_url=_gateway_base_url_for_model(base_url_override, model),
             api_key=_OPENAI_KEY_PLACEHOLDER,
             http_client=httpx.AsyncClient(auth=gateway_auth),
+            default_headers=model_provider_service_headers(),
             **retry_kwargs,
         )
 
@@ -570,6 +572,7 @@ def _get_openai_async_client(
                 ),
                 api_key=_OPENAI_KEY_PLACEHOLDER,
                 http_client=httpx.AsyncClient(auth=auth),
+                default_headers=model_provider_service_headers(),
                 **retry_kwargs,
             )
         except DatabricksAuthError as exc:
@@ -636,6 +639,7 @@ def _get_openai_async_client(
         ),
         api_key=_OPENAI_KEY_PLACEHOLDER,
         http_client=httpx.AsyncClient(auth=auth),
+        default_headers=model_provider_service_headers(),
         **retry_kwargs,
     )
 

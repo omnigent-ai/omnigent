@@ -48,6 +48,7 @@ from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
     is_databricks_ai_gateway_url,
     is_ug_route,
+    model_provider_service_headers,
     with_gateway_attribution_lines,
 )
 from omnigent.inner import _proc
@@ -117,6 +118,19 @@ _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
+
+
+def _gateway_custom_headers() -> str:
+    """Return the ``ANTHROPIC_CUSTOM_HEADERS`` value for the Databricks gateway.
+
+    :returns: The coding-agent header, plus a
+        ``Databricks-Model-Provider-Service`` line when this harness is routed
+        to a Unity Gateway model provider service (one header per line).
+    """
+    lines = [_DATABRICKS_CODING_AGENT_HEADER]
+    lines += [f"{name}: {value}" for name, value in model_provider_service_headers().items()]
+    return "\n".join(lines)
+
 
 CLAUDE_AUTH_FAILED_CODE = "claude_sdk_auth_failed"
 CLAUDE_AUTH_FAILED_TITLE = "Claude Code could not authenticate"
@@ -1355,7 +1369,7 @@ def _resolve_gateway_env(
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
+        _ANTHROPIC_CUSTOM_HEADERS_ENV: _gateway_custom_headers(),
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
     # DATABRICKS-PATCH(claude-sdk-gateway-betas)
@@ -2337,6 +2351,11 @@ class ClaudeSDKExecutor(Executor):
         """
         base_url = env.get("ANTHROPIC_BASE_URL")
         if not self._gateway or not base_url:
+            return {}
+        if model_provider_service_headers():
+            # The gateway's listing names its own served ids, which a model
+            # provider service does not know; pinning aliases to them would send
+            # Claude Code's alias / fallback calls to ids the provider rejects.
             return {}
         if self._gateway_vocabulary is None:
             self._gateway_vocabulary = await run_sync_on_thread(
