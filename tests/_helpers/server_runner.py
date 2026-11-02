@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from tests._helpers.compat import (
     compat_server_python,
 )
 from tests._helpers.live_server import find_free_port, isolated_process_env, terminate_process
+from tests._helpers.polling import poll_until
 
 
 class ServerRunner:
@@ -49,7 +51,8 @@ class ServerRunner:
         self.server_home = root / "server-home"
         for path in (self.workspace, self.runner_home, self.server_home):
             path.mkdir(parents=True, exist_ok=True)
-        self.port = find_free_port()
+        # Older compatibility builds may not advertise the resolved port for --port 0.
+        self.port = find_free_port() if compat_server_python() is not None else 0
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.database_uri = database_uri or f"sqlite:///{root / 'chat.db'}"
         self.artifact_location = artifact_location or root / "artifacts"
@@ -163,8 +166,38 @@ class ServerRunner:
             {"OMNIGENT_RUNNER_TUNNEL_TOKEN": self._token, **self._server_env},
             cwd=self._server_cwd,
         )
+        if self.port == 0:
+            self._discover_bound_port()
         if wait_ready:
             self._wait_ready()
+
+    def _discover_bound_port(self) -> None:
+        """Read the CLI's bound endpoint before launching clients or runners."""
+
+        def announced() -> bool:
+            assert self.server is not None
+            assert self.server.poll() is None, (
+                f"Process exited with code {self.server.returncode} before announcing its port.\n"
+                f"{self.log_tail()}"
+            )
+            match = re.search(
+                r"^Starting omnigent server on 127\.0\.0\.1:(\d+)$",
+                self.log_path("server").read_text(errors="replace"),
+                re.MULTILINE,
+            )
+            if match is None:
+                return False
+            self.port = int(match.group(1))
+            assert 0 < self.port < 65536, f"Invalid bound server port: {self.port}"
+            self.base_url = f"http://127.0.0.1:{self.port}"
+            return True
+
+        try:
+            poll_until(announced, timeout_s=self._health_timeout, interval_s=self._poll_interval)
+        except AssertionError as exc:
+            raise AssertionError(
+                f"Server did not announce a bound port: {exc}\n{self.log_tail()}"
+            ) from exc
 
     def restart_server(self, *, env: Mapping[str, str | None] | None = None) -> None:
         """Clear in-memory server state and await the existing runner's reconnect."""
