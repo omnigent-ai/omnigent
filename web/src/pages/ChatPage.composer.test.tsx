@@ -4794,6 +4794,50 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
+  it.each([
+    ["idle", "running", false, false, "Send a follow-up (queued) — Esc to stop"],
+    ["idle", "running", true, false, "Send a follow-up — Esc to stop"],
+    ["idle", "running", true, true, "Send a follow-up (queued) — Esc to stop"],
+    ["streaming", "idle", true, false, "Send a follow-up — Esc to stop"],
+    ["idle", "waiting", false, false, "Send a message…"],
+    ["idle", "idle", false, false, "Send a message…"],
+  ] as const)(
+    "matches the send decision for a %s stream and %s session (always steer: %s, queued: %s)",
+    (status, sessionStatus, alwaysSteer, queued, placeholder) => {
+      const {
+        conversationId: previousConversationId,
+        queuedMessages,
+        sessionStatus: previousStatus,
+      } = useChatStore.getState();
+      onTestFinished(() =>
+        useChatStore.setState({
+          conversationId: previousConversationId,
+          queuedMessages,
+          sessionStatus: previousStatus,
+        }),
+      );
+      const previousAlwaysSteer = readAlwaysSteer();
+      onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+      writeAlwaysSteer(alwaysSteer);
+      // A reused entry would skip mirroring an unchanged status onto the root store.
+      const conversationId = `conv_placeholder_${status}_${sessionStatus}_${alwaysSteer}_${queued}`;
+      useChatStore.setState({
+        conversationId,
+        queuedMessages: queued ? [{ queueId: "q_held", text: "held", conversationId }] : [],
+        sessionStatus,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            status,
+            isWorking: status === "streaming" || computeIsWorking(sessionStatus),
+          })}
+        />,
+      );
+      expect(textarea().placeholder).toBe(placeholder);
+    },
+  );
+
   it("resets the native text input when the Send button moves focus first", () => {
     const props = composerProps({ status: "streaming", isWorking: true });
     render(<Composer {...props} />);

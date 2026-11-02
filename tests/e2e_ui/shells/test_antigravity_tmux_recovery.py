@@ -60,17 +60,23 @@ pytestmark = [
 _ROOT = Path(__file__).resolve().parents[3]
 
 
+@dataclass
+class MockGemini:
+    requested: list[str]
+    release: threading.Event
+
+
 @pytest.fixture
 def antigravity_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, built_spa: None
-) -> Iterator[list[str] | None]:
+) -> Iterator[MockGemini | None]:
     """Build with the caller's HOME before isolating agy credentials."""
     if os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock":
         assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
         yield None
         return
 
-    replies: list[str] = []
+    model = MockGemini(requested=[], release=threading.Event())
 
     class GeminiHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -83,15 +89,19 @@ def antigravity_model(
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             reply = "Ready."
+            held = False
             for content in reversed(request.get("contents", [])):
                 if content.get("role") != "user":
                     continue
                 text = "\n".join(part.get("text", "") for part in content.get("parts", []))
-                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
+                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})( once released)?\.", text)
                 if matches:
-                    reply = matches[-1]
-                    replies.append(reply)
+                    reply, hold = matches[-1]
+                    held = bool(hold)
+                    model.requested.append(reply)
                     break
+            if held:
+                model.release.wait(timeout=180)
             response = {
                 "candidates": [
                     {
@@ -126,8 +136,9 @@ def antigravity_model(
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield replies
+            yield model
         finally:
+            model.release.set()
             server.shutdown()
             thread.join(timeout=5)
 
@@ -137,6 +148,27 @@ def _wait_until(check: Callable[[], bool], message: str, timeout: float = 60) ->
     while not check():
         assert time.monotonic() < deadline, message
         time.sleep(0.2)
+
+
+def _watch_session_events(base_url: str, session_id: str) -> list[dict]:
+    """Collect the live session events that every browser viewer also receives."""
+    events: list[dict] = []
+    subscribed = threading.Event()
+
+    def read() -> None:
+        url = f"{base_url}/v1/sessions/{session_id}/stream"
+        with (
+            contextlib.suppress(httpx.HTTPError),
+            httpx.stream("GET", url, timeout=httpx.Timeout(30, read=None)) as response,
+        ):
+            for line in response.iter_lines():
+                if line.startswith("data: {"):
+                    events.append(json.loads(line.removeprefix("data: ")))
+                    subscribed.set()
+
+    threading.Thread(target=read, daemon=True).start()
+    assert subscribed.wait(30), "could not subscribe to the session stream"
+    return events
 
 
 @dataclass
@@ -334,16 +366,26 @@ def _antigravity_stack(directory: Path) -> Iterator[AntigravitySession]:
 
 @pytest.fixture
 def antigravity_session(
-    request: pytest.FixtureRequest, tmp_path: Path, antigravity_model: list[str] | None
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    antigravity_model: MockGemini | None,
 ) -> Iterator[AntigravitySession]:
     assert not request.config.getoption("--ui-base-url"), "this test requires its own server"
-    assert shutil.which("agy"), "install agy before running this test"
+    agy = shutil.which("agy")
+    assert agy, "install agy before running this test"
+    if not agy.endswith("/bin/agy"):
+        # Connect-RPC port discovery only recognizes an agy launched as ``*/bin/agy``.
+        link_dir = tmp_path / "agy-install" / "bin"
+        link_dir.mkdir(parents=True)
+        (link_dir / "agy").symlink_to(agy)
+        monkeypatch.setenv("PATH", f"{link_dir}{os.pathsep}{os.environ['PATH']}")
     with _antigravity_stack(tmp_path) as session:
         yield session
 
 
 def test_antigravity_survives_probe_outage_then_detects_exit(
-    page: Page, antigravity_session: AntigravitySession, antigravity_model: list[str] | None
+    page: Page, antigravity_session: AntigravitySession, antigravity_model: MockGemini | None
 ) -> None:
     session = antigravity_session
     page.add_init_script(_BLOCK_LOOPBACK_DIALS)
@@ -361,7 +403,9 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
         reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
         expect(reply.filter(has_text=token)).to_have_count(1, timeout=180_000)
         if antigravity_model is not None:
-            assert token in antigravity_model, "agy did not request this reply from the mock model"
+            assert token in antigravity_model.requested, (
+                "agy did not request this reply from the mock model"
+            )
         expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
         page.get_by_test_id("view-mode-terminal").click()
         expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
@@ -426,3 +470,49 @@ def test_antigravity_survives_probe_outage_then_detects_exit(
     response.raise_for_status()
     assert response.json()["status"] == "idle"
     assert session.runner.poll() is None, "terminal exit killed the runner"
+
+
+def test_antigravity_web_turn_stays_in_progress_until_agy_replies(
+    page: Page, antigravity_session: AntigravitySession, antigravity_model: MockGemini | None
+) -> None:
+    if antigravity_model is None:
+        pytest.skip("holding agy's reply requires OMNIGENT_E2E_ANTIGRAVITY=mock")
+    session = antigravity_session
+    page.add_init_script(_BLOCK_LOOPBACK_DIALS)
+    page.goto(f"{session.base_url}/c/{session.session_id}?view=terminal")
+    terminal = page.get_by_test_id("main-terminal-view").get_by_test_id("terminal-view")
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=120_000)
+
+    token = f"agy-e2e-{uuid.uuid4().hex[:8]}"
+    page.get_by_test_id("view-mode-chat").click()
+    composer = page.get_by_label("Message the agent")
+    events = _watch_session_events(session.base_url, session.session_id)
+    composer.fill(f"Reply {token} once released. No tools.")
+    page.get_by_role("button", name="Send", exact=True).click()
+    sent = page.locator('[data-testid="message-bubble"][data-role="user"]')
+    expect(sent.filter(has_text=token)).to_have_count(1, timeout=30_000)
+    _wait_until(
+        lambda: token in antigravity_model.requested, "agy did not ask the mock model to reply"
+    )
+
+    def delivered_while_running() -> bool:
+        statuses = [event["status"] for event in events if event.get("type") == "session.status"]
+        completed = any(event.get("type") == "response.completed" for event in events)
+        return completed and statuses[-1:] == ["running"]
+
+    # The browser settles its send on the same response.completed this viewer receives.
+    _wait_until(delivered_while_running, "the delivered turn did not leave agy running")
+    queued = "Send a follow-up (queued) — Esc to stop"
+    expect(composer).to_have_attribute("placeholder", queued, timeout=10_000)
+    held_until = time.monotonic() + 3
+    while time.monotonic() < held_until:
+        assert composer.get_attribute("placeholder") == queued, (
+            "the turn was reported complete while agy was still waiting for its model reply"
+        )
+        time.sleep(0.2)
+    antigravity_model.release.set()
+
+    reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
+    expect(reply.filter(has_text=token)).to_have_count(1, timeout=60_000)
+    expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
+    expect(composer).to_have_attribute("placeholder", "Send a message…", timeout=30_000)
