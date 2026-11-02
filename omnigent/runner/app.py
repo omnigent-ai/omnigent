@@ -4122,6 +4122,7 @@ def create_runner_app(
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
+        inbox_recovery_checked = False
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
@@ -4161,13 +4162,18 @@ def create_runner_app(
             if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
                 watcher.cancel()
             if not has_buffered and not _suppress_status:
+                # Schedule unread inbox results before deciding the session is done.
+                # An intermediate idle lets headless clients stop the runner early.
+                _rewake_parent_if_inbox_stranded(conv_id)
+                inbox_recovery_checked = True
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
-                    (e := _subagent_work_by_child.get(c)) is not None
-                    and e.status in ("launching", "running", "waiting")
-                    for c in children
+                    (entry := _subagent_work_by_child.get(child_id)) is not None
+                    and entry.status in ("launching", "running", "waiting")
+                    for child_id in children
                 )
-                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
+                waiting = has_running_children or conv_id in _subagent_wake_pending
+                _publish_turn_status(conv_id, "waiting" if waiting else "idle")
         if was_interrupted:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
@@ -4202,6 +4208,8 @@ def create_runner_app(
             # A clean native turn end acknowledges prompt submission, so the
             # dispatch leaves ``launching`` even when no running edge is relayed.
             mark_subagent_work_started(conv_id)
+        if inbox_recovery_checked:
+            return
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
@@ -5150,6 +5158,8 @@ def create_runner_app(
                 return
 
         _captured_session_id = session_id
+        # ponytail: one lock per relay; split by path only if recovery contention matters.
+        _native_file_changes_lock = asyncio.Lock()
 
         async def _relay_tool_executor(
             name: str,
@@ -5180,7 +5190,11 @@ def create_runner_app(
 
             :param payload: Hook JSON object from ``/hook/observe-tool``.
             """
-            from omnigent.runner.native_file_observer import native_file_changes
+            from omnigent.runner.native_file_observer import (
+                native_file_changes,
+                resolve_native_original,
+            )
+            from omnigent.runner.slow_io import run_slow_io
             from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
 
             try:
@@ -5190,14 +5204,40 @@ def create_runner_app(
                 registry = await _resolve_session_fs_registry(_captured_session_id)
                 if registry is None:
                     return
-                for change in changes:
-                    if change.baseline is not None:
-                        registry.seed_snapshot(
-                            change.path,
-                            change.baseline,
-                            session_id=_captured_session_id,
-                        )
-                    registry.record_change(change.path, change.operation, _captured_session_id)
+                async with _native_file_changes_lock:
+                    for change in changes:
+                        try:
+                            if registry.needs_snapshot(change.path):
+                                current = None
+                                if change.patch is not None:
+                                    environment = resource_registry.resolve_environment(
+                                        _captured_session_id, "default", relay_spec
+                                    )
+                                    result = await environment.read(
+                                        change.move_path or change.path,
+                                        max_bytes=1_048_576,
+                                        regular_only=True,
+                                    )
+                                    if not result.get("error") and isinstance(
+                                        result.get("content"), str
+                                    ):
+                                        current = result["content"]
+                                original = await run_slow_io(
+                                    resolve_native_original, change, current
+                                )
+                                if original is not None:
+                                    registry.seed_snapshot(
+                                        change.path, original, session_id=_captured_session_id
+                                    )
+                        except Exception:
+                            _logger.warning(
+                                "native original recovery failed for session=%s path=%r",
+                                _captured_session_id,
+                                change.path,
+                                exc_info=True,
+                                extra={"session_id": _captured_session_id},
+                            )
+                        registry.record_change(change.path, change.operation, _captured_session_id)
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,
