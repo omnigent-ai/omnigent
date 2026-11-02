@@ -3162,6 +3162,10 @@ describe("chatStore — send (first-send ordering)", () => {
       "runner_starting",
       "The runner for this session is still connecting. Your message will be sent when it's ready.",
     ],
+    [
+      "host_sign_in_required",
+      "The server rejected this host's credentials, so the runner could not connect. Sign in again with `omnigent login https://example.test` on this host. Your message will be sent once the runner can connect.",
+    ],
   ])("holds a %s send and sends it once released", async (code, notice) => {
     // The server refuses (and records nothing) only because this client asks to
     // hold: the message must wait in the queue, not land back in the composer.

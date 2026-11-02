@@ -1884,6 +1884,8 @@ async def _relaunch_then_report_exit(
     comm: ApplicationCommunicator,
     session_id: str,
     daemon_report: str,
+    *,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     """Relaunch, then send a pre-connect exit report over the host tunnel.
 
@@ -1902,6 +1904,7 @@ async def _relaunch_then_report_exit(
     try:
         return await client.post(
             f"/v1/sessions/{session_id}/events",
+            headers=headers,
             json={
                 "type": "message",
                 "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
@@ -2398,6 +2401,81 @@ async def test_native_message_relaunch_hold_for_starting_runner_ends(
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     errors = [item for item in items if item["type"] == "error"]
     assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+
+
+# What a host reports for a runner the server refused on the host's expired sign-in.
+_SIGN_IN_EXIT_REPORT = (
+    "The server rejected this host's credentials, so the runner could not connect. "
+    "Sign in again with `omnigent login https://example.test` on this host, then retry. "
+    "Details: runner process exited with code 77 (log on host: ~/logs/runner-ab.log)"
+)
+
+
+@pytest.mark.parametrize("holds", [True, False], ids=["holding_client", "other_client"])
+async def test_native_message_relaunch_holds_send_until_the_host_signs_in(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    holds: bool,
+) -> None:
+    """A runner refused on its host's expired sign-in holds a holding client's send.
+
+    Nothing is recorded and the idle session is not failed. A resend before the
+    relaunch backoff ends holds again without launching another runner. A client
+    that does not hold still gets the failed turn naming the sign-in.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Let the exit report, not the timeout, settle the send.
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 5.0)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+
+    response = await _relaunch_then_report_exit(
+        client,
+        comm,
+        session_id,
+        _SIGN_IN_EXIT_REPORT,
+        headers=_HOLD_SEND_HEADERS if holds else None,
+    )
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    if not holds:
+        assert response.status_code == 202, response.text
+        assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+        assert errors[0]["message"] == _SIGN_IN_EXIT_REPORT
+        return
+    assert response.status_code == 503, response.text
+    error = response.json()["error"]
+    assert error["code"] == "host_sign_in_required"
+    assert error["message"] == (
+        "The server rejected this host's credentials, so the runner could not connect. "
+        "Sign in again with `omnigent login https://example.test` on this host. "
+        "Your message will be sent once the runner can connect."
+    )
+    assert errors == []
+    assert [item for item in items if item.get("role") == "user"] == []
+    # The runner's exit did not fail the idle session either.
+    held_runner = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert held_runner is not None
+    assert held_runner.live_status != "failed"
+    assert "omnigent.last_task_error_code" not in held_runner.labels
+
+    again = await _post_hello(client, session_id, headers=_HOLD_SEND_HEADERS)
+
+    assert again.status_code == 503, again.text
+    assert again.json()["error"]["code"] == "host_sign_in_required"
+    # No new runner was launched or bound for the resend.
+    after = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert after is not None and after.runner_id == held_runner.runner_id
+    outcomes = [event.attributes["outcome"] for event in _runner_client_wait_events(caplog)]
+    assert outcomes[-1] == "host_sign_in_held"
 
 
 async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_while_connected(

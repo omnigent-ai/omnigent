@@ -10,7 +10,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 
 import cachetools
 import httpx
@@ -58,7 +58,11 @@ from omnigent.host.frames import (
 )
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.identity import (
+    RUNNER_AUTH_REJECTED_CAUSE,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
     CODEX_PROVIDER_AUTH_FAILED,
@@ -709,6 +713,100 @@ async def _hold_send_for_starting_runner(
     if first_held is None:
         _runner_starting_holds[session_id] = time.monotonic()
     return True
+
+
+# A person can take hours to see that their host's sign-in expired and sign in
+# again, so a holding client keeps the message this long before the turn fails.
+HOST_SIGN_IN_HOLD_S = 24 * 60 * 60.0
+# Until the person signs in again every relaunched runner dies on the same
+# refusal, so a held resend this soon after one does not launch another.
+HOST_SIGN_IN_RELAUNCH_BACKOFF_S = 5 * 60.0
+
+# Session id -> when its sends were first held for an expired host sign-in.
+_host_sign_in_holds: WorkspaceScopedCache[str, float] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=2 * HOST_SIGN_IN_HOLD_S, timer=time.monotonic)
+)
+# Host id -> the cause its last runner reported when refused on the host's sign-in.
+_host_sign_in_rejections: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=4096, ttl=HOST_SIGN_IN_RELAUNCH_BACKOFF_S, timer=time.monotonic
+    )
+)
+
+
+def is_host_sign_in_rejection(cause: str | None) -> bool:
+    """Report whether a runner exit cause is the host's expired sign-in.
+
+    :param cause: The host's report for a runner that exited, e.g. the text
+        :class:`~omnigent.host.frames.HostRunnerExitedFrame` carries.
+    :returns: ``True`` when the server refused the runner on the host's credentials.
+    """
+    return cause is not None and RUNNER_AUTH_REJECTED_CAUSE in cause
+
+
+def note_host_sign_in_rejection(host_id: str, cause: str) -> None:
+    """Remember that the server refused a host's runner on the host's sign-in.
+
+    :param host_id: The host whose runner exited.
+    :param cause: The host's report, which names the command to sign in again.
+    """
+    _host_sign_in_rejections[host_id] = cause
+
+
+def _host_sign_in_hold_message(cause: str) -> str:
+    """Return the refusal text for a send held until the host signs in again.
+
+    :param cause: The host's report, e.g. ``"The server rejected this host's
+        credentials, ... Sign in again with `isaac omni login <url>` on this
+        host, then retry. Details: ..."``.
+    :returns: The host's sign-in instruction, then that the message waits for it.
+    """
+    instruction, sep, _ = cause.partition(", then retry.")
+    if not sep:
+        instruction = "This host's sign-in has expired. Sign in again on the host"
+    return f"{instruction}. Your message will be sent once the runner can connect."
+
+
+def _hold_send_for_host_sign_in(session_id: str) -> bool:
+    """Report whether a holding client should resend after its host signs in again.
+
+    :param session_id: The session whose send found no runner.
+    :returns: ``True`` until the hold has lasted :data:`HOST_SIGN_IN_HOLD_S`.
+    """
+    first_held = _host_sign_in_holds.get(session_id)
+    if first_held is not None and time.monotonic() - first_held > HOST_SIGN_IN_HOLD_S:
+        _host_sign_in_holds.pop(session_id, None)
+        return False
+    if first_held is None:
+        _host_sign_in_holds[session_id] = time.monotonic()
+    return True
+
+
+def _raise_host_sign_in_hold(
+    session_id: str, conv: Conversation, runner_id: str | None, cause: str
+) -> NoReturn:
+    """Refuse a held send whose host must sign in again; nothing is recorded.
+
+    :param session_id: The session whose send found no runner.
+    :param conv: The session row, for its host id.
+    :param runner_id: The runner the host could not connect, if known.
+    :param cause: The host's report for that runner.
+    :raises OmnigentError: Always, with :data:`ErrorCode.HOST_SIGN_IN_REQUIRED`.
+    """
+    _logger.info(
+        "Host %s must sign in again; the client holds the send for session %s",
+        conv.host_id,
+        session_id,
+        extra=debug_event(
+            "runner_client_wait",
+            session_id=session_id,
+            runner_id=runner_id,
+            host_id=conv.host_id,
+            outcome="host_sign_in_held",
+            attempts=0,
+        ),
+    )
+    raise OmnigentError(_host_sign_in_hold_message(cause), code=ErrorCode.HOST_SIGN_IN_REQUIRED)
 
 
 async def _recover_retry_session(
@@ -3056,6 +3154,19 @@ def register_events_routes(
                         # to recognize and join a concurrent replacement launch.
                         if runner_client is not None:
                             conv = fresh_conv
+                rejected_sign_in = _host_sign_in_rejections.get(conv.host_id or "")
+                if (
+                    runner_client is None
+                    and rejected_sign_in is not None
+                    and body.type == "message"
+                    and _is_native_terminal_session(conv)
+                    and not isinstance(request, StartupInputContext)
+                    and _client_holds_host_offline_sends(request.headers)
+                    and _hold_send_for_host_sign_in(session_id)
+                ):
+                    # Every runner launched before the person signs in again dies
+                    # on the same refusal; hold the message without launching one.
+                    _raise_host_sign_in_hold(session_id, conv, conv.runner_id, rejected_sign_in)
                 if runner_client is None and _host_conn is not None:
                     launch_attempt = await _launch_runner_on_host(
                         conv,
@@ -3174,6 +3285,7 @@ def register_events_routes(
         if runner_client is not None:
             # A later starting runner gets a fresh hold.
             _runner_starting_holds.pop(session_id, None)
+            _host_sign_in_holds.pop(session_id, None)
         if runner_client is None:
             # A native terminal-session message must NOT be silently
             # dropped when no runner is reachable — the runner crashed
@@ -3292,6 +3404,15 @@ def register_events_routes(
                     )
                     raise OmnigentError(
                         _runner_starting_hold_message(), code=ErrorCode.RUNNER_STARTING
+                    )
+                if (
+                    is_host_sign_in_rejection(exit_cause)
+                    and _client_holds_host_offline_sends(request.headers)
+                    and _hold_send_for_host_sign_in(session_id)
+                ):
+                    assert exit_cause is not None
+                    _raise_host_sign_in_hold(
+                        session_id, conv, relaunched_runner_id or conv.runner_id, exit_cause
                     )
                 if exit_cause:
                     failure_message = exit_cause

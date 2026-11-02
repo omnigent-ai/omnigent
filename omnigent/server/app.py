@@ -4447,7 +4447,9 @@ def create_app(
         instead of spinning on "starting" until a timeout. Only a runner
         that never connected fails an idle top-level session for that
         reason: when the host dies after the runner ran, an idle session
-        lost no work and stays idle (offline via liveness). An idle
+        lost no work and stays idle (offline via liveness). Nor does a runner
+        the server refused on its host's expired sign-in: the send that
+        launched it reports the sign-in instead, and no work was lost. An idle
         sub-agent is not failed either way, since its work finished on a
         runner that was already live.
 
@@ -4459,6 +4461,10 @@ def create_app(
         from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
         from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.routes.sessions.routes_events import (
+            is_host_sign_in_rejection,
+            note_host_sign_in_rejection,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         # The crash report is authoritative and carries the richer cause;
@@ -4473,6 +4479,9 @@ def create_app(
         )
         # Only a runner that never connected failed to start; one that ran and died is a crash.
         failure_code = RUNNER_PROCESS_CRASH if runner_ran else "runner_failed_to_start"
+        sign_in_rejected = not runner_ran and is_host_sign_in_rejection(error)
+        if sign_in_rejected:
+            note_host_sign_in_rejection(host_id, error)
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -4489,7 +4498,7 @@ def create_app(
             affected,
             ErrorDetail(code=failure_code, message=error),
             conversation_store,
-            fail_idle_top_level=not runner_ran,
+            fail_idle_top_level=not runner_ran and not sign_in_rejected,
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:

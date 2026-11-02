@@ -31,6 +31,11 @@ RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 # it ever connected, so the launching host reports a sign-in problem rather
 # than a crash. 77 is ``EX_NOPERM`` from sysexits.h.
 RUNNER_AUTH_REJECTED_EXIT_CODE = 77
+# Lead sentence of the cause a host reports for that exit; the server reads it to
+# tell an expired host sign-in from a crash, so keep it verbatim.
+RUNNER_AUTH_REJECTED_CAUSE = (
+    "The server rejected this host's credentials, so the runner could not connect."
+)
 # A host-launched runner uses this bearer for its initial server connection,
 # then falls back to its own refreshable auth when the bearer is rejected.
 RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
