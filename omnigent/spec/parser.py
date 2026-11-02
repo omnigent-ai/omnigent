@@ -288,15 +288,10 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     model_egress = _parse_model_egress(raw.get("model_egress"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
-    # Top-level ``async:`` flag gates the LLM-callable async-dispatch
-    # builtins (``sys_call_async``, ``sys_read_inbox``,
-    # ``sys_cancel_async``). Defaults to True to match
-    # ``omnigent/inner/datamodel.py::AgentDef.async_enabled`` — the
-    # same YAML must produce the same tool surface under Omnigent mode and
-    # the legacy inner stack. Agents that want to suppress the surface
-    # declare ``async: false`` explicitly. ``bool()`` accepts YAML
-    # truthy/falsy values (``true`` / ``True`` / ``yes`` /
-    # ``false`` / ``no``) consistently.
+    # ``async: false`` hides ``sys_call_async`` and ``sys_cancel_async``;
+    # specs that dispatch delegated work retain ``sys_read_inbox`` as its
+    # drain. Defaults to True, matching AgentDef.async_enabled. ``bool()``
+    # accepts YAML truthy/falsy values consistently.
     async_enabled = bool(raw.get("async", True))
     # Top-level ``timers:`` flag gates the LLM-callable timer
     # builtins (``sys_timer_set``, ``sys_timer_cancel``).
