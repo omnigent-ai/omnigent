@@ -70,7 +70,10 @@ describe("isNewSessionHotkey", () => {
     expect(isNewSessionHotkey(altGraph, isMac)).toBe(false);
   });
 
-  it("preserves the native chord and rejects the old browser chord", () => {
+  it("uses Cmd+N in native shells, keeps the older Alt chord, and not in browsers", () => {
+    const native = event({ key: "n", code: "KeyN", metaKey: true });
+    expect(isNewSessionHotkey(native, true, true)).toBe(true);
+    expect(isNewSessionHotkey(native, true, false)).toBe(false);
     const old = event({ key: "˜", code: "KeyN", metaKey: true, altKey: true });
     expect(isNewSessionHotkey(old, true, true)).toBe(true);
     expect(isNewSessionHotkey(old, true, false)).toBe(false);
@@ -84,6 +87,19 @@ describe("isNewSessionHotkey", () => {
     expect(
       isNewSessionHotkey(event({ code: "KeyN", ctrlKey: true, altKey: true }), false, true),
     ).toBe(true);
+  });
+
+  it.each([
+    ["⌘", { metaKey: true }, true],
+    ["Ctrl", { ctrlKey: true }, false],
+  ])("on another layout, %s+N follows the key that types N", (_name, modifier, isMac) => {
+    // Dvorak types B at the physical N key, and N at the physical L key.
+    expect(isNewSessionHotkey(event({ key: "n", code: "KeyL", ...modifier }), isMac, true)).toBe(
+      true,
+    );
+    expect(isNewSessionHotkey(event({ key: "b", code: "KeyN", ...modifier }), isMac, true)).toBe(
+      false,
+    );
   });
 });
 

@@ -30,7 +30,7 @@ import {
   CompactShortcutKeys,
   newSessionShortcutKeys,
   RIGHT_SIDEBAR_TOGGLE_KEYS,
-  SETTINGS_KEYS,
+  settingsShortcutKeys,
   SIDEBAR_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
@@ -207,7 +207,7 @@ export function CommandPalette({
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
         run: () => navigate("/settings"),
-        shortcut: SETTINGS_KEYS,
+        shortcut: settingsShortcutKeys(),
       },
       {
         id: "toggle-left-sidebar",
