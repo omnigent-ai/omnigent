@@ -1424,7 +1424,7 @@ stream and surface queue/interrupt semantics.
 > may change in a future revision; clients should isolate the
 > constant rather than hardcoding it. Importing
 > `SessionInputConsumedEvent` from
-> `omnigent.server.schemas` is the supported pattern.
+> `omnigent_client.wire` is the supported pattern.
 
 **Response (`response.*`)** — emitted by the executor (and the AP
 streaming routes for the lifecycle events). The session stream

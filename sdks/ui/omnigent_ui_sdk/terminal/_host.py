@@ -252,7 +252,7 @@ class _SubagentNode:
     # web-parity ``Failed`` label (outranks a stale ``completed`` status).
     last_task_error: bool = False
     # Whether the child session is closed to new user input — derived from its
-    # labels / title via :func:`omnigent.util.session_lifecycle.is_session_closed`.
+    # labels / title via :func:`omnigent_client.session_lifecycle.is_session_closed`.
     # Sticky (a closed session never reopens); gates interactive chat: a closed
     # child is view-only because a ``message`` to it returns 409 CONFLICT.
     closed: bool = False
