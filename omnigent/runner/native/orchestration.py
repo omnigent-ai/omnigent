@@ -5259,6 +5259,7 @@ async def _auto_create_codex_terminal(
     from omnigent.harnesses.codex_native.app_server import (
         CodexAppServerClient,
         CodexAppServerResponseError,
+        NativeCodexLaunch,
         apply_codex_thread_effort,
         build_codex_native_server,
         codex_remote_resume_omits_permission_args,
@@ -5266,6 +5267,7 @@ async def _auto_create_codex_terminal(
         fresh_codex_launch_catalog,
         is_missing_rollout_error,
         is_unreadable_thread_error,
+        native_codex_launch_base_url,
         native_codex_launch_pins_model_provider,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
@@ -5351,13 +5353,34 @@ async def _auto_create_codex_terminal(
     _codex_cli_path = _find_codex_cli()
     _catalog_launch = None
     _fresh_codex_catalog: list[_JsonObject] | None = None
-    try:
-        _catalog_launch = await asyncio.to_thread(
-            resolve_native_codex_launch,
-            model=None,
-            spec=_launch_spec,
-            terminal_launch_args=_codex_terminal_args,
+
+    def catalog_for_selected_route() -> NativeCodexLaunch:
+        default_launch = resolve_native_codex_launch(
+            model=None, spec=_launch_spec, terminal_launch_args=_codex_terminal_args
         )
+        if default_launch.profile == _codex_launch.profile and (
+            default_launch.profile is not None
+            or (
+                codex_session_meta_model_provider(default_launch)
+                == codex_session_meta_model_provider(_codex_launch)
+                and native_codex_launch_base_url(default_launch)
+                == native_codex_launch_base_url(_codex_launch)
+            )
+        ):
+            return default_launch
+        # Keep the selected provider while removing the session-specific model pin.
+        return dataclasses.replace(
+            _codex_launch,
+            model=None,
+            config_overrides=[
+                value
+                for value in _codex_launch.config_overrides
+                if value.partition("=")[0].strip() != "model"
+            ],
+        )
+
+    try:
+        _catalog_launch = await asyncio.to_thread(catalog_for_selected_route)
         _fresh_codex_catalog = fresh_codex_launch_catalog(
             codex_path=_codex_cli_path,
             launch=_catalog_launch,
@@ -5392,12 +5415,7 @@ async def _auto_create_codex_terminal(
         _codex_catalog_was_stale = False
         try:
             if _catalog_launch is None:
-                _catalog_launch = await asyncio.to_thread(
-                    resolve_native_codex_launch,
-                    model=None,
-                    spec=_launch_spec,
-                    terminal_launch_args=_codex_terminal_args,
-                )
+                _catalog_launch = await asyncio.to_thread(catalog_for_selected_route)
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
             _codex_catalog_was_stale = await codex_launch_catalog_is_stale(

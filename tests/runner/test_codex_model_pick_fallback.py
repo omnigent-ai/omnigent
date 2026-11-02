@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,15 +16,18 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import yaml
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.codex_native import app_server as codex_app
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
 from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     REAL_CODEX_LAUNCH_CATALOG,
     REAL_CODEX_REPROBED_LAUNCH_CATALOG,
@@ -94,6 +97,7 @@ async def codex_launch_harness(
     """Keep the real catalog store and launcher isolated from all live CLIs."""
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
@@ -230,13 +234,57 @@ async def codex_launch_harness(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pick", ["databricks-gpt-5-6-sol", "system.ai.gpt-5-6-sol"])
+@pytest.mark.parametrize("route", ["same-provider", "subscription-with-gateway"])
 async def test_equivalent_gateway_pick_launches_without_reset(
-    pick: str, codex_launch_harness: _LaunchHarness
+    pick: str,
+    route: str,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Gateway prefixes and endpoint punctuation do not make a pick unavailable."""
     harness = codex_launch_harness
     harness.snapshot["model_override"] = pick
-    harness.seed_catalog([{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}])
+    rows = [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]
+    if route == "subscription-with-gateway":
+        config = isolate_provider_resolution(monkeypatch, tmp_path / "providers")
+        (config / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "providers": {
+                        "subscription": {"kind": "subscription", "cli": "codex", "default": True},
+                        "gateway": {
+                            "kind": "key",
+                            "openai": {
+                                "base_url": "https://gateway.example.test/v1",
+                                "api_key": "test-gateway-key",
+                            },
+                        },
+                    }
+                }
+            )
+        )
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        (home / "auth.json").write_text('{"auth_mode":"apikey","OPENAI_API_KEY":"test-login"}')
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_native_codex_launch)
+        selected = resolve_native_codex_launch(model=pick, spec=harness.agent_spec)
+        gateway_shape = replace(
+            selected,
+            model=None,
+            config_overrides=[
+                value for value in selected.config_overrides if value.partition("=")[0] != "model"
+            ],
+        )
+        model_catalog_store.write_catalog(
+            "codex-native",
+            codex_app.codex_catalog_fingerprint(gateway_shape, codex_path=_CODEX_PATH),
+            rows,
+        )
+        harness.seed_catalog([{"id": "account-only-model", "isDefault": True}])
+    else:
+        harness.seed_catalog(rows)
 
     await harness.launch()
 

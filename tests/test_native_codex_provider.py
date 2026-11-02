@@ -279,6 +279,167 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     assert launch.profile is None
 
 
+_GATEWAY_KEY_PROVIDER = {
+    "gateway": {
+        "kind": "key",
+        "openai": {
+            "base_url": "https://gateway.example.com/serving-endpoints",
+            "api_key": "gw-key",
+        },
+    }
+}
+
+_OPENAI_KEY_PROVIDER = {
+    "api-key": {
+        "kind": "key",
+        "openai": {"base_url": "https://api.openai.com/v1", "api_key": "test-api-key"},
+    }
+}
+
+
+@pytest.mark.parametrize("logged_in", [True, False])
+@pytest.mark.parametrize("malformed_candidate", [False, True])
+def test_resolve_native_codex_launch_subscription_gateway_pick_routes_through_gateway(
+    _isolated: Path, logged_in: bool, malformed_candidate: bool
+) -> None:
+    """A pinned gateway model never reaches the built-in openai provider on a login.
+
+    The ChatGPT login cannot serve a Databricks gateway id, so a launch pinned to
+    one must route through a configured provider that can, whether or not Codex is
+    logged in. Failure with ``model_provider="openai"`` means the gateway pick was
+    sent to the login and fails with model_not_found.
+    """
+    _seed(
+        _isolated,
+        {
+            "codex-subscription": {"kind": "subscription", "cli": "codex", "default": True},
+            **_OPENAI_KEY_PROVIDER,
+            **(
+                {
+                    "invalid": {
+                        "kind": "key",
+                        "openai": {"base_url": "https://[broken/v1", "api_key": "test-key"},
+                    }
+                }
+                if malformed_candidate
+                else {}
+            ),
+            **_GATEWAY_KEY_PROVIDER,
+        },
+    )
+    _write_codex_login(_isolated, logged_in=logged_in)
+
+    launch = resolve_native_codex_launch(model="system.ai.gpt-6-astra")
+
+    joined = "\n".join(launch.config_overrides)
+    assert 'model_provider="openai"' not in joined
+    assert 'base_url="https://gateway.example.com/serving-endpoints"' in joined
+    assert launch.model == "system.ai.gpt-6-astra"
+    assert not launch.login_required
+
+
+@pytest.mark.parametrize("logged_in", [True, False])
+@pytest.mark.parametrize("auth_source", ["default", "spec"])
+def test_resolve_native_codex_launch_subscription_rejects_unroutable_gateway_pick(
+    _isolated: Path, logged_in: bool, auth_source: str
+) -> None:
+    """An incompatible explicit pick cannot silently use another model or credential."""
+    _seed(
+        _isolated,
+        {
+            "codex-subscription": {"kind": "subscription", "cli": "codex", "default": True},
+            **_OPENAI_KEY_PROVIDER,
+            **(_GATEWAY_KEY_PROVIDER if auth_source == "spec" else {}),
+        },
+    )
+    _write_codex_login(_isolated, logged_in=logged_in)
+
+    spec = _spec(auth=ProviderAuth(name="codex-subscription")) if auth_source == "spec" else None
+    with pytest.raises(
+        ValueError, match=r"system\.ai\.gpt-6-astra.*requires a Databricks gateway"
+    ):
+        resolve_native_codex_launch(model="system.ai.gpt-6-astra", spec=spec)
+
+
+def test_resolve_native_codex_launch_subscription_account_pick_stays_on_login(
+    _isolated: Path,
+) -> None:
+    """A non-gateway pick on a logged-in subscription still defers to the login."""
+    _seed(
+        _isolated,
+        {
+            "codex-subscription": {"kind": "subscription", "cli": "codex", "default": True},
+            **_GATEWAY_KEY_PROVIDER,
+        },
+    )
+    _write_codex_login(_isolated, logged_in=True)
+
+    launch = resolve_native_codex_launch(model="gpt-5.5")
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert launch.model == "gpt-5.5"
+
+
+@pytest.mark.parametrize(
+    "provider_selection", ["none", "unusable-default", "explicit-subscription"]
+)
+@pytest.mark.parametrize("config_profile", [None, "gateway"])
+def test_gateway_pick_preserves_codex_env_key_provider(
+    _isolated: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_selection: str,
+    config_profile: str | None,
+) -> None:
+    """An unadopted custom provider remains the effective route for a gateway pick."""
+    providers: dict[str, object] = {}
+    if provider_selection == "unusable-default":
+        providers = {
+            "unusable": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key_ref": "env:CODEX_UNUSED_PROVIDER_TOKEN",
+                },
+            }
+        }
+    elif provider_selection == "explicit-subscription":
+        providers = {"subscription": {"kind": "subscription", "cli": "codex", "default": True}}
+    _seed(_isolated, providers)
+    home = _isolated / ".codex"
+    home.mkdir()
+    monkeypatch.delenv("CODEX_UNUSED_PROVIDER_TOKEN", raising=False)
+    monkeypatch.setenv("CODEX_GATEWAY_TOKEN", "test-gateway-token")
+    config = (
+        'model_provider = "custom-gateway"\n'
+        "[model_providers.custom-gateway]\n"
+        'base_url = "https://workspace.ai-gateway.cloud.databricks.com/codex/v1"\n'
+        'env_key = "CODEX_GATEWAY_TOKEN"\n'
+        'wire_api = "responses"\n'
+    )
+    (home / "config.toml").write_text(config if config_profile is None else "")
+    if config_profile is not None:
+        (home / f"{config_profile}.config.toml").write_text(config)
+
+    launch_args = () if config_profile is None else ("--profile", config_profile)
+    if provider_selection == "explicit-subscription":
+        with pytest.raises(ValueError, match="requires a Databricks gateway provider"):
+            resolve_native_codex_launch(
+                model="system.ai.glm-5-2",
+                terminal_launch_args=launch_args,
+                spec=_spec(auth=ProviderAuth(name="subscription")),
+            )
+        return
+    launch = resolve_native_codex_launch(
+        model="system.ai.glm-5-2", terminal_launch_args=launch_args
+    )
+
+    assert launch.model == "system.ai.glm-5-2"
+    assert launch.config_overrides == ['model_provider="custom-gateway"']
+    assert not launch.login_required
+    assert "test-gateway-token" not in launch.summary
+
+
 def test_resolve_native_codex_launch_subscription_ignores_private_inherited_home(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

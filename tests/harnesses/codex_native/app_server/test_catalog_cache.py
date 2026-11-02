@@ -58,6 +58,7 @@ def _catalog_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> NativeCo
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(codex_native_app_server, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "source-codex-home"))
 
     def _unexpected_resolution(*, model: object, spec: object = None) -> NativeCodexLaunch:
         pytest.fail("catalog access must reuse the supplied launch shape")
