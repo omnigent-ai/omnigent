@@ -493,7 +493,7 @@ Defaults are per agent, so a Claude default and a Codex default coexist. You
 can also switch models in the middle of a session with the `/model` command.
 
 <details>
-<summary>Gateway base URLs (OpenRouter, Ollama)</summary>
+<summary>Gateway base URLs (OpenRouter, Neon, Ollama)</summary>
 
 When you add a **Gateway** credential, `omnigent setup` asks for a base URL
 and a key. The base URL depends on which agent you point it at:
@@ -502,11 +502,14 @@ and a key. The base URL depends on which agent you point it at:
 |---|---|---|---|
 | **OpenRouter** | Claude Code | `https://openrouter.ai/api` | your OpenRouter key (`sk-or-…`) |
 | **OpenRouter** | Codex / OpenAI agents | `https://openrouter.ai/api/v1` | your OpenRouter key (`sk-or-…`) |
+| **Neon AI Gateway** | Claude Code | `https://<branch-host>/anthropic` | your Neon credential (`nt_live_…`) |
+| **Neon AI Gateway** | Codex / OpenAI agents | `https://<branch-host>/openai/v1` (Responses API) | your Neon credential (`nt_live_…`) |
 | **Ollama** (local) | Codex / OpenAI agents | `http://localhost:11434/v1` | any value (Ollama ignores it) |
 
 For Claude Code, point at OpenRouter's Anthropic-compatible endpoint
 (`…/api`, **not** `…/api/v1`). For Codex and the OpenAI-agents harness, use
-the OpenAI-compatible `…/api/v1`.
+the OpenAI-compatible `…/api/v1`. To serve both from one Neon provider entry,
+see the [Neon AI Gateway guide](docs/neon-ai-gateway.md).
 
 </details>
 
