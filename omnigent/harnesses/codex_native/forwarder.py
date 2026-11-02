@@ -89,6 +89,10 @@ _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
+# Bounds one ``thread/resume`` attempt, which holds the session's delivery scope:
+# an unanswered resume would otherwise block every live post. Sized well above a
+# resume's normal latency so a large reconnect replay is not cut off.
+_SUBSCRIBE_RESUME_TIMEOUT_SECONDS = 30.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has
@@ -2828,33 +2832,6 @@ async def _subscribe_until_ready(
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
 ) -> None:
-    """Reserve authoritative delivery order while subscribing and replaying."""
-    async with _conversation_item_delivery_scope(session_id):
-        await _subscribe_until_ready_inner(
-            client,
-            ap_client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            thread_id=thread_id,
-            usage_coalescer=usage_coalescer,
-            elicitation_tracker=elicitation_tracker,
-            forwarder_state=forwarder_state,
-            ready_signal=ready_signal,
-        )
-
-
-async def _subscribe_until_ready_inner(
-    client: CodexAppServerClient,
-    ap_client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    bridge_dir: Path,
-    thread_id: str,
-    usage_coalescer: _SessionUsageCoalescer,
-    elicitation_tracker: _CodexElicitationTaskTracker,
-    forwarder_state: _CodexForwarderState | None = None,
-    ready_signal: asyncio.Event | None = None,
-) -> None:
     """
     Subscribe this app-server connection to a Codex thread.
 
@@ -2874,6 +2851,10 @@ async def _subscribe_until_ready_inner(
     reach the connection without a successful resume, so the caller can
     detect activity and set the signal. A short poll still covers the
     brief window between "thread active" and the rollout being flushed.
+
+    Each resume attempt, and on success the sync and replay that must precede
+    live posts, holds the session's delivery scope; waits between attempts do
+    not, so a subscription that never succeeds cannot silence the session.
 
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
@@ -2905,81 +2886,144 @@ async def _subscribe_until_ready_inner(
     )
     saw_not_ready = False
     while True:
-        received_live_items = client.is_subscribed_to_thread(thread_id)
-        try:
+        async with _conversation_item_delivery_scope(session_id):
+            received_live_items = client.is_subscribed_to_thread(thread_id)
             params: _JsonObject = {"threadId": thread_id}
             if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
                 params["excludeTurns"] = True
-            response = await client.request("thread/resume", params)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # app-server error envelopes are surfaced as RuntimeError.
-            if _is_thread_not_ready_error(exc):
-                if not saw_not_ready:
-                    _logger.info(
-                        "Codex thread %s is not ready yet (no/empty rollout); "
-                        "retrying subscription",
-                        thread_id,
-                    )
-                saw_not_ready = True
-                if ready_signal is not None and not ready_signal.is_set():
-                    # Idle fresh thread: no rollout until the first turn, and
-                    # no reason to poll meanwhile. Park until the caller's
-                    # event loop observes the thread go active.
-                    await ready_signal.wait()
-                else:
-                    # No signal wired (fallback), or the thread is active but
-                    # its rollout isn't flushed yet (brief race) — a short
-                    # poll covers that window.
-                    await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
-                continue
-            _logger.warning("failed to subscribe to Codex thread %s", thread_id, exc_info=True)
-            return
-        if forwarder_state is not None:
-            forwarder_state.note_resume_response(response)
-            # Source of truth for the cost policy is config.toml's model (what
-            # /model writes). Read it now so model_override reflects it from
-            # the first tool call, not a turn later. Falls back to the resume
-            # response's model when config.toml has none.
-            _refresh_model_from_config(bridge_dir, forwarder_state)
-            _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
-            _refresh_effort_from_config(bridge_dir, forwarder_state)
-            await _sync_model_change(
-                ap_client, session_id=session_id, forwarder_state=forwarder_state
-            )
-            # A fresh thread's subscription completes only once its first turn
-            # starts, so that turn's ``turn/started`` is missed: mirror the
-            # config.toml effort here too (an in-TUI ``/model`` effort change
-            # before the first turn would otherwise never reach the composer).
-            # Gated on a seen config effort: without one the unseeded baseline
-            # would mirror a spurious ``None`` on every session. On a fresh
-            # session this first sync posts the launch effort itself — a
-            # redundant-but-harmless mirror of the value Omnigent launched
-            # with, not a terminal change.
-            if forwarder_state.last_config_effort is not None:
-                await _sync_reasoning_effort_change(
-                    ap_client, session_id=session_id, forwarder_state=forwarder_state
+            try:
+                response = await asyncio.wait_for(
+                    client.request("thread/resume", params),
+                    timeout=_SUBSCRIBE_RESUME_TIMEOUT_SECONDS,
                 )
-            await _sync_codex_approval_mode_change(
+            except TimeoutError:
+                response = None
+                timed_out = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # app-server error envelopes are surfaced as RuntimeError.
+                if not _is_thread_not_ready_error(exc):
+                    _logger.warning(
+                        "failed to subscribe to Codex thread %s", thread_id, exc_info=True
+                    )
+                    return
+                response = None
+                timed_out = False
+            if response is not None:
+                await _finish_subscription(
+                    ap_client,
+                    response,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    thread_id=thread_id,
+                    usage_coalescer=usage_coalescer,
+                    elicitation_tracker=elicitation_tracker,
+                    forwarder_state=forwarder_state,
+                    received_live_items=received_live_items,
+                    replay_from_turn_id=replay_from_turn_id,
+                )
+                return
+        if timed_out:
+            _logger.warning(
+                "Codex thread/resume for %s did not answer within %.0fs; retrying subscription",
+                thread_id,
+                _SUBSCRIBE_RESUME_TIMEOUT_SECONDS,
+            )
+            await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+            continue
+        if not saw_not_ready:
+            _logger.info(
+                "Codex thread %s is not ready yet (no/empty rollout); retrying subscription",
+                thread_id,
+            )
+        saw_not_ready = True
+        if ready_signal is not None and not ready_signal.is_set():
+            # Idle fresh thread: no rollout until the first turn, and
+            # no reason to poll meanwhile. Park until the caller's
+            # event loop observes the thread go active.
+            await ready_signal.wait()
+        else:
+            # No signal wired (fallback), or the thread is active but
+            # its rollout isn't flushed yet (brief race) — a short
+            # poll covers that window.
+            await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+
+
+async def _finish_subscription(
+    ap_client: httpx.AsyncClient,
+    response: CodexMessage,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    usage_coalescer: _SessionUsageCoalescer,
+    elicitation_tracker: _CodexElicitationTaskTracker,
+    forwarder_state: _CodexForwarderState | None,
+    received_live_items: bool,
+    replay_from_turn_id: str | None,
+) -> None:
+    """
+    Sync thread metadata from a successful resume and replay its snapshot.
+
+    The caller holds the session's delivery scope, so no live post lands
+    between the resume and its replay.
+
+    :param ap_client: Omnigent HTTP client used for replayed items.
+    :param response: Successful ``thread/resume`` response envelope.
+    :param session_id: Omnigent conversation id.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id.
+    :param usage_coalescer: Token-usage coalescer for replayed events.
+    :param elicitation_tracker: Background Codex elicitation tracker.
+    :param forwarder_state: Optional mutable forwarder state that
+        receives thread metadata from the resume response.
+    :param received_live_items: Whether this connection was already
+        subscribed (and so received live items) before the resume.
+    :param replay_from_turn_id: Interrupted turn to replay from, if any.
+    :returns: None.
+    """
+    if forwarder_state is not None:
+        forwarder_state.note_resume_response(response)
+        # Source of truth for the cost policy is config.toml's model (what
+        # /model writes). Read it now so model_override reflects it from
+        # the first tool call, not a turn later. Falls back to the resume
+        # response's model when config.toml has none.
+        _refresh_model_from_config(bridge_dir, forwarder_state)
+        _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
+        _refresh_effort_from_config(bridge_dir, forwarder_state)
+        await _sync_model_change(ap_client, session_id=session_id, forwarder_state=forwarder_state)
+        # A fresh thread's subscription completes only once its first turn
+        # starts, so that turn's ``turn/started`` is missed: mirror the
+        # config.toml effort here too (an in-TUI ``/model`` effort change
+        # before the first turn would otherwise never reach the composer).
+        # Gated on a seen config effort: without one the unseeded baseline
+        # would mirror a spurious ``None`` on every session. On a fresh
+        # session this first sync posts the launch effort itself — a
+        # redundant-but-harmless mirror of the value Omnigent launched
+        # with, not a terminal change.
+        if forwarder_state.last_config_effort is not None:
+            await _sync_reasoning_effort_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
-        if forwarder_state is not None and received_live_items:
-            forwarder_state.resume_echo_thread_ids.add(thread_id)
-        try:
-            await _replay_resume_response(
-                ap_client,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                response=response,
-                usage_coalescer=usage_coalescer,
-                elicitation_tracker=elicitation_tracker,
-                forwarder_state=forwarder_state,
-                replay_from_turn_id=replay_from_turn_id,
-            )
-        finally:
-            if forwarder_state is not None:
-                forwarder_state.resume_echo_thread_ids.discard(thread_id)
-        return
+        await _sync_codex_approval_mode_change(
+            ap_client, session_id=session_id, forwarder_state=forwarder_state
+        )
+    if forwarder_state is not None and received_live_items:
+        forwarder_state.resume_echo_thread_ids.add(thread_id)
+    try:
+        await _replay_resume_response(
+            ap_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            response=response,
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
+            forwarder_state=forwarder_state,
+            replay_from_turn_id=replay_from_turn_id,
+        )
+    finally:
+        if forwarder_state is not None:
+            forwarder_state.resume_echo_thread_ids.discard(thread_id)
 
 
 def _event_indicates_thread_active(event: CodexMessage) -> bool:

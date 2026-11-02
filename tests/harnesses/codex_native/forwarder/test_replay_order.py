@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -544,3 +545,136 @@ async def test_turn_started_waits_for_replay_before_replacing_active_turn(tmp_pa
         await tracker.close()
 
     assert read_bridge_state(tmp_path).active_turn_id == "turn_2"  # type: ignore[union-attr]
+
+
+def _live_completion(text: str = "live") -> dict:
+    return {
+        "threadId": "thread_1",
+        "turnId": "turn_1",
+        "item": {"type": "agentMessage", "id": "item_live", "text": text},
+    }
+
+
+@pytest.mark.asyncio
+async def test_subscribe_parked_on_a_not_ready_thread_does_not_block_live_posts(
+    tmp_path: Path,
+) -> None:
+    """A fresh thread's parked subscription leaves the delivery scope free."""
+
+    class _NotReadyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return False
+
+        async def request(self, _method: str, _params: dict) -> dict:
+            self.calls += 1
+            raise RuntimeError("no rollout found for thread id thread_1")
+
+    native = _NotReadyClient()
+    client = _RecordingClient()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    ready_signal = asyncio.Event()
+    locks_token = fwd._conversation_item_locks.set({})
+    subscribe = asyncio.create_task(
+        fwd._subscribe_until_ready(
+            native,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            ready_signal=ready_signal,
+        )
+    )
+    try:
+        while native.calls == 0:
+            await asyncio.sleep(0)
+        await asyncio.wait_for(
+            fwd._handle_completed_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                _live_completion(),
+                forwarder_state=fwd._CodexForwarderState(),
+            ),
+            timeout=5.0,
+        )
+    finally:
+        subscribe.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await subscribe
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+        "thread_1:turn_1:item_live"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A resume Codex never answers is retried instead of holding the scope forever."""
+
+    class _HangingFirstResumeClient:
+        def __init__(self) -> None:
+            self.params: list[dict] = []
+
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return True
+
+        async def request(self, _method: str, params: dict) -> dict:
+            self.params.append(params)
+            if len(self.params) == 1:
+                await asyncio.Event().wait()
+            return {"result": {"thread": {"id": "thread_1", "turns": []}}}
+
+    monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_TIMEOUT_SECONDS", 0.05)
+    native = _HangingFirstResumeClient()
+    client = _RecordingClient()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        subscribe = asyncio.create_task(
+            fwd._subscribe_until_ready(
+                native,  # type: ignore[arg-type]
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                usage_coalescer=usage,
+                elicitation_tracker=tracker,
+            )
+        )
+        while not native.params:
+            await asyncio.sleep(0)
+        await asyncio.wait_for(
+            fwd._handle_completed_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                _live_completion(),
+                forwarder_state=fwd._CodexForwarderState(),
+            ),
+            timeout=5.0,
+        )
+        await asyncio.wait_for(subscribe, timeout=5.0)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+    # The retry is still a reconnect, not a fresh not-ready thread.
+    assert native.params == [
+        {"threadId": "thread_1", "excludeTurns": True},
+        {"threadId": "thread_1", "excludeTurns": True},
+    ]
+    assert [body["data"]["source_id"] for _url, body in client.posts] == [
+        "thread_1:turn_1:item_live"
+    ]
