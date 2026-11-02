@@ -529,44 +529,22 @@ class PersistentTaskScheduler:
             await self._claim_pending()
 
     async def run_now(self, task: ScheduledTask) -> ScheduledTaskRun | None:
-        """Record a Run now request, starting it here if this replica owns its host.
+        """Record a Run now request for the host's owner to start on its next poll.
 
-        Otherwise the host's owner starts it on its next poll. Returns the
-        recorded run, or None if the task was deleted.
+        Starting it inside the request would tie the startup to the request's
+        context, which request cancellation tears down when the response ends.
+        Returns the recorded run, or None if the task was deleted.
         """
         trigger_key = manual_trigger_key()
         host_id = occurrence_host_id(task, trigger_key)
         with workspace_scope(task.workspace_id):
-            run = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 self._store.request_manual_run,
                 task,
                 now=int(self._now()),
                 trigger_key=trigger_key,
                 host_id=host_id,
             )
-        if run is None:
-            return None
-        # A poll may claim it concurrently; the claim is conditional, so one wins.
-        try:
-            if (
-                not self._stopped
-                and self.is_started
-                and len(self._startups) < self._max_startups
-                and self._dispatching()
-                and host_ownership_key(run.workspace_id, run.host_id)
-                in await self._owned_host_keys(
-                    [host_ownership_key(run.workspace_id, run.host_id)], operation="claim"
-                )
-            ):
-                await self._start_pending(run)
-        except Exception:
-            # The request is recorded; failing it here would invite a duplicate retry.
-            _logger.exception(
-                "Could not start requested run %s here; a later poll will start it",
-                run.id,
-                extra=_run_event("scheduled_task_operation_failed", run, operation="claim"),
-            )
-        return run
 
     async def _claim_pending(self) -> None:
         """Start Run now requests whose host this replica owns, one page per poll.

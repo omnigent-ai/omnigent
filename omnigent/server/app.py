@@ -5206,7 +5206,7 @@ def create_app(
             ):
                 _logger.warning(
                     "device-grant: GitHub OAuth does not support prompt=login / "
-                    "max_age=0, so the anti-phishing re-auth gate cannot be enforced. "
+                    "max_age, so the anti-phishing re-auth gate cannot be enforced. "
                     "Device-grant flow skipped for this deployment; only "
                     "/oauth/token + /oauth/revoke are mounted."
                 )

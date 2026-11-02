@@ -480,6 +480,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
                 env={
                     "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
                     "ANTHROPIC_AUTH_TOKEN": "must-not-leak",
+                    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
                 },
             )
         },
@@ -500,6 +501,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
+            "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
             "ANTHROPIC_CUSTOM_HEADERS": (
                 "x-databricks-use-coding-agent-mode: true\n"
                 "Databricks-Custom-Coding-Agent: claude-code\n"
@@ -9219,6 +9221,7 @@ def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     assert cfg is not None
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": base_url,
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
         "ANTHROPIC_CUSTOM_HEADERS": (
             "X-Team: search\n"
             "Databricks-Custom-Coding-Agent: claude-code\n"
@@ -12647,6 +12650,7 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     assert config is not None
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
     assert config.env["CLAUDE_CODE_USE_GATEWAY"] == "1"
+    assert config.env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
         "Databricks-Custom-Coding-Agent: claude-code",
@@ -12682,6 +12686,7 @@ def test_connect_fallback_prefers_ucode_state(
                 env={
                     "ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic",
                     "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/0.1.0 claude/2.1.0",
+                    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
                 },
             )
         },
@@ -12694,6 +12699,7 @@ def test_connect_fallback_prefers_ucode_state(
     # ucode's base URL + discovered model win over the hand-built defaults.
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
     assert config.model == "system.ai.claude-sonnet-4-6"
+    assert config.env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
     # ug's own header lines survive, and the route is attributed to it.
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "User-Agent: ucode/0.1.0 claude/2.1.0",
