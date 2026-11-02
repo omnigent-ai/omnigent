@@ -620,43 +620,69 @@ export function touchScrollPayload(
 }
 
 /**
- * How long the bridge gets to answer a ``paste`` frame before the browser
+ * How long the bridge gets to acknowledge a ``paste`` frame before the browser
  * pastes through xterm instead. Runners that predate the frame ignore it; a
- * current bridge answers within its own prompt wait.
+ * current bridge sends ``paste-accepted`` at once and then waits for the prompt.
  */
 export const SHELL_PASTE_ACK_TIMEOUT_MS = 10_000;
+
+/** Refusal reasons a bridge ``paste-result`` frame can carry. */
+const BRIDGE_PASTE_REFUSALS = [
+  "read-only",
+  "too-large",
+  "empty",
+  "busy",
+  "not-ready",
+  "failed",
+] as const;
+
+/**
+ * Why a command was not pasted: a bridge reason, ``unsafe`` (an xterm paste
+ * would run lines) or ``interrupted`` (the socket closed before the answer).
+ */
+export type ShellPasteRefusal = (typeof BRIDGE_PASTE_REFUSALS)[number] | "unsafe" | "interrupted";
+
+/** Called with a command that was not pasted and why. */
+export type ShellPasteRefusedHandler = (text: string, reason: ShellPasteRefusal) => void;
 
 /** A command waiting to be pasted; see {@link TerminalSession.pasteWhenShellReady}. */
 interface PendingShellPaste {
   claim: () => string | null;
-  onRefused?: (text: string) => void;
+  onRefused?: ShellPasteRefusedHandler;
 }
 
 /** A ``paste`` frame the bridge has not answered yet. */
 interface InFlightShellPaste {
   id: number;
   text: string;
-  onRefused?: (text: string) => void;
-  ackTimer: ReturnType<typeof setTimeout>;
+  onRefused?: ShellPasteRefusedHandler;
+  /** Cleared once the bridge acknowledges the frame. */
+  ackTimer: ReturnType<typeof setTimeout> | null;
 }
 
-/** Parse the bridge's ``{"type": "paste-result"}`` answer to a ``paste`` frame. */
-export function parseTerminalPasteResult(message: string): { id: unknown; pasted: boolean } | null {
+/** A bridge answer to a ``paste`` frame. */
+export type TerminalPasteFrame =
+  | { kind: "accepted"; id: unknown }
+  | { kind: "result"; id: unknown; pasted: boolean; reason: ShellPasteRefusal };
+
+/** Parse the bridge's ``paste-accepted`` and ``paste-result`` frames. */
+export function parseTerminalPasteFrame(message: string): TerminalPasteFrame | null {
   let value: unknown;
   try {
     value = JSON.parse(message);
   } catch {
     return null;
   }
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    (value as { type?: unknown }).type !== "paste-result"
-  ) {
-    return null;
-  }
-  const result = value as { id?: unknown; pasted?: unknown };
-  return { id: result.id, pasted: result.pasted === true };
+  if (typeof value !== "object" || value === null) return null;
+  const frame = value as { type?: unknown; id?: unknown; pasted?: unknown; reason?: unknown };
+  if (frame.type === "paste-accepted") return { kind: "accepted", id: frame.id };
+  if (frame.type !== "paste-result") return null;
+  return {
+    kind: "result",
+    id: frame.id,
+    pasted: frame.pasted === true,
+    reason: BRIDGE_PASTE_REFUSALS.find((reason) => reason === frame.reason) ?? "failed",
+  };
 }
 
 /**
@@ -858,8 +884,8 @@ export class TerminalSession {
             this.queryReplies?.dispose();
             this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
           }
-          const pasteResult = parseTerminalPasteResult(ev.data);
-          if (pasteResult !== null) this.settleInFlightPaste(pasteResult);
+          const pasteFrame = parseTerminalPasteFrame(ev.data);
+          if (pasteFrame !== null) this.settleInFlightPaste(pasteFrame);
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -870,7 +896,9 @@ export class TerminalSession {
       "close",
       (ev) => {
         // An unanswered paste may already be in the pane; never repeat it.
+        const inFlight = this.inFlightPaste;
         this.dropInFlightPaste();
+        inFlight?.onRefused?.(inFlight.text, "interrupted");
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -1057,14 +1085,15 @@ export class TerminalSession {
    * Paste a command at the shell's prompt without running it.
    *
    * The bridge pastes once the prompt is ready, or refuses. A runner that
-   * doesn't answer within {@link SHELL_PASTE_ACK_TIMEOUT_MS} gets an xterm
-   * paste, only when that can't run a line.
+   * doesn't acknowledge within {@link SHELL_PASTE_ACK_TIMEOUT_MS} gets an
+   * xterm paste, only when that can't run a line.
    *
    * @param claim Takes the command; null means another view already pasted it.
    *   Called once, when the WebSocket is open.
-   * @param onRefused Called with a command that was not pasted.
+   * @param onRefused Called with a command that was not pasted, or that may
+   *   not have been because the socket closed first.
    */
-  pasteWhenShellReady(claim: () => string | null, onRefused?: (text: string) => void): void {
+  pasteWhenShellReady(claim: () => string | null, onRefused?: ShellPasteRefusedHandler): void {
     if (this.disposed) return;
     this.pendingPaste = { claim, onRefused };
     this.sendPendingPaste();
@@ -1087,11 +1116,16 @@ export class TerminalSession {
     };
   }
 
-  private settleInFlightPaste(result: { id: unknown; pasted: boolean }): void {
+  private settleInFlightPaste(frame: TerminalPasteFrame): void {
     const inFlight = this.inFlightPaste;
-    if (inFlight === null || result.id !== inFlight.id) return;
+    if (inFlight === null || frame.id !== inFlight.id) return;
+    if (frame.kind === "accepted") {
+      if (inFlight.ackTimer !== null) clearTimeout(inFlight.ackTimer);
+      inFlight.ackTimer = null;
+      return;
+    }
     this.dropInFlightPaste();
-    if (!result.pasted) inFlight.onRefused?.(inFlight.text);
+    if (!frame.pasted) inFlight.onRefused?.(inFlight.text, frame.reason);
     this.sendPendingPaste();
   }
 
@@ -1104,14 +1138,14 @@ export class TerminalSession {
     if (this.term.modes.bracketedPasteMode || !inFlight.text.includes("\n")) {
       this.term.paste(inFlight.text);
     } else {
-      inFlight.onRefused?.(inFlight.text);
+      inFlight.onRefused?.(inFlight.text, "unsafe");
     }
     this.sendPendingPaste();
   }
 
   private dropInFlightPaste(): void {
     if (this.inFlightPaste === null) return;
-    clearTimeout(this.inFlightPaste.ackTimer);
+    if (this.inFlightPaste.ackTimer !== null) clearTimeout(this.inFlightPaste.ackTimer);
     this.inFlightPaste = null;
   }
 

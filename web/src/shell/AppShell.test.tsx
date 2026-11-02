@@ -5946,10 +5946,10 @@ describe("AppShell open in shell", () => {
     );
   }
 
-  function renderOpenerProbe(permissionLevel: number) {
+  function renderOpenerProbe(permissionLevel: number, terminals = ["zsh"]) {
     mockConversations([{ id: "conv_sdk", permission_level: permissionLevel }]);
     useSessionAgentMock.mockReturnValue({
-      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+      data: { id: "ag_x", name: "polly", terminals },
     } as ReturnType<typeof useSessionAgent>);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(sessionShellTree(client, "/c/conv_sdk", <ShellOpenerProbe />));
@@ -5985,8 +5985,97 @@ describe("AppShell open in shell", () => {
     expect(claimPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe("npm test");
   });
 
+  function createdShellResponse() {
+    return new Response(
+      JSON.stringify({
+        id: "terminal_zsh_u1",
+        metadata: { terminal_name: "zsh", session_key: "u1", running: true },
+      }),
+      { status: 201, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  it("opens the new shell full screen on a phone", async () => {
+    // WHY: the Workspace rail is hidden below md, so a rail tab would leave
+    // the pasted command out of sight.
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: false,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => createdShellResponse()),
+    );
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open"),
+    );
+    expect(screen.getByTestId("terminals-panel").getAttribute("data-initial-key")).toContain("zsh");
+    expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true);
+  });
+
+  it("tells the user when the shell can't be created", async () => {
+    const errorToast = vi.spyOn(toast, "error");
+    onTestFinished(() => errorToast.mockRestore());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: "terminal limit reached" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    );
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+
+    await waitFor(() => expect(errorToast).toHaveBeenCalled());
+    expect(errorToast.mock.calls[0][0]).toBe("Couldn't open a shell");
+    expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(false);
+  });
+
+  it("doesn't start a second shell while one is still being created", async () => {
+    const infoToast = vi.spyOn(toast, "info");
+    onTestFinished(() => infoToast.mockRestore());
+    let finishCreate: (response: Response) => void = () => {};
+    const fetchMock = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          if (init?.method === "POST") finishCreate = resolve;
+          else resolve(new Response("{}", { status: 200 }));
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderOpenerProbe(4);
+    const button = screen.getByRole("button", { name: "open command" });
+
+    fireEvent.click(button);
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(true),
+    );
+    fireEvent.click(button);
+
+    expect(infoToast).toHaveBeenCalledWith("A shell is already opening", expect.anything());
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    finishCreate(createdShellResponse());
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+  });
+
   it("offers no opener to a viewer who would attach read-only", () => {
     renderOpenerProbe(1);
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
+  });
+
+  it("offers no opener when the agent declares no shells", () => {
+    renderOpenerProbe(4, []);
 
     expect(screen.getByText("no shell opener")).toBeInTheDocument();
   });

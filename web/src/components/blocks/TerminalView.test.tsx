@@ -23,7 +23,7 @@ import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
-import type { ConnectionState } from "./TerminalSession";
+import type { ConnectionState, ShellPasteRefusedHandler } from "./TerminalSession";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -83,7 +83,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
     pasteWhenShellReady: ReturnType<
-      typeof vi.fn<(claim: () => string | null, onRefused?: (text: string) => void) => void>
+      typeof vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>
     >;
   }[],
 }));
@@ -98,7 +98,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
     pasteWhenShellReady =
-      vi.fn<(claim: () => string | null, onRefused?: (text: string) => void) => void>();
+      vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>();
 
     constructor(
       container: HTMLDivElement,
@@ -244,6 +244,7 @@ describe("control-mode terminal", () => {
 describe("pending shell input", () => {
   afterEach(() => {
     claimPendingShellInput("conv_abc", "terminal_bash_s1");
+    claimPendingShellInput("conv_abc", "terminal_other");
   });
 
   it("hands input queued before the attach to the session once", async () => {
@@ -270,7 +271,6 @@ describe("pending shell input", () => {
 
     expect(paste).toHaveBeenCalledTimes(1);
     expect(paste.mock.calls[0][0]()).toBe("ls");
-    claimPendingShellInput("conv_abc", "terminal_other");
   });
 
   it("leaves queued input alone on a read-only attach", async () => {
@@ -281,15 +281,20 @@ describe("pending shell input", () => {
     expect(terminalSessionMock.instances[0].pasteWhenShellReady).not.toHaveBeenCalled();
   });
 
-  it("explains a refused multi-line paste", async () => {
+  it.each([
+    ["unsafe", "Command not pasted", /couldn't take this command without running it/],
+    ["not-ready", "Command not pasted", /didn't reach an empty prompt/],
+    ["interrupted", "Command may not have been pasted", /Check the prompt before pressing Enter/],
+  ] as const)("explains a %s refusal", async (reason, title, description) => {
     queuePendingShellInput("conv_abc", "terminal_bash_s1", "a\nb");
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
 
     const [, onRefused] = terminalSessionMock.instances[0].pasteWhenShellReady.mock.calls[0];
-    act(() => onRefused?.("a\nb"));
+    act(() => onRefused?.("a\nb", reason));
 
-    expect(await screen.findByText("Command not pasted")).toBeInTheDocument();
+    expect(await screen.findByText(title)).toBeInTheDocument();
+    expect(screen.getByText(description)).toBeInTheDocument();
   });
 });
 

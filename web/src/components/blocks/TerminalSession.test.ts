@@ -1271,6 +1271,10 @@ describe("TerminalSession", () => {
       socket.emit("message", { data: JSON.stringify({ type: "paste-result", ...result }) });
     }
 
+    function acceptPaste(socket: FakeWebSocket, id: number) {
+      socket.emit("message", { data: JSON.stringify({ type: "paste-accepted", id }) });
+    }
+
     async function writePane(socket: FakeWebSocket, session: TerminalSession, text: string) {
       const term = (session as unknown as { term: Terminal }).term;
       const bytes = new TextEncoder().encode(text);
@@ -1298,20 +1302,56 @@ describe("TerminalSession", () => {
       session.dispose();
     });
 
+    it("sends no fallback after the bridge pasted", () => {
+      vi.useFakeTimers();
+      try {
+        const { socket, session } = makeSession();
+        const refused = vi.fn();
+        socket.open();
+        session.pasteWhenShellReady(() => "ls", refused);
+        answerPaste(socket, { id: 1, pasted: true });
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
+
+        expect(inputFrames(socket)).toEqual([]);
+        expect(refused).not.toHaveBeenCalled();
+        session.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("reports a command the bridge refused", () => {
       const { socket, session } = makeSession();
-      const refused: string[] = [];
+      const refused: [string, string][] = [];
       socket.open();
       session.pasteWhenShellReady(
         () => "echo one\necho two",
-        (text) => refused.push(text),
+        (text, reason) => refused.push([text, reason]),
       );
 
       answerPaste(socket, { id: 99, pasted: false, reason: "not-ready" });
       expect(refused).toEqual([]);
       answerPaste(socket, { id: 1, pasted: false, reason: "not-ready" });
 
-      expect(refused).toEqual(["echo one\necho two"]);
+      expect(refused).toEqual([["echo one\necho two", "not-ready"]]);
+      expect(inputFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    it("tells the caller when the socket closes before the bridge answers", () => {
+      // WHY: the bridge may already have pasted, so the browser can't retry,
+      // but the user must know to check the prompt.
+      const { socket, session } = makeSession();
+      const refused: [string, string][] = [];
+      socket.open();
+      session.pasteWhenShellReady(
+        () => "make deploy",
+        (text, reason) => refused.push([text, reason]),
+      );
+      acceptPaste(socket, 1);
+      socket.emit("close", { code: 1006, reason: "" });
+
+      expect(refused).toEqual([["make deploy", "interrupted"]]);
       expect(inputFrames(socket)).toEqual([]);
       session.dispose();
     });
@@ -1353,23 +1393,46 @@ describe("TerminalSession", () => {
         session.dispose();
       });
 
+      it("waits past the timeout once the bridge accepted the paste", async () => {
+        // WHY: a bridge waiting for a slow prompt must not race an xterm paste
+        // that could land in whatever the pane is running.
+        const { socket, session } = makeSession();
+        socket.open();
+        await writePane(socket, session, "\x1b[?2004h$ ");
+        vi.useFakeTimers();
+        const refused: string[] = [];
+        session.pasteWhenShellReady(
+          () => "ls -la",
+          (text) => refused.push(text),
+        );
+        acceptPaste(socket, 1);
+
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
+        expect(inputFrames(socket)).toEqual([]);
+        answerPaste(socket, { id: 1, pasted: true });
+
+        expect(inputFrames(socket)).toEqual([]);
+        expect(refused).toEqual([]);
+        session.dispose();
+      });
+
       it("types a single-line command but refuses a multi-line one", () => {
         // WHY: without bracketed paste every newline is Enter, which would run
         // the command the user has not reviewed yet.
         vi.useFakeTimers();
         const { socket, session } = makeSession();
-        const refused: string[] = [];
+        const refused: [string, string][] = [];
         socket.open();
         session.pasteWhenShellReady(() => "ls -la");
         vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
         session.pasteWhenShellReady(
           () => "echo one\necho two",
-          (text) => refused.push(text),
+          (text, reason) => refused.push([text, reason]),
         );
         vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
 
         expect(inputFrames(socket)).toEqual(["ls -la"]);
-        expect(refused).toEqual(["echo one\necho two"]);
+        expect(refused).toEqual([["echo one\necho two", "unsafe"]]);
         session.dispose();
       });
 

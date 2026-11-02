@@ -44,6 +44,7 @@ import {
 } from "./TerminalClipboardPrompt";
 import {
   type ConnectionState,
+  type ShellPasteRefusal,
   type TerminalActivityListener,
   type TerminalInputListener,
   applyTerminalCopy,
@@ -89,6 +90,46 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+/** Toast text for a chat command that was not pasted into the shell. */
+export function shellPasteRefusalMessage(reason: ShellPasteRefusal): {
+  title: string;
+  description: string;
+} {
+  const copyHint = "Copy it from the chat instead.";
+  switch (reason) {
+    case "interrupted":
+      return {
+        title: "Command may not have been pasted",
+        description: `The connection to the shell dropped. Check the prompt before pressing Enter, or ${copyHint.toLowerCase()}`,
+      };
+    case "not-ready":
+      return {
+        title: "Command not pasted",
+        description: `The shell didn't reach an empty prompt in time. ${copyHint}`,
+      };
+    case "busy":
+      return {
+        title: "Command not pasted",
+        description: `Another command is still being pasted into this shell. ${copyHint}`,
+      };
+    case "too-large":
+      return {
+        title: "Command not pasted",
+        description: `The command is too long to paste. ${copyHint}`,
+      };
+    case "read-only":
+      return {
+        title: "Command not pasted",
+        description: `This shell is attached read-only. ${copyHint}`,
+      };
+    default:
+      return {
+        title: "Command not pasted",
+        description: `The shell couldn't take this command without running it. ${copyHint}`,
+      };
+  }
+}
 
 function isReconnectableTerminalClose(code: number): boolean {
   return (
@@ -338,11 +379,10 @@ export function TerminalView({
     if (session === null || readOnly || !hasPendingShellInput(sessionId, terminalId)) return;
     session.pasteWhenShellReady(
       () => claimPendingShellInput(sessionId, terminalId),
-      () =>
-        toast.info("Command not pasted", {
-          description:
-            "The shell couldn't take this command without running it. Copy it from the chat instead.",
-        }),
+      (_text, reason) => {
+        const { title, description } = shellPasteRefusalMessage(reason);
+        toast.info(title, { description });
+      },
     );
   }, [sessionId, terminalId, readOnly]);
   useEffect(() => subscribePendingShellInput(offerPendingShellInput), [offerPendingShellInput]);

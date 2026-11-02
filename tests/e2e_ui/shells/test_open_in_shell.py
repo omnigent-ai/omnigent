@@ -6,9 +6,9 @@ full-screen shell view) and pastes the command at the first prompt without
 running it. The command runs only when the user presses Enter.
 
 xterm draws to a canvas, so the test checks the hand-off on the attach WebSocket
-(the browser's ``paste`` frame and the bridge's ``paste-result``) and checks
-execution through marker files at absolute ``tmp_path`` paths that the
-runner-local shell writes.
+(the browser's ``paste`` frame and the bridge's ``paste-accepted`` and
+``paste-result`` answers) and checks execution through marker files at absolute
+``tmp_path`` paths that the runner-local shell writes.
 """
 
 from __future__ import annotations
@@ -104,10 +104,11 @@ def test_open_in_shell_pastes_command_until_user_runs_it(
         f"the bridge never answered the paste; sent frames: {sent_text!r}"
     )
     assert [message["text"] for message in _messages(sent_text, "paste")] == [command]
+    assert _messages(received_text, "paste-accepted") == [{"type": "paste-accepted", "id": 1}]
     assert _messages(received_text, "paste-result") == [
         {"type": "paste-result", "id": 1, "pasted": True}
     ]
-    # Bracketed paste leaves the lines in readline's buffer; nothing runs yet.
+    # The paste leaves the lines in the line editor's buffer; nothing runs yet.
     page.wait_for_timeout(2_000)
     assert not first_marker.exists() and not second_marker.exists()
 

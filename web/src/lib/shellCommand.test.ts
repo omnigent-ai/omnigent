@@ -34,10 +34,41 @@ describe("shellCommandFromCodeBlock", () => {
     expect(shellCommandFromCodeBlock("$ ls\nfile.txt\n$ pwd\n/home/me\n")).toBe("ls\npwd");
   });
 
+  it("keeps a script whose later lines merely start with a dollar sign", () => {
+    // WHY: only a block that opens with a prompt is a transcript; a script
+    // line like a heredoc's "$ x" must not drop every other line.
+    const script = "cat <<'EOF'\n$ not a prompt\nEOF\necho done";
+    expect(shellCommandFromCodeBlock(script)).toBe(script);
+  });
+
+  it("treats a block opening with a prompt after blank lines as a transcript", () => {
+    expect(shellCommandFromCodeBlock("\n$ ls\nfile.txt\n")).toBe("ls");
+  });
+
   it("keeps backslash continuations of a prompted command", () => {
     expect(shellCommandFromCodeBlock("$ docker run \\\n  --rm image\noutput\n")).toBe(
       "docker run \\\n  --rm image",
     );
+  });
+
+  it("strips secondary prompts from a transcript's continuation lines", () => {
+    // WHY: a "> " left on the line would redirect output into a file and
+    // truncate it.
+    expect(shellCommandFromCodeBlock("$ printf '%s\\n' \\\n> hello\nhello\n")).toBe(
+      "printf '%s\\n' \\\nhello",
+    );
+    expect(shellCommandFromCodeBlock("$ cat <<'EOF'\n> one\n> EOF\none\n")).toBe(
+      "cat <<'EOF'\none\nEOF",
+    );
+  });
+
+  it("keeps a real redirection on a continuation line", () => {
+    expect(shellCommandFromCodeBlock("$ echo hi \\\n> > out.txt\n")).toBe("echo hi \\\n> out.txt");
+    expect(shellCommandFromCodeBlock("echo hi \\\n> out.txt")).toBe("echo hi \\\n> out.txt");
+  });
+
+  it("skips output that merely starts with a secondary prompt", () => {
+    expect(shellCommandFromCodeBlock("$ ls\nfile.txt\n> quoted output\n")).toBe("ls");
   });
 
   it("drops leading blank lines and normalizes CRLF", () => {
@@ -75,6 +106,14 @@ describe("pending shell input", () => {
 
     expect(hasPendingShellInput("session", "terminal", expired)).toBe(false);
     expect(claimPendingShellInput("session", "terminal", expired)).toBeNull();
+  });
+
+  it("drops expired input for other shells when new input is queued", () => {
+    queuePendingShellInput("session", "abandoned", "ls", 1_000);
+    queuePendingShellInput("session", "terminal", "pwd", 1_000 + PENDING_SHELL_INPUT_TTL_MS + 1);
+
+    // Asked at the original time, so only pruning can make it disappear.
+    expect(hasPendingShellInput("session", "abandoned", 1_000)).toBe(false);
   });
 
   it("notifies subscribers when input is queued", () => {

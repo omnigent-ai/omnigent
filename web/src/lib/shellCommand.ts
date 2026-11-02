@@ -4,7 +4,7 @@
 
 import { createContext, useContext } from "react";
 
-/** Fenced-code languages whose contents are commands for a POSIX-style shell. */
+/** Fenced-code languages whose contents are commands for an interactive shell. */
 const SHELL_LANGUAGES = new Set([
   "bash",
   "sh",
@@ -36,6 +36,8 @@ export function isShellCodeClassName(className: string | undefined): boolean {
 }
 
 const PROMPT_PREFIX = /^\s*\$ /;
+// The shell's secondary prompt (PS2), shown before each continuation line.
+const CONTINUATION_PREFIX = /^> /;
 
 /** Whether a UTF-16 code unit is a control character other than tab or LF. */
 function isDroppedControl(code: number): boolean {
@@ -55,8 +57,10 @@ function withoutControlCharacters(text: string): string {
 /**
  * The command text a shell code block hands to a new shell.
  *
- * A transcript keeps only its ``$ `` lines (and their continuations), without
- * the prompt. Trailing newlines and control characters other than tab are dropped.
+ * A block whose first non-blank line starts with ``$ `` is a transcript: only
+ * its ``$ `` lines and their continuations are kept, without the prompts. A
+ * continuation follows a trailing backslash or carries the ``> `` secondary
+ * prompt. Trailing newlines and control characters other than tab are dropped.
  *
  * @param code The code block's text, e.g. ``"$ npm test\\nok\\n"``.
  * @returns The command, e.g. ``"npm test"``; empty when nothing remains.
@@ -64,13 +68,24 @@ function withoutControlCharacters(text: string): string {
 export function shellCommandFromCodeBlock(code: string): string {
   const lines = withoutControlCharacters(code.replace(/\r\n?/g, "\n")).split("\n");
   let commandLines = lines;
-  if (lines.some((line) => PROMPT_PREFIX.test(line))) {
+  const firstLine = lines.find((line) => line.trim() !== "");
+  if (firstLine !== undefined && PROMPT_PREFIX.test(firstLine)) {
     commandLines = [];
+    let inCommand = false;
     let continued = false;
     for (const line of lines) {
-      const prompted = PROMPT_PREFIX.test(line);
-      if (!prompted && !continued) continue;
-      commandLines.push(prompted ? line.replace(PROMPT_PREFIX, "") : line);
+      if (PROMPT_PREFIX.test(line)) {
+        commandLines.push(line.replace(PROMPT_PREFIX, ""));
+        inCommand = true;
+      } else if (inCommand && CONTINUATION_PREFIX.test(line)) {
+        // Left in, "> " would be a redirection that truncates a file.
+        commandLines.push(line.replace(CONTINUATION_PREFIX, ""));
+      } else if (continued) {
+        commandLines.push(line);
+      } else {
+        inCommand = false;
+        continue;
+      }
       continued = line.trimEnd().endsWith("\\");
     }
   }
@@ -108,10 +123,14 @@ function pendingShellInputKey(sessionId: string, terminalId: string): string {
   return JSON.stringify([sessionId, terminalId]);
 }
 
+function isExpired(entry: PendingShellInput, now: number): boolean {
+  return now - entry.queuedAt > PENDING_SHELL_INPUT_TTL_MS;
+}
+
 function liveEntry(key: string, now: number): PendingShellInput | null {
   const entry = pendingShellInputs.get(key);
   if (entry === undefined) return null;
-  if (now - entry.queuedAt > PENDING_SHELL_INPUT_TTL_MS) {
+  if (isExpired(entry, now)) {
     pendingShellInputs.delete(key);
     return null;
   }
@@ -131,6 +150,10 @@ export function queuePendingShellInput(
   text: string,
   now = Date.now(),
 ): void {
+  // Shells that never attached would otherwise keep their commands forever.
+  for (const [key, entry] of pendingShellInputs) {
+    if (isExpired(entry, now)) pendingShellInputs.delete(key);
+  }
   pendingShellInputs.set(pendingShellInputKey(sessionId, terminalId), { text, queuedAt: now });
   for (const listener of pendingShellInputListeners) listener();
 }

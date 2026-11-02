@@ -2099,14 +2099,28 @@ function AppShellImpl() {
     ],
   );
   useNewShellHotkey(launchDefaultShell, shellLaunchable);
-  // Chat code blocks get "Open in shell" only where the viewer could open a
-  // shell themselves; non-owners attach read-only and couldn't type the paste.
-  const latestLaunchShellRef = useRef({ launchDefaultShell, shellLaunchable });
-  latestLaunchShellRef.current = { launchDefaultShell, shellLaunchable };
+  // Read at click time so the context value stays stable across renders.
+  const latestLaunchShellRef = useRef({
+    launchDefaultShell,
+    shellLaunchable,
+    creating: createTerminal.isPending,
+  });
+  latestLaunchShellRef.current = {
+    launchDefaultShell,
+    shellLaunchable,
+    creating: createTerminal.isPending,
+  };
   const openShellCommand = useCallback((command: string) => {
     const latest = latestLaunchShellRef.current;
     if (latest.shellLaunchable) latest.launchDefaultShell(command);
+    else if (latest.creating) {
+      toast.info("A shell is already opening", {
+        description: "Try again once it appears.",
+      });
+    }
   }, []);
+  // Chat code blocks get "Open in shell" only where the viewer could open a
+  // shell themselves; non-owners attach read-only and couldn't type the paste.
   const shellCommandOpener =
     agentSupportsShells &&
     isOwnerLevel(permissionLevel) &&
