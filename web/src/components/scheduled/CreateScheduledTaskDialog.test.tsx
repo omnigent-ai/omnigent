@@ -325,8 +325,9 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(submit).toBeEnabled();
   });
 
-  it("pins a workspace only after the full-screen browser confirms", () => {
-    renderDialog();
+  it("pins a workspace on confirmation and waits for reconnection if its host disconnects", () => {
+    const onOpenChange = vi.fn();
+    const { rerender } = renderDialog(onOpenChange);
     const hostTrigger = screen.getByTestId("task-host-trigger");
     fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(hostTrigger);
@@ -340,6 +341,26 @@ describe("CreateScheduledTaskDialog validation", () => {
 
     expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
     expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(screen.getByTestId("task-workspace-browse")).toBeEnabled();
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
   });
 });
 
@@ -607,11 +628,17 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   });
 
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
     renderWithSandboxes();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -718,13 +745,18 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
 
     await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
+    const browse = screen.getByTestId("task-workspace-browse");
+    expect(browse).toBeDisabled();
+    expect(browse).toHaveAccessibleDescription("Connect your host to select a workspace.");
+    fireEvent.click(browse);
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
   });
 
-  it("keeps the saved workspace in view and in the update when the host changes", async () => {
+  it("preserves a saved workspace when switching to an offline host, but disables browsing", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [
         { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
-        { host_id: "host_2", name: "desktop", owner: "me", status: "online" },
+        { host_id: "host_2", name: "desktop", owner: "me", status: "offline" },
       ],
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     render(
@@ -741,6 +773,10 @@ describe("CreateScheduledTaskDialog submit", () => {
 
     // Omitting the workspace would keep the saved one, so the form keeps showing it.
     expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getByText("Connect your host to select a workspace.")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
