@@ -225,6 +225,7 @@ def test_elicitation_request_event_translates() -> None:
         ElicitationRequestParams,
     )
 
+    questions = {"questions": [{"question": "Env?", "options": [{"label": "dev"}]}]}
     params = ElicitationRequestParams(
         mode="form",
         message="Approve this?",
@@ -232,6 +233,7 @@ def test_elicitation_request_event_translates() -> None:
         phase="tool_call",
         policy_name="approve_shell",
         content_preview="rm -rf /tmp",
+        ask_user_question=questions,
     )
     event = ElicitationRequestEvent(
         type="response.elicitation_request",
@@ -249,6 +251,8 @@ def test_elicitation_request_event_translates() -> None:
     assert out.requested_schema == {"type": "object"}
     # Own-session prompt: no mirrored-child routing hint.
     assert out.target_session_id is None
+    # Without the questions the REPL falls back to y/a/n, which answers nothing.
+    assert out.ask_user_question == questions
 
 
 def test_elicitation_request_event_preserves_target_session_id() -> None:

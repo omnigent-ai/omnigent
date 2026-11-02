@@ -51,7 +51,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
-from omnigent_ui_sdk.terminal import StreamLive
+from omnigent_ui_sdk.terminal import QuestionSpec, StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -1007,6 +1007,9 @@ class _FieldInputState:
         # prompting rather than advancing to — and re-prompting for —
         # the next field after the turn is already gone.
         self._aborted: bool = False
+        # Elicitation the open prompt answers, so another client's verdict
+        # for it can release the prompt.
+        self._elicitation_id: str | None = None
 
     @property
     def pending(self) -> bool:
@@ -1021,7 +1024,7 @@ class _FieldInputState:
         """:returns: ``True`` if collection was cancelled mid-prompt."""
         return self._aborted
 
-    def begin(self, field_name: str) -> asyncio.Future[str]:
+    def begin(self, field_name: str, elicitation_id: str | None = None) -> asyncio.Future[str]:
         # A fresh prompt is never pre-aborted. Cleared here (not in the
         # collection loop) so the flag spans exactly one begin/await
         # cycle: the loop reads it the instant the await returns, and
@@ -1030,8 +1033,19 @@ class _FieldInputState:
         if self._future is not None and not self._future.done():
             self._future.set_result("")
         self._field_name = field_name
+        self._elicitation_id = elicitation_id
         self._future = asyncio.get_running_loop().create_future()
         return self._future
+
+    def resolve_elsewhere(self, elicitation_id: str) -> bool:
+        """Release the open prompt if another client answered its elicitation.
+
+        :returns: ``True`` when the prompt belonged to *elicitation_id*.
+        """
+        if not self.pending or not elicitation_id or elicitation_id != self._elicitation_id:
+            return False
+        self.cancel()
+        return True
 
     def resolve(self, text: str) -> bool:
         if self._future is None or self._future.done():
@@ -1047,6 +1061,102 @@ class _FieldInputState:
             self._future.set_result("")
         self._future = None
         self._field_name = None
+        self._elicitation_id = None
+
+
+@dataclass
+class _PromptTicket:
+    """One elicitation request waiting for, or holding, the terminal prompt.
+
+    :param elicitation_id: Id of the elicitation, e.g. ``"elicit_abc"``. The
+        server may reuse an id for a later request, which gets a new ticket.
+    :param event: The translated :class:`ElicitationRequest`.
+    :param settled: Set once a verdict from here is no longer wanted: another
+        client answered the request, or the server re-asked under its id.
+    """
+
+    elicitation_id: str
+    event: object
+    settled: bool = False
+
+
+def _settle_resolved_elsewhere(
+    session: _SessionsChatReplAdapter,
+    approval_state: _ApprovalState,
+    field_input_state: _FieldInputState,
+    elicitation_id: str,
+    action: str | None,
+    reason: str | None,
+) -> str | None:
+    """Release this REPL's prompt for an elicitation another client settled.
+
+    :returns: The transcript line, e.g. ``"approved elsewhere"``, or ``None``
+        when no prompt here was waiting on *elicitation_id*.
+    """
+    session.note_elicitation_resolved(elicitation_id)
+    if approval_state.resolve_elsewhere(
+        elicitation_id, action
+    ) or field_input_state.resolve_elsewhere(elicitation_id):
+        return _resolved_elsewhere_label(action, reason)
+    return None
+
+
+def _question_prompts(payload: object) -> list[QuestionSpec]:
+    """Parse an ``ask_user_question`` extra into selector questions; ``[]`` when unusable.
+
+    Follows the web form: a typed answer is allowed unless ``isOther`` is
+    ``false``. Every question must be answerable, so one that isn't (no
+    options and no typing, or malformed) rejects the whole batch.
+
+    :param payload: The extra, e.g. ``{"questions": [{"question": "Env?", ...}]}``.
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list):
+        return []
+    questions: list[QuestionSpec] = []
+    for raw in raw_questions:
+        if not isinstance(raw, dict):
+            return []
+        text = raw.get("question")
+        raw_options = raw.get("options", [])
+        if not isinstance(text, str) or not text or not isinstance(raw_options, list):
+            return []
+        options: list[tuple[str, str]] = []
+        for option in raw_options:
+            label = option.get("label") if isinstance(option, dict) else option
+            if not isinstance(label, str) or not label:
+                return []  # a malformed option: the question can't be shown faithfully
+            description = option.get("description") if isinstance(option, dict) else ""
+            options.append((label, description if isinstance(description, str) else ""))
+        text_input = raw.get("textInput")
+        default = text_input.get("default") if isinstance(text_input, dict) else None
+        allow_custom = raw.get("isOther") is not False
+        if not options and not allow_custom and not isinstance(default, str):
+            return []  # nothing to pick and typing is forbidden: unanswerable
+        question_id = raw.get("id")
+        header = raw.get("header")
+        questions.append(
+            QuestionSpec(
+                key=question_id if isinstance(question_id, str) and question_id else text,
+                question=text,
+                header=header if isinstance(header, str) else "",
+                options=tuple(options),
+                multi_select=raw.get("multiSelect") is True,
+                allow_custom=allow_custom,
+                text_default=default if isinstance(default, str) else None,
+            )
+        )
+    return questions
+
+
+def _asks_for_secret(payload: object) -> bool:
+    """Whether any question in an ``ask_user_question`` extra is marked ``isSecret``."""
+    raw_questions = payload.get("questions") if isinstance(payload, dict) else None
+    return isinstance(raw_questions, list) and any(
+        isinstance(raw, dict) and raw.get("isSecret") is True for raw in raw_questions
+    )
 
 
 def _build_elicitation_content_from_schema(
@@ -1225,6 +1335,11 @@ def _elicitation_resolve_session_id(sdk_event: object, fallback_session_id: str)
     return getattr(sdk_event, "target_session_id", None) or fallback_session_id
 
 
+def _dict_or_none(value: object) -> dict[str, object] | None:
+    """Return *value* when it is a dict, else ``None``."""
+    return value if isinstance(value, dict) else None
+
+
 def _server_event_to_sdk_event(event: object) -> object | None:
     """Translate a server-shape ``ServerStreamEvent`` into an SDK-shape event.
 
@@ -1318,6 +1433,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
             # verdict is POSTed back to the child that parked on it, not
             # the ancestor stream the event was relayed onto.
             target_session_id=params.target_session_id,
+            ask_user_question=_dict_or_none((params.model_extra or {}).get("ask_user_question")),
         )
     if isinstance(event, CompactionInProgressEvent):
         return CompactionInProgress()
@@ -1376,6 +1492,7 @@ class _SessionsChatReplAdapter:
         harness: str | None = None,
         attach_only: bool = False,
         field_input_state: _FieldInputState | None = None,
+        approval_state: _ApprovalState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
         registered_agent: RegisteredAgent | None = None,
@@ -1423,6 +1540,8 @@ class _SessionsChatReplAdapter:
             ``False`` (default) is the runner-owning ``run`` path.
         :param field_input_state: Shared state for collecting schema
             field values interactively via the main input loop.
+        :param approval_state: The y/a/n approval gate, so a request
+            re-asked under its id can release the old card.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
         :param registered_agent: Catalog identity selected for a new remote session.
@@ -1434,6 +1553,15 @@ class _SessionsChatReplAdapter:
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
         self._field_input_state = field_input_state
+        self._approval_state = approval_state
+        # Prompts queued or open, by elicitation id: a repeat request for one
+        # is dropped, and another client's verdict settles it.
+        self._prompt_tickets: dict[str, _PromptTicket] = {}
+        # One terminal prompt at a time: they share the input line, and a
+        # second prompt would otherwise take it from the first.
+        self._prompt_lock = asyncio.Lock()
+        # The prompt holding ``_prompt_lock`` (shown to the user).
+        self._open_ticket: _PromptTicket | None = None
         self._host = host
         self._fmt = fmt
         self._session_id: str | None = session_id
@@ -2711,6 +2839,40 @@ class _SessionsChatReplAdapter:
 
         task.add_done_callback(_discard_task)
 
+    def queue_elicitation(self, session_id: str, event: object) -> asyncio.Task[None] | None:
+        """Queue the terminal prompt for an elicitation; its task POSTs the verdict.
+
+        The request is registered before this returns, so a resolved event
+        handled right after it settles the prompt instead of missing it.
+
+        :param session_id: Session to post the verdict to.
+        :param event: The translated :class:`ElicitationRequest`.
+        :returns: The task collecting the verdict, or ``None`` when *event*
+            repeats a request that is still queued or open.
+        """
+        elicitation_id = getattr(event, "elicitation_id", "")
+        current = self._prompt_tickets.get(elicitation_id)
+        if current is not None:
+            if current.event == event:
+                return None
+            self._release_replaced(elicitation_id)
+        ticket = _PromptTicket(elicitation_id, event)
+        if elicitation_id:
+            self._prompt_tickets[elicitation_id] = ticket
+        return asyncio.create_task(self._answer_prompt(session_id, ticket))
+
+    def _release_replaced(self, elicitation_id: str) -> None:
+        """Release the old prompt of a request re-asked under *elicitation_id*.
+
+        Its verdict must not answer the new request, so nothing is posted for
+        it, whichever prompt it holds: the selector, a y/a/n card or a form.
+        """
+        self.note_elicitation_resolved(elicitation_id)
+        if self._approval_state is not None:
+            self._approval_state.resolve_elsewhere(elicitation_id, None)
+        if self._field_input_state is not None:
+            self._field_input_state.resolve_elsewhere(elicitation_id)
+
     async def _handle_elicitation(
         self,
         session_id: str,
@@ -2722,11 +2884,85 @@ class _SessionsChatReplAdapter:
         :param session_id: Session to post the approval to.
         :param event: The translated :class:`ElicitationRequest`.
         """
+        task = self.queue_elicitation(session_id, event)
+        if task is not None:
+            await task
+
+    async def _answer_prompt(self, session_id: str, ticket: _PromptTicket) -> None:
+        """Prompt for *ticket* when its turn comes and POST the verdict."""
+        try:
+            if self._pre_approved(ticket):
+                # Answered without input, so it needn't wait for the prompt.
+                resolve_payload = await self._collect_verdict(ticket)
+            else:
+                async with self._prompt_lock:
+                    if ticket.settled:
+                        return  # its verdict is no longer wanted from here
+                    self._open_ticket = ticket
+                    try:
+                        resolve_payload = await self._collect_verdict(ticket)
+                    finally:
+                        self._open_ticket = None
+            if resolve_payload is not None:
+                await self._post_elicitation_verdict(session_id, ticket, resolve_payload)
+        finally:
+            # Finished with this request, so a later one may reuse its id.
+            if self._prompt_tickets.get(ticket.elicitation_id) is ticket:
+                del self._prompt_tickets[ticket.elicitation_id]
+
+    def _pre_approved(self, ticket: _PromptTicket) -> bool:
+        """Whether *ticket* is a y/a/n approval the user already said "always" to.
+
+        Its hook approves it without prompting, unless accepting it would
+        still ask for schema fields.
+        """
+        event = ticket.event
+        if self._approval_state is None or getattr(event, "ask_user_question", None) is not None:
+            return False
+        policy_name = getattr(event, "policy_name", "")
+        if not self._approval_state.is_pre_approved(policy_name, getattr(event, "phase", "")):
+            return False
+        schema = getattr(event, "requested_schema", None) or {}
+        return not schema.get("properties") or (
+            _build_elicitation_content_from_schema(schema) is not None
+        )
+
+    async def _collect_verdict(self, ticket: _PromptTicket) -> dict[str, object] | None:
+        """Prompt for *ticket*'s request and build its resolve payload (``None``: post nothing)."""
+        ask_user_question = getattr(ticket.event, "ask_user_question", None)
+        questions = _question_prompts(ask_user_question)
+        if isinstance(ask_user_question, dict) and not questions:
+            # Nothing usable to ask; an approval would accept with no answers.
+            return {"action": "decline"}
+        if questions and self._host is not None:
+            # Questions get the selector: a y/a/n accept would carry no answers.
+            return await self._question_payload(
+                ticket, questions, secret=_asks_for_secret(ask_user_question)
+            )
+        return await self._approval_payload(ticket)
+
+    def note_elicitation_resolved(self, elicitation_id: str) -> None:
+        """Settle the queued or open request for *elicitation_id* so no verdict is posted."""
+        ticket = self._prompt_tickets.pop(elicitation_id, None)
+        if ticket is None:
+            return
+        ticket.settled = True
+        if ticket is self._open_ticket and self._host is not None:
+            self._host.dismiss_questions()
+
+    async def _approval_payload(self, ticket: _PromptTicket) -> dict[str, object] | None:
+        """Run the y/a/n approval hook and build the resolve payload.
+
+        :param ticket: The request being answered.
+        :returns: ``{"action": ..., "content"?: ...}`` for the resolve POST, or
+            ``None`` when another client answered it mid-prompt.
+        """
         import inspect
 
         from omnigent_client._tool_handler import ElicitationRequestCtx
 
-        elicitation_id = getattr(event, "elicitation_id", "")
+        event = ticket.event
+        elicitation_id = ticket.elicitation_id
         hook = self._hooks.on_elicitation_request
         if hook is None:
             action = "decline"
@@ -2749,6 +2985,8 @@ class _SessionsChatReplAdapter:
                 action = "accept" if result else "decline"
             except Exception:  # noqa: BLE001
                 action = "decline"
+        if ticket.settled:
+            return None  # settled elsewhere while the y/a/n card was open
         # Build the resolve payload. For accept with a requestedSchema,
         # populate ``content`` from the schema so the MCP server receives
         # the form data it expects. Simple schemas (boolean, enum) are
@@ -2766,24 +3004,39 @@ class _SessionsChatReplAdapter:
                 # agent turn doesn't hang waiting on a verdict that the
                 # background task would otherwise never POST.
                 try:
-                    prompted = await self._prompt_schema_fields(schema)
+                    prompted = await self._prompt_schema_fields(schema, ticket)
                 except Exception:  # noqa: BLE001
                     prompted = None
+                if ticket.settled:
+                    return None  # settled elsewhere mid-form
                 if prompted is not None:
                     resolve_payload["content"] = prompted
                 else:
                     resolve_payload["action"] = "decline"
 
+        return resolve_payload
+
+    async def _post_elicitation_verdict(
+        self,
+        session_id: str,
+        ticket: _PromptTicket,
+        resolve_payload: dict[str, object],
+    ) -> None:
+        """POST the verdict, retrying transport errors until *ticket* is settled."""
         # URL-based elicitation: deliver the verdict to the elicitation's
         # dedicated resolve URL rather than as an in-band ``approval`` event.
         # A transport error can happen after the server accepted the POST but
         # before the client received its response, so retrying is safe: the
         # server either accepts the retry or reports the elicitation resolved.
         for attempt in range(3):
+            if ticket.settled:
+                # Settled meanwhile, perhaps by an earlier attempt; the id may
+                # now belong to a re-asked request this verdict must not answer.
+                return
             try:
                 await self._client.sessions.resolve_elicitation(
                     session_id,
-                    elicitation_id,
+                    ticket.elicitation_id,
                     resolve_payload,
                 )
                 return
@@ -2811,14 +3064,59 @@ class _SessionsChatReplAdapter:
                     return
                 await asyncio.sleep(0.1 * (2**attempt))
 
+    async def _question_payload(
+        self,
+        ticket: _PromptTicket,
+        questions: list[QuestionSpec],
+        *,
+        secret: bool,
+    ) -> dict[str, object] | None:
+        """Ask the questions in the terminal's selector and build the resolve payload.
+
+        :param ticket: The request being answered.
+        :param questions: Parsed questions from the ``ask_user_question`` extra.
+        :param secret: Whether a question is marked secret.
+        :returns: An accept carrying the web form's answer shape, a decline
+            when the user dismisses it, or ``None`` to post nothing (another
+            client answered, or a secret question must be answered there).
+        """
+        host = self._host
+        if host is None:
+            return None
+        if secret:
+            # Typed terminal input is visible on screen; leave it pending.
+            from rich.text import Text
+
+            host.output(
+                Text(
+                    "   ? This question asks for a secret, which the terminal can't take "
+                    "safely. Answer it in the web UI.",
+                    style=self._fmt.warning if self._fmt is not None else "",
+                )
+            )
+            return None
+        try:
+            answers = await host.ask_questions(questions)
+        except Exception:  # noqa: BLE001
+            # Never leave the elicitation unresolved: a failed prompt declines.
+            answers = None
+        if ticket.settled:
+            return None  # answered in another client while the selector was open
+        if answers is None:
+            return {"action": "decline"}
+        return {"action": "accept", "content": answers}
+
     async def _prompt_schema_fields(
         self,
         schema: dict[str, object],
+        ticket: _PromptTicket | None = None,
     ) -> dict[str, str | int | float | bool | list[str] | None] | None:
         """Prompt the user for each schema property via the main input loop.
 
         Returns the filled content dict, or ``None`` if the interactive
         state is unavailable (e.g. no ``_field_input_state`` wired up).
+        *ticket* is the request being answered; collection stops once
+        another client settles it.
         """
         from rich.text import Text
 
@@ -2839,6 +3137,8 @@ class _SessionsChatReplAdapter:
         for key, prop in properties.items():
             if not isinstance(prop, dict):
                 return None
+            if ticket is not None and ticket.settled:
+                return None  # settled elsewhere between fields: ask nothing more
 
             prop_type = prop.get("type", "string")
             description = prop.get("description", "")
@@ -2882,7 +3182,7 @@ class _SessionsChatReplAdapter:
             # everything: a single typo on field N shouldn't decline the
             # whole form. The user aborts the turn with Esc (→ ``aborted``).
             while True:
-                raw = await fis.begin(key)
+                raw = await fis.begin(key, ticket.elicitation_id if ticket is not None else None)
                 if fis.aborted:
                     return None
 
@@ -3505,6 +3805,7 @@ async def run_repl(
         harness=harness,
         attach_only=attach_only,
         field_input_state=field_input_state,
+        approval_state=approval_state,
         host=host,
         fmt=fmt,
     )
@@ -3763,8 +4064,15 @@ async def run_repl(
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            if approval_state.resolve_elsewhere(event.elicitation_id, event.action):
-                label = _resolved_elsewhere_label(event.action, event.reason)
+            label = _settle_resolved_elsewhere(
+                session,
+                approval_state,
+                field_input_state,
+                event.elicitation_id,
+                event.action,
+                event.reason,
+            )
+            if label is not None:
                 host.output(
                     Text.from_markup(
                         f"   [{fmt.muted}]› {label}[/{fmt.muted}]",
@@ -4122,11 +4430,10 @@ async def run_repl(
             sid = _elicitation_resolve_session_id(
                 sdk_ev, getattr(session, "session_id", None) or ""
             )
-            elicit_task = asyncio.create_task(
-                session._handle_elicitation(sid, sdk_ev),
-            )
-            _background_event_tasks.add(elicit_task)
-            elicit_task.add_done_callback(_background_event_tasks.discard)
+            elicit_task = session.queue_elicitation(sid, sdk_ev)
+            if elicit_task is not None:
+                _background_event_tasks.add(elicit_task)
+                elicit_task.add_done_callback(_background_event_tasks.discard)
             if tape_entry is not None:
                 _maybe_log_tape_entry(tape_entry)
             return

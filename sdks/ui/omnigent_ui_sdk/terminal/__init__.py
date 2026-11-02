@@ -19,6 +19,7 @@ from ._host import (
     PendingAttachment,
     TerminalHost,
 )
+from ._questions import QuestionSpec
 from ._theme import DARK_THEME, LIGHT_THEME, THEMES, TerminalTheme, TerminalThemeName
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "OverlayAction",
     "OverlayTarget",
     "PendingAttachment",
+    "QuestionSpec",
     "RichBlockFormatter",
     "StreamLive",
     "StreamingText",
