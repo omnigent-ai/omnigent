@@ -10757,8 +10757,8 @@ def _native_subagent_wrapper_labels(
     return _native_subagent_wrapper_labels_from_spec(sub_spec)
 
 
-# Host readiness values that keep a native harness out of Smart Routing, which
-# only offers harnesses whose host readiness is confirmed.
+# Host readiness values that keep a native harness out of Smart Routing. An
+# unresponsive CLI may be stuck at a setup prompt, so routing never picks it.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
     {
         False,

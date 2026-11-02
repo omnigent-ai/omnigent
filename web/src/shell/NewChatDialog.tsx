@@ -923,7 +923,8 @@ function harnessWarningMessage(
  * Gated on the setup feature: when OFF, renders the original "run omnigent
  * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
  * <agent>" action that repairs native agents on user hosts in place, or opens
- * the setup checklist for other agents and managed hosts.
+ * the setup checklist for other agents and managed hosts. An unresponsive CLI
+ * keeps its timeout explanation, since setup would not change it.
  */
 function HarnessSetupNotice({
   agentName,
@@ -949,7 +950,7 @@ function HarnessSetupNotice({
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
-      {featureEnabled ? (
+      {featureEnabled && reason !== "cli-unresponsive" ? (
         <>
           <span>
             {agentName} isn&apos;t ready on {hostName}.

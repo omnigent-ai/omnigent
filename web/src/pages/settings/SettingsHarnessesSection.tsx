@@ -566,7 +566,8 @@ function HarnessCard({
   const status = harnessStatus(entry.harness, host);
   const mode = harnessFixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
-  const opensDetail = status.ready || (status.needsSetup && canFix);
+  const needsAttention = status.needsSetup || status.reason === "cli-unresponsive";
+  const opensDetail = status.ready || (needsAttention && canFix);
   const navigate = useNavigate();
   const body = (
     <>
@@ -587,8 +588,7 @@ function HarnessCard({
             />
           </div>
         </div>
-        {(status.ready ||
-          (status.needsSetup && canFix && (mode !== "install" || !installable))) && (
+        {(status.ready || (needsAttention && canFix && (mode !== "install" || !installable))) && (
           <Button
             size="icon-sm"
             variant="ghost"
@@ -720,9 +720,11 @@ function HarnessDetail({
       warning={credentialProblem}
       showStatus={canSetup}
       statusLabel={
-        status.reason === "binary-missing" || status.reason === "unconfigured"
-          ? reconfigurationReason(status.reason)
-          : "Needs reconfiguration"
+        status.reason === "cli-unresponsive"
+          ? "Not checked"
+          : status.reason === "binary-missing" || status.reason === "unconfigured"
+            ? reconfigurationReason(status.reason)
+            : "Needs reconfiguration"
       }
       action={
         status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
@@ -745,7 +747,7 @@ function HarnessDetail({
           account={readyNotice.account}
         />
       )}
-      {status.needsSetup && !credentialProblem && (
+      {(status.needsSetup || status.reason === "cli-unresponsive") && !credentialProblem && (
         <HarnessWarning
           entry={entry}
           host={host}
@@ -849,11 +851,13 @@ function HarnessWarning({
   onFix: (mode: HarnessFixMode) => void;
 }) {
   const copy =
-    reason === "readiness-error"
-      ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "update"
-        ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-        : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+    reason === "cli-unresponsive"
+      ? `${entry.name}’s CLI on ${host.name} didn’t respond to a version check. New sessions still try to start it; run it on that machine and finish any setup prompt it shows.`
+      : reason === "readiness-error"
+        ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
+        : mode === "update"
+          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
   const action = !installable
     ? "Set up"
     : mode === "update"
@@ -867,7 +871,7 @@ function HarnessWarning({
         <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
         <p>{copy}</p>
       </div>
-      {!host.sandbox_provider && (
+      {!host.sandbox_provider && reason !== "cli-unresponsive" && (
         <Button size="sm" onClick={() => onFix(mode)}>
           {action}
         </Button>
