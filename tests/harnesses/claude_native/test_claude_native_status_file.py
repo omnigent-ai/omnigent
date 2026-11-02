@@ -435,6 +435,56 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
     assert poller.active is True
 
 
+def test_busy_left_by_a_background_agent_reads_idle(tmp_path: Path) -> None:
+    """A busy file reads idle while a settled turn's background agent works.
+
+    Claude keeps the file ``busy`` for the agent's lifetime without rewriting
+    it, so the bridge's mark is rechecked on every tick of an unchanged file.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    agent_after_turn = [False]
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        background_agents_after_turn=lambda: agent_after_turn[0],
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    # The turn's Stop lists a running agent; the forwarded idle edge resyncs.
+    agent_after_turn[0] = True
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert published == [(RUNNING, None), (IDLE, None), (IDLE, None)]
+    assert poller.holding_background_agents is True
+
+    # A follow-up prompt starts a turn the same busy file now reports.
+    agent_after_turn[0] = False
+    poller.tick()
+    assert published[-1] == (RUNNING, None)
+    assert poller.holding_background_agents is False
+
+    # A dialog still needs the user, whatever the agent is doing.
+    agent_after_turn[0] = True
+    poller.tick()
+    _write_session_file(
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="permission prompt"
+    )
+    poller.tick()
+    assert published[-2:] == [(IDLE, None), (RUNNING, "permission prompt")]
+    assert poller.holding_background_agents is False
+
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert published[-1] == (IDLE, None)
+    assert poller.holding_background_agents is False
+
+
 def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:
     """A retired poller stays retired across a reconnect.
 

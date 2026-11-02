@@ -221,25 +221,30 @@ def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
     assert pane_names >= NATIVE_PANE_TERMINAL_NAMES
 
 
-async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
+@pytest.mark.parametrize("live_work", ["approval_wait", "background_agent"])
+async def test_runner_busy_check_spares_a_pane_with_live_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    live_work: str,
 ) -> None:
     """
-    The runner's busy check treats a fresh approval-wait marker as busy.
+    The runner's busy check treats an approval wait or a background agent as busy.
 
-    A pane parked on a permission prompt has no active turn, no ``running``
-    status, no attached client and no output, so every other signal reads idle
-    and the reaper would kill the prompt under a still-answerable card.
+    A pane parked on a permission prompt, or whose settled turn left a background
+    agent working, has no active turn, no ``running`` status, no attached client
+    and no output, so every other signal reads idle and the reaper would kill it.
     """
     # Bound by name when the app is built, so stub before building: no tmux here.
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
     monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
     registry = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    agent_sessions: set[str] = set()
+    monkeypatch.setattr(resources, "session_has_background_agents", agent_sessions.__contains__)
     app = create_runner_app(
         terminal_registry=registry,
-        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        resource_registry=resources,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     reaper = app.state.native_pane_reaper
@@ -250,11 +255,14 @@ async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
 
     assert not await reaper._is_busy(pane)
 
-    marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
-    marker.parent.mkdir(parents=True)
-    claude_native_bridge.touch_approval_wait_marker(marker)
+    if live_work == "approval_wait":
+        marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
+        marker.parent.mkdir(parents=True)
+        claude_native_bridge.touch_approval_wait_marker(marker)
+    else:
+        agent_sessions.add("conv_parked")
     assert await reaper._is_busy(pane)
-    # Another session's parked prompt does not spare this pane.
+    # Another session's live work does not spare this pane.
     other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
     assert not await reaper._is_busy(other)
 

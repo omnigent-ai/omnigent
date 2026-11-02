@@ -37,6 +37,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.program_status import ProgramStatusReader
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -953,11 +954,16 @@ async def _observe_native_with_real_poller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     session_id: str,
+    *,
+    program_status_report: Path | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
-    """Observe a Claude terminal with a real poller and caller-written status file."""
+    """Observe a Claude terminal with a real poller and caller-written status file.
+
+    With ``program_status_report``, the terminal also has a PTY relay's OSC status report.
+    """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
-    status_file.parent.mkdir(parents=True)
+    status_file.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
@@ -969,6 +975,8 @@ async def _observe_native_with_real_poller(
     watcher = Mock()
     monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
     monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
+    if program_status_report is not None:
+        instance.program_status = ProgramStatusReader(program_status_report)
     statuses: list[str] = []
     registry.set_session_status_publisher(
         lambda _sid, status, _reason=None: statuses.append(status)
@@ -1262,6 +1270,115 @@ async def test_queued_turn_republishes_running_after_stop(
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poll_before_idle_edge", [False, True], ids=["edge-then-poll", "poll-then-edge"]
+)
+@pytest.mark.parametrize("status_source", ["status_file", "osc"])
+async def test_stop_leaving_a_background_agent_settles_a_busy_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poll_before_idle_edge: bool,
+    status_source: str,
+) -> None:
+    """A Stop that leaves a background agent running settles the turn despite a busy file.
+
+    Claude keeps its status file busy and its OSC report working for the agent's
+    lifetime, so the idle edge's resync must not republish running, nor may a
+    restarted runner; a blocking Stop hook's continuation or the next prompt's turn does.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_conversation_id,
+        record_hook_event,
+    )
+
+    session_id = "conv_background_agent"
+    claude_session_id = "claude-background-agent"
+    report: Path | None = None
+    if status_source == "osc":
+        report = tmp_path / "program-status.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "relay_pid": os.getpid(),
+                    "pid": 123,
+                    "status": {"state": "working", "app": "claude-code"},
+                }
+            )
+        )
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_report=report
+    )
+    bridge_dir = bridge_dir_for_conversation_id(session_id)
+
+    def hook(event_name: str, **fields: object) -> None:
+        record_hook_event(
+            bridge_dir, {"hook_event_name": event_name, "session_id": claude_session_id, **fields}
+        )
+
+    async def tick() -> None:
+        on_tick()
+        await asyncio.sleep(0)
+
+    async def stop_leaving_the_agent_running() -> None:
+        hook(
+            "Stop",
+            transcript_path=str(transcript),
+            background_tasks=[{"id": "a1", "type": "subagent", "status": "running"}],
+        )
+        if poll_before_idle_edge:
+            await tick()
+        registry.note_external_session_status(session_id, "idle")
+        await tick()
+        await tick()
+        assert not registry.session_turn_is_active(session_id)
+        assert registry.session_has_background_agents(session_id)
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type": "user", "message": {"content": "go"}}\n'
+        '{"type": "assistant", "message": {"content": []}}\n',
+        encoding="utf-8",
+    )
+    record = {"pid": 123, "sessionId": claude_session_id, "kind": "interactive", "status": "busy"}
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+    hook("UserPromptSubmit")
+    await tick()
+    assert statuses == ["running"]
+
+    await stop_leaving_the_agent_running()
+    settled = ["running", "idle"] if poll_before_idle_edge else ["running"]
+    assert statuses == settled
+
+    restarted_tick, restarted_statuses, restarted, _ = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_report=report
+    )
+    restarted_tick()
+    await asyncio.sleep(0)
+    assert restarted_statuses == ["idle"]
+    assert restarted.session_has_background_agents(session_id)
+
+    feedback = {
+        "type": "user",
+        "isMeta": True,
+        "message": {"content": "Stop hook feedback:\nwait"},
+    }
+    with transcript.open("a", encoding="utf-8") as transcript_file:
+        transcript_file.write(json.dumps(feedback) + "\n")
+    await tick()
+    assert statuses == [*settled, "running"]
+    assert registry.session_turn_is_active(session_id)
+    assert not registry.session_has_background_agents(session_id)
+
+    with transcript.open("a", encoding="utf-8") as transcript_file:
+        transcript_file.write('{"type": "assistant", "message": {"content": []}}\n')
+    await stop_leaving_the_agent_running()
+    hook("UserPromptSubmit")
+    await tick()
+    assert registry.session_turn_is_active(session_id)
+    assert not registry.session_has_background_agents(session_id)
 
 
 @pytest.mark.asyncio

@@ -37,10 +37,14 @@ class ClaudeProgramStatusPoller:
         turn_is_active: Callable[[], bool] | None = None,
         turn_activity_epoch: Callable[[], int] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        background_agents_after_turn: Callable[[], bool] | None = None,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
+        # Claude reports working for a background agent that outlives its turn.
+        self._background_agents_after_turn = background_agents_after_turn
+        self._holding_background_agents = False
         self._omnigent_session_id = omnigent_session_id
         self._terminal_instance_id = terminal_instance_id
         self._terminal_launch_id = terminal_launch_id
@@ -76,6 +80,15 @@ class ClaudeProgramStatusPoller:
             return None
         return blocked_reason(report) if report is not None else self._fallback.blocked_on
 
+    @property
+    def holding_background_agents(self) -> bool:
+        """Whether a working report reads as idle for a turn's background agent."""
+        if self._retired:
+            return False
+        if self._using_osc:
+            return self._holding_background_agents
+        return self._fallback.holding_background_agents
+
     def tick(self) -> None:
         """Publish changed reports; never interpret silence as completion."""
         if self._retired:
@@ -105,18 +118,26 @@ class ClaudeProgramStatusPoller:
         self._error_observed = is_error
         if report is not None:
             self._using_osc = True
-            if report != self._last:
+            holding = (
+                report.state == "working"
+                and self._background_agents_after_turn is not None
+                and self._background_agents_after_turn()
+            )
+            if report != self._last or holding != self._holding_background_agents:
                 self._last = report
+                self._holding_background_agents = holding
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
                 if report.state != "error":
-                    status = "running" if report.state in {"working", "blocked"} else "idle"
+                    working = report.state in {"working", "blocked"} and not holding
+                    status = "running" if working else "idle"
                     self._on_status(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
         else:
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
+            self._holding_background_agents = False
             self._last = None
             self._fail_if_hook_overdue(None)
             self._fallback.tick()

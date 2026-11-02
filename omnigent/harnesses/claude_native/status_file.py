@@ -433,6 +433,10 @@ class SessionStatusPoller:
         bridge has captured it, or ``None`` before the first hook. Used to
         cross-check the pid file and to scan as a fallback.
     :param config_dir: Explicit Claude config dir override (tests).
+    :param background_agents_after_turn: Returns whether Claude's last turn
+        ended with a background agent still running. Claude stays ``busy``
+        for that agent although its prompt is free, so such a ``busy`` reads
+        as :data:`IDLE`. ``None`` reports every ``busy`` as running.
     """
 
     def __init__(
@@ -443,11 +447,14 @@ class SessionStatusPoller:
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
         omnigent_session_id: str | None = None,
+        background_agents_after_turn: Callable[[], bool] | None = None,
     ) -> None:
         self._on_status = on_status
         self._pane_pid_getter = pane_pid_getter
         # Claude's own session uuid, resolved lazily from the bridge.
         self._session_id_getter = session_id_getter
+        self._background_agents_after_turn = background_agents_after_turn
+        self._holding_background_agents = False
         # The Omnigent conversation id this poller watches — for debug-log
         # attribution only (distinct from Claude's session uuid above).
         self._omnigent_session_id = omnigent_session_id
@@ -476,7 +483,8 @@ class SessionStatusPoller:
         """Advance one poll: resolve if needed, then publish on change.
 
         Safe to call every poll; a no-op once resolution is exhausted, and
-        an unchanged active file costs a single ``stat``.
+        an unchanged active file costs a single ``stat`` (plus the
+        background-agent check while it reads ``busy``).
         """
         with self._resync_lock:
             requested = self._resync_requested
@@ -570,6 +578,11 @@ class SessionStatusPoller:
             return None
         return status.blocked_on
 
+    @property
+    def holding_background_agents(self) -> bool:
+        """Whether the last ``busy`` read as idle for a turn's background agent."""
+        return self._holding_background_agents and not self._exhausted
+
     def _read_and_publish(self) -> None:
         """Read the resolved file and fire the callback on a status change."""
         assert self._path is not None
@@ -581,22 +594,34 @@ class SessionStatusPoller:
             self._exhausted = True
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
-            return
-        self._last_mtime = mtime
-        status = read_session_status(self._path)
-        if self._exhausted:
-            return
-        if status is None:
-            # An unrecognized literal — the file is an undocumented internal
-            # detail whose vocabulary can grow. We are now blind to this
-            # transition, so drop the dedup baseline: the next readable
-            # status must publish rather than be swallowed as a duplicate.
-            self._last_status = None
-            self._last_edge = None
-            return
-        self._last_status = status
-        edge = (status.runner_status, status.blocked_on)
+            status = self._last_status
+            # The background-agent mark changes without rewriting a busy file.
+            if status is None or status.raw_status != "busy":
+                return
+        else:
+            self._last_mtime = mtime
+            status = read_session_status(self._path)
+            if self._exhausted:
+                return
+            if status is None:
+                # An unrecognized literal — the file is an undocumented internal
+                # detail whose vocabulary can grow. We are now blind to this
+                # transition, so drop the dedup baseline: the next readable
+                # status must publish rather than be swallowed as a duplicate.
+                self._last_status = None
+                self._last_edge = None
+                self._holding_background_agents = False
+                return
+            self._last_status = status
+        holding = (
+            status.raw_status == "busy"
+            and self._background_agents_after_turn is not None
+            and self._background_agents_after_turn()
+        )
+        self._holding_background_agents = holding
+        runner_status = IDLE if holding else status.runner_status
+        edge = (runner_status, status.blocked_on)
         if edge == self._last_edge:
             return
         self._last_edge = edge
-        self._on_status(status.runner_status, status.blocked_on)
+        self._on_status(runner_status, status.blocked_on)
