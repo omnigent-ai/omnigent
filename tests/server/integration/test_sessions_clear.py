@@ -4,18 +4,32 @@ The web-UI ``/clear`` command POSTs ``{"type": "clear"}`` to
 ``POST /v1/sessions/{id}/events``. Like ``compact``, the server forwards the
 control to the bound runner, which types the harness's own ``/clear`` into the
 session terminal (200), no-ops for harnesses without one (204), or reports a
-failed injection (5xx).
+failed injection (5xx). A claude-sdk session instead continues in a fresh
+session on the same host, workspace and runner, after the runner frees its live
+SDK client.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
 
-from tests.server.helpers import create_test_agent
+from omnigent.entities import MessageData, NewConversationItem
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes.sessions import routes_core
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -59,16 +73,25 @@ def _fake_runner_returning(clear_status: int) -> tuple[httpx.AsyncClient, list[d
 
 
 async def _post_clear(
-    client: httpx.AsyncClient, clear_status: int
+    client: httpx.AsyncClient,
+    clear_status: int,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str = "claude-native",
 ) -> tuple[httpx.Response, list[dict[str, Any]]]:
     """
     POST a ``clear`` control with the runner answering *clear_status*.
 
     :param client: The test HTTP client.
     :param clear_status: Status the fake runner returns for the control.
+    :param monkeypatch: Pins the session's resolved harness.
+    :param harness: Harness the session resolves to. claude-sdk ``clear``
+        moves to a fresh session instead (the ``test_claude_sdk_clear_*`` tests below).
     :returns: The server response and the forwarded clear bodies.
     """
     from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_resolve_harness", lambda *_a, **_k: harness)
 
     runner, captured = _fake_runner_returning(clear_status)
     set_runner_client(runner)
@@ -82,28 +105,320 @@ async def _post_clear(
     return resp, captured
 
 
-async def test_clear_is_forwarded_to_the_runner(client: httpx.AsyncClient) -> None:
+async def test_clear_is_forwarded_to_the_runner(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A runner that typed the harness's /clear makes the control succeed."""
-    resp, captured = await _post_clear(client, 200)
+    resp, captured = await _post_clear(client, 200, monkeypatch)
 
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
     assert captured == [{"type": "clear"}]
 
 
-async def test_clear_reports_unsupported_session_types(client: httpx.AsyncClient) -> None:
+async def test_clear_reports_unsupported_session_types(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A runner no-op (harness without a native /clear) is a clear 400."""
-    resp, captured = await _post_clear(client, 204)
+    resp, captured = await _post_clear(client, 204, monkeypatch, harness="openai-agents")
 
     assert resp.status_code == 400, resp.text
     assert "/clear is not available" in resp.text
     assert captured == [{"type": "clear"}]
 
 
-async def test_clear_surfaces_a_failed_injection(client: httpx.AsyncClient) -> None:
+async def test_clear_surfaces_a_failed_injection(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A runner that could not type /clear surfaces an error, not success."""
-    resp, captured = await _post_clear(client, 503)
+    resp, captured = await _post_clear(client, 503, monkeypatch)
 
     assert resp.status_code >= 500, resp.text
     assert "Clear failed" in resp.text
     assert captured == [{"type": "clear"}]
+
+
+_RUNNER_ID = "runner_live"
+_OWNER = "alice@example.com"
+_EDITOR = "bob@example.com"
+_HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+
+@dataclass
+class LiveRunner:
+    """What the fake live runner received, and how it answers ``clear``."""
+
+    clear_status: int = 200
+    posts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    superseded: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+@asynccontextmanager
+async def install_live_runner(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[LiveRunner]:
+    """Register a live runner on *app* and record what the server sends it."""
+    state = LiveRunner()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        state.posts.append((request.url.path, body))
+        if body.get("type") == "clear":
+            return httpx.Response(state.clear_status, json={"error": "busy"})
+        return httpx.Response(201 if request.url.path == "/v1/sessions" else 200, json={})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://runner")
+    register_test_runner(app, _RUNNER_ID)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=client))
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    monkeypatch.setattr(
+        routes_core,
+        "_publish_session_superseded",
+        lambda source, target, *, reason: state.superseded.append((source, target, reason)),
+    )
+    try:
+        yield state
+    finally:
+        app.state.tunnel_registry.deregister(_RUNNER_ID)
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def live_runner(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[LiveRunner]:
+    """A live runner on the shared single-user app."""
+    async with install_live_runner(app, monkeypatch) as state:
+        yield state
+
+
+@pytest_asyncio.fixture
+async def auth_live_runner(
+    auth_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[LiveRunner]:
+    """A live runner on the app that enforces session permissions."""
+    async with install_live_runner(auth_app, monkeypatch) as state:
+        yield state
+
+
+def clear_requests(runner: LiveRunner) -> list[dict[str, Any]]:
+    """The ``clear`` controls the runner received."""
+    return [body for _path, body in runner.posts if body.get("type") == "clear"]
+
+
+def resolve_harness_as(monkeypatch: pytest.MonkeyPatch, harness: str) -> None:
+    """Make every session resolve to *harness*."""
+    monkeypatch.setattr(sessions_module, "_resolve_harness", lambda *_a, **_k: harness)
+
+
+async def create_placed_session(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    *,
+    runner_id: str | None = _RUNNER_ID,
+    host: bool = True,
+    user: str | None = None,
+) -> tuple[str, list[str]]:
+    """Create a two-turn session with run settings and placement.
+
+    :param user: Creating user on an app with permissions, e.g. ``"alice@example.com"``.
+    :returns: The session id and its item ids (Q1, A1, Q2, A2).
+    """
+    agent = await create_test_agent(client, user=user)
+    resp = await client.post(
+        "/v1/sessions",
+        headers={"X-Forwarded-Email": user} if user else None,
+        json={
+            "agent_id": agent["id"],
+            "title": "Parser work",
+            "labels": {"team": "core"},
+            "model_override": "claude-opus-4-7",
+            "reasoning_effort": "high",
+            "terminal_launch_args": ["--permission-mode", "acceptEdits"],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    for turn in (1, 2):
+        store.append(
+            session_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{turn}",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": f"Q{turn}"}]
+                    ),
+                ),
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{turn}",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": f"A{turn}"}],
+                        agent="test-agent",
+                    ),
+                ),
+            ],
+        )
+    if host:
+        store.set_host_id(session_id, _HOST_ID, "/work/repo", "feature/parser")
+    if runner_id is not None:
+        store.replace_runner_id(session_id, runner_id)
+    return session_id, [item.id for item in store.list_items(session_id).data]
+
+
+def message_texts(store: SqlAlchemyConversationStore, session_id: str) -> list[str]:
+    """Return every message text in *session_id*, in order."""
+    return [
+        part["text"]
+        for item in store.list_items(session_id).data
+        if isinstance(item.data, MessageData)
+        for part in item.data.content
+    ]
+
+
+@pytest.mark.parametrize("runner_status", [200, 204])
+async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: int,
+) -> None:
+    """``clear`` frees the old SDK client, then continues in an empty bound session.
+
+    The runner gets a marked request, so only a server that continues the work
+    makes it release the client; an older runner's 204 still continues. The new
+    session keeps the source's host, workspace, branch, runner and run
+    settings; the source keeps its history and gets a notice plus a redirect.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    live_runner.clear_status = runner_status
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(client, store)
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    new_id = resp.json()["session_id"]
+    release = (
+        f"/v1/sessions/{source_id}/events",
+        {"type": "clear", "continue_in_new_session": True},
+    )
+    # The old session's client is freed before the new session is initialized.
+    initialized = [(path, body.get("session_id")) for path, body in live_runner.posts]
+    assert live_runner.posts.index(release) < initialized.index(("/v1/sessions", new_id))
+    assert message_texts(store, new_id) == []
+    fork = store.get_conversation(new_id)
+    assert fork is not None
+    assert (fork.runner_id, fork.host_id, fork.workspace, fork.git_branch) == (
+        _RUNNER_ID,
+        _HOST_ID,
+        "/work/repo",
+        "feature/parser",
+    )
+    assert (fork.model_override, fork.reasoning_effort) == ("claude-opus-4-7", "high")
+    assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
+    assert fork.labels["team"] == "core"
+    # Untitled, so the first message names it like any new chat.
+    assert fork.title is None
+    assert message_texts(store, source_id)[:4] == ["Q1", "A1", "Q2", "A2"]
+    notice = message_texts(store, source_id)[-1]
+    assert "ended by `/clear`" in notice and f"(/c/{new_id})" in notice
+    assert live_runner.superseded == [(source_id, new_id, "clear")]
+
+
+async def test_claude_sdk_clear_with_an_offline_runner_binds_the_host_only(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stopped runner leaves the new session on the host, which relaunches it on send."""
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(client, store, runner_id="runner_gone")
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    fork = store.get_conversation(resp.json()["session_id"])
+    assert fork is not None
+    assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
+
+
+@pytest.mark.parametrize(
+    ("clear_status", "placement", "status", "message"),
+    [
+        (409, "runner", 400, "Stop the current turn"),
+        (200, "running", 400, "Stop the current turn"),
+        (200, "none", 503, "runner is offline"),
+        (200, "editor", 403, ""),
+        (200, "sub_agent", 400, "only available in a top-level session"),
+    ],
+)
+async def test_claude_sdk_clear_refusals_create_no_session(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    auth_live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_status: int,
+    placement: str,
+    status: int,
+    message: str,
+) -> None:
+    """A busy runner or turn, no placement, a non-owner or a sub-agent refuses ``clear``.
+
+    The caller and session checks run before the runner frees the client, so
+    an editor's or a sub-agent's ``clear`` never reaches the runner.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    auth_live_runner.clear_status = clear_status
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(
+        auth_client,
+        store,
+        runner_id=None if placement == "none" else _RUNNER_ID,
+        host=placement != "none",
+        user=_OWNER,
+    )
+    caller = _OWNER
+    if placement == "running":
+        monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
+    elif placement == "editor":
+        granted = await auth_client.put(
+            f"/v1/sessions/{source_id}/permissions",
+            json={"user_id": _EDITOR, "level": LEVEL_EDIT},
+            headers={"X-Forwarded-Email": _OWNER},
+        )
+        assert granted.status_code < 300, granted.text
+        caller = _EDITOR
+    elif placement == "sub_agent":
+        source = store.get_conversation(source_id)
+        assert source is not None
+        child = store.create_conversation(
+            kind="sub_agent", parent_conversation_id=source_id, agent_id=source.agent_id
+        )
+        store.set_host_id(child.id, _HOST_ID, "/work/repo")
+        store.replace_runner_id(child.id, _RUNNER_ID)
+        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, child.id, LEVEL_OWNER)
+        source_id = child.id
+    headers = {"X-Forwarded-Email": caller}
+    before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source_id}/events",
+        json={"type": "clear", "data": {}},
+        headers=headers,
+    )
+
+    assert resp.status_code == status, resp.text
+    assert message in resp.text
+    after = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
+    assert after == before
+    assert auth_live_runner.superseded == []
+    if placement in ("editor", "sub_agent"):
+        assert clear_requests(auth_live_runner) == []

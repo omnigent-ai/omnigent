@@ -11,7 +11,7 @@ import type { SandboxProfile } from "./sandboxProfilesApi";
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
-import type { ConversationItem } from "./conversationItems";
+import { isMessageItem, type ConversationItem } from "./conversationItems";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
@@ -919,6 +919,89 @@ export async function forkSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/** A user prompt `/rewind` can return to. */
+export interface RewindPrompt {
+  /** The prompt's item id, e.g. "msg_abc". */
+  itemId: string;
+  /** Its text, joined from the prompt's text parts. */
+  text: string;
+  /** Epoch seconds, when the server recorded it. */
+  createdAt?: number;
+}
+
+/** Message pages `/rewind` reads before giving up on older prompts. */
+const REWIND_PROMPT_PAGES = 5;
+const REWIND_PROMPT_PAGE_SIZE = 200;
+
+/**
+ * List a session's user prompts, newest first, for the `/rewind` picker.
+ *
+ * Reads message items only (`GET /v1/sessions/{id}/items?type=message`, which
+ * servers advertising `session_rewind` support) and skips hidden context
+ * messages. Stops after the newest {@link REWIND_PROMPT_PAGES} pages.
+ *
+ * @param sessionId - Session to read, e.g. "conv_abc".
+ * @param signal - Aborts the requests when the picker closes.
+ */
+export async function fetchRewindPrompts(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<RewindPrompt[]> {
+  const prompts: RewindPrompt[] = [];
+  let after: string | null = null;
+  // Each page needs the previous page's cursor.
+  /* oxlint-disable no-await-in-loop */
+  for (let page = 0; page < REWIND_PROMPT_PAGES; page++) {
+    const params = new URLSearchParams({
+      limit: String(REWIND_PROMPT_PAGE_SIZE),
+      order: "desc",
+      type: "message",
+    });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+      { signal },
+    );
+    const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
+    for (const item of body.data) {
+      if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
+      const text = item.content
+        .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
+        .join("\n");
+      prompts.push({ itemId: item.id, text, createdAt: item.created_at });
+    }
+    if (!body.has_more || body.last_id == null) break;
+    after = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return prompts;
+}
+
+/**
+ * Rewind a Claude session to just before one of its prompts:
+ * `POST /v1/sessions/{id}/rewind`.
+ *
+ * The server forks the history before the prompt onto the same host and
+ * runner and links the source to the fork; the caller opens the fork and puts
+ * `prompt` back in its composer.
+ *
+ * @param sessionId - Session to rewind, e.g. "conv_abc".
+ * @param itemId - The user prompt to return to, e.g. "msg_abc".
+ * @returns The rewound session's id and the prompt's text.
+ */
+export async function rewindSession(
+  sessionId: string,
+  itemId: string,
+): Promise<{ sessionId: string; prompt: string }> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/rewind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item_id: itemId }),
+  });
+  const body = await readJsonOrThrow<{ session_id: string; prompt: string }>(res);
+  return { sessionId: body.session_id, prompt: body.prompt };
 }
 
 /**
