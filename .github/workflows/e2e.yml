@@ -154,3 +154,86 @@ jobs:
           num_shards: ${{ matrix.num_shards }}
           parallelism: ${{ github.event.inputs.parallelism || vars.E2E_PARALLELISM || '3' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+
+  harness-e2e:
+    # Journeys for native harnesses whose CLI the sharded lane does not install.
+    # Each matrix entry installs one pinned CLI and runs its e2e files against
+    # the in-process mock model; they skip in the shards above, which lack it.
+    name: E2E Harness (${{ matrix.harness }})
+    needs: setup
+    if: needs.setup.outputs.e2e == 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - harness: opencode
+            tests: >-
+              tests/e2e/test_host_opencode_native_mock_e2e.py
+              tests/e2e/test_opencode_native_wire_contract_e2e.py
+              tests/e2e/test_opencode_native_startup_cancel_leak_e2e.py
+              tests/e2e/test_chat_import_e2e.py::test_cli_imports_opencode_store_end_to_end
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+
+      # Same key and extras as e2e-run, so the shards' venv cache is reused.
+      - name: Cache virtualenv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install project and test dependencies
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
+
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+
+      - name: Install OpenCode CLI
+        if: matrix.harness == 'opencode'
+        uses: ./.github/actions/setup-opencode-e2e
+
+      - name: Run harness e2e tests
+        env:
+          TESTS: ${{ matrix.tests }}
+          E2E_TMP_BASE: /tmp/omnigent-e2e-${{ github.run_id }}-${{ matrix.harness }}
+          # Fail rather than skip when the installed CLI is missing or unsupported.
+          OMNIGENT_E2E_OPENCODE_REQUIRED: "1"
+          # Enables the credential-free wire-contract test.
+          OMNIGENT_E2E_OPENCODE_NATIVE: "1"
+        run: |
+          mkdir -p "$E2E_TMP_BASE"
+          read -r -a test_args <<<"$TESTS"
+          uv run pytest "${test_args[@]}" \
+            --timeout=300 \
+            --timeout-method=thread \
+            --basetemp="$E2E_TMP_BASE" \
+            --junitxml="$E2E_TMP_BASE/junit.xml" \
+            -v --tb=long --log-level=INFO -r a
+
+      - name: Upload logs on failure
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: e2e-harness-logs-${{ github.run_id }}-${{ matrix.harness }}
+          path: |
+            /tmp/omnigent-e2e-${{ github.run_id }}-${{ matrix.harness }}/**/*.log
+            /tmp/omnigent-e2e-${{ github.run_id }}-${{ matrix.harness }}/junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+          include-hidden-files: true

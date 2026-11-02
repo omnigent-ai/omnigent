@@ -58,8 +58,9 @@ def wrap_auth_command(
     return "!" + shlex.join(argv)
 
 
-async def refresh_model_auth(auth_dir: Path) -> float:
+async def refresh_model_auth(auth_dir: Path, *, workspace: Path) -> float:
     """Warm configured token caches outside Pi's ten-second request deadline."""
+    workspace = workspace.resolve()
     delay_s = 30.0
     for config_path in sorted(auth_dir.glob("auth-*.json")):
         if config_path.name.endswith(".result.json"):
@@ -76,7 +77,10 @@ async def refresh_model_auth(auth_dir: Path) -> float:
             cached = json.loads(Path(config["cachePath"]).read_text())
             expires_at = cached["expiresAt"]
             cached_at = cached.get("cachedAt", expires_at - interval)
-            if expires_at - time.time() * 1000 > min(interval, expires_at - cached_at) / 2:
+            if (
+                cached.get("cwd") == str(workspace)
+                and expires_at - time.time() * 1000 > min(interval, expires_at - cached_at) / 2
+            ):
                 continue
         except (OSError, ValueError, KeyError, TypeError):
             pass
@@ -86,6 +90,7 @@ async def refresh_model_auth(auth_dir: Path) -> float:
                 str(auth_dir / "command.cjs"),
                 str(config_path),
                 "--refresh",
+                cwd=workspace,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -108,7 +113,7 @@ async def refresh_model_auth(auth_dir: Path) -> float:
     return delay_s
 
 
-async def supervise_model_auth(auth_dir: Path) -> None:
+async def supervise_model_auth(auth_dir: Path, *, workspace: Path) -> None:
     """Refresh model credentials before the private request cache expires."""
     while True:
-        await asyncio.sleep(await refresh_model_auth(auth_dir))
+        await asyncio.sleep(await refresh_model_auth(auth_dir, workspace=workspace))

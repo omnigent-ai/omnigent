@@ -23,12 +23,13 @@ async def supervise_pi_credentials(
     server_url: str,
     *,
     auth_dir: Path | None,
+    workspace: Path,
     refresh_bridge: bool,
 ) -> None:
     """Keep model and bridge credentials under the runner's existing lifecycle."""
     async with asyncio.TaskGroup() as tasks:
         if auth_dir is not None:
-            tasks.create_task(supervise_model_auth(auth_dir))
+            tasks.create_task(supervise_model_auth(auth_dir, workspace=workspace))
         if refresh_bridge:
             tasks.create_task(supervise_pi_auth_refresh(bridge_dir, server_url))
 
