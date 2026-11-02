@@ -2328,7 +2328,7 @@ async def test_rejected_tunnel_refuses_launches_until_starting_runners_settle(
 
 
 @pytest.mark.parametrize(
-    ("starting", "drain_cap_s", "earliest_drop_s"),
+    ("starting", "drain_cap_s", "expected_drop_s"),
     [
         # An unreadable marker counts as connected, so the quiet window ends the drain.
         ("unreadable_marker", 30.0, 0.05),
@@ -2341,9 +2341,9 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
     monkeypatch: pytest.MonkeyPatch,
     starting: str,
     drain_cap_s: float,
-    earliest_drop_s: float,
+    expected_drop_s: float,
 ) -> None:
-    """The drain still drops the tunnel when starting work never settles or cannot be read."""
+    """The drain drops the tunnel on time when starting work never settles or cannot be read."""
     import httpx
 
     from omnigent.host.identity import HOST_TOKEN_ENV_VAR
@@ -2365,6 +2365,14 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
     transport = Mock()
     transport.abort.side_effect = lambda: aborted_at.append(loop.time())
     host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+    check_starting_runners = host._has_starting_runners
+    checked_at: list[float] = []
+
+    async def _record_starting_checks() -> bool:
+        checked_at.append(loop.time())
+        return await check_starting_runners()
+
+    monkeypatch.setattr(host, "_has_starting_runners", _record_starting_checks)
     marker: Path | Mock = tmp_path / "starting.marker"
     if starting == "unreadable_marker":
         marker = Mock(spec=Path)
@@ -2380,7 +2388,9 @@ async def test_rejected_tunnel_drain_always_drops_the_tunnel(
     await asyncio.wait_for(host._drop_tunnel_if_credentials_rejected(), timeout=5)
 
     transport.abort.assert_called_once_with()
-    assert aborted_at[0] - started_at >= earliest_drop_s
+    assert aborted_at[0] - started_at >= expected_drop_s
+    # The drain may overrun by one poll; the slack only absorbs a loaded runner.
+    assert aborted_at[0] - checked_at[0] < expected_drop_s + 0.5
     host._ws = SimpleNamespace(transport=Mock())  # type: ignore[assignment]
     frame = HostLaunchRunnerFrame(
         request_id="req_after_drop",
