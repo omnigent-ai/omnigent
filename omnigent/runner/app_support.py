@@ -45,7 +45,7 @@ def _message_scheduled_run(body: Mapping[str, Any] | None) -> ScheduledRunLogCon
 def _shared_scheduled_run(
     bodies: Sequence[Mapping[str, Any]],
 ) -> ScheduledRunLogContext | None:
-    """Mixed input batches have input-level attribution, not a single owning occurrence."""
+    """Return the shared occurrence, or None when input contexts differ."""
     if not bodies:
         return None
     run = _message_scheduled_run(bodies[0])

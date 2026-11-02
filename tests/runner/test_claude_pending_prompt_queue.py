@@ -404,17 +404,6 @@ async def test_buffered_turn_restores_its_own_occurrence(
         "task-" + run if run else None for run in expected_runs
     ]
     if harness_name == "claude-sdk":
-        batch = [
-            row
-            for row in rows
-            if row["event_name"] == "runner_input_assigned"
-            and row["attributes"]["delivery_mode"] == "coalesced"
-        ]
-        assert [row["attributes"].get("run_id") for row in batch] == [runs[1], runs[0]]
-        assert len({row["attributes"]["turn_epoch"] for row in batch}) == 1
-        assert [row["attributes"].get("turn_run_id") for row in batch] == [
-            runs[0] if runs[0] == runs[1] else None
-        ] * 2
         texts = [
             item["content"][0]["text"]
             for item in harness.posted_bodies[1]["content"]

@@ -89,7 +89,6 @@ from omnigent.runner.app_support import (
     SpecResolver,
     _client_safe_error_detail,
     _CommentRelayBinding,
-    _message_scheduled_run,
     _require_full_native_lock_coverage,
     _resolve_forwarded_message_content,
     _shared_scheduled_run,
@@ -4035,38 +4034,6 @@ def create_runner_app(
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
     _post_sign_in_hold_notice = _sign_in_watch.post_sign_in_hold_notice
 
-    def _log_input_assignment(
-        conv_id: str,
-        body: Mapping[str, Any],
-        delivery_mode: str,
-        *,
-        batch_has_scheduled_input: bool = False,
-    ) -> None:
-        input_run = _message_scheduled_run(body)
-        turn_run = _turn_occurrences.get(conv_id)
-        if (
-            input_run is None
-            and turn_run is None
-            and not batch_has_scheduled_input
-            and delivery_mode != "steering"
-        ):
-            return
-        with contextlib.suppress(Exception), scheduled_run_scope(input_run, session_id=conv_id):
-            _logger.info(
-                "Input assigned to runner turn",
-                extra=debug_event(
-                    "runner_input_assigned",
-                    session_id=conv_id,
-                    input_source="scheduled" if input_run is not None else "unscheduled",
-                    delivery_mode=delivery_mode,
-                    pending_id=body.get("pending_id"),
-                    injection_id=body.get("injection_id"),
-                    turn_epoch=_turn_bind_epoch.get(conv_id),
-                    response_id=_live_response_id.get(conv_id),
-                    turn_run_id=turn_run.run_id if turn_run is not None else None,
-                ),
-            )
-
     def _begin_turn_slot(
         conv_id: str,
         body: Mapping[str, Any] | None = None,
@@ -4091,16 +4058,6 @@ def create_runner_app(
             _turn_pending_ids[conv_id] = {pending_id}
         else:
             _turn_pending_ids.pop(conv_id, None)
-        batch_has_scheduled_input = any(
-            _message_scheduled_run(item) is not None for item in turn_inputs
-        )
-        for item in turn_inputs:
-            _log_input_assignment(
-                conv_id,
-                item,
-                "coalesced" if len(turn_inputs) > 1 else "turn_start",
-                batch_has_scheduled_input=batch_has_scheduled_input,
-            )
 
     def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
         """Whether a forward repeats a message that is still queued or running.
@@ -6479,7 +6436,6 @@ def create_runner_app(
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
-                                            _log_input_assignment(conv_id, _m, "steering")
                                             _pending_id = _m.get("pending_id")
                                             if isinstance(_pending_id, str):
                                                 _turn_pending_ids.setdefault(conv_id, set()).add(

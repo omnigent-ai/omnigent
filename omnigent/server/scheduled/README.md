@@ -607,13 +607,10 @@ scopes launch logs and the runner scopes request logs; shared clients stamp each
 request separately, and interactive requests clear the occurrence fields. Buffered inputs
 retain their own occurrence (or explicit absence) through queue drains and sign-in
 retries. Telemetry does not change live steering or SDK queue coalescing. An
-interactive correction can still steer an active automation turn. A consumed
-steer has its own `runner_input_assigned` event with the input's occurrence (or
-explicit absence) and the active `turn_run_id`. Ordinary execution logs retain
-the initiating turn's context. A batch combining different input contexts has no
-single turn occurrence; each input's assignment records its own IDs with the
-same `turn_epoch`. Join assignments by runner ID, session ID, and turn epoch.
-These associations do not divide model output or execution cost among inputs.
+interactive correction can still steer an active automation turn. Ordinary execution
+logs retain the initiating turn's context. A batch combining different input
+contexts has no single turn occurrence. These logs do not divide model output or
+execution cost among inputs.
 Session-wide relays and prompt/sign-in watchers clear occurrence context. Host
 exit watchers retain launch attribution only for confirmed pre-connect failures. No
 process-wide run ID is installed: continued sessions can serve multiple runs and
@@ -633,7 +630,6 @@ not have the new delivery correlation.
 | `scheduled_run_prompt_dispatch_started` | The server begins a direct send or processes a saved input through normal dispatch. A competing saved-input worker may lose the claim and send nothing. | `session_id`, `dispatch_id`, saved `input_id` when applicable |
 | `scheduled_run_prompt_sent` | Dispatch returned explicit runner acceptance, before saved-input housekeeping. Failures inside dispatch after acceptance can suppress this event (see below). Handled native startup refusals do not count. | `session_id`, `dispatch_id`, `input_id` when saved, `prompt_delay_seconds`, `target`, `session_mode` |
 | `scheduled_run_prompt_not_accepted` | Direct dispatch returns a handled refusal. Logs the non-delivery without raising or changing the existing run-status flow. | `session_id`, `dispatch_id`, `failure_stage=prompt_send`, `outcome=not_sent` |
-| `runner_input_assigned` | An automation-bearing turn starts, a queued batch containing scheduled input is assigned, or a live steer is consumed. Assignment is not proof of successful execution. | Input `task_id`/`run_id` when scheduled, `input_source`, `delivery_mode` (`turn_start`, `coalesced`, `steering`), `pending_id`, `injection_id`, `turn_epoch`, `response_id` when live, initiating `turn_run_id` when unambiguous |
 | `scheduled_run_stage_started` | A fire enters a new stage, before potentially blocking/failing work. Consecutive nested entries into the same stage are suppressed per run. Gives the last observed boundary when a process dies. | `fire_stage` |
 | `scheduled_run_stage_failed` | Runner startup, prompt dispatch, managed launch, or post-delivery bookkeeping failed. | `failure_stage`, `exception_type` or `error_code`; saved-input failures also include `input_id`, `dispatch_id`, `outcome` |
 | `scheduled_run_stage_interrupted` | A direct runner startup or prompt send was cancelled. | `failure_stage`, `outcome=uncertain` |
