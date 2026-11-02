@@ -754,10 +754,6 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
 )
 _HOST_DAEMON_PROXY_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
         "http_proxy",
         "https_proxy",
         "all_proxy",
@@ -3882,7 +3878,7 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in local_server_env_vars
-            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key.lower() in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
             or key in forwarded_names
             or key.startswith(daemon_env_prefixes)
@@ -3897,7 +3893,7 @@ def _build_host_daemon_env(
             key: value
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
-            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key.lower() in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
             or key in forwarded_names
             or key.startswith(daemon_env_prefixes)

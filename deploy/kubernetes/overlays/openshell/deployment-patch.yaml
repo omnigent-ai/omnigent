@@ -9,8 +9,10 @@ spec:
       containers:
         - name: omnigent
           volumeMounts:
+            # The server runs as root, so the SDK reads its gateway config
+            # from /root/.config/openshell/gateways/<cluster>/.
             - name: openshell-gateway
-              mountPath: /home/omnigent/.config/openshell
+              mountPath: /root/.config/openshell
               readOnly: true
             - name: server-config
               mountPath: /data/server-config.yaml
@@ -21,6 +23,17 @@ spec:
           secret:
             secretName: openshell-gateway-config
             optional: true
+            # Secret keys cannot contain "/", so map them onto the SDK's
+            # layout. The directory name must match sandbox.openshell.cluster.
+            items:
+              - key: metadata.json
+                path: gateways/openshell/metadata.json
+              - key: ca.crt
+                path: gateways/openshell/mtls/ca.crt
+              - key: tls.crt
+                path: gateways/openshell/mtls/tls.crt
+              - key: tls.key
+                path: gateways/openshell/mtls/tls.key
         - name: server-config
           configMap:
             name: omnigent-server-config
