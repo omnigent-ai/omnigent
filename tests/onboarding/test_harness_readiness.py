@@ -12,9 +12,15 @@ import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+import omnigent.onboarding.harness_readiness as hreadiness
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_PROBE_UNANSWERED,
+    HARNESS_VERSION_TOO_LOW,
+)
 from omnigent.onboarding.harness_readiness import (
+    PROBE_UNANSWERED,
     _READINESS_PROBE_MAX_WORKERS,
     _binary_availability_reason,
     _databricks_credential_source,
@@ -914,6 +920,45 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         )
 
 
+def test_binary_availability_reason_distinguishes_probe_unanswered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #12496: an unanswered --version probe is not a version problem.
+
+    A launcher shim that self-configures hangs the probe until the budget
+    kills it; the binary resolves fine, so readiness must report
+    "probe-unanswered" rather than the upgrade-hint "version-too-low".
+    """
+    monkeypatch.setattr(
+        hreadiness, "harness_cli_probe_outcome", lambda _key, **_kw: PROBE_UNANSWERED
+    )
+    monkeypatch.setattr(hi, "harness_cli_binary", lambda _key: "/usr/bin/pi")
+    assert (
+        hreadiness._binary_availability_reason("pi")
+        == HARNESS_PROBE_UNANSWERED
+    )
+
+
+def test_harness_is_configured_allows_probe_unanswered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hreadiness,
+        "_harness_availability_core",
+        lambda _harness: HARNESS_PROBE_UNANSWERED,
+    )
+    assert hreadiness.harness_is_configured("pi") is True
+
+
+def test_harness_is_configured_still_blocks_version_too_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hreadiness,
+        "_harness_availability_core",
+        lambda _harness: HARNESS_VERSION_TOO_LOW,
+    )
+    assert hreadiness.harness_is_configured("pi") is False
 def test_antigravity_native_requires_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
