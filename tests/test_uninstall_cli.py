@@ -122,3 +122,50 @@ def test_uninstall_cli_uses_exclusive_manifest_and_cleans_temp_script(
     assert result.exit_code == 0, result.output
     assert manifest_paths and not manifest_paths[0].exists()
     assert not temp_script_dir.exists()
+
+
+def _stub_command(path: Path, body: str) -> None:
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+
+
+def test_uninstall_leaves_third_party_units_named_like_omnigent(
+    monkeypatch, tmp_path: Path, capfd
+) -> None:
+    home = tmp_path / "home"
+    launch_dir = home / "Library" / "LaunchAgents"
+    systemd_dir = home / ".config" / "systemd" / "user"
+    launch_dir.mkdir(parents=True)
+    systemd_dir.mkdir(parents=True)
+    third_party_plist = launch_dir / "com.example.omnigent-handoff.plist"
+    third_party_plist.write_text("plist\n")
+    third_party_unit = systemd_dir / "com.example.omnigent-handoff.service"
+    third_party_unit.write_text("[Unit]\n")
+    (home / ".zshrc").write_text(
+        "# >>> Omnigent installer >>>\n"
+        'export PATH="$HOME/.local/bin:$PATH"\n'
+        "# <<< Omnigent installer <<<\n"
+    )
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    launchctl_log = tmp_path / "launchctl.log"
+    systemctl_log = tmp_path / "systemctl.log"
+    _stub_command(stubs / "launchctl", f'printf \'%s\\n\' "$*" >> "{launchctl_log}"')
+    _stub_command(stubs / "systemctl", f'printf \'%s\\n\' "$*" >> "{systemctl_log}"')
+    _stub_command(stubs / "uv", "echo 'omnigent is not installed' >&2; exit 1")
+    _stub_command(stubs / "tmux", "exit 1")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(home / ".omnigent"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("PATH", f"{stubs}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.chdir(home)
+
+    result = CliRunner().invoke(cli_module.cli, ["uninstall", "--yes"])
+
+    report = capfd.readouterr().out + result.output
+    assert result.exit_code == 0, report
+    assert "com.example.omnigent-handoff" not in report
+    assert third_party_plist.exists()
+    assert third_party_unit.exists()
+    assert not launchctl_log.exists()
+    assert not systemctl_log.exists()
