@@ -1254,7 +1254,6 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
         ("function_call", "call_b"),
         ("function_call_output", "call_a"),
         ("function_call_output", "call_b"),
-        ("function_call_output", "call_orphan"),
         ("message", None),
     ]
 
@@ -1282,3 +1281,127 @@ def test_replay_output_order_preserves_content_boundaries(boundary: dict[str, An
     ]
 
     assert codex_native._codex_items_with_outputs_in_call_order(items) == items
+
+
+def _assert_tool_outputs_follow_their_calls(records: list[dict[str, Any]]) -> None:
+    """Assert every replayed function output is preceded by its call in the rollout."""
+    seen_call_ids: set[str] = set()
+    for record in records:
+        if record["type"] == "compacted":
+            seen_call_ids = set()
+            history = record["payload"]["replacement_history"]
+        elif record["type"] == "response_item":
+            history = [record["payload"]]
+        else:
+            continue
+        for payload in history:
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "function_call":
+                seen_call_ids.add(payload["call_id"])
+            elif payload.get("type") == "function_call_output":
+                assert payload["call_id"] in seen_call_ids, payload
+
+
+def _tool_call(call_id: str, response_id: str = "codex_turn_1") -> dict[str, Any]:
+    return {
+        "type": "function_call",
+        "name": "exec_command",
+        "arguments": f'{{"cmd":"run {call_id}"}}',
+        "call_id": call_id,
+        "response_id": response_id,
+    }
+
+
+def _tool_output(call_id: str, response_id: str = "codex_turn_1") -> dict[str, Any]:
+    return {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": f"{call_id} done",
+        "response_id": response_id,
+    }
+
+
+def _user_message(text: str, response_id: str = "codex_turn_1") -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}],
+        "response_id": response_id,
+    }
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        pytest.param(
+            [
+                _user_message("first"),
+                _tool_call("call_cancelled", "codex_cancelled"),
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "response_id": "codex_cancelled",
+                    "interrupted": True,
+                    "content": [{"type": "output_text", "text": "cancelled"}],
+                },
+                _tool_output("call_cancelled", "codex_turn_2"),
+                _user_message("next", "codex_turn_2"),
+            ],
+            id="output-of-call-dropped-as-interrupted",
+        ),
+        pytest.param(
+            [
+                _user_message("first"),
+                _tool_output("call_late"),
+                _tool_call("call_late"),
+                _user_message("next", "codex_turn_2"),
+            ],
+            id="output-replayed-before-its-call",
+        ),
+        pytest.param(
+            [
+                _user_message("first"),
+                {
+                    "type": "compaction",
+                    "summary": "compacted",
+                    "compacted_messages": [
+                        _user_message("summary"),
+                        _tool_output("call_summarized_away"),
+                    ],
+                    "response_id": "codex_turn_2",
+                },
+                _user_message("next", "codex_turn_2"),
+            ],
+            id="compaction-snapshot-output-without-call",
+        ),
+        pytest.param(
+            [
+                _user_message("first"),
+                _tool_call("call_open"),
+                {
+                    "type": "compaction",
+                    "summary": "compacted",
+                    "compacted_messages": [_user_message("summary")],
+                    "response_id": "codex_turn_2",
+                },
+                _tool_output("call_open", "codex_turn_2"),
+            ],
+            id="output-after-compaction-of-open-call",
+        ),
+    ],
+)
+def test_rollout_records_never_replay_tool_output_without_preceding_call(
+    history: list[dict[str, Any]],
+) -> None:
+    """A replayed tool output always follows its call, or is dropped."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        history,
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+
+    _assert_tool_outputs_follow_their_calls(records)
