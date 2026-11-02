@@ -57,23 +57,32 @@ jobs:
       # one ecosystem from forcing a from-scratch re-resolve of the other, which
       # would reintroduce the in-range transitive churn this job avoids. `any`
       # drives the shared token/PR steps below.
+      #
+      # The uv.lock *format* is a third flag. `uv lock --check` passes on an
+      # older lock revision, but Dependabot's current uv rewrites the header in
+      # every Python bump and the auto-merge policy refuses the header change.
+      # The script compares the committed revision with the one this (pinned)
+      # uv writes, so the lock follows the uv pin in .github/actions/setup-uv.
       - name: Check lockfile consistency
         id: check
         run: |
           drifted_uv=false
+          drifted_uv_format=false
           drifted_pnpm=false
           uv lock --check || drifted_uv=true
+          python3 .github/scripts/uv_lock_format.py check || drifted_uv_format=true
           # --lockfile-only: verify the lock satisfies the manifests without a
           # full node_modules install; --frozen-lockfile fails on any desync.
           pnpm install --frozen-lockfile --lockfile-only || drifted_pnpm=true
           any=false
-          if [ "$drifted_uv" = "true" ] || [ "$drifted_pnpm" = "true" ]; then
+          if [ "$drifted_uv" = "true" ] || [ "$drifted_uv_format" = "true" ] || [ "$drifted_pnpm" = "true" ]; then
             any=true
           fi
           echo "drifted_uv=$drifted_uv" >> "$GITHUB_OUTPUT"
+          echo "drifted_uv_format=$drifted_uv_format" >> "$GITHUB_OUTPUT"
           echo "drifted_pnpm=$drifted_pnpm" >> "$GITHUB_OUTPUT"
           echo "drifted=$any" >> "$GITHUB_OUTPUT"
-          echo "uv.lock drifted=$drifted_uv, pnpm-lock.yaml drifted=$drifted_pnpm"
+          echo "uv.lock drifted=$drifted_uv (format: $drifted_uv_format), pnpm-lock.yaml drifted=$drifted_pnpm"
 
       # 7-day cooldown comes from uv.toml (`exclude-newer = "P7D"`) and from
       # pnpm-workspace.yaml (`minimumReleaseAge: 10080`), recorded as a relative
@@ -82,6 +91,12 @@ jobs:
       - name: Regenerate uv.lock
         if: steps.check.outputs.drifted_uv == 'true'
         run: uv lock
+
+      # Rewrites the lock in the pinned uv's format with every pin unchanged
+      # (the script fails and restores the file if a pin would move).
+      - name: Migrate uv.lock to the pinned uv's lock format
+        if: steps.check.outputs.drifted_uv_format == 'true'
+        run: python3 .github/scripts/uv_lock_format.py migrate
 
       # Preserve existing resolutions; only manifest drift needs a new pin.
       # pnpm applies the workspace cooldown to newly selected releases.
@@ -146,7 +161,7 @@ jobs:
           # exempts gh from `set -e`, so a non-zero exit hits the else branch.)
           if gh pr create --base main --head "$BRANCH" \
               --title "chore(oss): regenerate public lockfiles against public PyPI/npm" \
-              --body "Automated: the lockfiles were out of sync with the manifests, so uv.lock + pnpm-lock.yaml were regenerated against public PyPI/npm and validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles consistent and buildable."; then
+              --body "Automated: the lockfiles were out of sync with the manifests or uv.lock was in an older lock format, so uv.lock + pnpm-lock.yaml were regenerated against public PyPI/npm and validated by a Docker build + omnigent --help smoke (run ${{ github.run_id }}). Merge to keep the public lockfiles consistent, buildable and in the format Dependabot writes."; then
             echo "Opened the regen PR."
           else
             echo "::warning::Could not open the regen PR automatically (the GITHUB_TOKEN may be disallowed from creating PRs). The branch '$BRANCH' is pushed with the regenerated lockfiles — open the PR by hand:"
