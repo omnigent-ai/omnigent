@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.inner._proc import process_alive
+
 _CHECK = "import a, b, sys\nprint('A', a.A, 'B', b.B)\nsys.exit((a.A, b.B) != (1, 1))\n"
 
 
@@ -160,12 +162,10 @@ def test_signal_kills_the_replicas_and_exits_128_plus_the_signal(
 
 
 def _exits(pid: int) -> bool:
-    """Whether process ``pid`` is gone within 2 s."""
+    """Whether process ``pid`` is gone within 2 s; a killed one left unreaped counts."""
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not process_alive(pid):
             return True
         time.sleep(0.05)
     return False

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.host.speculate import Drafter, Outcome, SpeculationError, Verifier, speculate
+from omnigent.inner._proc import process_alive
 
 # Runs every test_*.py, so hiding one from the verifier would make a broken tree pass.
 _CHECK = """\
@@ -79,12 +80,10 @@ def _ledger(out: Outcome) -> list[str]:
 
 
 def _exits(pid: int) -> bool:
-    """Whether process ``pid`` is gone within 2 s."""
+    """Whether process ``pid`` is gone within 2 s; a killed one left unreaped counts."""
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not process_alive(pid):
             return True
         time.sleep(0.05)
     return False
