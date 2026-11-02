@@ -507,7 +507,7 @@ def test_an_uncleared_composer_logs_its_shape_without_text(
     )
     def deliver(bridge_dir: Path, *, content: str) -> None:
         delivery_diagnostics.start_attempt()
-        bridge._clear_composer("/tmp/sock", "main")
+        bridge._clear_composer("/tmp/sock", "main", bridge_dir=bridge_dir)
 
     with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
         with pytest.raises(bridge.ClaudeComposerNotCleared):
