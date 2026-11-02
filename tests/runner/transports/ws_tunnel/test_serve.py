@@ -1476,6 +1476,45 @@ async def test_runner_retry_row_retains_application_heartbeat_observations(
     assert closed["send_errors"] == 0
 
 
+async def test_runner_retry_row_names_the_rejected_upgrade_status(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refused reconnect records the HTTP status and reason on its retry row."""
+    import logging
+
+    import websockets
+
+    attempts = 0
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            raise asyncio.CancelledError
+        raise InvalidStatus(Response(502, "Bad Gateway", [], b""))
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(serve_module, "_INITIAL_RECONNECT_DELAY_S", 0.001)
+    caplog.set_level(logging.INFO, logger=serve_module.__name__)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner-http-status",
+            runner_version="0.1.0",
+        )
+    retry_row = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+    )
+    assert retry_row["error_type"] == "InvalidStatus"
+    assert retry_row["http_status"] == 502
+    assert retry_row["http_reason"] == "Bad Gateway"
+
+
 async def test_runner_close_freezes_pending_response_send(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

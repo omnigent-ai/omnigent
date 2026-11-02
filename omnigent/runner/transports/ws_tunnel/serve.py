@@ -820,6 +820,12 @@ async def serve_tunnel(
                 error_type=(
                     type(disconnect_error).__name__ if disconnect_error is not None else None
                 ),
+                http_status=_websocket_http_status(disconnect_error)
+                if disconnect_error is not None
+                else None,
+                http_reason=_websocket_http_reason(disconnect_error)
+                if disconnect_error is not None
+                else None,
                 close_code=close.code,
                 close_reason=close.reason,
                 close_rcvd_code=close.rcvd_code,
@@ -981,6 +987,17 @@ async def _refresh_auth_token(
                 ),
             )
     return current_token
+
+
+def _websocket_http_reason(exc: BaseException) -> str | None:
+    """Extract the HTTP reason phrase from a WebSocket handshake error.
+
+    :param exc: Exception raised while opening the WebSocket.
+    :returns: Reason phrase, e.g. ``"Forbidden"``, truncated to 64 characters,
+        or ``None`` when the exception carries no HTTP response.
+    """
+    reason = getattr(getattr(exc, "response", None), "reason_phrase", None)
+    return reason[:64] if isinstance(reason, str) and reason else None
 
 
 def _websocket_http_status(exc: BaseException) -> int | None:
@@ -1155,6 +1172,24 @@ async def _serve_tunnel_once(
             ),
         )
 
+    def _report_liveness() -> None:
+        # Periodic while connected: a healthy runner keeps emitting this row,
+        # so its absence or growing loop lag marks a stalled runner.
+        _logger.info(
+            "Runner %s tunnel liveness",
+            runner_id,
+            extra=debug_event(
+                "runner_tunnel_liveness",
+                session_id=runner_primary_session_id(),
+                runner_id=runner_id,
+                connection_id=connection_id,
+                inflight_request_count=sum(
+                    1 for task in dispatch_tasks.values() if not task.done()
+                ),
+                **diagnostics.snapshot(),
+            ),
+        )
+
     async with (
         websockets.connect(
             tunnel_url,
@@ -1169,7 +1204,9 @@ async def _serve_tunnel_once(
             ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
             ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
         ) as ws,
-        diagnostics.monitoring(_report_diagnostics, connection_id=connection_id),
+        diagnostics.monitoring(
+            _report_diagnostics, connection_id=connection_id, liveness_report=_report_liveness
+        ),
     ):
         diagnostics.settings.update(
             app_silence_timeout_s=RUNNER_TUNNEL_SILENCE_TIMEOUT_S,
