@@ -144,8 +144,39 @@ def test_build_session_home_without_user_home_writes_hooks_only(
 
 
 @pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
-def test_ci_headers_survive_kimi_private_home(tmp_path, monkeypatch, caplog, context) -> None:
-    """Native config copying preserves CI headers and leaves non-gateway providers alone."""
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        pytest.param(
+            """[providers.databricks]
+type = "openai_responses"
+base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1"
+api_key = "test-key"
+[providers.databricks.custom_headers]
+X-Existing = "kept"
+Databricks-Ai-Gateway-Request-Tags = '{"team":"ci"}'
+""",
+            id="table-with-headers",
+        ),
+        pytest.param(
+            'providers.databricks = {type = "openai_responses", '
+            'base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1", '
+            'api_key = "test-key"}\n',
+            id="inline-without-headers",
+        ),
+        pytest.param(
+            'providers.databricks = {type = "openai_responses", '
+            'base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1", '
+            'api_key = "test-key", customHeaders = {X-Existing = "kept", '
+            'Databricks-Ai-Gateway-Request-Tags = \'{"team":"ci"}\'}}\n',
+            id="inline-with-headers",
+        ),
+    ],
+)
+def test_ci_headers_survive_kimi_private_home(
+    tmp_path, monkeypatch, caplog, context, provider_config
+) -> None:
+    """Native setup adds CI headers without changing provider settings or user files."""
     from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
 
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
@@ -158,15 +189,10 @@ def test_ci_headers_survive_kimi_private_home(tmp_path, monkeypatch, caplog, con
             lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
         )
     user_home = _fake_user_home(tmp_path, monkeypatch)
-    original = """default_model = "test"
-[providers.databricks]
-type = "openai_responses"
-base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1"
-api_key = "test-key"
-[providers.databricks.custom_headers]
-X-Existing = "kept"
-Databricks-Ai-Gateway-Request-Tags = '{"team":"ci"}'
-[providers.external]
+    original = (
+        'default_model = "test"\n'
+        + provider_config
+        + """[providers.external]
 type = "openai_responses"
 base_url = "https://example.com/v1"
 [providers.unused]
@@ -176,25 +202,68 @@ provider = "databricks"
 model = "test-model"
 max_context_size = 200000
 """
-    # CI writes the same supported config consumed by the headless executor.
-    (user_home / "config.toml").write_text(with_kimi_ci_request_tags(original))
+    )
+    (user_home / "config.toml").write_text(original)
+    original_config = tomllib.loads(original)
     session_home = tmp_path / "session"
     env = build_kimi_session_home(session_home, bridge_dir=tmp_path / "bridge")
     configured = tomllib.loads((Path(env[KIMI_CODE_HOME_ENV_VAR]) / "config.toml").read_text())
     provider = configured["providers"]["databricks"]
-    assert provider["api_key"] == "test-key"
-    assert provider["base_url"].endswith("/ai-gateway/codex/v1")
-    assert provider["custom_headers"]["X-Existing"] == "kept"
-    expected = {"team": "ci"}
+    original_provider = original_config["providers"]["databricks"]
+    header_key = "customHeaders" if "customHeaders" in original_provider else "custom_headers"
+    original_headers = original_provider.get(header_key, {})
+    headers = provider.get(header_key, {})
+    assert {key: value for key, value in provider.items() if key != header_key} == {
+        key: value for key, value in original_provider.items() if key != header_key
+    }
+    assert {key: value for key, value in headers.items() if key != REQUEST_TAGS_HEADER} == {
+        key: value for key, value in original_headers.items() if key != REQUEST_TAGS_HEADER
+    }
+    expected = json.loads(original_headers.get(REQUEST_TAGS_HEADER, "{}"))
     if context and context != "invalid":
         expected.update(json.loads(context))
-    assert json.loads(provider["custom_headers"][REQUEST_TAGS_HEADER]) == expected
-    assert configured["providers"]["external"] == tomllib.loads(original)["providers"]["external"]
-    assert configured["providers"]["unused"] == tomllib.loads(original)["providers"]["unused"]
+    assert json.loads(headers.get(REQUEST_TAGS_HEADER, "{}")) == expected
+    assert configured["providers"]["external"] == original_config["providers"]["external"]
+    assert configured["providers"]["unused"] == original_config["providers"]["unused"]
     assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
-    assert configured["models"] == tomllib.loads(original)["models"]
+    assert configured["models"] == original_config["models"]
     assert len(configured["hooks"]) == 2
     assert (session_home / "oauth").is_symlink()
+    assert (user_home / "config.toml").read_text() == original
+
+
+@pytest.mark.parametrize("failure", ["exception", "invalid-output"])
+def test_kimi_serialization_failure_preserves_original_config(
+    tmp_path, monkeypatch, caplog, failure
+) -> None:
+    import tomlkit
+    from tomlkit.exceptions import ConvertError
+
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    original = """[providers.databricks]
+base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1"
+api_key = "test-key"
+"""
+    (user_home / "config.toml").write_text(original)
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"repro-agent"}')
+
+    def fail_serialization(config):
+        if failure == "exception":
+            raise ConvertError("test serialization failure")
+        return "invalid toml ["
+
+    monkeypatch.setattr(tomlkit, "dumps", fail_serialization)
+    assert with_kimi_ci_request_tags(original) == original
+    session_home = tmp_path / "session"
+    build_kimi_session_home(session_home, bridge_dir=tmp_path / "bridge")
+    written = (session_home / "config.toml").read_text()
+    assert written.startswith(original)
+    configured = tomllib.loads(written)
+    assert configured["providers"] == tomllib.loads(original)["providers"]
+    assert len(configured["hooks"]) == 2
+    assert (session_home / "oauth").is_symlink()
+    assert (user_home / "config.toml").read_text() == original
+    assert "Skipping CI tags: could not serialize Kimi provider config" in caplog.text
 
 
 @pytest.mark.parametrize(

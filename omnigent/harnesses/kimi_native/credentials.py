@@ -25,6 +25,7 @@ import logging
 import os
 import shlex
 import sys
+import tomllib
 from pathlib import Path
 
 from omnigent.databricks_ai_gateway import (
@@ -59,7 +60,7 @@ def with_kimi_ci_request_tags(config_text: str) -> str:
         return config_text
     changed = False
     models = config.get("models", {})
-    for provider_name, provider in providers.items():
+    for provider_name, provider in list(providers.items()):
         if not isinstance(provider, dict):
             continue
         base_url = provider.get("base_url", provider.get("baseUrl"))
@@ -81,9 +82,26 @@ def with_kimi_ci_request_tags(config_text: str) -> str:
         existing = provider.get(header_key, {})
         if not isinstance(existing, dict) or not all(isinstance(name, str) for name in existing):
             continue
+        if isinstance(provider, tomlkit.items.InlineTable):
+            # Rebuild parsed inline tables so new fields receive comma separators.
+            inline_provider = tomlkit.inline_table()
+            for name, value in provider.items():
+                inline_provider[name] = value
+            providers[provider_name] = inline_provider
+            provider = inline_provider
         provider[header_key] = with_ci_request_tags(existing)
         changed = True
-    return tomlkit.dumps(config) if changed else config_text
+    if not changed:
+        return config_text
+    try:
+        rendered = tomlkit.dumps(config)
+        tomllib.loads(rendered)
+    except (TOMLKitError, TypeError, ValueError):
+        logging.getLogger(__name__).warning(
+            "Skipping CI tags: could not serialize Kimi provider config"
+        )
+        return config_text
+    return rendered
 
 
 def resolve_user_kimi_home() -> Path:

@@ -402,7 +402,6 @@ def test_ci_provider_headers_survive_hermes_policy_config(
 ) -> None:
     """Native and headless policy setup share the provider-scoped header boundary."""
     from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
-    from omnigent.harnesses.hermes_native.credentials import with_hermes_ci_request_tags
 
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
@@ -431,8 +430,7 @@ def test_ci_provider_headers_survive_hermes_policy_config(
     }
     user_home = tmp_path / ".hermes"
     user_home.mkdir()
-    # Explicit CI provider files also serve standalone headless runs without policy hooks.
-    (user_home / "config.yaml").write_text(json.dumps(with_hermes_ci_request_tags(original)))
+    (user_home / "config.yaml").write_text(json.dumps(original))
     (user_home / ".env").write_text("OPENAI_API_KEY=test-key\n")
     monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
     home = b.write_policy_hook_config(tmp_path / "bridge", "http://localhost:6767", "ci-test")
