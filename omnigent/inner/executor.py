@@ -728,6 +728,10 @@ class Executor:
         """Whether ``enqueue_session_message()`` is expected to work during a running turn."""
         return False
 
+    def preserves_message_content_blocks(self) -> bool:
+        """Whether fresh and queued input must retain original content block boundaries."""
+        return False
+
     def supports_tool_boundary_interrupt(self) -> bool:
         """Whether queued user input can be applied by interrupting after a tool boundary."""
         return False
