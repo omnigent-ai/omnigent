@@ -8,13 +8,17 @@ from typing import Final, Literal, TypeGuard
 HARNESS_BINARY_MISSING: Final[Literal["binary-missing"]] = "binary-missing"
 HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = "needs-auth"
 HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
+HARNESS_PROBE_UNANSWERED: Final[Literal["probe-unanswered"]] = "probe-unanswered"
 
-HarnessUnavailableReason = Literal["binary-missing", "needs-auth", "version-too-low"]
+HarnessUnavailableReason = Literal[
+    "binary-missing", "needs-auth", "probe-unanswered", "version-too-low"
+]
 HarnessAvailability = Literal[
     True,
     False,
     "binary-missing",
     "needs-auth",
+    "probe-unanswered",
     "version-too-low",
 ]
 
@@ -29,6 +33,7 @@ def is_harness_availability(value: object) -> TypeGuard[HarnessAvailability]:
     return isinstance(value, bool) or value in (
         HARNESS_BINARY_MISSING,
         HARNESS_NEEDS_AUTH,
+        HARNESS_PROBE_UNANSWERED,
         HARNESS_VERSION_TOO_LOW,
     )
 

@@ -49,7 +49,7 @@ from typing import NamedTuple
 
 from packaging.version import InvalidVersion, Version
 
-from omnigent._platform import resolve_cli_binary
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
@@ -819,6 +819,11 @@ def _parse_harness_cli_version(text: str) -> str | None:
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
+# Sentinel returned when the ``--version`` probe times out: the binary exists
+# but never answered (e.g. a launcher shim that self-configures interactively).
+# Distinct from a parseable-but-too-old version, which needs an upgrade.
+PROBE_UNANSWERED = "probe-unanswered"
+
 # Cache successful probes to limit subprocess churn during readiness checks.
 # Launchers can delegate to an updated executable without changing themselves.
 _VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
@@ -996,6 +1001,36 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     return _harness_cli_version_satisfies(spec, binary, timeout)
 
 
+def harness_cli_probe_outcome(
+    key: str,
+    timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+) -> bool:
+    """Return whether the CLI is ready, distinguishing a probe that never answered.
+
+    Mirrors :func:`harness_cli_installed` but returns :data:`PROBE_UNANSWERED`
+    instead of ``False`` when the ``--version`` probe times out: the binary
+    resolves, so the readiness layer can report "probe-unanswered" (a state
+    the launch gate may treat as usable) rather than the upgrade hint that
+    ``version-too-low`` implies — launcher shims that self-configure could
+    previously never answer and be misreported as outdated.
+
+    :param key: A harness family key, e.g. :data:`PI_KEY`.
+    :param timeout: Seconds to wait for the ``--version`` probe subprocess.
+    """
+    spec = harness_install_spec(key)
+    if spec is None:
+        return False
+    binary = harness_cli_binary(key)
+    if binary is None:
+        return False
+    if spec.min_version is None and spec.max_version_exclusive is None:
+        return True
+    version = _harness_cli_version_string(spec, binary, timeout)
+    if version == PROBE_UNANSWERED:
+        return PROBE_UNANSWERED
+    return _harness_cli_version_satisfies(spec, binary, timeout)
+
+
 def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     """Return the installed CLI's version string plus the declared range.
 
@@ -1059,6 +1094,15 @@ def _harness_cli_version_string(
             cached = _VERSION_PROBE_CACHE.get(sig)
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
+    flags: dict[str, object] = {}
+    if IS_WINDOWS:
+        # DETACHED_PROCESS detaches the probe from the daemon's console, so a
+        # launcher shim that opens its own TTY has nothing to bind to.
+        flags["creationflags"] = 0x00000008  # DETACHED_PROCESS
+    else:
+        # start_new_session detaches the probe from the controlling terminal
+        # (POSIX setsid), so an interactive first-run shim cannot open /dev/tty.
+        flags["start_new_session"] = True
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -1068,7 +1112,13 @@ def _harness_cli_version_string(
             timeout=timeout,
             check=False,
             cwd=probe_cwd,
+            **flags,
         )
+    except subprocess.TimeoutExpired:
+        # The probe never got an answer (e.g. a launcher shim dropped into its
+        # interactive first-run wizard). Callers report this as its own
+        # availability state instead of mistaking it for a version problem.
+        return PROBE_UNANSWERED
     except (OSError, subprocess.SubprocessError):
         return None
     # Failed launchers can print a runtime version, not the CLI's version.
