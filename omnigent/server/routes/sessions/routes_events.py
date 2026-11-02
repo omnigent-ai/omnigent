@@ -338,9 +338,9 @@ from omnigent.util.session_lifecycle import (
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
-# One shared Resume attempt per session, split by caller for side chats; see
-# _retry_session_single_flight.
-_RetryFlight = tuple[str, str | None]
+# One shared Resume attempt per session, split by caller for side chats and by
+# wake-only mode; see _retry_session_single_flight.
+_RetryFlight = tuple[str, str | None, bool]
 _retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
     WorkspaceScopedCache()
 )
@@ -668,8 +668,12 @@ async def _recover_retry_session(
     runner_router: RunnerRouter | None,
     user_id: str | None,
     permission_store: PermissionStore | None,
+    wake_only: bool = False,
 ) -> dict[str, bool | str]:
-    """Recover runner/terminal readiness without creating transcript input."""
+    """Recover runner/terminal readiness without creating transcript input.
+
+    *wake_only* reconnects the runner without resuming an interrupted turn.
+    """
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
@@ -717,7 +721,7 @@ async def _recover_retry_session(
         runner_client,
         conversation_store,
         initializer=getattr(request.app.state, "runner_session_initializer", None),
-        suppress_recovery_turn=was_connected or bool(saved_inputs),
+        suppress_recovery_turn=wake_only or was_connected or bool(saved_inputs),
         require_success=True,
         trigger="retry_session",
     )
@@ -772,6 +776,7 @@ async def _retry_session_single_flight(
     runner_router: RunnerRouter | None,
     user_id: str | None,
     permission_store: PermissionStore | None,
+    wake_only: bool = False,
 ) -> dict[str, bool | str]:
     """Share one in-flight recovery attempt across concurrent callers.
 
@@ -780,7 +785,7 @@ async def _retry_session_single_flight(
     concurrent requests.
     """
     is_side_chat = conversation is not None and _side_chat_source_id(conversation) is not None
-    flight: _RetryFlight = (session_id, user_id if is_side_chat else None)
+    flight: _RetryFlight = (session_id, user_id if is_side_chat else None, wake_only)
     lock = _retry_recovery_lock(session_id)
     async with lock:
         task = _retry_recovery_tasks.get(flight)
@@ -793,6 +798,7 @@ async def _retry_session_single_flight(
                     runner_router=runner_router,
                     user_id=user_id,
                     permission_store=permission_store,
+                    wake_only=wake_only,
                 )
             )
             _retry_recovery_tasks[flight] = task
@@ -1429,6 +1435,8 @@ def register_events_routes(
             )
         if body.type == _RETRY_SESSION_TYPE:
             startup = getattr(request.app.state, "startup_inputs", None)
+            # A passive wake (e.g. opening Files) must not start agent work.
+            wake_only = body.data.get("wake_only") is True
             result = await _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,
@@ -1437,8 +1445,9 @@ def register_events_routes(
                 runner_router=runner_router,
                 user_id=user_id,
                 permission_store=permission_store,
+                wake_only=wake_only,
             )
-            if startup is not None and await startup.retry(session_id):
+            if not wake_only and startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)
                 return {**result, "queued": True}

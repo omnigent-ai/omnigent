@@ -3844,13 +3844,15 @@ async def test_message_relaunch_recreated_workspace_continues_with_notice(
     assert _WORKSPACE in notice["message"], notice["message"]
 
 
+@pytest.mark.parametrize("wake_only", [False, True], ids=["resume", "wake-only"])
 async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    wake_only: bool,
 ) -> None:
-    """Retry relaunches one dead runner and confirms its recovered lifecycle."""
+    """Retry relaunches one dead runner; a wake-only retry skips the recovery turn."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -3873,7 +3875,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     response = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "retry_session", "data": {}},
+        json={"type": "retry_session", "data": {"wake_only": True} if wake_only else {}},
     )
     await responder
 
@@ -3884,7 +3886,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
         "recovery": "runner_relaunched",
     }
     initialize.assert_awaited_once()
-    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is wake_only
     relay_ready.assert_awaited_once()
     after = await client.get(f"/v1/sessions/{session_id}/items")
     assert after.json() == before.json()
@@ -3980,7 +3982,7 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
         return second_result
 
     monkeypatch.setattr(routes_events, "_recover_retry_session", _recover)
-    flight = (session_id, None)
+    flight = (session_id, None, False)
     routes_events._retry_recovery_tasks.pop(flight, None)
 
     waiter = asyncio.create_task(

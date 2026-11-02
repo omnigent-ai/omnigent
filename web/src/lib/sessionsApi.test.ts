@@ -27,6 +27,7 @@ import {
   openSessionStream,
   postEvent,
   continueFailedTurn,
+  retrySession,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1715,6 +1716,21 @@ describe("stopSession", () => {
     expect(url).toBe("/v1/sessions/conv_abc/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
     expect(out.queued).toBe(false);
+  });
+});
+
+describe("retrySession", () => {
+  it.each([
+    [{}, {}],
+    [{ wakeOnly: true }, { wake_only: true }],
+  ])("posts retry_session with options %o", async (options, data) => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, recovered: true }));
+
+    await retrySession("conv_abc", options);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_abc/events");
+    expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data });
   });
 });
 

@@ -375,10 +375,13 @@ asleep, **Reconnect host** in the composer's host menu has the server wake the
 sandbox and start the agent without sending a message, in the browser too; a
 toast says when it's back online or why the wake failed. Reloading during the
 wake keeps its progress (for example "Provisioning sandbox…") in the chat.
-Opening the Files or Changes view on such a session wakes the sandbox the same
-way for editors: the panel shows **Starting sandbox…**, then the file list; a
-failed wake shows the reason and **Try again**. Read-only viewers keep the
-send-a-message hint.
+Opening Files or Changes on such a session wakes the sandbox for editors, in the
+desktop Workspace rail and the mobile Files drawer alike. The wake only
+reconnects: it resumes no interrupted turn and retries no failed startup input.
+The panel shows **Starting sandbox…**, then the file list; a failed wake shows
+the reason and **Try again**. If the sandbox sleeps again while the panel stays
+open, it shows **Start sandbox** rather than waking again. Read-only viewers
+keep the send-a-message hint.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -864,8 +867,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`reconnect`, Files view on an asleep sandbox:**
   `tests/e2e_ui/files/test_asleep_sandbox_auto_wake.py` uses the same patch,
   with workspace reads failing until the wake succeeds. It checks that opening
-  Files sends only `retry_session` and then lists the files, and that a failed
-  wake offers Try again, not a live sandbox resume.
+  Files in the desktop rail sends only a wake-only `retry_session` and then
+  lists the files, and that a failed wake offers Try again, not a live sandbox
+  resume. The mobile drawer is covered by `web/src/shell/FilesPanel.test.tsx`.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

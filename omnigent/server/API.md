@@ -1020,6 +1020,14 @@ Request body matches `SessionEventInput`:
                                   (there is no separate "resume" event).
                                   The conversation transcript is
                                   preserved. Returns `{queued: false}`.
+      - "retry_session"         — reconnect or relaunch the session's
+                                  runner (requires LEVEL_EDIT) and retry
+                                  saved inputs that failed before
+                                  submission. Returns `{queued, recovered,
+                                  recovery}`. Payload `{}`, or
+                                  `{"wake_only": true}` to only reconnect:
+                                  no interrupted turn resumes and failed
+                                  saved inputs stay failed.
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without

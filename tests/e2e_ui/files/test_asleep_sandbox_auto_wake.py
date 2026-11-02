@@ -2,7 +2,7 @@
 
 A session whose managed sandbox idle-stopped reads ``host_asleep``, and the
 Files panel has no workspace to list. Opening the panel must ask the server to
-resume the sandbox with a ``retry_session`` event, show that it is starting,
+resume the sandbox with a wake-only ``retry_session`` event, show that it is starting,
 and list the files once the sandbox reads online, without the user sending a
 chat message. ``force_host_asleep`` patches the browser's view into
 ``host_asleep`` and workspace reads answer the runner-offline 503 until a wake
@@ -14,9 +14,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
-from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -24,16 +21,16 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Request, Response, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import _recording_requested, open_right_rail
 from tests.e2e_ui.sessions._host_asleep import force_host_asleep
 
-# Filesystem PUTs land in ``<repo-root>/<session_id>/`` (os_env.cwd: .).
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILE_PATH = "sandbox_notes.txt"
-_RETRY_SESSION = {"type": "retry_session", "data": {}}
+_RETRY_SESSION = {"type": "retry_session", "data": {"wake_only": True}}
 _RESUME_ERROR = "No runner is available to recover this session."
-# Long enough for a viewer to read each state in the recorded demo.
+# Long enough for a viewer to read each state in a recorded demo.
 _HOLD_MS = 2_500
+# Long enough for an unwanted automatic retry to reach the server.
+_NO_RETRY_WAIT_MS = 2_500
 
 
 def _runner_unavailable(message: str) -> str:
@@ -41,9 +38,15 @@ def _runner_unavailable(message: str) -> str:
     return json.dumps({"error": {"code": "runner_unavailable", "message": message}})
 
 
+def _hold_for_viewer(request: pytest.FixtureRequest, page: Page) -> None:
+    """Pause on the current state only when the journey is being filmed."""
+    if _recording_requested(request.node):
+        page.wait_for_timeout(_HOLD_MS)
+
+
 @pytest.fixture
-def asleep_session_file(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    """Seed ``_FILE_PATH`` in the session workspace and yield ``(base_url, session_id)``."""
+def asleep_session_file(seeded_session: tuple[str, str]) -> tuple[str, str]:
+    """Seed ``_FILE_PATH`` in the session's temporary workspace."""
     base_url, session_id = seeded_session
     response = httpx.put(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{_FILE_PATH}",
@@ -51,11 +54,7 @@ def asleep_session_file(seeded_session: tuple[str, str]) -> Iterator[tuple[str, 
         timeout=10.0,
     )
     response.raise_for_status()
-    try:
-        yield (base_url, session_id)
-    finally:
-        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
-        (_REPO_ROOT / _FILE_PATH).unlink(missing_ok=True)
+    return (base_url, session_id)
 
 
 class _SandboxWakeRecorder:
@@ -66,17 +65,20 @@ class _SandboxWakeRecorder:
         self.asleep = True
         self.events: list[Any] = []
 
+    def _is_event_post(self, request: Request) -> bool:
+        return (
+            request.method == "POST"
+            and urlparse(request.url).path == f"/v1/sessions/{self.session_id}/events"
+        )
+
     def on_request(self, request: Request) -> None:
-        if request.method != "POST" or (
-            urlparse(request.url).path != f"/v1/sessions/{self.session_id}/events"
-        ):
-            return
-        self.events.append(request.post_data_json)
+        if self._is_event_post(request):
+            self.events.append(request.post_data_json)
 
     def on_response(self, response: Response) -> None:
         request = response.request
-        if request.method == "POST" and request.post_data_json == _RETRY_SESSION and response.ok:
-            self.asleep = False
+        if response.ok and self._is_event_post(request):
+            self.asleep = self.asleep and request.post_data_json != _RETRY_SESSION
 
 
 def _fail_workspace_reads_while_asleep(page: Page, recorder: _SandboxWakeRecorder) -> None:
@@ -128,7 +130,7 @@ def test_opening_files_wakes_asleep_sandbox(
     base_url, session_id = asleep_session_file
     page, recorder = _open_asleep_session(request, base_url, session_id)
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    page.wait_for_timeout(_HOLD_MS)
+    _hold_for_viewer(request, page)
 
     with _wait_for_wake_request(page, session_id):
         open_right_rail(page)
@@ -141,7 +143,7 @@ def test_opening_files_wakes_asleep_sandbox(
     expect(rail.get_by_text("Starting sandbox…")).to_have_count(0)
     # The wake is the only session event: no chat message was sent.
     assert recorder.events == [_RETRY_SESSION]
-    page.wait_for_timeout(_HOLD_MS)
+    _hold_for_viewer(request, page)
 
 
 def test_failed_sandbox_wake_offers_try_again(
@@ -166,7 +168,7 @@ def test_failed_sandbox_wake_offers_try_again(
     page, recorder = _open_asleep_session(request, base_url, session_id)
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}/events$"), _fail_first_wake)
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    page.wait_for_timeout(_HOLD_MS)
+    _hold_for_viewer(request, page)
 
     with _wait_for_wake_request(page, session_id):
         open_right_rail(page)
@@ -177,7 +179,7 @@ def test_failed_sandbox_wake_offers_try_again(
     try_again = rail.get_by_role("button", name="Try again")
     expect(try_again).to_be_visible()
     # The failure is not retried automatically.
-    page.wait_for_timeout(_HOLD_MS)
+    page.wait_for_timeout(_NO_RETRY_WAIT_MS)
     assert recorder.events == [_RETRY_SESSION]
 
     with _wait_for_wake_request(page, session_id):
@@ -186,4 +188,4 @@ def test_failed_sandbox_wake_offers_try_again(
         timeout=30_000
     )
     assert recorder.events == [_RETRY_SESSION, _RETRY_SESSION]
-    page.wait_for_timeout(_HOLD_MS)
+    _hold_for_viewer(request, page)

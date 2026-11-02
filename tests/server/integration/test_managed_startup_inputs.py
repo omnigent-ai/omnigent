@@ -212,6 +212,13 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         )
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
+        woken = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {"wake_only": True}},
+        )
+        assert woken.status_code == 202, woken.text
+        assert woken.json()["queued"] is False
+        assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
         retried = await env.client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )

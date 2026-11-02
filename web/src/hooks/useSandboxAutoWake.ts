@@ -25,11 +25,19 @@ interface WakeState {
   error: string | null;
 }
 
+const PHASE_BY_STEP: Record<WakeState["step"], SandboxWakePhase> = {
+  idle: "idle",
+  requesting: "waking",
+  settling: "waking",
+  failed: "failed",
+};
+
 /**
  * Wake a session's asleep managed sandbox when a view that needs it opens.
  *
- * Uses the same server recovery as **Reconnect host** (`retry_session`), so
- * the sandbox resumes and its runner starts without a chat message. Each
+ * Uses the same server recovery as **Reconnect host** (`retry_session`) in
+ * wake-only mode, so the sandbox resumes and its runner starts without a chat
+ * message, a resumed turn, or a retried startup input. Each
  * opening (`active` turning true) wakes at most once: a sandbox that idles
  * back to sleep while the view stays open waits for `wake()` or a reopen, so
  * an open panel never keeps a sandbox awake.
@@ -67,7 +75,8 @@ export function useSandboxAutoWake({
     opening.pending = true;
     setState({ conversationId, step: "requesting", error: null });
     try {
-      await retrySession(conversationId);
+      // "already_connected" also settles: liveness can lag a runner that is up.
+      await retrySession(conversationId, { wakeOnly: true });
       if (openingRef.current === opening) {
         setState({ conversationId, step: "settling", error: null });
       }
@@ -113,7 +122,5 @@ export function useSandboxAutoWake({
     return () => window.clearTimeout(timeout);
   }, [asleep, conversationId, step]);
 
-  const phase: SandboxWakePhase =
-    step === "requesting" || step === "settling" ? "waking" : step === "failed" ? "failed" : "idle";
-  return { phase, error: current.error, wake };
+  return { phase: PHASE_BY_STEP[step], error: current.error, wake };
 }

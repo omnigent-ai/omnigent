@@ -49,7 +49,7 @@ describe("useSandboxAutoWake", () => {
     const { result, rerender } = renderWake(asleepAndOpen);
 
     expect(retryMock).toHaveBeenCalledTimes(1);
-    expect(retryMock).toHaveBeenCalledWith("conv_sleepy");
+    expect(retryMock).toHaveBeenCalledWith("conv_sleepy", { wakeOnly: true });
     expect(result.current.phase).toBe("waking");
 
     await act(async () => request.resolve(recovered));
@@ -59,6 +59,48 @@ describe("useSandboxAutoWake", () => {
     expect(retryMock).toHaveBeenCalledTimes(1);
 
     rerender({ ...asleepAndOpen, asleep: false });
+    expect(result.current.phase).toBe("idle");
+  });
+
+  it("waits for liveness when the server finds the runner already connected", async () => {
+    retryMock.mockResolvedValue({ queued: false, recovered: false, recovery: "already_connected" });
+    const { result, rerender } = renderWake(asleepAndOpen);
+    await act(async () => {});
+
+    expect(result.current.phase).toBe("waking");
+    rerender({ ...asleepAndOpen, asleep: false });
+    expect(result.current.phase).toBe("idle");
+  });
+
+  it("ignores a pending wake's outcome after switching sessions", async () => {
+    const first = deferred<PostEventResponse>();
+    const second = deferred<PostEventResponse>();
+    retryMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const { result, rerender } = renderWake(asleepAndOpen);
+
+    await act(async () => rerender({ ...asleepAndOpen, conversationId: "conv_other" }));
+    expect(retryMock).toHaveBeenLastCalledWith("conv_other", { wakeOnly: true });
+    await act(async () => first.reject(new Error("old session failed")));
+    expect(result.current.phase).toBe("waking");
+    expect(result.current.error).toBeNull();
+
+    await act(async () => second.resolve(recovered));
+    rerender({ ...asleepAndOpen, conversationId: "conv_other", asleep: false });
+    expect(result.current.phase).toBe("idle");
+    expect(retryMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not wake again on reopen after a wake that settled while hidden", async () => {
+    const request = deferred<PostEventResponse>();
+    retryMock.mockReturnValueOnce(request.promise);
+    const { result, rerender } = renderWake(asleepAndOpen);
+
+    rerender({ ...asleepAndOpen, active: false });
+    await act(async () => request.resolve(recovered));
+    rerender({ ...asleepAndOpen, active: false, asleep: false });
+
+    await act(async () => rerender({ ...asleepAndOpen, asleep: false }));
+    expect(retryMock).toHaveBeenCalledTimes(1);
     expect(result.current.phase).toBe("idle");
   });
 
@@ -133,7 +175,7 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("failed");
 
     await act(async () => rerender({ ...asleepAndOpen, conversationId: "conv_other" }));
-    expect(retryMock).toHaveBeenLastCalledWith("conv_other");
+    expect(retryMock).toHaveBeenLastCalledWith("conv_other", { wakeOnly: true });
     expect(result.current.phase).toBe("waking");
   });
 });

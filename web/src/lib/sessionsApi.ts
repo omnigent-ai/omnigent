@@ -1527,9 +1527,16 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 
-/** Reconnect or relaunch the existing runner without replaying user input. */
-export function retrySession(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "retry_session", data: {} });
+/**
+ * Reconnect or relaunch the existing runner without replaying user input.
+ * `wakeOnly` only reconnects it: no interrupted turn resumes and failed
+ * startup inputs stay failed.
+ */
+export function retrySession(
+  sessionId: string,
+  { wakeOnly = false }: { wakeOnly?: boolean } = {},
+): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "retry_session", data: wakeOnly ? { wake_only: true } : {} });
 }
 
 // Multiple error cards can describe the same failed turn.

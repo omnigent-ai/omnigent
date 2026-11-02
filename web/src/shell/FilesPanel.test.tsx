@@ -437,7 +437,7 @@ describe("FilesPanel on an asleep sandbox", () => {
       renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
 
       expect(retrySessionMock).toHaveBeenCalledTimes(1);
-      expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep");
+      expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
       expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
       expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
       expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
@@ -464,6 +464,44 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(retrySessionMock).toHaveBeenCalledTimes(1);
   });
 
+  it("starts the sandbox when the mobile Files drawer opens", async () => {
+    useAsleepMock.mockReturnValue(true);
+    useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
+    useChangedFilesMock.mockReturnValue(
+      unloadedResult() as ReturnType<typeof useWorkspaceChangedFiles>,
+    );
+    useDirectoryMock.mockReturnValue(directoryResult());
+    useEnvironmentMock.mockReturnValue(environmentResult(null, null));
+    useSearchMock.mockReturnValue(searchResult([], false, false, false));
+    const drawer = (open: boolean) => (
+      <MemoryRouter initialEntries={["/c/conv_asleep"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanelDrawer
+                sort="recent"
+                onSortChange={vi.fn()}
+                open={open}
+                onClose={vi.fn()}
+                onFileSelect={vi.fn()}
+                flatView={false}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    const { rerender } = render(drawer(false));
+    expect(retrySessionMock).not.toHaveBeenCalled();
+
+    await act(async () => rerender(drawer(true)));
+    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+  });
+
   it("does not wake the sandbox from a hidden panel, but offers to start it", async () => {
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false, active: false });
@@ -473,7 +511,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
     });
-    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep");
+    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
   });
 
   it("keeps the send-a-message hint for a read-only viewer", () => {
