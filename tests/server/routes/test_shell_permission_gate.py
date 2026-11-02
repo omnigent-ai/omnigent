@@ -953,6 +953,48 @@ _REVIEWER = {"login": "octocat", "kind": "user"}
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize("caller", ["owner@example.com", "viewer@example.com"])
+@pytest.mark.parametrize(
+    "resource,code_context,after",
+    [
+        ("", False, None),
+        ("/review-threads", True, None),
+        ("/review-threads", True, "cursor"),
+        ("/review-threads/thread-1/comments", False, "cursor"),
+    ],
+)
+async def test_review_conversation_reads_follow_file_sharing(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    resource: str,
+    code_context: bool,
+    after: str | None,
+    session: str,
+    caller: str,
+) -> None:
+    path = f"/v1/sessions/{session}/resources/github{resource}"
+    params = {"pr_url": _LABELS_PR_URL}
+    if after:
+        params["after"] = after
+        if resource == "/review-threads":
+            params.update(head_sha="a" * 40, base_sha="b" * 40)
+    response = await client.get(path, params=params, headers={"X-Forwarded-Email": caller})
+    if code_context and session == "conv_share" and caller == "viewer@example.com":
+        assert response.status_code == 403, response.text
+        assert runner_client.gets == []
+        return
+    assert response.status_code == 200, response.text
+    assert runner_client.gets == [path]
+    forwarded = (
+        {**params, "after": "", "head_sha": "", "base_sha": ""}
+        if code_context and not after
+        else params
+    )
+    assert runner_client.get_params == [forwarded]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path, added",
     [(_LABELS_PATH, "bug"), (_REVIEWERS_PATH, _REVIEWER)],
@@ -996,6 +1038,7 @@ _MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
 _DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
 _MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
 _COMMENTS_PATH = "/v1/sessions/conv_share/resources/github/comments"
+_REVIEW_REPLY_PATH = "/v1/sessions/conv_share/resources/github/review-threads/thread-1/replies"
 _DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
 _ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 
@@ -1043,17 +1086,26 @@ async def test_pr_merge_routes_require_edit(
     [("owner@example.com", 200), ("viewer@example.com", 403)],
     ids=["edit-allowed", "read-denied"],
 )
-@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
+@pytest.mark.parametrize("resource", ["details", "comment", "reply", "thread"])
 async def test_pr_details_route_requires_edit(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
     caller: str,
     expected: int,
-    comment: bool,
+    resource: str,
 ) -> None:
     """Writing PR text acts as the host's account, so viewers are refused."""
-    path = _COMMENTS_PATH if comment else _DETAILS_PATH
+    comment = resource != "details"
+    path = {
+        "details": _DETAILS_PATH,
+        "comment": _COMMENTS_PATH,
+        "reply": _REVIEW_REPLY_PATH,
+        "thread": _REVIEW_REPLY_PATH.removesuffix("/thread-1/replies"),
+    }[resource]
     fields = {"body": "Hello"} if comment else {"title": "Renamed"}
+    if resource == "thread":
+        fields["anchor"] = {"line": 2}
+    forwarded = {**fields, **({"thread_id": "thread-1"} if resource == "reply" else {})}
     edited = await client.post(
         path,
         json={"pr_url": _LABELS_PR_URL, **fields, "session_id": "untrusted"},
@@ -1062,7 +1114,7 @@ async def test_pr_details_route_requires_edit(
 
     assert edited.status_code == expected, edited.text
     expected_posts = [
-        (path, {"pr_url": _LABELS_PR_URL, **({"body": None} if not comment else {}), **fields})
+        (path, {"pr_url": _LABELS_PR_URL, **({"body": None} if not comment else {}), **forwarded})
     ]
     assert runner_client.posts == ([] if expected == 403 else expected_posts)
 
@@ -1091,10 +1143,11 @@ async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
         (_REVIEWERS_PATH, {"pr_url": _LABELS_PR_URL, "add": [_REVIEWER]}),
         (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed"}),
         (_COMMENTS_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
+        (_REVIEW_REPLY_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_MERGE_PATH, _MERGE_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "reviewers", "details", "comments", "merge", "disable-auto-merge"],
+    ids=["labels", "reviewers", "details", "comments", "reply", "merge", "disable-auto-merge"],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,

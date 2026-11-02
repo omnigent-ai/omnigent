@@ -184,7 +184,7 @@ def test_session_pr_selection_and_unlink(
     link.click()
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_value(two)
     rail.get_by_role("button", name="Link", exact=True).click()
-    expect(rail.get_by_role("button", name="All pull requests (1)")).to_be_visible()
+    expect(rail.get_by_role("button", name=re.compile("All pull requests"))).to_have_count(0)
     expect(indicator).to_have_accessible_name("#42")
     expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
 
@@ -302,7 +302,6 @@ def test_session_pr_account_fallback(
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("button", name="example/one #42", exact=True).click()
     expect(rail.get_by_text("Can’t reach the upstream repo", exact=True)).to_be_visible()
     account = rail.get_by_role("combobox", name="GitHub account")
     alternative = rail.get_by_text("or", exact=True)

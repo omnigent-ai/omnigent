@@ -41,6 +41,24 @@ interface UseSessionResult {
   error: Error | null;
 }
 
+/**
+ * Whether ``targetId`` is on the cached parent chain starting at
+ * ``parentSessionId``. Synchronous and cache-only: the chain is cached by
+ * {@link useRootSessionId}'s walk, and an uncached hop ends the search.
+ */
+export function isCachedAncestor(
+  queryClient: QueryClient,
+  parentSessionId: string | null | undefined,
+  targetId: string,
+): boolean {
+  let id = parentSessionId ?? null;
+  for (let hop = 0; id !== null && hop < MAX_ROOT_WALK_HOPS; hop++) {
+    if (id === targetId) return true;
+    id = queryClient.getQueryData<Session>(["session", id])?.parentSessionId ?? null;
+  }
+  return false;
+}
+
 /** The shared ``["session", id]`` snapshot query, disabled for a null id; see {@link useSession}. */
 export function sessionQueryOptions(sessionId: string | null) {
   return {

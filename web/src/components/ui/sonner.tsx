@@ -1,4 +1,4 @@
-import { useTheme } from "next-themes";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Toaster as Sonner, type ToasterProps, useSonner } from "sonner";
 import {
   CircleCheckIcon,
@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 
 const Toaster = ({ expand, ...props }: ToasterProps) => {
-  const { theme = "system" } = useTheme();
+  const theme = useResolvedThemeMode();
   const { toasts } = useSonner();
   const hasPersistentPrompt = toasts.some(
     (toast) => toast.dismissible === false && toast.duration === Number.POSITIVE_INFINITY,
@@ -17,7 +17,7 @@ const Toaster = ({ expand, ...props }: ToasterProps) => {
 
   return (
     <Sonner
-      theme={theme as ToasterProps["theme"]}
+      theme={theme}
       className="toaster group"
       icons={{
         success: <CircleCheckIcon className="size-4" />,
