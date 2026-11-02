@@ -29,9 +29,11 @@ import {
 import * as agentsHook from "@/hooks/useAvailableAgents";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
+import * as sandboxModelHooks from "@/hooks/useSandboxModelOptions";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { getCurrentUserId } from "@/lib/identity";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
@@ -40,6 +42,11 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: undefined })),
+}));
+// The sandbox catalog behind the model dropdown in sandbox mode. Returning no
+// data keeps the static alias fallback unless a test supplies a catalog.
+vi.mock("@/hooks/useSandboxModelOptions", () => ({
+  useSandboxModelOptions: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
@@ -169,6 +176,9 @@ const updateMutateAsync = vi.fn();
 beforeEach(() => {
   projectsQuery.current = { data: PROJECTS, isPending: false, isSuccess: true, isError: false };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
+  vi.mocked(sandboxModelHooks.useSandboxModelOptions).mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof sandboxModelHooks.useSandboxModelOptions>);
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
   resolveOrCreateProjectId.mockReset();
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
@@ -604,6 +614,63 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
+  });
+
+  it("offers the sandbox catalog for the agent's harness in sandbox mode", async () => {
+    vi.mocked(sandboxModelHooks.useSandboxModelOptions).mockReturnValue({
+      data: {
+        models: [{ id: "system.ai.claude-sonnet-5", displayName: "Claude Sonnet 5" }],
+        configured: false,
+        configuration_revision: null,
+        provider_label: "AI Gateway",
+        default_model: null,
+        status: "ready",
+      },
+    } as unknown as ReturnType<typeof sandboxModelHooks.useSandboxModelOptions>);
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "company",
+          sandbox_provider_capabilities: { company: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(sandboxModelHooks.useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "company",
+      "claude-native",
+      "ag_claude_native",
+      getCurrentUserId(),
+      true,
+    );
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Claude Sonnet 5" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Opus" })).not.toBeInTheDocument();
+  });
+
+  it("falls back to the Claude aliases when the sandbox catalog is unavailable", async () => {
+    vi.mocked(sandboxModelHooks.useSandboxModelOptions).mockReturnValue({
+      data: {
+        models: [],
+        configured: false,
+        configuration_revision: null,
+        provider_label: "AI Gateway",
+        default_model: null,
+        status: "unavailable",
+      },
+    } as unknown as ReturnType<typeof sandboxModelHooks.useSandboxModelOptions>);
+    renderWithSandboxes();
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Opus" })).toBeInTheDocument();
   });
 
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
