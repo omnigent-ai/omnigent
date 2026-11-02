@@ -30,9 +30,13 @@ Five behaviors are covered:
 
 4. **Terminal view startup vs. stopped states.** A starting terminal-first
    session renders a passive "Starting up…" status with no actionable
-   control; a stopped one — PTY removed mid-session, or a genuine stop
-   followed by a hard reload inside the cold-boot window — renders the
-   stopped copy with an enabled Resume action and no startup status.
+   control. A stopped one offers Resume after automatic recovery fails,
+   or when its host cannot be reached.
+
+5. **A program's terminal queries are answered once.** tmux answers a query
+   such as the cursor position itself; the browser terminal must not answer
+   the copy control mode forwards, or the extra reply reaches the program as
+   typed input.
 
 All use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
@@ -52,6 +56,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
@@ -341,14 +346,7 @@ def test_starting_terminal_view_shows_loading_without_resume(
 
 
 def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[str, str]) -> None:
-    """A genuinely stopped terminal-first session keeps its Resume action.
-
-    Mirror of the startup-gap test above — same offline modeling (empty PTY
-    inventory, runner down, live channels silenced) — but the session row
-    is OLDER than the 45s cold-boot grace, so nothing can read it as a
-    starting session: the stopped-session UI and its Resume action must
-    render, with no startup status.
-    """
+    """Failed automatic recovery leaves a stopped session's Resume action."""
     base_url, session_id = terminal_session
 
     # Outside the grace window (created an hour ago), runner down.
@@ -377,6 +375,18 @@ def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[
     # for why each is needed).
     page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
 
     # Every liveness carrier agrees: runner offline, created long past the
     # cold-boot grace.
@@ -415,11 +425,123 @@ def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[
 
     terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
     expect(terminal_view).to_be_visible()
-    # The stopped-session UI renders — no startup status, and the Resume
-    # action is present and enabled.
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
     expect(terminal_view).to_contain_text("The harness is not running.")
     expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
     expect(terminal_view.get_by_role("status")).to_have_count(0)
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
+
+
+def test_failed_terminal_view_surfaces_runner_failure_cause(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A failed terminal-first session surfaces its failure cause on Terminal.
+
+    When the runner fails to start (``runner_failed_to_start`` recorded as a
+    session-level ``last_task_error`` with no transcript item), the Terminal
+    view must tell the user why — the same actionable cause the Chat view
+    surfaces via its error pill — so a user who defaults to Terminal can
+    tell the session failed and why.
+    """
+    base_url, session_id = terminal_session
+
+    # Outside the cold-boot grace, runner down — and the launch failed with a
+    # persisted, actionable cause (mirrors the Chat view's last_task_error).
+    created = int(time.time()) - 3600
+    failure = {
+        "code": "runner_failed_to_start",
+        "message": (
+            "runner process exited before connecting; "
+            "host authentication failed (run `omnigent login`)"
+        ),
+    }
+
+    terminal_list = re.compile(rf"/v1/sessions/{re.escape(session_id)}/resources/terminals\?.*")
+    page.route(
+        terminal_list,
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"data":[],"first_id":null,"last_id":null,"has_more":false}',
+        ),
+    )
+    page.route(
+        re.compile(r"/health\?session_ids="),
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"sessions": {session_id: {"runner_online": False, "host_online": True}}}
+            ),
+        ),
+    )
+    # Silence the live channels so the real online runner never leaks past the
+    # mocks (same reason as the stopped-session test above).
+    page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
+
+    def _patch_conversation_rows(route):
+        resp = route.fetch()
+        body = resp.json()
+        for row in body.get("data", []):
+            if row.get("id") == session_id:
+                row["runner_online"] = False
+                row["created_at"] = created
+                row["status"] = "failed"
+                row["last_task_error"] = failure
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(r"/v1/sessions\?"), _patch_conversation_rows)
+
+    def _patch_snapshot(route):
+        resp = route.fetch()
+        body = resp.json()
+        body["created_at"] = created
+        body["status"] = "failed"
+        body["last_task_error"] = failure
+        route.fulfill(response=resp, json=body)
+
+    page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
+
+    terminal_first = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.ui": "terminal"}},
+        timeout=10.0,
+    )
+    terminal_first.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    terminal_button = page.get_by_test_id("view-mode-terminal")
+    expect(terminal_button).to_be_enabled()
+    terminal_button.click()
+    expect(terminal_button).to_have_attribute("aria-pressed", "true")
+
+    terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+    expect(terminal_view).to_be_visible()
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
+    expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
+
+    # The persisted failure cause must be visible, mirroring the Chat error pill.
+    expect(terminal_view).to_contain_text("host authentication failed")
 
 
 def test_shell_wheel_scroll_reaches_mouse_tracking_program(
@@ -484,6 +606,50 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
         f"(log: {log.read_bytes()[:200]!r})"
         if log.exists()
         else "wheel log never created"
+    )
+
+
+_CURSOR_POSITION_REPORT = re.compile(rb"\x1b\[\d+;\d+R")
+
+
+def _cursor_position_reports(log: Path) -> int:
+    """Count the cursor position reports a shell program has read so far."""
+    return len(_CURSOR_POSITION_REPORT.findall(log.read_bytes())) if log.exists() else 0
+
+
+def test_shell_program_gets_one_reply_to_a_cursor_position_query(
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A program's cursor position query gets exactly one answer.
+
+    PowerShell asks for the cursor position on every prompt. tmux answers, but
+    control mode also forwards the raw query to the browser's xterm, and a
+    second answer from there reaches the program as typed input: ``28;1R`` at
+    the prompt. Like the wheel test, a program writes the query from a raw tty
+    and records its stdin to an absolute ``tmp_path`` file. Which queries the
+    browser still answers is covered by ``TerminalQueryReplies.test.ts``.
+    """
+    base_url, session_id = terminal_session
+    log = tmp_path / "replies.log"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    page.keyboard.type(f"stty raw -echo; printf '\\e[6n'; cat > '{log}'")
+    page.keyboard.press("Enter")
+
+    poll_until(lambda: _cursor_position_reports(log) >= 1, timeout_s=15)
+    # A duplicate from the browser trails tmux's reply by a WebSocket round trip.
+    page.wait_for_timeout(1_500)  # custom-lint: disable=sleep-then-assert -- duplicate window
+    reports = _cursor_position_reports(log)
+    assert reports == 1, (
+        f"expected one cursor position report, got {reports} (log: {log.read_bytes()[:200]!r})"
     )
 
 

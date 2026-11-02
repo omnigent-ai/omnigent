@@ -56,6 +56,8 @@ class LocalManagedHost(SandboxHostLauncher):
         self.unkeyed_url = unkeyed_url
         self.gate = threading.Event()
         self.provisioning = threading.Event()
+        # Set to make the next provision fail like a cloud allocation error.
+        self.fail_provision = False
         self.process: subprocess.Popen[bytes] | None = None
 
     def prepare(self) -> None:
@@ -64,6 +66,8 @@ class LocalManagedHost(SandboxHostLauncher):
     def provision(self, name: str) -> str:
         self.provisioning.set()
         assert self.gate.wait(timeout=120), "browser never released sandbox provisioning"
+        if self.fail_provision:
+            raise RuntimeError("injected sandbox allocation failure")
         return name
 
     def start_host(
@@ -130,6 +134,9 @@ def replica_app(
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
 
     uri = f"sqlite:///{root / 'replicas.db'}"
     artifacts = LocalArtifactStore(str(root / "artifacts"))
@@ -152,6 +159,11 @@ def replica_app(
         launcher.gate.set()
         return {"released": True}
 
+    @control.post("/provision/fail")
+    async def fail_provision() -> dict[str, bool]:
+        launcher.fail_provision = True
+        return {"failing": True}
+
     @control.post("/host/stop")
     async def stop_host() -> dict[str, bool]:
         launcher.gate.set()
@@ -173,6 +185,7 @@ def replica_app(
         artifact_store=artifacts,
         agent_cache=cache,
         host_store=HostStore(uri),
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(uri),
         extra_routers=[(control, "/__test", ["test-control"])],
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
@@ -216,13 +229,34 @@ def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) 
         body = await request.body()
         headers = {k: v for k, v in request.headers.items() if k not in _HOP_HEADERS}
         if strip_host_id and request.method == "POST" and request.url.path == "/v1/sessions":
-            create = json.loads(body)
-            create.pop("host_id", None)
-            body = json.dumps(create).encode()
+            content_type = request.headers.get("content-type", "")
+            if content_type.startswith("multipart/form-data"):
+                # A create carrying attachments sends its JSON as the
+                # ``metadata`` part; re-encode the form without the id.
+                form = await request.form()
+                create = json.loads(str(form["metadata"]))
+                create.pop("host_id", None)
+                files = [
+                    ("initial_files", (part.filename, await part.read(), part.content_type))
+                    for part in form.getlist("initial_files")
+                    if not isinstance(part, str)
+                ]
+                encoded = httpx.Request(
+                    "POST", replica_a, data={"metadata": json.dumps(create)}, files=files
+                )
+                body = encoded.read()
+                content_type = encoded.headers["content-type"]
+            else:
+                create = json.loads(body)
+                create.pop("host_id", None)
+                body = json.dumps(create).encode()
             key = None
             headers = {
-                k: v for k, v in headers.items() if k.lower() not in {SLICE_KEY, "content-length"}
+                k: v
+                for k, v in headers.items()
+                if k.lower() not in {SLICE_KEY, "content-length", "content-type"}
             }
+            headers["content-type"] = content_type
         target = replica_b if key else replica_a
         record: dict[str, Any] = {
             "path": request.url.path,

@@ -16,8 +16,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
@@ -42,6 +44,7 @@ from .credential_proxy import (
 from .datamodel import CredentialProxySpec, OSEnvSpec
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
@@ -78,6 +81,9 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # opaque JSON object at this boundary with runtime validation in
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+# Ops without side effects: safe to send again if the helper died before replying.
+_REPLAY_SAFE_OPS = frozenset({"read"})
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +258,7 @@ def build_helper_env(
     # but strip again so a spec author can't re-admit one by naming it
     # in ``sandbox.env_passthrough``.
     env.pop(SHARED_ENVIRONMENT_VAR, None)
+    env.pop(HOST_SANDBOX_BACKEND_ENV, None)
     return strip_runner_auth_secrets(env)
 
 
@@ -328,6 +335,8 @@ class OSEnvironment(ABC):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -354,6 +363,13 @@ class OSEnvironment(ABC):
         max_output: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
+
+    def run_git(
+        self, argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run Git read arguments from a worker thread in this environment."""
+        del argv, cwd, timeout
+        raise OSError("This environment does not support Git reads")
 
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         """Remove the entry *path* names, confined like ``write``.
@@ -434,10 +450,22 @@ class _HelperProcessClient:
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
         self._lock = threading.Lock()
+        # bwrap --die-with-parent kills the helper when the thread that spawned it
+        # exits, and each request runs on its own short-lived thread.
+        self._spawner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="os-env-helper")
         self._closed = False
         atexit.register(self.close)
 
     def request(self, payload: OpRequest) -> OpResult:
+        if payload.get("op") == "git":
+            timeout = max(0.0, float(payload["timeout"]))
+            payload = {**payload, "deadline": time.monotonic() + timeout}
+            if not self._lock.acquire(timeout=timeout):
+                return {"timed_out": True}
+            try:
+                return self._request_locked(payload, allow_retry=True)
+            finally:
+                self._lock.release()
         with self._lock:
             return self._request_locked(payload, allow_retry=True)
 
@@ -445,6 +473,8 @@ class _HelperProcessClient:
         with self._lock:
             self._closed = True
             self._stop_locked()
+        self._spawner.shutdown(wait=False)
+        atexit.unregister(self.close)
 
     def _request_locked(
         self,
@@ -456,6 +486,11 @@ class _HelperProcessClient:
             return {"error": "OS environment helper is closed"}
 
         self._ensure_started_locked()
+        if payload.get("op") == "git":
+            remaining = payload["deadline"] - time.monotonic()
+            if remaining <= 0:
+                return {"timed_out": True}
+            payload = {**payload, "timeout": remaining}
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
@@ -463,19 +498,41 @@ class _HelperProcessClient:
         try:
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
+        except OSError as exc:
+            # The helper never received the request, so any op can be sent again.
+            return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
+        try:
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
             result = json.loads(line)
-            if isinstance(result, dict):
-                return result
-            return {"error": f"Helper returned non-object response: {result!r}"}
         except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
+            op = payload.get("op")
+            if op in _REPLAY_SAFE_OPS:
+                return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
             self._stop_locked()
-            if allow_retry and not self._closed:
-                self._ensure_started_locked()
-                return self._request_locked(payload, allow_retry=False)
-            return {"error": f"os_env helper failed: {exc}"}
+            return {
+                "error": (
+                    f"Lost the os_env helper during {op!r}; it may already have run, "
+                    f"so it was not sent again: {exc}"
+                )
+            }
+        if isinstance(result, dict):
+            return result
+        return {"error": f"Helper returned non-object response: {result!r}"}
+
+    def _resend_on_new_helper_locked(
+        self,
+        payload: OpRequest,
+        *,
+        allow_retry: bool,
+        exc: Exception,
+    ) -> OpResult:
+        self._stop_locked()
+        if allow_retry and not self._closed:
+            self._ensure_started_locked()
+            return self._request_locked(payload, allow_retry=False)
+        return {"error": f"os_env helper failed: {exc}"}
 
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -649,17 +706,19 @@ class _HelperProcessClient:
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
-            self._proc = subprocess.Popen(
-                spawn_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
-                env=env,
-                **popen_kwargs,
-            )
+            self._proc = self._spawner.submit(
+                lambda: subprocess.Popen(
+                    spawn_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
+                    env=env,
+                    **popen_kwargs,
+                )
+            ).result()
         except Exception:
             self._stop_locked()
             raise
@@ -943,6 +1002,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -956,6 +1017,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "offset": offset,
                 "limit": limit,
                 "max_bytes": max_bytes,
+                "regular_only": regular_only,
             },
         )
         return cast(OpResult, result)
@@ -1011,6 +1073,24 @@ class CallerProcessOSEnvironment(OSEnvironment):
             request["max_output"] = max_output
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
+
+    def run_git(
+        self, argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Use the persistent sandbox helper; callers must use a worker thread."""
+        result = self._helper.request(
+            {"op": "git", "argv": argv, "cwd": str(cwd), "timeout": timeout}
+        )
+        if result.get("timed_out"):
+            raise subprocess.TimeoutExpired(["git", *argv], timeout)
+        if result.get("error"):
+            raise OSError(result["error"])
+        return subprocess.CompletedProcess(
+            ["git", *argv],
+            result["returncode"],
+            base64.b64decode(result["stdout"]),
+            base64.b64decode(result["stderr"]),
+        )
 
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         result = await run_sync_on_thread(
@@ -1102,6 +1182,67 @@ def _handle_helper_request(
     sandbox: SandboxPolicy,
 ) -> OpResult:
     op = request.get("op")
+    if op == "git":
+        from omnigent.runtime.filesystem_registry import _anchored_git_env
+
+        args, target, timeout = request.get("argv"), request.get("cwd"), request.get("timeout")
+        if (
+            not isinstance(args, list)
+            or not args
+            or not all(isinstance(arg, str) for arg in args)
+            or args[0] not in {"status", "diff", "show"}
+            or not isinstance(target, str)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            return {"error": "Invalid Git read request"}
+        try:
+            git_cwd = _resolve_path(cwd, target)
+            _assert_within_reach(cwd, sandbox, git_cwd, need_write=False)
+            _assert_read_allowed(sandbox, git_cwd, cwd)
+            options = ["--no-ext-diff", "--no-textconv"] if args[0] == "diff" else []
+            argv = [
+                "git",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "diff.autoRefreshIndex=false",
+                args[0],
+                *options,
+                *args[1:],
+            ]
+            git_env = _anchored_git_env()
+            if args[0] == "show":
+                # Baseline reads distinguish missing HEAD paths from other Git failures.
+                git_env["LC_ALL"] = "C"
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                completed = subprocess.run(
+                    argv,
+                    cwd=git_cwd,
+                    env=git_env,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=timeout,
+                )
+                stdout.seek(0)
+                stderr.seek(0)
+                output, errors = (
+                    stdout.read(10 * 1024 * 1024 + 1),
+                    stderr.read(10 * 1024 * 1024 + 1),
+                )
+            if max(len(output), len(errors)) > 10 * 1024 * 1024:
+                return {"error": "Git output exceeds the 10 MiB read limit"}
+            return {
+                "returncode": completed.returncode,
+                "stdout": base64.b64encode(output).decode("ascii"),
+                "stderr": base64.b64encode(errors).decode("ascii"),
+            }
+        except subprocess.TimeoutExpired:
+            return {"timed_out": True}
+        except OSError as exc:
+            return {"error": str(exc)}
+
     if op == "read":
         raw_path = request.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1116,6 +1257,20 @@ def _handle_helper_request(
         offset = offset_raw if isinstance(offset_raw, int) else 1
         max_bytes_raw = request.get("max_bytes")
         max_bytes = max_bytes_raw if isinstance(max_bytes_raw, int) else None
+        if request.get("regular_only"):
+            if not max_bytes or max_bytes < 0 or not hasattr(os, "O_NONBLOCK"):
+                return {"error": "A bounded regular-file read is unavailable"}
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                with os.fdopen(descriptor, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        return {"error": "Original content requires a regular file"}
+                    content = source.read(max_bytes + 1)
+                if len(content) > max_bytes or b"\0" in content:
+                    return {"error": "Original content exceeds the text read limit"}
+                return {"content": content.decode("utf-8"), "encoding": "utf-8"}
+            except (OSError, UnicodeError) as exc:
+                return {"error": str(exc)}
         return _read_impl(
             path,
             offset,

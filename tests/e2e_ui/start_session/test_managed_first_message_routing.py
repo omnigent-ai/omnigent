@@ -166,11 +166,10 @@ def test_managed_first_message_rebinds_live_stream_across_replicas(
     mock_llm_server_url: str,
 ) -> None:
     """
-    Create and send through the UI; recover both POST and SSE without navigation.
+    Create through the UI; follow server-owned delivery live without navigation.
 
-    The create carries no host id, so the message and stream start on the
-    default replica, while the host keys by its own id as an older sandbox
-    does.
+    The create carries no host id, so it and the stream start on the default
+    replica, while the host keys by its own id as an older sandbox does.
     """
     configure_mock_llm(
         mock_llm_server_url,
@@ -218,6 +217,8 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
     ):
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        page_errors: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
         await page.context.tracing.start(screenshots=True, snapshots=True, sources=True)
         network_url = f"{rig.ingress}/__test/network"
         try:
@@ -250,13 +251,16 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             rows = await _poll(
                 client,
                 network_url,
-                lambda rows: bool(posts(rows) and streams(rows) and streams(rows)[0]["body"]),
+                lambda rows: bool(streams(rows) and streams(rows)[0]["body"]),
             )
             create = next(
                 row for row in rows if row["path"] == "/v1/sessions" and row["method"] == "POST"
             )
             assert json.loads(create["request"])["host_type"] == "managed"
-            assert posts(rows)[0]["key"] is None and posts(rows)[0]["status"] is None
+            assert json.loads(create["request"])["initial_input"]["data"]["content"] == [
+                {"type": "input_text", "text": _PROMPT}
+            ]
+            assert not posts(rows), "the server owns delivery of the accepted first input"
             assert streams(rows)[0]["replica"] == "a" and streams(rows)[0]["status"] == 200
             assert not streams(rows)[0]["closed"]
             snapshot = (await client.get(rig.a + session_path)).json()
@@ -278,20 +282,14 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             )
             await page.screenshot(path=str(rig.logs / "provisioning.png"))
             (await client.post(f"{rig.a}/__test/provision/release")).raise_for_status()
-            rows = await _poll(
+            snapshot = await _poll(
                 client,
-                network_url,
-                lambda rows: len(posts(rows)) == 2 and posts(rows)[1]["status"] == 202,
+                rig.b + session_path,
+                lambda body: bool(body["host_id"] and body["runner_id"]),
                 timeout=90,
             )
-            initial, retry = posts(rows)
-            assert initial["status"] == 400
-            assert json.loads(initial["body"])["error"]["code"] == "wrong_replica"
-            assert initial["request"] == retry["request"], "retry changed the message/stable_id"
-            snapshot = (await client.get(rig.b + session_path)).json()
             host_id = snapshot["host_id"]
             assert host_id and snapshot["runner_id"]
-            assert retry["key"] == host_id and retry["replica"] == "b"
             state_a, state_b = [
                 (await client.get(f"{url}/__test/state", params={"host_id": host_id})).json()
                 for url in (rig.a, rig.b)
@@ -299,6 +297,13 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             assert state_a["pid"] != state_b["pid"]
             assert state_a["host_local"] is False and state_b["host_local"] is True
             await _poll(client, f"{model_url}/gate/pending", lambda body: body["pending"])
+            await _poll(
+                client,
+                network_url,
+                lambda rows: any(
+                    row["key"] == host_id and row["status"] == 200 for row in streams(rows)
+                ),
+            )
             (await client.post(f"{model_url}/gate/release")).raise_for_status()
 
             # Confirm the runner actually committed the reply before attributing
@@ -312,6 +317,9 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
             await expect(assistant.filter(has_text=_REPLY)).to_be_visible(timeout=20_000)
             rows = (await client.get(network_url)).json()
+            assert not posts(rows), "opening the session must not resend its first input"
+            assert len(streams(rows)) == 2, "handoff must not depend on error-driven reconnects"
+            assert not page_errors
             assert streams(rows)[0]["closed"], "the browser left its wrong-replica stream open"
             keyed = [
                 row for row in streams(rows) if row["key"] == host_id and row["status"] == 200
@@ -334,8 +342,8 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             await expect(host_chip.locator(".lucide-monitor-cloud")).to_be_visible()
             rows = (await client.get(network_url)).json()
             assert len(streams(rows)) == stream_count
-            assert len(posts(rows)) == 3
-            assert posts(rows)[2]["key"] == host_id
+            assert len(posts(rows)) == 1
+            assert posts(rows)[0]["key"] == host_id
             await expect(page).to_have_url(f"{rig.ui}/c/{session_id}")
 
             snapshot = (await client.get(rig.b + session_path)).json()
@@ -382,7 +390,8 @@ def test_managed_create_lands_on_its_hosts_replica(
     """
     A create with a chosen host id keys everything by it from the start; one
     without (an older client) stays on the default replica, where the host it
-    launches connects too. Either way the first message lands on the first try.
+    launches connects too. Either way the launch delivers the first input on
+    the replica holding the host's tunnel.
     """
     configure_mock_llm(
         mock_llm_server_url,
@@ -439,9 +448,12 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
                     and json.loads(row["request"])["type"] == "message"
                 ]
 
-            rows = await _poll(client, network_url, lambda rows: bool(posts(rows)))
+            rows = await _poll(client, network_url, lambda rows: created(rows) is not None)
             create = created(rows)
             assert create is not None
+            assert json.loads(create["request"])["initial_input"]["data"]["content"] == [
+                {"type": "input_text", "text": _SHARDED_PROMPT}
+            ]
             session_prefix = f"/v1/sessions/{json.loads(create['body'])['id']}"
             replica, replica_url = ("b", rig.b) if keyed else ("a", rig.a)
             host_id = json.loads(create["request"]).get("host_id")
@@ -451,21 +463,14 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
             assert labels.get("omnigent.sandbox.requested_host_id") == host_id
             if keyed:
                 assert host_id is not None and re.fullmatch(r"[0-9a-f]{32}", host_id)
-            # The message waits on the launch on the replica that will hold the
-            # host's tunnel, instead of failing over from another replica.
-            assert posts(rows)[0]["key"] == host_id and posts(rows)[0]["replica"] == replica
-
             # The create launched there, so that replica holds the provisioning gate.
             (await client.post(f"{replica_url}/__test/provision/release")).raise_for_status()
-            rows = await _poll(
+            snapshot = await _poll(
                 client,
-                network_url,
-                lambda rows: posts(rows)[0]["status"] == 202,
+                replica_url + session_prefix,
+                lambda body: bool(body["host_id"] and body["runner_id"]),
                 timeout=90,
             )
-            assert len(posts(rows)) == 1, "the first message was re-sent"
-            snapshot = (await client.get(replica_url + session_prefix)).json()
-            assert snapshot["host_id"] and snapshot["runner_id"]
             state = (
                 await client.get(
                     f"{replica_url}/__test/state", params={"host_id": snapshot["host_id"]}
@@ -478,9 +483,10 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
             (await client.post(f"{model_url}/gate/release")).raise_for_status()
             assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
             await expect(assistant.filter(has_text=_SHARDED_REPLY)).to_be_visible(timeout=20_000)
+            rows = (await client.get(network_url)).json()
+            assert not posts(rows), "the server owns delivery of the accepted first input"
 
             if keyed:
-                rows = (await client.get(network_url)).json()
                 session_rows = [row for row in rows if row["path"].startswith(session_prefix)]
                 assert session_rows
                 assert all(row["key"] == host_id for row in session_rows), session_rows
@@ -578,8 +584,9 @@ def test_first_native_message_outlasts_a_long_sandbox_launch(
 ) -> None:
     """
     A Claude Code or Codex session's first message stays pending through a launch
-    longer than the browser's model wait and the server's hold. Codex then sends
-    it once; Claude Code also waits for its model, which needs real inference.
+    longer than the browser's model wait and the server's hold. The server saved it
+    with the create, so Codex receives it once without a browser send; Claude Code
+    also waits for its model, which needs real inference.
     """
     _run_in_fresh_loop(_drive_long_launch(managed_replicas, agent_name, sends_once_ready))
 
@@ -624,23 +631,26 @@ async def _drive_long_launch(
             await expect(user.filter(has_text=_NATIVE_PROMPT)).to_have_count(1)
             await expect(page.get_by_test_id("error-pill")).to_have_count(0)
             await expect(page.get_by_label("Message the agent")).to_have_value("")
-            # Still in the browser, not parked on the server.
+            # Saved by the server with the create; the browser never posts it.
+            assert [entry["content"][-1]["text"] for entry in snapshot["pending_inputs"]] == [
+                _NATIVE_PROMPT
+            ]
             assert not posts((await client.get(network_url)).json())
             await page.screenshot(path=str(rig.logs / "long-launch.png"))
             if not sends_once_ready:
                 return
 
             (await client.post(f"{rig.b}/__test/provision/release")).raise_for_status()
-            rows = await _poll(
+            await _poll(
                 client,
-                network_url,
-                lambda rows: any(row["status"] == 202 for row in posts(rows)),
+                rig.b + session_path,
+                lambda data: (
+                    not data["pending_inputs"]
+                    and len(_persisted_messages(data, "user", _NATIVE_PROMPT)) == 1
+                ),
                 timeout=120,
             )
-            [sent] = posts(rows)
-            assert json.loads(sent["request"])["data"]["content"] == [
-                {"type": "input_text", "text": _NATIVE_PROMPT}
-            ]
+            assert not posts((await client.get(network_url)).json())
         finally:
             for url in (rig.a, rig.b):
                 await client.post(f"{url}/__test/provision/release")

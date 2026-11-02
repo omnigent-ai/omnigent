@@ -1,6 +1,13 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "@/shell/TerminalFirstContext";
+import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { BubbleView, WorkingIndicator } from "./ChatPage";
@@ -23,6 +30,7 @@ afterEach(() => {
     sandboxStatus: null,
     backgroundTaskCount: 0,
     blockedOn: null,
+    blocks: [],
     sessionStatus: "idle",
     status: "idle",
   });
@@ -179,6 +187,121 @@ describe("WorkingIndicator", () => {
     act(() => useChatStore.setState({ sessionStatus: "running" }));
     rerender(<WorkingIndicator />);
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+
+  describe("parked on a terminal permission prompt", () => {
+    const sideChatId = "conv_side_child";
+    const terminalFirstSession: TerminalFirstContextValue = {
+      isClaudeNative: true,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      isShellView: false,
+      view: "chat",
+      terminalViewKey: null,
+      setView: () => {},
+      terminalsAvailable: true,
+      terminalStartingUp: false,
+    };
+    const pendingApproval: ElicitationBlock = {
+      type: "elicitation",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+      elicitationId: "elic_1",
+      targetSessionId: null,
+      message: "Allow shell command?",
+      phase: "tool_call",
+      policyName: "ask-before-shell",
+      contentPreview: "{}",
+      requestedSchema: {},
+      url: null,
+      status: "pending",
+      response: null,
+    };
+
+    afterEach(() => {
+      cleanup();
+      conversationRegistry.release(sideChatId);
+      useChatStore.setState({ conversationId: null });
+    });
+
+    function renderInTerminalFirstSession(scope: string | null = null) {
+      return render(
+        <TerminalFirstContextProvider value={terminalFirstSession}>
+          <ConversationScopeContext.Provider value={scope}>
+            <WorkingIndicator />
+          </ConversationScopeContext.Provider>
+        </TerminalFirstContextProvider>,
+      );
+    }
+
+    it("sends the user to the Terminal view when no chat card mirrors the prompt", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      renderInTerminalFirstSession();
+
+      const expected =
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.";
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(expected);
+      expect(screen.getByRole("status")).toHaveTextContent(expected);
+    });
+
+    it("keeps the block reason beside a pending approval card", () => {
+      useChatStore.setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [pendingApproval],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("still points at the terminal when the only pending card is a sub-agent's", () => {
+      useChatStore.setState({
+        conversationId: "conv_root",
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: "conv_sub_agent" }],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+      );
+    });
+
+    it("keeps the block reason beside a side chat's own pending card", () => {
+      conversationRegistry.acquire(sideChatId).setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: sideChatId }],
+      });
+      renderInTerminalFirstSession(sideChatId);
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("leaves out the Terminal view hint outside a terminal-first session", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      render(<WorkingIndicator />);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
+    });
+
+    it("does not offer the root session's Terminal view from a side chat", () => {
+      conversationRegistry
+        .acquire(sideChatId)
+        .setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      renderInTerminalFirstSession(sideChatId);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
+    });
   });
 });
 
@@ -370,12 +493,64 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("message-bubble").children).toHaveLength(1);
   });
 
+  it("folds a finished Codex turn's commentary into one Worked row by default", () => {
+    const codexTurn: AssistantBubble = {
+      ...foldOnlyBubble([
+        {
+          kind: "text",
+          itemId: "t1",
+          text: "Reading the tests.",
+          final: true,
+          phase: "commentary",
+        },
+        toolItem("c6"),
+        { kind: "text", itemId: "t2", text: "Adding the case.", final: true, phase: "commentary" },
+        toolItem("c7"),
+        { kind: "text", itemId: "t3", text: "Added the test.", final: true, phase: "final_answer" },
+      ]),
+      continued: false,
+    };
+    render(<BubbleView bubble={codexTurn} />);
+    expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Worked for 2m 27s" })).toBeInTheDocument();
+    expect(screen.queryByText("Reading the tests.")).not.toBeInTheDocument();
+    expect(screen.getByText("Added the test.")).toBeVisible();
+    cleanup();
+
+    // Without answer labels, progress messages stay visible unless the user opts in.
+    const unlabeled = codexTurn.items.map((item) =>
+      item.kind === "text" ? { ...item, phase: undefined } : item,
+    );
+    render(<BubbleView bubble={{ ...codexTurn, items: unlabeled }} />);
+    expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+    expect(screen.getByText("Reading the tests.")).toBeVisible();
+  });
+
   it("spans the column for a fold-only turn so the row's hairline draws", () => {
     // WHY: shrink-wrapped to the ~110px summary row, the trailing hairline
     // (a flex-1 span) collapses to zero width and the click target stops
     // short of the column. The prose cap keeps it aligned with the rule
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
+    expect(bubble.firstElementChild).toHaveClass("w-full");
+    expect(bubble.firstElementChild).not.toHaveClass("w-fit");
+  });
+
+  it("spans the prose width for tool rows beside a short reply", () => {
+    // WHY: shrink-wrapped to "Done.", the rows above it would cut their titles off mid-column.
+    render(
+      <BubbleView
+        bubble={{
+          ...foldOnlyBubble([
+            toolItem("c5"),
+            { kind: "text", itemId: "t5", text: "Done.", final: true },
+          ]),
+          continued: false,
+        }}
+      />,
+    );
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble).toHaveClass("max-w-[var(--chat-prose-width)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");

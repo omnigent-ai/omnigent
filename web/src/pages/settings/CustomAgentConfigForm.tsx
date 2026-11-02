@@ -93,7 +93,7 @@ export function CustomAgentConfigForm({
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!revision?.etag || !dirty || validation || conflict || busy) return;
+    if (!revision || !dirty || validation || conflict || busy) return;
     setError(null);
     try {
       const result = await save.mutateAsync({ etag: revision.etag, patch });
@@ -102,10 +102,14 @@ export function CustomAgentConfigForm({
       setDraft(agentConfigDraft(result.config));
       save.reset();
     } catch (err) {
-      if (err instanceof ApiError && [412, 428].includes(err.status)) {
+      if (err instanceof ApiError && err.status === 412) {
         setConflict(true);
         setError(
-          "This agent changed or its revision is unavailable. Reload the latest configuration before saving. Your draft is still here.",
+          "This agent changed. Reload the latest configuration before saving. Your draft is still here.",
+        );
+      } else if (err instanceof ApiError && err.status === 428) {
+        setError(
+          "This server needs an update before it can save these changes. Your draft is still here. Try saving again after the update.",
         );
       } else setError(err instanceof Error ? err.message : "Could not save the agent.");
       // Mutation variables can contain replacement credentials; only the local draft retains them.
@@ -273,16 +277,11 @@ export function CustomAgentConfigForm({
               {error || validation}
             </p>
           )}
-          {!revision?.etag && (
-            <p role="alert">
-              The server did not provide a configuration revision. Reload before saving.
-            </p>
-          )}
           <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 border-t border-border bg-background py-4">
             <p className="mr-auto w-full text-xs text-muted-foreground @lg:w-auto">
               Changes apply to sessions on their next turn.
             </p>
-            {(conflict || !revision?.etag) && (
+            {conflict && (
               <Button
                 type="button"
                 variant="outline"
@@ -298,7 +297,7 @@ export function CustomAgentConfigForm({
             <Button
               type="submit"
               loading={save.isPending}
-              disabled={busy || !dirty || Boolean(validation) || conflict || !revision?.etag}
+              disabled={busy || !dirty || Boolean(validation) || conflict || !revision}
             >
               Save changes
             </Button>

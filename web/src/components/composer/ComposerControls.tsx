@@ -24,6 +24,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { cn } from "@/lib/utils";
 import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
@@ -53,7 +54,7 @@ export function ComposerWorkspaceBar({
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
+        "composer-context-bar group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
         COMPOSER_CONTENT_INSET_CLASS,
         COMPOSER_TRAY_INSET_CLASS,
         className,
@@ -156,11 +157,13 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  disabledReason,
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
   onSelect,
   testIdPrefix = "composer",
+  openNonce = 0,
 }: {
   label: string;
   value: string;
@@ -168,26 +171,38 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hover text explaining why the picker is disabled. */
+  disabledReason?: string;
   /** Hide the visible value; it stays in the accessible name. */
   iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
+  /** Opens the menu each time this changes to a new nonzero value. */
+  openNonce?: number;
 }) {
+  const inert = disabled || (loading && !interactiveWhileLoading);
+  const [open, setOpen] = useState(false);
+  const appliedOpenNonce = useRef(openNonce);
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    if (!inert) setOpen(true);
+  }, [openNonce, inert]);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild disabled={inert}>
         <button
           type="button"
-          disabled={disabled || (loading && !interactiveWhileLoading)}
+          disabled={inert}
           aria-busy={loading || undefined}
           className={cn(
             "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
             loading && "disabled:opacity-100",
           )}
           aria-label={`${label}: ${value}`}
-          title={`${label}: ${value}`}
+          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
@@ -250,34 +265,6 @@ export function ComposerConfigTooltipRows({
       ))}
     </>
   );
-}
-
-const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
-
-function useMenuGuardedTooltip(menuOpen: boolean) {
-  const [wantsOpen, setWantsOpen] = useState(false);
-  // Epoch millis until which open requests are ignored; Infinity while the
-  // menu is open. A ref, not state: it is only read when Radix requests an
-  // open, so changing it never needs a re-render.
-  const suppressedUntil = useRef(0);
-  useEffect(() => {
-    if (menuOpen) {
-      setWantsOpen(false);
-      suppressedUntil.current = Number.POSITIVE_INFINITY;
-    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
-      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
-    }
-  }, [menuOpen]);
-  return {
-    open: wantsOpen && !menuOpen,
-    onOpenChange: (next: boolean) =>
-      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
-    triggerProps: {
-      onPointerEnter: () => {
-        if (!menuOpen) suppressedUntil.current = 0;
-      },
-    },
-  } as const;
 }
 
 /**

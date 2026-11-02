@@ -12,7 +12,6 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tarfile
@@ -33,6 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import TurnComplete
 from omnigent.runner.app import _resolve_forwarded_message_content
+from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -134,12 +134,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _find_free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
     env = {
         **os.environ,
@@ -232,7 +226,7 @@ def fault_injected_server(tmp_path: Path) -> Iterator[str]:
 
     Yields the base URL. The server is always terminated on teardown.
     """
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     server_log = (tmp_path / "server.log").open("w")
     proc: subprocess.Popen[bytes] | None = None
@@ -342,8 +336,10 @@ async def test_transient_attachment_read_does_not_drop_native_attachment(
     # fail-once stays armed for the resolver under test.
     probe_id = _upload_file(base_url, session_id, "probe.md", b"probe")
     probe_base = f"{base_url}/v1/sessions/{session_id}/resources/files/{probe_id}"
-    first = _http.get(probe_base, timeout=10.0)
-    second = _http.get(probe_base, timeout=10.0)
+    # The server closes the connection after this 500, so a pooled client could
+    # resend on the closing socket; give each probe read its own connection.
+    first = httpx.get(probe_base, timeout=10.0, trust_env=False)
+    second = httpx.get(probe_base, timeout=10.0, trust_env=False)
     assert first.status_code == 500, f"transient failure signature not live: {first.status_code}"
     assert first.json()["error"]["code"] == "internal_error"
     assert second.status_code == 200, "resource must be readable again on the next read"

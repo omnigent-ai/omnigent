@@ -316,7 +316,7 @@ def _command_line() -> str:
 
 def _build_report(exc: BaseException, tb_text: str, *, source: str) -> str:
     """Compose the GitHub-ready markdown report."""
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     exc_type = type(exc).__qualname__
     msg = str(exc).strip() or "(no message)"
     version = _CONFIG["version"]
@@ -360,7 +360,7 @@ def _save_report(report_md: str) -> Path:
     """Write the report to the crashes dir (rotated) and return its path."""
     d = _crashes_dir()
     d.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
     path = d / f"crash-{stamp}.md"
     if path.exists():
         # Same-second collision. The pid separates concurrent processes, but a

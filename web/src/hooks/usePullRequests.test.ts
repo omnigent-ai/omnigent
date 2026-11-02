@@ -1,10 +1,11 @@
-// Tests for the pure helpers in usePullRequests — the 404 → reason classifier that
-// steers an outdated host to the "update your host" panel state, the payload
-// normalizer (and that the info fetch applies it), and the panel's
-// poll-interval decision.
+// Tests for usePullRequests' pure helpers: the 404 → "update your host" classifier, the
+// payload normalizer (and that the info fetch applies it), the poll interval, and label edits.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  applyPullRequestLabelChange,
+  applyPullRequestReviewerChange,
+  computeLinkedPullRequestPollInterval,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
   normalizePullRequestInfo,
@@ -22,6 +23,56 @@ const FORGE_DISPLAY = {
   request_name: "pull request",
   number_prefix: "!",
 };
+
+describe("applyPullRequestReviewerChange", () => {
+  it("withdraws, re-requests, and appends reviewers as GitHub will, ignoring case", () => {
+    const reviewers = [
+      { login: "Alice", kind: "user" as const, state: "PENDING" as const },
+      { login: "bob", kind: "user" as const, state: "APPROVED" as const },
+      { login: "core", kind: "team" as const, state: "PENDING" as const },
+    ];
+
+    expect(
+      applyPullRequestReviewerChange(reviewers, {
+        add: [
+          { login: "Bob", kind: "user" },
+          { login: "core", kind: "user" },
+        ],
+        remove: [{ login: "alice", kind: "user" }],
+      }),
+    ).toEqual([
+      { login: "bob", kind: "user", state: "PENDING" },
+      { login: "core", kind: "team", state: "PENDING" },
+      { login: "core", kind: "user", state: "PENDING" },
+    ]);
+    expect(reviewers[1].state).toBe("APPROVED");
+  });
+});
+
+describe("applyPullRequestLabelChange", () => {
+  const label = (name: string, color: string | null = null) => ({
+    name,
+    color,
+    description: null,
+  });
+
+  it("removes labels case-insensitively and appends added ones", () => {
+    const labels = [label("Bug"), label("docs"), label("size/XS")];
+
+    expect(
+      applyPullRequestLabelChange(labels, { add: [label("ready")], remove: [label("bug")] }),
+    ).toEqual([label("docs"), label("size/XS"), label("ready")]);
+    expect(labels).toHaveLength(3);
+  });
+
+  it("replaces a label it re-adds, so a repeated edit changes nothing more", () => {
+    const change = { add: [label("Ready", "0e8a16")], remove: [] };
+    const once = applyPullRequestLabelChange([label("ready"), label("docs")], change);
+
+    expect(once).toEqual([label("docs"), label("Ready", "0e8a16")]);
+    expect(applyPullRequestLabelChange(once, change)).toEqual(once);
+  });
+});
 
 describe("pullRequestNotFoundReason", () => {
   it("flags an outdated host from its 'resource not found' message", () => {
@@ -244,6 +295,49 @@ describe("computePullRequestPollInterval", () => {
     },
     ...over,
   });
+
+  it("refreshes list rows slowly and rests closed or merged rows", () => {
+    expect(computePullRequestPollInterval(undefined, true)).toBe(30_000);
+    expect(computePullRequestPollInterval(ready(), true)).toBe(30_000);
+    for (const state of ["CLOSED", "MERGED"]) {
+      expect(computePullRequestPollInterval(ready({ pr: { ...ready().pr!, state } }), true)).toBe(
+        false,
+      );
+    }
+  });
+
+  it("does not poll for linked PRs before receiving metadata", () => {
+    expect(computeLinkedPullRequestPollInterval(undefined)).toBe(false);
+  });
+
+  it.each([
+    { states: [], selected: null, interval: false },
+    { states: ["MERGED", "closed"], selected: null, interval: false },
+    { states: [], selected: "MERGED", interval: false },
+    { states: ["OPEN"], selected: "CLOSED", interval: false },
+    { states: ["MERGED", "OPEN"], selected: null, interval: 30_000 },
+    { states: ["CLOSED", "UNKNOWN"], selected: null, interval: 30_000 },
+    { states: [null], selected: null, interval: 30_000 },
+    { states: [undefined], selected: null, interval: 30_000 },
+    { states: ["CLOSED"], selected: "UNKNOWN", interval: 30_000 },
+    { states: ["CLOSED", "OPEN"], selected: "MERGED", interval: 30_000 },
+  ])(
+    "linked polling for $states with selection $selected is $interval",
+    ({ states, selected, interval }) => {
+      const info = ready({
+        pr: selected ? { ...ready().pr!, url: "pr-0", state: selected } : null,
+        prs: states.map((state, index) => ({
+          url: `pr-${index}`,
+          host: "github.com",
+          repository: "org/repo",
+          number: index + 1,
+          relationship: "attached",
+          state,
+        })),
+      });
+      expect(computeLinkedPullRequestPollInterval(info)).toBe(interval);
+    },
+  );
 
   it("polls setup/availability states the user fixes outside the app", () => {
     // No info yet (initial error / transient failure with no cache).

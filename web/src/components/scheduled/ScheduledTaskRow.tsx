@@ -16,13 +16,16 @@
 
 import { useMemo, useState } from "react";
 import {
+  CirclePlayIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PencilIcon,
   PlayIcon,
   Trash2Icon,
-  ZapIcon,
 } from "lucide-react";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -56,6 +59,8 @@ export function ScheduledTaskRow({
   onDelete: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
+  const navigate = useNavigate();
+  const detailPageEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [menuOpen, setMenuOpen] = useState(false);
   const { trackClick } = useOmnigentAnalytics();
   const paused = task.state === "paused";
@@ -65,6 +70,40 @@ export function ScheduledTaskRow({
   // WHICH instant is next on the client.
   const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
   const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt, now), [task.nextRunAt, now]);
+
+  // Navigate to the task's detail page from the card BODY. The ⋯ menu (trigger
+  // + portalled content) stops propagation so opening / using it never also
+  // navigates. Rendered as a real <button> so keyboard (Enter/Space) and focus
+  // come for free; the ⋯ trigger is a sibling, not a descendant, so there's no
+  // nested-interactive-element (button-in-button) violation.
+  function handleNavigate() {
+    navigate(`/tasks/${task.id}`);
+  }
+
+  const body = (
+    <>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="truncate text-[15px] font-semibold">{task.name}</span>
+        {paused && (
+          <span
+            data-testid="task-paused-pill"
+            className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+          >
+            Paused
+          </span>
+        )}
+      </span>
+      <span className="truncate text-ui text-muted-foreground/80" data-testid="task-schedule-line">
+        {scheduleSummary}
+        {nextRun && (
+          <>
+            {" · "}
+            <span data-testid="task-next-run">Next run {nextRun}</span>
+          </>
+        )}
+      </span>
+    </>
+  );
 
   return (
     <div
@@ -84,31 +123,21 @@ export function ScheduledTaskRow({
         "group relative flex items-center gap-3 rounded-xl border border-border bg-card py-3 pr-12 pl-4 transition-colors hover:bg-muted/40",
       )}
     >
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-[15px] font-semibold">{task.name}</span>
-          {paused && (
-            <span
-              data-testid="task-paused-pill"
-              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-            >
-              Paused
-            </span>
-          )}
-        </span>
-        <span
-          className="truncate text-ui text-muted-foreground/80"
-          data-testid="task-schedule-line"
+      {/* Stretch the body's hit area across the card while keeping the menu
+          trigger above it. */}
+      {detailPageEnabled ? (
+        <button
+          type="button"
+          data-testid="task-row-open"
+          onClick={handleNavigate}
+          aria-label={`Open ${task.name}`}
+          className="flex min-w-0 flex-1 cursor-pointer flex-col text-left after:absolute after:inset-0 after:content-['']"
         >
-          {scheduleSummary}
-          {nextRun && (
-            <>
-              {" · "}
-              <span data-testid="task-next-run">Next run {nextRun}</span>
-            </>
-          )}
-        </span>
-      </div>
+          {body}
+        </button>
+      ) : (
+        <div className="flex min-w-0 flex-1 flex-col">{body}</div>
+      )}
 
       {/* Hover-revealed ellipsis menu, mirroring the sidebar conversation-row
           action button: absolute-positioned on the right, hidden until the row
@@ -123,8 +152,11 @@ export function ScheduledTaskRow({
             aria-label={`Actions for ${task.name}`}
             data-testid="task-row-menu"
             disabled={busy}
+            // Sit above the body's hit area; don't bubble into card navigation.
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
             className={cn(
-              "-translate-y-1/2 absolute top-1/2 right-3 transition-opacity",
+              "-translate-y-1/2 absolute top-1/2 right-3 z-10 transition-opacity",
               "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
               "md:aria-expanded:opacity-100",
             )}
@@ -132,7 +164,14 @@ export function ScheduledTaskRow({
             <MoreHorizontalIcon className="size-4" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
+        {/* The menu content portals to the body, so a click inside it can't
+            bubble to the card; guard anyway for the rare non-portalled path and
+            to keep item selection from triggering navigation. */}
+        <DropdownMenuContent
+          align="end"
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
           <DropdownMenuItem
             onSelect={() => {
               trackClick("tasks.scheduled.run_now", "button");
@@ -140,7 +179,7 @@ export function ScheduledTaskRow({
             }}
             data-testid="task-run-now"
           >
-            <ZapIcon className="size-4" />
+            <PlayIcon className="size-4" />
             Run now
           </DropdownMenuItem>
           <DropdownMenuItem
@@ -162,7 +201,7 @@ export function ScheduledTaskRow({
           >
             {paused ? (
               <>
-                <PlayIcon className="size-4" />
+                <CirclePlayIcon className="size-4" />
                 Resume
               </>
             ) : (
