@@ -280,7 +280,8 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "Code): 'default', 'auto', 'acceptEdits', 'plan', "
                                 "'dontAsk', or 'bypassPermissions'. Set null for the agent "
                                 "default. Required for approval review; resend the current "
-                                "value when it is unchanged."
+                                "value when it is unchanged. When switching to a harness "
+                                "without permission-mode support, send null."
                             ),
                         },
                         "max_cost_usd": {

@@ -736,6 +736,9 @@ def test_ask_on_scheduled_task_change_bounds_the_preview(
     assert reason.count("v" * 58) == 0
     assert "Settings: name=" in reason
     assert f"timezone=UTC, permission_mode=None, {expected}" in reason
+    settings = reason.split("Settings: ", 1)[1].split("\nFull automation instructions:", 1)[0]
+    # These known fields use at most 102 characters; extras have a 200-character budget.
+    assert len(settings) <= 302
 
 
 def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
