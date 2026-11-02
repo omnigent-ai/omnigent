@@ -205,8 +205,14 @@ def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(
     )
 
 
-def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:
-    """A forwarded idle edge cannot lose its resync to an in-flight OSC read."""
+@pytest.mark.parametrize(
+    ("operation", "transition"),
+    [("tick", "resync"), ("tick", "retire"), ("active", "retire"), ("blocked_on", "retire")],
+)
+def test_lifecycle_change_during_snapshot_read(
+    tmp_path: Path, monkeypatch, operation: str, transition: str
+) -> None:
+    """Reconnect survives an in-flight read; retirement prevents its publication."""
     path = tmp_path / "program-status.json"
     path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": "idle"}}))
     published: list[str] = []
@@ -227,7 +233,7 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     poller.tick()
     assert published == ["idle"]
 
-    path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": "working"}}))
+    _write_report(path, {"state": "blocked", "kind": "question", "message": "input needed"})
     entered = threading.Event()
     release = threading.Event()
     original_read = Path.read_text
@@ -241,14 +247,24 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(Path, "read_text", pause_read)
     with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(poller.tick)
+        pending = executor.submit(
+            lambda: poller.tick() if operation == "tick" else getattr(poller, operation)
+        )
         try:
             assert entered.wait(5), "poller did not reach the snapshot read"
-            poller.resync()
+            getattr(poller, transition)()
         finally:
             release.set()
-        pending.result(timeout=5)
+        result = pending.result(timeout=5)
 
+    if transition == "retire":
+        assert result is (False if operation == "active" else None)
+        poller.resync()
+        poller.tick()
+        assert poller.active is False
+        assert poller.blocked_on is None
+        assert published == ["idle"]
+        return
     assert published == ["idle", "running"]
     poller.tick()
     assert published == ["idle", "running", "running"]

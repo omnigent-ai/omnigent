@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { transform } from "lightningcss";
 import { type ComponentProps, createElement } from "react";
 import { createPortal } from "react-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -635,6 +636,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
     shell.setAttribute("data-android-native", "");
     document.body.appendChild(shell);
     shells.push(shell);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       createElement(
         TooltipProvider,
@@ -675,7 +677,12 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           onShowHiddenChange: () => {},
         }),
       ),
-      { container: shell },
+      {
+        container: shell,
+        // The panel reads session snapshots for its tab labels.
+        wrapper: ({ children }) =>
+          createElement(QueryClientProvider, { client: queryClient }, children),
+      },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');
     expect(rail, "the rail <aside> the CSS selector keys on is gone").not.toBeNull();

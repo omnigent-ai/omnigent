@@ -162,7 +162,7 @@ function CyclePreview({ section, hint }: { section: ComposerConfigSection; hint?
       <span role="status" className="sr-only">
         {section.header}: {selected?.label}
       </span>
-      <ComposerConfigSections models={section} />
+      <ComposerConfigSections models={section} browseModels={false} />
       {hint && (
         <div className="whitespace-normal px-2 py-1.5 text-xs text-muted-foreground">{hint}</div>
       )}
