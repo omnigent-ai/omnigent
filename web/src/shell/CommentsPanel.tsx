@@ -44,7 +44,8 @@ export interface CommentsPanelProps {
   onClickComment: (comment: Comment) => void;
   /** When false, "Address All" is disabled (no agent registered). */
   canAddress: boolean;
-  addressPending: boolean;
+  /** Ids an Address All in flight is sending; they and "Address All" wait for it. */
+  sendingCommentIds: string[];
   /**
    * When false, the add-comment form and all edit/delete buttons are hidden
    * (read-only access). When true, the add-comment form is shown, but the
@@ -81,7 +82,7 @@ export function CommentsPanel({
   onDeleteComment,
   onClickComment,
   canAddress,
-  addressPending,
+  sendingCommentIds,
   canEdit = true,
   pendingBodyRef,
   onCopyCommentLink,
@@ -184,7 +185,7 @@ export function CommentsPanel({
             variant="outline"
             size="xs"
             className="rounded-full px-3 gap-1.5"
-            disabled={!canAddress || comments.length === 0 || addressPending}
+            disabled={!canAddress || comments.length === 0 || sendingCommentIds.length > 0}
             onClick={onAddressAll}
           >
             <WandSparklesIcon className="size-3.5" />
@@ -289,15 +290,19 @@ export function CommentsPanel({
             <div className="space-y-2 p-3">
               {comments.map((c) => {
                 const isSelected = isSelectedComment(c);
+                const sending = sendingCommentIds.includes(c.id);
+                // The agent gets the body the server read, so a sending comment is frozen.
+                const modifiable = canModify(c) && !sending;
                 return (
                   <CommentCard
                     key={c.id}
                     comment={c}
                     isSelected={isSelected}
+                    sending={sending}
                     cardRef={isSelected ? selectedCardRef : undefined}
                     onClick={() => onClickComment(c)}
-                    onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
-                    onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
+                    onDelete={modifiable ? () => onDeleteComment(c.id) : undefined}
+                    onEdit={modifiable ? (newBody) => onEditComment(c.id, newBody) : undefined}
                     onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
                     now={currentTime}
                   />
@@ -340,6 +345,8 @@ export function CommentsPanel({
 interface CommentCardProps {
   comment: Comment;
   isSelected?: boolean;
+  /** An Address All in flight includes this comment. */
+  sending?: boolean;
   /** Set on the currently-selected card so the panel can scroll it into view. */
   cardRef?: RefObject<HTMLDivElement | null>;
   onClick?: () => void;
@@ -352,6 +359,7 @@ interface CommentCardProps {
 function CommentCard({
   comment: c,
   isSelected,
+  sending,
   cardRef,
   onClick,
   onEdit,
@@ -399,7 +407,9 @@ function CommentCard({
     if (!editing) setEditBody(c.body);
   }, [c.id, c.body, editing]);
 
-  const statusLabel = c.status === "addressed" ? "Sent" : null;
+  let statusLabel: string | null = null;
+  if (sending) statusLabel = "Sending…";
+  else if (c.status === "addressed") statusLabel = "Sent";
 
   function startEdit() {
     setEditBody(c.body);

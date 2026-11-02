@@ -1933,7 +1933,7 @@ function FileViewerBody({
               )
                 setActiveSelection(null);
             }}
-            addressPending={sender?.isPending ?? false}
+            sendingCommentIds={sender?.pendingCommentIds ?? []}
             canEdit={canEdit}
           />
         )}

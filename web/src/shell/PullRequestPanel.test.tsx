@@ -77,6 +77,7 @@ const state = vi.hoisted(() => ({
   storedFetches: 0,
   storesPrs: true,
   unlink: { mutate: vi.fn(), isPending: false, isError: false, error: null as Error | null },
+  setPref: { isPending: false, variables: undefined as { account?: string } | undefined },
   sandboxAsleep: false,
   // False once the session's host disconnects, which leaves cached live info without an error.
   serveable: undefined as boolean | undefined,
@@ -137,7 +138,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
         : { mutate: state.updateSessionPr, isPending: false, isError: false },
     useSetPullRequestPreference: () => ({
       mutate: () => {},
-      isPending: false,
+      ...state.setPref,
       isError: false,
       error: null,
     }),
@@ -305,6 +306,7 @@ beforeEach(() => {
   state.storedFetches = 0;
   state.storesPrs = true;
   state.unlink = { mutate: vi.fn(), isPending: false, isError: false, error: null };
+  state.setPref = { isPending: false, variables: undefined };
   state.sandboxAsleep = false;
   state.serveable = undefined;
   // Fire the observer callback immediately on observe so lazy sections mount.
@@ -631,6 +633,77 @@ describe("PullRequestPanel", () => {
       });
     });
     expect(screen.getByRole("link", { name: /PR 2/ })).toBeVisible();
+  });
+
+  it("dismisses the link form while linking and keeps a newer URL when an older link lands", async () => {
+    state.realPrHooks = true;
+    const one = "https://github.com/acme/app/pull/1";
+    const two = "https://github.com/acme/app/pull/2";
+    const three = "https://github.com/acme/app/pull/3";
+    const association = (url: string, number: number): PullRequestAssociation => ({
+      url,
+      number,
+      host: "github.com",
+      repository: "acme/app",
+      relationship: "attached",
+      title: `PR ${number}`,
+    });
+    state.stored.conv_1 = [association(one, 1)];
+    let attached = false;
+    const payload = (url: string) => ({
+      ...state.info!.data!,
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: attached ? [association(one, 1), association(two, 2)] : [association(one, 1)],
+      pr: { ...state.info!.data!.pr!, url, title: url === two ? "PR 2" : "PR 1" },
+    });
+    let respond: (response: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST")
+          return new Promise<Response>((resolve) => {
+            respond = resolve;
+          });
+        const request = new URL(String(input), "http://localhost");
+        return new Response(JSON.stringify(payload(request.searchParams.get("pr_url") ?? one)));
+      }),
+    );
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByRole("link", { name: /PR 1/ });
+    const openForm = () => user.click(screen.getByRole("button", { name: "Link a PR" }));
+    const urlInput = () => screen.getByRole("textbox", { name: "Pull request URL" });
+
+    await openForm();
+    await user.type(urlInput(), two);
+    await user.click(screen.getByRole("button", { name: "Link" }));
+    expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    expect(screen.getByText(`Linking ${two}…`)).toBeVisible();
+    await act(async () =>
+      respond(
+        new Response(JSON.stringify({ error: { message: "Not visible to this account" } }), {
+          status: 422,
+        }),
+      ),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      `Couldn’t link ${two}: Not visible to this account`,
+    );
+    await openForm();
+    expect(urlInput()).toHaveValue(two);
+
+    await user.click(screen.getByRole("button", { name: "Link" }));
+    await openForm();
+    await user.clear(urlInput());
+    await user.type(urlInput(), three);
+    expect(screen.getByRole("button", { name: "Link" })).toBeDisabled();
+    attached = true;
+    await act(async () => respond(new Response(JSON.stringify(payload(two)))));
+    await screen.findByRole("link", { name: /PR 2/ });
+    expect(screen.queryByText(`Linking ${two}…`)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(urlInput()).toHaveValue(three);
   });
 
   it.each([1, 2])(
@@ -1601,7 +1674,7 @@ describe("PullRequestPanel", () => {
     }
   });
 
-  it("names an extensible provider's account selector", () => {
+  it("names an extensible provider's account selector and shows a pending switch", () => {
     const info = state.info!.data!;
     info.repo = null;
     info.provider = "forge";
@@ -1629,8 +1702,13 @@ describe("PullRequestPanel", () => {
       line_counts: true,
       linked_pr_diff: true,
     };
-    renderPanel();
-    expect(screen.getByRole("combobox", { name: "Example Forge account" })).toBeInTheDocument();
+    const { rerender } = renderPanel();
+    const account = screen.getByRole("combobox", { name: "Example Forge account" });
+    expect(account).toHaveTextContent("personal");
+    state.setPref = { isPending: true, variables: { account: "work" } };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(account).toHaveTextContent("work");
+    expect(account).toBeDisabled();
   });
 
   it("hides the account selector when the provider can't switch accounts", () => {
@@ -2747,6 +2825,10 @@ describe("session PR selection", () => {
     await user.click(screen.getByRole("button", { name: "Actions for example/two #42" }));
     await user.click(screen.getByRole("menuitem", { name: "Unlink PR" }));
     expect(state.unlink.mutate).toHaveBeenCalledWith(two, expect.any(Object));
+    Object.assign(state.unlink, { isPending: true, variables: two });
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText(`Unlinking ${two}…`)).toBeVisible();
+    state.unlink.isPending = false;
 
     expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));

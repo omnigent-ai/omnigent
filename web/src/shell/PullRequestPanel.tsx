@@ -238,7 +238,10 @@ function GithubAccountSelector({
   const accounts = info.auth.accounts ?? [];
   if (!info.capabilities.account_switching || accounts.length <= 1) return null;
 
-  const selectedAccount = info.auth.selected_account ?? undefined;
+  // Show the choice being saved; it stays locked so saves can't land out of order.
+  const selectedAccount = setPref.isPending
+    ? setPref.variables.account
+    : (info.auth.selected_account ?? undefined);
 
   return (
     <div className="flex w-full max-w-xs flex-col items-center gap-2 pt-2">
@@ -1691,8 +1694,11 @@ export function PullRequestPanel({
           onSubmit={(event) => {
             event.preventDefault();
             if (linkNeedsHost) return;
+            // The status line below tracks the link; a failed URL stays for the next open.
+            const submittedUrl = url;
+            setLinking(false);
             update.mutate(
-              { url, action: "attach" },
+              { url: submittedUrl, action: "attach" },
               {
                 onSuccess: async (data) => {
                   if (storesPrs && data.prs) {
@@ -1707,8 +1713,7 @@ export function PullRequestPanel({
                     }));
                   }
                   changeSelection(data.selected_pr_url);
-                  setLinking(false);
-                  setUrl("");
+                  setUrl((current) => (current === submittedUrl ? "" : current));
                 },
               },
             );
@@ -1733,9 +1738,14 @@ export function PullRequestPanel({
           </Button>
         </form>
       )}
+      {update.isPending && (
+        <p role="status" className="mt-1 truncate text-ui text-muted-foreground">
+          Linking {update.variables.url}…
+        </p>
+      )}
       {update.isError && (
         <p role="alert" className="mt-1 text-ui text-destructive">
-          {update.error.message}
+          Couldn’t link {update.variables.url}: {update.error.message}
         </p>
       )}
     </>
@@ -1827,10 +1837,18 @@ export function PullRequestPanel({
           {refreshButton}
         </div>
       ) : null}
-      {showTrackingControls && (linking || update.isError) && (
+      {showTrackingControls && (linking || update.isPending || update.isError) && (
         <div className="shrink-0 border-b border-border p-2 [&>:first-child]:mt-0">
           {linkControls}
         </div>
+      )}
+      {unlink.isPending && (
+        <p
+          role="status"
+          className="shrink-0 truncate border-b border-border p-2 text-ui text-muted-foreground"
+        >
+          Unlinking {unlink.variables}…
+        </p>
       )}
       {unlink.isError && (
         <p role="alert" className="shrink-0 border-b border-border p-2 text-ui text-destructive">

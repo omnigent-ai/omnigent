@@ -11,6 +11,7 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 // `useOptionalCommentSender` in `CommentSenderContext.tsx`.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 
@@ -177,15 +178,27 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
         sent_comment_ids: string[];
       };
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       if (gridEnabled)
         void useChatStore
           .getState()
           .send(data.formatted_message, agentId, undefined, { pinnedConversationId: sessionId });
       else void useChatStore.getState().send(data.formatted_message, agentId);
-      void queryClient.invalidateQueries({
-        queryKey: ["comments", sessionId],
-      });
+      // Mark the sent comments addressed before Address All re-enables, so a
+      // stale, failed or slow refetch can't offer them again.
+      const queryKey = ["comments", sessionId];
+      await queryClient.cancelQueries({ queryKey });
+      const sent = new Set(data.sent_comment_ids);
+      queryClient.setQueriesData<Comment[]>({ queryKey }, (comments) =>
+        comments?.map((comment) =>
+          sent.has(comment.id) ? { ...comment, status: "addressed" } : comment,
+        ),
+      );
+      void queryClient.invalidateQueries({ queryKey });
+    },
+    // A toast, so the failure still shows after the file viewer closes.
+    onError: (error) => {
+      showToast(`Couldn't send comments to the agent: ${error.message}`, { duration: 0 });
     },
   });
 }

@@ -9,6 +9,7 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { showToast } from "@/components/ui/toast";
 import { useChatStore } from "@/store/chatStore";
 import {
   commentsQueryKey,
@@ -26,6 +27,7 @@ import {
 vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: vi.fn() },
 }));
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -42,6 +44,7 @@ const sendMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   sendMock.mockReset();
+  vi.mocked(showToast).mockReset();
   vi.mocked(useChatStore.getState).mockReturnValue({
     send: sendMock,
   } as unknown as ReturnType<typeof useChatStore.getState>);
@@ -300,14 +303,49 @@ describe("useSendCommentsToAgent", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 
-  it("throws on non-2xx and never dispatches to the agent", async () => {
+  it("reports a failure after the viewer closes and never dispatches to the agent", async () => {
     // A failed send must NOT call the chat store, or the user sees a
     // message dispatched while the comments stay unsent server-side.
-    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        respond = resolve;
+      }),
+    );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const { result } = renderSend(queryClient);
+    const { result, unmount } = renderSend(queryClient);
     result.current.mutate({ comment_ids: ["c1"] });
-    await waitFor(() => expect(result.current.isError).toBe(true));
+    unmount();
+    respond(mockResponse({}, { ok: false, status: 500 }));
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith("Couldn't send comments to the agent: 500 OK", {
+        duration: 0,
+      }),
+    );
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("marks the sent comments addressed even when the refetch fails", async () => {
+    // Address All re-enables on this list; drafts left in it would be sent twice.
+    const draft = (id: string) => makeComment({ id, path: "a.py" });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse([draft("c1"), draft("c2")]))
+      .mockResolvedValueOnce(mockResponse({ formatted_message: "msg", sent_comment_ids: ["c1"] }))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(
+      () => ({ list: useComments("conv_1"), send: useSendCommentsToAgent("conv_1", "ag_1") }),
+      { wrapper: wrapperWith(queryClient) },
+    );
+    await waitFor(() => expect(result.current.list.isSuccess).toBe(true));
+
+    result.current.send.mutate({ comment_ids: ["c1"] });
+    await waitFor(() => expect(result.current.list.isError).toBe(true));
+    expect(result.current.send.isSuccess).toBe(true);
+    expect(result.current.list.data?.map((comment) => comment.status)).toEqual([
+      "addressed",
+      "draft",
+    ]);
   });
 });

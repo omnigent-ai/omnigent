@@ -9,8 +9,8 @@ import { useSendCommentsToAgent } from "@/hooks/useComments";
 interface CommentSender {
   /** Fire the POST /comments/send mutation. */
   mutate: ReturnType<typeof useSendCommentsToAgent>["mutate"];
-  /** True while a `mutate` call is in flight. */
-  isPending: boolean;
+  /** Comment ids of the `mutate` call in flight; empty when idle. */
+  pendingCommentIds: string[];
 }
 
 const CommentSenderContext = createContext<CommentSender | null>(null);
@@ -57,9 +57,10 @@ function AgentBoundSenderProvider({
   children: ReactNode;
 }) {
   const mutation = useSendCommentsToAgent(sessionId, agentId);
+  const pendingCommentIds = mutation.isPending ? mutation.variables.comment_ids : undefined;
   const value = useMemo(
-    () => ({ mutate: mutation.mutate, isPending: mutation.isPending }),
-    [mutation.mutate, mutation.isPending],
+    () => ({ mutate: mutation.mutate, pendingCommentIds: pendingCommentIds ?? [] }),
+    [mutation.mutate, pendingCommentIds],
   );
   return <CommentSenderContext.Provider value={value}>{children}</CommentSenderContext.Provider>;
 }

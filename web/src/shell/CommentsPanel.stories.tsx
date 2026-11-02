@@ -75,7 +75,7 @@ const meta = {
     onClickComment: () => undefined,
     onCopyCommentLink: () => undefined,
     canAddress: true,
-    addressPending: false,
+    sendingCommentIds: [],
     canEdit: true,
     now,
   },

@@ -1053,7 +1053,7 @@ describe("FileViewer URL sync — comment param (write)", () => {
 describe("FileViewer addressed selection", () => {
   it("keeps the selected comment active while Address All moves it", () => {
     const mutate = vi.fn();
-    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, pendingCommentIds: [] });
     const comment = makeComment("c1");
     useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
 

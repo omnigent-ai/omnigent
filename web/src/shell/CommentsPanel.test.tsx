@@ -62,7 +62,7 @@ function renderPanel(
       onDeleteComment={vi.fn()}
       onClickComment={vi.fn()}
       canAddress={false}
-      addressPending={false}
+      sendingCommentIds={[]}
       onCopyCommentLink={onCopyCommentLink}
     />,
   );
@@ -165,7 +165,7 @@ function renderGated(opts: {
       onDeleteComment={opts.handlers?.onDeleteComment ?? vi.fn()}
       onClickComment={vi.fn()}
       canAddress={false}
-      addressPending={false}
+      sendingCommentIds={[]}
       canEdit={opts.canEdit}
       onCopyCommentLink={vi.fn()}
     />,
@@ -354,7 +354,7 @@ describe("CommentsPanel show more / less", () => {
           onDeleteComment={vi.fn()}
           onClickComment={vi.fn()}
           canAddress={false}
-          addressPending={false}
+          sendingCommentIds={[]}
         />,
       );
 
@@ -392,7 +392,7 @@ describe("CommentsPanel show more / less", () => {
           onDeleteComment={vi.fn()}
           onClickComment={vi.fn()}
           canAddress={false}
-          addressPending={false}
+          sendingCommentIds={[]}
         />,
       );
 
@@ -459,7 +459,7 @@ function panelWithSelection(
       onDeleteComment={vi.fn()}
       onClickComment={onClickComment}
       canAddress={false}
-      addressPending={false}
+      sendingCommentIds={[]}
     />
   );
 }
@@ -556,5 +556,38 @@ describe("CommentsPanel active-comment reveal", () => {
     fireEvent.click(screen.getByText("Comment c2"));
 
     expect(onClickComment).toHaveBeenCalledWith(addressed);
+  });
+});
+
+describe("CommentsPanel Address All in flight", () => {
+  it("freezes only the comments being sent until the send settles", () => {
+    const comments = [makeComment("c1"), makeComment("c2")];
+    const panel = (sendingCommentIds: string[]) => (
+      <CommentsPanel
+        comments={comments}
+        addressedComments={[]}
+        activeSelection={null}
+        onAddComment={vi.fn()}
+        onAddressAll={vi.fn()}
+        onEditComment={vi.fn()}
+        onDeleteComment={vi.fn()}
+        onClickComment={vi.fn()}
+        canAddress
+        sendingCommentIds={sendingCommentIds}
+      />
+    );
+    const { rerender } = render(panel(["c1"]));
+
+    expect(screen.getAllByText("Sending…")).toHaveLength(1);
+    expect(screen.getByText("Comment c1").closest(".rounded-lg")).toHaveTextContent("Sending…");
+    expect(screen.getByRole("button", { name: "Address All" })).toBeDisabled();
+    // The agent gets the body the server read, so only c2 stays editable.
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
+
+    rerender(panel([]));
+    expect(screen.queryByText("Sending…")).toBeNull();
+    expect(screen.getByRole("button", { name: "Address All" })).toBeEnabled();
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(2);
   });
 });
