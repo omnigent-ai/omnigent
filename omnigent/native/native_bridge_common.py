@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
 import logging
 import os
 import shutil
@@ -67,13 +68,13 @@ def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
 
 @contextmanager
 def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
-    """Prevent orphan cleanup while a runner prepares a bridge directory."""
+    """Exclude cleanup while preparing a bridge or updating its ownership."""
     with _bridge_dir_lock(bridge_dir):
         yield
 
 
 @contextmanager
-def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
+def try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
     """Try to exclude bridge preparation without ever blocking cleanup."""
     lock = _bridge_dir_lock(bridge_dir)
     try:
@@ -85,6 +86,16 @@ def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
         yield True
     finally:
         lock.release()
+
+
+def read_bridge_session_id(bridge_dir: Path) -> str | None:
+    """Read a Codex/Antigravity owner independently of other runtime fields."""
+    try:
+        raw = json.loads((bridge_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    session_id = raw.get("session_id") if isinstance(raw, dict) else None
+    return session_id if isinstance(session_id, str) and session_id else None
 
 
 def write_owner_pid_marker(bridge_dir: Path) -> None:
@@ -146,7 +157,7 @@ def prune_orphaned_dirs(
     for entry in bridge_root.iterdir():
         if not entry.is_dir() or entry.name == _LOCK_DIR_NAME:
             continue
-        with _try_bridge_dir_cleanup_lock(entry) as acquired:
+        with try_bridge_dir_cleanup_lock(entry) as acquired:
             if not acquired:
                 continue
             marker = entry / OWNER_PID_FILENAME
