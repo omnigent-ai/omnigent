@@ -23,6 +23,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app, native_controls
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
@@ -2544,6 +2545,26 @@ _PASSWORD_PANE_TAIL = (
             + _PASSWORD_PANE_TAIL,
             id="exited",
         ),
+        pytest.param(
+            "inject",
+            claude_native_bridge.ClaudeComposerNotCleared(
+                "A draft left in Claude Code's input box could not be cleared, so nothing "
+                "was sent. Open the terminal, clear the input box, then retry."
+            ),
+            "A draft is left in Claude Code's input box, so the switch was not sent. Open "
+            "the terminal, clear the input box, then switch models again.",
+            id="leftover-draft",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeInjectionCancelled(
+                "Claude Code message delivery was cancelled"
+            ),
+            "Claude Code did not accept the switch before the request timed out. It may "
+            "still be starting, or showing a prompt. Check the terminal, then switch models "
+            "again.",
+            id="cancelled-before-ready",
+        ),
     ],
 )
 async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
@@ -4087,3 +4108,54 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+class _DeadRegisteredTerminal:
+    """A terminal entry still registered after its pane died (never becomes ready)."""
+
+    async def is_alive(self) -> bool:
+        return False
+
+
+class _DeadRegisteredRegistry:
+    def get(self, *_args: Any) -> _DeadRegisteredTerminal:
+        return _DeadRegisteredTerminal()
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_reports_a_terminal_still_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch to a recreated terminal that never becomes ready is not sent.
+
+    The reply says the terminal is still starting and quotes its last line,
+    instead of a generic runner failure. Failure on main: the switch waits in the
+    prompt wait with the heal's budget already spent and answers the generic error.
+    """
+    typed: list[str] = []
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 1.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(
+        SessionResourceRegistry,
+        "terminal_registry",
+        property(lambda _self: _DeadRegisteredRegistry()),
+    )
+    monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _bridge_dir: False)
+    monkeypatch.setattr(
+        claude_native_bridge, "claude_pane_last_notice", lambda _bridge_dir: "Plugin dev mode"
+    )
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=lambda *_a, **_k: None,
+        inject=lambda *_a, **kwargs: typed.append(kwargs.get("command", "")),
+        status=lambda _bridge_dir: None,
+    )
+
+    assert typed == []
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"] == "claude_native_model_failed"
+    assert body["detail"].startswith("The Claude terminal is still starting")
+    assert body["detail"].endswith("Last terminal line: Plugin dev mode")

@@ -15827,3 +15827,32 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
             pytest.fail("delivery continued after a failed resize")
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
+
+
+def test_claude_pane_last_notice_returns_the_sanitized_last_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The not-ready reply quotes the pane's last visible line without escape codes.
+
+    Failure on main: the helper does not exist, so a not-ready model switch has
+    no pane line to name.
+    """
+    pane = "Welcome\n\n\x1b[1;31m! Plugin dev mode is active\x1b[0m\n   \n"
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_read_json_file",
+        lambda _path: {"socket_path": "/tmp/s", "tmux_target": "%1"},
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _socket, _target: pane)
+
+    assert claude_native_bridge.claude_pane_last_notice(tmp_path) == (
+        "! Plugin dev mode is active"
+    )
+
+
+def test_claude_pane_last_notice_is_empty_without_a_readable_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unadvertised or unreadable pane yields no notice rather than an error."""
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", lambda _path: None)
+    assert claude_native_bridge.claude_pane_last_notice(tmp_path) == ""
