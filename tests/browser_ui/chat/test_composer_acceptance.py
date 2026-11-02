@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from itertools import pairwise
 from pathlib import Path
 
@@ -209,22 +210,29 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     assert bounds["height"] == pytest.approx(expected_bar_height, abs=0.5)
     assert center_y == pytest.approx(bounds["y"] + expected_center_offset, abs=0.5)
     trailing = control_bounds[status_ids[-1]]
-    # The docked tray's content inset matches the card's shared inset
-    # (1px border + 12px padding).
+    # The context bar uses its compact content inset (1px computed border +
+    # 8px padding).
     assert trailing["x"] + trailing["width"] == pytest.approx(
-        bounds["x"] + bounds["width"] - 13, abs=0.5
+        bounds["x"] + bounds["width"] - 9, abs=0.5
     )
     background = control_bounds["background-task-pill"]
     subagent = control_bounds["subagent-task-pill"]
     context_ring = control_bounds["composer-context-ring"]
     assert background["x"] + background["width"] == pytest.approx(subagent["x"], abs=0.5)
     assert subagent["x"] + subagent["width"] + 4 == pytest.approx(context_ring["x"], abs=0.5)
-    # A label that would have to truncate collapses the whole bar to icons
-    # instead — the full value stays in the title — and a bar with room shows
-    # every label untruncated. Neither state may show an ellipsis.
+    # Labels collapse when they no longer fit. The PR's full identity remains
+    # available in its hover preview, or its title on touch devices.
     collapsed = bar.get_attribute("data-labels") == "collapsed"
     assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_number)
-    expect(pr_label).to_have_attribute("title", f"#{pr_number}")
+    if is_mobile:
+        expect(pr_label).to_have_attribute("title", f"#{pr_number}")
+    else:
+        assert pr_label.get_attribute("title") is None
+        pr_link.hover()
+        preview = page.get_by_test_id("composer-pr-preview")
+        expect(preview.get_by_text(f"example/repo #{pr_number}", exact=True)).to_be_visible()
+        page.mouse.move(0, 0, steps=10)
+        expect(preview).to_be_hidden()
     # The PR number stays visible and the context ring stays accessible; a
     # crowded bar collapses only the directory and branch text to their icons.
     expect(pr_label).to_be_visible()
@@ -364,3 +372,63 @@ def test_long_model_and_permission_remain_single_row(
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name=display_name, exact=True)).to_be_visible()
     assert all(results.values()), results
+
+
+def test_prompt_history_preserves_drafts_during_real_arrow_navigation(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Native caret movement stops at the draft's top; empty input can recall."""
+    chat = chat_session_contract
+    history = ["Explain the previous change.", "Summarize the latest change."]
+    history_key = f"omnigent:prompt-history:{chat.session_id}"
+    page.add_init_script(
+        f"localStorage.setItem({json.dumps(history_key)}, {json.dumps(json.dumps(history))})"
+    )
+    page.set_viewport_size({"width": 1100, "height": 900})
+    page.goto(chat.url)
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible()
+
+    draft = "Keep this unfinished thought while I move back through its wrapped lines. " * 8
+    composer.fill(draft)
+    positions = [composer.evaluate("element => element.selectionStart")]
+    for _ in range(30):
+        composer.press("ArrowUp")
+        expect(composer).to_have_value(draft)
+        positions.append(composer.evaluate("element => element.selectionStart"))
+        if positions[-1] == 0:
+            break
+    assert positions[-1] == 0, positions
+    assert len(set(positions)) >= 3, "The draft must wrap across multiple visual lines"
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(draft)
+    composer.press("X")
+    expect(composer).to_have_value(f"X{draft}")
+
+    composer.fill("")
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[-1])
+    assert composer.evaluate("element => element.selectionStart") == len(history[-1])
+    # The first Up traverses the recalled line; the next walks older history.
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[-1])
+    assert composer.evaluate("element => element.selectionStart") == 0
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[0])
+    composer.press("ArrowDown")
+    expect(composer).to_have_value(history[-1])
+    composer.press("ArrowDown")
+    expect(composer).to_have_value("")
+
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[-1])
+    composer.press("!")
+    edited = f"{history[-1]}!"
+    expect(composer).to_have_value(edited)
+    composer.press("ArrowDown")
+    expect(composer).to_have_value(edited)
+    composer.press("ArrowUp")
+    assert composer.evaluate("element => element.selectionStart") == 0
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(edited)
+    assert chat.event_posts == []

@@ -36,6 +36,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
+
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes seeded
 # files into the server process's cwd — the repo root (this file is
 # ``<repo>/tests/e2e_ui/comments/...``, so the repo root is ``parents[3]``).
@@ -142,10 +144,21 @@ def test_html_preview_add_comment(
     # (not inside the frame), so find it on the page.
     add_comment_btn = page.get_by_role("button", name="Add comment")
     expect(add_comment_btn).to_be_visible(timeout=10_000)
+    frame_width = preview.locator("body").evaluate("() => window.innerWidth")
     add_comment_btn.click()
 
     # CommentsPanel opens alongside the preview.
     expect(file_viewer.locator("span.font-semibold", has_text="Comments")).to_be_visible()
+    # The panel narrows the frame, which re-reports the still-visible selection;
+    # that must not bring back the dismissed floating button.
+    poll_until(
+        lambda: preview.locator("body").evaluate("() => window.innerWidth") != frame_width,
+        timeout_s=10,
+        interval_s=0.1,
+    )
+    # Outlast the frame's 150 ms selection debounce before checking the button stays gone.
+    page.wait_for_timeout(500)
+    expect(page.locator("[data-add-comment-btn]")).to_have_count(0)
     selection_text = preview.locator("body").evaluate("() => window.getSelection().toString()")
     assert selection_text == _ANCHOR_SENTENCE, "fresh draft selection should remain visible"
 
@@ -223,6 +236,7 @@ def test_html_comment_external_runtime_connects_under_strict_csp(
               selection: "omni:selection",
               commentClick: "omni:commentClick",
               selectionCleared: "omni:selectionCleared",
+              zoom: "omni:zoom",
             },
           }).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
           const iframe = document.createElement("iframe");

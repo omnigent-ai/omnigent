@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -48,6 +49,9 @@ class PiNativeExecutor(Executor):
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()
+        # Turns and live steering share one cached executor and yield while
+        # minting, so serialize refresh + enqueue to keep the inbox in arrival order.
+        self._enqueue_lock = asyncio.Lock()
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the Pi extension."""
@@ -70,8 +74,9 @@ class PiNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
-        self._refresh_auth_headers()
-        enqueue_user_message(self._bridge_dir, text)
+        async with self._enqueue_lock:
+            await asyncio.to_thread(self._refresh_auth_headers)
+            enqueue_user_message(self._bridge_dir, text)
         return True
 
     async def run_turn(
@@ -103,11 +108,12 @@ class PiNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Pi native turn had no user text to send")
             return
-        self._refresh_auth_headers()
         model = config.model if config is not None else None
-        if model:
-            enqueue_model_change(self._bridge_dir, model)
-        enqueue_user_message(self._bridge_dir, text)
+        async with self._enqueue_lock:
+            await asyncio.to_thread(self._refresh_auth_headers)
+            if model:
+                enqueue_model_change(self._bridge_dir, model)
+            enqueue_user_message(self._bridge_dir, text)
         yield TurnComplete(response=None)
 
     def _refresh_auth_headers(self) -> None:
@@ -122,7 +128,8 @@ class PiNativeExecutor(Executor):
         policy hooks already get via re-mint. Minting runs in-runner through
         the same factory those use. Best-effort: any failure (no factory in
         local/unauthenticated runs, transient SDK error) leaves the existing
-        headers in place rather than blocking the turn.
+        headers in place rather than blocking the turn. Minting is synchronous
+        and can run CLI auth, so async callers run this in a worker thread.
 
         ponytail: refreshes per turn, so a *single* turn running past ~1h
         still risks expiry mid-turn; add a background refresh task keyed to

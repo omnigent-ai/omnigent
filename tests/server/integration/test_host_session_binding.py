@@ -51,6 +51,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -158,7 +159,8 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     async def _respond_launched() -> None:
         """Respond to the launch frame from the host."""
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            # Binding writes finish before the launch frame; allow for CI database latency.
+            output = await comm.receive_output(timeout=10.0)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -884,6 +886,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     message_resp = await env.client.post(
@@ -1021,6 +1024,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     # Tail live progress at the layer the SSE endpoint reads it from.
@@ -1076,6 +1080,89 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     assert snapshot_after.status_code == 200, snapshot_after.text
     assert snapshot_after.json()["sandbox_status"] is None
     del tunnels
+
+
+async def test_managed_launch_action_required_reaches_snapshot_and_stream(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch that needs the user to act reports ``action_required`` with
+    what to do: the live stream and the snapshot carry those details until
+    the launch moves on.
+    """
+    from fastapi import HTTPException
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.managed_hosts import SandboxStageObserver
+
+    env = managed_session_env
+    details = "Refresh your dbcert on your laptop."
+    subscribed = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def _launch_needing_action(*, on_stage: SandboxStageObserver, **_: object) -> None:
+        """Stand in for a deployment's launch that finds the user has to act."""
+        await subscribed.wait()
+        # Details only belong to action_required; the publisher drops them elsewhere.
+        on_stage("provisioning", "Not shown for this stage.")
+        on_stage("action_required", details)
+        await finish.wait()
+        raise HTTPException(status_code=502, detail="managed sandbox launch failed: test over")
+
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.launch_managed_host", _launch_needing_action
+    )
+    agent = await create_test_agent(env.client, name="managed-action-required-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    reports: list[dict[str, Any]] = []
+
+    async def _tail_reports() -> None:
+        """Collect sandbox_status events after subscribing, through the first action_required."""
+        async for event in session_stream.subscribe(
+            session_id, ready_event={"type": "_test_subscribed"}
+        ):
+            if event.get("type") == "_test_subscribed":
+                subscribed.set()
+            elif event.get("type") == "session.sandbox_status":
+                reports.append(event)
+                if event["stage"] == "action_required":
+                    return
+
+    try:
+        await asyncio.wait_for(_tail_reports(), timeout=10.0)
+        snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["sandbox_status"] == {
+            "stage": "action_required",
+            "error": None,
+            "provider": "modal",
+            "details": details,
+        }
+    finally:
+        finish.set()
+    assert [(r["stage"], r["details"]) for r in reports] == [
+        ("provisioning", None),
+        ("action_required", details),
+    ]
+
+    # Let the stand-in launch settle as failed so no launch task outlives the test.
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while asyncio.get_running_loop().time() < deadline:
+        settled = await env.client.get(f"/v1/sessions/{session_id}")
+        if (settled.json()["sandbox_status"] or {}).get("stage") == "failed":
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the stand-in launch never settled as failed")
+    # Each report replaces the last, so the failure no longer carries the details.
+    assert settled.json()["sandbox_status"]["details"] is None
 
 
 async def test_subagent_session_reuses_managed_sandbox_runner(
@@ -1336,8 +1423,8 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     calls: list[str] = []
 
     def _finish_wake(**kwargs: object) -> None:
-        del kwargs
-        calls.append("wake")
+        # The wake gets the host's provider, which its seeded launch status names.
+        calls.append(f"wake {kwargs['provider']}")
         tracker.begin(conv.id)
         tracker.finish(conv.id)
 
@@ -1358,7 +1445,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
             conversation_store=conv_store,
         )
     assert exc.value.code == ErrorCode.WRONG_REPLICA
-    assert calls == ["wake"]
+    assert calls == ["wake islo"]
 
 
 async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_paused(
@@ -1494,7 +1581,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
 
     await sessions_module._run_managed_wake(
@@ -1564,7 +1651,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
@@ -1639,7 +1726,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
@@ -2040,6 +2127,47 @@ async def test_delete_reaped_managed_session_removes_durable_host(
     assert env.host_store.get_host(host.host_id) is None
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_capture"), [("?capture_logs=true", True), ("", False)]
+)
+async def test_delete_managed_session_forwards_capture_logs(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    expected_capture: bool,
+) -> None:
+    """``DELETE ?capture_logs=true`` asks managed teardown for the sandbox logs."""
+    from omnigent.server import managed_hosts
+
+    env = managed_session_env
+    host = env.host_store.register_managed_host(
+        host_id="3c4d5e6f7a8b49203a15c6d7e8f9a0b1",
+        name="managed-capture-delete",
+        user_id=RESERVED_USER_LOCAL,
+        token="managed-capture-delete-token",
+        provider="modal",
+        sandbox_id="sb-capture-delete",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    agent = await create_test_agent(env.client, name="managed-capture-delete-agent")
+    conversation = env.conv_store.create_conversation(
+        agent_id=agent["id"],
+        host_id=host.host_id,
+        workspace="/tmp/managed-capture-delete",
+    )
+    teardowns: list[bool] = []
+
+    async def record_teardown(*args: object, capture_logs: bool = False) -> None:
+        teardowns.append(capture_logs)
+
+    monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
+
+    response = await env.client.delete(f"/v1/sessions/{conversation.id}{query}")
+
+    assert response.status_code == 200, response.text
+    assert teardowns == [expected_capture]
+
+
 def _runner_exited_app(db_uri: str, tmp_path: Path) -> tuple[FastAPI, SqlAlchemyConversationStore]:
     """Build the full server app so ``host.runner_exited`` hits ``_on_runner_exited``.
 
@@ -2114,9 +2242,7 @@ async def test_runner_exited_logs_one_event_per_bound_session(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_crashed")
-    async with asyncio.timeout(5.0):
-        while len(_runner_exited_events(caplog)) < 2:
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: len(_runner_exited_events(caplog)) >= 2)
 
     events = _runner_exited_events(caplog)
     assert sorted(getattr(r, "session_id", None) for r in events) == sorted([parent.id, child.id])
@@ -2136,9 +2262,7 @@ async def test_runner_exited_without_bound_sessions_logs_sessionless_event(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_orphan")
-    async with asyncio.timeout(5.0):
-        while not _runner_exited_events(caplog):
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: _runner_exited_events(caplog))
     # Let any (incorrect) extra rows from the same frame land before counting.
     await asyncio.sleep(0.05)
 
@@ -2174,9 +2298,7 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     def _callback_failures() -> list[logging.LogRecord]:
         return [r for r in caplog.records if "on_runner_exited callback failed" in r.getMessage()]
 
-    async with asyncio.timeout(5.0):
-        while not _callback_failures():
-            await asyncio.sleep(0.01)
+    await poll_until_async(_callback_failures)
 
     events = _runner_exited_events(caplog)
     assert len(events) == 1
@@ -2343,7 +2465,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
 
     error = _persisted_task_error(conv_store, conv.id)
     assert error is not None
-    assert error["code"] == "runner_failed_to_start"
+    assert error["code"] == "runner_process_crash"
     decision = _disconnect_decisions(caplog, conv.id)[0]
     attributes = getattr(decision, "attributes", {})
     assert attributes["decision"] == "failed_mid_turn"

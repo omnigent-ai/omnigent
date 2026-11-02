@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Emits the integration-test harness matrix as `matrix=<json>` on $GITHUB_OUTPUT.
 #
-# Returns an EMPTY matrix ({"include":[]}) to skip: zero jobs, NO check-runs.
-# This is the whole reason for the indirection (mirrors e2e-shard-matrix.sh): a
-# job-level `if:` skip would instead leave one check-run with an unexpanded
-# `Integration (${{ matrix.name }})` name.
+# Returns {"include":[]} when skipped. The consuming job must guard this value
+# with a job-level `if:` before GitHub expands the matrix.
 #
 # Skips draft PRs and scopes without consumers in this suite.
 #

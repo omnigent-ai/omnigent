@@ -20,7 +20,7 @@ def test_host_cert_cache_rejects_unsupported_ca_key(tmp_path: Path) -> None:
     """Ed25519 CAs fail early because leaf signing uses SHA-256."""
     key = ed25519.Ed25519PrivateKey.generate()
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Unsupported CA")])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)

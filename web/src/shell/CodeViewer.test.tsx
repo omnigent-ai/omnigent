@@ -7,6 +7,8 @@ import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -23,12 +25,26 @@ vi.mock("@/components/ai-elements/code-block", () => ({
   // NotebookPreview renders notebook code cells through CodeBlockContent.
   CodeBlockContent: ({ code }: { code: string }) => <pre>{code}</pre>,
 }));
-vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null }));
+vi.mock("./MarkdownRichTextViewer", () => ({
+  MarkdownRichTextViewer: ({ isSettled }: { isSettled: boolean }) => (
+    <div data-testid="markdown-editor-stub" data-settled={String(isSettled)} />
+  ),
+}));
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: ({ largeMarkdown }: { largeMarkdown?: boolean }) => (
-    <div data-testid="monaco-editor-stub" data-large-markdown={String(!!largeMarkdown)} />
+  MonacoCodeEditor: ({
+    largeMarkdown,
+    isSettled,
+  }: {
+    largeMarkdown?: boolean;
+    isSettled: boolean;
+  }) => (
+    <div
+      data-testid="monaco-editor-stub"
+      data-large-markdown={String(!!largeMarkdown)}
+      data-settled={String(isSettled)}
+    />
   ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
@@ -102,28 +118,35 @@ const MINIMAL_NB = JSON.stringify({
   cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
 });
 
+interface ViewerOptions {
+  conversationId?: string;
+  viewMode?: "editor" | "preview" | "source" | "diff";
+  truncated?: boolean;
+  markdownSourceFallback?: boolean;
+  mediaActive?: boolean;
+  position?: { line: number; endLine?: number };
+  onRequestEditMode?: () => void;
+}
+
 function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: {
-    viewMode?: "editor" | "preview" | "source" | "diff";
-    truncated?: boolean;
-    markdownSourceFallback?: boolean;
-    mediaActive?: boolean;
-    position?: { line: number };
-    onRequestEditMode?: () => void;
-  } = {},
+  opts: ViewerOptions = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return render(viewerElement(content, panelOpen, path, opts));
+}
+
+function viewerElement(content: string, panelOpen: boolean, path: string, opts: ViewerOptions) {
+  return (
     <CodeViewer
       markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
-      conversationId="conv_1"
+      conversationId={opts.conversationId ?? "conv_1"}
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
       comments={[]}
@@ -136,7 +159,7 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+    />
   );
 }
 
@@ -818,6 +841,30 @@ describe("CodeViewer HTML preview sandbox", () => {
     // #777: every link opens in a new tab via the injected base tag.
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
+
+  it.each([
+    ["another file", "b.html", "conv_1"],
+    ["the same path in another conversation", "a.html", "conv_2"],
+  ])("opens %s at 100% zoom", async (_, nextPath, nextConversationId) => {
+    const html = "<html><head></head><body><p>report</p></body></html>";
+    const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
+    const { port, send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+    await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+
+    // The content stays loaded, as it does for a cached file.
+    rerender(
+      viewerElement(html, true, nextPath, {
+        viewMode: "preview",
+        conversationId: nextConversationId,
+      }),
+    );
+    expect(zoomBox().style.transform).toBe("");
+    port.close();
+  });
 });
 
 describe("CodeViewer rendered previews skip Shiki highlighting", () => {
@@ -1177,6 +1224,32 @@ describe("source line navigation", () => {
       HTMLElement.prototype.scrollIntoView = original;
     }
   });
+
+  it.each([
+    ["inside the file", 2, 4, ["two", "three", "four"]],
+    ["past the end of the file", 4, 99, ["four", "five"]],
+  ])(
+    "highlights every line of a cited range %s and centers its first line",
+    (_label, line, endLine, cited) => {
+      const scroll = vi.fn();
+      const original = HTMLElement.prototype.scrollIntoView;
+      HTMLElement.prototype.scrollIntoView = scroll;
+      try {
+        renderViewer("one\ntwo\nthree\nfour\nfive", true, "notes.md", {
+          position: { line, endLine },
+        });
+        const row = (text: string) =>
+          screen.getByText(text).closest("[data-line]")?.parentElement?.parentElement;
+        expect(scroll.mock.instances.at(-1)).toBe(row(cited[0]));
+        for (const text of ["one", "two", "three", "four", "five"]) {
+          if (cited.includes(text)) expect(row(text)).toHaveClass("bg-yellow-200/40");
+          else expect(row(text)).not.toHaveClass("bg-yellow-200/40");
+        }
+      } finally {
+        HTMLElement.prototype.scrollIntoView = original;
+      }
+    },
+  );
 });
 
 it.each([true, false])(
@@ -1207,5 +1280,82 @@ describe("large Markdown source fallback", () => {
     expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
     expect(highlightCode).not.toHaveBeenCalled();
     expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
+  });
+});
+
+describe("CodeViewer refresh failures", () => {
+  function renderQuery(fileQuery: ReturnType<typeof useFileContent>) {
+    return render(
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path="notes.md"
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("keeps the loaded file on screen when a refresh fails", () => {
+    const { container } = renderQuery({
+      ...makeFileQuery("still here"),
+      isError: true,
+      isRefetchError: true,
+      isSuccess: false,
+      error: new Error("502 Bad Gateway"),
+    } as unknown as ReturnType<typeof useFileContent>);
+    expect(container.textContent).toContain("still here");
+    expect(container.textContent).not.toContain("Error loading file");
+  });
+
+  it.each([
+    ["the rich editor", "notes.md", "editor" as const, "markdown-editor-stub"],
+    ["Monaco", "main.ts", "source" as const, "monaco-editor-stub"],
+  ])("lets %s switch to a file whose refresh is failing", (_editor, filePath, viewMode, stub) => {
+    // Without settling, the editor would keep the previous file's document
+    // while autosave targets this path.
+    render(
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path={filePath}
+        fileQuery={
+          {
+            ...makeFileQuery("cached"),
+            isError: true,
+            isRefetchError: true,
+            isSuccess: false,
+          } as unknown as ReturnType<typeof useFileContent>
+        }
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />,
+    );
+    expect(screen.getByTestId(stub)).toHaveAttribute("data-settled", "true");
+  });
+
+  it("shows the error when the file never loaded", () => {
+    const { container } = renderQuery({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      isLoadingError: true,
+      isSuccess: false,
+      error: new Error("404 Not Found"),
+    } as unknown as ReturnType<typeof useFileContent>);
+    expect(container.textContent).toContain("Error loading file: 404 Not Found");
   });
 });

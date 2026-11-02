@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -83,7 +83,7 @@ def test_scope_requests_and_bounded_automatic_pagination(
     expect(load_more).to_be_visible()
 
     # Five loaded pages must still cost one request per scope timer tick.
-    page.clock.pause_at(datetime.now(timezone.utc) + timedelta(seconds=5))
+    page.clock.pause_at(datetime.now(UTC) + timedelta(seconds=5))
     start_count = len(requests)
     for _ in range(3):
         page.clock.fast_forward(60_000)

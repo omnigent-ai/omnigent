@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { NativeModelOption } from "@/lib/types";
 
 import {
   compactModelTriggerLabel,
@@ -99,11 +100,9 @@ describe("catalog model labels", () => {
     expect(formatStatusModelLabel("provider/other", rows)).toBe("Selected model");
   });
 
-  it("does not fold catalog prefixes or conflate context variants", () => {
+  it("resolves catalog prefixes without conflating context variants", () => {
     const rows = [{ id: "opus", model: "claude-opus-4-8", displayName: "Opus" }];
-    expect(formatStatusModelLabel("system.ai.claude-opus-4-8", rows)).toBe(
-      "system.ai.claude-opus-4-8",
-    );
+    expect(formatStatusModelLabel("system.ai.claude-opus-4-8", rows)).toBe("Opus");
     expect(formatStatusModelLabel("claude-opus-4-8[1m]", rows)).toBe("claude-opus-4-8[1m]");
   });
 
@@ -113,6 +112,46 @@ describe("catalog model labels", () => {
     expect(formatStatusModelLabel(model, [{ id: model, displayName: "GPT-5.6 Luna" }])).toBe(
       "GPT-5.6 Luna",
     );
+  });
+
+  it.each([
+    ["gpt-6.1-sol", "system.ai.gpt-6-1-sol", "GPT-6.1-Sol"],
+    ["SYSTEM.AI.GPT-5-6-LUNA", "gpt-5.6-luna", "GPT-5.6 Luna"],
+    ["databricks-claude-sonnet-5", "claude-sonnet-5", "Sonnet 5"],
+    ["system.ai.glm-5-3", "glm-5.3", "GLM-5.3"],
+    ["GEMINI-2.5-PRO", "gemini-2.5-pro", "Gemini 2.5 Pro"],
+    ["QWEN3-CODER", "qwen3-coder", "Qwen3 Coder"],
+    ["provider/CUSTOM-MODEL", "provider/custom-model", "Team model"],
+  ])("uses the same catalog name for every spelling of %s", (reported, id, displayName) => {
+    const option = Object.freeze({ id, model: id, displayName });
+    expect(formatStatusModelLabel(reported, [option])).toBe(nativeModelLabel(option));
+    expect(formatStatusModelLabel(reported, [option])).toBe(displayName);
+    expect(option.id).toBe(id);
+  });
+
+  it("keeps both context variants distinct when resolving alternate spellings", () => {
+    const rows = [
+      { id: "opus", model: "claude-opus-4-8", displayName: "Opus 4.8" },
+      { id: "opus[1m]", model: "claude-opus-4-8[1m]", displayName: "Opus 4.8 (1M context)" },
+    ];
+    expect(formatStatusModelLabel("SYSTEM.AI.CLAUDE-OPUS-4-8[1M]", rows)).toBe(
+      "Opus 4.8 (1M context)",
+    );
+    expect(formatStatusModelLabel("SYSTEM.AI.CLAUDE-OPUS-4-8", rows.toReversed())).toBe("Opus 4.8");
+    expect(formatStatusModelLabel("provider-a/custom", [{ id: "provider-b/custom" }])).toBe(
+      "provider-a/custom",
+    );
+  });
+
+  it("resolves Cursor labels without crashing on null model IDs", () => {
+    const rows = [
+      { id: "auto", model: null, displayName: "Auto" },
+      { id: "claude-opus-4-8", model: null, displayName: "Claude Opus 4.8" },
+      { id: null, model: null, displayName: "Broken row" },
+    ] as unknown as NativeModelOption[];
+    expect(formatStatusModelLabel("default", rows)).toBe("default");
+    expect(formatStatusModelLabel("databricks-claude-opus-4-8", rows)).toBe("Claude Opus 4.8");
+    expect(formatStatusModelLabel("claude-opus-4-8[1m]", rows)).toBe("claude-opus-4-8[1m]");
   });
 
   it("names the exact model a row launches in its hover text", () => {

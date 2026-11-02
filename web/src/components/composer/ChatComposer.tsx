@@ -11,6 +11,7 @@ import {
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   isComposerAltNewlineKey,
@@ -231,28 +232,6 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
   }, [barRef]);
 }
 
-/**
- * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
- * sees it. The editing commands also keep it on the undo stack; the fallback
- * covers environments without them.
- */
-function insertComposerText(
-  textarea: HTMLTextAreaElement,
-  text: string,
-  start = textarea.selectionStart,
-  end = textarea.selectionEnd,
-) {
-  textarea.setSelectionRange(start, end);
-  const inserted =
-    typeof document.execCommand === "function" &&
-    (text || start === end
-      ? document.execCommand("insertText", false, text)
-      : document.execCommand("delete"));
-  if (inserted) return;
-  textarea.setRangeText(text, start, end, "end");
-  textarea.dispatchEvent(new Event("input", { bubbles: true }));
-}
-
 export function ComposerTextInput({
   input,
   keyboard,
@@ -357,12 +336,14 @@ export function ComposerInputArea({ className, ...props }: ComponentPropsWithout
  * One wrapping row of chips (attachment tiles, mention chips) on the shared
  * inset line. Chips are measured through their own boxes, so the row pads
  * rather than margins; the chip type picks its gap via ``className``.
+ * Past three tile rows the row scrolls, so many chips cannot push the input
+ * and Send off screen; ``-mt-1 pt-1`` keeps corner remove buttons unclipped.
  */
 export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
     <div
       className={cn(
-        "flex flex-wrap items-start gap-2 pb-2",
+        "-mt-1 flex max-h-[208px] flex-wrap items-start gap-2 overflow-y-auto pt-1 pb-2",
         COMPOSER_CONTENT_INSET_CLASS,
         className,
       )}
