@@ -8,8 +8,8 @@ It does not import settings, enable automatic client sync, or change launches.
 ## Enable an isolated server
 
 In the server configuration file, set `shared_preferences_authority_id` to a
-stable, nonempty identifier for this deployment. The CLI mounts the API only
-when that setting is present. Replicas sharing a database must use the same ID;
+stable, nonempty identifier for this deployment. `omnigent server` and the
+Docker image mount the API only when that setting is present. Replicas sharing a database must use the same ID;
 separate deployments must use different IDs. Keep the ID across restarts and
 URL changes. Existing stored state rejects an inconsistent authority.
 
