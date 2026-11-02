@@ -51,6 +51,29 @@ def test_model_probe_uses_configured_auth_helper(
         assert json.loads(args[args.index("--settings") + 1])["apiKeyHelper"] == helper
 
 
+@pytest.mark.parametrize("helper", [None, "printf test-token"])
+@pytest.mark.parametrize("stream_input", [True, False])
+def test_model_probe_disables_user_hooks_in_one_settings_argument(
+    monkeypatch: pytest.MonkeyPatch, helper: str | None, stream_input: bool
+) -> None:
+    """User SessionStart hooks would run for the headless probe and stall it past its timeout."""
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch", lambda command, args: (command, args)
+    )
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"CLAUDE_CODE_USE_GATEWAY": "1"}, api_key_helper=helper
+    )
+
+    _, args = claude_native._claude_model_probe_launch(config, stream_input=stream_input)
+
+    assert args.count("--settings") == 1
+    settings = json.loads(args[args.index("--settings") + 1])
+    expected: dict[str, object] = {"disableAllHooks": True}
+    if helper:
+        expected["apiKeyHelper"] = helper
+    assert settings == expected
+
+
 @pytest.mark.posix_only
 @pytest.mark.parametrize("previous_bare_catalog", [False, True], ids=["empty-store", "bare-cache"])
 async def test_catalog_runs_wrapper_bootstrap_before_discovery(
