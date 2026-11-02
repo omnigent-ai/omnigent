@@ -1,9 +1,16 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerWorkspaceStatus } from "./ComposerWorkspaceStatus";
 
-afterEach(cleanup);
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn() }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+
+afterEach(() => {
+  cleanup();
+  copyTextMock.mockReset();
+  vi.useRealTimers();
+});
 
 const base = {
   workspacePath: "/home/alice/repo",
@@ -16,18 +23,60 @@ const base = {
 };
 
 describe("ComposerWorkspaceStatus", () => {
-  it("renders the working directory and selected worktree as read-only secondary text", () => {
+  it("renders the working directory as a copy button and the worktree as read-only text", () => {
     render(<ComposerWorkspaceStatus {...base} />);
     const directory = screen.getByTestId("composer-workspace-dir");
     const worktree = screen.getByTestId("composer-git-branch");
     expect(directory).toHaveTextContent("repo");
     expect(worktree).toHaveTextContent("feature/login");
-    expect(directory).toHaveAccessibleName("Working directory: /home/alice/repo");
+    expect(directory).toHaveAccessibleName("Copy working directory: /home/alice/repo");
+    expect(directory).toHaveAttribute(
+      "title",
+      "Working directory: /home/alice/repo. Click to copy.",
+    );
     expect(worktree).toHaveAccessibleName("Worktree: feature/login");
-    expect(directory.tagName).toBe("SPAN");
+    expect(directory.tagName).toBe("BUTTON");
     expect(worktree.tagName).toBe("SPAN");
     expect(directory).toHaveClass("text-muted-foreground");
     expect(worktree).toHaveClass("text-muted-foreground");
+    expect(screen.getAllByRole("button")).toEqual([directory]);
+  });
+
+  it("copies the full working directory path and confirms in place", async () => {
+    vi.useFakeTimers();
+    copyTextMock.mockResolvedValue(undefined);
+    render(<ComposerWorkspaceStatus {...base} />);
+    const directory = screen.getByTestId("composer-workspace-dir");
+    await act(async () => {
+      fireEvent.click(directory);
+    });
+    expect(copyTextMock).toHaveBeenCalledWith("/home/alice/repo");
+    expect(directory).toHaveAttribute("title", "Copied: /home/alice/repo");
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(directory).toHaveAttribute(
+      "title",
+      "Working directory: /home/alice/repo. Click to copy.",
+    );
+  });
+
+  it("reports a failed copy on the chip", async () => {
+    copyTextMock.mockRejectedValue(new Error("Clipboard API not available"));
+    render(<ComposerWorkspaceStatus {...base} />);
+    const directory = screen.getByTestId("composer-workspace-dir");
+    await act(async () => {
+      fireEvent.click(directory);
+    });
+    expect(directory).toHaveAttribute("title", "Copy failed");
+    expect(directory).toHaveClass("text-destructive");
+  });
+
+  it("keeps an unbound working directory read-only", () => {
+    render(<ComposerWorkspaceStatus {...base} workspacePath={null} />);
+    const directory = screen.getByTestId("composer-workspace-dir");
+    expect(directory.tagName).toBe("SPAN");
+    expect(directory).toHaveAccessibleName("Working directory: Not selected");
     expect(screen.queryByRole("button")).toBeNull();
   });
 
