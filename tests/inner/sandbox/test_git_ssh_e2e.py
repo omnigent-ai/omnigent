@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import shlex
 import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,6 +14,7 @@ import omnigent.inner.terminal as terminal_module
 from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.terminal import create_terminal_instance
+from tests._helpers.polling import poll_until
 from tests.inner.sandbox.conftest import run_async
 
 
@@ -102,10 +102,12 @@ def test_git_ssh_clone_inside_sandboxed_terminal(
     instance = create_terminal_instance(name="git-ssh", session_key="test", spec=spec).instance
     try:
         run_async(instance.launch(cwd=workspace))
-        deadline = time.monotonic() + 30
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        assert marker.exists(), run_async(instance.read()).get("screen")
+        # Shell redirection creates the file before printf writes the result.
+        poll_until(
+            lambda: marker.exists() and marker.read_text() in {"success", "failure"},
+            timeout_s=30,
+            interval_s=0.1,
+        )
         assert marker.read_text() == "success", (
             detail.read_text() if detail.exists() else run_async(instance.read()).get("screen")
         )
