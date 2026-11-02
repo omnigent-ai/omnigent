@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
@@ -87,7 +87,7 @@ dependencies = [
     { name = "frozenlist" },
     { name = "multidict" },
     { name = "propcache" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
     { name = "yarl" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6c/4c/bdccd81e9ee225b69c60e7766c9a5b05364f118f4d383713b89a682d772d/aiohttp-3.14.5.tar.gz", hash = "sha256:5558a7f5a05af9ecf744af91e5baefc436f93c9333e656c27ec253f9a6bbe178", size = 8078052, upload-time = "2026-10-11T01:05:12.408Z" }
@@ -236,7 +236,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "frozenlist" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz", hash = "sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7", size = 25007, upload-time = "2025-07-03T22:54:43.528Z" }
 wheels = [
@@ -290,7 +290,7 @@ version = "4.14.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/cc/a381afa6efea9f496eff839d4a6a1aed3bfafc7b3ab4b0d1b243a12573dd/anyio-4.14.2.tar.gz", hash = "sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f", size = 260176, upload-time = "2026-07-12T20:29:07.082Z" }
 wheels = [
@@ -524,7 +524,7 @@ name = "build"
 version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "os_name == 'nt' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "os_name == 'nt'" },
     { name = "packaging" },
     { name = "pyproject-hooks" },
 ]
@@ -612,7 +612,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -955,7 +955,7 @@ name = "cryptography"
 version = "50.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bb/ad/5d6702db60b1e40b41ef513b6967ff5848f307d50f8449baf1634f5908f1/cryptography-50.0.1.tar.gz", hash = "sha256:5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20", size = 880381, upload-time = "2026-08-25T19:45:45.499Z" }
 wheels = [
@@ -1093,7 +1093,7 @@ version = "0.153.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-auth" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "requests" },
     { name = "urllib3" },
@@ -1106,7 +1106,7 @@ wheels = [
 [package.optional-dependencies]
 sandbox = [
     { name = "grpcio" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 
@@ -1250,7 +1250,7 @@ name = "docker"
 version = "7.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "requests" },
     { name = "urllib3" },
 ]
@@ -1288,7 +1288,7 @@ dependencies = [
     { name = "httpcore" },
     { name = "httpx" },
     { name = "packaging" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "python-dateutil" },
     { name = "rich" },
@@ -1524,8 +1524,8 @@ name = "gevent"
 version = "26.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "(platform_python_implementation == 'CPython' and sys_platform == 'win32') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "greenlet", marker = "platform_python_implementation == 'CPython' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "cffi", marker = "platform_python_implementation == 'CPython' and sys_platform == 'win32'" },
+    { name = "greenlet", marker = "platform_python_implementation == 'CPython'" },
     { name = "zope-event" },
     { name = "zope-interface" },
 ]
@@ -1772,7 +1772,7 @@ name = "googleapis-common-protos"
 version = "1.75.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b5/c8/f439cffde755cffa462bfbb156278fa6f9d09119719af9814b858fd4f81f/googleapis_common_protos-1.75.0.tar.gz", hash = "sha256:53a062ff3c32552fbd62c11fe23768b78e4ddf0494d5e5fd97d3f4689c75fbbd", size = 151035, upload-time = "2026-05-07T08:04:49.423Z" }
@@ -1994,7 +1994,7 @@ name = "gunicorn"
 version = "26.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "packaging", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "packaging" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6d/b7/a4a3f632f823e432ce6bc65f62961b7980c898c77f075a2f7118cb3846fe/gunicorn-26.0.0.tar.gz", hash = "sha256:ca9346f85e3a4aeeb64d491045c16b9a35647abd37ea15efe53080eb8b090baf", size = 727286, upload-time = "2026-05-05T06:38:25.529Z" }
 wheels = [
@@ -2417,9 +2417,9 @@ dependencies = [
     { name = "jaraco-classes" },
     { name = "jaraco-context" },
     { name = "jaraco-functools" },
-    { name = "jeepney", marker = "sys_platform == 'linux' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "pywin32-ctypes", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "secretstorage", marker = "sys_platform == 'linux' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "jeepney", marker = "sys_platform == 'linux'" },
+    { name = "pywin32-ctypes", marker = "sys_platform == 'win32'" },
+    { name = "secretstorage", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/4b/674af6ef2f97d56f0ab5153bf0bfa28ccb6c3ed4d1babf4305449668807b/keyring-25.7.0.tar.gz", hash = "sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b", size = 63516, upload-time = "2025-11-16T16:26:09.482Z" }
 wheels = [
@@ -2560,7 +2560,7 @@ dependencies = [
     { name = "pytest" },
     { name = "python-engineio" },
     { name = "python-socketio", extra = ["client"] },
-    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "pyzmq" },
     { name = "requests" },
     { name = "werkzeug" },
@@ -2724,12 +2724,12 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
-    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "sse-starlette" },
     { name = "starlette" },
     { name = "typing-extensions" },
     { name = "typing-inspection" },
-    { name = "uvicorn", marker = "sys_platform != 'emscripten' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ba/93/0142dc84a666daf8ad51a34268f34c12fd6fda4f3810c4be2504eecc8212/mcp-1.30.0.tar.gz", hash = "sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4", size = 680511, upload-time = "2026-09-07T14:34:15.845Z" }
 wheels = [
@@ -3223,7 +3223,7 @@ name = "obstore"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a3/8c/9ec984edd0f3b72226adfaa19b1c61b15823b35b52f311ca4af36d009d15/obstore-0.8.2.tar.gz", hash = "sha256:a467bc4e97169e2ba749981b4fd0936015428d9b8f3fb83a5528536b1b6f377f", size = 168852, upload-time = "2025-09-16T15:34:55.786Z" }
 wheels = [
@@ -3271,6 +3271,7 @@ wheels = [
 name = "omnigent"
 version = "0.21.0.dev0"
 source = { editable = "." }
+default-groups = []
 dependencies = [
     { name = "alembic" },
     { name = "anyio" },
@@ -3293,15 +3294,15 @@ dependencies = [
     { name = "openai-agents" },
     { name = "opentelemetry-api" },
     { name = "packaging" },
-    { name = "pexpect", marker = "sys_platform != 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pexpect", marker = "sys_platform != 'win32'" },
     { name = "pillow" },
     { name = "prompt-toolkit" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
-    { name = "pyte", marker = "sys_platform != 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pyte", marker = "sys_platform != 'win32'" },
     { name = "python-dateutil" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -3309,7 +3310,7 @@ dependencies = [
     { name = "starlette" },
     { name = "tiktoken" },
     { name = "tomlkit" },
-    { name = "tzdata", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
     { name = "zstandard" },
@@ -3435,7 +3436,7 @@ dev = [
     { name = "filelock" },
     { name = "grpcio-tools" },
     { name = "hindsight-client" },
-    { name = "moto", extra = ["s3"], marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "moto", extra = ["s3"], marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "nimble-python" },
     { name = "pre-commit" },
     { name = "pyrefly" },
@@ -3760,7 +3761,7 @@ dependencies = [
     { name = "googleapis-common-protos" },
     { name = "grpcio" },
     { name = "httpx" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 wheels = [
@@ -3988,7 +3989,7 @@ name = "opentelemetry-proto"
 version = "1.45.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4b/7f/15f014fb195da6c2dbb6c71399b8e76824878718e94de6454038488eed28/opentelemetry_proto-1.45.1.tar.gz", hash = "sha256:79e0fb95e4616691a469439238aa9224d75779b3e108e895d1aa125ab29ca77c", size = 46488, upload-time = "2026-10-06T17:33:11.49Z" }
@@ -4203,7 +4204,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "ptyprocess" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -4550,8 +4551,8 @@ name = "psycopg"
 version = "3.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "tzdata", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/db/2f/cb91e5502ec9de1de6f1b76cfbf69531932725361168bb06963620c77e2e/psycopg-3.3.4.tar.gz", hash = "sha256:e21207764952cff81b6b8bdacad9a3939f2793367fdac2987b3aac36a651b5bc", size = 165799, upload-time = "2026-05-01T23:31:55.179Z" }
 wheels = [
@@ -4560,7 +4561,7 @@ wheels = [
 
 [package.optional-dependencies]
 binary = [
-    { name = "psycopg-binary", marker = "implementation_name != 'pypy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "psycopg-binary", marker = "implementation_name != 'pypy'" },
 ]
 
 [[package]]
@@ -4915,7 +4916,7 @@ name = "pyte"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "wcwidth", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "wcwidth" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ab/ab/b599762933eba04de7dc5b31ae083112a6c9a9db15b01d3109ad797559d9/pyte-0.8.2.tar.gz", hash = "sha256:5af970e843fa96a97149d64e170c984721f20e52227a2f57f0a54207f08f083f", size = 92301, upload-time = "2023-11-12T09:33:43.217Z" }
 wheels = [
@@ -4927,7 +4928,7 @@ name = "pytest"
 version = "9.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -4944,7 +4945,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pytest" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/7c/d36d04db312ecf4298932ef77e6e4a9e8ad017906e24e34f0b0c361a2473/pytest_asyncio-1.4.0.tar.gz", hash = "sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42", size = 58514, upload-time = "2026-05-26T09:56:04.083Z" }
 wheels = [
@@ -5226,7 +5227,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "implementation_name == 'pypy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "cffi", marker = "implementation_name == 'pypy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
@@ -5271,7 +5272,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
     { name = "rpds-py" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/f5/df4e9027acead3ecc63e50fe1e36aca1523e1719559c499951bb4b53188f/referencing-0.37.0.tar.gz", hash = "sha256:44aefc3142c5b842538163acb373e24cce6632bd54bdb01b21ad5863489f50d8", size = 78036, upload-time = "2025-10-13T15:30:48.871Z" }
 wheels = [
@@ -5685,8 +5686,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
-    { name = "jeepney", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -5827,43 +5828,74 @@ wheels = [
 
 [[package]]
 name = "sqlalchemy"
-version = "2.0.50"
+version = "2.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/57/da/6fbf010c8ebb347679d0d100b22fe9ba5e13fd04046c5df7280d2f0bf706/sqlalchemy-2.0.50.tar.gz", hash = "sha256:af5607d11ef90fd6a5c0549fe0045dce1663d427426bcfb506dcb5346a85a3b9", size = 9907424, upload-time = "2026-05-24T19:20:04.018Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/08/bb/28e3106ee586e5b2f5ecf211eec1348055f0f926314b13fe23b9cffa9039/sqlalchemy-2.1.5.tar.gz", hash = "sha256:0df76cf1ca680ad745bd378a6299a058611a8a784eeaeb4ed78ad4a0b7ce2003", size = 10569593, upload-time = "2026-10-16T20:52:20.57Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/be/b0/a9d19b43f38f878b1278bca5b00b909f7540d41494396dd2561f9ad0956d/sqlalchemy-2.0.50-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:23ae23d8b9d344d30d0a92f06d45825024a5790f1c1dd4cf452636a50d3e58cb", size = 2159807, upload-time = "2026-05-24T19:27:53.086Z" },
-    { url = "https://files.pythonhosted.org/packages/f5/2c/191dd58a248fd2cfd4780fa82c375c505e4ad98c8b522fa69ec492130d77/sqlalchemy-2.0.50-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:47b71b933e7b4ebad407c8fdfd70d2c4f08b78b3238bb30eebdd6eb32ca51b89", size = 3343358, upload-time = "2026-05-24T20:09:29.279Z" },
-    { url = "https://files.pythonhosted.org/packages/8a/2b/514fce8a7df81cf5bad7ff7865de7ac0c5776a38cc043475c4703eb7fe8b/sqlalchemy-2.0.50-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:110fdac56ace278949f00de805edacbd6141e382d992f9ba28238b3a0827a600", size = 3357994, upload-time = "2026-05-24T20:17:13.495Z" },
-    { url = "https://files.pythonhosted.org/packages/35/a6/a0e283f5494f92b0d77e319ff77e437b1ffe4a051ba67c81d53234825475/sqlalchemy-2.0.50-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:0f5e4ac70e9e757f6b3e87c0491ff034442ecd8dfd36d041a50564c322dafc0e", size = 3289399, upload-time = "2026-05-24T20:09:32.239Z" },
-    { url = "https://files.pythonhosted.org/packages/b7/96/1b07325ba71752d6a028b77d07bed1483ad545f794e8b1dc89b3ba3b3c68/sqlalchemy-2.0.50-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:724f3dcbe53dd0151e3cb5e7ec4ba4c620bede579caacd16275dc35ce06e8615", size = 3321216, upload-time = "2026-05-24T20:17:15.581Z" },
-    { url = "https://files.pythonhosted.org/packages/ed/8e/bad6ed253e8a99edfc99af02f7173ec48a1d3ed1b9b35a1b8bc1700900cc/sqlalchemy-2.0.50-cp312-cp312-win32.whl", hash = "sha256:1208050441471d003b7c8cb4054fb084f185cf35ac3f0ea270803865bca9939a", size = 2119194, upload-time = "2026-05-24T19:50:04.943Z" },
-    { url = "https://files.pythonhosted.org/packages/b6/2d/314a6690dda4b9cfc571eab1a63cf6fe6e1470aa3759ccda6aa016ee0f5a/sqlalchemy-2.0.50-cp312-cp312-win_amd64.whl", hash = "sha256:9d1af51558029a156a70986b7df88f042b3d158d7c8d8fb5072912d4b32d89c7", size = 2146186, upload-time = "2026-05-24T19:50:06.74Z" },
-    { url = "https://files.pythonhosted.org/packages/0b/c4/c42356b527296e9862f67990efce31ef78b4cf69cd3f80873a528a060320/sqlalchemy-2.0.50-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:06a9210bdc5f4298cff0781087e2ff45683922252dacc452846373a58761f093", size = 2156697, upload-time = "2026-05-24T19:27:54.764Z" },
-    { url = "https://files.pythonhosted.org/packages/60/a1/b1a70e3c4365ac7fe9e347f3710f19b562c866fb96d45e3c891588789a7b/sqlalchemy-2.0.50-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8b53784972ade4f8174b9aa661f31a06f8a936d2cfdd602913ff3c6dd40ae873", size = 3284260, upload-time = "2026-05-24T20:09:34.195Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/4a/f3ac3caa19f263d57b0a47f8c91bbf56583dc2d3fc63acfbf644abb24fe0/sqlalchemy-2.0.50-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:31648fa14460537e768a7303b078e4344d208e0d23e06867c1f376a227ed82db", size = 3302280, upload-time = "2026-05-24T20:17:17.825Z" },
-    { url = "https://files.pythonhosted.org/packages/66/55/ccada3e3d62254587819749a0bc69f41173eb48a6e385d10e66d32a9c88e/sqlalchemy-2.0.50-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:03f4323c980ad0e918cc9e5369b015f759f4e534db5bbaf4dc36832c10d05064", size = 3231580, upload-time = "2026-05-24T20:09:36.406Z" },
-    { url = "https://files.pythonhosted.org/packages/05/f6/6809349130a2de0e109e7f00fd7d431da9565b9b2868b32ee684754f672b/sqlalchemy-2.0.50-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:2b9dcc43afef8ac157cd92fce96985d6b8b0cfbd3df4d666f66b4d55a75d202f", size = 3269375, upload-time = "2026-05-24T20:17:20.34Z" },
-    { url = "https://files.pythonhosted.org/packages/48/84/278a811ef4e07be9c89dc5cdd7be833268509a66a68c4897cf585e67428f/sqlalchemy-2.0.50-cp313-cp313-win32.whl", hash = "sha256:60922d6599065ddca2c6f376b9aa2f41a6b85a271725e0909490bbc50b1998a5", size = 2117229, upload-time = "2026-05-24T19:50:08.215Z" },
-    { url = "https://files.pythonhosted.org/packages/f6/1c/067cc6187ed32d2ec222fe6d2643acc1659a6d0659f8a7cbc5ad3ae83280/sqlalchemy-2.0.50-cp313-cp313-win_amd64.whl", hash = "sha256:287086e67275a212c4582d166a6fb03a65ccc5551d80866270ce0dd9f34eccd3", size = 2143126, upload-time = "2026-05-24T19:50:09.691Z" },
-    { url = "https://files.pythonhosted.org/packages/df/32/10ac51b4be7cdecd7e93d069251c86dfbf70b7adbd7c67b48ccea6c49e1c/sqlalchemy-2.0.50-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:c966932507a4d7d0a37314927dbfcd89720e3f37d2a1e3352e7ae7939fa8e8a0", size = 2158519, upload-time = "2026-05-24T19:27:56.472Z" },
-    { url = "https://files.pythonhosted.org/packages/5a/76/e703d2f7681d7d66c4c891af3f07c7ccf4c76ad7f18351de035b5eda007a/sqlalchemy-2.0.50-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:faffef4bcc20a1892e65e155293d99d60855bbbc79250ab712819cfd56a8e6bb", size = 3282063, upload-time = "2026-05-24T20:09:38.57Z" },
-    { url = "https://files.pythonhosted.org/packages/31/26/ef168b184a25701f9995e8fb7e503fafd7a99c1c77cda1bc1a26ea2ed486/sqlalchemy-2.0.50-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6c206aec519a2e7bd08abbfb33436e325fd22c632d9c21a9047e376ce241646e", size = 3287069, upload-time = "2026-05-24T20:17:21.942Z" },
-    { url = "https://files.pythonhosted.org/packages/c2/15/765acc2bc693bccc43ca4a95d5b69750da8aaf6db1b5c616536e087f8920/sqlalchemy-2.0.50-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:bef4ac756363227ef6402a75fee025a4bc690f92328e825868939b3b3a446a6d", size = 3230453, upload-time = "2026-05-24T20:09:40.398Z" },
-    { url = "https://files.pythonhosted.org/packages/63/61/08e03c3adbf5db0087a0b6816746fec8f3032fb2f7fc899a9bb9b2a48ce4/sqlalchemy-2.0.50-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:96fbee6b19c19cd1556c8bf9419447cf2ec149ffcab7ab64348c23e54ef8547f", size = 3252413, upload-time = "2026-05-24T20:17:24.067Z" },
-    { url = "https://files.pythonhosted.org/packages/03/0c/370a1f2db38436c615e10134c8a37de3688e74084792380695f3f5083860/sqlalchemy-2.0.50-cp314-cp314-win32.whl", hash = "sha256:8f00e3eb43ba30eb1b238ee03a8a62309486d1321eda3328bb611e0340033ad8", size = 2120063, upload-time = "2026-05-24T19:50:11.08Z" },
-    { url = "https://files.pythonhosted.org/packages/7f/a0/fe92bb9817863bc13ba093bda931979a26cc2ca69f8e8f26d07add3d7c6f/sqlalchemy-2.0.50-cp314-cp314-win_amd64.whl", hash = "sha256:15708c613cd5005b7dffe1f66ee6a63ee8f5e46799f71c70ebad74178c676a39", size = 2145830, upload-time = "2026-05-24T19:50:12.452Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/ff/e5640a98a0b2f491eb8fde10fb6c773621a2e44340de231fafcc9370f4a9/sqlalchemy-2.0.50-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:3699dac4be410e97049a1658e9480da9cde956594aa0f3aebc60b88f21c5ba70", size = 2178435, upload-time = "2026-05-24T19:42:58.889Z" },
-    { url = "https://files.pythonhosted.org/packages/b7/85/337116e186f1236375b5fb70c21cfac98e8e8ab0d3a47be838dc47a59e08/sqlalchemy-2.0.50-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f96233858e3df43932ac11589e22520da6e8aeb624b03fedfeebb0e8ea213086", size = 3566059, upload-time = "2026-05-24T20:01:20.848Z" },
-    { url = "https://files.pythonhosted.org/packages/96/34/bb0e190e161c3c2c24314a65add57218be14a4a9486886b7f5047c1ff7c8/sqlalchemy-2.0.50-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c4e70c46fad30c3bcc6a4708bc0130a3173e11a5b25f0ea4a9d8911b450f1f52", size = 3535366, upload-time = "2026-05-24T20:03:56.768Z" },
-    { url = "https://files.pythonhosted.org/packages/df/5a/a7f759f97e4fd499c5d4e4488c760d5a7fbecf3028b465a04274fcd52384/sqlalchemy-2.0.50-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:1918a3cf564d16d95bca7301005f41ab2ad50b07cd3b9da50d3ed986db148d6a", size = 3474879, upload-time = "2026-05-24T20:01:23.058Z" },
-    { url = "https://files.pythonhosted.org/packages/9d/d9/2907ea38eb60687d297bf9c39e5ee58053c87b57fe8a9cae97090cecbf10/sqlalchemy-2.0.50-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:b00098cdbdbd38c7be3d568b0c9c3122b8c0ec62b911b57cd5e6e0254d60a76d", size = 3486117, upload-time = "2026-05-24T20:03:59.052Z" },
-    { url = "https://files.pythonhosted.org/packages/f2/e3/5aa06f167559f8c0bdae487e297d23ba548150ab016a3418265d617a4985/sqlalchemy-2.0.50-cp314-cp314t-win32.whl", hash = "sha256:1fbd55a969d7ac44a98e3dec75016074f809fa08f871585ace58dde110d1bf3e", size = 2150823, upload-time = "2026-05-24T20:08:58.644Z" },
-    { url = "https://files.pythonhosted.org/packages/65/9b/112fb8f977582d7489d036e409e3723948bcf5320b3ac465f3c481bbe8f9/sqlalchemy-2.0.50-cp314-cp314t-win_amd64.whl", hash = "sha256:c5c3cdb753a9004183e1ccb634b41611654c989e61bc68617ce878e46d6f1e51", size = 2185794, upload-time = "2026-05-24T20:09:00.319Z" },
-    { url = "https://files.pythonhosted.org/packages/d0/10/f7220e9b784d295d241c86ed99aeb537f92afcd469a64861f2717e9bb077/sqlalchemy-2.0.50-py3-none-any.whl", hash = "sha256:92064363517a3ff8212b5a93b8c62876579d8dfd1ca5b561335f30152d884fa9", size = 1943861, upload-time = "2026-05-24T19:59:01.119Z" },
+    { url = "https://files.pythonhosted.org/packages/35/a5/286dc0a04b2f2052b15785784db16c39628d3d7424b25112a306bd0e1d43/sqlalchemy-2.1.5-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:3eb1907fc67aacc160276e7f61c1f71a7a38c10e84ff87b74d90cae0abd137bb", size = 2471746, upload-time = "2026-10-16T22:45:12.171Z" },
+    { url = "https://files.pythonhosted.org/packages/44/80/066b7dca8250d8a6135afe692b8a80bc5239c0a0344213ba847fc3f9a46b/sqlalchemy-2.1.5-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:22eeeb297ced15cd7571aca242aede6a59141dcc3282c29c987fbc83f05c823b", size = 4673470, upload-time = "2026-10-16T22:34:28.997Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/33/8be720a412d595fa061a9ddcff6b5340ae09d3317ba6a32207523eb239f3/sqlalchemy-2.1.5-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6eb2fc3c1e8d2498d944b6ff64d32a63a5c900a14892c200626e701e69187113", size = 4726119, upload-time = "2026-10-16T22:40:54.421Z" },
+    { url = "https://files.pythonhosted.org/packages/47/01/938538f2d7fa2e1ba62d07beaac3303c9ec0d21479e35320cbe5b0312ccc/sqlalchemy-2.1.5-cp312-cp312-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:a534a39a9247a17843d9f6e34a0877d1a2af870b273e53e1c453b3a65f93c28e", size = 4374608, upload-time = "2026-10-16T22:52:47.037Z" },
+    { url = "https://files.pythonhosted.org/packages/35/e4/b27d25f452994dc9acecb86f7984750c0f7891734fc1a50aee83483fd88e/sqlalchemy-2.1.5-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:3cc3292040c980e9f1a54b14da76cf938a6a04a27e8acf6cb7709e9c3a40935b", size = 4596779, upload-time = "2026-10-16T22:34:30.811Z" },
+    { url = "https://files.pythonhosted.org/packages/53/51/f2fae2a6bb734400aec41f3e625efcc03f1e43a26b852aa89206efce61a1/sqlalchemy-2.1.5-cp312-cp312-musllinux_1_2_riscv64.whl", hash = "sha256:ce8d3de4e0489671fa023dea3f769360df02b2df6e482a44f8fa4421dd41c0ae", size = 4367657, upload-time = "2026-10-16T22:52:49.12Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/22/05957d18ac378d20ee048010916d3c1931442bcbd0c1c21b18e0e868ab6f/sqlalchemy-2.1.5-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:143cea634f03f9a8009fdeaeab46808031ab05bf0c50ec0aa25da51c29bdeeb8", size = 4673278, upload-time = "2026-10-16T22:40:56.847Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/ea/266829855add33a99f1cb59d548e563e208aea514277d2f9650b454041dc/sqlalchemy-2.1.5-cp312-cp312-win32.whl", hash = "sha256:7133bd0ac969ba1a108508975e0c26229329cadaaa48844f0a038dafa610693b", size = 2381924, upload-time = "2026-10-16T22:33:41.207Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/1b/3f59712d0a7e08bf3a075df43b0a3d89de051728d829d6836f546c533012/sqlalchemy-2.1.5-cp312-cp312-win_amd64.whl", hash = "sha256:ee7267d7ffed80c370dfdd7ad1c741d0227f0e8054b83d00715fb99307bd330c", size = 2434617, upload-time = "2026-10-16T22:33:42.917Z" },
+    { url = "https://files.pythonhosted.org/packages/57/f6/31e94eb5403ca04d393805fe6df5470f48aabdbfb05437e93c2a7f8e3ebd/sqlalchemy-2.1.5-cp312-cp312-win_arm64.whl", hash = "sha256:b3732a60b01560c9efee3b9ea188dc12614b2642ffce4f8235c4fbf72dd40fe8", size = 2394015, upload-time = "2026-10-16T22:27:33.803Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/aa/f10fc142d2db255249107ee8b21bfbabc10b90f7fadf13c3cf898acc6179/sqlalchemy-2.1.5-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:dc1c86db97372e6bba18a7bcf0f6150dbdd808237f0f52802ef0bec676a94642", size = 2465792, upload-time = "2026-10-16T22:42:39.038Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/0d/d395e310e36b5bd39a121cd455504aa1e9111f419efaa88be6b814b4e54d/sqlalchemy-2.1.5-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6c229afac414d691d2f69a6f4e294ac5b5fd334c49da1f4fb86ab7f2a466271d", size = 4599703, upload-time = "2026-10-16T22:55:25.351Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/6d/04f4ffc5038571e712c4f88f20d7022091bafab082e85ea5b37a7e8270f1/sqlalchemy-2.1.5-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1cf433bcb77696cc915552d7f1e8d9117a5dae5aff9fceb06a69d74b3b3c2bd1", size = 4652645, upload-time = "2026-10-16T22:59:23.273Z" },
+    { url = "https://files.pythonhosted.org/packages/11/85/08bc336576755daf087e0888e44657f4f72b6676a99522e7a612f0c2481e/sqlalchemy-2.1.5-cp313-cp313-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:399d3e212cb557d5bd1ca6f79981e8c3f45c0f6be60b63a9ded790396a81af08", size = 4316833, upload-time = "2026-10-16T23:15:10.011Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/5c/476441255cc7afa25e8c75e5a61d3c5c3af7cf61c951ebed2ee9873ec4b1/sqlalchemy-2.1.5-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:6a51c56afdb880e9f83736a2e81c02dd002fe1c5ad68346a35d97a2e135b1568", size = 4523134, upload-time = "2026-10-16T22:55:27.374Z" },
+    { url = "https://files.pythonhosted.org/packages/63/ca/064e5e3ca7c8f256c8f9b5206eafd410a39226c2ab6fe7e8c1e70725e432/sqlalchemy-2.1.5-cp313-cp313-musllinux_1_2_riscv64.whl", hash = "sha256:17f8c68bd35bb76b2d9ef1097941fb783ef9ef6604c1d2a72c2e276430aeffca", size = 4318058, upload-time = "2026-10-16T23:15:12.139Z" },
+    { url = "https://files.pythonhosted.org/packages/90/8c/e38956834896e21038a67193f91b189b9a61555b92fac42368027d5a2524/sqlalchemy-2.1.5-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:59dbd7412531da0124df8667a244b5155773632e9bd79a5c2ead393b11b59de5", size = 4613916, upload-time = "2026-10-16T22:59:25.19Z" },
+    { url = "https://files.pythonhosted.org/packages/14/b3/5531eb9d10d4bd38bd7e6c505776ac73be259dc117c9f07a8c46db4e9a2b/sqlalchemy-2.1.5-cp313-cp313-win32.whl", hash = "sha256:3f566787cb3a6a25ad8c5170e90167d4e8ea103d412aa4ea95021a6df0b95964", size = 2379136, upload-time = "2026-10-16T22:48:37.111Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/f6/c48924aafae616d59a2eb0375feeaf4bc4356327a442bda3b9205861b543/sqlalchemy-2.1.5-cp313-cp313-win_amd64.whl", hash = "sha256:fb8dcd5e1cc12fdd4d490819ec7a56e8c02e86ca9087a472e28b422ff932bae0", size = 2429688, upload-time = "2026-10-16T22:48:39.038Z" },
+    { url = "https://files.pythonhosted.org/packages/51/84/0855a7d42b700b091af6f817c171c2ff97478b0d5143fe61963adbff9201/sqlalchemy-2.1.5-cp313-cp313-win_arm64.whl", hash = "sha256:65eece9d9494e46de1eb3d49eb438acfcecf059e7a92a2f3daf72ec26d371757", size = 2390320, upload-time = "2026-10-16T22:31:43.871Z" },
+    { url = "https://files.pythonhosted.org/packages/01/b0/59b26375cd618e861a9295d855b866ca85be654d20ed47e494e33c3bf26e/sqlalchemy-2.1.5-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:5541a110ac4bb6377c785aea1b8f0b4d6658ed0ca5061ed1115d0725062b026b", size = 2468925, upload-time = "2026-10-16T22:42:40.547Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/a1/01931ba38770f169ce70e4034b0dcf2c1a776fe7d8dde93a34b6355510b1/sqlalchemy-2.1.5-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f029b2f7114623c03f762596f313515a2358004c44eb18924a15940f2e27d30f", size = 4593220, upload-time = "2026-10-16T22:55:29.253Z" },
+    { url = "https://files.pythonhosted.org/packages/42/9e/fa478482503a69dfb3b0cb82f3f80fe3816026530dd34b5359e2acd9f30d/sqlalchemy-2.1.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cc44dcc80e89a006af415edffc7409b1f2976a4597065449c166987f95801ab4", size = 4622806, upload-time = "2026-10-16T22:59:27.153Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/01/357ff85423013de8316316752c36a6bd1b7f3830c30dc63754afe06ba589/sqlalchemy-2.1.5-cp314-cp314-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:72ddd7a8ec187d02de0ef316a15aaf381ddcc594958247b02a3dcdb4c42f0b02", size = 4316247, upload-time = "2026-10-16T23:15:14.27Z" },
+    { url = "https://files.pythonhosted.org/packages/43/53/88c5af325c81c929d0ed5b7ec15b087173bd3587d93366c5e336b9647267/sqlalchemy-2.1.5-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:f5173a6e60a15090f9e2348a8ca94cc13de72796c16733f3b62fbb22acba07b8", size = 4522522, upload-time = "2026-10-16T22:55:30.835Z" },
+    { url = "https://files.pythonhosted.org/packages/87/29/f6f01f121d5e590c568f405f78b8eb3edace446c114126fc428536446dd6/sqlalchemy-2.1.5-cp314-cp314-musllinux_1_2_riscv64.whl", hash = "sha256:09b10bd68223d57cce39c08947efae3f91ac40b552e07c7c869c3350a0fc4c23", size = 4317593, upload-time = "2026-10-16T23:15:16.397Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/6f/14863fc9aea433645851330242823b1879cdaac71c118f7c9366e7caf4da/sqlalchemy-2.1.5-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:ea4cb5022462d9f15e7b72a52c267385aa97ac224c8503ac63ba90c0067ad0d9", size = 4583207, upload-time = "2026-10-16T22:59:29.322Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/e9/6907fc009d9d06e8d03d6bf286df46e878ea2a85c839dcb65ef11ceb3a39/sqlalchemy-2.1.5-cp314-cp314-win32.whl", hash = "sha256:c3ffbe6c680c626403b7e9697d92465501078731b9e8863b1410826e66b950e1", size = 2386018, upload-time = "2026-10-16T22:48:40.692Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/d6/dea47b4b361c427d390edc10d73050e6d11d905c56ef26861ff5f94aa8fa/sqlalchemy-2.1.5-cp314-cp314-win_amd64.whl", hash = "sha256:061d089901319463a1160e4596191e355d2a9b4cce4852dac5adc301b085ac2f", size = 2436983, upload-time = "2026-10-16T22:48:42.2Z" },
+    { url = "https://files.pythonhosted.org/packages/be/28/305a91768a1ca0980c6ead455dcda5a2c1e616022901898e966ccf913ba9/sqlalchemy-2.1.5-cp314-cp314-win_arm64.whl", hash = "sha256:f5bc7fb93f1c17efefeb062bc4d2742ad1b71d56c36e6e2898a371ac6a56839a", size = 2401394, upload-time = "2026-10-16T22:31:45.275Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/6d/d4bab269d94ed1017950873643b5bd3eb271a5b8d5b0451250f0173f90fc/sqlalchemy-2.1.5-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:9bb993b1d0890a2da90589684c3d09de75df82c06aa8f7eda246c7cd0ea3e820", size = 2508315, upload-time = "2026-10-16T22:55:01.45Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/80/aeab72b51fceb71b1e1d62cabc6f51c9d8f20588165aa54e0d0d6cc77c05/sqlalchemy-2.1.5-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:df7e71ed051e4003e73484ef6547aacfb3a2322aac0c230d530c97e48e77b4d7", size = 4924848, upload-time = "2026-10-16T22:41:10.671Z" },
+    { url = "https://files.pythonhosted.org/packages/05/8b/7318ca0ae828fa1605dd4481f8eeecb5325a7ead6289c1206fb1ff1e2e1d/sqlalchemy-2.1.5-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c76d4cb9c76a6906563133449a76d9eae6c8529ca09484b8615ca604442b442e", size = 4835557, upload-time = "2026-10-16T23:06:18.482Z" },
+    { url = "https://files.pythonhosted.org/packages/35/17/7a5a196b0af72d65cbcd3a6fb7c4128693d039faf58a682ffe2d19329420/sqlalchemy-2.1.5-cp314-cp314t-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:59a56be2e4e972061f9d5c1d5b01763b8b2207b48b956fbb6879c7443f5817f7", size = 4513707, upload-time = "2026-10-16T23:28:18.969Z" },
+    { url = "https://files.pythonhosted.org/packages/91/50/ca323ed15fc06c73a7fd85a3a339749994c560c12312ee8a53abf0f9a7ec/sqlalchemy-2.1.5-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:bc1a61d7f42e71746b5a2e10e90a6b174b4add441b7b6cf14278f1e029b2b800", size = 4781127, upload-time = "2026-10-16T22:41:12.784Z" },
+    { url = "https://files.pythonhosted.org/packages/26/3d/c56a75d0a2f6af08f6bb28d0b69e129911a2fc52b24dbafd7a7e5ac5c1aa/sqlalchemy-2.1.5-cp314-cp314t-musllinux_1_2_riscv64.whl", hash = "sha256:740e96dfb99a615c8056070d3747efe8bce4c145e5953ccc9e4b004c139de0d2", size = 4513816, upload-time = "2026-10-16T23:28:21.378Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/dd/84e0cd627bbd3e35b5f033191a4f597e611ff96e424db36a444a8d6755cc/sqlalchemy-2.1.5-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:92a0bb0595331c8e40bc615a67cc7bca9b761487409d1bf46c598b6ba5c0754d", size = 4772462, upload-time = "2026-10-16T23:06:20.876Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/47/cf0a920fc40344f8a1806d661e7c702341aebd871e31e1d1d6e0fbc9d1e0/sqlalchemy-2.1.5-cp314-cp314t-win32.whl", hash = "sha256:11185c72b5372369166cb721537943f8e1e6e42a399e9bac19e02f3ee20592a4", size = 2444861, upload-time = "2026-10-16T22:51:51.169Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/1d/4c5dc7e30fe740a01df4ba5ab800be2d7674b87f042e4c21c7ca89b36f9d/sqlalchemy-2.1.5-cp314-cp314t-win_amd64.whl", hash = "sha256:5173207b8fe1ddfc1d451c420a2a9cbbd0734b4a19896b8080e3744497e1c20c", size = 2512497, upload-time = "2026-10-16T22:51:53.014Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/2f/d3e9bfb1faabea302b98ba8c9dd6252bc362c6afeabe28ffcc1eea8a6bd2/sqlalchemy-2.1.5-cp314-cp314t-win_arm64.whl", hash = "sha256:def2f117a6ec0a25202ee36a148bbcfad3d43e2f2bb2e698e6d4448c6db5cb19", size = 2430598, upload-time = "2026-10-16T22:32:54.554Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/7c/17f07378eea7ec2fac8ac60f99fe3c474ef5c19a3adede70ae9886eb82d7/sqlalchemy-2.1.5-cp315-cp315-macosx_11_0_arm64.whl", hash = "sha256:a0b80f91d9ed92be7a134278ea2e83a693c07d9986824ca51d859af9e57e18f5", size = 2468856, upload-time = "2026-10-16T22:27:43.754Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/c0/4fef29827b198937e09c40d0fa36b9738bd3914f0e5040927dfac8dfee21/sqlalchemy-2.1.5-cp315-cp315-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3033ddeeeb34c6c536622c07e932a20f8c9f58d6dd76e56595a76b55a25011ff", size = 4597018, upload-time = "2026-10-16T22:41:59.749Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/d8/37645f8445ac3774e18f8dc72e0fa0ac868e0dff0e987ff3bec644f55102/sqlalchemy-2.1.5-cp315-cp315-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f4d30723171d511ec16ac057872a38b9b395420c0aaf81b2f94dd7bf1345c5fe", size = 4632322, upload-time = "2026-10-16T22:44:53.83Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/c9/15466cd08a6c329acc4f730dff7041e84122456fe38c518c93a07d6d82ca/sqlalchemy-2.1.5-cp315-cp315-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:5cefa5badc13df1c9082bacdfa435c8eb6dcb9b32717f51d09d1e160a599646f", size = 4338381, upload-time = "2026-10-16T23:01:22.714Z" },
+    { url = "https://files.pythonhosted.org/packages/12/2b/a93b7c8f6886138dac91f66fccd3b42473c365408d9a4c1b69403cf206f8/sqlalchemy-2.1.5-cp315-cp315-musllinux_1_2_aarch64.whl", hash = "sha256:2549e503185897de1fc5ca7730d5daed0d27d0b26df4a059dcdd33ebe81b7b4b", size = 4525244, upload-time = "2026-10-16T22:42:01.631Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/47/d3926cacd194be073a2053a05470f20ed7da623f399e95213c1e497954fd/sqlalchemy-2.1.5-cp315-cp315-musllinux_1_2_riscv64.whl", hash = "sha256:5a6871ee159a943d874012de835d56d0544ee871a99dbae05bc053da315b2c23", size = 4337223, upload-time = "2026-10-16T23:01:24.702Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/a8/b15ab4712342a18fb3949c77687c24d3749e86079c9905cc2cbebbd44da3/sqlalchemy-2.1.5-cp315-cp315-musllinux_1_2_x86_64.whl", hash = "sha256:51e290080415325b66a94d20f6360e310606acb832f2bd677d4fcb95728e7ce1", size = 4594562, upload-time = "2026-10-16T22:44:55.661Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/ab/3b6ef6c77740d7fbf5a3eb45f95768fb809b0769bd21df81d5f8c002e5a5/sqlalchemy-2.1.5-cp315-cp315-win32.whl", hash = "sha256:c228084025a28aa038aef9b821d842508650fe12fe51f06e9cdaa4393be7812c", size = 2385770, upload-time = "2026-10-16T22:41:04.484Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/c1/0b3256bc11487b2846a26d58946caea0ed395fd500951a16fb82d31a20ff/sqlalchemy-2.1.5-cp315-cp315-win_amd64.whl", hash = "sha256:bc09dd22c3fc491a2df7d16ca4167de35573f40c2e82dd4d6ddae589a73e7032", size = 2437043, upload-time = "2026-10-16T22:41:06.12Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/a0/09eaa7897f6f745de16220b20c63660948a95716be90d2f405af08222e57/sqlalchemy-2.1.5-cp315-cp315-win_arm64.whl", hash = "sha256:375ef1bf78bc269a220963163d2580d5377898ed23a00bdd98a02d755421573d", size = 2401090, upload-time = "2026-10-16T22:28:58.035Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/c2/4c747dcc6fe329dd07ab57233f334eca19a3ff05934e0aba4f25a0977a67/sqlalchemy-2.1.5-cp315-cp315t-macosx_11_0_arm64.whl", hash = "sha256:7af1c92255cf8d50e87a808ce41096907332acdd09f285426a52f7c300e152db", size = 2504475, upload-time = "2026-10-16T22:55:02.946Z" },
+    { url = "https://files.pythonhosted.org/packages/07/f1/183446b1bc29484087ba7a6bb199a265c0559bf8ff201c1ee54bf1fe0936/sqlalchemy-2.1.5-cp315-cp315t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:85891e0828e76a77fe912995dbc3ee949099488ba0a2ab323535d2e767446b20", size = 4902197, upload-time = "2026-10-16T22:41:14.703Z" },
+    { url = "https://files.pythonhosted.org/packages/31/0b/b24baf343461eefdecc672df1ccbb14c8c64028a11625dabc97b0bb9791b/sqlalchemy-2.1.5-cp315-cp315t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a72e062d2d38826dd89231df692fb40f12d7d1b9d118be23bcc1cf93c6e31782", size = 4851871, upload-time = "2026-10-16T23:06:22.861Z" },
+    { url = "https://files.pythonhosted.org/packages/da/27/f688b34ea3d85b38e01b7463874f1f4b91619dfed4e6cac88c27caface73/sqlalchemy-2.1.5-cp315-cp315t-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:b79ee943e2e12246f873345762b83dbadd1fcfc3e832eab83272d672704dbdea", size = 4500095, upload-time = "2026-10-16T23:28:23.431Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/04/d8e13be8d0c25ba49244a9c24579ef61d5a6b57f98e55fbb173b7923ec3a/sqlalchemy-2.1.5-cp315-cp315t-musllinux_1_2_aarch64.whl", hash = "sha256:e9418d87b55c469c2f1328246d4533238cdc43134c695d6b9a6b7a87da49d463", size = 4757826, upload-time = "2026-10-16T22:41:16.465Z" },
+    { url = "https://files.pythonhosted.org/packages/86/2e/a0bd2ead949cc605ce3ad5d38e2fe84963b2aa7f89e8648c1bbad13a3679/sqlalchemy-2.1.5-cp315-cp315t-musllinux_1_2_riscv64.whl", hash = "sha256:898d86c22640fe52ffe02b4abc043a3c6754b4875837599e739be440966dffa1", size = 4499377, upload-time = "2026-10-16T23:28:25.203Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/dd/c1ca0713a1a7d8d6eb5864edd2d11d7a6a327aaba664645733cb53662425/sqlalchemy-2.1.5-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:b3ad20cd035392f2b91a6466e24643990c1378beda80c9bda87a3a41e841e838", size = 4777264, upload-time = "2026-10-16T23:06:25.203Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/dc/9dec72cea689f16bc8ecfcd62b4aa2796009a7cef6be85a9f70310ecf71b/sqlalchemy-2.1.5-cp315-cp315t-win32.whl", hash = "sha256:db34eefaf992c84460ab26ecf2fc2bdcc68965d6becfae8182cae0efeaa3e8f8", size = 2441666, upload-time = "2026-10-16T22:51:54.58Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/28/f44c4524ce8a68935bd6f23ee801165072fb8c1e477fc9855efd9eaa2360/sqlalchemy-2.1.5-cp315-cp315t-win_amd64.whl", hash = "sha256:173054351d863ddada188284e309e87a9f030132c8d534e05458971ff061aa1e", size = 2507526, upload-time = "2026-10-16T22:51:56.262Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/fc/e90c91f6c2709a431f9b75e41bd31216337859411359f4a4fc2615c989e3/sqlalchemy-2.1.5-cp315-cp315t-win_arm64.whl", hash = "sha256:22c8d0873168a54f614e381559ea83d547b2cc5488b95b049bdc92667586bd5f", size = 2426204, upload-time = "2026-10-16T22:32:56.011Z" },
+    { url = "https://files.pythonhosted.org/packages/de/e9/61176e4753f74ab5f6e72a56314ee654d25c31e6fc98c99060442998cccb/sqlalchemy-2.1.5-py3-none-any.whl", hash = "sha256:2f77b77b716f005b2dc3cc059d56df6a919bfb5b439e4149890a9df6c36be9e3", size = 2060214, upload-time = "2026-10-16T22:43:30.801Z" },
 ]
 
 [[package]]
@@ -5882,14 +5914,14 @@ wheels = [
 
 [[package]]
 name = "sqlalchemy-cockroachdb"
-version = "2.0.4"
+version = "2.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c0/46/1462dd4734c58e04b754db71a9607de6d748dedea86e30007b5ae7b4e3db/sqlalchemy_cockroachdb-2.0.4.tar.gz", hash = "sha256:f66354d2b93da89cb4524c5b78a44d0cf5a8943d328b7f0aee4aa1dfc6178b65", size = 31803, upload-time = "2026-04-23T18:12:28.147Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/32/02/2e2e6a0b47259f3c61f3a062653070302eea81f0ae9a57cd3ab7f1dc110e/sqlalchemy_cockroachdb-2.0.3.tar.gz", hash = "sha256:48b763ffd8b2a4dc9d56459934a56d7d5ffad415c6e68d114baee5d12cf79c1d", size = 28539, upload-time = "2025-06-11T00:34:53.619Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f2/f1/e08ec3fc57b6f890e8f6eb16734c4865626635f4863cc2fe7d259699ce7b/sqlalchemy_cockroachdb-2.0.4-py3-none-any.whl", hash = "sha256:0804306a733a1fe09b2d496eadf8bf35d878862b6138e69175136fa2ca0ce5d0", size = 22726, upload-time = "2026-04-23T18:12:26.936Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/61/ae638b8adaea4bcb5092b7fedad14d53ef2bef2b75877503019ddf06cd89/sqlalchemy_cockroachdb-2.0.3-py3-none-any.whl", hash = "sha256:cd1dca9a8c65ec8564c928ea26d154b7fc02f82948af200d965343894ca0c0f5", size = 22134, upload-time = "2025-06-11T00:34:52.736Z" },
 ]
 
 [[package]]
@@ -5920,7 +5952,7 @@ version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/e3/7c1dc7381d9f8ab7d854328ebfa884e62cb3f3d8549ddfd37c7814f42afa/starlette-1.3.1.tar.gz", hash = "sha256:05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0", size = 2703240, upload-time = "2026-06-12T09:23:11.602Z" }
 wheels = [
@@ -6120,7 +6152,7 @@ name = "tqdm"
 version = "4.68.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/b3/36c8ecf72e8925200671613332db156d84b99b3aee742a41c1938ebb0808/tqdm-4.68.1.tar.gz", hash = "sha256:fc163d96b287bd031e1aa24421ce4411b25559bd0a1be4fe649bdaa4d2c02bf5", size = 171236, upload-time = "2026-06-05T17:23:15.267Z" }
 wheels = [
@@ -6211,11 +6243,11 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "httptools" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "uvloop", marker = "(platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
     { name = "watchfiles" },
     { name = "websockets" },
 ]
