@@ -516,6 +516,7 @@ function pullRequestInfoQueryOptions(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
     refetchInterval: options?.poll
       ? (query) => {
           const info = query.state.data;
@@ -653,6 +654,7 @@ export function usePullRequestChangedFiles(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -740,6 +742,7 @@ export function usePullRequestDiff(
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+    gcTime: 30 * 60_000,
   });
 }
 

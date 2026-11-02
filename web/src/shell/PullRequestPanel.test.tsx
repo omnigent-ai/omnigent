@@ -387,6 +387,71 @@ afterEach(() => {
 });
 
 describe("PullRequestPanel", () => {
+  it.each([false, true])(
+    "restores cached PR details after session switches and remounts (mobile=%s)",
+    async (mobile) => {
+      state.realPrHooks = true;
+      const url = state.info!.data!.pr!.url;
+      const payload = {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "acme/app",
+            number: 6000,
+            relationship: "attached",
+          },
+        ],
+      };
+      let refreshing = false;
+      const fetchMock = vi.fn(() =>
+        refreshing
+          ? new Promise<Response>(() => {})
+          : Promise.resolve(new Response(JSON.stringify(payload))),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const user = userEvent.setup();
+      const { client, rerender } = renderPanel(mobile);
+      await user.click(
+        await screen.findByRole("button", { name: "acme/app #6000 — chore: dummy PR" }),
+      );
+      await user.click(await screen.findByRole("tab", { name: "Comments" }));
+      // A subsequent poll replaces the original response in the shared cache.
+      payload.pr = { ...payload.pr!, title: "Updated by polling" };
+      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      expect(await screen.findByText("Updated by polling")).toBeVisible();
+
+      rerender(<PullRequestPanel conversationId="conv_other" />);
+      expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+      fetchMock.mockClear();
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Updated by polling")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // Even a stale response remains visible while the return refresh is pending.
+      rerender(<div />);
+      await act(() =>
+        client.invalidateQueries({ queryKey: ["github-info", "conv_1"], refetchType: "none" }),
+      );
+      refreshing = true;
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Updated by polling")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByText("Loading pull requests…")).toBeNull();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    },
+  );
+
   it.each(["UNKNOWN", "BLOCKED", "error"])(
     "keeps compact confirmation and pending refusal through a polling transition: %s",
     async (transition) => {
