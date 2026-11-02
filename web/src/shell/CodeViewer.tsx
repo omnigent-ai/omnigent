@@ -505,6 +505,8 @@ export interface CodeViewerProps {
   viewMode: "editor" | "preview" | "source" | "diff";
   /** FileViewer keeps this choice stable across autosaves for the current file. */
   markdownSourceFallback: boolean;
+  /** Soft-wrap long lines in the Monaco editor; the Shiki source view always wraps. */
+  wrapLines?: boolean;
   onDirtyChange?: (isDirty: boolean) => void;
   /**
    * Forwarded to the Monaco editor only — it reports its auto-save lifecycle so
@@ -543,6 +545,7 @@ export function CodeViewer({
   searchInputRef,
   viewMode,
   markdownSourceFallback,
+  wrapLines = false,
   onDirtyChange,
   onSaveStatusChange,
   pendingBodyRef,
@@ -970,6 +973,8 @@ export function CodeViewer({
   if (isHtmlPreview) {
     return (
       <HtmlCommentViewer
+        // A different file, or the same path in another conversation, starts at 100% zoom.
+        key={`${conversationId}:${path}`}
         conversationId={conversationId}
         content={content}
         truncated={truncated}
@@ -1021,6 +1026,7 @@ export function CodeViewer({
           isSettled={fileQuery.data !== undefined}
           truncated={truncated}
           largeMarkdown={markdownSourceFallback}
+          wrapLines={wrapLines}
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}

@@ -23,7 +23,8 @@ and the recording protocol for comparing revisions.
 ## How to get to it (user POV)
 
 - `files`: open a session's Workspace panel, select Files, then a Markdown file.
-- `changes`: select a changed Markdown file, then exit diff to edit it.
+- `changes`: select an existing changed Markdown file, then exit diff to edit it.
+  Deleted files stay in diff; select another file to continue editing.
 - `direct-link`: open a session URL with a selected Markdown file.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
   Source at that line, rather than the rich editor, and a range (`:12-18`,
@@ -243,8 +244,15 @@ instead of treating one comparison clip as complete feature verification.
 - Reference-style links (`[text][label]`, `[text][]`, `[text]`) save in that
   form while their URL, title and label still match a definition; otherwise
   they save inline. Link definition lines show read-only, like footnotes.
+- Saves write top-level blocks the user did not change from the file's source,
+  byte-for-byte; only edited blocks are re-serialized, so an edit inside a list
+  or table rewrites that whole list or table. Changed definitions, or a kept
+  block that would read differently beside its new neighbour (indented code
+  after a list, an unclosed fence), re-serialize the whole file, so an unrelated
+  block's syntax can still change after a deletion. An edited block is separated from
+  its neighbours by exactly one blank line. `web/src/shell/markdownSourceBlocks.ts`.
 - Load measurements do not establish typing latency. Dirty detection compares
-  immutable editor documents; autosave still serializes the whole document.
+  immutable editor documents; autosave writes edited blocks only.
   Changes that serialize identically become clean when autosave checks them.
 - Setext-heading detection uses a line scanner with marked 17 interruption
   rules. Compatibility tests compare it with upstream; remove the workaround
