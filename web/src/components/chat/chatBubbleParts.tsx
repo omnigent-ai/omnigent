@@ -950,7 +950,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-100 mobile-app:[@media(pointer:coarse)]:opacity-100">
+        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
           {ts && (
             <span
               className="select-none text-[11px] leading-4 text-foreground/56"
@@ -1124,13 +1124,15 @@ function AssistantBubble({
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
         className={cn(
-          "mobile-app:gap-1",
+          "mobile-app:gap-0",
           spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
         )}
       >
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
+            // The final code card has its own margin inside the custom pre wrapper.
+            "mobile-app:[&_.message-markdown>.chat-code-block:last-child>[data-streamdown=code-block]]:mb-0",
             (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
@@ -1166,7 +1168,7 @@ function AssistantBubble({
               "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
               actionsPersistent
                 ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-100 mobile-app:[@media(pointer:coarse)]:opacity-100",
+                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
             )}
           >
             <MessageActions>
