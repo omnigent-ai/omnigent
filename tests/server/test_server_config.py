@@ -8,6 +8,7 @@ for ``admins`` / ``allowed_domains``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -26,6 +27,7 @@ from omnigent.server.server_config import (
     branding_logo_asset,
     config_str_list,
     load_branding_snapshot,
+    load_picker_curation,
     load_server_config,
     resolve_config_path,
     session_title_instructions,
@@ -676,3 +678,86 @@ def test_filesystem_attachment_policy_reads_the_config_file(
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
 
     assert filesystem_attachment_policy().all_types
+
+
+# ── New Chat picker curation ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"restrict_to_agent_names": []},
+        {"restrict_to_agent_names": [""]},
+        # An operator clearing a key in place means "no curation", not "nothing".
+        {"restrict_to_agent_names": "  ", "default_agent_name": "  "},
+    ],
+    ids=["absent", "empty-list", "blank-name", "blank-values"],
+)
+def test_picker_curation_is_empty_without_config(config: dict[str, object]) -> None:
+    """Absent, empty or blank keys mean the full roster, which is every existing deployment."""
+    curation = load_picker_curation(config)
+
+    assert curation.restrict_to_agent_names == ()
+    assert curation.default_agent_name is None
+    assert curation.restricted is False
+    assert curation.config() == {"restrict_to_agent_names": [], "default_agent_name": None}
+
+
+def test_picker_curation_keeps_the_configured_order_and_drops_repeats() -> None:
+    """The order is the operator's: a deployment can put its own agent first."""
+    curation = load_picker_curation(
+        {"restrict_to_agent_names": ["polly", "debby", "polly"], "default_agent_name": "debby"}
+    )
+
+    assert curation.restrict_to_agent_names == ("polly", "debby")
+    assert curation.default_agent_name == "debby"
+    assert curation.restricted is True
+
+
+def test_picker_curation_accepts_a_single_name_without_a_list() -> None:
+    """One agent is the common case; requiring YAML list syntax for it is a trap."""
+    curation = load_picker_curation({"restrict_to_agent_names": "polly"})
+
+    assert curation.restrict_to_agent_names == ("polly",)
+
+
+@pytest.mark.parametrize("value", [42, {"polly": True}, True, [42], ["polly", 42]])
+def test_picker_restriction_of_the_wrong_type_is_ignored(
+    value: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fail open: a malformed value must not empty a deployment's picker."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.server_config"):
+        curation = load_picker_curation({"restrict_to_agent_names": value})
+
+    assert curation.restrict_to_agent_names == ()
+    assert "restrict_to_agent_names" in caplog.text
+
+
+def test_picker_default_of_the_wrong_type_is_ignored(caplog: pytest.LogCaptureFixture) -> None:
+    """Same for the default: ignore it rather than pre-selecting nonsense."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.server_config"):
+        curation = load_picker_curation({"default_agent_name": ["polly"]})
+
+    assert curation.default_agent_name is None
+    assert "default_agent_name" in caplog.text
+
+
+def test_a_default_outside_the_restriction_is_dropped(caplog: pytest.LogCaptureFixture) -> None:
+    """It could never be selected, so keeping it would pin a pick that cannot exist."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.server_config"):
+        curation = load_picker_curation(
+            {"restrict_to_agent_names": ["polly"], "default_agent_name": "debby"}
+        )
+
+    assert curation.restrict_to_agent_names == ("polly",)
+    assert curation.default_agent_name is None
+    assert "does not offer" in caplog.text
+
+
+def test_a_default_without_any_restriction_is_kept() -> None:
+    """Pre-selecting an agent does not imply hiding the others."""
+    curation = load_picker_curation({"default_agent_name": "polly"})
+
+    assert curation.restrict_to_agent_names == ()
+    assert curation.default_agent_name == "polly"

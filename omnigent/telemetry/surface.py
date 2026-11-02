@@ -2,6 +2,26 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+CLIENT_SURFACE_LABEL_KEY = "omnigent.client_surface"
+CLIENT_SURFACE_ENV_VAR = "OMNIGENT_CLIENT_SURFACE"
+CLIENT_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile", "cli"})
+
+
+def resolve_client_surface(
+    headers: Mapping[str, str], *, parent_labels: Mapping[str, str] | None = None
+) -> str:
+    """Identify the creating client; internal child requests inherit their parent's surface."""
+    surface = headers.get("x-omnigent-client")
+    if surface is not None and surface in CLIENT_SURFACES:
+        return surface
+    if parent_labels is not None:
+        inherited = parent_labels.get(CLIENT_SURFACE_LABEL_KEY)
+        if inherited is not None and inherited in CLIENT_SURFACES:
+            return inherited
+    return classify_surface(headers.get("user-agent"))
+
 
 def classify_surface(user_agent: str | None) -> str:
     """Return a surface label for the given User-Agent string.

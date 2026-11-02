@@ -860,13 +860,8 @@ jobs:
           pathlib.Path('/tmp/polly_review.txt').write_text(cleaned)
           "
 
-          # Use a collision-resistant random delimiter so model output
-          # containing "REVIEW_EOF" cannot truncate the output.
-          delim="REVIEW_$(openssl rand -hex 8)"
-          echo "review_text<<${delim}" >> "$GITHUB_OUTPUT"
-          # Cap at 60 KB — GitHub comment body limit is ~65 KB.
-          head -c 61440 /tmp/polly_review.txt >> "$GITHUB_OUTPUT"
-          echo "${delim}" >> "$GITHUB_OUTPUT"
+          # Later steps consume the review file; only readiness crosses step outputs.
+          echo "review_ready=true" >> "$GITHUB_OUTPUT"
 
       # Runs even though "Run Polly review" failed (hence !cancelled()), but
       # only for a capacity/overload failure — a genuine failure gets no note.
@@ -916,7 +911,7 @@ jobs:
 
       - name: Post review comment
         id: publish
-        if: steps.polly.outputs.review_text != ''
+        if: steps.polly.outputs.review_ready == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
