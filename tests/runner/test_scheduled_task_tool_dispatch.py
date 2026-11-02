@@ -369,11 +369,16 @@ async def test_calls_without_project_args_skip_the_capability_check() -> None:
     assert [url for _, url, _ in client.calls] == [f"/v1/scheduled-tasks/{_TASK_ID}"]
 
 
-@pytest.mark.parametrize("project_id", ["0123456789abcdef0123456789abcdef", None])
-def test_update_schema_accepts_a_project_id_or_null(project_id: str | None) -> None:
-    """A schema-validating client can move a task's project or clear it with null."""
+@pytest.mark.parametrize("field", ["project_id", "session_id"])
+@pytest.mark.parametrize("value", ["0123456789abcdef0123456789abcdef", None])
+def test_update_schema_accepts_an_id_or_null(field: str, value: str | None) -> None:
+    """A schema-validating client can set a task's project or session, or clear it with null.
+
+    Gemini rejects a list-valued ``type`` and fails every request that carries the tool.
+    """
     parameters = SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
-    jsonschema.validate({"scheduled_task_id": _TASK_ID, "project_id": project_id}, parameters)
+    assert not isinstance(parameters["properties"][field].get("type"), list)
+    jsonschema.validate({"scheduled_task_id": _TASK_ID, field: value}, parameters)
 
 
 @pytest.mark.asyncio

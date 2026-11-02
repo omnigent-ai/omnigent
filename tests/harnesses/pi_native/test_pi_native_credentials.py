@@ -325,6 +325,330 @@ def test_inline_databricks_gateway_respects_curated_tiers(
     assert [m["id"] for m in provider.extra_models] == ["system.ai.gpt-5", "system.ai.gpt-5-mini"]
 
 
+def _databricks_anthropic_gateway_config(**family_extra: object) -> dict[str, object]:
+    return {
+        "providers": {
+            "unity": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/anthropic",
+                    "api_key": "gw-token",
+                    "models": {"default": "system.ai.claude-opus-5", **family_extra},
+                },
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize("listing", ["curated", "unavailable"])
+def test_inline_databricks_gateway_keeps_gemini_off_the_anthropic_wire(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, listing: str
+) -> None:
+    """Gemini on an Anthropic-only gateway family runs on MLflow Chat, not Anthropic.
+
+    Gemini-3.x rejects Anthropic-format tool history without a thought signature,
+    so each tool-using turn after the first failed with ``400 (no body)``.
+    """
+
+    def _listing(host: str, token: str):
+        if listing == "curated":
+            raise AssertionError("a curated tier map must not trigger enumeration")
+        raise RuntimeError("403 from unity-catalog/model-services")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    tiers = {"fast": "system.ai.gemini-3-5-flash"} if listing == "curated" else {}
+
+    provider = creds.resolve_pi_native_provider(
+        model="system.ai.gemini-3-5-flash",
+        config_loader=lambda: _databricks_anthropic_gateway_config(**tiers),
+    )
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    launch = creds.pi_native_provider_launch(tmp_path, provider)
+    rendered = json.loads((tmp_path / "models.json").read_text())["providers"]
+    mlflow = rendered["omnigent-mlflow"]
+    assert mlflow["api"] == "openai-completions"
+    assert mlflow["baseUrl"] == "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1"
+    assert [m["id"] for m in mlflow["models"]] == ["system.ai.gemini-3-5-flash"]
+    expected_claude = ["system.ai.claude-opus-5"] if listing == "curated" else []
+    assert [m["id"] for m in rendered["omnigent"]["models"]] == expected_claude
+    assert launch.args[:4] == [
+        "--provider",
+        "omnigent-mlflow",
+        "--model",
+        "system.ai.gemini-3-5-flash",
+    ]
+    # The MLflow Chat adapter that carries Gemini's signatures is loaded for it.
+    assert "--extension" in launch.args
+    staged = json.loads((tmp_path / "omnigent_gateway_providers.json").read_text())
+    assert staged == ["omnigent-mlflow"]
+
+
+def _databricks_mlflow_gateway_config(**models: str) -> dict[str, object]:
+    return {
+        "providers": {
+            "unity": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "chat",
+                    "models": models,
+                },
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("config", "listing_path", "listing", "expected"),
+    [
+        pytest.param(
+            _databricks_anthropic_gateway_config(fast="system.ai.claude-haiku-5-5"),
+            "/ai-gateway/anthropic/v1/models",
+            [
+                "system.ai.claude-opus-5",
+                "system.ai.claude-sonnet-5-5",
+                "anthropic-aigw-12e8d1ee-system.ai.gpt-5-6-sol",
+            ],
+            {
+                "omnigent/system.ai.claude-opus-5",
+                "omnigent/system.ai.claude-haiku-5-5",
+                "omnigent/system.ai.claude-sonnet-5-5",
+            },
+            id="anthropic-family",
+        ),
+        pytest.param(
+            _databricks_anthropic_gateway_config(fast="system.ai.gemini-3-5-flash"),
+            "/ai-gateway/anthropic/v1/models",
+            [
+                "system.ai.claude-opus-5",
+                "system.ai.claude-sonnet-5-5",
+                "anthropic-aigw-12e8d1ee-system.ai.gpt-5-6-sol",
+            ],
+            {
+                "omnigent/system.ai.claude-opus-5",
+                "omnigent-mlflow/system.ai.gemini-3-5-flash",
+                "omnigent/system.ai.claude-sonnet-5-5",
+            },
+            id="anthropic-family-moved-gemini",
+        ),
+        pytest.param(
+            _databricks_openai_gateway_config(fast="system.ai.claude-haiku-5-5"),
+            "/ai-gateway/codex/v1/models",
+            ["system.ai.gpt-5", "system.ai.gpt-5-mini", "system.ai.claude-sonnet-5-5"],
+            {
+                "omnigent-openai/system.ai.gpt-5",
+                "omnigent/system.ai.claude-haiku-5-5",
+                "omnigent-openai/system.ai.gpt-5-mini",
+                "omnigent/system.ai.claude-sonnet-5-5",
+            },
+            id="responses-family-moved-claude",
+        ),
+        pytest.param(
+            _databricks_mlflow_gateway_config(
+                default="system.ai.gemini-3-5-flash", fast="system.ai.claude-haiku-5-5"
+            ),
+            "/ai-gateway/mlflow/v1/models",
+            ["system.ai.gemini-3-5-pro", "system.ai.claude-sonnet-5-5"],
+            {
+                "omnigent-mlflow/system.ai.gemini-3-5-flash",
+                "omnigent/system.ai.claude-haiku-5-5",
+                "omnigent-mlflow/system.ai.gemini-3-5-pro",
+                "omnigent/system.ai.claude-sonnet-5-5",
+            },
+            id="mlflow-family-moved-claude",
+        ),
+        # Every tier moves, so the listed Gemini row needs its own provider.
+        pytest.param(
+            _databricks_mlflow_gateway_config(
+                default="system.ai.claude-opus-5", fast="system.ai.claude-haiku-5-5"
+            ),
+            "/ai-gateway/mlflow/v1/models",
+            ["system.ai.gemini-3-5-pro", "system.ai.claude-sonnet-5-5"],
+            {
+                "omnigent/system.ai.claude-opus-5",
+                "omnigent/system.ai.claude-haiku-5-5",
+                "omnigent-mlflow/system.ai.gemini-3-5-pro",
+                "omnigent/system.ai.claude-sonnet-5-5",
+            },
+            id="mlflow-family-all-claude-tiers",
+        ),
+        # A failed listing still offers every configured tier on its own provider.
+        pytest.param(
+            _databricks_anthropic_gateway_config(fast="system.ai.gemini-3-5-flash"),
+            "/ai-gateway/anthropic/v1/models",
+            None,
+            {
+                "omnigent/system.ai.claude-opus-5",
+                "omnigent-mlflow/system.ai.gemini-3-5-flash",
+            },
+            id="anthropic-family-moved-gemini-listing-401",
+        ),
+        pytest.param(
+            _databricks_openai_gateway_config(fast="system.ai.claude-haiku-5-5"),
+            "/ai-gateway/codex/v1/models",
+            None,
+            {"omnigent-openai/system.ai.gpt-5", "omnigent/system.ai.claude-haiku-5-5"},
+            id="responses-family-moved-claude-listing-401",
+        ),
+    ],
+)
+def test_databricks_gateway_picker_keeps_live_rows_when_a_tier_moves(
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict[str, object],
+    listing_path: str,
+    listing: list[str] | None,
+    expected: set[str],
+) -> None:
+    """A tier that moves to another surface leaves the family's live picker rows in place.
+
+    Each listed row is offered where a tier with that id would run: Claude on the
+    Anthropic passthrough, anything else on the family's own surface. The
+    Anthropic surface's listing also names other vendors' endpoints, which its
+    Messages API answers with 404, so those rows are dropped.
+
+    :param config: The omnigent config with a curated Databricks gateway family.
+    :param listing_path: The family endpoint's model-listing path.
+    :param listing: Live model ids the endpoint returns, or ``None`` when it
+        answers 401.
+    :param expected: The picker's qualified model ids.
+    """
+
+    def _unexpected(host: str, token: str):
+        raise AssertionError("a curated tier map must not trigger enumeration")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+    listed: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        listed.append(str(request.url))
+        if listing is None:
+            return httpx.Response(401, json={"error_code": "UNAUTHENTICATED"})
+        return httpx.Response(200, json={"data": [{"id": row} for row in listing]})
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert listed == [f"https://wkspc.cloud.databricks.com{listing_path}"]
+    assert {o["model"] for o in options} == expected
+
+
+@pytest.mark.parametrize(
+    ("model_id", "provider_id", "api", "path"),
+    [
+        ("system.ai.gpt-5-5", "omnigent-openai", "openai-responses", "/ai-gateway/codex/v1"),
+        (
+            "databricks-meta-llama-3-3-70b-instruct",
+            "omnigent-completions",
+            "openai-completions",
+            "/serving-endpoints",
+        ),
+    ],
+)
+def test_inline_databricks_gateway_moves_anthropic_tiers_to_their_own_surface(
+    monkeypatch: pytest.MonkeyPatch, model_id: str, provider_id: str, api: str, path: str
+) -> None:
+    """Non-Claude tiers on an Anthropic-only gateway family leave the Anthropic wire."""
+
+    def _unexpected(host: str, token: str):
+        raise AssertionError("a curated tier map must not trigger enumeration")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+
+    provider = creds.resolve_pi_native_provider(
+        model=model_id,
+        config_loader=lambda: _databricks_anthropic_gateway_config(other=model_id),
+    )
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    rendered = provider.to_models_config()["providers"]
+    assert {pid: [m["id"] for m in payload["models"]] for pid, payload in rendered.items()} == {
+        "omnigent": ["system.ai.claude-opus-5"],
+        provider_id: [model_id],
+    }
+    assert rendered[provider_id]["api"] == api
+    assert rendered[provider_id]["baseUrl"] == f"https://wkspc.cloud.databricks.com{path}"
+
+
+def test_inline_databricks_gateway_moves_a_tier_with_its_own_family_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Gemini tier on the Anthropic family keeps that family's workspace and key.
+
+    Selecting Gemini explicitly still resolves through the OpenAI family, which
+    serves it on the wire that family declares.
+    """
+
+    def _boom(host: str, token: str):
+        raise RuntimeError("403 from unity-catalog/model-services")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _boom)
+    config = _databricks_anthropic_gateway_config(fast="system.ai.gemini-3-5-flash")
+    config["providers"]["unity"]["openai"] = {
+        "base_url": "https://other.cloud.databricks.com/ai-gateway/codex/v1",
+        "api_key": "openai-token",
+        "wire_api": "responses",
+        "models": {"default": "system.ai.gpt-5-5"},
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    gemini = creds.resolve_pi_native_provider(
+        model="system.ai.gemini-3-5-flash", config_loader=lambda: config
+    )
+
+    assert provider is not None and gemini is not None
+    mlflow = provider.to_models_config()["providers"]["omnigent-mlflow"]
+    assert mlflow["baseUrl"] == "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1"
+    assert mlflow["apiKey"] == "gw-token"
+    assert [m["id"] for m in mlflow["models"]] == ["system.ai.gemini-3-5-flash"]
+    assert gemini.api == "openai-responses"
+    assert gemini.base_url == "https://other.cloud.databricks.com/ai-gateway/codex/v1"
+    assert gemini.api_key == "openai-token"
+
+
+def test_inline_databricks_gateway_sends_claude_to_the_anthropic_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude on an MLflow-Chat-only gateway family runs on Anthropic Messages."""
+
+    def _boom(host: str, token: str):
+        raise RuntimeError("403 from unity-catalog/model-services")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _boom)
+    config = {
+        "providers": {
+            "unity": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "chat",
+                    "models": {"default": "system.ai.gemini-3-5-flash"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(
+        model="system.ai.claude-opus-5", config_loader=lambda: config
+    )
+
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert provider.auth_header is True
+    assert provider.credential_warning is None
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
+    assert not provider.additional_providers
+
+
 def test_inline_databricks_gateway_enumerates_only_the_selected_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

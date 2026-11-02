@@ -4284,23 +4284,27 @@ def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
   catalog.unshift({ provider: "anthropic", id: "databricks-claude-opus-4-1", hasKey: true });
   catalog.push({ provider: "omnigent", id: "foo", hasKey: true });
   catalog.push({ provider: "omnigent-completions", id: "omnigent/foo", hasKey: true });
+  catalog.push({ provider: "omnigent-mlflow", id: "system.ai.gemini-3-5-flash", hasKey: true });
   await handlers.session_start({}, ctx);
   await deliverModelChange("databricks-claude-opus-4-1");
   await deliverModelChange("omnigent/foo");
+  await deliverModelChange("system.ai.gemini-3-5-flash");
   assert.deepEqual(setModelCalls.map((model) => [model.provider, model.id]), [
     ["omnigent", "databricks-claude-opus-4-1"],
     ["omnigent-completions", "omnigent/foo"],
+    ["omnigent-mlflow", "system.ai.gemini-3-5-flash"],
   ]);
   const options = posted.find((event) => event.type === "external_model_options").data.models;
   assert.deepEqual(options.map((model) => model.id), [
     "databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1", "foo", "omnigent/foo",
+    "system.ai.gemini-3-5-flash",
   ]);
   await handlers.model_select({ source: "set", model: setModelCalls[1] }, ctx);
   const changes = posted.filter((event) => event.type === "external_model_change");
   assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
   assert.equal(changes[1].data.model, "omnigent/foo");
   await deliverModelChange("anthropic/databricks-claude-opus-4-1");
-  assert.equal(setModelCalls.length, 2);
+  assert.equal(setModelCalls.length, 3);
   assert.equal(errorItems().length, 1);
   finish();
 })().catch((error) => {

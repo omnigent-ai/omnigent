@@ -70,6 +70,9 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
         # chat surface omits Pi's required finish reason need Responses instead.
         if any(keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS):
             return DatabricksPiSurface.RESPONSES
+        # Newer GPT models reject function tools on the MLflow Chat surface.
+        if "gpt" in lower:
+            return DatabricksPiSurface.RESPONSES
         return DatabricksPiSurface.MLFLOW
     if "gpt" in lower:
         # Unknown GPT metadata fails toward Responses — the forward-compatible
