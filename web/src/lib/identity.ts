@@ -23,6 +23,7 @@ import {
   isDatabricksWorkspace,
   isHostRoutingEnabled,
 } from "./host";
+import { clientRoutingKey } from "./routingKey";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -59,9 +60,10 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  *   loaded yet → send NO key (the modal host would be a wrong guess for a
  *   specific session; a keyless miss re-addresses instead).
  * - ``/v1/skills`` → the query's ``host_id`` or the host for ``session_id``.
- * - everything else (session lists, ``/v1/sessions/updates``, ``/health``) is a
- *   cross-host / DB-backed read → ``{scoped: false}``, where the modal host is a
- *   legitimate cache-affinity hint.
+ * - everything else (session lists, ``/v1/sessions/projects``,
+ *   ``/v1/sessions/updates``, ``/health``) is a cross-host / DB-backed read →
+ *   ``{scoped: false}``, where the modal host is a legitimate cache-affinity
+ *   hint.
  *
  * The host-scoped families are an ALLOWLIST of what exists today (verified:
  * ``/v1/sessions/{id}/agent`` is under the sessions prefix, and
@@ -70,6 +72,10 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  * families so a matcher change is a conscious edit.
  */
 type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
+
+// Routes under /v1/sessions/ whose next segment is not a session id. Read as a
+// session id, they would look up a host that can't exist and go out unkeyed.
+const SESSION_COLLECTION_ROUTES = new Set(["orchestrated", "projects", "updates"]);
 
 function skillsParamsForUrl(url: string): URLSearchParams | null {
   const match = url.match(/\/v1\/skills(?:\?([^#]*))?(?:#.*)?$/);
@@ -88,8 +94,11 @@ function hostScopeForUrl(url: string): UrlHostScope {
   const hostMatch = url.match(/\/v1\/hosts\/([^/?#]+)/);
   if (hostMatch) return { scoped: true, hostId: decodeURIComponent(hostMatch[1]) };
   const sessionMatch = url.match(/\/v1\/sessions\/([^/?#]+)/);
-  if (sessionMatch)
-    return { scoped: true, hostId: getSessionHost(decodeURIComponent(sessionMatch[1])) };
+  if (sessionMatch) {
+    const sessionId = decodeURIComponent(sessionMatch[1]);
+    if (!SESSION_COLLECTION_ROUTES.has(sessionId))
+      return { scoped: true, hostId: getSessionHost(sessionId) };
+  }
   return { scoped: false };
 }
 
@@ -582,7 +591,8 @@ export async function authenticatedFetch(
   if (!headers.has(SLICE_KEY_HEADER) && isHostRoutingEnabled()) {
     // Key by the request's OWN host when it's host-scoped; otherwise (a
     // cross-host / DB-backed read) fall back to the modal host as a
-    // cache-affinity hint. The distinction matters: a host-scoped request whose
+    // cache-affinity hint, or to the per-client key when there is no modal host
+    // ({@link clientRoutingKey}). The distinction matters: a host-scoped request whose
     // host isn't known yet must send NO key rather than the modal — the modal
     // is the wrong guess for a SPECIFIC session, so it would route to a replica
     // that doesn't hold the tunnel; a keyless miss re-addresses instead. Only
@@ -599,6 +609,9 @@ export async function authenticatedFetch(
       derivedHostId = hostIdFromBody(url, init?.body);
     } else {
       derivedHostId = modalHostId();
+      // The client key names no host, so it is not stamped as one: a wrong_replica
+      // reply is returned as for an unkeyed request, and nothing is demoted.
+      if (derivedHostId === null) headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
     // Skip keying a host we've already PROVEN routes keyless (its tunnels dialed
     // in without a key → they live on the default replica). This spares the long

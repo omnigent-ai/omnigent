@@ -103,6 +103,27 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     }
   });
 
+  it("routes by the per-client key when no modal host was picked", async () => {
+    vi.resetModules();
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    const { resolveModalHost } = await import("./sessionHost");
+    const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
+    resolveModalHost();
+    try {
+      socket.start();
+      const first = latestWs();
+      expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toMatch(/^[0-9a-f]{32}$/);
+      first.open();
+      first.close();
+      vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+      expect(latestWs()).not.toBe(first);
+      expect(latestWs().url).toBe(first.url);
+    } finally {
+      socket.stop();
+      vi.resetModules();
+    }
+  });
+
   it("forces a reconnect after the watchdog window of total silence", () => {
     sessionUpdatesSocket.start();
     const ws = latestWs();

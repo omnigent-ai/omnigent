@@ -18,6 +18,7 @@
 
 import { isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
 import { isPageHidden, nextReconnectDelay } from "@/lib/reconnectBackoff";
+import { clientRoutingKey } from "@/lib/routingKey";
 import { modalHostId } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
@@ -72,17 +73,17 @@ export const HEALTHY_CONNECTION_MS = 5_000;
  * changes for the page — so every auto-reconnect rebuilds the identical URL and
  * never re-keys (no connection churn). The provider only calls `start()` once
  * the modal host is resolved (see `isModalHostResolved`), so this reads a
- * settled value. Omitted on an unsharded server and when no host was picked.
+ * settled value. When no host was picked, the per-client key
+ * ({@link clientRoutingKey}) stands in; it is stored per client. Omitted
+ * on an unsharded server.
  *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
   const path = "/v1/sessions/updates";
   if (!isHostRoutingEnabled()) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
-  return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
-  );
+  const sliceKey = modalHostId() ?? clientRoutingKey();
+  return resolveWebSocketUrl(`${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}`);
 }
 
 /**

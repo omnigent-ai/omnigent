@@ -232,9 +232,9 @@ export function resolveModalHost(): void {
 }
 
 /**
- * The frozen modal host_id, or `null` (→ send no key → default route) before
- * it is resolved or when no host could be picked. Read by `authenticatedFetch`
- * (host-less routes) and `buildUpdatesUrl`.
+ * The frozen modal host_id, or `null` before it is resolved or when no host
+ * could be picked (callers then use the per-client key from `routingKey.ts`).
+ * Read by `authenticatedFetch` (host-less routes) and `buildUpdatesUrl`.
  */
 export function modalHostId(): string | null {
   return _modalHostId;
