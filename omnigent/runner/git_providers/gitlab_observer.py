@@ -7,8 +7,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import PurePath
 from urllib.parse import unquote
 
-from omnigent.git_providers import EnvInstances
-from omnigent.git_providers.gitlab import GitLabProvider, instance_authority
+from omnigent.git_providers import EnvInstances, instance_authority
+from omnigent.git_providers.gitlab import GitLabProvider
 from omnigent.runner.git_providers import ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import result_objects
 from omnigent.runner.session_prs import PullRequestRef
