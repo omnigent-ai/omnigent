@@ -159,6 +159,7 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
     if (typeof id === "string" && id) {
       questionPayload.id = id;
     }
+    if (rec.isSecret === true) questionPayload.isSecret = true;
     questions.push(questionPayload);
   }
 

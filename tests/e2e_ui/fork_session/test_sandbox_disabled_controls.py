@@ -227,7 +227,7 @@ def test_arclet_session_forks_only_onto_a_new_arclet(
         forwarded = {
             key: value
             for key, value in body.items()
-            if key not in {"host_type", "sandbox_provider", "workspace", "host_id"}
+            if key not in {"host_type", "sandbox_provider", "workspace", "workspaces", "host_id"}
         }
         route.fulfill(response=route.fetch(post_data=json.dumps(forwarded)))
 
@@ -269,3 +269,4 @@ def test_arclet_session_forks_only_onto_a_new_arclet(
     assert len(fork_bodies) == 1, fork_bodies
     assert fork_bodies[0]["host_type"] == "managed", fork_bodies[0]
     assert fork_bodies[0]["sandbox_provider"] == "arclet", fork_bodies[0]
+    assert fork_bodies[0]["workspaces"] == [], fork_bodies[0]

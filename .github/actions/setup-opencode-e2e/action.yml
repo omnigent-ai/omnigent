@@ -1,0 +1,23 @@
+name: Set up OpenCode for e2e
+description: >
+  Install @opencode/cli from this action's committed integrity lock and put
+  `opencode` on PATH, for the opencode-native e2e journeys.
+
+runs:
+  using: composite
+  steps:
+    - name: Install OpenCode CLI
+      shell: bash
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: |
+        # Under RUNNER_TEMP: an npm install inside the checkout would hoist into
+        # the repository's root package.
+        cli_dir="${RUNNER_TEMP}/omnigent-e2e-opencode"
+        mkdir -p "$cli_dir"
+        cp "${GITHUB_ACTION_PATH}/"{package.json,package-lock.json} "$cli_dir/"
+        npm ci --prefix "$cli_dir" --ignore-scripts --no-audit --no-fund
+        # The wrapper's postinstall links the locked platform binary into bin/.
+        node "$cli_dir/node_modules/@opencode/cli/postinstall.mjs"
+        "$cli_dir/node_modules/.bin/opencode" --version
+        echo "$cli_dir/node_modules/.bin" >> "$GITHUB_PATH"

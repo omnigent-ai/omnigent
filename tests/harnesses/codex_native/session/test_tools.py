@@ -413,8 +413,9 @@ def test_forwarder_posts_codex_file_change_tool_call() -> None:
     assert posted[1]["data"]["item_data"]["output"] == "add /repo/greeting.py"
 
 
+@pytest.mark.parametrize("original", ["old", "x" * 1_048_576], ids=["small", "oversized"])
 def test_forwarder_sends_file_change_to_observer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, original: str
 ) -> None:
     """A completed fileChange reaches the non-git workspace registry relay."""
     (tmp_path / "tool_relay.json").write_text(
@@ -453,7 +454,7 @@ def test_forwarder_sends_file_change_to_observer(
                 "id": "call_patch",
                 "changes": [
                     {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
-                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": original},
                 ],
                 "status": "completed",
             },
@@ -462,22 +463,24 @@ def test_forwarder_sends_file_change_to_observer(
         )
     )
 
+    expected_changes = [
+        {"path": "/repo/new.py", "kind": {"type": "add"}},
+        {"path": "/repo/old.py", "kind": {"type": "delete"}},
+    ]
+    if original == "old":
+        expected_changes[0]["diff"] = "new"
+        expected_changes[1]["diff"] = original
     assert observed == [
         {
             "hook_event_name": "PostToolUse",
             "tool_name": "apply_patch",
-            "tool_input": {
-                "changes": [
-                    {"path": "/repo/new.py", "kind": {"type": "add"}},
-                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
-                ]
-            },
+            "tool_input": {"changes": expected_changes},
             "tool_response": {"type": "success"},
         }
     ]
 
 
-@pytest.mark.parametrize("status", ["failed", "declined"])
+@pytest.mark.parametrize("status", ["failed", "declined", "inProgress", "cancelled"])
 def test_forwarder_does_not_observe_unsuccessful_file_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
 ) -> None:

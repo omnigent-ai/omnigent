@@ -15,7 +15,9 @@ import logging
 import os
 import subprocess
 import threading
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +26,7 @@ from omnigent.runtime.filesystem_registry import (
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
     GitStatusUnavailable,
+    MultiRepositoryFilesystemRegistry,
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
@@ -339,6 +342,21 @@ def test_get_baseline_returns_none_when_no_snapshot(tmp_path: Path) -> None:
     result = reg.get_baseline("never_seeded.py")
     # No snapshot, no git → must return None.
     assert result is None, f"Expected None (no snapshot, no git), got {result!r}."
+
+
+@pytest.mark.parametrize("operation,original", [("created", ""), ("modified", None)])
+def test_first_observation_preserves_known_or_unknown_original(
+    tmp_path: Path, operation: str, original: str | None
+) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    assert registry.needs_snapshot("file.txt")
+    registry.record_change("file.txt", operation, "session")
+    registry.seed_snapshot("file.txt", "intermediate", session_id="session")
+    registry.record_change("file.txt", "modified", "session")
+    assert not registry.needs_snapshot("file.txt")
+    assert registry.get_baseline("file.txt") == original
+    registry.unregister_conversation("session")
+    assert registry.needs_snapshot("file.txt")
 
 
 def test_get_baseline_returns_snapshot_for_non_git_workspace(tmp_path: Path) -> None:
@@ -1258,21 +1276,41 @@ def test_create_filesystem_registry_bogus_git_dir_below_real_repo(tmp_path: Path
     )
 
 
-def test_create_filesystem_registry_broken_gitlink(tmp_path: Path) -> None:
-    """A .git file pointing at a nonexistent git dir yields the plain registry.
+@pytest.mark.parametrize("marker", ["broken_gitlink", "empty_directory"])
+def test_create_filesystem_registry_broken_gitlink(tmp_path: Path, marker: str) -> None:
+    """Invalid root metadata preserves observed files until a valid repository exists.
 
     Git itself treats a broken gitlink as fatal rather than walking past it,
     so the workspace must be handled as non-git.
 
     Failure means _find_git_root accepts gitlinks whose target is missing.
     """
-    (tmp_path / ".git").write_text("gitdir: /nonexistent/gitdir\n", encoding="utf-8")
+    if marker == "broken_gitlink":
+        (tmp_path / ".git").write_text("gitdir: /nonexistent/gitdir\n", encoding="utf-8")
+    else:
+        (tmp_path / ".git").mkdir()
     registry = create_filesystem_registry(tmp_path)
     assert isinstance(registry, AgentEditFilesystemRegistry), (
         f"Expected AgentEditFilesystemRegistry for a broken gitlink, "
         f"got {type(registry).__name__}. "
         "_find_git_root may be accepting gitlinks without validating the target."
     )
+    (tmp_path / "notes.txt").write_text("after")
+    registry.seed_snapshot("notes.txt", "before", session_id="session")
+    registry.record_change("notes.txt", "modified", "session")
+    assert [r["path"] for r in registry.list_changed_files("session", limit=100)] == ["notes.txt"]
+    record = registry.get_changed_file("session", "notes.txt")
+    assert record is not None and record["status"] == "modified"
+    assert registry.get_baseline("notes.txt") == "before"
+
+    if marker == "broken_gitlink":
+        (tmp_path / ".git").unlink()
+    _init_git_with_commit(tmp_path, "notes.txt", "committed")
+    (tmp_path / "notes.txt").write_text("next edit")
+    assert isinstance(registry, MultiRepositoryFilesystemRegistry)
+    reader = registry.with_git_runner(_trusted_test_git)
+    assert [r["path"] for r in reader.list_changed_files("session", limit=100)] == ["notes.txt"]
+    assert reader.get_baseline("notes.txt") == "committed"
 
 
 def test_create_filesystem_registry_linked_worktree(tmp_path: Path) -> None:
@@ -1434,6 +1472,210 @@ def _init_git_with_commit(tmp_path: Path, name: str, content: str) -> dict[str, 
         ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
     )
     return env
+
+
+def _trusted_test_git(
+    argv: list[str], cwd: Path, timeout: float
+) -> subprocess.CompletedProcess[bytes]:
+    """Execute Git only for repositories created by these tests."""
+    return subprocess.run(
+        ["git", *argv], cwd=cwd, timeout=timeout, capture_output=True, env=_git_env()
+    )
+
+
+def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
+    tmp_path: Path,
+) -> None:
+    for name in ("alpha", "beta"):
+        repo = tmp_path / name
+        repo.mkdir()
+        _init_git_with_commit(repo, "same.txt", f"{name} original\n")
+        (repo / "gone.txt").write_text("delete me\n")
+        _trusted_test_git(["add", "."], repo, 5).check_returncode()
+        _trusted_test_git(["commit", "-m", "add deletion target"], repo, 5).check_returncode()
+    alpha, beta = tmp_path / "alpha", tmp_path / "beta"
+    (alpha / "same.txt").write_text("staged\n")
+    _trusted_test_git(["add", "same.txt"], alpha, 5).check_returncode()
+    (alpha / "same.txt").write_text("staged\nunstaged\n")
+    (alpha / "new.txt").write_text("new\n")
+    (beta / "same.txt").write_text("beta changed\n")
+    (beta / "gone.txt").unlink()
+    registry = create_filesystem_registry(tmp_path)
+    assert isinstance(registry, MultiRepositoryFilesystemRegistry)
+    reader = registry.with_git_runner(_trusted_test_git)
+    expected = {
+        "alpha/same.txt": "modified",
+        "alpha/new.txt": "created",
+        "beta/same.txt": "modified",
+        "beta/gone.txt": "deleted",
+    }
+    changes = reader.list_changed_files("session", limit=100)
+    assert {record["path"]: record["status"] for record in changes} == expected
+    assert all(record["repository_root"] == record["path"].split("/")[0] for record in changes)
+    for name in ("alpha", "beta"):
+        assert reader.get_baseline(f"{name}/same.txt") == f"{name} original\n"
+    assert reader.get_baseline("beta/gone.txt") == "delete me\n"
+    assert reader.get_baseline("alpha/new.txt") is None
+    assert reader.get_baseline("alpha/absent.txt") is None
+
+    # Existing fallback events must neither override Git nor omit loose-file edits.
+    registry.seed_snapshot("alpha/same.txt", "wrong original", session_id="session")
+    registry.record_change("alpha/same.txt", "created", "session")
+    registry.record_change("alpha/phantom.txt", "modified", "session")
+    (tmp_path / "notes.txt").write_text("after")
+    registry.seed_snapshot("notes.txt", "before", session_id="session")
+    registry.record_change("notes.txt", "modified", "session")
+    assert {r["path"]: r["status"] for r in reader.list_changed_files("session", limit=100)} == {
+        **expected,
+        "notes.txt": "modified",
+    }
+    assert reader.get_baseline("alpha/same.txt") == "alpha original\n"
+    assert reader.get_baseline("notes.txt") == "before"
+
+    # Reconstruct the registry as after a runner restart, retaining only disk state.
+    restarted = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    assert {
+        r["path"]: r["status"] for r in restarted.list_changed_files("session", limit=100)
+    } == expected
+    _trusted_test_git(["add", "."], alpha, 5).check_returncode()
+    _trusted_test_git(["commit", "-m", "finish alpha"], alpha, 5).check_returncode()
+    _trusted_test_git(["restore", "."], beta, 5).check_returncode()
+    assert restarted.list_changed_files("session", limit=100) == []
+    (beta / "same.txt").write_text("next edit\n")
+    assert [r["path"] for r in restarted.list_changed_files("session", limit=100)] == [
+        "beta/same.txt"
+    ]
+    for index in range(10_001):
+        registry.record_change(f"beta/old-{index}", "deleted", "history")
+    registry.record_change("notes.txt", "deleted", "history")
+    assert {r["path"] for r in reader.list_changed_files("history", limit=100)} == {
+        "beta/same.txt",
+        "notes.txt",
+    }
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    _trusted_test_git(["init"], unborn, 5).check_returncode()
+    assert reader.get_baseline("unborn/new.txt") is None
+
+
+@pytest.mark.parametrize("repository_count", [1, 4, 8])
+def test_multi_repo_git_command_bounds_and_cold_scoped_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository_count: int
+) -> None:
+    for index in range(repository_count):
+        repo = tmp_path / f"repo-{index}"
+        repo.mkdir()
+        _init_git_with_commit(repo, "same.txt", "original\n")
+        (repo / "same.txt").write_text("changed\n")
+    for index in range(20):
+        (tmp_path / f"ordinary-{index}").mkdir()
+    _init_fake_git_repo(tmp_path / "ordinary-0" / "nested")
+    (tmp_path / "alias").symlink_to(tmp_path / "repo-0", target_is_directory=True)
+    calls: list[tuple[str, Path]] = []
+
+    def run_git(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        assert 0 < timeout <= 8
+        calls.append((argv[0], cwd))
+        return _trusted_test_git(argv, cwd, timeout)
+
+    reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(run_git)
+    assert len(reader.list_changed_files("session", limit=100)) == repository_count
+    assert calls == [
+        (command, tmp_path / f"repo-{i}")
+        for i in range(repository_count)
+        for command in ("status", "diff")
+    ]
+    calls.clear()
+    cold = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(run_git)
+    monkeypatch.setattr(
+        cold, "_repository_roots", lambda: pytest.fail("scoped read scanned siblings")
+    )
+    record = cold.get_changed_file("session", "repo-0/same.txt")
+    assert record is not None and record["repository_root"] == "repo-0"
+    assert cold.get_baseline("repo-0/same.txt") == "original\n"
+    assert calls == [("status", tmp_path / "repo-0"), ("show", tmp_path / "repo-0")]
+
+
+@pytest.mark.parametrize("boundary", ["repositories", "entries", "time"])
+def test_multi_repo_discovery_bounds_fail_without_partial_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    for index in range(33):
+        (tmp_path / str(index) / ".git").mkdir(parents=True)
+    reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(
+        lambda *_args: pytest.fail("discovery must finish before running Git")
+    )
+    with monkeypatch.context() as patches:
+        patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
+        if boundary == "entries":
+            entry = SimpleNamespace(name="file.txt", is_dir=lambda **_: False)
+            patches.setattr(
+                "omnigent.runtime.filesystem_registry.os.scandir",
+                lambda _: nullcontext(iter([entry] * 65_537)),
+            )
+        elif boundary == "time":
+            clock = iter([0, 0.251])
+            patches.setattr(
+                "omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock)
+            )
+        with pytest.raises(GitStatusUnavailable, match=r"discovery limit|32 repositories"):
+            reader.list_changed_files("session", limit=100)
+
+
+def test_large_parent_preserves_loose_files_and_discovers_late_repositories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for index in range(1025):
+        (tmp_path / str(index)).mkdir()
+    reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    reader.record_change("notes.txt", "deleted", "session")
+    with monkeypatch.context() as patches:
+        patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
+        assert [r["path"] for r in reader.list_changed_files("session", limit=100)] == [
+            "notes.txt"
+        ]
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_git_with_commit(repo, "file.txt", "original")
+        (repo / "file.txt").write_text("changed")
+        assert {r["path"] for r in reader.list_changed_files("session", limit=100)} == {
+            "notes.txt",
+            "repo/file.txt",
+        }
+
+
+@pytest.mark.parametrize("failure", ["deadline", "timeout", "helper", "nonzero"])
+def test_multi_repo_baseline_failures_are_not_missing_originals(
+    tmp_path: Path, failure: str
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_with_commit(repo, "file.txt", "original")
+
+    def failed_show(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert argv == ["show", "HEAD:file.txt"]
+        if failure == "deadline":
+            raise GitStatusUnavailable("Repository changes exceeded the eight-second budget")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, timeout)
+        if failure == "helper":
+            raise OSError("Git output exceeds the 10 MiB read limit")
+        return subprocess.CompletedProcess(argv, 128, b"", b"fatal: unable to read tree\n")
+
+    reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(failed_show)
+    with pytest.raises(GitStatusUnavailable):
+        reader.get_baseline("repo/file.txt")
+
+
+def test_multi_repo_requires_runner_and_surfaces_failed_repository(tmp_path: Path) -> None:
+    (tmp_path / "broken" / ".git").mkdir(parents=True)
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    with pytest.raises(GitStatusUnavailable, match="session runner"):
+        registry.list_changed_files("session", limit=100)
+    with pytest.raises(GitStatusUnavailable, match="Repository 'broken': git status exited"):
+        registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
 
 
 def test_git_line_counts_modified(tmp_path: Path) -> None:
