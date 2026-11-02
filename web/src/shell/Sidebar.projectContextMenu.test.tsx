@@ -31,7 +31,7 @@ vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
   return {
     ...conversationHooksMock(),
-    useProjects: () => ({ data: [{ id: PROJECT_ID, name: PROJECT_NAME }] }),
+    useProjects: () => ({ data: [{ id: PROJECT_ID, name: PROJECT_NAME, color: "nord" }] }),
     useProjectSessions: () => ({
       data: undefined,
       isLoading: false,
@@ -131,6 +131,12 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("project folder header context menu", () => {
+  it("tints the folder icon with the project's palette color", () => {
+    renderSidebar();
+    const icon = folderHeader().querySelector('[data-project-color="nord"]');
+    expect(icon).toHaveStyle({ color: "#5e81ac" });
+  });
+
   it("opens the kebab's exact action set on right-click", () => {
     renderSidebar();
     const header = folderHeader();

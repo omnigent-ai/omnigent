@@ -144,15 +144,26 @@ async def test_rename_missing_project_404(project_client: httpx.AsyncClient) -> 
     assert resp.status_code == 404
 
 
-async def test_create_defaults_to_empty_config(project_client: httpx.AsyncClient) -> None:
-    """A project created without a config field reports an empty config."""
-    body = (await project_client.post("/v1/projects", json={"name": "P"})).json()
-    assert body["config"] == {}
+async def test_create_assigns_the_least_used_color_unless_marked(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Unmarked projects get the least-used color; an emoji is kept."""
+    first = (await project_client.post("/v1/projects", json={"name": "A"})).json()
+    second = (await project_client.post("/v1/projects", json={"name": "B"})).json()
+    emoji = await project_client.post("/v1/projects", json={"name": "E", "config": {"icon": "🔥"}})
+    assert first["config"] == {"color": "omni"}
+    assert second["config"] == {"color": "dracula"}
+    assert emoji.json()["config"] == {"icon": "🔥"}
 
 
 async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClient) -> None:
     """A config passed on create round-trips through the create + get responses."""
-    cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
+    cfg = {
+        "host_id": "host_abc",
+        "workspace": "/work/repo",
+        "model": "claude-opus-4-8",
+        "color": "nord",
+    }
     created = (
         await project_client.post("/v1/projects", json={"name": "Configured", "config": cfg})
     ).json()
@@ -183,7 +194,7 @@ async def test_patch_without_config_preserves_it(project_client: httpx.AsyncClie
         )
     ).json()
     renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "P2"})
-    assert renamed.json()["config"] == {"host_id": "keep"}
+    assert renamed.json()["config"] == {"host_id": "keep", "color": "omni"}
 
 
 async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -> None:
@@ -229,32 +240,33 @@ async def test_session_projects_unions_first_class_and_labels(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": both["id"], "name": "Both", "icon": None},
-        {"id": empty["id"], "name": "Empty FC", "icon": None},
-        {"id": None, "name": "Label Only", "icon": None},
+        {"id": both["id"], "name": "Both", "icon": None, "color": both["config"]["color"]},
+        {"id": empty["id"], "name": "Empty FC", "icon": None, "color": "omni"},
+        {"id": None, "name": "Label Only", "icon": None, "color": None},
     ]
 
 
-async def test_session_projects_surfaces_config_icon(
+async def test_session_projects_surfaces_config_icon_and_color(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """A first-class project's ``config.icon`` surfaces in the sidebar listing
-    so the folder can render the emoji; a non-string/absent icon stays None."""
+    """A first-class project's ``config.icon`` and ``config.color`` surface in
+    the sidebar listing; non-string/absent values stay None."""
     fire = (
-        await project_client.post("/v1/projects", json={"name": "Fire", "config": {"icon": "🔥"}})
-    ).json()
-    # A config without an icon key surfaces None (default folder glyph).
-    plain = (
         await project_client.post(
-            "/v1/projects", json={"name": "Plain", "config": {"host_id": "h"}}
+            "/v1/projects", json={"name": "Fire", "config": {"icon": "🔥", "color": "nord"}}
         )
     ).json()
+    # Absent icon and non-string color both surface None (default folder glyph).
+    plain = (await project_client.post("/v1/projects", json={"name": "Plain"})).json()
+    await project_client.patch(
+        f"/v1/projects/{plain['id']}", json={"config": {"host_id": "h", "color": 3}}
+    )
 
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": fire["id"], "name": "Fire", "icon": "🔥"},
-        {"id": plain["id"], "name": "Plain", "icon": None},
+        {"id": fire["id"], "name": "Fire", "icon": "🔥", "color": "nord"},
+        {"id": plain["id"], "name": "Plain", "icon": None, "color": None},
     ]
 
 

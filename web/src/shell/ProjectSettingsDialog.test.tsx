@@ -236,8 +236,8 @@ describe("ProjectSettingsDialog", () => {
     fireEvent.click(screen.getByTestId("project-settings-worktree"));
     fireEvent.click(screen.getByTestId("project-settings-save"));
 
-    await waitFor(() => expect(createMock).toHaveBeenCalledWith("Work"));
-    expect(updateMock).toHaveBeenCalledWith("p_new", { use_worktree: true });
+    await waitFor(() => expect(createMock).toHaveBeenCalledWith("Work", { use_worktree: true }));
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it("persists host, workspace, and agent from a seeded config on save", async () => {

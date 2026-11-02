@@ -5414,11 +5414,14 @@ class SessionProjectSummary(BaseModel):
     :param icon: The project's chosen emoji icon (a unicode grapheme), read
         from its ``config``; ``None`` when unset or for a label-only folder,
         so the sidebar falls back to the default folder glyph.
+    :param color: The project's chosen color (a web theme palette id), read
+        from its ``config``; ``None`` when unset or for a label-only folder.
     """
 
     id: str | None = None
     name: str
     icon: str | None = None
+    color: str | None = None
 
 
 class CreateProjectRequest(BaseModel):
@@ -5428,7 +5431,8 @@ class CreateProjectRequest(BaseModel):
     :param name: Human-readable project name. Trimmed; must be non-empty and
         at most 100 characters; unique among the caller's projects.
     :param config: Optional default session settings (opaque JSON object).
-        Omitted / empty stores no defaults.
+        Omitted / empty stores no defaults. Without an ``icon`` or a palette
+        ``color``, the server assigns a ``color``.
     """
 
     model_config = ConfigDict(extra="forbid")
