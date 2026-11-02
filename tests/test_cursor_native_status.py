@@ -95,7 +95,157 @@ def test_cli_record_usage_records_turn_end_on_empty_stdin(tmp_path: Path, monkey
     assert status.count_turn_ends(bridge) == 1
 
 
+def test_conversation_identity_is_not_a_turn_generation(tmp_path: Path) -> None:
+    status.record_turn_end(tmp_path, {"conversation_id": "conversation", "status": "aborted"})
+    assert status.read_turn_end(tmp_path, 1).get("generation_id") is None
+    assert status.read_turn_outcome(tmp_path, 1) == "cancelled"
+
+
 # --- forwarder loop: idle POST is once-per-turn, deduped, restart-safe --------
+
+
+@pytest.mark.parametrize(
+    ("hook_timing", "stop_id"),
+    [
+        ("during_cleanup", "first"),
+        ("delayed_after_fresh_input", "first"),
+        ("missing", "first"),
+        ("during_cleanup", None),
+        ("during_cleanup", "conversation"),
+    ],
+)
+@pytest.mark.parametrize("next_outcome", ["completed", "aborted"])
+async def test_failed_turn_cleanup_does_not_lose_the_next_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_timing: str,
+    next_outcome: str,
+    stop_id: str | None,
+) -> None:
+    from omnigent.harnesses.cursor_native import permissions
+
+    bridge = tmp_path / "bridge"
+    store = tmp_path / "store.db"
+    with sqlite3.connect(store) as db:
+        db.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+        db.execute(
+            "INSERT INTO blobs VALUES (?, ?)",
+            (
+                "first",
+                json.dumps(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "<user_query>first turn</user_query>"}
+                        ],
+                    }
+                ),
+            ),
+        )
+    if stop_id is not None:
+        status.record_turn_start(bridge, {"generation_id": "first"})
+    failure = status.CursorTurnFailure()
+    delivered_rows: list[int] = []
+    outcomes: list[tuple[str, str | None]] = []
+    delivery_entered = asyncio.Event()
+    release_delivery = asyncio.Event()
+    interrupted: list[Path] = []
+
+    def interrupt(path: Path, **kwargs) -> None:
+        interrupted.append(path)
+        if hook_timing == "during_cleanup":
+            status.record_turn_end(bridge, {"generation_id": stop_id, "status": "aborted"})
+
+    async def post_status(client, *, session_id, status, turn_outcome, output=None):
+        if output is not None:
+            assert interrupted == [bridge]
+            delivery_entered.set()
+            await release_delivery.wait()
+        outcomes.append((turn_outcome, output))
+
+    async def post_item(client, *, session_id, item):
+        delivered_rows.append(item.rowid)
+
+    async def ignore_patch(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(fwd, "_discover_store", lambda *args: store)
+    monkeypatch.setattr(fwd, "_read_last_used_model", lambda path: None)
+    monkeypatch.setattr(fwd, "_patch_external_session_id", ignore_patch)
+    monkeypatch.setattr(fwd, "_post_conversation_item", post_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", post_status)
+    monkeypatch.setattr(permissions, "_post_external_session_status", post_status)
+    monkeypatch.setattr(permissions, "inject_interrupt", interrupt)
+    forwarder = asyncio.create_task(
+        fwd.forward_cursor_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="child",
+            bridge_dir=bridge,
+            agent_name="cursor-native-ui",
+            workspace=str(tmp_path),
+            launch_epoch_ms=1000,
+            poll_interval_s=0.001,
+            turn_failure=failure,
+        )
+    )
+    cleanup = None
+    try:
+        await _wait_until(lambda: delivered_rows == [1])
+        async with httpx.AsyncClient() as client:
+            cleanup = asyncio.create_task(
+                permissions._fail_yolo_turn(
+                    client,
+                    session_id="child",
+                    bridge_dir=bridge,
+                    store_path=store,
+                    active={},
+                    failure=failure,
+                    output="Error: approval recovery failed",
+                )
+            )
+            await _wait_until(delivery_entered.is_set)
+            assert failure.lock.locked()
+            assert outcomes == []
+            release_delivery.set()
+            await cleanup
+        if hook_timing == "missing":
+            assert status.read_posted_count(bridge) == 0
+        if stop_id is not None:
+            status.record_turn_start(bridge, {"generation_id": "fresh"})
+        with sqlite3.connect(store) as db:
+            db.execute(
+                "INSERT INTO blobs VALUES (?, ?)",
+                (
+                    "fresh",
+                    json.dumps(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "<user_query>fresh turn</user_query>"}
+                            ],
+                        }
+                    ),
+                ),
+            )
+        await _wait_until(lambda: delivered_rows == [1, 2])
+        if hook_timing == "delayed_after_fresh_input":
+            status.record_turn_end(bridge, {"generation_id": "first", "status": "aborted"})
+        status.record_turn_end(bridge, {"generation_id": "fresh", "status": next_outcome})
+        expected_markers = 1 if hook_timing == "missing" else 2
+        await _wait_until(lambda: status.read_posted_count(bridge) == expected_markers)
+        assert outcomes == [
+            ("failed", "Error: approval recovery failed"),
+            ("completed" if next_outcome == "completed" else "cancelled", None),
+        ]
+        assert not forwarder.done()
+    finally:
+        forwarder.cancel()
+        if cleanup is not None:
+            cleanup.cancel()
+        await asyncio.gather(
+            forwarder, *([cleanup] if cleanup is not None else []), return_exceptions=True
+        )
 
 
 class _StatusRecorder:

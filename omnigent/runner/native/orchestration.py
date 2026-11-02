@@ -3481,7 +3481,10 @@ async def _auto_create_cursor_terminal(
         cursor_launch_args_enable_yolo,
         supervise_cursor_transcript_elicitations,
     )
+    from omnigent.harnesses.cursor_native.status import CursorTurnFailure
     from omnigent.harnesses.cursor_native.usage import supervise_cursor_usage_forwarder
+
+    turn_failure = CursorTurnFailure()
 
     if server_client is not None and ensure_comment_relay is not None:
         await ensure_comment_relay(
@@ -3516,6 +3519,7 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                turn_failure=turn_failure,
             ),
             supervise_cursor_transcript_elicitations(
                 base_url=server_url,
@@ -3525,6 +3529,7 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                turn_failure=turn_failure,
                 # Yolo / force sessions still sometimes leave pending markers;
                 # answer those in-pane instead of mirroring a card to a parent
                 # that cannot click it.

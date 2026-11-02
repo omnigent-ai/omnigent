@@ -23,10 +23,12 @@ cursor blocks the turn end on the hook.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Append-only log of per-turn outcomes written by the cursor ``stop`` hook.
@@ -36,6 +38,39 @@ TURN_END_FILE = "cursor_turn_end.jsonl"
 #: turned into an ``external_session_status`` post. Persisted so a
 #: supervisor restart never re-wakes the parent for a turn it already reported.
 _STATE_FILE = "cursor_status_forwarder.json"
+_TURN_START_FILE = "cursor_turn_start"
+
+
+@dataclass
+class CursorTurnFailure:
+    """Coordinate turn interruption and suppress its delayed stop events."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    after_stop: int | None = None
+    before_rowid: int = 0
+    suppressed_stops: set[int] = field(default_factory=set)
+    generations: set[str] = field(default_factory=set)
+    uncertain_generations: set[str] = field(default_factory=set)
+    uncertain_stops: dict[int, str | None] = field(default_factory=dict)
+
+
+def record_turn_start(bridge_dir: Path, payload: object) -> None:
+    """Persist only the native generation ID, excluding prompt and attachment data."""
+    generation = payload.get("generation_id") if isinstance(payload, dict) else None
+    if not isinstance(generation, str) or not generation:
+        raise ValueError("Cursor turn start did not contain a generation ID")
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    tmp = bridge_dir / (_TURN_START_FILE + ".tmp")
+    tmp.write_text(generation, encoding="utf-8")
+    os.replace(tmp, bridge_dir / _TURN_START_FILE)
+
+
+def read_current_generation(bridge_dir: Path) -> str | None:
+    """Read the generation last observed by the beforeSubmitPrompt hook."""
+    try:
+        return (bridge_dir / _TURN_START_FILE).read_text(encoding="utf-8") or None
+    except (OSError, ValueError):
+        return None
 
 
 def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
@@ -53,7 +88,7 @@ def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
     """
     line: dict[str, object] = {"ts": time.time()}
     if isinstance(payload, dict):
-        gen_id = payload.get("generation_id") or payload.get("conversation_id")
+        gen_id = payload.get("generation_id")
         if isinstance(gen_id, str) and gen_id:
             line["generation_id"] = gen_id
         hook_status = payload.get("status")
@@ -79,12 +114,8 @@ def count_turn_ends(bridge_dir: Path) -> int:
     return sum(1 for raw in text.splitlines() if raw.strip())
 
 
-def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
-    """Read the outcome at a snapshotted marker count, ignoring later appends.
-
-    Legacy markers without a status retain their completed-turn behavior.
-    Unreadable or corrupt markers raise so the forwarder can retry delivery.
-    """
+def read_turn_end(bridge_dir: Path, turn_end: int) -> dict[str, object]:
+    """Read one snapshotted marker without conflating it with later generations."""
     if turn_end <= 0:
         raise ValueError("turn-end marker count must be positive")
     lines = (bridge_dir / TURN_END_FILE).read_text(encoding="utf-8").splitlines()
@@ -92,6 +123,12 @@ def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
     marker = json.loads(markers[turn_end - 1])
     if not isinstance(marker, dict):
         raise ValueError("turn-end marker must be an object")
+    return marker
+
+
+def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
+    """Map the snapshotted native status, retaining legacy completed-turn behavior."""
+    marker = read_turn_end(bridge_dir, turn_end)
     hook_status = marker.get("status", "completed")
     if hook_status == "aborted":
         return "cancelled"
@@ -131,6 +168,6 @@ def clear_cursor_status_state(bridge_dir: Path) -> None:
     runner calls this when it re-creates a cursor terminal so a stale marker count
     from a prior terminal can't make the new forwarder skip (or re-fire) idle.
     """
-    for name in (TURN_END_FILE, _STATE_FILE):
+    for name in (TURN_END_FILE, _STATE_FILE, _TURN_START_FILE):
         with contextlib.suppress(OSError):
             (bridge_dir / name).unlink()
