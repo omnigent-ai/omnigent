@@ -3,7 +3,8 @@
 ``omnigent host`` runs in the foreground of a real terminal (a pty), a session
 on that host has a turn waiting on the model, and the terminal closes. The
 kernel delivers SIGHUP to the host, which dies by it. The reply should still
-reach the session before the runner exits.
+reach the session before the runner exits. SIGTERM and Ctrl-C controls stop
+the held turn for both direct and zygote runners, without request replay.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from tests._helpers.live_server import isolated_local_server, isolated_process_e
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
+    get_mock_requests,
     poll_session_until_terminal,
     release_mock_gate,
     send_user_message_to_session,
@@ -56,7 +58,7 @@ executor:
 class _ForegroundHostTerminal:
     """``omnigent host`` as the session leader of a pty, drained like a terminal."""
 
-    def __init__(self, root: Path, base_url: str, mock_url: str) -> None:
+    def __init__(self, root: Path, base_url: str, mock_url: str, *, use_zygote: bool) -> None:
         home = root / "home"
         config = home / ".omnigent"
         config.mkdir(parents=True)
@@ -67,7 +69,13 @@ class _ForegroundHostTerminal:
         )
         self.log_path = root / "host.log"
         env = isolated_process_env(
-            home, {"OPENAI_BASE_URL": f"{mock_url}/v1", "OPENAI_API_KEY": "mock-key"}, None
+            home,
+            {
+                "OPENAI_BASE_URL": f"{mock_url}/v1",
+                "OPENAI_API_KEY": "mock-key",
+                "OMNIGENT_RUNNER_ZYGOTE": str(int(use_zygote)),
+            },
+            None,
         )
         env.update(
             OMNIGENT_CONFIG_HOME=str(config),
@@ -170,10 +178,15 @@ def _wait_until(predicate: Callable[[], object], timeout: float, interval: float
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="pty hangup semantics; /proc liveness")
-@pytest.mark.min_runner_version("0.19.0")
+@pytest.mark.min_runner_version("0.21.0")
 @pytest.mark.timeout(420)
+@pytest.mark.parametrize("use_zygote", [True, False], ids=["zygote", "direct"])
+@pytest.mark.parametrize("exit_action", ["hangup", "sigterm", "ctrl-c"])
 def test_terminal_hangup_lets_in_flight_turn_finish(
-    tmp_path: Path, isolated_mock_llm_server_url: str
+    tmp_path: Path,
+    isolated_mock_llm_server_url: str,
+    use_zygote: bool,
+    exit_action: str,
 ) -> None:
     mock_url = isolated_mock_llm_server_url
     model = f"hangup-turn-{uuid.uuid4().hex[:8]}"
@@ -188,7 +201,9 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
         isolated_local_server(tmp_path / "server") as base_url,
         httpx.Client(base_url=base_url, trust_env=False, timeout=30) as client,
     ):
-        terminal = _ForegroundHostTerminal(tmp_path / "host", base_url, mock_url)
+        terminal = _ForegroundHostTerminal(
+            tmp_path / "host", base_url, mock_url, use_zygote=use_zygote
+        )
         try:
 
             def _host_online() -> bool:
@@ -234,6 +249,7 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
             runner_create_time = _proc.process_create_time(runner_pid)
             forked = re.search(r"zygote pid=(\d+), runner pid=", host_log)
             zygote_pid = int(forked.group(1)) if forked else None
+            assert (zygote_pid is not None) == use_zygote, "requested runner launch path not used"
             zygote_create_time = _proc.process_create_time(zygote_pid) if zygote_pid else None
             host_pgid = _pgid_or_none(terminal.child.pid)
             print(
@@ -254,19 +270,32 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                 return bool(body.get("pending"))
 
             assert _wait_until(_gate_pending, _GATE_TIMEOUT_S), "the turn never reached the model"
+            assert len(get_mock_requests(mock_url, key=model)) == 1
             before = client.get(f"/v1/sessions/{session_id}").json()
             print(f"status before hangup: {before.get('status')}")
 
             hangup_at = time.monotonic()
-            terminal.hang_up()
+            if exit_action == "hangup":
+                terminal.hang_up()
+            elif exit_action == "sigterm":
+                os.kill(terminal.child.pid, signal.SIGTERM)
+            else:
+                terminal.child.sendcontrol("c")
             host_exit = terminal.wait_exit(timeout=15)
             print(
                 f"host exit (exitstatus, signalstatus)={host_exit} "
                 f"after {time.monotonic() - hangup_at:.2f}s"
             )
             assert not terminal.child.isalive(), (
-                f"host survived the terminal hangup (test precondition): {host_exit}"
+                f"host survived {exit_action} (test precondition): {host_exit}"
             )
+            if exit_action != "hangup":
+                assert _wait_until(lambda: not _pid_running(runner_pid), 15.0), (
+                    f"explicit {exit_action} left the busy runner draining"
+                )
+                assert len(get_mock_requests(mock_url, key=model)) == 1
+                print(f"explicit {exit_action}: runner stopped with the mock reply still held")
+                return
             assert host_exit[1] == signal.SIGHUP, f"host should die by SIGHUP, not {host_exit}"
             # custom-lint: disable-next=sleep-then-assert -- negative window: runner must not exit
             time.sleep(2.0)
@@ -285,8 +314,6 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
             body = poll_session_until_terminal(
                 client, session_id=session_id, response_id=response_id, timeout=_TURN_TIMEOUT_S
             )
-            # Failure labels land asynchronously; re-read once the status settled.
-            time.sleep(1.0)
             settled = client.get(f"/v1/sessions/{session_id}").json()
             error = settled.get("last_task_error") or body.get("error")
             print(
@@ -299,17 +326,29 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                 f"(runner alive when the model replied: {runner_alive_at_release})"
             )
             assert _REPLY in final_assistant_text(body)
+            assert len(get_mock_requests(mock_url, key=model)) == 1, "turn must not be resubmitted"
             assert _wait_until(lambda: not _pid_running(runner_pid), 30.0), (
                 f"runner {runner_pid} kept running after its turn finished"
             )
         finally:
-            # Reaping does not reserve these non-child PIDs, so confirm identity
-            # (PID plus start time) before SIGKILL to avoid hitting a recycled PID.
-            for pid, create_time in (
-                (runner_pid, runner_create_time),
-                (zygote_pid, zygote_create_time),
-            ):
-                if pid and _pid_running(pid) and _proc.process_create_time(pid) == create_time:
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.kill(pid, 9)
-            terminal.close()
+            try:
+                if zygote_pid is not None and not terminal.child.isalive():
+                    assert _wait_until(lambda: not _pid_running(zygote_pid), 15.0), (
+                        "runner zygote outlived the host"
+                    )
+            finally:
+                # Confirm PID and start time before killing non-child processes.
+                try:
+                    for pid, create_time in (
+                        (runner_pid, runner_create_time),
+                        (zygote_pid, zygote_create_time),
+                    ):
+                        if (
+                            pid
+                            and _pid_running(pid)
+                            and _proc.process_create_time(pid) == create_time
+                        ):
+                            with contextlib.suppress(ProcessLookupError, PermissionError):
+                                os.kill(pid, 9)
+                finally:
+                    terminal.close()

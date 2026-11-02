@@ -274,7 +274,7 @@ def install_host_signal_handlers() -> Callable[[], None]:
     """Log and flush before a stop signal ends the host, then die by that signal.
 
     There is no graceful teardown: runners notice the daemon is gone through
-    their parent-death watchdog. On SIGHUP (the terminal hung up) the hangup
+    their parent-death watchdog. On SIGHUP (e.g. a terminal hangup) the hangup
     callback first tells runners to finish in-flight work. After logging, the
     signal's default action is restored and re-raised, so supervisors still see
     a signal death. POSIX main thread only; elsewhere this is a no-op.

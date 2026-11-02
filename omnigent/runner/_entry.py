@@ -1239,7 +1239,7 @@ def _run_parent_death_killer(
     The CLI sets it (via the adopt signal) while it is still alive, so the
     flag is observed before the subsequent parent-death is detected.
 
-    When *finish_work* is set (the host's terminal hung up) and work is in
+    When *finish_work* is set (the host requested it on SIGHUP) and work is in
     flight, the runner keeps serving until *has_active_work* reports idle or
     *finish_work_max_s* passes; a finished runner then closes as idle.
 
@@ -2194,7 +2194,7 @@ def _install_signal_handlers(
         an intentional stop from a real crash when a terminal watcher races
         the shutdown. ``None`` skips it.
     :param finish_work_event: Optional event set when
-        :data:`RUNNER_FINISH_WORK_SIGNAL` arrives (the host's terminal hung up).
+        :data:`RUNNER_FINISH_WORK_SIGNAL` arrives (the host requested it on SIGHUP).
         ``None`` skips the handler.
     :returns: None.
     """

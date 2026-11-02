@@ -11,6 +11,7 @@ import os
 import queue
 import select
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -12252,25 +12253,31 @@ ific earlier point.
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("draft", ["", _STALE_MULTILINE_DRAFT], ids=["empty", "hidden-draft"])
 @pytest.mark.parametrize("printed", list(_PRINTED_OVER_BOX_PANES))
-@pytest.mark.parametrize("repaint_shows_box", [True, False], ids=["repainted", "still-covered"])
+# Where the repaint finds Claude Code: in the pane's process tree, only through
+# the bridge's session (a launcher runs it outside that tree), or nowhere.
+@pytest.mark.parametrize("repaint_reaches", ["pane-tree", "bridge-session", "nothing"])
 def test_output_printed_over_the_input_box_is_repainted_before_refusing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     slash: bool,
     draft: str,
     printed: str,
-    repaint_shows_box: bool,
+    repaint_reaches: str,
 ) -> None:
     """Output another process printed over the box is repainted, not refused as a draft."""
     composer = _EditableComposer(draft, cursor=len(draft))
     composer.install(monkeypatch)
+    bridge_dir = _picker_bridge_dir(tmp_path)
     covered = True
     repaints: list[str] = []
 
-    def repaint(socket_path: str, tmux_target: str) -> int:
+    def repaint(socket_path: str, tmux_target: str, session_bridge_dir: Path | None = None) -> int:
         nonlocal covered
         repaints.append(tmux_target)
-        covered = not repaint_shows_box
+        if repaint_reaches == "pane-tree" or (
+            repaint_reaches == "bridge-session" and session_bridge_dir == bridge_dir
+        ):
+            covered = False
         return 1
 
     monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
@@ -12281,25 +12288,25 @@ def test_output_printed_over_the_input_box_is_repainted_before_refusing(
             _PRINTED_OVER_BOX_PANES[printed] if covered else composer._capture_pane(*args)
         ),
     )
-    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    message = "/effort high" if slash else "hello from the web"
 
     def inject() -> None:
         if slash:
-            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+            claude_native_bridge.inject_slash_command(bridge_dir, command=message)
         else:
-            inject_user_message(bridge_dir, content="hello from the web")
+            inject_user_message(bridge_dir, content=message)
 
-    if repaint_shows_box:
-        inject()
-        assert [text.strip() for text in composer.submitted] == [
-            "/effort high" if slash else "hello from the web"
-        ]
-    else:
+    if repaint_reaches == "nothing":
         with pytest.raises(
             claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
         ):
             inject()
+        assert message not in composer.text
         assert composer.submitted == []
+    else:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [message]
     assert len(repaints) == 1
 
 
@@ -12391,7 +12398,9 @@ def test_blank_rows_after_an_empty_glyph_row_count_as_a_cleared_box(
     """A whole box holding only blank rows below ``❯`` is empty: nothing can join the paste."""
     sends = _fake_tmux(monkeypatch, ["──────\n❯\n\n──────\n  ? for shortcuts\n"])
 
-    claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+    claude_native_bridge._clear_composer(
+        "/tmp/example/tmux.sock", "claude:0.0", bridge_dir=Path("/tmp/example/bridge")
+    )
 
     assert sum(1 for send in sends if "-l" in send) == 1
 
@@ -14885,6 +14894,49 @@ async def test_curl_evaluate_policy_command_round_trips(
         output = json.loads(result.stdout)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+        # A failing curl replays stdin into the Python hook, which reaches the
+        # same verdict through the relay's policy proxy.
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
+        )
+        failing_bin = tmp_path / "failing-curl"
+        failing_bin.mkdir()
+        (failing_bin / "curl").write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        (failing_bin / "curl").chmod(0o755)
+        calls_before = client.calls
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{failing_bin}{os.pathsep}{os.environ['PATH']}"},
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        assert client.calls == calls_before + 1
+
+        # Without curl on PATH, the command goes straight to the Python hook.
+        no_curl_bin = tmp_path / "no-curl"
+        no_curl_bin.mkdir()
+        for tool in ("cat", "date", "env"):
+            (no_curl_bin / tool).symlink_to(shutil.which(tool))
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": str(no_curl_bin)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "not found" not in result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert client.calls == calls_before + 2
     finally:
         relay.close()
 
@@ -14911,6 +14963,457 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.fixture
+def unaccepting_relay_url() -> Iterator[str]:
+    """Yield the URL of a relay that accepts no connections, like one whose runner is stuck.
+
+    One unaccepted connection fills the listener's accept queue, so the kernel
+    drops later connection attempts and curl's connect hangs.
+    """
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(0)
+        with socket.create_connection(server.getsockname()):
+            yield f"http://127.0.0.1:{server.getsockname()[1]}"
+
+
+def test_policy_hook_runs_python_soon_when_the_relay_accepts_no_connections(
+    tmp_path: Path, unaccepting_relay_url: str
+) -> None:
+    """The policy hook gives up on the connection after seconds, not its day-long ``--max-time``.
+
+    Then it hands the event to the Python hook, which evaluates it without the relay.
+    """
+    python = tmp_path / "python"
+    received = tmp_path / "python-stdin"
+    python.write_text(f"#!/bin/sh\ncat > {shlex.quote(str(received))}\n", encoding="utf-8")
+    python.chmod(0o755)
+    settings = claude_native_bridge.build_hook_settings(
+        tmp_path, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+    )
+    command = next(entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry)[
+        "hooks"
+    ][0]["command"]
+    (tmp_path / "tool_relay.env").write_text(
+        f"OMNIGENT_RELAY_URL='{unaccepting_relay_url}'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert received.read_text() == json.dumps(_PRE_TOOL_USE_PAYLOAD)
+
+
+@pytest.mark.asyncio
+async def test_curl_evaluate_policy_command_keeps_the_relay_token_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The policy hook's curl gets the relay token from a here-doc, not its arguments.
+
+    It also ignores the user's ``.curlrc`` and proxy settings: through the
+    refusing proxy, the verdict would come from the Python fallback ("ask")
+    instead of the relay ("deny").
+    """
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "curl says no"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        args = augment_claude_args((), bridge_dir=bridge_dir, ap_server_url="http://127.0.0.1:9")
+        settings = _load_invocation_settings(args)
+        command = next(
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        )["hooks"][0]["command"]
+        relay_info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        home = tmp_path / "home"
+        home.mkdir()
+        trace = home / "trace.log"
+        (home / ".curlrc").write_text(f'verbose\ntrace-ascii = "{trace}"\n', encoding="utf-8")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        argv_file = tmp_path / "curl-argv"
+        (bin_dir / "curl").write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$@" > {shlex.quote(str(argv_file))}\n'
+            f'exec {shlex.quote(str(shutil.which("curl")))} "$@"\n',
+            encoding="utf-8",
+        )
+        (bin_dir / "curl").chmod(0o755)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            refusing_proxy = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "HOME": str(home),
+            **dict.fromkeys(
+                ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"), refusing_proxy
+            ),
+        }
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", command],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+    finally:
+        relay.close()
+
+    assert result.returncode == 0, result.stderr
+    assert relay_info["token"] not in argv_file.read_text()
+    assert not trace.exists()
+    output = json.loads(result.stdout)
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "curl says no" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+_TERMINAL_ENV = {
+    "OMNIGENT_TERMINAL_INSTANCE_ID": "a" * 32,
+    "OMNIGENT_TERMINAL_LAUNCH_ID": "b" * 32,
+    "OMNIGENT_TERMINAL_LAUNCH_SESSION_ID": "conv_lifecycle",
+}
+
+
+def _fake_hook_python(directory: Path) -> tuple[Path, Path]:
+    """Write a stand-in Python that appends each run's arguments and stdin to a log."""
+    script = directory / "python"
+    runs = directory / "python-runs.log"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(runs))}\n'
+        f"/bin/cat >> {shlex.quote(str(runs))}\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script, runs
+
+
+def _unmatched_hook_command(settings: dict[str, Any], event: str, marker: str) -> str:
+    """Return the command of *event*'s catch-all hook whose command contains *marker*."""
+    return next(
+        hook["command"]
+        for group in settings["hooks"][event]
+        if "matcher" not in group
+        for hook in group["hooks"]
+        if marker in hook["command"]
+    )
+
+
+async def _run_hook_command(
+    command: str, payload: dict[str, object], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run a hook command through /bin/sh off-loop with *env* added to PATH."""
+    return await asyncio.to_thread(
+        subprocess.run,
+        ["/bin/sh", "-c", command],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], **env},
+        timeout=60,
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lifecycle hook posts to the relay with curl.
+
+    The relay does the Python hook's work: it records each event and its
+    lifecycle evidence under the terminal's launch ids, and answers
+    SessionStart with the session link.
+    """
+    from omnigent.conversation_browser import conversation_url
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
+    try:
+        python, runs = _fake_hook_python(tmp_path)
+        settings = claude_native_bridge.build_hook_settings(
+            bridge_dir, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+        )
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": "conv_hook_eval"}), encoding="utf-8"
+        )
+        lifecycle_hook = _unmatched_hook_command(
+            settings, "UserPromptSubmit", "/hook/claude/event"
+        )
+        outputs = {}
+        for event, extra in (
+            ("SessionStart", {"source": "startup"}),
+            ("UserPromptSubmit", {}),
+            ("PreCompact", {"trigger": "manual"}),
+        ):
+            payload = {"hook_event_name": event, "session_id": "claude-1", **extra}
+            result = await _run_hook_command(lifecycle_hook, payload, _TERMINAL_ENV)
+            assert result.returncode == 0, result.stderr
+            outputs[event] = result.stdout
+    finally:
+        relay.close()
+
+    assert not runs.exists()
+    assert claude_native_bridge.read_hook_events_since(bridge_dir, 0)[1] == [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreCompact",
+    ]
+    assert json.loads(outputs["SessionStart"]) == {
+        "systemMessage": "Open this session in Omnigent: "
+        + conversation_url("http://127.0.0.1:9", "conv_hook_eval")
+    }
+    assert outputs["UserPromptSubmit"] == outputs["PreCompact"] == ""
+    lifecycle = json.loads((bridge_dir / f"lifecycle-{'b' * 32}.json").read_text())
+    assert lifecycle["terminal_instance_id"] == "a" * 32
+    assert lifecycle["launch_session_id"] == "conv_lifecycle"
+    assert [event["event_name"] for event in lifecycle["events"]] == [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreCompact",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stop, and a SessionStart from ``/clear`` or ``/resume``, run the Python hook.
+
+    Claude writes a turn's final message while its Stop hooks run, and Python's
+    start-up keeps that message ahead of the Stop record. ``/clear`` and
+    ``/resume`` can rotate the Omnigent session, which the Python hook does
+    with the terminal's credentials. Once the relay is gone, every hook runs it.
+    """
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(
+        bridge_dir, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
+    )
+    lifecycle_hook = _unmatched_hook_command(settings, "SessionStart", "/hook/claude/event")
+    try:
+        for source in ("clear", "resume"):
+            payload = {"hook_event_name": "SessionStart", "source": source, "session_id": "c-1"}
+            result = await _run_hook_command(lifecycle_hook, payload, _TERMINAL_ENV)
+            assert result.returncode == 0, result.stderr
+        for event in ("Stop", "StopFailure"):
+            stop_hook = _unmatched_hook_command(settings, event, "claude_native.hook")
+            result = await _run_hook_command(stop_hook, {"hook_event_name": event}, _TERMINAL_ENV)
+            assert result.returncode == 0, result.stderr
+    finally:
+        relay.close()
+    prompt = {"hook_event_name": "UserPromptSubmit"}
+    result = await _run_hook_command(lifecycle_hook, prompt, _TERMINAL_ENV)
+    assert result.returncode == 0, result.stderr
+
+    log = runs.read_text()
+    assert log.count(f"-I -m omnigent.harnesses.claude_native.hook --bridge-dir {bridge_dir}") == 5
+    assert '"source": "clear"' in log and '"source": "resume"' in log
+    for event in ("Stop", "StopFailure", "UserPromptSubmit"):
+        assert f'"hook_event_name": "{event}"' in log
+    assert claude_native_bridge.read_hook_events_since(bridge_dir, 0)[1] == []
+
+
+def test_lifecycle_hook_runs_python_only_when_the_relay_missed_the_event(tmp_path: Path) -> None:
+    """Python records the event when curl couldn't send it, not after a dropped answer.
+
+    A dropped answer can follow the relay recording the event, so Python would
+    record it twice. An empty relay file leaves curl nowhere to send it.
+    """
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(tmp_path, python_executable=str(python))
+    command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+
+    def run() -> None:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    received = threading.Event()
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+
+        def take_request_and_hang_up() -> None:
+            connection, _ = server.accept()
+            with connection:
+                connection.recv(65536)
+                received.set()
+
+        thread = threading.Thread(target=take_request_and_hang_up, daemon=True)
+        thread.start()
+        (tmp_path / "tool_relay.env").write_text(
+            f"OMNIGENT_RELAY_URL='http://127.0.0.1:{server.getsockname()[1]}'\n"
+            "OMNIGENT_RELAY_TOKEN='token'\n",
+            encoding="utf-8",
+        )
+        run()
+        thread.join(timeout=5)
+    assert received.is_set()
+    assert not runs.exists()
+
+    (tmp_path / "tool_relay.env").write_text("", encoding="utf-8")
+    run()
+    assert payload in runs.read_text()
+
+
+@pytest.mark.parametrize("shell", ["/bin/sh", "bash", "zsh"])
+def test_lifecycle_hook_runs_python_after_a_timeout_that_sent_nothing(
+    tmp_path: Path, shell: str
+) -> None:
+    """curl exits 28 for a connect timeout too; only a timeout after sending skips Python.
+
+    The stand-in curl answers like a real timeout: no body, the ``-w`` request
+    size, exit 28. Request bytes sent mean the relay may have recorded the event.
+    """
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(tmp_path, python_executable=str(python))
+    command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+    (tmp_path / "tool_relay.env").write_text(
+        "OMNIGENT_RELAY_URL='http://127.0.0.1:9'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "curl").write_text(
+        '#!/bin/sh\ncat >/dev/null\nprintf "\\n%s" "$SENT"\nexit 28\n', encoding="utf-8"
+    )
+    (bin_dir / "curl").chmod(0o755)
+
+    def run(sent: str) -> None:
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SENT": sent}
+        result = subprocess.run(
+            [shell, "-c", command],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+
+    run("149")
+    assert not runs.exists(), "a timeout after sending would record the event twice"
+    run("0")
+    assert payload in runs.read_text()
+
+
+def test_lifecycle_hook_runs_python_soon_when_the_relay_accepts_no_connections(
+    tmp_path: Path, unaccepting_relay_url: str
+) -> None:
+    """The connect timeout ends the wait, and Python records the event the relay never got."""
+    python, runs = _fake_hook_python(tmp_path)
+    settings = claude_native_bridge.build_hook_settings(tmp_path, python_executable=str(python))
+    command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+    (tmp_path / "tool_relay.env").write_text(
+        f"OMNIGENT_RELAY_URL='{unaccepting_relay_url}'\nOMNIGENT_RELAY_TOKEN='token'\n",
+        encoding="utf-8",
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert payload in runs.read_text()
+    assert time.monotonic() - started < 8, "the hook waited out its 10-second --max-time"
+
+
+@pytest.mark.asyncio
+async def test_relay_hook_failures_reach_the_sessions_hook_stderr_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relay-side recording failure is written where the Python hook's stderr goes.
+
+    The forwarder reports that file's lines with the session id.
+    """
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, _ScriptedPolicyClient({}))
+    try:
+        python, runs = _fake_hook_python(tmp_path)
+        settings = claude_native_bridge.build_hook_settings(
+            bridge_dir, python_executable=str(python)
+        )
+        command = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
+        (bridge_dir / claude_native_bridge._HOOKS_FILE).mkdir()
+        result = await _run_hook_command(command, {"hook_event_name": "UserPromptSubmit"}, {})
+    finally:
+        relay.close()
+
+    assert result.returncode == 0, result.stderr
+    assert not runs.exists()
+    stderr_file = bridge_dir / claude_native_bridge.OBSERVER_HOOK_STDERR_FILE
+    assert "omnigent claude hook: failed to record hook" in stderr_file.read_text()
+
+
+def test_framework_context_hook_starts_python_only_for_pending_context(tmp_path: Path) -> None:
+    """Without pending framework context the shell answers the prompt hook.
+
+    Pending context still goes to the Python hook, which reads and removes it,
+    so Claude gets it once.
+    """
+    fake_python, runs = _fake_hook_python(tmp_path)
+    fake_settings = claude_native_bridge.build_hook_settings(
+        tmp_path, python_executable=str(fake_python)
+    )
+    fake_hook = _unmatched_hook_command(fake_settings, "UserPromptSubmit", "framework-context")
+    real_hook = _unmatched_hook_command(
+        claude_native_bridge.build_hook_settings(tmp_path), "UserPromptSubmit", "framework-context"
+    )
+    payload = json.dumps({"hook_event_name": "UserPromptSubmit"})
+
+    def run(command: str) -> str:
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    assert run(fake_hook) == ""
+    assert not runs.exists()
+    (tmp_path / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE).write_text(
+        "pending context", encoding="utf-8"
+    )
+    outputs = [run(real_hook), run(fake_hook)]
+
+    assert json.loads(outputs[0]) == {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "pending context",
+        }
+    }
+    assert outputs[1] == ""
+    assert not runs.exists()
 
 
 @pytest.mark.asyncio
