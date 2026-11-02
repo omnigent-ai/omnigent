@@ -30,6 +30,17 @@ _STORYBOOK_SNAPSHOT_ROOT = (
     / "test_story_matches_baseline"
 )
 _VISUAL_TAG = "visual-snapshot"
+_FREEZE_MOTION_CSS = (
+    "*, *::before, *::after { animation: none !important; transition: none !important; }"
+)
+# Installed before any story script runs, so play functions interact with
+# settled layout: a flyout opened mid-animation anchors to its parent's
+# in-flight transform and keeps that stale position after motion stops.
+_FREEZE_MOTION_INIT_SCRIPT = f"""
+const sheet = new CSSStyleSheet();
+sheet.replaceSync({json.dumps(_FREEZE_MOTION_CSS)});
+document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+"""
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,7 @@ def test_story_matches_baseline(
         route.abort()
 
     page.route("**/*", reject_external_request)
+    page.add_init_script(_FREEZE_MOTION_INIT_SCRIPT)
     story_id = quote(story.id, safe="")
     page.goto(f"{storybook_server}/iframe.html?id={story_id}&viewMode=story")
 
@@ -140,13 +152,9 @@ def test_story_matches_baseline(
     assert story_status == "success", f"Storybook story finished with status {story_status!r}"
     assert play_error is None, "Storybook play function threw an exception"
 
-    # Freeze motion so spinners, transitions, and delayed mascot animation do
-    # not encode capture timing into the baseline.
-    page.add_style_tag(
-        content=(
-            "*, *::before, *::after { animation: none !important; transition: none !important; }"
-        )
-    )
+    # Motion is already frozen by the init script; restate it in the document
+    # in case a story replaced the adopted stylesheets.
+    page.add_style_tag(content=_FREEZE_MOTION_CSS)
     shared_code_blocks = page.locator('[data-code-highlighted="false"]')
     if shared_code_blocks.count() > 0:
         page.wait_for_function(
