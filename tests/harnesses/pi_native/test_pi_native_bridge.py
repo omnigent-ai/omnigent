@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 from pathlib import Path
@@ -117,6 +118,65 @@ def test_enqueue_model_change_payload_shape(tmp_path: Path) -> None:
     assert payload["type"] == "model_change"
     assert payload["model"] == "databricks-claude-sonnet-4-6"
     assert isinstance(payload["created_at"], (int, float))
+
+
+def test_enqueue_model_change_acknowledgement_envelope(tmp_path: Path) -> None:
+    """Startup replay requests carry an acknowledgement id; ordinary changes do not."""
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+
+    acknowledged_id = pi_native_bridge.enqueue_model_change(
+        bridge_dir, "openai-codex/gpt-5.6-sol", wait_for_ack=True
+    )
+    ordinary_id = pi_native_bridge.enqueue_model_change(bridge_dir, "openai-codex/gpt-5.6-terra")
+
+    payloads = {
+        payload["id"]: payload
+        for payload in (
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (bridge_dir / "inbox").glob("*.json")
+        )
+    }
+    assert payloads[acknowledged_id]["ack_id"] == acknowledged_id
+    assert "ack_id" not in payloads[ordinary_id]
+
+
+def test_wait_for_model_change_ack_returns_acceptance(tmp_path: Path) -> None:
+    """An acknowledgement is consumed only when its id matches the request."""
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "acks").mkdir(parents=True)
+    change_id = "model_change_ack-test"
+    ack_path = bridge_dir / "acks" / f"{change_id}.json"
+    ack_path.write_text(json.dumps({"id": change_id, "ok": True}), encoding="utf-8")
+
+    assert asyncio.run(pi_native_bridge.wait_for_model_change_ack(bridge_dir, change_id)) is True
+    assert not ack_path.exists()
+
+
+def test_wait_for_model_change_ack_returns_false_for_rejection_and_timeout(tmp_path: Path) -> None:
+    """Rejected and missing acknowledgements never make startup replay look successful."""
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "acks").mkdir(parents=True)
+    change_id = "model_change_rejected-test"
+    (bridge_dir / "acks" / f"{change_id}.json").write_text(
+        json.dumps({"id": change_id, "ok": False, "error": "not available"}),
+        encoding="utf-8",
+    )
+
+    assert (
+        asyncio.run(
+            pi_native_bridge.wait_for_model_change_ack(bridge_dir, change_id, timeout=0.01)
+        )
+        is False
+    )
+    assert (
+        asyncio.run(
+            pi_native_bridge.wait_for_model_change_ack(
+                bridge_dir, "model_change_missing", timeout=0.01
+            )
+        )
+        is False
+    )
 
 
 def test_enqueue_user_message_payload_shape(tmp_path: Path) -> None:
