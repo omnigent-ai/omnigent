@@ -151,6 +151,7 @@ follow-up turn, and a resumed session prove the full agent flow.
 | Symptom | Likely cause |
 |---|---|
 | `400 model "<id>" is not available on the anthropic_messages endpoint` (or `openai_responses`) | The model does not match the path. Use a Claude model on `/anthropic` and an OpenAI model on `/openai/v1`, or switch to `/v1` with `wire_api: chat`. |
+| `403` with `AI Gateway credits required`, or `/v1/models` lists no enabled models (`unavailable_reason: credits_required`) | The organization has no prepaid AI Gateway credits. Add credits from the Neon Console **Billing** page; the error's `recovery_url` links to it. |
 | `401` | The token lacks the `ai_gateway:invoke` scope, was revoked, or belongs to a branch outside this host's lineage. |
 | `429` mentioning the input or output token limit | The account's 200,000 tokens per minute limit (input and output are counted separately). Requests resume when the window resets. |
 | `429` with `REQUEST_LIMIT_EXCEEDED` | Neon's account-level daily spend cap. See Neon's [troubleshooting guide](https://neon.com/docs/ai-gateway/troubleshooting). |
