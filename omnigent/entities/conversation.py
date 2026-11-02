@@ -321,6 +321,12 @@ class MessageData(BaseModel):
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
         Stored as given so clients can act on values added later; ``None``
         when unset, not a string, or longer than 64 characters.
+    :param source_session_id: Session whose agent sent this user message into
+        a child session, e.g. ``"conv_parent123"``. The server keeps it only
+        for a message the parent's runner sent to that parent's child; a
+        single-user server, with no other caller to forge it, skips that proof.
+    :param source_agent_name: Display name of the agent in
+        ``source_session_id``, stamped by the server, e.g. ``"Claude"``.
     """
 
     role: Literal["user", "assistant"]
@@ -336,6 +342,8 @@ class MessageData(BaseModel):
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    source_session_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    source_agent_name: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("content")
     @classmethod
@@ -366,6 +374,12 @@ class MessageData(BaseModel):
         if self.role == "user" and self.phase is not None:
             raise ValueError("user messages cannot carry 'phase'")
         return self
+
+    def without_source(self) -> MessageData:
+        """Return this message without sender fields that only the server may stamp."""
+        if self.source_session_id is None and self.source_agent_name is None:
+            return self
+        return self.model_copy(update={"source_session_id": None, "source_agent_name": None})
 
 
 def synthesize_conversation_title(

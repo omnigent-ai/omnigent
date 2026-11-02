@@ -238,6 +238,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
     _resolve_harness,
+    _resolve_message_source,
     _response_agent_name_from_store,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
@@ -1257,6 +1258,16 @@ def register_events_routes(
                 pass
             else:
                 created_by = body_created_by
+        body = await _resolve_message_source(
+            body,
+            parent_session_id=conv.parent_conversation_id,
+            # Single-user servers have no other identity to forge a sender for.
+            speaks_for=lambda source: (
+                permission_store is None or _has_runner_created_by_authority(request, source)
+            ),
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+        )
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent

@@ -1548,8 +1548,9 @@ async def _post_child_message_event(
     *,
     content: list[_JsonObject],
     created_by: str | None,
+    source_session_id: str,
 ) -> httpx.Response:
-    """Post a child message, retrying once without best-effort attribution."""
+    """Post a child message from *source_session_id*, retrying once without attribution."""
 
     def _payload(actor: str | None) -> _JsonObject:
         return {
@@ -1557,6 +1558,7 @@ async def _post_child_message_event(
             "data": {
                 "role": "user",
                 "content": content,
+                "source_session_id": source_session_id,
             },
             **({"created_by": actor} if actor is not None else {}),
         }
@@ -1658,6 +1660,7 @@ async def _send_to_in_flight_child(
             child_session_id,
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
+            source_session_id=conversation_id,
         )
     except httpx.HTTPError as exc:
         return (
@@ -3117,6 +3120,7 @@ async def _execute_subagent_tool(
             child_session_id,
             content=message_content,
             created_by=dispatch_created_by,
+            source_session_id=conversation_id,
         )
     except httpx.HTTPError as exc:
         teardown_warning = await _teardown_failed_child(
@@ -3303,6 +3307,7 @@ async def _send_to_existing_session(
             target_session_id,
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
+            source_session_id=conversation_id,
         )
     except httpx.HTTPError as exc:
         await _teardown_failed_child(server_client, target_session_id, created_child=False)
@@ -3376,7 +3381,11 @@ def _build_session_create_body(
         body["initial_items"] = [
             {
                 "type": "message",
-                "data": {"role": "user", "content": [{"type": "input_text", "text": message}]},
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message}],
+                    "source_session_id": conversation_id,
+                },
             }
         ]
     return body
@@ -3736,6 +3745,8 @@ async def _post_child_first_message(
     child_session_id: str,
     message: str,
     server_client: httpx.AsyncClient,
+    *,
+    source_session_id: str,
 ) -> str | None:
     """
     Queue a bundle-created child's first user message.
@@ -3748,6 +3759,7 @@ async def _post_child_first_message(
         e.g. ``"conv_abc123"``.
     :param message: The first user message text.
     :param server_client: HTTP client pointed at the Omnigent server.
+    :param source_session_id: The creating (parent) session id.
     :returns: ``None`` on success; a JSON error string (carrying the
         created ``conversation_id`` so the orchestrator can retry via
         ``sys_session_send``) on failure.
@@ -3760,6 +3772,7 @@ async def _post_child_first_message(
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": message}],
+                    "source_session_id": source_session_id,
                 },
             },
             timeout=30.0,
@@ -3909,7 +3922,9 @@ async def _session_create_from_config_path(
 
     message = args.get("message")
     if isinstance(message, str) and message:
-        message_error = await _post_child_first_message(child_session_id, message, server_client)
+        message_error = await _post_child_first_message(
+            child_session_id, message, server_client, source_session_id=conversation_id
+        )
         if message_error is not None:
             return message_error
 
