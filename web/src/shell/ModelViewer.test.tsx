@@ -13,9 +13,9 @@ import type { FileContentResponse } from "@/hooks/useFileContent";
 interface LoaderBehavior {
   // What the active loader's parse should do.
   mode: "valid" | "empty" | "nan" | "throw";
-  // If set, the OrbitControls constructor throws AFTER the renderer is created,
-  // exercising the partial-init failure/teardown path.
-  orbitThrows: boolean;
+  // If set, the TrackballControls constructor throws AFTER the renderer is
+  // created, exercising the partial-init failure/teardown path.
+  trackballThrows: boolean;
   // If set, the parsed object carries a mesh whose material references textures
   // (as a textured 3MF does), so teardown's texture disposal can be asserted.
   texturedMaterial: boolean;
@@ -23,7 +23,7 @@ interface LoaderBehavior {
 
 const behavior: LoaderBehavior = {
   mode: "valid",
-  orbitThrows: false,
+  trackballThrows: false,
   texturedMaterial: false,
 };
 
@@ -59,6 +59,43 @@ let lastRenderer: RendererRecord | null = null;
 // the STL loader runs (the only format that builds its own material).
 let lastMaterial: { color: number } | null = null;
 
+// The parsed root, its rotation when its bounds were measured, and how many
+// times that rotation was written: print formats must be stood up exactly once,
+// before the bounds that drive camera fitting.
+let lastParsedObject: { rotation: { x: number } } | null = null;
+let rotationAtBounds: number | null = null;
+let rotationWrites = 0;
+
+function makeRotation() {
+  let x = 0;
+  return Object.defineProperty({}, "x", {
+    get: () => x,
+    set: (value: number) => {
+      x = value;
+      rotationWrites += 1;
+    },
+  }) as { x: number };
+}
+
+// Scene-graph records for the controls and headlight tests.
+interface ControlsRecord {
+  kind: "orbit" | "trackball";
+  instance: { rotateSpeed: number };
+  camera: unknown;
+  cameraPositionOnConstruction: { x: number; y: number; z: number };
+  handleResizeCalls: number;
+  updateCalls: number;
+  disposeCalls: number;
+}
+let lastControls: ControlsRecord | null = null;
+let lastCamera: {
+  children: unknown[];
+  position: { x: number; y: number; z: number };
+} | null = null;
+let lastScene: { children: unknown[] } | null = null;
+let lastKeyTarget: { parent: unknown; position: { x: number; y: number; z: number } } | null = null;
+let resizeControls: (() => void) | null = null;
+
 function makeParsedObject() {
   // A textured mesh mirrors what a 3MF loader yields: a material whose slots
   // (map, normalMap) hold Texture instances. disposeObject must free those, so
@@ -82,6 +119,7 @@ function makeParsedObject() {
           ? { empty: false, nan: true }
           : { empty: false, nan: false },
     position: { sub: () => {} },
+    rotation: makeRotation(),
     traverse: (cb: (child: unknown) => void) => cb(child),
   };
 }
@@ -100,16 +138,44 @@ vi.mock("three/examples/jsm/loaders/STLLoader.js", () => ({ STLLoader: loaderStu
 vi.mock("three/examples/jsm/loaders/3MFLoader.js", () => ({ ThreeMFLoader: loaderStub("3mf") }));
 vi.mock("three/examples/jsm/loaders/OBJLoader.js", () => ({ OBJLoader: loaderStub("obj") }));
 
-vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
-  OrbitControls: class {
-    constructor() {
-      if (behavior.orbitThrows) throw new Error("orbit init failed");
+// Both controls modules are stubbed so a test can tell which one the viewer
+// built; the record also captures the camera position at construction, since
+// TrackballControls snapshot it for reset().
+function controlsStub(kind: "orbit" | "trackball") {
+  return class {
+    rotateSpeed = 1;
+    constructor(camera: unknown) {
+      if (kind === "trackball" && behavior.trackballThrows) {
+        throw new Error("controls init failed");
+      }
+      const position = (camera as { position: { x: number; y: number; z: number } }).position;
+      lastControls = {
+        kind,
+        instance: this,
+        camera,
+        cameraPositionOnConstruction: { x: position.x, y: position.y, z: position.z },
+        handleResizeCalls: 0,
+        updateCalls: 0,
+        disposeCalls: 0,
+      };
     }
-    enableDamping = false;
-    target = { set: () => {} };
-    update() {}
-    dispose() {}
-  },
+    handleResize() {
+      if (lastControls) lastControls.handleResizeCalls += 1;
+    }
+    update() {
+      if (lastControls) lastControls.updateCalls += 1;
+    }
+    dispose() {
+      if (lastControls) lastControls.disposeCalls += 1;
+    }
+  };
+}
+
+vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
+  OrbitControls: controlsStub("orbit"),
+}));
+vi.mock("three/examples/jsm/controls/TrackballControls.js", () => ({
+  TrackballControls: controlsStub("trackball"),
 }));
 
 vi.mock("three", () => {
@@ -117,7 +183,10 @@ vi.mock("three", () => {
     x = 0;
     y = 0;
     z = 0;
-    set() {
+    set(x: number, y: number, z: number) {
+      this.x = x;
+      this.y = y;
+      this.z = z;
       return this;
     }
     sub() {
@@ -128,7 +197,9 @@ vi.mock("three", () => {
     min = { x: 0, y: 0, z: 0 };
     max = { x: 1, y: 1, z: 1 };
     private empty = false;
-    setFromObject(obj: { boxSpec?: { empty: boolean; nan: boolean } }) {
+    setFromObject(obj: { boxSpec?: { empty: boolean; nan: boolean }; rotation?: { x: number } }) {
+      lastParsedObject = obj as { rotation: { x: number } };
+      rotationAtBounds = obj.rotation?.x ?? 0;
       const box = obj.boxSpec ?? { empty: false, nan: false };
       this.empty = box.empty;
       if (box.nan) this.max = { x: NaN, y: 1, z: 1 };
@@ -145,11 +216,22 @@ vi.mock("three", () => {
     }
   }
   class PerspectiveCamera {
+    isPerspectiveCamera = true;
     fov = 45;
     aspect = 1;
     near = 0.1;
     far = 1000;
     position = new Vector3();
+    children: unknown[] = [];
+    constructor() {
+      lastCamera = { children: this.children, position: this.position };
+    }
+    add(...objects: { parent?: unknown }[]) {
+      for (const object of objects) {
+        object.parent = this;
+        this.children.push(object);
+      }
+    }
     updateProjectionMatrix() {}
   }
   class WebGLRenderer {
@@ -173,13 +255,20 @@ vi.mock("three", () => {
     }
   }
   class Scene {
-    add() {}
+    children: unknown[] = [];
+    constructor() {
+      lastScene = { children: this.children };
+    }
+    add(...objects: unknown[]) {
+      this.children.push(...objects);
+    }
     remove() {}
   }
   class Mesh {
     geometry = null;
     material = null;
     position = new Vector3();
+    rotation = makeRotation();
     traverse(cb: (c: unknown) => void) {
       cb(this);
     }
@@ -213,10 +302,14 @@ vi.mock("three", () => {
       }
     },
     DirectionalLight: class {
+      isDirectionalLight = true;
       position = new Vector3();
       intensity: number;
+      parent: unknown = null;
+      target = { parent: null as unknown, position: new Vector3() };
       constructor(_color?: number, intensity = 1) {
         this.intensity = intensity;
+        lastKeyTarget = this.target;
       }
     },
   };
@@ -249,13 +342,21 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
 // its body exactly once instead of spinning.
 beforeEach(() => {
   behavior.mode = "valid";
-  behavior.orbitThrows = false;
+  behavior.trackballThrows = false;
   behavior.texturedMaterial = false;
   materialTextures.map = makeTextureRecord();
   materialTextures.normalMap = makeTextureRecord();
   parseCalls.length = 0;
   lastRenderer = null;
   lastMaterial = null;
+  lastParsedObject = null;
+  rotationAtBounds = null;
+  rotationWrites = 0;
+  lastControls = null;
+  lastCamera = null;
+  lastScene = null;
+  lastKeyTarget = null;
+  resizeControls = null;
   themeState.resolvedTheme = "light";
   vi.stubGlobal(
     "requestAnimationFrame",
@@ -265,6 +366,9 @@ beforeEach(() => {
   vi.stubGlobal(
     "ResizeObserver",
     class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeControls = () => callback([], this as unknown as ResizeObserver);
+      }
       observe() {}
       unobserve() {}
       disconnect() {}
@@ -316,6 +420,88 @@ describe("ModelViewer loader selection (unified with dispatch)", () => {
   });
 });
 
+describe("ModelViewer print orientation", () => {
+  // STL and 3MF loaders return the slicer's Z-up frame; the viewer stands the
+  // part up once, before measuring the bounds that frame the camera.
+  it("rotates STL once before computing bounds", async () => {
+    render(<ModelViewer data={makeData({ path: "part.stl" })} path="part.stl" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["stl"]);
+    expect(lastParsedObject?.rotation.x).toBe(-Math.PI / 2);
+    expect(rotationAtBounds).toBe(-Math.PI / 2);
+    expect(rotationWrites).toBe(1);
+  });
+
+  it("rotates 3MF once before computing bounds", async () => {
+    render(<ModelViewer data={makeData({ path: "part.3mf" })} path="part.3mf" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["3mf"]);
+    expect(lastParsedObject?.rotation.x).toBe(-Math.PI / 2);
+    expect(rotationAtBounds).toBe(-Math.PI / 2);
+    expect(rotationWrites).toBe(1);
+  });
+
+  it("leaves OBJ, which is already Y-up, unrotated", async () => {
+    render(<ModelViewer data={makeData({ path: "mesh.obj" })} path="mesh.obj" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    expect(parseCalls).toEqual(["obj"]);
+    expect(lastParsedObject?.rotation.x).toBe(0);
+    expect(rotationAtBounds).toBe(0);
+    expect(rotationWrites).toBe(0);
+  });
+});
+
+describe("ModelViewer trackball controls and headlight", () => {
+  it("fits the camera before building trackball controls and resizes them with the pane", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    const controls = lastControls;
+    if (!controls) throw new Error("TrackballControls were not initialized");
+
+    expect(controls.kind).toBe("trackball");
+    expect((controls.camera as { children: unknown[] }).children).toBe(lastCamera?.children);
+    // The controls snapshot the camera for reset(), so it must already be at
+    // its fitted position when they are built.
+    expect(controls.cameraPositionOnConstruction).toEqual(lastCamera?.position);
+    expect(controls.cameraPositionOnConstruction).not.toEqual({ x: 0, y: 0, z: 0 });
+    expect(controls.updateCalls).toBeGreaterThanOrEqual(1);
+
+    resizeControls?.();
+    expect(controls.handleResizeCalls).toBe(1);
+  });
+
+  it("turns the model about once per canvas width of drag", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    // TrackballControls rotate rotateSpeed radians per half canvas width.
+    expect(lastControls?.instance.rotateSpeed).toBe(Math.PI);
+  });
+
+  it("parents the key light and its target to the camera, which joins the scene", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    const camera = lastScene?.children.find(
+      (child) => (child as { isPerspectiveCamera?: boolean }).isPerspectiveCamera,
+    );
+    expect(camera).toBeDefined();
+    const carried = lastCamera?.children ?? [];
+    expect(
+      carried.some((child) => (child as { isDirectionalLight?: boolean }).isDirectionalLight),
+    ).toBe(true);
+    expect(carried).toContain(lastKeyTarget);
+    expect(lastKeyTarget?.parent).toBe(camera);
+    // Aimed straight down the view axis, so camera-facing surfaces stay lit.
+    expect(lastKeyTarget?.position).toMatchObject({ x: 0, y: 0, z: -1 });
+  });
+
+  it("disposes the controls on unmount", async () => {
+    const { unmount } = render(<ModelViewer data={makeData()} path="part.stl" />);
+    await waitFor(() => expect(lastControls).not.toBeNull());
+    unmount();
+    expect(lastControls?.disposeCalls).toBe(1);
+  });
+});
+
 describe("ModelViewer error states", () => {
   it("shows the error overlay for a malformed model (parse throws)", async () => {
     behavior.mode = "throw";
@@ -363,10 +549,10 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
 
 describe("ModelViewer teardown", () => {
   it("releases the renderer/WebGL context on a post-init failure (no leak)", async () => {
-    // Renderer is created, then OrbitControls throws — the failure path must
-    // tear down the already-created renderer (dispose + forceContextLoss)
+    // Renderer is created, then TrackballControls throws — the failure path
+    // must tear down the already-created renderer (dispose + forceContextLoss)
     // rather than leaking the context until unmount.
-    behavior.orbitThrows = true;
+    behavior.trackballThrows = true;
     render(<ModelViewer data={makeData()} path="part.stl" />);
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     await waitFor(() => expect(lastRenderer?.contextLost).toBe(true));
