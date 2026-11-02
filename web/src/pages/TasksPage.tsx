@@ -420,9 +420,9 @@ function TemplateGallery({
     <section
       className={preview ? "mt-6 border-t border-border/60 pt-6" : undefined}
       data-testid="tasks-suggestions"
-      aria-label={preview ? "Start from a template" : "Automation templates"}
+      aria-label={preview ? "Suggested Automations" : "Automation templates"}
     >
-      {preview && <h2 className="mb-3 text-base font-semibold">Start from a template</h2>}
+      {preview && <h2 className="mb-3 text-base font-semibold">Suggested Automations</h2>}
       <div className="grid gap-x-6 gap-y-2 md:grid-cols-2">
         {AUTOMATION_TEMPLATES.map((template) => {
           const Icon = template.icon;
