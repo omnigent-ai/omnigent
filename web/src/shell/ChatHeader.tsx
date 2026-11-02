@@ -35,6 +35,7 @@ import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
+import { HistoryNavigationButtons } from "./HistoryNavigationButtons";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
 import { HeaderTitle } from "./HeaderTitle";
@@ -562,12 +563,18 @@ export function ChatHeader({
           !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
-          <SidebarOpenButton
-            onOpenSidebar={onOpenSidebar}
-            settingsMode={settingsMode}
-            componentId="chat.header.open_sidebar"
-          />
+        {(!canvas || canvas.compact || canvas.focused) && (
+          <div className="flex shrink-0 items-center gap-1 empty:hidden">
+            {!sidebarOpen && (
+              <SidebarOpenButton
+                onOpenSidebar={onOpenSidebar}
+                settingsMode={settingsMode}
+                componentId="chat.header.open_sidebar"
+              />
+            )}
+            {/* Phone Settings has its own back control and centers a fixed title over this slot. */}
+            {!(settingsMode && isMobile) && <HistoryNavigationButtons />}
+          </div>
         )}
         {canvas?.compact && (
           <Button

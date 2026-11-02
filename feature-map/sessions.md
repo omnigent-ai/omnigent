@@ -134,6 +134,15 @@ the header menu), and each place is a separate entry point.
   uses the latest summary, retained context and subsequent turns.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
+- `history-navigation`: the desktop app and the iOS/Android apps show Back and
+  Forward arrows at the left of the page header. They step through the pages
+  visited in that window (sessions, sub-agent sessions, Inbox, Tasks, Settings);
+  switching Chat/Terminal or opening a file is not a step. An arrow is disabled
+  when there is nothing in its direction or the next page is outside the app,
+  such as the workspace root of a workspace-hosted server. Browser tabs,
+  WebViews without the Navigation API, phone app builds without the sidebar
+  server picker, and phone-width Settings pages, which keep their own back
+  arrow, show no arrows.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab. On macOS the browser toolbar can also import the current site's
@@ -503,6 +512,14 @@ create or select a closable Browser soft tab automatically.
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
 to switch, or press Escape to cancel.
+
+**History arrows, desktop app:** the Back and Forward arrows sit at the left of
+the page header, next to the sidebar toggle. On macOS they follow the title-bar
+Search/Settings/collapse controls when the sidebar is collapsed and start the
+main pane's header when it is open; on Windows and Linux they follow the
+sidebar toggle. **iOS and Android apps:** the arrows sit next to the header's
+menu button on phones (except on Settings pages) and at the left of the
+header on tablets.
 
 ## Driving it with the repro environment
 
@@ -923,6 +940,15 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold
   Control and press Tab to show the five most recent, cycle with Tab and
   Shift+Tab, release Control to switch, then reopen and press Escape to cancel.
+- **`history-navigation` (component):**
+  `web/src/shell/HistoryNavigationButtons.test.tsx` (shell gating, router
+  stepping, and the mount-path boundary) and the `shell history navigation`
+  cases in `web/src/shell/ChatHeader.test.tsx`. **Manual, desktop and phone
+  apps:** open sessions A, B, and C from the sidebar; Back is enabled and
+  Forward disabled. Press Back twice to reach A (Back is now disabled), Forward
+  once to reach B, then open Settings and press Back to return to B. Switching
+  Chat/Terminal is not a step. Against a workspace-hosted server, Back on the
+  first app page stays disabled instead of returning to the workspace root.
 - **`browser-storage` (real Electron, own environment):**
   `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
   tab, open it in another tab and the agent browser, and confirm both are signed
@@ -1020,6 +1046,9 @@ plain `uv run pytest`, which starts a private server for the test.
 
 ## Gotchas
 
+- History arrows render only in the native shells. A browser tab shows none, so
+  a browser run with an injected bridge marker checks layout and stepping but
+  not the packaged app's Navigation API or its root redirect.
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new
