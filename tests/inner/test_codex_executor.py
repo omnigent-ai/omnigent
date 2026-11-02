@@ -5167,6 +5167,29 @@ def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
     assert codex_skill_sources(None, home, workspace=home) == host_tiers
 
 
+def test_codex_skill_sources_skips_symlink_loops(tmp_path: Path) -> None:
+    """A looping skills symlink is skipped without hiding the valid workspace or host tiers."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "app"
+    for directory in (
+        home / ".codex" / "skills",
+        home / ".agents",
+        repo / ".git",
+        repo / ".agents",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    for looping in (home / ".agents" / "skills", repo / ".agents" / "skills"):
+        looping.symlink_to(looping)
+    assert codex_skill_sources(None, home, workspace=workspace) == [
+        workspace.resolve() / ".agents" / "skills",
+        home / ".codex" / "skills",
+    ]
+
+
 def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
     """Only existing dirs are returned (bundle absent → host only)."""
     from omnigent.inner.codex_executor import codex_skill_sources

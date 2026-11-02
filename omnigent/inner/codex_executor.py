@@ -762,7 +762,8 @@ def _codex_repo_skill_dirs(workspace: Path) -> list[Path]:
     Like Codex, walk from the workspace up to the nearest ``.git`` ancestor;
     outside a repository only the workspace's own directory is read.
     """
-    current = workspace.resolve()
+    # realpath, unlike Path.resolve, tolerates symlink loops.
+    current = Path(os.path.realpath(workspace))
     chain = [current, *current.parents]
     repo_root = next((directory for directory in chain if (directory / ".git").exists()), None)
     scoped = chain[: chain.index(repo_root) + 1] if repo_root is not None else [current]
@@ -809,11 +810,11 @@ def codex_skill_sources(
     shared = home / ".agents" / "skills"
     if workspace is not None:
         # A home-directory workspace keeps ~/.agents/skills at its user-tier rank.
-        user_tier = shared.resolve()
+        user_tier = os.path.realpath(shared)
         sources.extend(
             directory
             for directory in _codex_repo_skill_dirs(workspace)
-            if directory.is_dir() and directory.resolve() != user_tier
+            if directory.is_dir() and os.path.realpath(directory) != user_tier
         )
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
