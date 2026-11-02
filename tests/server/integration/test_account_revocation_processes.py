@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import socket
+import re
 import subprocess
 import sys
 import time
@@ -27,11 +27,13 @@ def test_delete_revokes_cookie_and_refresh_on_another_server(tmp_path: Path) -> 
             "OMNIGENT_SKIP_WEB_UI": "true",
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
             "OMNIGENT_AUTH_PROVIDER": "accounts",
+            "OMNIGENT_ACCOUNTS_BASE_URL": "http://127.0.0.1",
             "OMNIGENT_ACCOUNTS_COOKIE_SECRET": "ab" * 32,
             "OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME": "admin",
             "OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD": "admin-pw-12345",
             "OMNIGENT_ACCOUNTS_AUTO_OPEN": "0",
             "OMNIGENT_ADMIN_CREDENTIALS_PATH": str(tmp_path / "admin-creds"),
+            "OMNIGENT_LOG_LEVEL": "INFO",
             "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
             "XDG_DATA_HOME": str(tmp_path / "xdg-data"),
         }
@@ -42,12 +44,10 @@ def test_delete_revokes_cookie_and_refresh_on_another_server(tmp_path: Path) -> 
         clients = []
         try:
             for index in range(2):
-                with socket.socket() as sock:
-                    sock.bind(("127.0.0.1", 0))
-                    port = sock.getsockname()[1]
-                base = f"http://127.0.0.1:{port}"
-                env["OMNIGENT_ACCOUNTS_BASE_URL"] = base
                 log_path = tmp_path / f"server-{index}.log"
+                process_log_path = tmp_path / f"server-{index}-process.log"
+                process_log_path.touch()
+                env["OMNIGENT_PROCESS_LOG_FILE"] = str(process_log_path)
                 log = stack.enter_context(log_path.open("w"))
                 process = subprocess.Popen(
                     [
@@ -58,7 +58,7 @@ def test_delete_revokes_cookie_and_refresh_on_another_server(tmp_path: Path) -> 
                         "--host",
                         "127.0.0.1",
                         "--port",
-                        str(port),
+                        "0",
                         "--database-uri",
                         f"sqlite:///{tmp_path / 'test.db'}",
                         "--artifact-location",
@@ -70,8 +70,22 @@ def test_delete_revokes_cookie_and_refresh_on_another_server(tmp_path: Path) -> 
                     stderr=subprocess.STDOUT,
                 )
                 processes.append(process)
-                client = stack.enter_context(httpx.Client(base_url=base, timeout=5))
                 deadline = time.monotonic() + 30
+                # Discover the kernel-assigned listener after Uvicorn owns its port.
+                while time.monotonic() < deadline:
+                    logs = log_path.read_text() + process_log_path.read_text()
+                    assert process.poll() is None, logs
+                    listening = re.search(
+                        r"Uvicorn running on (http://127\.0\.0\.1:[1-9]\d*)",
+                        logs,
+                    )
+                    if listening is not None:
+                        base = listening.group(1)
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(log_path.read_text() + process_log_path.read_text())
+                client = stack.enter_context(httpx.Client(base_url=base, timeout=5))
                 while time.monotonic() < deadline:
                     assert process.poll() is None, log_path.read_text()
                     try:
