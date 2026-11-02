@@ -4122,6 +4122,7 @@ def create_runner_app(
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
+        inbox_recovery_checked = False
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
@@ -4161,13 +4162,18 @@ def create_runner_app(
             if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
                 watcher.cancel()
             if not has_buffered and not _suppress_status:
+                # Schedule unread inbox results before deciding the session is done.
+                # An intermediate idle lets headless clients stop the runner early.
+                _rewake_parent_if_inbox_stranded(conv_id)
+                inbox_recovery_checked = True
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
-                    (e := _subagent_work_by_child.get(c)) is not None
-                    and e.status in ("launching", "running", "waiting")
-                    for c in children
+                    (entry := _subagent_work_by_child.get(child_id)) is not None
+                    and entry.status in ("launching", "running", "waiting")
+                    for child_id in children
                 )
-                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
+                waiting = has_running_children or conv_id in _subagent_wake_pending
+                _publish_turn_status(conv_id, "waiting" if waiting else "idle")
         if was_interrupted:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
@@ -4202,6 +4208,8 @@ def create_runner_app(
             # A clean native turn end acknowledges prompt submission, so the
             # dispatch leaves ``launching`` even when no running edge is relayed.
             mark_subagent_work_started(conv_id)
+        if inbox_recovery_checked:
+            return
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
