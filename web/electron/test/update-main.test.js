@@ -827,6 +827,36 @@ describe("close-window request", () => {
   });
 });
 
+describe("global show shortcut IPC", () => {
+  it("refuses the shortcut handlers from a page off the pinned server and saves nothing", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:get-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.throws(
+      () =>
+        harness.ipcHandlers.get("omnigent:set-global-shortcut")(harness.events.unpinned, {
+          enabled: true,
+          accelerator: "Control+Shift+K",
+        }),
+      /connected server page/,
+    );
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:record-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.equal(
+      harness.ipcHandlers.get("omnigent:cancel-global-shortcut-recording")(harness.events.unpinned),
+      false,
+    );
+    assert.equal(harness.readSettings().global_shortcut, undefined);
+  });
+});
+
 describe("developer-mode menu wiring", () => {
   it("places expiry simulations under Debug, not Server, in development builds", (t) => {
     const harness = loadMainHarness({ isPackaged: false, platform: "linux" });

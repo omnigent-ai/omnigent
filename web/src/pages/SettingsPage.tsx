@@ -271,6 +271,7 @@ import {
   isElectronShell,
   resetCliPath,
   supportsBrowser,
+  supportsGlobalShortcut,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
@@ -284,6 +285,7 @@ import {
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
+import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -1887,6 +1889,11 @@ function GeneralSection() {
         {supportsBrowser() && (
           <SettingsGroup title="Links" testId="settings-group-links">
             <OpenLinksInAppControl />
+          </SettingsGroup>
+        )}
+        {supportsGlobalShortcut() && (
+          <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
+            <GlobalShortcutControl />
           </SettingsGroup>
         )}
       </div>

@@ -294,6 +294,13 @@ interface ElectronDesktopApi extends NativeShellApi {
   setDesktopCommandState?: (state: DesktopCommandState) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
+  /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
+  getGlobalShortcut?: () => Promise<GlobalShortcutStatus | null>;
+  /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
+  setGlobalShortcut?: (setting: GlobalShortcutSetting) => Promise<{ ok: boolean; error?: string }>;
+  /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
+  recordGlobalShortcut?: () => Promise<string | null>;
+  cancelGlobalShortcutRecording?: () => Promise<boolean>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -487,6 +494,17 @@ export interface HostActionResult {
    * generic error. Set by the desktop's `omnigent:host-control` handler.
    */
   authError?: boolean;
+}
+
+/** The "Show Omnigent from anywhere" shortcut; `accelerator` is an Electron accelerator. */
+export interface GlobalShortcutSetting {
+  enabled: boolean;
+  accelerator: string;
+}
+
+/** The saved shortcut, with `error` while it is on but the shell couldn't register it. */
+export interface GlobalShortcutStatus extends GlobalShortcutSetting {
+  error?: string;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";
@@ -778,6 +796,65 @@ export async function closeDesktopWindow(): Promise<boolean> {
     console.warn("[nativeBridge] closeWindow failed:", err);
     return false;
   }
+}
+
+/**
+ * True when the shell can show Omnigent from anywhere. Needs both calls, so a
+ * shell that can read the shortcut but not save it counts as unsupported.
+ */
+export function supportsGlobalShortcut(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.getGlobalShortcut === "function" &&
+    typeof electron.setGlobalShortcut === "function"
+  );
+}
+
+/** The saved "Show Omnigent from anywhere" shortcut; `null` outside the shell or on failure. */
+export async function getGlobalShortcut(): Promise<GlobalShortcutStatus | null> {
+  const electron = electronApi();
+  if (!electron?.getGlobalShortcut) return null;
+  try {
+    return await electron.getGlobalShortcut();
+  } catch (err) {
+    console.warn("[nativeBridge] electron getGlobalShortcut failed:", err);
+    return null;
+  }
+}
+
+/** Saves the shortcut. Resolves `{ ok: false, error }` when refused; the setting is unchanged. */
+export async function setGlobalShortcut(
+  setting: GlobalShortcutSetting,
+): Promise<{ ok: boolean; error?: string }> {
+  const electron = electronApi();
+  if (!electron?.setGlobalShortcut) return { ok: false, error: "Couldn't save the shortcut." };
+  try {
+    return await electron.setGlobalShortcut(setting);
+  } catch (err) {
+    console.warn("[nativeBridge] electron setGlobalShortcut failed:", err);
+    return { ok: false, error: "Couldn't save the shortcut." };
+  }
+}
+
+/** Whether the shell records the next chord itself, before the page's shortcuts see it. */
+export function shellRecordsGlobalShortcut(): boolean {
+  return typeof electronApi()?.recordGlobalShortcut === "function";
+}
+
+/** The next chord, taken by the shell; null when recording was cancelled or failed. */
+export async function recordGlobalShortcut(): Promise<string | null> {
+  try {
+    return (await electronApi()?.recordGlobalShortcut?.()) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron recordGlobalShortcut failed:", err);
+    return null;
+  }
+}
+
+export function cancelGlobalShortcutRecording(): void {
+  void electronApi()
+    ?.cancelGlobalShortcutRecording?.()
+    .catch(() => {});
 }
 
 /**
