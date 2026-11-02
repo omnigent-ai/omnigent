@@ -154,6 +154,24 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
     return result
 
 
+# Harnesses whose bound provider is read through its ``openai`` family.
+_OPENAI_FAMILY_HARNESSES = frozenset(
+    {"codex", "codex-native", "openai-agents", "qwen", "jcode", "opencode-native"}
+)
+
+
+def bound_harness_family(key: str) -> str | None:
+    """Return the single model family a bound harness reads, or ``None``.
+
+    :param key: A normalized harness key, e.g. ``"claude-native"``.
+    :returns: ``"anthropic"`` or ``"openai"``; ``None`` for harnesses that read
+        every family the provider has (Pi, ACP).
+    """
+    if key in {"claude-native", "claude-sdk"}:
+        return "anthropic"
+    return "openai" if key in _OPENAI_FAMILY_HARNESSES else None
+
+
 def binding_for_harness(config: dict[str, object], harness: str) -> HarnessInferenceBinding | None:
     """Resolve exact ACP identities before an explicitly configured generic ACP fallback."""
     bindings = parse_inference_config(config)
@@ -210,24 +228,7 @@ def resolve_bound_model(config: dict[str, object], harness: str, model: str | No
     if selected is None:
         provider = resolve_bound_provider(config, harness)
         if provider is not None:
-            key = normalize_inference_harness(harness)
-            preferred = (
-                "anthropic"
-                if key in {"claude-native", "claude-sdk"}
-                else (
-                    "openai"
-                    if key
-                    in {
-                        "codex",
-                        "codex-native",
-                        "openai-agents",
-                        "qwen",
-                        "jcode",
-                        "opencode-native",
-                    }
-                    else None
-                )
-            )
+            preferred = bound_harness_family(normalize_inference_harness(harness))
             families = (
                 [provider.families[preferred]]
                 if preferred in provider.families
