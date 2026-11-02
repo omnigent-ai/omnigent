@@ -28,6 +28,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { askUserQuestionPayloadOf } from "@/lib/askUserQuestion";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import {
   Message,
@@ -305,6 +306,18 @@ export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[]
     }
   }
   return pending;
+}
+
+// Keyboard input drives the newest pending AskUserQuestion. A newer one still
+// awaiting delivery holds the keys, so older questions stay inert.
+export function keyboardActiveQuestionId(pending: ElicitationItem[]): string | null {
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]!;
+    if (askUserQuestionPayloadOf(item) === null) continue;
+    const awaitingDelivery = item.nativeDelivery && item.nativeDelivery.state !== "ready";
+    return awaitingDelivery ? null : item.elicitationId;
+  }
+  return null;
 }
 
 // Drop the pending elicitation cards from the transcript bubbles so they

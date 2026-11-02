@@ -530,6 +530,7 @@ export const ComposerMicButton = ({
       aria-busy={connecting}
       aria-label={a11yLabel}
       data-server-dictation-available={serverAvailable}
+      data-dictating={isListening || undefined}
       title={tooltip}
       className={cn(
         "size-9 md:size-8",

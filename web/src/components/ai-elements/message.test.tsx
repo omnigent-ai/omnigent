@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { setEmbedRoot } from "@/lib/host";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
@@ -281,6 +282,44 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
     15_000,
   );
 });
+
+it("leaves Escape to the fullscreen diagram while a question waits", async () => {
+  vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+  const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+  Object.defineProperty(SVGElement.prototype, "getBBox", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+  });
+  const onReject = vi.fn();
+  try {
+    render(
+      <>
+        <MessageResponse>{"```mermaid\nflowchart LR\n  Alpha --> Beta\n```"}</MessageResponse>
+        <AskUserQuestionForm
+          elicitationId="elic_pick"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={vi.fn()}
+          onReject={onReject}
+          keyboardActive
+        />
+      </>,
+    );
+    await waitFor(() => expect(document.querySelector('svg[id^="mermaid-"]')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    expect(screen.getByTitle("Exit fullscreen")).toBeInTheDocument();
+    // Focus stays on the page, outside the overlay.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+    expect(onReject).not.toHaveBeenCalled();
+  } finally {
+    if (originalGetBBox) Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+    else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+  }
+}, 15_000);
 
 it("preserves ordinary code fences in reasoning", () => {
   const { container } = render(
