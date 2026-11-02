@@ -465,11 +465,20 @@ export function HeaderConversationMenu({
               }}
               className="mt-4 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
             />
-            <DialogFooter className="mt-4 border-t-0 bg-transparent">
-              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
+            <DialogFooter className="mt-4 border-t-0 bg-transparent mobile-app:flex-col-reverse mobile-app:gap-1">
+              <Button
+                type="button"
+                variant="ghost"
+                className="mobile-touch-target mobile-app:w-full"
+                onClick={() => setRenameOpen(false)}
+              >
                 Cancel
               </Button>
-              <Button type="submit" disabled={!renameTitle.trim() || rename.isPending}>
+              <Button
+                type="submit"
+                className="mobile-touch-target mobile-app:w-full"
+                disabled={!renameTitle.trim() || rename.isPending}
+              >
                 Rename
               </Button>
             </DialogFooter>
