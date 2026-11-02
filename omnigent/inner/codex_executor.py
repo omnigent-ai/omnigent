@@ -1111,6 +1111,56 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _drop_native_tool_settings(table: dict[str, Any]) -> bool:
+    """Remove settings in one config table that outrank ``CODEX_NATIVE_FEATURES_OFF``."""
+    removed = False
+    for key in ("web_search", "experimental_use_unified_exec_tool"):
+        removed |= table.pop(key, None) is not None
+    features = table.get("features")
+    if isinstance(features, dict):
+        for name in _NATIVE_FEATURE_KEYS:
+            removed |= features.pop(name, None) is not None
+    return removed
+
+
+def _strip_host_launched_config(
+    codex_home: Path, router_bridge_dir: Path | None, *, session_id: str | None
+) -> None:
+    """Drop inherited config that would start user commands beside the app-server.
+
+    ``[mcp_servers.*]``, ``notify`` and the user ``hooks.json`` launch processes
+    that would share the worker's host network when its native tools are off.
+    ``[projects.*]`` trust is dropped too, so a project ``.codex/config.toml``
+    cannot add them back. Native-tool settings go from the root and every profile,
+    since a selected profile or a legacy feature alias outranks the ``-c`` overrides.
+    The router hooks, if any, are rewritten alone.
+    """
+    import tomlkit
+
+    config_path = codex_home / "config.toml"
+    if config_path.is_file():
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        changed = False
+        for key in ("mcp_servers", "notify", "projects"):
+            changed |= document.pop(key, None) is not None
+        profiles = document.get("profiles")
+        profile_tables = list(profiles.values()) if isinstance(profiles, dict) else []
+        for table in (document, *profile_tables):
+            if isinstance(table, dict):
+                changed |= _drop_native_tool_settings(table)
+        if changed:
+            if config_path.is_symlink():
+                # Never write through to the user's real config.toml.
+                config_path.unlink()
+            config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    # Staging symlinks the user's hooks but falls back to a copy; drop either.
+    hooks_path = codex_home / _CODEX_HOOKS_FILENAME
+    if hooks_path.is_symlink() or hooks_path.exists():
+        hooks_path.unlink()
+    if router_bridge_dir is not None:
+        write_codex_router_hooks_file(codex_home, router_bridge_dir, session_id=session_id)
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -2779,6 +2829,40 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+# ``-c`` overrides that switch off every Codex-native capability beyond the
+# model call; shared with the runner's background title worker.
+CODEX_NATIVE_FEATURES_OFF = (
+    "features.unified_exec=false",
+    "features.shell_tool=false",
+    'web_search="disabled"',
+    "features.apps=false",
+    "features.browser_use=false",
+    "features.computer_use=false",
+    "features.image_generation=false",
+    "features.multi_agent=false",
+    "features.plugins=false",
+    "features.skill_mcp_dependency_install=false",
+    "features.tool_search=false",
+)
+
+# Feature keys, including legacy aliases, that could switch those tools back on.
+_NATIVE_FEATURE_KEYS = frozenset(
+    {
+        override.split("=", 1)[0].removeprefix("features.")
+        for override in CODEX_NATIVE_FEATURES_OFF
+        if override.startswith("features.")
+    }
+    | {
+        "collab",
+        "connectors",
+        "experimental_use_unified_exec_tool",
+        "web_search",
+        "web_search_cached",
+        "web_search_request",
+    }
+)
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -3068,6 +3152,16 @@ class _CodexAppServerSession:
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
+            if not worker_launch.native_tools_allowed:
+                self._disable_native_tools = True
+                for override in CODEX_NATIVE_FEATURES_OFF:
+                    argv.extend(["-c", override])
+                await asyncio.to_thread(
+                    _strip_host_launched_config,
+                    self._codex_home_dir,
+                    router_bridge_dir,
+                    session_id=codex_router_session_id(self._env),
+                )
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()
             liveness_read_fd: int | None = None
@@ -3133,7 +3227,11 @@ class _CodexAppServerSession:
             self._supports_direct_tool_namespaces = version is not None and tuple(
                 int(part) for part in version.groups()
             ) >= (0, 142, 0)
-            self._containment_confirmed = self._worker_launch.sandboxed
+            # A worker without native tools can write the host login, so Codex's
+            # own sandbox must keep confining apply_patch there.
+            self._containment_confirmed = (
+                self._worker_launch.sandboxed and self._worker_launch.native_tools_allowed
+            )
             self._started = True
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
@@ -3639,6 +3737,10 @@ class _CodexAppServerSession:
         assert self._proc is not None
         if self._containment_confirmed:
             sandbox = "danger-full-access"
+        elif self._worker_launch is not None and not self._worker_launch.native_tools_allowed:
+            # A writable thread lets apply_patch use the user's writable roots and makes
+            # Codex record the project as trusted again.
+            sandbox = "read-only"
 
         self._native_progress_observed = self._reader_started_turn != self._reader_completed_turn
 
