@@ -31,7 +31,12 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
-from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.harness_availability import (
+    HARNESS_CLI_UNRESPONSIVE,
+    HARNESS_VERSION_TOO_LOW,
+    HarnessAvailability,
+    is_harness_availability,
+)
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -1518,6 +1523,38 @@ HostFrame = (
 # ── Encode / decode ──────────────────────────────────────
 
 
+# Older servers reject a readiness frame holding a state they don't know, so an
+# unresponsive CLI travels as "version-too-low" plus this list for newer servers.
+_CLI_UNRESPONSIVE_HARNESSES_KEY = "cli_unresponsive_harnesses"
+
+
+def _encode_configured_harnesses(
+    configured_harnesses: dict[str, HarnessAvailability] | None,
+) -> _JsonObject:
+    """Return the wire fields for a readiness map that older servers accept.
+
+    :param configured_harnesses: Readiness keyed by harness, or ``None``.
+    :returns: ``configured_harnesses`` limited to states older servers decode,
+        plus ``cli_unresponsive_harnesses`` when any harness is in that state.
+    """
+    if configured_harnesses is None:
+        return {"configured_harnesses": None}
+    unresponsive = [
+        harness
+        for harness, availability in configured_harnesses.items()
+        if availability == HARNESS_CLI_UNRESPONSIVE
+    ]
+    if not unresponsive:
+        return {"configured_harnesses": configured_harnesses}
+    return {
+        "configured_harnesses": {
+            harness: HARNESS_VERSION_TOO_LOW if harness in unresponsive else availability
+            for harness, availability in configured_harnesses.items()
+        },
+        _CLI_UNRESPONSIVE_HARNESSES_KEY: unresponsive,
+    }
+
+
 def _encode_payload(payload: _JsonObject) -> str:
     """Serialize a frame payload, injecting the active trace context.
 
@@ -1559,7 +1596,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "frame_protocol_version": frame.frame_protocol_version,
                 "name": frame.name,
                 "runners": list(frame.runners),
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
@@ -1582,7 +1619,7 @@ def encode_host_frame(frame: HostFrame) -> str:
         return _encode_payload(
             {
                 "kind": HostFrameKind.HARNESS_READINESS.value,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
             }
@@ -1799,7 +1836,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.INSTALL_HARNESS_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "version": frame.version,
                 "gateway_inference": frame.gateway_inference,
@@ -1819,7 +1856,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.REFRESH_HARNESSES_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
@@ -1890,7 +1927,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "success": frame.success,
                 "expired": frame.expired,
                 "error": frame.error,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
             }
         )
@@ -1908,7 +1945,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.HARNESS_LOGOUT_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "error": frame.error,
             }
@@ -1933,7 +1970,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.STORE_SECRET_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
-                "configured_harnesses": frame.configured_harnesses,
+                **_encode_configured_harnesses(frame.configured_harnesses),
                 "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
@@ -2507,7 +2544,7 @@ def _decode_known_host_frame(
                 success=_required_bool(msg, "success"),
                 expired=_required_bool(msg, "expired") if "expired" in msg else False,
                 error=_optional_nullable_str(msg, "error"),
-                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                configured_harnesses=_decode_configured_harnesses(msg),
                 harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
             )
         case HostFrameKind.HARNESS_LOGOUT:
@@ -2519,7 +2556,7 @@ def _decode_known_host_frame(
             return HostHarnessLogoutResultFrame(
                 request_id=_required_str(msg, "request_id"),
                 status=_required_str(msg, "status"),
-                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                configured_harnesses=_decode_configured_harnesses(msg),
                 harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
                 error=_optional_nullable_str(msg, "error"),
             )
@@ -2625,7 +2662,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         interactive_shells=(
@@ -2645,7 +2682,7 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     raw = msg.get("configured_harnesses")
     if not isinstance(raw, dict):
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    configured_harnesses = _decode_configured_harnesses(msg)
     if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
     if len(configured_harnesses) != len(raw):
@@ -3017,7 +3054,7 @@ def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResult
     return HostInstallHarnessResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         version=_optional_nullable_str(msg, "version"),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
@@ -3030,7 +3067,7 @@ def _decode_refresh_harnesses_result(msg: _JsonObject) -> HostRefreshHarnessesRe
     return HostRefreshHarnessesResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
@@ -3064,7 +3101,7 @@ def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
     return HostStoreSecretResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
-        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        configured_harnesses=_decode_configured_harnesses(msg),
         harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
@@ -3573,6 +3610,22 @@ def _optional_str_availability_map(
     if not isinstance(val, dict):
         return None
     return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
+
+
+def _decode_configured_harnesses(msg: _JsonObject) -> dict[str, HarnessAvailability] | None:
+    """Decode ``configured_harnesses``, restoring states sent in compatible form.
+
+    :param msg: Decoded frame object.
+    :returns: The readiness map, or ``None`` when absent or malformed.
+    """
+    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    unresponsive = msg.get(_CLI_UNRESPONSIVE_HARNESSES_KEY)
+    if configured_harnesses is None or not isinstance(unresponsive, list):
+        return configured_harnesses
+    for harness in unresponsive:
+        if isinstance(harness, str) and harness in configured_harnesses:
+            configured_harnesses[harness] = HARNESS_CLI_UNRESPONSIVE
+    return configured_harnesses
 
 
 def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:

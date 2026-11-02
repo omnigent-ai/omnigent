@@ -986,6 +986,29 @@ def test_antigravity_native_requires_credential(
     assert harness_is_configured("native-antigravity") is True
 
 
+def test_unanswered_version_probe_still_requires_antigravity_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing credential blocks even when the ``agy --version`` probe times out."""
+    import omnigent.onboarding.gemini_auth as _ga
+
+    _all_clis_installed(monkeypatch)
+    answered_run = hi.subprocess.run
+
+    def _hanging_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["--version"]:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        return answered_run(argv, **kwargs)
+
+    monkeypatch.setattr(hi.subprocess, "run", _hanging_version)
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: False)
+    assert configured_harness_map()["antigravity-native"] is False
+    assert harness_is_configured("antigravity-native") is False
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
+    assert configured_harness_map()["antigravity-native"] == HARNESS_CLI_UNRESPONSIVE
+    assert harness_is_configured("antigravity-native") is True
+
+
 def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

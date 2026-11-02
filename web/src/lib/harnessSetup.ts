@@ -248,10 +248,8 @@ export function harnessUnavailableReasonOnHost(
     if (isCodexHarness(harness)) return "binary-missing";
     return "unconfigured";
   }
-  // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
-  // string when installed-but-not-ready. "version-too-low" and
-  // "cli-unresponsive" can surface for any CLI-backed harness whose binary is
-  // present but too old or not answering its version check.
+  // Installed-but-not-ready CLI harnesses report a structured string;
+  // "version-too-low" and "cli-unresponsive" can surface for any CLI harness.
   if (
     availability === "binary-missing" ||
     availability === "cli-unresponsive" ||

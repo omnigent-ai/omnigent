@@ -3153,12 +3153,17 @@ export function NewChatLandingScreen() {
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   // Probe only the selected, available harness. Older hosts without readiness
-  // metadata remain eligible, matching the picker's setup warnings.
-  const canLoadHostModels = (harness: string) =>
-    selectedNativeHarness === harness &&
-    hostSelected &&
-    selectedHost?.status === "online" &&
-    !harnessUnconfiguredOnHost(harness, selectedHost);
+  // metadata remain eligible, matching the picker's setup warnings. A CLI that
+  // missed its version check still launches, so its catalog stays loadable.
+  const canLoadHostModels = (harness: string) => {
+    const unavailableReason = harnessUnavailableReasonOnHost(harness, selectedHost);
+    return (
+      selectedNativeHarness === harness &&
+      hostSelected &&
+      selectedHost?.status === "online" &&
+      (unavailableReason === null || unavailableReason === "cli-unresponsive")
+    );
+  };
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,

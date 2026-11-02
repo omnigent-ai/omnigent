@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -99,6 +100,7 @@ from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -1344,7 +1346,8 @@ async def test_handle_launch_refuses_unconfigured_harness(
     inference_config = None
     if inference_bound:
         monkeypatch.setattr(
-            "omnigent.onboarding.harness_install.missing_harness_cli", lambda _harness: None
+            "omnigent.onboarding.harness_install.missing_harness_cli",
+            lambda _harness, _timeout=None: None,
         )
         inference_config = {
             "providers": {"test": {}},
@@ -1436,6 +1439,56 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     assert "install the CLI" not in (result.error or ""), result.error
     assert result.status == "launched", result.error
     assert result.runner_id is not None
+
+
+async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound launch lets an unanswered CLI through within the readiness probe budget."""
+    probe_timeouts: list[object] = []
+    original_which = shutil.which
+    original_run = subprocess.run
+
+    def _resolve_claude(name: str, *args: object, **kwargs: object) -> str | None:
+        return "/usr/bin/claude" if name == "claude" else original_which(name, *args, **kwargs)
+
+    def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] != ["--version"]:
+            return original_run(argv, **kwargs)
+        probe_timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    host = _make_host_process()
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+    monkeypatch.setattr(shutil, "which", _resolve_claude)
+    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
+    )
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    frame = HostLaunchRunnerFrame(
+        request_id="req_bound_unanswered",
+        binding_token="token_bound",
+        workspace=str(tmp_path),
+        harness="claude-native",
+        inference_config={
+            "providers": {
+                "work": {
+                    "kind": "key",
+                    "default": ["anthropic"],
+                    "anthropic": {"base_url": "https://api.example.com", "api_key": "sk-test"},
+                }
+            },
+            "inference": {"harnesses": {"claude-native": {"provider": "work"}}},
+        },
+    )
+    result = await host._handle_launch(frame)
+
+    assert result.status == "launched", result.error
+    assert probe_timeouts == [READINESS_CLI_PROBE_TIMEOUT_S]
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(

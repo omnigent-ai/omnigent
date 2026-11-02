@@ -10757,9 +10757,8 @@ def _native_subagent_wrapper_labels(
     return _native_subagent_wrapper_labels_from_spec(sub_spec)
 
 
-# Host readiness values that mean the native CLI cannot launch. A routed
-# session landing on a missing, unauthenticated or unresponsive binary would fail
-# to open its terminal, so those harnesses are never offered to Smart Routing.
+# Host readiness values that keep a native harness out of Smart Routing, which
+# only offers harnesses whose host readiness is confirmed.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
     {
         False,

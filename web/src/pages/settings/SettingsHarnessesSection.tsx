@@ -474,6 +474,14 @@ function HarnessStatusText({
       </span>
     );
   }
+  if (status.reason === "cli-unresponsive") {
+    return (
+      <span className="flex w-fit items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+        <TriangleAlertIcon className="size-3.5" aria-hidden />
+        CLI did not respond
+      </span>
+    );
+  }
   if (status.needsSetup && !enhanced) {
     const text = harnessWarningBadgeText(status.reason);
     return (

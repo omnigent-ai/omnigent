@@ -7347,7 +7347,7 @@ describe("NewChatLandingScreen", () => {
     },
   );
 
-  it("warns about an unresponsive CLI without disabling its harness row", () => {
+  it("lets the user pick a harness whose CLI did not respond and warns about it", () => {
     mockAgents([
       DEFAULT_LANDING_AGENTS[0],
       {
@@ -7359,29 +7359,34 @@ describe("NewChatLandingScreen", () => {
         skills: [],
       },
     ]);
-    renderLanding();
-    selectUnconfiguredAgent("a_pi");
     mockHosts([
       {
         ...host("online"),
         configured_harnesses: { "claude-native": true, "pi-native": "cli-unresponsive" },
       } as Host,
     ]);
+    renderLanding();
+    const lastPiModelQuery = () =>
+      useHostModelOptionsMock.mock.calls.filter(([, harness]) => harness === "pi-native").at(-1);
+    expect(lastPiModelQuery()?.[2]).toBe(false);
+    expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    const row = screen.getByTestId("new-chat-landing-agent-a_pi");
+    expect(row).not.toHaveAttribute("aria-disabled", "true");
+    expect(within(row).queryByTestId("new-chat-landing-agent-warning-a_pi")).toBeNull();
+    fireEvent.click(row);
+    closeMenu();
+
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "Harness readiness changed" },
     });
-
     const notice = screen.getByTestId("new-chat-landing-harness-warning");
     expect(notice).toHaveTextContent("Pi's CLI on machine-1 did not respond to a version check");
     expect(notice).not.toHaveTextContent("outdated");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    if (screen.queryByTestId("new-chat-landing-agent-a_pi") == null) {
-      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    }
-    const row = screen.getByTestId("new-chat-landing-agent-a_pi");
-    expect(row).not.toHaveAttribute("aria-disabled", "true");
-    expect(within(row).queryByTestId("new-chat-landing-agent-warning-a_pi")).toBeNull();
+    expect(lastPiModelQuery()).toEqual(["host_1", "pi-native", true, { poll: true }]);
   });
 
   it("disables broken harness rows and explains the actionable failure", async () => {

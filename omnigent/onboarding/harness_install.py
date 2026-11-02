@@ -695,7 +695,7 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key) if key is not None else None
 
 
-def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
+def missing_harness_cli(harness: str, timeout: float | None = None) -> HarnessInstallSpec | None:
     """Return a harness's required CLI spec when that CLI can't be used.
 
     Combines :func:`required_cli_for_harness` with the same probe
@@ -711,6 +711,8 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
 
     :param harness: An executor harness identifier, e.g. ``"pi"`` or
         ``"claude-native"``.
+    :param timeout: Seconds to wait for the ``--version`` probe, e.g. ``10.0``
+        on the host launch path; ``None`` uses the default CLI probe budget.
     :returns: The :class:`HarnessInstallSpec` for a CLI-backed harness whose
         ``binary`` is not on ``PATH`` or is outside its supported version range;
         ``None`` when the harness needs no CLI (SDK-based / unknown), the
@@ -724,7 +726,8 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     if install_key is None:
         return spec
     try:
-        if harness_cli_installed(install_key, raise_on_timeout=True):
+        probe_timeout = _DEFAULT_CLI_PROBE_TIMEOUT_S if timeout is None else timeout
+        if harness_cli_installed(install_key, probe_timeout, raise_on_timeout=True):
             return None
     except subprocess.TimeoutExpired:
         _logger.warning(

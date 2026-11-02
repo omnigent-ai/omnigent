@@ -2012,10 +2012,16 @@ class HostProcess:
             and (binding_for_harness(frame.inference_config, frame.harness) is not None)
         )
         if has_binding:
-            from omnigent.onboarding.harness_install import missing_harness_cli
+            from omnigent.onboarding.harness_install import (
+                READINESS_CLI_PROBE_TIMEOUT_S,
+                missing_harness_cli,
+            )
 
             assert frame.harness is not None
-            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+            missing = await asyncio.to_thread(
+                missing_harness_cli, frame.harness, READINESS_CLI_PROBE_TIMEOUT_S
+            )
+            harness_ready = missing is None
         else:
             harness_ready = frame.harness is None or await asyncio.to_thread(
                 harness_is_configured, frame.harness

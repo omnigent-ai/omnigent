@@ -327,6 +327,15 @@ describe("Harnesses grid", () => {
     expect(within(card("codex-native")).getByText("Not installed")).toBeTruthy();
   });
 
+  it("says a CLI that missed its version check did not respond, not that it is outdated", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": "cli-unresponsive" } }];
+    renderHarnesses();
+
+    expect(within(card("pi-native")).getByText("CLI did not respond")).toBeTruthy();
+    expect(within(card("pi-native")).queryByLabelText(/Out of date/)).toBeNull();
+    expect(screen.queryByTestId("harness-action-pi-native")).toBeNull();
+  });
+
   it("does not offer one-click install for a not-installed Cursor harness", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses();
