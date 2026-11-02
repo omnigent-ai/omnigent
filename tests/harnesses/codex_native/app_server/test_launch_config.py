@@ -888,6 +888,92 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
         await server.close()
 
 
+@pytest.mark.parametrize(
+    ("config_override", "copied_model", "expected_model"),
+    [
+        # A ChatGPT login cannot serve the gateway model the shared config copied.
+        ('model_provider="openai"', "system.ai.gpt-6-astra", None),
+        # A valid model on the same route is kept.
+        ('model_provider="openai"', "gpt-5.5", "gpt-5.5"),
+        # A gateway route keeps its own gateway model.
+        ('model_provider="Databricks"', "system.ai.gpt-6-astra", "system.ai.gpt-6-astra"),
+    ],
+)
+async def test_start_drops_copied_gateway_model_on_subscription_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_override: str,
+    copied_model: str,
+    expected_model: str | None,
+) -> None:
+    """
+    A subscription launch never carries a gateway-only model from the copied config.
+
+    The session config copies the user's shared ``model`` line. Codex sends that
+    id to the built-in ``openai`` provider on a ChatGPT login, which rejects
+    gateway ids, so the line is dropped and Codex uses the account default. A
+    table-scoped ``model`` and the shared source file are left alone.
+    """
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = f'model = "{copied_model}"\n[profiles.default]\nmodel = "table-scoped-stays"\n'
+    (source_home / "config.toml").write_text(original, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server.config_overrides = [config_override]
+
+    try:
+        await server.start()
+        rendered = tomllib.loads((server.codex_home / "config.toml").read_text(encoding="utf-8"))
+        assert rendered.get("model") == expected_model
+        assert rendered["profiles"]["default"]["model"] == "table-scoped-stays"
+        assert (source_home / "config.toml").read_text(encoding="utf-8") == original
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        pytest.param('"model" = "system.ai.gateway-model"\n', id="quoted-key"),
+        pytest.param('  model = "system.ai.gateway-model"\n', id="indented-key"),
+        pytest.param(
+            'developer_instructions = """\nmodel = "keep this instruction"\n"""\n'
+            'model = "system.ai.gateway-model"\n',
+            id="model-in-instructions",
+        ),
+        pytest.param(
+            'developer_instructions = """\n[keep this instruction]\n"""\n'
+            'model = "system.ai.gateway-model"\n',
+            id="bracket-in-instructions",
+        ),
+        pytest.param(
+            'model = "system.ai.gateway-model"\n'
+            '  [profiles.default]\nmodel = "table-scoped-stays"\n',
+            id="indented-table",
+        ),
+    ],
+)
+def test_drop_gateway_model_preserves_other_toml_values(tmp_path: Path, original: str) -> None:
+    from omnigent.harnesses.codex_native.app_server import _drop_gateway_model_from_codex_config
+
+    source = tmp_path / "source-config.toml"
+    source.write_text(original, encoding="utf-8")
+    private_home = tmp_path / "codex-home"
+    private_home.mkdir()
+    config = private_home / "config.toml"
+    config.symlink_to(source)
+    expected = tomllib.loads(original)
+    del expected["model"]
+
+    _drop_gateway_model_from_codex_config(private_home)
+
+    assert tomllib.loads(config.read_text(encoding="utf-8")) == expected
+    assert not config.is_symlink()
+    assert source.read_text(encoding="utf-8") == original
+
+
 class TestPinCodexConfigModel:
     """_pin_codex_config_model seeds the per-session config.toml model."""
 

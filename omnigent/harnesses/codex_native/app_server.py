@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
+from urllib.parse import urlparse
 
 import tomlkit
 import websockets
@@ -29,6 +30,7 @@ from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -379,6 +381,32 @@ def _codex_mcp_server_config_section(
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
+# Codex's built-in ``openai`` provider, which a ChatGPT login authenticates. It
+# serves OpenAI ids only, never a Databricks gateway id.
+_BUILTIN_OPENAI_PROVIDER_OVERRIDE = 'model_provider="openai"'
+
+
+def _drop_gateway_model_from_codex_config(codex_home: Path) -> None:
+    """
+    Remove a copied top-level ``model`` that only a Databricks gateway serves.
+
+    The session ``config.toml`` copies the user's shared file, whose ``model``
+    may name a gateway route (``system.ai.*``). A launch that pins the built-in
+    ``openai`` provider (a ChatGPT login) cannot serve that id, so the line is
+    dropped and Codex uses its own default. Other models are kept.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    """
+    config_path = codex_home / "config.toml"
+    copied_model = read_codex_home_config_model(codex_home)
+    if copied_model is None or not is_databricks_model_id(copied_model):
+        return
+    _materialize_config_symlink(config_path)
+    document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    del document["model"]
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     """
     Write *model* as the top-level ``model`` key in the session config.toml.
@@ -540,7 +568,7 @@ def _sync_codex_developer_instructions(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     try:
         document = tomlkit.parse(existing) if existing else tomlkit.document()
-    except Exception:  # title metadata must never block Codex startup.
+    except Exception:  # noqa: BLE001 -- instruction sync must not block startup
         _logger.warning(
             "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
@@ -1983,7 +2011,7 @@ async def _codex_launch_catalog(
     try:
         if launch is None:
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:  # a broken provider config means no catalog
+    except Exception:  # noqa: BLE001 -- provider resolution failure means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
@@ -2469,6 +2497,8 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
+        elif _BUILTIN_OPENAI_PROVIDER_OVERRIDE in self.config_overrides:
+            _drop_gateway_model_from_codex_config(self.codex_home)
         effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
         requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
         effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
@@ -2609,7 +2639,7 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                    except Exception:  # the local write below still repairs it
+                    except Exception:  # noqa: BLE001 -- local config write repairs an RPC failure
                         _logger.warning(
                             "Could not persist supported Codex reasoning effort at startup",
                             exc_info=True,
@@ -2628,7 +2658,7 @@ class CodexNativeAppServer:
             finally:
                 try:
                     await startup_client.close()
-                except Exception:  # a dead control socket cannot undo trust
+                except Exception:  # noqa: BLE001 -- control socket cleanup cannot undo trust
                     _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -2705,7 +2735,7 @@ class CodexNativeAppServer:
             if self.router_hooks_registered:
                 try:
                     await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
-                except Exception:  # routing trust never blocks startup
+                except Exception:  # noqa: BLE001 -- routing trust is best effort at startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
                         exc_info=True,
@@ -2729,7 +2759,7 @@ class CodexNativeAppServer:
                             len(still_untrusted),
                             ", ".join(still_untrusted),
                         )
-                except Exception:  # trust-all never blocks startup
+                except Exception:  # noqa: BLE001 -- trust-all is best effort at startup
                     _logger.warning(
                         "codex hook trust-all failed; the startup hook-review screen "
                         "may appear on resume",
@@ -3733,7 +3763,7 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
-    except Exception as exc:  # cached ucode state is the launch fallback
+    except Exception as exc:  # noqa: BLE001 -- live discovery falls back to cached models
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
         _logger.warning(
@@ -3749,7 +3779,7 @@ def _resolve_databricks_codex_model(
             workspace_state = read_ucode_state(host)
             if workspace_state is not None:
                 servable = tuple(workspace_state.codex_models)
-        except Exception:  # the bundled catalog is the last resort
+        except Exception:  # noqa: BLE001 -- unreadable state falls back to the bundled catalog
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
@@ -4257,8 +4287,13 @@ def _first_routable_codex_provider(
             continue
         launch = _codex_provider_launch(candidate, model)
         if launch is not None:
+            if model is not None and is_databricks_model_id(model) and launch.profile is None:
+                base_url = native_codex_launch_base_url(launch)
+                # An OpenAI API key cannot serve a gateway model either.
+                if base_url is None or urlparse(base_url).hostname == "api.openai.com":
+                    continue
             _logger.warning(
-                "native-codex: subscription default %r has no usable Codex login; "
+                "native-codex: subscription default %r cannot serve this launch; "
                 "routing through provider %r instead.",
                 exclude,
                 name,
@@ -4311,6 +4346,16 @@ def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
     return effective_self_sufficient_builtin_provider(config)
 
 
+def _validate_codex_login_model(model: str | None) -> None:
+    """Reject an explicit gateway model before launching Codex's account route."""
+    if model is not None and is_databricks_model_id(model):
+        raise ValueError(
+            f"The selected model {model!r} requires a Databricks gateway provider. "
+            f"Run `{cli_invocation()} setup` to configure one, or select a model "
+            "supported by your Codex account."
+        )
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -4336,7 +4381,13 @@ def _resolve_subscription_launch(
     # set a custom default ``model_provider`` (e.g. isaac's Databricks AI
     # Gateway), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
-    subscription_overrides = ['model_provider="openai"']
+    subscription_overrides = [_BUILTIN_OPENAI_PROVIDER_OVERRIDE]
+    if model is not None and is_databricks_model_id(model):
+        # A ChatGPT login cannot serve a gateway id, even when Codex is logged in.
+        gateway_launch = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
+        if gateway_launch is not None:
+            return gateway_launch
+        _validate_codex_login_model(model)
     if _codex_login_usable():
         log_info_once(
             _logger,
@@ -4483,6 +4534,7 @@ def resolve_native_codex_launch(
         )
         if spec_entry is not None:
             if spec_entry.kind == SUBSCRIPTION_KIND:
+                _validate_codex_login_model(model)
                 # A spec-named subscription defers to Codex's own login,
                 # logged in or not. The machine-default path would substitute
                 # the first OTHER routable provider on a logged-out Codex
@@ -4627,6 +4679,7 @@ def resolve_native_codex_launch(
                     "(Codex-native ambient config; Codex authenticates it itself)"
                 ),
             )
+        _validate_codex_login_model(model)
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
@@ -4661,6 +4714,7 @@ def resolve_native_codex_launch(
         return launch
     # Default provider can't route on its own (no openai surface / no usable
     # credential / unresolvable secret) → Codex's own login.
+    _validate_codex_login_model(model)
     _logger.warning(
         "native-codex: provider %r is the Codex default but has no usable openai "
         "credential — falling back to Codex's own login.",
