@@ -47,6 +47,11 @@ import {
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  readSidebarViewPreferences,
+  writeSidebarViewPreferences,
+} from "@/lib/sidebarViewPreferences";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -724,6 +729,7 @@ function infinitePage(rows: Conversation[]): ConversationsInfiniteData {
 }
 
 describe("useStopAndDeleteConversation cache eviction", () => {
+  afterEach(() => localStorage.removeItem("omnigent:sidebar-view"));
   /**
    * Seed the caches a delete touches and render the hook.
    *
@@ -734,6 +740,15 @@ describe("useStopAndDeleteConversation cache eviction", () => {
   function seedAndDelete(
     deleteResult: Response | Promise<Response> = mockResponse({ deleted: true }),
   ) {
+    writeSidebarViewPreferences({
+      ...DEFAULT_SIDEBAR_VIEW,
+      ordering: "custom",
+      customOrder: {
+        baseOrdering: "updated",
+        ids: ["unloaded", "conv_x", "conv_other"],
+        startedAt: 100,
+      },
+    });
     // Call 1: stop_session → {queued:false}. Call 2: the DELETE.
     fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
     fetchMock.mockImplementationOnce(() => Promise.resolve(deleteResult));
@@ -811,6 +826,7 @@ describe("useStopAndDeleteConversation cache eviction", () => {
       false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_sibling"]);
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual(["unloaded", "conv_other"]);
   });
 
   it("drops the backfill and session snapshot caches", async () => {
@@ -944,6 +960,11 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The per-session caches survive a failed delete — the session is still
     // there to open.
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeDefined();
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual([
+      "unloaded",
+      "conv_x",
+      "conv_other",
+    ]);
   });
 
   it("puts the runner-offline worktree message on the restore toast, not a 404", async () => {

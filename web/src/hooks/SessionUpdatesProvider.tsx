@@ -42,6 +42,7 @@ import {
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
+import { removeSidebarCustomOrderIds } from "@/lib/sidebarViewPreferences";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
 // action. 250 ms is short enough to feel live, long enough to batch the
@@ -386,6 +387,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
                 : previous,
           );
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
+          removeSidebarCustomOrderIds(frame.ids);
           return;
         case "snapshot":
         case "changed": {

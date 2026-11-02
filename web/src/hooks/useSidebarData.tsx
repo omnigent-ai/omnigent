@@ -6,6 +6,7 @@ import {
   useLayoutEffect,
   useMemo,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -13,6 +14,8 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
+  sidebarBaseOrdering,
+  subscribeSidebarViewPreferences,
   writeSidebarViewPreferences,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
@@ -46,16 +49,26 @@ export type SidebarListQuery = Pick<
 function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
-  const [storedView, setView] = useState(readSidebarViewPreferences);
+  const storedView = useSyncExternalStore(
+    subscribeSidebarViewPreferences,
+    readSidebarViewPreferences,
+    () => DEFAULT_SIDEBAR_VIEW,
+  );
   const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
     ? storedView
     : DEFAULT_SIDEBAR_VIEW;
-  const sortBy: SessionSortBy = view.ordering === "created" ? "created_at" : "updated_at";
+  const sortBy: SessionSortBy =
+    sidebarBaseOrdering(view) === "created" ? "created_at" : "updated_at";
   const updateView = useCallback(
-    (patch: Partial<SidebarViewPreferences>) => {
-      const next = { ...storedView, ...patch };
-      writeSidebarViewPreferences(next);
-      if (next.ordering !== storedView.ordering) {
+    (
+      patch:
+        | Partial<SidebarViewPreferences>
+        | ((view: SidebarViewPreferences) => SidebarViewPreferences),
+    ) => {
+      const previous = readSidebarViewPreferences();
+      const next = typeof patch === "function" ? patch(previous) : { ...previous, ...patch };
+      if (next === previous) return;
+      if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(previous)) {
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
           void client.invalidateQueries({ queryKey, refetchType: "none" });
@@ -65,14 +78,14 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
               (key[0] === "conversations"
                 ? (key[5] ?? "updated_at")
                 : parseProjectSessionsQueryKey(key).sortBy) ===
-              (next.ordering === "created" ? "created_at" : "updated_at"),
+              (sidebarBaseOrdering(next) === "created" ? "created_at" : "updated_at"),
           });
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
       }
-      setView(next);
+      writeSidebarViewPreferences(next);
     },
-    [storedView, client],
+    [client],
   );
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";
@@ -116,7 +129,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   );
   const pinnedRows = pinned.data?.conversations;
   const viewerId = useViewerId();
-  const loadedRows = useMemo(
+  const allLoadedRows = useMemo(
     () =>
       dedupeSessionRows([
         ...(pinnedRows ?? []),
@@ -125,9 +138,10 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
           : filterSessionScope([...folders.values()].flat(), "mine", viewerId)),
         ...mineRows,
         ...sharedRows,
-      ]).filter((row) => !row.archived),
+      ]),
     [mineRows, sharedRows, pinnedRows, folders, sharedActive, viewerId],
   );
+  const loadedRows = useMemo(() => allLoadedRows.filter((row) => !row.archived), [allLoadedRows]);
   const inboxRows = useMemo(
     () =>
       config.inboxIncludesShared
@@ -214,6 +228,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     all,
     inbox: config.inboxIncludesShared ? all : mine,
     pinned,
+    allLoadedRows,
     loadedRows,
     loadedData,
     inboxRows,

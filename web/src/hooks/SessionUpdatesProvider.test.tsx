@@ -18,6 +18,11 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  readSidebarViewPreferences,
+  writeSidebarViewPreferences,
+} from "@/lib/sidebarViewPreferences";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -115,6 +120,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  localStorage.removeItem("omnigent:sidebar-view");
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -363,6 +369,14 @@ describe("SessionUpdatesProvider project folders", () => {
 
   it("evicts a removed session from a project folder's cache", () => {
     const client = new QueryClient();
+    writeSidebarViewPreferences({
+      ...DEFAULT_SIDEBAR_VIEW,
+      customOrder: {
+        baseOrdering: "updated",
+        ids: ["unloaded", "conv_filed", "conv_other"],
+        startedAt: 100,
+      },
+    });
     seedProjectFolder(client, "Sprint 42", ["conv_filed", "conv_other"]);
     renderProvider(client, ["/"]);
     const handler = frameHandler();
@@ -376,6 +390,7 @@ describe("SessionUpdatesProvider project folders", () => {
       false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual(["unloaded", "conv_other"]);
   });
 });
 

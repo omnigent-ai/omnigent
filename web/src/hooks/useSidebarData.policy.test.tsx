@@ -5,13 +5,19 @@ import {
   onlineManager,
 } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useLayoutEffect, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  readSidebarViewPreferences,
+  removeSidebarCustomOrderIds,
+  writeSidebarViewPreferences,
+  DEFAULT_SIDEBAR_VIEW,
+} from "@/lib/sidebarViewPreferences";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
 import type { Session } from "@/lib/types";
 import type * as IdentityModule from "@/lib/identity";
@@ -629,3 +635,54 @@ it.each([false, true])(
     expect(fetchMock).not.toHaveBeenCalled();
   },
 );
+
+it.each(["created", "updated"] as const)(
+  "retains %s pages and cursors when Custom is selected or reordered",
+  async (baseOrdering) => {
+    groupingUi = true;
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: baseOrdering }));
+    const { result } = renderHook(useSidebarData, { wrapper });
+    await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
+    await act(async () => {
+      await result.current.mine.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.mine.data?.pages[0].data).toHaveLength(2));
+    const data = result.current.mine.data;
+    const sortBy = result.current.sortBy;
+    const customOrder = { baseOrdering, ids: ["mine-older", "mine"], startedAt: 100 };
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "custom", customOrder }));
+    expect(result.current.sortBy).toBe(sortBy);
+    expect(result.current.mine.data).toBe(data);
+    act(() =>
+      result.current.updateView({ customOrder: { ...customOrder, ids: ["mine", "mine-older"] } }),
+    );
+    act(() => {
+      removeSidebarCustomOrderIds(["mine-older"]);
+      result.current.updateView({ grouping: "status" });
+      result.current.updateView({ show: ["branch"] });
+    });
+    expect(result.current.view.customOrder?.ids).toEqual(["mine"]);
+    expect(result.current.view.grouping).toBe("status");
+    expect(result.current.view.show).toEqual(["branch"]);
+    act(() => result.current.updateView({ ordering: baseOrdering }));
+    expect(readSidebarViewPreferences().customOrder?.ids).toEqual(["mine"]);
+    expect(result.current.mine.data).toBe(data);
+    expect(fetchMock).not.toHaveBeenCalled();
+  },
+);
+
+it("observes a preference write between render and subscription", async () => {
+  groupingUi = true;
+  function WriteOnMount({ children }: { children: ReactNode }) {
+    useLayoutEffect(() => {
+      writeSidebarViewPreferences({ ...DEFAULT_SIDEBAR_VIEW, grouping: "harness" });
+    }, []);
+    return children;
+  }
+  const { result } = renderHook(useSidebarData, {
+    wrapper: ({ children }) => wrapper({ children: <WriteOnMount>{children}</WriteOnMount> }),
+  });
+  await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
+  expect(result.current.view.grouping).toBe("harness");
+});
