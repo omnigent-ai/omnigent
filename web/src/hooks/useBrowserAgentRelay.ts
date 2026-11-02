@@ -12,14 +12,17 @@ import { useEffect } from "react";
 import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import {
+  navigationHostOptions,
+  SESSION_HOST_PROTOCOL,
+  supportsBrowser,
+  type BrowserHostOptions,
+} from "@/lib/nativeBridge";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
-import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
-import { getSessionSlim } from "@/lib/sessionsApi";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import type { Host } from "@/hooks/useHosts";
-import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -29,26 +32,31 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  browserHasView?: (
+    conversationId: string,
+  ) => Promise<{ exists: boolean; hostIsThisMachine?: boolean }>;
   browserScreenshot?: (
     conversationId: string,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
   /** @deprecated Compatibility with pre-typed desktops until v0.21. */
   browserExecute?: (
     conversationId: string,
     script: string,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
   browserPerformAction?: (
     conversationId: string,
     action: "snapshot" | "click" | "type",
     args?: Record<string, unknown>,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
 }
 
@@ -86,13 +94,19 @@ async function performAction(
   conversationId: string,
   action: "snapshot" | "click" | "type",
   args?: Record<string, unknown>,
+  opts?: BrowserHostOptions,
 ) {
   if (desktop.browserPerformAction) {
-    return desktop.browserPerformAction(conversationId, action, args);
+    return opts
+      ? desktop.browserPerformAction(conversationId, action, args, opts)
+      : desktop.browserPerformAction(conversationId, action, args);
   }
   // Pre-typed desktops retain their existing executor until the v0.21 transition.
   if (desktop.browserExecute) {
-    return desktop.browserExecute(conversationId, buildBrowserActionScript(action, args));
+    const script = buildBrowserActionScript(action, args);
+    return opts
+      ? desktop.browserExecute(conversationId, script, opts)
+      : desktop.browserExecute(conversationId, script);
   }
   return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
@@ -109,6 +123,7 @@ async function dispatch(
   sourceHostId: string | null,
   rememberedArcaHostId: string | null,
   sourceIsArcaHost: boolean,
+  readHostOptions?: BrowserHostOptions,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -123,7 +138,7 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
-          ...(sourceHostId ? { sourceHostId } : {}),
+          ...navigationHostOptions(sourceHostId),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
@@ -143,12 +158,20 @@ async function dispatch(
         if (!desktop.browserScreenshot) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        const r = await desktop.browserScreenshot(conversationId);
+        const r = readHostOptions
+          ? await desktop.browserScreenshot(conversationId, readHostOptions)
+          : await desktop.browserScreenshot(conversationId);
         if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
         return { ok: true, data_url: r.dataUrl };
       }
       case "snapshot": {
-        const r = await performAction(desktop, conversationId, "snapshot");
+        const r = await performAction(
+          desktop,
+          conversationId,
+          "snapshot",
+          undefined,
+          readHostOptions,
+        );
         if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
@@ -158,12 +181,12 @@ async function dispatch(
         }
       }
       case "click": {
-        const r = await performAction(desktop, conversationId, "click", args);
+        const r = await performAction(desktop, conversationId, "click", args, readHostOptions);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         return { ok: true };
       }
       case "type": {
-        const r = await performAction(desktop, conversationId, "type", args);
+        const r = await performAction(desktop, conversationId, "type", args, readHostOptions);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
         return { ok: true };
       }
@@ -246,34 +269,26 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      let sourceHostId: string | null = null;
-      if (evt.action === "navigate") {
+      const needsHostRevalidation = ["screenshot", "snapshot", "click", "type"].includes(
+        evt.action,
+      );
+      let privilegedView = true;
+      if (needsHostRevalidation && desktop.browserHasView) {
         try {
-          // Parent hints cannot establish which ancestor has the nearest own host binding.
-          const visited = new Set<string>();
-          let id: string | null = sourceConversationId;
-          while (id !== null && !visited.has(id)) {
-            visited.add(id);
-            const hopId: string = id;
-            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
-            const source: Session = await queryClient.fetchQuery({
-              queryKey: ["session", hopId],
-              queryFn: () => getSessionSlim(hopId),
-              staleTime: Infinity,
-              retry: false,
-            });
-            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
-            setSessionParent(source.id, source.parentSessionId);
-            if (source.hostId) {
-              sourceHostId = source.hostId;
-              break;
-            }
-            id = source.parentSessionId;
-          }
+          const view = await desktop.browserHasView(sourceConversationId);
+          privilegedView = view.hostIsThisMachine === true;
         } catch {
-          // Unknown provenance stays denied for localhost; public browsing still works.
+          // A failed probe requires current host metadata before acting.
         }
       }
+      const revalidateHost = needsHostRevalidation && privilegedView;
+      const sourceHostId =
+        evt.action === "navigate" || revalidateHost
+          ? await fetchSessionHostId(sourceConversationId, { queryClient })
+          : null;
+      const readHostOptions = revalidateHost
+        ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
+        : undefined;
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
       const sourceIsArcaHost =
         evt.action === "navigate" && sourceHostId !== null
@@ -294,6 +309,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             sourceHostId,
             rememberedArcaHostId,
             sourceIsArcaHost,
+            readHostOptions,
           );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };

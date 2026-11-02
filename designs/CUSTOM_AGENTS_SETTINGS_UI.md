@@ -45,13 +45,26 @@ capability is true. Owned agents open directly in the form; Save changes stays
 inactive until a field changes. Existing list/detail responses and multipart installation are unchanged.
 
 1. `GET /v1/agents/{id}/config` returns description, model, harness, literal
-   instructions, and MCP declarations keyed by name. Save the response's `ETag`.
+   instructions, and MCP declarations keyed by name. Save the response's `ETag` when available.
    Header/env credential names are listed in `configured_header_names` and
    `configured_env_names`; values are never returned. Responses use `no-store`.
-2. `PATCH /v1/agents/{id}` accepts JSON and requires `If-Match: <ETag>`. Send only
+2. `PATCH /v1/agents/{id}` accepts JSON and optional `If-Match: <ETag>`. Send only
    changed fields. A successful response returns the updated configuration and
-   ETag; an unchanged patch retains the version and timestamp. A missing tag
-   returns 428; a stale tag returns 412. Reload before retrying a conflict.
+   ETag; an unchanged patch retains the version and timestamp. A supplied stale
+   tag returns 412. Reload before retrying a conflict.
+   Without a tag, the patch applies to the latest configuration: the last successful
+   save of a field wins. Omitted fields are preserved, and the database still rejects
+   changes that race with the write itself.
+
+The editor saves without `If-Match` when a proxy strips `ETag`. If a proxy strips
+`If-Match` from the request instead, the backend accepts the same partial edit
+without a stale-draft check. Neither revision header must survive the proxy.
+Keep the existing `custom_agents_settings_ui` flag off until both backend and UI
+support this behavior.
+Either can deploy first while the flag is off. With the flag enabled, a newer UI
+against an older backend can receive 428 without a tag. The editor retains the
+draft and explains that the server needs an update, without offering reload as a
+fix. Saving can be retried after the update without discarding the draft.
 
 ```json
 {

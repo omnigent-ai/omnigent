@@ -58,12 +58,15 @@ class SandboxProviderMetadata:
         provider-specific ``sandbox.<name>`` config block.
     :param managed_token_ttl_s: Optional default managed launch-token
         lifetime in seconds.
+    :param manages_profiles: Advertise profile support without importing or
+        constructing the launcher. Must match its ``manages_profiles`` capability.
     """
 
     name: str
     launcher_class: str
     config_model: type[object] | None = None
     managed_token_ttl_s: int | None = None
+    manages_profiles: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,6 +141,16 @@ def _builtin_contribution() -> SandboxProviderContribution:
             "lakebox": SandboxProviderMetadata(
                 name="lakebox",
                 launcher_class="omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
+            ),
+            # OSS Databricks Sandbox provider over the REST command-execution
+            # API (no SSH). Distinct from `lakebox`, whose launcher ships only
+            # in the internal build.
+            "databricks": SandboxProviderMetadata(
+                name="databricks",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.databricks_sandbox:DatabricksSandboxLauncher"
+                ),
+                managed_token_ttl_s=7 * 24 * 3600,
             ),
             "modal": SandboxProviderMetadata(
                 name="modal",

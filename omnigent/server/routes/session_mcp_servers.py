@@ -389,7 +389,7 @@ def create_session_mcp_servers_router(
 
             current_spec = validate_agent_bundle(
                 bundle_bytes,
-                enforce_handler_allowlist=not local_single_user_enabled(),
+                enforce_handler_allowlist=True,
             )
             current_names = {server.name for server in current_spec.mcp_servers} | {
                 server.name for server in selected_mcp_spec(current_spec, conv.labels).mcp_servers
@@ -424,7 +424,7 @@ def create_session_mcp_servers_router(
             new_bundle = _tar_gz_dir(root, original_bundle=bundle_bytes)
             new_spec = validate_agent_bundle(
                 new_bundle,
-                enforce_handler_allowlist=not local_single_user_enabled(),
+                enforce_handler_allowlist=True,
             )
             if new_spec.name != agent.name:
                 raise OmnigentError(

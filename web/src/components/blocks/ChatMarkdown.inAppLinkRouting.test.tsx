@@ -1,6 +1,5 @@
-// Desktop chat links: a same-origin session link opens in place, an opted-in
-// plain click routes to the embedded browser, and everything else keeps the
-// shell's external default.
+// Desktop chat links: a plain click on a same-origin session link opens it in
+// place; other links open independent in-app tabs when opted in.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -13,6 +12,10 @@ import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
   isNativeShell: () => true,
+}));
+
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
 }));
 
 const LINK = "https://example.com/page";
@@ -56,54 +59,75 @@ function clickLink(href = LINK, init: MouseEventInit = {}): MouseEvent {
   return event;
 }
 
-it("routes an opted-in plain click into the conversation's browser view", () => {
-  expect(clickLink().defaultPrevented).toBe(true);
-  expect(openOrNavigate).toHaveBeenCalledWith("conv-1", LINK, undefined, { agent: true });
+it.each([
+  ["plain click", {}],
+  ["cmd-click", { metaKey: true }],
+  ["ctrl-click", { ctrlKey: true }],
+])("routes an opted-in %s into a new in-app browser tab", async (_label, init) => {
+  expect(clickLink(LINK, init).defaultPrevented).toBe(true);
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(
+      expect.stringMatching(/^browser-tab:conv-1:[^:]+$/),
+      LINK,
+      undefined,
+      { agent: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+    ),
+  );
 });
 
 it.each([
-  ["cmd-click", LINK, { metaKey: true }],
-  ["ctrl-click", LINK, { ctrlKey: true }],
+  ["shift-click", LINK, { shiftKey: true }],
+  ["shift-cmd-click", LINK, { shiftKey: true, metaKey: true }],
+  ["shift-ctrl-click", LINK, { shiftKey: true, ctrlKey: true }],
+  ["alt-click", LINK, { altKey: true }],
   ["middle-click", LINK, { button: 1 }],
   ["a mailto: link", "mailto:a@example.com", {}],
-  ["cmd-click on a session link", SESSION_LINK, { metaKey: true }],
 ])("keeps %s on the external path", (_label, href, init) => {
   expect(clickLink(href, init).defaultPrevented).toBe(false);
   expect(openOrNavigate).not.toHaveBeenCalled();
 });
 
-it.each([LINK, "https://other.example.com/c/conv-2"])(
-  "keeps %s on the external path when the preference is off",
-  (href) => {
-    writeOpenLinksInApp(false);
-    window.history.replaceState(null, "", "/c/conv-1");
-    expect(clickLink(href).defaultPrevented).toBe(false);
-    expect(window.location.pathname).toBe("/c/conv-1");
-    expect(openOrNavigate).not.toHaveBeenCalled();
-  },
-);
+it.each([
+  [LINK, {}],
+  [LINK, { metaKey: true }],
+  [LINK, { ctrlKey: true }],
+  ["https://other.example.com/c/conv-2", {}],
+  [SESSION_LINK, { metaKey: true }],
+  [SESSION_LINK, { ctrlKey: true }],
+])("keeps %s (%j) on the external path when the preference is off", (href, init) => {
+  writeOpenLinksInApp(false);
+  window.history.replaceState(null, "", "/c/conv-1");
+  expect(clickLink(href, init).defaultPrevented).toBe(false);
+  expect(window.location.pathname).toBe("/c/conv-1");
+  expect(openOrNavigate).not.toHaveBeenCalled();
+});
 
 it.each([true, false])(
   "opens a same-origin session link in place (in-app browser preference %s)",
-  (preference) => {
+  async (preference) => {
     writeOpenLinksInApp(preference);
     window.history.replaceState(null, "", "/c/conv-1");
     expect(clickLink(SESSION_LINK).defaultPrevented).toBe(true);
     expect(window.location.pathname).toBe("/c/conv-2");
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(openOrNavigate).not.toHaveBeenCalled();
   },
 );
 
 it.each([true, false])(
   "keeps a same-origin non-session link off the session path (in-app browser preference %s)",
-  (preference) => {
+  async (preference) => {
     writeOpenLinksInApp(preference);
     window.history.replaceState(null, "", "/c/conv-1");
     const settingsLink = `${window.location.origin}/settings/c/session`;
     expect(clickLink(settingsLink).defaultPrevented).toBe(preference);
     expect(window.location.pathname).toBe("/c/conv-1");
-    expect(openOrNavigate.mock.calls).toEqual(
-      preference ? [["conv-1", settingsLink, undefined, { agent: true }]] : [],
+    await vi.waitFor(() =>
+      expect(openOrNavigate.mock.calls.map(([, url]) => url)).toEqual(
+        preference ? [settingsLink] : [],
+      ),
     );
   },
 );

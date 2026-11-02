@@ -43,7 +43,7 @@ jobs:
   draft-release:
     # Inert in forks / mirrors — only the canonical repo should cut releases.
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Skip pre-release tags (rcN / devN / preN)
