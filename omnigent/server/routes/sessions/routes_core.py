@@ -712,7 +712,7 @@ def register_core_routes(
         workspace: str | None,
         harness: str | None,
         conversation: Conversation | None = None,
-    ) -> tuple[str, bool] | None:
+    ) -> tuple[str, bool, bool] | None:
         """
         Bind a just-created session to a caller-supplied host and launch.
 
@@ -733,8 +733,8 @@ def register_core_routes(
         start, and if the host still refuses there, that path consults
         the daemon and persists a transcript error (see post_event's
         relaunch branch). The JSON create instead unbinds a session
-        whose new worktree it removes after the failure. No create-time
-        harness gating.
+        whose new worktree it removes after the host refuses the launch.
+        No create-time harness gating.
 
         :param request: The create request (for ``app.state`` lookups).
         :param user_id: Authenticated caller, or ``None`` when auth is
@@ -750,9 +750,11 @@ def register_core_routes(
         :param conversation: Optional authoritative row already returned by
             session creation, used to avoid re-reading it during launch
             authorization. Its id must match ``session_id``.
-        :returns: ``(runner_id, launch_failed)`` after the bind, or
-            ``None`` when the server has no host registry/store wired
-            (minimal test wirings — nothing was attempted).
+        :returns: ``(runner_id, launch_failed, host_refused)`` after the
+            bind, or ``None`` when the server has no host registry/store
+            wired (minimal test wirings — nothing was attempted).
+            ``host_refused`` is true only when the host itself reported the
+            failure; a timeout or send error leaves the launch outcome unknown.
         :raises OmnigentError: ``CONFLICT`` when a runner is already
             bound; ``INTERNAL_ERROR`` on a NULL workspace.
         :raises HTTPException: 403/404 from ``resolve_host_launch``.
@@ -854,9 +856,11 @@ def register_core_routes(
         )
         launch_timeout_s = resolve_launch_timeout_s()
         launch_result: HostLaunchResult
+        host_answered = False
         try:
             host_registry.send_text(conn, launch_frame)
             launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
+            host_answered = True
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
         except TimeoutError:
@@ -893,7 +897,7 @@ def register_core_routes(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
-        return runner_id, launch_failed
+        return runner_id, launch_failed, host_answered and launch_failed
 
     @router.post(
         "/sessions/orchestrated",
@@ -1236,7 +1240,7 @@ def register_core_routes(
                 conversation=conv,
             )
             if launched is not None:
-                runner_id, launch_failed = launched
+                runner_id, launch_failed, host_refused = launched
                 if launch_failed and _terminal_first_create:
                     # The runner never booted, so its pending=False clear
                     # will never fire. Clear the spin-up flag here so a
@@ -1245,7 +1249,7 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
-                if launch_failed and body.git is not None and not body.git.existing_worktree:
+                if host_refused and body.git is not None and not body.git.existing_worktree:
                     unbound = await _remove_failed_launch_worktree(
                         conversation_store=conversation_store,
                         host_registry=getattr(request.app.state, "host_registry", None),

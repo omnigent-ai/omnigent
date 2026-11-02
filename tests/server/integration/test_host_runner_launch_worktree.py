@@ -43,6 +43,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes import hosts as hosts_routes
 from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -139,7 +140,8 @@ async def register_host(
     :returns: Async iterator yielding a ``register`` factory. Kwargs:
         ``create_status`` (``"ok"``/``"failed"``), ``create_error``
         (host failure detail), ``launch_status``
-        (``"launched"``/``"failed"``), ``remove_status``
+        (``"launched"``/``"failed"``, or ``"no_reply"`` to leave the
+        launch unanswered), ``remove_status``
         (``"ok"``/``"failed"``). Returns the :class:`_HostCapture`
         accumulating frames the host received.
     """
@@ -220,6 +222,8 @@ async def register_host(
                         resolver_tasks.append(asyncio.create_task(_resolve_create(frame, fut)))
                 elif isinstance(frame, HostLaunchRunnerFrame):
                     cap.launch.append(frame)
+                    if launch_status == "no_reply":
+                        continue
                     fut = conn.pending_launches.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(
@@ -605,6 +609,102 @@ async def test_inline_create_keeps_binding_when_worktree_removal_fails(
     assert conv.host_id == _HOST_ID
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-leak"
     assert conv.git_branch == "feature/leak"
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+
+
+@pytest.mark.parametrize("launch_outcome", ["timeout", "send_error"])
+async def test_inline_create_keeps_new_worktree_when_launch_outcome_is_unknown(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_outcome: str,
+) -> None:
+    """A launch the host never answered may still start a runner there, so the worktree stays."""
+    cap = register_host(launch_status="no_reply")
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_launch.resolve_launch_timeout_s", lambda: 0.01
+    )
+    if launch_outcome == "send_error":
+        registry = app.state.host_registry
+        send_text = registry.send_text
+
+        def _fail_launch_send(conn: HostConnection, data: str) -> None:
+            if isinstance(decode_host_frame(data), HostLaunchRunnerFrame):
+                raise ConnectionError("host connection was replaced")
+            send_text(conn, data)
+
+        monkeypatch.setattr(registry, "send_text", _fail_launch_send)
+    agent = await create_test_agent(client, name="wt-inline-unknown-launch-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.launch) == (1 if launch_outcome == "timeout" else 0)
+    assert cap.remove == []
+    body = resp.json()
+    assert body["runner_id"] is not None
+    assert WORKTREE_ROOT_LABEL_KEY in body["labels"]
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        body["runner_id"],
+        _HOST_ID,
+        f"{_SOURCE_REPO}-worktrees/feature-leak",
+        "feature/leak",
+    )
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+
+
+async def test_inline_create_keeps_worktree_once_another_runner_is_bound(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup after a refused launch leaves a session alone once a relaunch has rebound it."""
+    cap = register_host(launch_status="failed")
+    store = SqlAlchemyConversationStore(db_uri)
+    remove_failed_launch_worktree = routes_core._remove_failed_launch_worktree
+
+    async def _rebind_before_cleanup(**kwargs: Any) -> object:
+        store.replace_runner_id(
+            kwargs["session_id"], "runner_replacement", expected_runner_id=kwargs["runner_id"]
+        )
+        return await remove_failed_launch_worktree(**kwargs)
+
+    monkeypatch.setattr(routes_core, "_remove_failed_launch_worktree", _rebind_before_cleanup)
+    agent = await create_test_agent(client, name="wt-inline-rebound-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert cap.remove == []
+    conv = store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        "runner_replacement",
+        _HOST_ID,
+        f"{_SOURCE_REPO}-worktrees/feature-leak",
+        "feature/leak",
+    )
     assert WORKTREE_ROOT_LABEL_KEY in conv.labels
 
 
