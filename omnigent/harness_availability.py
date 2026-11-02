@@ -12,15 +12,17 @@ HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
 # missing, too old, or of unknown version. Older servers drop it from a hello and
 # reject a live readiness refresh that contains it.
 HARNESS_TMUX_UNAVAILABLE: Final[Literal["tmux-unavailable"]] = "tmux-unavailable"
+HARNESS_PROBE_UNANSWERED: Final[Literal["probe-unanswered"]] = "probe-unanswered"
 
 HarnessUnavailableReason = Literal[
-    "binary-missing", "needs-auth", "version-too-low", "tmux-unavailable"
+    "binary-missing", "needs-auth", "probe-unanswered", "version-too-low", "tmux-unavailable"
 ]
 HarnessAvailability = Literal[
     True,
     False,
     "binary-missing",
     "needs-auth",
+    "probe-unanswered",
     "version-too-low",
     "tmux-unavailable",
 ]
@@ -36,6 +38,7 @@ def is_harness_availability(value: object) -> TypeGuard[HarnessAvailability]:
     return isinstance(value, bool) or value in (
         HARNESS_BINARY_MISSING,
         HARNESS_NEEDS_AUTH,
+        HARNESS_PROBE_UNANSWERED,
         HARNESS_VERSION_TOO_LOW,
         HARNESS_TMUX_UNAVAILABLE,
     )
