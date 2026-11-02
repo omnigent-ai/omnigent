@@ -10,6 +10,21 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `picker-curation`: server config `restrict_to_agent_names` limits and orders
+  what New Chat offers, and `default_agent_name` pre-selects one for a user
+  with no remembered pick. Curated, the menu is one flat list with no Harnesses
+  heading, no "Other..." submenus, no "Create custom agent" entry and no Smart
+  Routing entry; a name matching nothing shows an empty state and logs at
+  startup, while a failed agent fetch says so rather than blaming the
+  deployment. A returning user's cached picker stays closed while `/v1/info` is
+  pending, including behind the embedded app's offline stand-in, so the full
+  roster never shows ahead of the curation (a failed probe falls back to the
+  uncurated picker); "Hide unconfigured harnesses" and the per-entry hides in
+  Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
+  configured default carrying that agent's own brain harness, never the
+  rejected agent's, and a project's configured agent outside the curation is
+  reported unavailable until the user picks an offered one. Display only,
+  and New Chat only: the scheduled-task and project-settings pickers are untouched.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
@@ -46,6 +61,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `isaac-credential-detection`: harness setup offers Isaac when host-side
   Databricks detection finds a matching credential, and fails open for older
   hosts or servers that cannot report detection results.
+- `picker-entry-visibility`: the user hides individual harnesses and agents from
+  every agent picker (new chat, automation, project default) in Settings →
+  Appearance, per device. Independent of the readiness filter above, which only
+  drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
@@ -152,6 +171,14 @@ Real-provider history compatibility requires a separate live check.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
+The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press
+**Edit**, filter the checklist and uncheck an entry, or press **Show all** to
+restore them. The entry drops from the New Chat, New automation and
+project-default pickers. This is the user's own per-device choice, unlike "Hide
+unconfigured harnesses" next to it, which only drops rows that cannot launch on
+the selected host.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
@@ -428,6 +455,14 @@ Cross-harness journeys:
   response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
+- **`picker-curation`:** `tests/server/test_server_config.py` (parsing),
+  `tests/server/test_app.py` (the `/v1/info` block and the startup warning),
+  `web/src/lib/capabilities.test.ts` (probe parsing),
+  the "curated New Chat picker" cases in `web/src/shell/AgentHarnessPicker.test.tsx`
+  (menu shape) and the
+  "picker curation" cases in `web/src/shell/NewChatDialog.test.tsx` (default
+  pre-selection, remembered picks and the empty state in the real landing
+  flow). Set the two keys in the server config, restart, and open New Chat.
 - **`needs-auth`:**
   `web/src/pages/settings/SettingsHarnessesSection.test.tsx` covers the
   flag-gated credential warning card, its Reconfigure affordance, and full-card click.
@@ -457,6 +492,16 @@ Cross-harness journeys:
   a newer same-value model write and its effort while the applied model stays
   unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
   These cases do not cover live providers or a post-refusal retry.
+- **`picker-entry-visibility`:**
+  `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
+  entry drops and when the picker points at Settings,
+  `web/src/pages/settings/PickerVisibilitySetting.test.tsx` the Settings
+  summary, checklist, **Show all** and a failed catalog load,
+  `web/src/lib/pickerEntryVisibility.test.ts`
+  the stored set, `web/src/lib/settingsPortability.test.ts` export and import,
+  `web/src/hooks/useAvailableAgents.test.tsx` (`useAgentCatalog`) the Settings
+  list's agents, and `web/src/lib/agentGrouping.test.ts` that Settings and the
+  picker group an entry the same way.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal

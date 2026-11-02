@@ -80,6 +80,10 @@ elif args == [
     "repos/example/project/pulls/42/files?per_page=100",
 ]:
     print("[[]]")
+elif args == ["api", "--hostname", "github.com", "repos/example/project/pulls/42"]:
+    print(json.dumps({"head": {"sha": pr["headRefOid"]}, "base": {"sha": pr["baseRefOid"]}}))
+elif args[:2] == ["pr", "diff"]:
+    print("")
 elif args[0] == "api":
     unexpected_api()
 else:

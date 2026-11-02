@@ -16,6 +16,15 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+
+/* CSS-pixel floor, independent of viewport width and pointer capability. */
+@utility mobile-touch-target {
+  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
 
 @theme inline {
   --font-heading: var(--font-sans);
@@ -1422,6 +1431,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-family: var(--font-mono);
   --diffs-header-font-family: var(--ui-font-family, var(--font-sans));
   --diffs-font-features: "liga" 0, "calt" 0;
+}
+
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
 }
 
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);

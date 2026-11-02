@@ -657,7 +657,7 @@ describe("side-chat selection reply", () => {
     const input = between
       ? screen.getByRole("textbox", { name: "Reply text before quote 2" })
       : screen.getByTestId("side-chat-input");
-    expect(fireEvent.paste(input, { clipboardData: { items: [] } })).toBe(true);
+    expect(fireEvent.paste(input, { clipboardData: { items: [], getData: () => "" } })).toBe(true);
     const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
     expect(
       fireEvent.paste(input, {
@@ -734,6 +734,15 @@ describe("side-chat selection reply", () => {
     );
     expect(input).toHaveValue("Keep this question");
     expect(screen.queryByAltText("shot.png")).toBeNull();
+  });
+
+  it.each([false, true])("inserts pasted text as typed input (pending: %s)", (pending) => {
+    if (!pending) conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={pending ? "pending:side" : childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    const getData = (type: string) => (type === "text/plain" ? "dictated words" : "");
+    expect(fireEvent.paste(input, { clipboardData: { items: [], getData } })).toBe(false);
+    expect(input).toHaveValue("dictated words");
   });
 
   it("quotes selected side-chat text in its own composer and preserves the draft", () => {

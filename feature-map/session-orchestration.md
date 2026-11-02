@@ -48,13 +48,18 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
   `sys_session_create` and `placement="same_host"` or `placement="managed"`.
+  Pass `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`
+  to choose an authorized profile/revision from the
+  [provider catalog](../docs/extending/provider_profiles.md).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
 - On Automations, pick the *Jira tickets*, *Slack messages*, or *GitHub issues*
-  chip, fill in the trigger builder, and save: the hourly automation's kept
-  session starts one worker per new match with `sys_session_create`. Covered by
+  chip, or choose **New automation → Create from template** to browse the same
+  templates at `/tasks/templates`. Pick a template, fill in the trigger builder,
+  and save: the hourly automation's kept session starts one worker per new match
+  with `sys_session_create`. Covered by
   `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
 
 ## Driving it with the repro environment
@@ -174,6 +179,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   still turns all orchestration off.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
+  The names also preserve different native approval scopes; see
+  [why the messaging tools remain separate](../docs/session-messaging-tool-boundary.md).
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or

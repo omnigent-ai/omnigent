@@ -103,7 +103,11 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
-from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.launch_failure import (
+    TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
+    FailureDiagnosis,
+    classify_terminal_failure,
+)
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -221,6 +225,28 @@ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
+
+
+_SPEC_FETCH_HTTP_STATUS = re.compile(r"failed with HTTP (\d{3})$")
+
+
+def _spec_resolve_error_detail(exc: BaseException) -> str:
+    """Name a failed agent-spec load's structured cause in the client detail.
+
+    Only the exception type, its direct cause's type, and the server's HTTP
+    status appear; the free-form text stays in the runner log.
+
+    :param exc: The spec resolver failure, e.g. ``httpx.ConnectError(...)`` or
+        ``RuntimeError("spec_resolver: GET /v1/... failed with HTTP 503")``.
+    :returns: e.g. ``"Could not load the agent spec (ConnectError). Request
+        failed on the runner; see the runner log for details: ~/..."``.
+    """
+    cause = _native_runtime._native_terminal_start_failure_cause(exc)
+    status = _SPEC_FETCH_HTTP_STATUS.search(str(exc)) if isinstance(exc, RuntimeError) else None
+    if status is not None:
+        cause = f"{cause} HTTP {status.group(1)}"
+    detail = _client_safe_error_detail(exc, context="spec resolve")
+    return f"Could not load the agent spec ({cause}). {detail}"
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -1948,6 +1974,8 @@ def create_runner_app(
             exit_status=event.exit_status,
             output=event.last_output,
         )
+        if diagnosis is None and event.closed_outside_omnigent:
+            diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
         error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
@@ -2428,7 +2456,7 @@ def create_runner_app(
                 status_code=503,
                 content={
                     "error": "spec_resolver_failed",
-                    "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                    "detail": _spec_resolve_error_detail(exc),
                 },
             )
 
@@ -2610,7 +2638,7 @@ def create_runner_app(
                     status_code=503,
                     content={
                         "error": "spec_resolver_failed",
-                        "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                        "detail": _spec_resolve_error_detail(exc),
                     },
                 )
         if spec_entry is not None:
@@ -5642,7 +5670,7 @@ def create_runner_app(
                     status_code=503,
                     content={
                         "error": "spec_resolver_failed",
-                        "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                        "detail": _spec_resolve_error_detail(exc),
                     },
                 )
         from omnigent.sandbox.copy_on_write import (

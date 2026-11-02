@@ -166,6 +166,7 @@ function loadNavigationHarness({
   notificationsSupported = false,
   oidc = {},
   acceptedSessions = new Set(),
+  deepLinks = null,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -477,7 +478,7 @@ function loadNavigationHarness({
       getDatabricksInternalFeaturesEnabled: () => internalFeatures,
       getManagedServerNames: () => managedServerNames,
     },
-    "./deepLink": {
+    "./deepLink": deepLinks ?? {
       parseOmnigentDeepLink: () => null,
       chooseDeepLinkStrategy: () => null,
     },
@@ -683,7 +684,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -3438,6 +3439,33 @@ describe("deep-link path join wiring (src/main.js)", () => {
 // serialized queue, the protocol registration, and the orchestrator — the
 // half no behavior test can see. Losing any silently reopens the readiness
 // race (macOS open-url before whenReady) or the single-instance funnel.
+describe("CLI deep-link handoff", () => {
+  for (const accepted of [true, false]) {
+    it(`navigates only after accepting the CLI request (${accepted})`, async () => {
+      const acknowledgments = [];
+      const h = loadNavigationHarness({
+        serverUrl: "http://localhost:6767/",
+        deepLinks: {
+          ...require("../src/deepLink"),
+          acceptCliDeepLink: async (raw) => {
+            acknowledgments.push(raw);
+            return accepted;
+          },
+        },
+      });
+      const url = "omnigent://localhost:6767/";
+      await h.api.handleDeepLink(url);
+      assert.deepEqual(acknowledgments, [url]);
+      assert.deepEqual(
+        h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+        accepted ? [{ channel: "omnigent:open-path", data: "/" }] : [],
+      );
+      assert.deepEqual(h.calls.loadURL, []);
+      h.api.disposeAuth();
+    });
+  }
+});
+
 describe("deep-link ingestion wiring (src/main.js)", () => {
   it("registers open-url with preventDefault + enqueueDeepLink as live code", () => {
     assert.match(
@@ -5177,6 +5205,32 @@ describe("find bar teardown (src/main.js)", () => {
     };
     assert.doesNotThrow(() => bar.close());
     assert.equal(h.calls.focused, undefined);
+  });
+
+  it("tells the page the bar opened, since the menu sends no page keydown", (t) => {
+    const { h } = openBar();
+    t.after(h.cleanup);
+    const opened = h.calls.progress.filter(({ channel }) => channel === "omnigent:find-opened");
+    assert.equal(opened.length, 1);
+  });
+
+  it("closes when the window switches conversation, not within one or in a subframe, under a mount", (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://omni.example/tenant/c/foo/c/alpha" });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = () => {};
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    h.webContents.emit(
+      "did-navigate-in-page",
+      "https://omni.example/tenant/c/foo/c/alpha?message=m1",
+      true,
+    );
+    h.webContents.emit("did-navigate-in-page", "https://embed.example/#tab", false);
+    assert.equal(bar.isDestroyed(), false);
+    h.webContents.emit("did-navigate-in-page", "https://omni.example/tenant/c/foo/c/beta", true);
+    assert.equal(bar.isDestroyed(), true);
   });
 });
 

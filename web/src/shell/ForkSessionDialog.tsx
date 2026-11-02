@@ -36,6 +36,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
@@ -43,7 +49,7 @@ import {
   workspaceRecoveryDisabledReason,
 } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
@@ -92,6 +98,17 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { randomUUID } from "@/lib/randomUUID";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
+import {
+  MAX_SANDBOX_REPOS,
+  SANDBOX_WORKSPACE_LENGTH_MESSAGE,
+  composeSandboxWorkspaces,
+  isValidSandboxBranch,
+  isValidSandboxRepoUrl,
+  isValidSandboxWorkspaceLength,
+  splitSandboxWorkspace,
+} from "@/lib/sandboxRepositories";
+import { SandboxRepositoryPicker } from "./SandboxRepositoryPicker";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
@@ -109,12 +126,8 @@ import {
 import {
   ConnectHostInstructions,
   SANDBOX_REPO_LABEL_KEY,
-  composeSandboxWorkspace,
-  deriveRepoName,
-  isValidSandboxRepoUrl,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
-  splitSandboxWorkspace,
 } from "./NewChatDialog";
 
 // Select sentinel for "keep the source's agent" (Radix Select needs a
@@ -131,11 +144,12 @@ const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 const NO_HOSTS: Host[] = [];
 
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
-type ForkField = "host" | "directory" | "sandboxRepo";
+type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
 const FORK_FIELD_IDS: Record<ForkField, string> = {
   host: "fork-session-host",
   directory: "fork-session-directory",
-  sandboxRepo: "fork-session-sandbox-repo",
+  sandboxRepo: "fork-session-sandbox-repo-input",
+  sandboxProfile: "fork-session-sandbox-profile",
 };
 
 function ForkFieldError({ message }: { message: string | null }) {
@@ -145,6 +159,14 @@ function ForkFieldError({ message }: { message: string | null }) {
       {message}
     </p>
   );
+}
+
+function sandboxRepositoryHint(count: number): string {
+  if (count === 0) return "No repositories selected. The fork starts in an empty workspace.";
+  if (count === 1) {
+    return "The agent starts in this repository. Remove it to start with an empty workspace.";
+  }
+  return "Repositories are cloned side by side. The agent starts in the directory containing them.";
 }
 
 /**
@@ -872,10 +894,13 @@ function SupportedForkSessionForm({
   const [sandboxSelected, setSandboxSelected] = useState(false);
   // Provider the sandbox pick launches on; null for a server that names none.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
-  // Repository cloned into the sandbox, split across two inputs and
-  // recomposed into the request's `<url>[#<branch>]` workspace.
-  const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
-  const [sandboxRepoBranch, setSandboxRepoBranch] = useState("");
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(null);
+  const profileEdited = useRef(false);
+  const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>([]);
+  const [sandboxBranchNotes, setSandboxBranchNotes] = useState<Record<string, string>>({});
+  const [sandboxBranchesChecked, setSandboxBranchesChecked] = useState(false);
+  const editedSandboxReposRef = useRef(new Set<string>());
+  const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   // Whether the "connect another host" CLI hint is expanded (only shown when
   // at least one host is online; otherwise the instructions render directly).
   const [showConnect, setShowConnect] = useState(false);
@@ -1102,28 +1127,110 @@ function SupportedForkSessionForm({
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
   const sourceSandboxRepo = sourceSession?.labels?.[SANDBOX_REPO_LABEL_KEY] ?? null;
-  // The source's repo label is space-joined when it had several repos. The
-  // single URL/branch fields below can't represent more than one, so a
-  // multi-repo source inherits ALL of them wholesale (the fork omits its own
-  // workspace, and the server re-clones every repo the source recorded).
-  const sourceSandboxRepos = (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean);
-  const multiRepoSource = sourceSandboxRepos.length > 1;
-
-  // Prefill the sandbox repository from the source's, so cloning a sandbox
-  // session onto a fresh sandbox lands in the same checkout. A ref keeps it
-  // ONE-SHOT: clearing the field is how the user asks for an empty sandbox,
-  // and a slot-empty guard would spring the prefill straight back.
+  const originalSandboxWorkspaces = useMemo(
+    () => (sourceSandboxRepo ?? "").split(/\s+/).filter(Boolean),
+    [sourceSandboxRepo],
+  );
+  const originalSandboxRepos = useMemo(
+    () => originalSandboxWorkspaces.map(splitSandboxWorkspace),
+    [originalSandboxWorkspaces],
+  );
+  const sandboxWorkspacesSupported = info !== "loading" && info.session_fork_workspaces === true;
+  // Older servers can only preserve multiple repositories through unchanged inheritance.
+  const canDiscoverSandboxBranches =
+    originalSandboxRepos.length > 0 &&
+    (sandboxWorkspacesSupported || originalSandboxRepos.length === 1);
+  const sandboxBranchesPending =
+    sandboxSelected && canDiscoverSandboxBranches && !sandboxBranchesChecked;
+  // Seed once so removing all inherited repositories stays an explicit choice.
   useEffect(() => {
     if (!sandboxSelected || sandboxRepoSeededRef.current || sourceSandboxRepo === null) return;
     sandboxRepoSeededRef.current = true;
-    // A multi-repo source can't be edited through the single URL/branch pair,
-    // so leave them blank and inherit every repo (see the submit below);
-    // splitting the space-joined label here would seed an invalid URL.
-    if (multiRepoSource) return;
-    const { url, branch } = splitSandboxWorkspace(sourceSandboxRepo);
-    setSandboxRepoUrl(url);
-    setSandboxRepoBranch(branch);
-  }, [sandboxSelected, sourceSandboxRepo, multiRepoSource]);
+    setSandboxRepos(originalSandboxRepos);
+  }, [sandboxSelected, sourceSandboxRepo, originalSandboxRepos]);
+
+  useEffect(() => {
+    if (
+      !visible ||
+      !sandboxSelected ||
+      busy ||
+      !canDiscoverSandboxBranches ||
+      sandboxBranchesChecked
+    )
+      return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort();
+      setSandboxBranchesChecked(true);
+    }, 8_000);
+    void fetchSessionRepositoryBranches(sourceSessionId, controller.signal)
+      .then(({ repositories }) => {
+        if (controller.signal.aborted) return;
+        const ambiguousUrls = new Set<string>();
+        for (const entries of [originalSandboxRepos, repositories]) {
+          const seen = new Set<string>();
+          for (const repo of entries) {
+            if (seen.has(repo.url)) ambiguousUrls.add(repo.url);
+            seen.add(repo.url);
+          }
+        }
+        const currentBranches = new Map(
+          repositories
+            .filter((repo) => !ambiguousUrls.has(repo.url))
+            .map((repo) => [repo.url, repo]),
+        );
+        setSandboxRepos((current) =>
+          current.map((repo) => {
+            const live = currentBranches.get(repo.url);
+            return !editedSandboxReposRef.current.has(repo.url) &&
+              live?.pushed &&
+              live.branch &&
+              isValidSandboxBranch(live.branch) &&
+              isValidSandboxWorkspaceLength(repo.url, live.branch)
+              ? { ...repo, branch: live.branch }
+              : repo;
+          }),
+        );
+        setSandboxBranchNotes(
+          Object.fromEntries(
+            originalSandboxRepos.flatMap((repo) => {
+              const live = currentBranches.get(repo.url);
+              if (
+                editedSandboxReposRef.current.has(repo.url) ||
+                live?.pushed !== false ||
+                !live.branch
+              ) {
+                return [];
+              }
+              return [
+                [
+                  repo.url,
+                  `“${live.branch}” isn’t pushed. Using ${repo.branch || "the default branch"}.`,
+                ],
+              ];
+            }),
+          ),
+        );
+      })
+      // An offline source or older server leaves the original branches selected.
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(timeout);
+        if (!controller.signal.aborted) setSandboxBranchesChecked(true);
+      });
+    return () => {
+      controller.abort();
+      clearTimeout(timeout);
+    };
+  }, [
+    visible,
+    sandboxSelected,
+    busy,
+    canDiscoverSandboxBranches,
+    originalSandboxRepos,
+    sourceSessionId,
+    sandboxBranchesChecked,
+  ]);
 
   // Resolve a typed "~/…" path to its absolute form against the host's home,
   // so it's directly submittable without opening the tree browser (the server
@@ -1153,49 +1260,99 @@ function SupportedForkSessionForm({
   // that would just fail server-side) until a live host is chosen.
   const selectedHostOnline =
     selectedHostId !== null && onlineHosts.some((h) => h.host_id === selectedHostId);
-  // A blank repository is legal — the clone then gets an empty sandbox —
-  // but a branch without one, or a malformed URL, greys the button instead
-  // of surfacing as a 422. Mirrors NewChatDialog's sandbox validity rule.
   // The destination provider the fork launches on (server default when none is
   // picked yet) and whether it clones several repos.
   const forkEffectiveProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const {
+    launchError: sandboxProfileError,
+    selection: selectedSandboxProfile,
+    current: currentSandboxProfile,
+  } = useSandboxProfileCatalog(sandboxSelected ? forkEffectiveProvider : null, sandboxProfile);
+  const sourceProfile = sourceSession?.sandboxProfile;
+  useEffect(() => {
+    if (
+      !sandboxSelected ||
+      profileEdited.current ||
+      !sourceProfile ||
+      sourceProfile.provider !== forkEffectiveProvider
+    )
+      return;
+    if (!sandboxProfile) setSandboxProfile(sourceProfile);
+    else if (
+      currentSandboxProfile &&
+      currentSandboxProfile.id === sourceProfile.id &&
+      currentSandboxProfile.revision !== sandboxProfile.revision
+    ) {
+      setSandboxProfile(currentSandboxProfile);
+    }
+  }, [
+    sandboxSelected,
+    sourceProfile,
+    forkEffectiveProvider,
+    sandboxProfile,
+    currentSandboxProfile,
+  ]);
+  const profileUpdatedFromSource =
+    !!sourceProfile &&
+    sandboxProfile?.id === sourceProfile.id &&
+    sandboxProfile.provider === sourceProfile.provider &&
+    sandboxProfile.revision !== sourceProfile.revision;
   const forkProviderMultiRepo =
     info !== "loading" &&
     forkEffectiveProvider !== null &&
     info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.multi_repo === true;
-  // Short "repo" / "repo#branch" form for the sandbox hint — the same name
-  // the clone directory takes inside the sandbox.
-  const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
-  const sandboxRepoLabel =
-    sandboxRepoName !== null && sandboxRepoBranch.trim() !== ""
-      ? `${sandboxRepoName}#${sandboxRepoBranch.trim()}`
-      : (sandboxRepoName ?? sandboxRepoUrl.trim());
+  const maxSandboxRepos = forkProviderMultiRepo ? MAX_SANDBOX_REPOS : 1;
+  const sandboxWorkspaces = composeSandboxWorkspaces(sandboxRepos);
+  const originalSandboxReposUnchanged =
+    sandboxWorkspaces.length === originalSandboxWorkspaces.length &&
+    sandboxWorkspaces.every((entry, index) => entry === originalSandboxWorkspaces[index]);
+  const unsupportedMultiRepoEdit =
+    !sandboxWorkspacesSupported && sandboxWorkspaces.length > 1 && !originalSandboxReposUnchanged;
+  const multiRepoUpgradeHint =
+    "Upgrade the server to change multiple repositories. You can keep the original repositories or select at most one.";
+  const sandboxWorkspaceFields = (() => {
+    if (sandboxWorkspacesSupported) return { workspaces: sandboxWorkspaces };
+    if (sandboxWorkspaces.length <= 1) return { workspace: sandboxWorkspaces[0] ?? null };
+    return {};
+  })();
   // The first field stopping submit, with the message shown under it. A coding
   // source needs a live host + valid directory; a sandbox clone needs neither
   // (the server provisions both), only a coherent repository.
   const submitBlocker = ((): { field: ForkField; message: string } | null => {
     if (sandboxSelected) {
-      // A multi-repo source inherits every repo, so it needs a multi-repo
-      // destination; a single-repo provider would reject it after the fork exists.
-      if (multiRepoSource) {
-        return forkProviderMultiRepo
-          ? null
-          : {
-              field: "host",
-              message: `This provider clones only one repository, but the source has ${sourceSandboxRepos.length}. Pick one that supports several.`,
-            };
+      if (sandboxProfileError !== null) {
+        return { field: "sandboxProfile", message: sandboxProfileError };
       }
-      if (sandboxRepoUrl.trim() === "") {
-        return sandboxRepoBranch.trim() === ""
-          ? null
-          : { field: "sandboxRepo", message: "Add the repository this branch belongs to." };
+      if (sandboxRepos.length > maxSandboxRepos) {
+        return {
+          field: "sandboxRepo",
+          message: `This provider clones at most ${maxSandboxRepos} ${maxSandboxRepos === 1 ? "repository" : "repositories"}. Remove extra repositories or choose another provider.`,
+        };
       }
-      return isValidSandboxRepoUrl(sandboxRepoUrl)
+      if (pendingRepoUrl.trim() !== "") {
+        return {
+          field: "sandboxRepo",
+          message: isValidSandboxRepoUrl(pendingRepoUrl)
+            ? "Finish or clear the repository URL before cloning."
+            : "Enter a repository URL like https://github.com/org/repo.",
+        };
+      }
+      if (sandboxRepos.some((repo) => !isValidSandboxRepoUrl(repo.url))) {
+        return {
+          field: "sandboxRepo",
+          message: "Enter a repository URL like https://github.com/org/repo.",
+        };
+      }
+      if (sandboxRepos.some((repo) => !isValidSandboxWorkspaceLength(repo.url, repo.branch))) {
+        return { field: "sandboxRepo", message: SANDBOX_WORKSPACE_LENGTH_MESSAGE };
+      }
+      if (unsupportedMultiRepoEdit) return { field: "sandboxRepo", message: multiRepoUpgradeHint };
+      return sandboxRepos.every((repo) => isValidSandboxBranch(repo.branch))
         ? null
         : {
             field: "sandboxRepo",
-            message: "Enter a repository URL like https://github.com/org/repo.",
+            message: "Enter a valid branch name or leave it blank for the default branch.",
           };
     }
     if (!isCodingSource) return null;
@@ -1219,14 +1376,20 @@ function SupportedForkSessionForm({
     }
     return null;
   })();
-  const canSubmit = submitBlocker === null;
+  const canSubmit = submitBlocker === null && !sandboxBranchesPending;
   const fieldError = (field: ForkField) =>
     showErrors && submitBlocker?.field === field ? submitBlocker.message : null;
   useEffect(() => {
     if (focusField === null) return;
-    document.getElementById(FORK_FIELD_IDS[focusField])?.focus();
+    const section = document.getElementById("fork-session-repositories");
+    const invalid =
+      focusField === "sandboxRepo" && pendingRepoUrl.trim() === ""
+        ? section?.querySelector<HTMLElement>('[aria-invalid="true"]')
+        : null;
+    const input = invalid ?? document.getElementById(FORK_FIELD_IDS[focusField]);
+    (input ?? section)?.focus();
     setFocusField(null);
-  }, [focusField]);
+  }, [focusField, pendingRepoUrl]);
 
   // Conflict hint: other *connected* sessions already working in the picked
   // directory on this host (same wiring as NewChatDialog).
@@ -1308,6 +1471,10 @@ function SupportedForkSessionForm({
 
   /** Target the clone at a server-provisioned sandbox on `provider`. */
   function selectSandbox(provider: string | null): void {
+    if (provider !== sandboxProvider) {
+      setSandboxProfile(null);
+      profileEdited.current = false;
+    }
     setSandboxSelected(true);
     setSandboxProvider(provider);
     // A host directory can't describe a sandbox that doesn't exist yet;
@@ -1319,13 +1486,11 @@ function SupportedForkSessionForm({
   }
 
   async function handleFork(): Promise<void> {
+    if (sandboxBranchesPending) return;
     if (submitBlocker !== null) {
       // Point at what's missing rather than ignoring the click.
       setShowErrors(true);
-      if (
-        submitBlocker.field === "sandboxRepo" ||
-        (submitBlocker.field === "directory" && !directoryAtTop)
-      ) {
+      if (submitBlocker.field === "directory" && !directoryAtTop) {
         setShowAdvanced(true);
       }
       setFocusField(submitBlocker.field);
@@ -1384,17 +1549,17 @@ function SupportedForkSessionForm({
         config: runConfig,
         // Sandbox clone: the server provisions the host, so the fork call
         // carries the compute request itself and no launchRunner follows.
-        // The workspace is always explicit — the dialog's repository field
-        // is the user's answer, including "blank" for an empty sandbox.
+        // Older servers accept one explicit workspace or unchanged inherited repositories.
         sandbox: sandboxSelected
           ? {
-              provider: sandboxProvider,
-              // Omit the workspace for a multi-repo source so the server
-              // inherits ALL of the source's repositories; otherwise send the
-              // single repo the fields resolve to (blank → empty sandbox).
-              workspace: multiRepoSource
-                ? undefined
-                : (composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null),
+              provider: forkEffectiveProvider,
+              ...(selectedSandboxProfile !== null
+                ? {
+                    profileId: selectedSandboxProfile.id,
+                    profileRevision: selectedSandboxProfile.revision,
+                  }
+                : {}),
+              ...sandboxWorkspaceFields,
               // The new sandbox host's id; keys the fork and its requests
               // until the host binds (see NewChatDialog's managed create).
               ...(info !== "loading" && info.request_managed_sandbox_host_id
@@ -1456,6 +1621,9 @@ function SupportedForkSessionForm({
       finishClone(clone, { forkId: fork.id });
     } catch (e) {
       // forkSession failed — nothing created, so inputs stay editable for a resubmit.
+      if (sandboxSelected) {
+        void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+      }
       const message = e instanceof Error ? e.message : "Couldn't clone the session. Try again.";
       if (clone) finishClone(clone, { error: message });
       else setError(message);
@@ -1790,17 +1958,89 @@ function SupportedForkSessionForm({
           />
         )}
 
-        {/* Sandbox counterpart of the reuse-dir indicator: the clone gets a
-              fresh sandbox, so say what lands in it and where to change that.
-              The repository fields themselves live under Advanced. */}
+        {sandboxSelected && forkEffectiveProvider !== null && (
+          <div className="flex flex-col gap-1">
+            <SandboxProfilePicker
+              id={FORK_FIELD_IDS.sandboxProfile}
+              provider={forkEffectiveProvider}
+              value={sandboxProfile}
+              onChange={(profile) => {
+                profileEdited.current = true;
+                setSandboxProfile(profile);
+              }}
+            />
+            {profileUpdatedFromSource && (
+              <p role="status" className="text-sm text-muted-foreground">
+                This profile has been updated since the original session.
+              </p>
+            )}
+            {sandboxProfileError !== null && (
+              <p role="status" className="text-sm text-muted-foreground">
+                {sandboxProfileError}
+              </p>
+            )}
+          </div>
+        )}
+
         {sandboxSelected && (
-          <p className="text-sm text-muted-foreground" data-testid="fork-session-sandbox-hint">
-            {multiRepoSource
-              ? `The clone starts in a fresh sandbox with all ${sourceSandboxRepos.length} of the source's repositories cloned into it.`
-              : sandboxRepoUrl.trim() === ""
-                ? "The clone starts in a fresh, empty sandbox. Name a repository under Advanced settings to clone one into it."
-                : `The clone starts in a fresh sandbox with ${sandboxRepoLabel} cloned into it. Open Advanced settings to change it.`}
-          </p>
+          <section
+            id="fork-session-repositories"
+            aria-labelledby="fork-session-repositories-label"
+            tabIndex={-1}
+            className="flex flex-col gap-3 rounded-lg border border-border p-3 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h3 id="fork-session-repositories-label" className="text-sm font-medium">
+                {maxSandboxRepos > 1 ? "Repositories" : "Repository"}
+              </h3>
+              <span className="text-xs text-muted-foreground">
+                {sandboxBranchesPending
+                  ? "Checking current branches…"
+                  : `${sandboxRepos.length} selected`}
+              </span>
+            </div>
+            <p className="text-sm text-muted-foreground" data-testid="fork-session-sandbox-hint">
+              Choose what to clone into the new sandbox. Changes here only apply to the fork.
+            </p>
+            <SandboxRepositoryPicker
+              selections={sandboxRepos}
+              onChange={(repos, editedBranchUrl) => {
+                sandboxRepoSeededRef.current = true;
+                if (editedBranchUrl) editedSandboxReposRef.current.add(editedBranchUrl);
+                for (const repo of [...sandboxRepos, ...repos]) {
+                  if (
+                    !sandboxRepos.some((previous) => previous.url === repo.url) ||
+                    !repos.some((next) => next.url === repo.url)
+                  ) {
+                    editedSandboxReposRef.current.add(repo.url);
+                  }
+                }
+                setSandboxBranchNotes((notes) =>
+                  Object.fromEntries(
+                    Object.entries(notes).filter(
+                      ([url]) => !editedSandboxReposRef.current.has(url),
+                    ),
+                  ),
+                );
+                setSandboxRepos(repos);
+              }}
+              branchNotes={sandboxBranchNotes}
+              maxRepos={maxSandboxRepos}
+              enabled={visible}
+              testIdPrefix="fork-session-sandbox-repo"
+              pendingUrl={pendingRepoUrl}
+              onPendingUrlChange={setPendingRepoUrl}
+            />
+            <p className="text-xs text-muted-foreground">
+              {sandboxRepositoryHint(sandboxRepos.length)}
+            </p>
+            <ForkFieldError
+              message={
+                fieldError("sandboxRepo") ??
+                (unsupportedMultiRepoEdit ? multiRepoUpgradeHint : null)
+              }
+            />
+          </section>
         )}
 
         {/* Indicator: by default the clone reuses the source's working
@@ -1902,90 +2142,6 @@ function SupportedForkSessionForm({
                   directory. The sandbox doesn't exist yet, so there is no
                   path to browse: the workspace is specified as a repository
                   the server clones into it. */}
-              {isCodingSource && sandboxSelected && multiRepoSource && (
-                <div
-                  className="flex flex-col gap-1"
-                  data-testid="fork-session-sandbox-repos-readonly"
-                >
-                  <span className="text-sm font-medium text-muted-foreground">Repositories</span>
-                  <ul className="flex flex-col gap-1 rounded-md border border-input bg-background px-3 py-2">
-                    {sourceSandboxRepos.map((w) => {
-                      const { url, branch } = splitSandboxWorkspace(w);
-                      const name = deriveRepoName(url) ?? url;
-                      return (
-                        <li key={w} className="truncate font-mono text-sm" title={w}>
-                          {branch.trim() !== "" ? `${name}#${branch}` : name}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                  {forkProviderMultiRepo ? (
-                    <p className="text-sm text-muted-foreground">
-                      All of the source's repositories are cloned into the fork's sandbox as
-                      siblings; the agent starts in the parent directory that holds them.
-                    </p>
-                  ) : (
-                    <p
-                      className="text-sm text-warning"
-                      data-testid="fork-session-repos-unsupported"
-                    >
-                      This provider clones only one repository, but the source has{" "}
-                      {sourceSandboxRepos.length}. Choose a provider that supports several to fork
-                      with all of them.
-                    </p>
-                  )}
-                </div>
-              )}
-              {isCodingSource && sandboxSelected && !multiRepoSource && (
-                <>
-                  <div className="flex flex-col gap-1">
-                    <label
-                      htmlFor="fork-session-sandbox-repo"
-                      className="text-sm font-medium text-muted-foreground"
-                    >
-                      Repository (optional)
-                    </label>
-                    <input
-                      id="fork-session-sandbox-repo"
-                      type="text"
-                      value={sandboxRepoUrl}
-                      onChange={(e) => setSandboxRepoUrl(e.target.value)}
-                      placeholder="https://github.com/org/repo"
-                      data-testid="fork-session-sandbox-repo-input"
-                      aria-invalid={fieldError("sandboxRepo") !== null || undefined}
-                      className="rounded-md border border-input aria-invalid:border-destructive bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
-                    />
-                    <ForkFieldError message={fieldError("sandboxRepo")} />
-                    <p className="text-sm text-muted-foreground">
-                      Cloned into the sandbox as the clone's working directory. Leave blank to start
-                      in an empty sandbox.
-                    </p>
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <label
-                      htmlFor="fork-session-sandbox-branch"
-                      className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
-                    >
-                      <GitBranchIcon className="size-3.5" />
-                      Branch (optional)
-                    </label>
-                    <input
-                      id="fork-session-sandbox-branch"
-                      type="text"
-                      value={sandboxRepoBranch}
-                      onChange={(e) => setSandboxRepoBranch(e.target.value)}
-                      placeholder="main"
-                      data-testid="fork-session-sandbox-branch-input"
-                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
-                    />
-                    <p className="text-sm text-muted-foreground">
-                      Leave blank to clone the repository's default branch.
-                    </p>
-                  </div>
-                </>
-              )}
-
               {isCodingSource && !sandboxSelected && !workspaceRecovery && (
                 <>
                   {!directoryAtTop && directoryField}
@@ -2017,6 +2173,7 @@ function SupportedForkSessionForm({
           data-testid="fork-session-submit"
           onClick={handleFork}
           loading={busy}
+          disabled={sandboxBranchesPending}
           // Greyed but clickable: a blocked click points at the missing field.
           aria-disabled={!canSubmit || undefined}
           className="aria-disabled:opacity-50"

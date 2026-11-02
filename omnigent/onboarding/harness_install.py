@@ -1224,9 +1224,10 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
-    :param installed: Whether the CLI resolves after the attempt, via the same
-        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
-        common global install dirs), not bare ``PATH`` alone.
+    :param installed: Whether the CLI is ready after the attempt by the same
+        :func:`harness_cli_installed` check readiness uses: it resolves via the
+        :func:`resolve_cli_binary` ladder (``PATH`` plus the common global
+        install dirs) and its version is in the supported range.
     :param reason: Human-readable failure reason when ``installed`` is False;
         ``None`` on success.
     """
@@ -1251,10 +1252,11 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
-        resolves via :func:`resolve_cli_binary` (including the no-op where it
-        was already present), otherwise ``(False, reason)`` naming the failure
-        (manual-only spec, missing installer, timeout, OS error, a diagnosed or
-        bare non-zero exit, or a post-install binary-not-found).
+        resolves via :func:`resolve_cli_binary` and passes its version range
+        (including the no-op where it was already present), otherwise
+        ``(False, reason)`` naming the failure (manual-only spec, missing
+        installer, timeout, OS error, a diagnosed or bare non-zero exit, a
+        post-install binary-not-found, or a CLI still outside its range).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
@@ -1281,7 +1283,9 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
     # via the ladder — the spurious "failed" toast next to a green "ready" tick.
     resolved = resolve_cli_binary(spec.binary)
-    if resolved is not None:
+    # A failed upgrade leaves the outdated binary resolving, so success also needs
+    # the version check readiness applies.
+    if resolved is not None and harness_cli_installed(key):
         # Put the resolving dir on ``PATH`` for this process so the setup
         # wizard's *later* steps — harness_login / harness_cli_logged_in /
         # harness_logout — which shell out with the bare binary name and only
@@ -1295,20 +1299,27 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         return HarnessInstallResult(True, None)
     if returncode != 0:
         return HarnessInstallResult(False, _installer_failure_reason(returncode, stderr_tail))
+    if resolved is not None:
+        version, required = harness_cli_version(key)
+        found = f"{version} (requires {required})" if version and required else "unsupported"
+        return HarnessInstallResult(
+            False, f"installer completed but {spec.binary!r} is still {found}"
+        )
     return HarnessInstallResult(
         False, f"installer completed but {spec.binary!r} could not be found"
     )
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it is now ready to use.
 
     Thin wrapper over :func:`try_install_harness_cli` that discards the failure
     reason, preserving the boolean contract the setup wizard relies on.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
-        ``False`` if the installer is missing or the install failed.
+    :returns: ``True`` when the CLI resolves and is version-compatible after
+        the install attempt, ``False`` if the installer is missing or the
+        install failed, including an upgrade that left the old version.
     :raises KeyError: If *key* has no install spec.
     """
     return try_install_harness_cli(key).installed

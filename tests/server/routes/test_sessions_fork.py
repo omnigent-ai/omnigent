@@ -301,6 +301,7 @@ class _ConversationStore:
             key: value
             for key, value in src.labels.items()
             if key not in (_FORK_ONLY_DROPPED_LABEL_KEYS | dropped_label_keys)
+            and not key.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
         }
         fork_labels.update(extra_labels or {})
         fork = Conversation(
@@ -2163,6 +2164,78 @@ async def test_fork_managed_inherits_all_source_repositories(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_count", [1, 2])
+async def test_fork_managed_explicit_workspaces_replace_source_repositories(
+    monkeypatch: pytest.MonkeyPatch, selected_count: int
+) -> None:
+    """The fork launches every chosen ref and records that selection for relaunch."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/old-web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(
+        app, monkeypatch, provider="modal" if selected_count == 1 else "kubernetes"
+    )
+    client = TestClient(app)
+    selected = [
+        "https://github.com/org/api#fix-auth",
+        "https://github.com/org/web#update-login",
+    ][:selected_count]
+
+    resp = client.post(
+        f"/v1/sessions/{conv.id}/fork",
+        json={"host_type": "managed", "workspaces": selected},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(launches) == 1
+    assert [(r.url, r.branch) for r in launches[0]["repos"]] == [
+        ("https://github.com/org/api", "fix-auth"),
+        ("https://github.com/org/web", "update-login"),
+    ][:selected_count]
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == selected[0]
+    if selected_count == 2:
+        assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.1"] == selected[1]
+    else:
+        assert f"{MANAGED_REPO_LABEL_KEY}.1" not in fork.labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspaces", [[], None])
+async def test_fork_managed_explicit_empty_workspaces_clear_source_repositories(
+    monkeypatch: pytest.MonkeyPatch, workspaces: list[str] | None
+) -> None:
+    """Removing every repo produces an empty sandbox instead of inheriting the source."""
+    conv = _make_conversation(
+        labels={
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+        }
+    )
+    conv_store = _ConversationStore(conversations={conv.id: conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    client = TestClient(app)
+
+    resp = client.post(
+        f"/v1/sessions/{conv.id}/fork", json={"host_type": "managed", "workspaces": workspaces}
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert launches[0]["repos"] == []
+    assert conv_store.label_writes == []
+    fork = conv_store.get_conversation(resp.json()["id"])
+    assert fork is not None
+    assert not any(key.startswith(MANAGED_REPO_LABEL_KEY) for key in fork.labels)
+
+
+@pytest.mark.asyncio
 async def test_fork_managed_explicit_workspace_overrides_inherited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2322,8 +2395,9 @@ async def test_fork_managed_rejects_unoffered_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_selection", [False, True])
 async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, explicit_selection: bool
 ) -> None:
     """A multi-repo source forked onto a single-repo provider fails the POST with
     a clear 400 (modal is exec-model → single-repo), rather than a background
@@ -2341,7 +2415,14 @@ async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
 
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+        json={
+            "host_type": "managed",
+            **(
+                {"workspaces": ["https://github.com/org/other-api", "https://github.com/org/web"]}
+                if explicit_selection
+                else {}
+            ),
+        },
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
