@@ -68,7 +68,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
-import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
@@ -811,6 +811,22 @@ interface WorkspacePanelProps {
   subagentPanelOpener?: SubagentPanelOpener;
 }
 
+/** A closed tab that Reopen Closed Tab (⇧⌘T) can bring back. */
+type ClosedTab =
+  | { kind: "file"; path: string }
+  | { kind: "panel"; tab: DefaultWorkspaceTab }
+  | { kind: "browser"; url: string | undefined };
+
+// Newest last, per session. Shells and side chats end when closed, so they aren't kept.
+const closedTabsBySession = new Map<string, ClosedTab[]>();
+// Browser tabs still reopening keep their place in the history in case that fails.
+const reopeningTabs = new WeakSet<ClosedTab>();
+
+function rememberClosedTab(conversationId: string, tab: ClosedTab): void {
+  const closed = closedTabsBySession.get(conversationId) ?? [];
+  closedTabsBySession.set(conversationId, [...closed.slice(-19), tab]);
+}
+
 /**
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
@@ -889,9 +905,21 @@ function WorkspacePanelImpl({
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  // Browser views being closed, so a second Close of one doesn't record it twice.
+  const closingBrowserViewsRef = useRef(new Set<string>());
   const closeBrowserTab = async (tabId: string) => {
-    const closed = await browsers.close(tabId);
-    if (!closed) toast.error("Couldn't close browser tab. Try again.");
+    const viewId = browserViewId(conversationId, tabId);
+    if (closingBrowserViewsRef.current.has(viewId)) return;
+    closingBrowserViewsRef.current.add(viewId);
+    try {
+      // Just after returning to a session the strip may not have the page yet; the view does.
+      const url = await browsers.pageUrl(tabId);
+      const closed = await browsers.close(tabId);
+      if (closed) rememberClosedTab(conversationId, { kind: "browser", url });
+      else toast.error("Couldn't close browser tab. Try again.");
+    } finally {
+      closingBrowserViewsRef.current.delete(viewId);
+    }
   };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -1168,23 +1196,31 @@ function WorkspacePanelImpl({
 
   // Closing the file on screen asks its viewer first, which confirms before
   // dropping edits it hasn't saved. Other file tabs have no mounted editor.
-  const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
-  const closeFile = useCallback(
-    (path: string) => {
-      if (path === selectedFilePath && guardFileNavigation) {
-        guardFileNavigation(null, undefined, () => onCloseFile(path));
-      } else {
-        onCloseFile(path);
-      }
-    },
-    [guardFileNavigation, onCloseFile, selectedFilePath],
-  );
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
+  const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  const closeFile = useCallback(
+    (path: string) => {
+      const close = () => {
+        rememberClosedTab(conversationId, { kind: "file", path });
+        onCloseFile(path);
+      };
+      if (path === selectedFilePath && guardFileNavigation) {
+        guardFileNavigation(null, undefined, close);
+      } else {
+        close();
+      }
+    },
+    [conversationId, guardFileNavigation, onCloseFile, selectedFilePath],
+  );
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) closeFile(selectedFilePath);
   }, [closeFile, selectedFilePath]);
+  const closePanel = (tab: DefaultWorkspaceTab) => {
+    rememberClosedTab(conversationId, { kind: "panel", tab });
+    onClosePanel(tab);
+  };
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
@@ -1481,7 +1517,7 @@ function WorkspacePanelImpl({
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
       } else if (openPanel !== undefined) {
-        onClosePanel(openPanel);
+        closePanel(openPanel);
       } else if (onHide) {
         onHide();
         return true;
@@ -1494,6 +1530,80 @@ function WorkspacePanelImpl({
     },
     { priority: 10 },
   );
+  // Desktop ⇧⌘[ / ⇧⌘] step through the tabs in strip order; ⇧⌘T reopens the last closed one.
+  const showAdjacentTab = (step: -1 | 1) => {
+    const options = panelOptions.filter((option) => !option.disabled);
+    const index = options.findIndex((option) => option.active);
+    const target =
+      index === -1 && step === -1 ? options.at(-1) : options.at((index + step) % options.length);
+    target?.select();
+    onReveal?.();
+  };
+  // The session and what its rail shows, apart from the browser tab a reopen selects itself.
+  const railView = [
+    conversationId,
+    rightRailTab,
+    selectedFilePath,
+    selectedTerminalKey,
+    sideChats.selected,
+  ].join("\n");
+  // Counts changes to it, so picking another tab and coming back still counts as a pick.
+  const railViewRef = useRef({ view: railView, changes: 0 });
+  if (railViewRef.current.view !== railView) {
+    railViewRef.current = { view: railView, changes: railViewRef.current.changes + 1 };
+  }
+  const reopenCountRef = useRef(0);
+  // A reopen that finishes after this panel unmounted leaves the next session's rail alone.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const reopenClosedTab = () => {
+    const closedTabs = closedTabsBySession.get(conversationId) ?? [];
+    const index = closedTabs.findLastIndex((tab) => !reopeningTabs.has(tab));
+    const closed = closedTabs[index];
+    if (!closed) return;
+    const reopenId = ++reopenCountRef.current;
+    if (closed.kind === "browser" && closed.url !== undefined) {
+      reopeningTabs.add(closed);
+      const changesBefore = railViewRef.current.changes;
+      void browsers.reopen(closed.url).then(({ ok, error }) => {
+        reopeningTabs.delete(closed);
+        if (!ok) {
+          // It stays in the history so the next Reopen Closed Tab can try again.
+          toast.error(`Couldn't reopen the browser tab${error ? `: ${error}` : "."}`);
+          return;
+        }
+        const current = closedTabsBySession.get(conversationId) ?? [];
+        if (current.includes(closed)) current.splice(current.indexOf(closed), 1);
+        // A later reopen, or a tab picked while the page loaded, keeps the rail where it is.
+        if (
+          mountedRef.current &&
+          reopenCountRef.current === reopenId &&
+          railViewRef.current.changes === changesBefore
+        ) {
+          onRightRailTabChange("browser");
+        }
+      });
+      onReveal?.();
+      return;
+    }
+    closedTabs.splice(index, 1);
+    if (closed.kind === "file") openFileViewer(closed.path);
+    else if (closed.kind === "panel") selectPermanentTab(closed.tab);
+    else {
+      browsers.add();
+      onRightRailTabChange("browser");
+    }
+    onReveal?.();
+  };
+  const tabCommandsActive = !pending && !contained;
+  useDesktopCommand("previous-tab", tabCommandsActive ? () => showAdjacentTab(-1) : null);
+  useDesktopCommand("next-tab", tabCommandsActive ? () => showAdjacentTab(1) : null);
+  useDesktopCommand("reopen-closed-tab", tabCommandsActive ? reopenClosedTab : null);
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1629,7 +1739,7 @@ function WorkspacePanelImpl({
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
-                            onClosePanel(tab);
+                            closePanel(tab);
                           }
                         }}
                       >
@@ -1640,7 +1750,7 @@ function WorkspacePanelImpl({
                         type="button"
                         aria-label={`Close ${label}`}
                         className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => onClosePanel(tab)}
+                        onClick={() => closePanel(tab)}
                       >
                         <XIcon className="size-3" />
                       </button>
