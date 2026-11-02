@@ -9032,7 +9032,7 @@ def test_reassign_runner_accepts_profile_and_host_atomically(
         assert profiles.get_session_host_id(target.id) == host_id
 
 
-def test_clear_host_binding_requires_the_expected_host(
+def test_clear_host_binding_requires_the_expected_host_and_runner(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     old_host_id, current_host_id = uuid.uuid4(), uuid.uuid4()
@@ -9048,9 +9048,14 @@ def test_clear_host_binding_requires_the_expected_host(
     unchanged = conversation_store.clear_host_binding(session.id, expected_host_id=old_host_id.hex)
     assert unchanged == current
     assert conversation_store.get_conversation(session.id) == current
+    unchanged = conversation_store.clear_host_binding(
+        session.id, expected_host_id=current_host_id.hex, expected_runner_id="stale-runner"
+    )
+    assert unchanged == current
+    assert conversation_store.get_conversation(session.id) == current
 
     cleared = conversation_store.clear_host_binding(
-        session.id, expected_host_id=str(current_host_id)
+        session.id, expected_host_id=str(current_host_id), expected_runner_id="current-runner"
     )
     assert cleared.host_id is None and cleared.workspace is None
     assert cleared.git_branch is None and cleared.runner_id is None

@@ -108,6 +108,7 @@ from omnigent.server.routes._errors import (
     agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -161,6 +162,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _remove_failed_launch_worktree,
     _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
@@ -730,7 +732,9 @@ def register_core_routes(
         keeps the binding; the first message drives the real runner
         start, and if the host still refuses there, that path consults
         the daemon and persists a transcript error (see post_event's
-        relaunch branch). No create-time harness gating.
+        relaunch branch). The JSON create instead unbinds a session
+        whose new worktree it removes after the failure. No create-time
+        harness gating.
 
         :param request: The create request (for ``app.state`` lookups).
         :param user_id: Authenticated caller, or ``None`` when auth is
@@ -1241,6 +1245,20 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
+                if launch_failed and body.git is not None and not body.git.existing_worktree:
+                    unbound = await _remove_failed_launch_worktree(
+                        conversation_store=conversation_store,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        session_id=resp.id,
+                        runner_id=runner_id,
+                        delete_branch=not body.git.existing_branch,
+                    )
+                    if unbound is not None:
+                        resp.runner_id = unbound.runner_id
+                        resp.host_id = unbound.host_id
+                        resp.workspace = unbound.workspace
+                        resp.git_branch = unbound.git_branch
+                        resp.labels.pop(WORKTREE_ROOT_LABEL_KEY, None)
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent

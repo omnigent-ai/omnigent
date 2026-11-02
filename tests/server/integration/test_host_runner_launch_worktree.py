@@ -42,6 +42,7 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes import hosts as hosts_routes
+from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -138,7 +139,8 @@ async def register_host(
     :returns: Async iterator yielding a ``register`` factory. Kwargs:
         ``create_status`` (``"ok"``/``"failed"``), ``create_error``
         (host failure detail), ``launch_status``
-        (``"launched"``/``"failed"``). Returns the :class:`_HostCapture`
+        (``"launched"``/``"failed"``), ``remove_status``
+        (``"ok"``/``"failed"``). Returns the :class:`_HostCapture`
         accumulating frames the host received.
     """
     conns: list[HostConnection] = []
@@ -150,6 +152,7 @@ async def register_host(
         create_error: str | None = None,
         create_gate: asyncio.Event | None = None,
         launch_status: str = "launched",
+        remove_status: str = "ok",
         workspace: str | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
@@ -233,7 +236,12 @@ async def register_host(
                     cap.remove_started.set()
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
-                        fut.set_result({"status": "ok", "error": None})
+                        fut.set_result(
+                            {
+                                "status": remove_status,
+                                "error": None if remove_status == "ok" else "worktree busy",
+                            }
+                        )
 
         conn._drain_task_for_test = asyncio.create_task(_drain())  # type: ignore[attr-defined]
         conns.append(conn)
@@ -518,6 +526,116 @@ async def test_launch_runner_rolls_back_worktree_on_launch_failure(
     assert conv.git_branch is None, (
         f"git_branch should be cleared (branch was removed); got {conv.git_branch!r}"
     )
+
+
+@pytest.mark.parametrize("existing_branch", [False, True])
+@pytest.mark.parametrize("subdirectory", [False, True])
+async def test_inline_create_rolls_back_new_worktree_on_launch_failure(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    existing_branch: bool,
+    subdirectory: bool,
+) -> None:
+    """A failed launch removes the created worktree root and leaves the new session unbound."""
+    root = f"{_SOURCE_REPO}-worktrees/feature-leak"
+    cap = register_host(
+        launch_status="failed", workspace=f"{root}/packages/api" if subdirectory else None
+    )
+    agent = await create_test_agent(client, name="wt-inline-unbind-agent")
+    git: dict[str, object] = {"branch_name": "feature/leak"}
+    if existing_branch:
+        git["existing_branch"] = True
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _SOURCE_REPO, "git": git},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.launch) == 1
+    assert [(frame.worktree_path, frame.branch, frame.delete_branch) for frame in cap.remove] == [
+        (root, "feature/leak", not existing_branch)
+    ]
+    body = resp.json()
+    assert (body["runner_id"], body["host_id"], body["workspace"], body["git_branch"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert WORKTREE_ROOT_LABEL_KEY not in body["labels"]
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+
+
+async def test_inline_create_keeps_binding_when_worktree_removal_fails(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An unconfirmed removal keeps the worktree recorded so a later delete can clean it up."""
+    cap = register_host(launch_status="failed", remove_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-remove-fail-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.remove) == 1
+    body = resp.json()
+    assert body["runner_id"] is not None
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.runner_id == body["runner_id"]
+    assert conv.host_id == _HOST_ID
+    assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-leak"
+    assert conv.git_branch == "feature/leak"
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+
+
+async def test_inline_create_keeps_existing_worktree_when_runner_launch_fails(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A worktree the create only attached to is never removed after a failed launch."""
+    cap = register_host(launch_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-existing-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/existing", "existing_worktree": True},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.launch) == 1
+    assert cap.create == []
+    assert cap.remove == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert conv.runner_id is not None
+    assert conv.workspace == _SOURCE_REPO
+    assert conv.git_branch == "feature/existing"
 
 
 async def test_launch_runner_retry_succeeds_after_failed_launch(
