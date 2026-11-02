@@ -148,19 +148,50 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
 
 # xterm.js sends these without its user typing: focus reports and answers to a
-# pane program's queries. A modified F3 key shares a cursor report's bytes.
+# pane program's queries.
 _TERMINAL_REPORTS: Final = re.compile(
     rb"(?:\x1b\[[IO]|\x1b\[[?>]?[0-9;]*(?:[cnRt]|\$y)"
     rb"|\x1bP[^\x1b]*\x1b\\|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))+"
 )
+# A modified F3 key has the bytes of a row-1 answer to this cursor position
+# request, so it counts as a report only shortly after the pane asked.
+_CURSOR_POSITION_REQUEST: Final = b"\x1b[6n"
+_MODIFIED_F3_KEY: Final = re.compile(rb"\x1b\[1;(?:[2-9]|1[0-6])R")
+_CURSOR_REPLY_WINDOW_S: Final[float] = 5.0
 
 # Bounds the client query each owner attach runs before attaching.
 _CLIENT_QUERY_TIMEOUT_S: Final[float] = 2.0
 
 
-def _is_terminal_report(data: bytes) -> bool:
+def _is_terminal_report(data: bytes, *, cursor_reply_expected: bool) -> bool:
     """Whether a browser input frame holds only reports xterm.js sent itself."""
-    return _TERMINAL_REPORTS.fullmatch(data) is not None
+    if _TERMINAL_REPORTS.fullmatch(data) is None:
+        return False
+    return cursor_reply_expected or _MODIFIED_F3_KEY.search(data) is None
+
+
+class _CursorRequestWatch:
+    """Track whether the browser may still be answering a pane's cursor request."""
+
+    def __init__(self) -> None:
+        self._tail = b""
+        self._requested_at: float | None = None
+
+    def feed(self, output: bytes) -> None:
+        """Note a request in forwarded pane output, even split across chunks."""
+        keep = len(_CURSOR_POSITION_REQUEST) - 1
+        if _CURSOR_POSITION_REQUEST in output or _CURSOR_POSITION_REQUEST in (
+            self._tail + output[:keep]
+        ):
+            self._requested_at = _monotonic()
+        self._tail = (self._tail + output[-keep:])[-keep:]
+
+    def reply_expected(self) -> bool:
+        """Whether a request was forwarded within the reply window."""
+        return (
+            self._requested_at is not None
+            and _monotonic() - self._requested_at <= _CURSOR_REPLY_WINDOW_S
+        )
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -813,6 +844,7 @@ async def bridge_tmux_control_to_websocket(
     # the window size.
     browser_size: str | None = None
     size_recheck = asyncio.Event()
+    cursor_requests = _CursorRequestWatch()
 
     def _current_ws_coalesce_limit() -> int:
         """Per-frame cap: small right after input, larger for output floods."""
@@ -879,6 +911,7 @@ async def bridge_tmux_control_to_websocket(
             if len(parts) == 3:
                 output = window_name_filter.feed(unescape_control_output(parts[2]))
                 if output:
+                    cursor_requests.feed(output)
                     output_chunks.put_nowait(output)
             return True
         buffer_name = _clipboard_buffer_name(line)
@@ -890,9 +923,12 @@ async def bridge_tmux_control_to_websocket(
             ):
                 _queue_clipboard_buffer(buffer_name)
             return True
-        if line.startswith((b"%session-changed ", b"%client-detached ")):
+        if line.startswith(
+            (b"%session-changed ", b"%client-detached ", b"%client-session-changed ")
+        ):
             # Recheck once tmux has registered this attach, in case the sizing
-            # client left meanwhile, and whenever another client leaves.
+            # client left meanwhile, and whenever another client detaches or
+            # switches session.
             size_recheck.set()
             return True
         if line.startswith(b"%exit"):
@@ -1008,7 +1044,9 @@ async def bridge_tmux_control_to_websocket(
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()
-                    if not _is_terminal_report(data):
+                    if not _is_terminal_report(
+                        data, cursor_reply_expected=cursor_requests.reply_expected()
+                    ):
                         await _take_window_size()
                     for cmd in _hex_send_keys_commands(tmux_target, data):
                         await _send_command(cmd)

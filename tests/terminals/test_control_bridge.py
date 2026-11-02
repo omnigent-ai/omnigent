@@ -34,9 +34,11 @@ from fastapi import WebSocketDisconnect
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import create_terminal_instance
 from omnigent.terminals.control_bridge import (
+    _CURSOR_REPLY_WINDOW_S,
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _client_sizes_window,
     _clipboard_buffer_name,
+    _CursorRequestWatch,
     _hex_send_keys_commands,
     _is_terminal_report,
     _read_tmux_buffer,
@@ -169,6 +171,7 @@ async def test_tmux_buffer_read_cancellation_reaps_subprocess(
         (b"\x1b[>0;276;0c", True),
         (b"\x1b[0n", True),
         (b"\x1b[24;80R", True),
+        (b"\x1b[1;80R", True),
         (b"\x1b[?2026;2$y", True),
         (b"\x1b[8;40;160t", True),
         (b"\x1bP1$r0m\x1b\\", True),
@@ -184,11 +187,53 @@ async def test_tmux_buffer_read_cancellation_reaps_subprocess(
         (b"\x1b[200~text\x1b[201~", False),
         (b"\x1b]", False),
         (b"\x1b[?1;2cx", False),
+        (b"\x1b[1;2R", False),
+        (b"\x1b[1;5R", False),
     ],
 )
 def test_terminal_reports_are_not_typing(data: bytes, is_report: bool) -> None:
     """Replies xterm.js sends on its own are told apart from keys, mouse and paste."""
-    assert _is_terminal_report(data) is is_report
+    assert _is_terminal_report(data, cursor_reply_expected=False) is is_report
+
+
+def test_row_one_cursor_report_answers_a_pending_cursor_request() -> None:
+    """A modified F3 key's bytes are a report while the pane awaits a cursor report."""
+    assert _is_terminal_report(b"\x1b[1;2R", cursor_reply_expected=True)
+
+
+@pytest.mark.parametrize(
+    ("chunks", "requested"),
+    [
+        ([b"\x1b[6n"], True),
+        ([b"prompt\x1b[", b"6n"], True),
+        ([b"\x1b", b"[", b"6", b"n"], True),
+        ([b"\x1b[6", b"x", b"n"], False),
+        ([b"\x1b[16n"], False),
+        ([b"\x1b[?6n"], False),
+    ],
+)
+def test_cursor_request_watch_spots_requests_split_across_output(
+    chunks: list[bytes], requested: bool
+) -> None:
+    """tmux can split a cursor position request between ``%output`` lines."""
+    watch = _CursorRequestWatch()
+    for chunk in chunks:
+        watch.feed(chunk)
+    assert watch.reply_expected() is requested
+
+
+def test_cursor_request_watch_expects_a_reply_only_for_a_while(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A browser that leaves the answer to tmux never replies, so the wait ends."""
+    now = 1000.0
+    monkeypatch.setattr("omnigent.terminals.control_bridge._monotonic", lambda: now)
+    watch = _CursorRequestWatch()
+    watch.feed(b"\x1b[6n")
+    now += _CURSOR_REPLY_WINDOW_S
+    assert watch.reply_expected()
+    now += 0.1
+    assert not watch.reply_expected()
 
 
 def test_hex_send_keys_commands_encodes_and_chunks() -> None:
@@ -1428,15 +1473,24 @@ async def _wait_for(query: Callable[[], Awaitable[object]], expected: object) ->
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_waiting_owner_takes_window_size_when_it_types() -> None:
+async def test_waiting_owner_takes_window_size_when_it_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A narrow owner that only opens the pane keeps the window's size until it types.
 
     Focus reports and xterm.js's answers to the pane's queries are not typing.
+    The window returns to the desktop's size once the phone leaves.
     """
-    sock, target = await _new_private_tmux("cat")
+    now = 1000.0
+    monkeypatch.setattr("omnigent.terminals.control_bridge._monotonic", lambda: now)
+    sock, target = await _new_private_tmux("read go; printf '\\033[6n'; cat")
     desktop = _LiveWebSocket(_resize_frame(160, 40))
     phone = _LiveWebSocket(_resize_frame(45, 40))
     tasks = [_start_bridge(desktop, sock, target)]
+
+    async def _phone_received_cursor_request() -> bool:
+        return b"\x1b[6n" in b"".join(phone.sent)
+
     try:
         await _wait_for(lambda: _window_width(sock, target), 160)
         tasks.append(_start_bridge(phone, sock, target))
@@ -1450,8 +1504,21 @@ async def test_waiting_owner_takes_window_size_when_it_types() -> None:
         phone.frames.put_nowait(_resize_frame(50, 40))
         assert await _settled_window_width(sock, target) == 160
 
-        phone.frames.put_nowait(_input_frame(b"x"))
+        await _tmux_output(sock, "send-keys", "-t", target, "go", "Enter")
+        await _wait_for(_phone_received_cursor_request, True)
+        shift_f3 = b"\x1b[1;2R"
+        phone.frames.put_nowait(_input_frame(shift_f3))
+        assert await _settled_window_width(sock, target) == 160, (
+            "the phone's answer to the pane's cursor position request counted as typing"
+        )
+
+        now += _CURSOR_REPLY_WINDOW_S + 1
+        phone.frames.put_nowait(_input_frame(shift_f3))
         assert await _settled_window_width(sock, target) == 50
+
+        phone.frames.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(tasks[1], timeout=10)
+        assert await _settled_window_width(sock, target) == 160
     finally:
         for task in tasks:
             await _kill_and_join(sock, task)
@@ -1547,8 +1614,12 @@ async def test_output_during_client_query_reaches_browser(monkeypatch: pytest.Mo
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_browser_owner_does_not_resize_attached_terminal_until_it_types() -> None:
-    """A browser opening a session also attached from a local terminal keeps that size."""
+@pytest.mark.parametrize("handover", ["browser types", "local terminal switches session"])
+async def test_browser_owner_keeps_local_terminal_size_until_handover(handover: str) -> None:
+    """A browser opening a session also attached from a local terminal keeps that size.
+
+    It takes the window size once it types or the local terminal leaves the session.
+    """
     tmux = shutil.which("tmux")
     assert tmux
     sock, target = await _new_private_tmux("cat")
@@ -1573,8 +1644,12 @@ async def test_browser_owner_does_not_resize_attached_terminal_until_it_types() 
         await _wait_for(lambda: _client_widths(sock), [70, 160])
         assert await _settled_window_width(sock, target) == 70
 
-        browser.frames.put_nowait(_input_frame(b"x"))
-        assert await _settled_window_width(sock, target) == 160
+        if handover == "browser types":
+            browser.frames.put_nowait(_input_frame(b"x"))
+        else:
+            await _tmux_output(sock, "new-session", "-d", "-s", "other", "cat")
+            await _tmux_output(sock, "switch-client", "-c", os.ttyname(tty), "-t", "other")
+        await _wait_for(lambda: _window_width(sock, target), 160)
     finally:
         for task in tasks:
             await _kill_and_join(sock, task)
