@@ -39,6 +39,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { queuePendingShellInput, ShellCommandOpenerContext } from "@/lib/shellCommand";
 import {
   isAndroidShell,
   isElectronShell,
@@ -2008,15 +2009,18 @@ function AppShellImpl() {
   // drawer even when this harness can't start side chats.
   const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
 
-  function openTerminalsPanel(key: string) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setPanelInitialKey(key);
-  }
+  const openTerminalsPanel = useCallback(
+    (key: string) => {
+      setSelectedFilePath(null); // close file viewer
+      clearFileViewerUrl();
+      setExecutionLogsKey(null); // close execution-logs panel
+      setFilesPanelOpen(false); // close files drawer
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setShellsPanelOpen(false); // close mobile shells drawer
+      setPanelInitialKey(key);
+    },
+    [clearFileViewerUrl, setPanelInitialKey],
+  );
 
   // Open a shell as a tab in the desktop workspace rail (the mobile path
   // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
@@ -2059,22 +2063,57 @@ function AppShellImpl() {
     !createTerminal.isPending &&
     liveness?.kind !== "host_offline" &&
     liveness?.kind !== "local_stranded";
-  const launchDefaultShell = useCallback(() => {
-    const name = resolveDefaultShell(boundAgent?.terminals ?? []);
-    if (name === null) return;
-    markShellCreateStarted();
-    createTerminal.mutate(name, {
-      onSuccess: (info) => openTerminalTab(terminalTabKey(info)),
-      onError: () => clearShellCreatePending(),
-    });
-  }, [
-    boundAgent,
-    createTerminal,
-    markShellCreateStarted,
-    clearShellCreatePending,
-    openTerminalTab,
-  ]);
+  // ``initialCommand`` comes from a chat code block's "Open in shell": the new
+  // shell gets it pasted at its first prompt, and on a phone it opens in the
+  // full-screen terminal panel because the rail is hidden there.
+  const launchDefaultShell = useCallback(
+    (initialCommand?: string) => {
+      const name = resolveDefaultShell(boundAgent?.terminals ?? []);
+      if (name === null || !conversationId) return;
+      const inMobilePanel = initialCommand !== undefined && isMobileViewport();
+      if (!inMobilePanel) markShellCreateStarted();
+      createTerminal.mutate(name, {
+        onSuccess: (info) => {
+          if (initialCommand !== undefined) {
+            queuePendingShellInput(conversationId, info.id, initialCommand);
+          }
+          if (inMobilePanel) openTerminalsPanel(terminalTabKey(info));
+          else openTerminalTab(terminalTabKey(info));
+        },
+        onError: (error) => {
+          clearShellCreatePending();
+          if (initialCommand !== undefined) {
+            toast.error("Couldn't open a shell", { description: error.message });
+          }
+        },
+      });
+    },
+    [
+      boundAgent,
+      conversationId,
+      createTerminal,
+      markShellCreateStarted,
+      clearShellCreatePending,
+      openTerminalTab,
+      openTerminalsPanel,
+    ],
+  );
   useNewShellHotkey(launchDefaultShell, shellLaunchable);
+  // Chat code blocks get "Open in shell" only where the viewer could open a
+  // shell themselves; non-owners attach read-only and couldn't type the paste.
+  const latestLaunchShellRef = useRef({ launchDefaultShell, shellLaunchable });
+  latestLaunchShellRef.current = { launchDefaultShell, shellLaunchable };
+  const openShellCommand = useCallback((command: string) => {
+    const latest = latestLaunchShellRef.current;
+    if (latest.shellLaunchable) latest.launchDefaultShell(command);
+  }, []);
+  const shellCommandOpener =
+    agentSupportsShells &&
+    isOwnerLevel(permissionLevel) &&
+    liveness?.kind !== "host_offline" &&
+    liveness?.kind !== "local_stranded"
+      ? openShellCommand
+      : null;
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
@@ -2703,9 +2742,11 @@ function AppShellImpl() {
                   data-session-id={conversationId}
                 >
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
-                    <RenderErrorBoundary name="this page" resetKey={location.pathname}>
-                      <Outlet />
-                    </RenderErrorBoundary>
+                    <ShellCommandOpenerContext.Provider value={shellCommandOpener}>
+                      <RenderErrorBoundary name="this page" resetKey={location.pathname}>
+                        <Outlet />
+                      </RenderErrorBoundary>
+                    </ShellCommandOpenerContext.Provider>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
 

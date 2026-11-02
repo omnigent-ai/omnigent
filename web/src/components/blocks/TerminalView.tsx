@@ -29,6 +29,11 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import {
+  claimPendingShellInput,
+  hasPendingShellInput,
+  subscribePendingShellInput,
+} from "@/lib/shellCommand";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
@@ -327,6 +332,21 @@ export function TerminalView({
     onInputRef.current?.();
   }, []);
 
+  // Hand a command queued by the chat's "Open in shell" to this view's session.
+  const offerPendingShellInput = useCallback(() => {
+    const session = sessionRef.current;
+    if (session === null || readOnly || !hasPendingShellInput(sessionId, terminalId)) return;
+    session.pasteWhenShellReady(
+      () => claimPendingShellInput(sessionId, terminalId),
+      () =>
+        toast.info("Command not pasted", {
+          description:
+            "The shell couldn't take this command without running it. Copy it from the chat instead.",
+        }),
+    );
+  }, [sessionId, terminalId, readOnly]);
+  useEffect(() => subscribePendingShellInput(offerPendingShellInput), [offerPendingShellInput]);
+
   const queueSessionClipboardCopy = useCallback(
     (request: TerminalClipboardRequest & { kind: "automatic" | "user" }) => {
       queueTerminalClipboardWrite({
@@ -598,6 +618,7 @@ export function TerminalView({
           notifyFileLink,
         );
         sessionRef.current = terminalSession;
+        offerPendingShellInput();
         // Relay-connected with a direct URL on offer: negotiate the
         // loopback upgrade in the background. In Chrome this is what
         // raises the Local Network Access prompt; the probe socket
@@ -629,6 +650,7 @@ export function TerminalView({
       notifyInput,
       notifyClipboardRequest,
       notifyFileLink,
+      offerPendingShellInput,
       disposeActiveSession,
     ],
   );

@@ -30,6 +30,9 @@ reattach when the session moves to another host.
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
   says so and routes the user to the terminal.
+- `open-in-shell`: an "Open in shell" button on a chat code block fenced as a
+  shell language opens a new default shell with the command pasted at its
+  prompt. Nothing runs until the user presses Enter.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -66,6 +69,9 @@ with their own terminal retain the switcher.
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
+- Hover a `bash`/`sh`/`zsh`/`shell`/`console` code block in an agent reply and
+  choose "Open in shell". On desktop the shell opens as a rail tab; on a phone
+  it opens in the full-screen terminal view.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -116,6 +122,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`open-in-shell`:**
+  `tests/e2e_ui/shells/test_open_in_shell.py` (desktop and a 390 px phone
+  viewport) checks the pasted command waits for Enter. The bridge's readiness
+  and refusal paths are in `tests/terminals/test_control_bridge.py`; the
+  browser fallback for runners without paste support is in
+  `web/src/components/blocks/TerminalSession.test.ts`.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
@@ -190,5 +202,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   stopped does. Wait past startup before calling a terminal stopped. A
   cloud-sandbox session stays in Starting up until its sandbox is ready, which
   can take minutes.
+- tmux before 3.7 does not report whether the shell enabled bracketed paste.
+  "Open in shell" then waits for a settled bash/zsh/fish prompt and pastes with
+  `paste-buffer -p`. A multi-line command is refused, not typed, when no prompt
+  appears within 5 s, because an unbracketed newline would run it.
 - Tests that need a harness-specific or opt-in environment skip quietly without
   it. Check that the test ran, not only that the suite passed.

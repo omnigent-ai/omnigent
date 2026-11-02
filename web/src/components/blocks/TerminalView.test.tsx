@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
 import { resolveInitialAttachUrl, watchDirectUpgrade } from "@/lib/terminals";
+import { claimPendingShellInput, queuePendingShellInput } from "@/lib/shellCommand";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -81,6 +82,9 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    pasteWhenShellReady: ReturnType<
+      typeof vi.fn<(claim: () => string | null, onRefused?: (text: string) => void) => void>
+    >;
   }[],
 }));
 
@@ -93,6 +97,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    pasteWhenShellReady =
+      vi.fn<(claim: () => string | null, onRefused?: (text: string) => void) => void>();
 
     constructor(
       container: HTMLDivElement,
@@ -119,6 +125,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        pasteWhenShellReady: this.pasteWhenShellReady,
       });
     }
   },
@@ -231,6 +238,58 @@ describe("control-mode terminal", () => {
       terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
     ).toBe(true);
     expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42, endLine: 50 });
+  });
+});
+
+describe("pending shell input", () => {
+  afterEach(() => {
+    claimPendingShellInput("conv_abc", "terminal_bash_s1");
+  });
+
+  it("hands input queued before the attach to the session once", async () => {
+    queuePendingShellInput("conv_abc", "terminal_bash_s1", "npm test");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const paste = terminalSessionMock.instances[0].pasteWhenShellReady;
+    expect(paste).toHaveBeenCalledTimes(1);
+    const [claim] = paste.mock.calls[0];
+    expect(claim()).toBe("npm test");
+    expect(claim()).toBeNull();
+  });
+
+  it("hands input queued after the attach to the live session", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const paste = terminalSessionMock.instances[0].pasteWhenShellReady;
+    expect(paste).not.toHaveBeenCalled();
+
+    act(() => queuePendingShellInput("conv_abc", "terminal_other", "ls"));
+    expect(paste).not.toHaveBeenCalled();
+    act(() => queuePendingShellInput("conv_abc", "terminal_bash_s1", "ls"));
+
+    expect(paste).toHaveBeenCalledTimes(1);
+    expect(paste.mock.calls[0][0]()).toBe("ls");
+    claimPendingShellInput("conv_abc", "terminal_other");
+  });
+
+  it("leaves queued input alone on a read-only attach", async () => {
+    queuePendingShellInput("conv_abc", "terminal_bash_s1", "ls");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    expect(terminalSessionMock.instances[0].pasteWhenShellReady).not.toHaveBeenCalled();
+  });
+
+  it("explains a refused multi-line paste", async () => {
+    queuePendingShellInput("conv_abc", "terminal_bash_s1", "a\nb");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const [, onRefused] = terminalSessionMock.instances[0].pasteWhenShellReady.mock.calls[0];
+    act(() => onRefused?.("a\nb"));
+
+    expect(await screen.findByText("Command not pasted")).toBeInTheDocument();
   });
 });
 

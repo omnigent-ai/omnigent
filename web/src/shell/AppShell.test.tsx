@@ -310,6 +310,11 @@ const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
+import {
+  claimPendingShellInput,
+  hasPendingShellInput,
+  useShellCommandOpener,
+} from "@/lib/shellCommand";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
@@ -5927,5 +5932,62 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("AppShell open in shell", () => {
+  function ShellOpenerProbe() {
+    const openShellCommand = useShellCommandOpener();
+    if (openShellCommand === null) return <div>no shell opener</div>;
+    return (
+      <button type="button" onClick={() => openShellCommand("npm test")}>
+        open command
+      </button>
+    );
+  }
+
+  function renderOpenerProbe(permissionLevel: number) {
+    mockConversations([{ id: "conv_sdk", permission_level: permissionLevel }]);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(sessionShellTree(client, "/c/conv_sdk", <ShellOpenerProbe />));
+  }
+
+  afterEach(() => {
+    claimPendingShellInput("conv_sdk", "terminal_zsh_u1");
+    vi.unstubAllGlobals();
+  });
+
+  it("creates the default shell and queues the command for its first prompt", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "terminal_zsh_u1",
+            metadata: { terminal_name: "zsh", session_key: "u1", running: true },
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+    const createCall = (fetchMock.mock.calls as unknown as [string, RequestInit][]).find(
+      ([url, init]) =>
+        url === "/v1/sessions/conv_sdk/resources/terminals" && init.method === "POST",
+    );
+    expect(JSON.parse(createCall?.[1].body as string)).toMatchObject({ terminal: "zsh" });
+    expect(claimPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe("npm test");
+  });
+
+  it("offers no opener to a viewer who would attach read-only", () => {
+    renderOpenerProbe(1);
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
   });
 });

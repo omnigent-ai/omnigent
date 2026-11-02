@@ -620,6 +620,46 @@ export function touchScrollPayload(
 }
 
 /**
+ * How long the bridge gets to answer a ``paste`` frame before the browser
+ * pastes through xterm instead. Runners that predate the frame ignore it; a
+ * current bridge answers within its own prompt wait.
+ */
+export const SHELL_PASTE_ACK_TIMEOUT_MS = 10_000;
+
+/** A command waiting to be pasted; see {@link TerminalSession.pasteWhenShellReady}. */
+interface PendingShellPaste {
+  claim: () => string | null;
+  onRefused?: (text: string) => void;
+}
+
+/** A ``paste`` frame the bridge has not answered yet. */
+interface InFlightShellPaste {
+  id: number;
+  text: string;
+  onRefused?: (text: string) => void;
+  ackTimer: ReturnType<typeof setTimeout>;
+}
+
+/** Parse the bridge's ``{"type": "paste-result"}`` answer to a ``paste`` frame. */
+export function parseTerminalPasteResult(message: string): { id: unknown; pasted: boolean } | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    (value as { type?: unknown }).type !== "paste-result"
+  ) {
+    return null;
+  }
+  const result = value as { id?: unknown; pasted?: unknown };
+  return { id: result.id, pasted: result.pasted === true };
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -675,6 +715,11 @@ export class TerminalSession {
   private touchLastY = 0;
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
+  /** A command to send once the WebSocket is open, or null. */
+  private pendingPaste: PendingShellPaste | null = null;
+  /** The ``paste`` frame awaiting the bridge's answer, or null. */
+  private inFlightPaste: InFlightShellPaste | null = null;
+  private nextPasteId = 1;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -786,6 +831,7 @@ export class TerminalSession {
         this.sendResize();
         if (this.focusOnConnect) this.term.focus();
         onState({ kind: "connected" });
+        this.sendPendingPaste();
       },
       { signal },
     );
@@ -812,6 +858,8 @@ export class TerminalSession {
             this.queryReplies?.dispose();
             this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
           }
+          const pasteResult = parseTerminalPasteResult(ev.data);
+          if (pasteResult !== null) this.settleInFlightPaste(pasteResult);
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -821,6 +869,8 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        // An unanswered paste may already be in the pane; never repeat it.
+        this.dropInFlightPaste();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -1004,6 +1054,72 @@ export class TerminalSession {
   }
 
   /**
+   * Paste a command at the shell's prompt without running it.
+   *
+   * The bridge waits for the shell's prompt and pastes with tmux's
+   * ``paste-buffer -p``, which adds bracketed-paste markers whenever the
+   * shell enabled them, so every line stays in the edit buffer until the user
+   * presses Enter. It refuses a multi-line command it can't paste that way,
+   * and ``onRefused`` gets it. A runner that doesn't answer within
+   * {@link SHELL_PASTE_ACK_TIMEOUT_MS} gets an xterm paste instead, but only
+   * when that is safe.
+   *
+   * @param claim Takes the command; null means another view already pasted it.
+   *   Called once, when the WebSocket is open.
+   * @param onRefused Called with a command that was not pasted.
+   */
+  pasteWhenShellReady(claim: () => string | null, onRefused?: (text: string) => void): void {
+    if (this.disposed) return;
+    this.pendingPaste = { claim, onRefused };
+    this.sendPendingPaste();
+  }
+
+  private sendPendingPaste(): void {
+    const pending = this.pendingPaste;
+    if (pending === null || this.inFlightPaste !== null) return;
+    if (this.disposed || this.ws.readyState !== WebSocket.OPEN) return;
+    this.pendingPaste = null;
+    const text = pending.claim();
+    if (text === null || text === "") return;
+    const id = this.nextPasteId++;
+    this.ws.send(JSON.stringify({ type: "paste", id, text }));
+    this.inFlightPaste = {
+      id,
+      text,
+      onRefused: pending.onRefused,
+      ackTimer: setTimeout(() => this.pasteWithoutBridge(id), SHELL_PASTE_ACK_TIMEOUT_MS),
+    };
+  }
+
+  private settleInFlightPaste(result: { id: unknown; pasted: boolean }): void {
+    const inFlight = this.inFlightPaste;
+    if (inFlight === null || result.id !== inFlight.id) return;
+    this.dropInFlightPaste();
+    if (!result.pasted) inFlight.onRefused?.(inFlight.text);
+    this.sendPendingPaste();
+  }
+
+  private pasteWithoutBridge(id: number): void {
+    const inFlight = this.inFlightPaste;
+    if (inFlight === null || inFlight.id !== id) return;
+    this.dropInFlightPaste();
+    if (this.disposed || this.ws.readyState !== WebSocket.OPEN) return;
+    // Without bracketed paste every line but the last would run.
+    if (this.term.modes.bracketedPasteMode || !inFlight.text.includes("\n")) {
+      this.term.paste(inFlight.text);
+    } else {
+      inFlight.onRefused?.(inFlight.text);
+    }
+    this.sendPendingPaste();
+  }
+
+  private dropInFlightPaste(): void {
+    if (this.inFlightPaste === null) return;
+    clearTimeout(this.inFlightPaste.ackTimer);
+    this.inFlightPaste = null;
+  }
+
+  /**
    * Tear down the bridge. Order matters: abort listeners FIRST so
    * the cleanup's ``ws.close()`` can't fire a stale ``close``
    * event into the next mount.
@@ -1015,6 +1131,8 @@ export class TerminalSession {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.dropInFlightPaste();
+    this.pendingPaste = null;
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();

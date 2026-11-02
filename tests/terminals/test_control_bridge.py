@@ -29,12 +29,16 @@ from fastapi import WebSocketDisconnect
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import create_terminal_instance
+from omnigent.terminals import control_bridge
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
     _hex_send_keys_commands,
+    _paste_pane_ready,
+    _PastePaneState,
     _read_tmux_buffer,
     _run_tmux_capture,
+    _sanitize_shell_paste,
     _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
@@ -1289,5 +1293,173 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
             f"attached control client reported TERM {termname!r}; a leaked "
             "'dumb' makes a pane TUI (Codex) refuse to start"
         )
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("npm install\r\nnpm test\n\n", "npm install\nnpm test"),
+        ("echo one\x1b[201~\ntouch two", "echo one[201~\ntouch two"),
+        ("printf 'a\tb'\x00\x7f\x9b", "printf 'a\tb'"),
+        ("ls\rpwd", "ls\npwd"),
+    ],
+)
+def test_sanitize_shell_paste_keeps_only_text_tabs_and_newlines(text: str, expected: str) -> None:
+    """ESC and other controls are dropped so pasted text can't end the bracketed paste."""
+    assert _sanitize_shell_paste(text) == expected
+
+
+def _pane_state(
+    flag: str, command: str = "bash", cursor: tuple[int, int] = (10, 0)
+) -> _PastePaneState:
+    return _PastePaneState(bracket_paste_flag=flag, current_command=command, cursor=cursor)
+
+
+@pytest.mark.parametrize(
+    ("state", "previous", "ready"),
+    [
+        (_pane_state("1", "cat", (0, 0)), None, True),
+        (_pane_state("0"), _pane_state("0"), False),
+        (_pane_state(""), _pane_state(""), True),
+        (_pane_state("", "-bash"), _pane_state("", "-bash"), True),
+        (_pane_state(""), None, False),
+        (_pane_state(""), _pane_state("", cursor=(3, 0)), False),
+        (_pane_state("", cursor=(0, 1)), _pane_state("", cursor=(0, 1)), False),
+        (_pane_state("", "sh"), _pane_state("", "sh"), False),
+        (_pane_state("", "python3"), _pane_state("", "python3"), False),
+    ],
+)
+def test_paste_pane_ready_requires_mode_or_settled_known_shell_prompt(
+    state: _PastePaneState, previous: _PastePaneState | None, ready: bool
+) -> None:
+    """tmux's mode flag decides when present; older tmux needs a settled shell prompt."""
+    assert _paste_pane_ready(state, previous) is ready
+
+
+def _paste_frame(paste_id: int, text: str) -> dict[str, object]:
+    return {
+        "type": "websocket.receive",
+        "text": json.dumps({"type": "paste", "id": paste_id, "text": text}),
+    }
+
+
+def _paste_results(ws: _FakeWebSocket) -> list[dict[str, object]]:
+    messages = (json.loads(message) for message in ws.sent_text)
+    return [message for message in messages if message.get("type") == "paste-result"]
+
+
+async def _send_enter(sock: Path, target: str) -> None:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux, "-S", str(sock), "send-keys", "-t", target, "Enter"
+    )
+    await proc.communicate()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_shell_paste_waits_for_enter(tmp_path: Path) -> None:
+    """A multi-line paste lands in bash's edit buffer and runs only on Enter."""
+    first, second = tmp_path / "first", tmp_path / "second"
+    sock, target = await _new_private_tmux("bash --noprofile --norc")
+    # An ESC[201~ in the text must not end the paste early and run the second line.
+    command = f"touch {first}\x1b[201~\ntouch {second}"
+    ws = _FakeWebSocket(inbound=[_paste_frame(7, command)])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        await poll_until_async(lambda: _paste_results(ws), timeout_s=10)
+        assert _paste_results(ws) == [{"type": "paste-result", "id": 7, "pasted": True}]
+        await _capture_when(sock, target, lambda pane: str(second).encode() in pane)
+        await asyncio.sleep(0.5)
+        assert not first.exists()
+        assert not second.exists()
+
+        await _send_enter(sock, target)
+        await poll_until_async(lambda: second.exists(), timeout_s=10)
+        assert not first.exists(), "the stripped ESC must not leave a file named after it"
+        assert (tmp_path / "first[201~").exists()
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_read_only_refuses_shell_paste() -> None:
+    """A read-only viewer cannot paste into the pane."""
+    sock, target = await _new_private_tmux("bash --noprofile --norc")
+    ws = _FakeWebSocket(inbound=[_paste_frame(1, "echo should-not-appear")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=True
+        )
+    )
+    try:
+        await poll_until_async(lambda: _paste_results(ws), timeout_s=10)
+        assert _paste_results(ws) == [
+            {"type": "paste-result", "id": 1, "pasted": False, "reason": "read-only"}
+        ]
+        await asyncio.sleep(0.3)
+        pane = await _run_tmux_capture(str(sock), target) or b""
+        assert b"should-not-appear" not in pane
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_refuses_multi_line_paste_without_a_shell_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A program that isn't a known shell would run the lines, so only one line goes in."""
+    monkeypatch.setattr(control_bridge, "_SHELL_PASTE_READY_TIMEOUT_S", 0.5)
+    sock, target = await _new_private_tmux("cat")
+    ws = _FakeWebSocket(
+        inbound=[_paste_frame(1, "first-line\nsecond-line"), _paste_frame(2, "only-line")]
+    )
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        await poll_until_async(lambda: len(_paste_results(ws)) == 2, timeout_s=10)
+        # The second frame arrives while the first still waits for a prompt.
+        assert sorted(_paste_results(ws), key=lambda result: str(result["id"])) == [
+            {"type": "paste-result", "id": 1, "pasted": False, "reason": "not-ready"},
+            {"type": "paste-result", "id": 2, "pasted": False, "reason": "busy"},
+        ]
+        pane = await _run_tmux_capture(str(sock), target) or b""
+        assert b"first-line" not in pane
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_pastes_single_line_without_a_shell_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One line has no newline to run it, so it is pasted once the wait expires."""
+    monkeypatch.setattr(control_bridge, "_SHELL_PASTE_READY_TIMEOUT_S", 0.5)
+    sock, target = await _new_private_tmux("cat")
+    ws = _FakeWebSocket(inbound=[_paste_frame(3, "only-line\n")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        await poll_until_async(lambda: _paste_results(ws), timeout_s=10)
+        assert _paste_results(ws) == [{"type": "paste-result", "id": 3, "pasted": True}]
+        pane = await _capture_when(sock, target, lambda pane: b"only-line" in pane)
+        # cat echoes a line only after a newline; one copy means it was never submitted.
+        assert pane.count(b"only-line") == 1
     finally:
         await _kill_and_join(sock, task)

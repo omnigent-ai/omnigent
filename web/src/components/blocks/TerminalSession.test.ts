@@ -9,6 +9,7 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  SHELL_PASTE_ACK_TIMEOUT_MS,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
@@ -1247,5 +1248,146 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+
+  describe("pasteWhenShellReady", () => {
+    const BRACKETED = (text: string) => `\x1b[200~${text}\x1b[201~`;
+
+    function inputFrames(socket: FakeWebSocket): string[] {
+      return socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    }
+
+    function pasteFrames(socket: FakeWebSocket): unknown[] {
+      return socket.sent.flatMap((frame) => {
+        if (typeof frame !== "string") return [];
+        const message = JSON.parse(frame) as { type?: string };
+        return message.type === "paste" ? [message] : [];
+      });
+    }
+
+    function answerPaste(socket: FakeWebSocket, result: object) {
+      socket.emit("message", { data: JSON.stringify({ type: "paste-result", ...result }) });
+    }
+
+    async function writePane(socket: FakeWebSocket, session: TerminalSession, text: string) {
+      const term = (session as unknown as { term: Terminal }).term;
+      const bytes = new TextEncoder().encode(text);
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+    }
+
+    it("hands the command to the bridge once the socket opens", () => {
+      // WHY: the bridge waits for the shell's prompt and pastes with tmux, so
+      // the browser must not type the lines itself, where Enter would run them.
+      const { socket, session } = makeSession();
+      const claim = vi.fn(() => "echo one\necho two");
+      session.pasteWhenShellReady(claim);
+      expect(claim).not.toHaveBeenCalled();
+
+      socket.open();
+
+      expect(claim).toHaveBeenCalledTimes(1);
+      expect(pasteFrames(socket)).toEqual([{ type: "paste", id: 1, text: "echo one\necho two" }]);
+      expect(inputFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    it("reports a command the bridge refused", () => {
+      const { socket, session } = makeSession();
+      const refused: string[] = [];
+      socket.open();
+      session.pasteWhenShellReady(
+        () => "echo one\necho two",
+        (text) => refused.push(text),
+      );
+
+      answerPaste(socket, { id: 99, pasted: false, reason: "not-ready" });
+      expect(refused).toEqual([]);
+      answerPaste(socket, { id: 1, pasted: false, reason: "not-ready" });
+
+      expect(refused).toEqual(["echo one\necho two"]);
+      expect(inputFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    it("does nothing when the input was already claimed elsewhere", () => {
+      const { socket, session } = makeSession();
+      session.pasteWhenShellReady(() => null);
+      socket.open();
+
+      expect(pasteFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    describe("when the runner never answers", () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it("pastes through xterm when the shell enabled bracketed paste", async () => {
+        const { socket, session } = makeSession();
+        socket.open();
+        await writePane(socket, session, "\x1b[?2004h$ ");
+        vi.useFakeTimers();
+        const refused: string[] = [];
+        session.pasteWhenShellReady(
+          () => "echo one\necho two",
+          (text) => refused.push(text),
+        );
+
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS - 1);
+        expect(inputFrames(socket)).toEqual([]);
+        vi.advanceTimersByTime(1);
+
+        expect(inputFrames(socket)).toEqual([BRACKETED("echo one\recho two")]);
+        expect(refused).toEqual([]);
+        // A late answer after the fallback must not paste or refuse again.
+        answerPaste(socket, { id: 1, pasted: false });
+        expect(refused).toEqual([]);
+        session.dispose();
+      });
+
+      it("types a single-line command but refuses a multi-line one", () => {
+        // WHY: without bracketed paste every newline is Enter, which would run
+        // the command the user has not reviewed yet.
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        const refused: string[] = [];
+        socket.open();
+        session.pasteWhenShellReady(() => "ls -la");
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        session.pasteWhenShellReady(
+          () => "echo one\necho two",
+          (text) => refused.push(text),
+        );
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+
+        expect(inputFrames(socket)).toEqual(["ls -la"]);
+        expect(refused).toEqual(["echo one\necho two"]);
+        session.dispose();
+      });
+
+      it("never repeats a paste after the socket closes or the session ends", () => {
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        session.pasteWhenShellReady(() => "ls");
+        socket.emit("close", { code: 1006, reason: "" });
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        expect(inputFrames(socket)).toEqual([]);
+
+        const claim = vi.fn(() => "pwd");
+        session.pasteWhenShellReady(claim);
+        session.dispose();
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        expect(inputFrames(socket)).toEqual([]);
+      });
+    });
   });
 });
