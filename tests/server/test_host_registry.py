@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
+from omnigent.host.frames import CAP_CODEX_PLAN_AT_LAUNCH, CAP_CODEX_SIDE_CHAT, HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
 
@@ -94,6 +94,9 @@ def test_host_supports_codex_side_chat_by_capability() -> None:
     assert registry.host_supports_codex_side_chat("host_old") is False
     # Fail-open: an unknown/offline host isn't declared too old.
     assert registry.host_supports_codex_side_chat("host_absent") is True
+    # Each token is gated on its own.
+    assert registry.host_may_support("host_new", CAP_CODEX_PLAN_AT_LAUNCH) is False
+    assert registry.host_may_support("host_absent", CAP_CODEX_PLAN_AT_LAUNCH) is True
 
 
 def test_interactive_shells_survive_disconnect() -> None:
