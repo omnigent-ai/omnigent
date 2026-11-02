@@ -761,17 +761,16 @@ def test_codex_provider_surfaces_skills_by_dir_name(tmp_path: Path) -> None:
     assert "triage" not in names
 
 
-def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
+def test_codex_menu_set_matches_executor_linked_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Invariant: the menu provider and the executor's symlink path select the
-    SAME skill set from the SAME sources (both via codex_skill_sources +
-    select_codex_skill_dirs) — so a / menu entry is always actually linked —
-    except workspace ``.agents`` skills, which Codex loads from its cwd unlinked.
+    Invariant: the menu provider and the executor's launch linking select the
+    SAME skill set from the SAME sources — so a / menu entry is always actually
+    linked — except workspace ``.agents`` skills, which Codex loads from its cwd
+    unlinked.
     """
-    from omnigent.inner.codex_executor import (
-        codex_skill_sources,
-        select_codex_skill_dirs,
-    )
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
 
     home = tmp_path / "home"
     host = home / ".codex" / "skills"
@@ -781,9 +780,12 @@ def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
         (d / "SKILL.md").write_text(f"---\nname: {n.split('--')[-1]}\ndescription: d\n---\nx\n")
     workspace = tmp_path / "ws"
     _write_skill(workspace / ".agents" / "skills", "workspace-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.chdir(workspace)
 
-    # What the executor would symlink (keys = dir names linked into CODEX_HOME).
-    linked = set(select_codex_skill_dirs("all", codex_skill_sources(None, home)))
+    codex_home = tmp_path / "codex-home"
+    populate_codex_skills_from_bundle(codex_home, None, "all")
+    linked = {entry.name for entry in (codex_home / "skills").iterdir()}
     # What the menu surfaces.
     menu = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "codex-native")}
     assert linked == {"alpha", "beta--gamma"}

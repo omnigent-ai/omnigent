@@ -5150,6 +5150,9 @@ def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
     """Outside a repo only the workspace's own dir counts; ``$HOME`` keeps its user rank."""
     from omnigent.inner.codex_executor import codex_skill_sources
 
+    if any((parent / ".git").exists() for parent in Path(os.path.realpath(tmp_path)).parents):
+        pytest.skip("tmp_path is inside a git checkout; outside-repo scoping can't be exercised")
+
     home = tmp_path / "home"
     workspace = tmp_path / "ws"
     for directory in (
