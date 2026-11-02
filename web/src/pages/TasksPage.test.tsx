@@ -7,7 +7,7 @@
 // stubbed to a marker so we assert the page opens it without exercising its
 // internals (covered by its own tests).
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksPage } from "./TasksPage";
@@ -146,6 +146,30 @@ function renderPage(path = "/tasks", basename = "") {
 }
 
 describe("TasksPage list", () => {
+  it("reopens the guide from the info button beside the heading", async () => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    setTasks([]);
+    render(
+      <MemoryRouter>
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <TasksPage />
+        </CapabilitiesProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    await waitFor(() => expect(screen.getByTestId("new-task-button")).toHaveFocus());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "About automations" }));
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "See examples" }));
+    expect(screen.getByRole("dialog", { name: "Example automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "About automations" })).toHaveFocus(),
+    );
+  });
+
   it("waits for the first task load and keeps the guide's step through a failed refetch", () => {
     vi.mocked(useViewerId).mockReturnValue("alice");
     const content = () => (

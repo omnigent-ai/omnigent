@@ -16,6 +16,7 @@ import {
   ArrowLeftIcon,
   ChevronDownIcon,
   ClockIcon,
+  InfoIcon,
   LayoutGridIcon,
   Loader2Icon,
   PencilIcon,
@@ -70,6 +71,9 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 
 export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }) {
   const newTaskButtonRef = useRef<HTMLButtonElement>(null);
+  const introButtonRef = useRef<HTMLButtonElement>(null);
+  // The guide shows once by itself; each click on the info button reopens it.
+  const [introOpens, setIntroOpens] = useState(0);
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
@@ -238,11 +242,28 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   return (
     <PageScroll contentClassName="px-4 md:px-6">
       {tasks !== undefined && (
-        <AutomationsIntro onClose={() => newTaskButtonRef.current?.focus()} />
+        <AutomationsIntro
+          openCount={introOpens}
+          onClose={() => (introOpens > 0 ? introButtonRef : newTaskButtonRef).current?.focus()}
+        />
       )}
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
-          <h1 className="text-2xl font-semibold">Automations</h1>
+          <div className="flex items-center gap-1">
+            <h1 className="text-2xl font-semibold">Automations</h1>
+            <Button
+              ref={introButtonRef}
+              variant="ghost"
+              size="icon-xs"
+              aria-label="About automations"
+              data-testid="tasks-intro-button"
+              componentId="tasks.intro.open"
+              className="text-muted-foreground"
+              onClick={() => setIntroOpens((n) => n + 1)}
+            >
+              <InfoIcon className="size-4" />
+            </Button>
+          </div>
           <p className="text-ui text-muted-foreground">
             Run agent sessions on a recurring schedule.
           </p>
