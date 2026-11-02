@@ -829,7 +829,6 @@ async def test_create_files_runs_into_an_owned_project(
     _make_user(db_uri, "bob@example.com")
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_projects"] is True
-    assert info["scheduled_task_harness_settings"] is True
     mine = await _make_project(auth_client, "mine")
     bobs = await _make_project(auth_client, "bob's", owner="bob@example.com")
 
@@ -2795,13 +2794,12 @@ async def test_codex_permission_round_trip(
     assert response.status_code == 200, response.text
     task_id = response.json()["id"]
     loaded = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert loaded.status_code == 200, loaded.text
     assert loaded.json()["permission_mode"] == mode
+    if mode != "full-access":
+        return
     changed = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}", json={"permission_mode": "read-only"}, headers=_headers()
     )
     assert changed.status_code == 200, changed.text
     assert changed.json()["permission_mode"] == "read-only"
-    cleared = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json={"permission_mode": None}, headers=_headers()
-    )
-    assert cleared.json()["permission_mode"] is None

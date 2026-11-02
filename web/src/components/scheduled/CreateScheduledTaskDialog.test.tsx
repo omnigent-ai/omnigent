@@ -2435,13 +2435,20 @@ describe("automation harness settings", () => {
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("modelOverride");
   });
 
-  it.each(["codex-native", "cursor-native"])(
+  it.each(["codex-native", "cursor-native", "claude-native", "pi-native"])(
     "uses the sandbox catalog for %s instead of the connected host's",
     async (harness) => {
       const agent = useHarness(harness);
       vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
         data: {
-          models: [{ ...models[0], id: "sandbox-model", displayName: "Sandbox model" }],
+          models: [
+            {
+              ...models[0],
+              id: "sandbox-model",
+              displayName: "Sandbox model",
+              supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+            },
+          ],
           configured: false,
           status: "ready",
         },
@@ -2470,6 +2477,9 @@ describe("automation harness settings", () => {
       expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith(null, harness, false);
       await choose("model", "Sandbox model");
       expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sandbox model");
+      fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+      expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: "Low" }));
       expect(sandboxModelsHook.useSandboxModelOptions).toHaveBeenLastCalledWith(
         "company",
         harness,
@@ -2505,6 +2515,104 @@ describe("automation harness settings", () => {
       </CapabilitiesProvider>
     );
   }
+
+  it.each(["claude-native", "pi-native"])(
+    "uses provider effort support for %s sandbox models",
+    (harness) => {
+      const agent = useHarness(harness);
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data: {
+          models: [{ id: "provider-model", isDefault: true }],
+          configured: false,
+          status: "ready",
+        },
+      } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      render(sandboxDialog(agent.id, true));
+      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["host", "sandbox"])(
+    "clears target-specific overrides when moving to another %s",
+    async (target) => {
+      const agent = useHarness("codex-native");
+      vi.mocked(hostsHook.useHosts).mockReturnValue({
+        data: [
+          { host_id: "host_1", name: "laptop", status: "online" },
+          { host_id: "host_2", name: "desktop", status: "online" },
+        ],
+      } as ReturnType<typeof hostsHook.useHosts>);
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: agent.id,
+              hostId: "host_1",
+              modelOverride: "saved-model",
+              reasoningEffort: "high",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      const changeTarget = async () => {
+        if (target === "host") await choose("host", "desktop");
+        else {
+          fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+          fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+        }
+      };
+      await changeTarget();
+      fireEvent.click(screen.getByRole("button", { name: "pick codex-native" }));
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Default");
+      fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+      expect(screen.queryByRole("option", { name: "saved-model" })).not.toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+      await choose("host", "laptop");
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
+      await changeTarget();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        modelOverride: null,
+        reasoningEffort: null,
+      });
+    },
+  );
+
+  it("clears sandbox model settings when the connected-host harness has no model controls", async () => {
+    const agent = useHarness("cursor-native");
+    render(sandboxDialog(agent.id, true));
+    await choose("host", "laptop");
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: null,
+      reasoningEffort: null,
+    });
+  });
+
+  it.each([
+    ["codex-native", null],
+    ["claude-native", "default"],
+  ])("normalizes a saved default permission for %s", async (harness, expected) => {
+    const agent = useHarness(harness!);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: agent.id, permissionMode: "default" })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBe(expected);
+  });
 
   it.each([false, true])(
     "blocks an explicitly unsupported sandbox in edit=%s, but recovers after a failed preview",

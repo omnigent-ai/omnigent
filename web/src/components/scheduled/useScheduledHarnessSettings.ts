@@ -19,6 +19,8 @@ import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { harnessUnconfiguredOnHost } from "@/lib/harnessSetup";
 import type { NativeModelOption } from "@/lib/types";
 
+const EMPTY_MODELS: NativeModelOption[] = [];
+
 /** Resolve choices for the automation's execution target without launching it. */
 export function useScheduledHarnessSettings(
   agent: AvailableAgent | undefined,
@@ -67,7 +69,7 @@ export function useScheduledHarnessSettings(
   if (sandbox) {
     liveCatalog = undefined;
     if (sandboxAuthoritative)
-      liveCatalog = sandboxData.status === "ready" ? sandboxData.models : [];
+      liveCatalog = sandboxData.status === "ready" ? sandboxData.models : EMPTY_MODELS;
   }
   const configured =
     sandbox && (sandboxAuthoritative ? sandboxData.configured : cached?.configured) === true;
@@ -106,6 +108,7 @@ export function useScheduledHarnessSettings(
     (harness === "claude-native" && !(sandbox && sandboxCatalogOffered)
       ? CLAUDE_NATIVE_MODELS.map((option) => ({ id: option.id, displayName: option.label }))
       : []);
+  // Like New Chat, provider default catalogs own effort choices even for Claude/Pi.
   const effortHarness = sandboxDefaultModels ? "codex-native" : harness;
   const effortsForModel = (picked: string) =>
     nativeEffortOptions(effortHarness, models, picked) ?? [];

@@ -61,13 +61,14 @@ it.each(["server", "user", "target", "kind", "harness", "agent"])(
   },
 );
 
-it.each([null, "corrupt", '{"models":[{"id":12}],"configured":false,"savedAt":1}'])(
-  "ignores invalid storage %s",
-  (value) => {
-    if (value !== null) localStorage.setItem(key()!, value);
-    expect(readModelCatalogCache(key())).toBeNull();
-  },
-);
+it.each([
+  null,
+  "corrupt",
+  JSON.stringify({ models: [{ id: 12 }], configured: false, savedAt: Date.now() }),
+])("ignores invalid storage %s", (value) => {
+  if (value !== null) localStorage.setItem(key()!, value);
+  expect(readModelCatalogCache(key())).toBeNull();
+});
 
 it("expires catalogs after a day and rejects future timestamps", () => {
   vi.useFakeTimers();

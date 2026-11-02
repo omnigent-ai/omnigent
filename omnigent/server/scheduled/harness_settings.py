@@ -32,7 +32,7 @@ async def scheduled_agent_harness(agent: Any, agent_cache: Any) -> str | None:
         raw = (executor.config.get("harness") or executor.type) if executor else None
         return canonicalize_harness(raw) or raw
     except Exception:
-        _logger.exception("Could not resolve scheduled agent harness")
+        _logger.exception("Could not resolve harness for scheduled agent %s", agent.id)
         return None
 
 

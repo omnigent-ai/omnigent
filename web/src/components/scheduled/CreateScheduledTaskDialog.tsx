@@ -165,8 +165,12 @@ export function CreateScheduledTaskDialog({
     // Settings belong to their harness. Returning to the edited task's agent
     // restores its saved values; selecting another agent clears them.
     const backToOriginal = isEdit && agent.id === editingTask?.agentId;
-    setPickedModel(backToOriginal ? (editingTask?.modelOverride ?? "") : "");
-    setPickedEffort(backToOriginal ? (editingTask?.reasoningEffort ?? "") : "");
+    setPickedModel(
+      backToOriginal && originalTargetSelected ? (editingTask?.modelOverride ?? "") : "",
+    );
+    setPickedEffort(
+      backToOriginal && originalTargetSelected ? (editingTask?.reasoningEffort ?? "") : "",
+    );
     setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
   }
 
@@ -350,7 +354,32 @@ export function CreateScheduledTaskDialog({
   );
   const supportsModel = harnessSettings.supportsModel;
   const supportsPermission = harnessSettings.permissions.length > 0;
+  const effectivePermission =
+    harnessSettings.harness !== "claude-native" && pickedPermission === "default"
+      ? ""
+      : pickedPermission;
+  const originalTargetSelected =
+    editingTask?.executionTarget === "managed_sandbox"
+      ? sandboxMode
+      : !sandboxMode && hostId === (editingTask?.hostId ?? "");
   const showAdvanced = supportsModel || supportsPermission;
+  function handleTargetChange(value: string) {
+    const nextSandbox = value === SANDBOX_HOST;
+    const nextHostId = nextSandbox ? "" : value;
+    if (nextSandbox === sandboxMode && nextHostId === hostId) return;
+    const originalTarget =
+      editingTask?.executionTarget === "managed_sandbox"
+        ? nextSandbox
+        : !nextSandbox && nextHostId === editingTask?.hostId;
+    const restore = isEdit && effectiveAgentId === editingTask?.agentId && originalTarget;
+    setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
+    setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
+    setSandboxMode(nextSandbox);
+    setHostId(nextHostId);
+    // Preserve a connected-host path for server validation; sandboxes start without one.
+    if (nextSandbox) setWorkspace("");
+    setWorkspaceBrowserOpen(false);
+  }
   function handleModelChange(model: string) {
     setPickedModel(model);
     if (
@@ -471,13 +500,13 @@ export function CreateScheduledTaskDialog({
       if (editingTask) {
         // Explicit null clears an override; unsupported settings stay untouched.
         const overrides = reusesExistingSession ? {} : {
-          ...(supportsModel
+          ...(supportsModel || !originalTargetSelected
             ? {
                 modelOverride: pickedModel || null,
                 reasoningEffort: pickedEffort || null,
               }
             : {}),
-          ...(supportsPermission ? { permissionMode: pickedPermission || null } : {}),
+          ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
         };
         await updateMutation.mutateAsync({
           id: editingTask.id,
@@ -504,8 +533,8 @@ export function CreateScheduledTaskDialog({
           // the create uses the agent's configured defaults.
           ...(supportsModel && pickedModel !== "" ? { modelOverride: pickedModel } : {}),
           ...(supportsModel && pickedEffort !== "" ? { reasoningEffort: pickedEffort } : {}),
-          ...(supportsPermission && pickedPermission !== ""
-            ? { permissionMode: pickedPermission }
+          ...(supportsPermission && effectivePermission !== ""
+            ? { permissionMode: effectivePermission }
             : {}),
         });
       }
@@ -671,22 +700,7 @@ export function CreateScheduledTaskDialog({
               <Select
                 value={sandboxMode ? SANDBOX_HOST : hostId}
                 componentId="tasks.scheduled.host"
-                onValueChange={(v) => {
-                  if (v === SANDBOX_HOST) {
-                    // A sandbox run is hostless; drop any pinned host/workspace.
-                    setSandboxMode(true);
-                    setHostId("");
-                    setWorkspace("");
-                    setWorkspaceBrowserOpen(false);
-                    return;
-                  }
-                  setSandboxMode(false);
-                  // Keep the workspace on a host switch: an update omits an empty
-                  // one, which leaves the saved path in place, so the form must
-                  // show what gets saved. The server checks it against the new host.
-                  setHostId(v);
-                  setWorkspaceBrowserOpen(false);
-                }}
+                onValueChange={handleTargetChange}
                 onOpenChange={handleSelectOpenChange}
               >
                 <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
@@ -881,7 +895,7 @@ export function CreateScheduledTaskDialog({
                     reusesExistingSession ? (editingTask?.reasoningEffort ?? "") : pickedEffort
                   }
                   permissionMode={
-                    reusesExistingSession ? (editingTask?.permissionMode ?? "") : pickedPermission
+                    reusesExistingSession ? (editingTask?.permissionMode ?? "") : effectivePermission
                   }
                   settings={harnessSettings}
                   disabled={reusesExistingSession}

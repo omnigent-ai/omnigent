@@ -21,6 +21,7 @@ ARG NODE_VERSION=22
 FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+ENV PNPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
 USER 0
 WORKDIR /web
@@ -37,6 +38,7 @@ RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
 COPY web/ ./web/
+COPY omnigent/native/permission_modes.json ./omnigent/native/
 RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
