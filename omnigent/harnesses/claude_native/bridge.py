@@ -5165,11 +5165,12 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 # pane's bottom. The answer is rendered atomically once generation
 # finishes — it does not stream chunk-by-chunk into the pane.
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
-_BTW_FOOTER_CLOSE_HINT = "Esc to close"
+# Whitespace is removed from footer hints because terminal wraps can split words.
+_BTW_FOOTER_CLOSE_HINT = "Esctoclose"
 # A settled overlay's footer offers copy + fork; while the answer is
 # still generating the footer carries neither and a ``✻ Answering…`` line
 # shows in the region. Both conditions gate "the exchange is complete".
-_BTW_FOOTER_COMPLETE_HINTS = ("c to copy", "f to fork")
+_BTW_FOOTER_COMPLETE_HINTS = ("ctocopy", "ftofork")
 _BTW_ANSWERING_HINT = "Answering"
 _BTW_QUESTION_PREFIX = "/btw"
 # Read-only capture cannot tell a complete tall answer from one the pane
@@ -5218,6 +5219,37 @@ class PaneSignals:
     btw_overlay: BtwOverlay | None = None
 
 
+def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
+    """Separate the side-chat body from its whitespace-free navigation footer."""
+    lines = pane.splitlines()
+    footer_idx = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if lines[index].lstrip().startswith(("↑/↓", "←/→"))
+        ),
+        None,
+    )
+    if footer_idx is None:
+        return None
+    footer = "".join("".join(lines[footer_idx:]).split())
+    if not footer.startswith(("↑/↓toscroll", "←/→toswitch")) or not footer.endswith(
+        _BTW_FOOTER_CLOSE_HINT
+    ):
+        return None
+    border_idx = next(
+        (
+            index
+            for index in range(footer_idx - 1, -1, -1)
+            if _BTW_OVERLAY_BORDER_GLYPH in lines[index]
+        ),
+        None,
+    )
+    if border_idx is None:
+        return None
+    return lines[border_idx + 1 : footer_idx], footer
+
+
 def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     """
     Parse a *completed* ``/btw`` side-chat overlay from a captured pane.
@@ -5229,23 +5261,12 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The parsed overlay, or ``None``.
     """
-    lines = pane.splitlines()
-    footer_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
-        None,
-    )
-    if footer_idx is None:
+    parts = _btw_overlay_parts(pane)
+    if parts is None:
         return None
-    footer = lines[footer_idx]
+    region, footer = parts
     if not all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
         return None
-    border_idx = next(
-        (i for i in range(footer_idx - 1, -1, -1) if _BTW_OVERLAY_BORDER_GLYPH in lines[i]),
-        None,
-    )
-    if border_idx is None:
-        return None
-    region = lines[border_idx + 1 : footer_idx]
     # A ``✻ Answering…`` line means the (current) exchange is still in
     # flight even though a completed footer is on screen — bail.
     if any(_BTW_ANSWERING_HINT in line for line in region):
@@ -5269,7 +5290,7 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     answer = _dedent_overlay_lines(answer_lines)
     if not answer:
         return None
-    truncated = (footer_idx - border_idx) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    truncated = len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
     return BtwOverlay(question=question, answer=answer, truncated=truncated)
 
 
@@ -5287,25 +5308,19 @@ def _btw_overlay_present(pane: str) -> bool:
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: True when the ``/btw`` overlay is visible.
     """
-    lines = pane.splitlines()
-    footer_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
-        None,
-    )
-    if footer_idx is None:
+    parts = _btw_overlay_parts(pane)
+    if parts is None:
         return False
-    if not any(_BTW_OVERLAY_BORDER_GLYPH in line for line in lines[:footer_idx]):
-        return False
-    footer = lines[footer_idx]
+    region, footer = parts
     # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
     # surfaces) from matching.
     if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
         return True
-    if "to switch" in footer:
+    if "toswitch" in footer:
         return True
-    return any(_BTW_ANSWERING_HINT in line for line in lines[:footer_idx])
+    return any(_BTW_ANSWERING_HINT in line for line in region)
 
 
 def _dedent_overlay_lines(overlay_lines: list[str]) -> str:
@@ -6321,7 +6336,8 @@ def _restore_occupied_input(
         # Nothing an Escape can clear: launcher output before the input box
         # mounts, a dialog that offers no dismissal, or one Escape would quit.
         unclearable = surface == _OVERLAY_SURFACE and (
-            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
+            not (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+            or _escape_quits_claude(pane)
         )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
@@ -7079,7 +7095,7 @@ def _wait_for_claude_prompt_ready(
             bridge_dir is not None
             and remaining > 0
             and _occupying_surface(pane) == _OVERLAY_SURFACE
-            and _ESCAPE_DISMISS_HINT.search(pane)
+            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
