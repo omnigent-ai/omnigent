@@ -666,6 +666,11 @@ def _term_height() -> int:
         return 24
 
 
+def _server_not_installed(err: Exception) -> bool:
+    """Whether ``err`` only says ``omnigent`` is not installed, so there is no CLI log."""
+    return isinstance(err, ModuleNotFoundError) and err.name == "omnigent"
+
+
 def _prompt_input_max_rows() -> int:
     """
     Maximum visible rows available to the prompt input buffer.
@@ -1540,10 +1545,9 @@ class TerminalHost:
             from omnigent.cli_diagnostics import redirect_stderr_to_log
 
             redirect_stderr_to_log()
-        except ModuleNotFoundError:
-            pass  # Installed without omnigent: there is no CLI log to redirect to.
         except Exception as err:
-            _log.exception("Failed to redirect stderr to the CLI diagnostics log: %s", err)
+            if not _server_not_installed(err):
+                _log.exception("Failed to redirect stderr to the CLI diagnostics log: %s", err)
         return self
 
     async def _drain_pending_handlers(self) -> None:
@@ -1587,10 +1591,9 @@ class TerminalHost:
             from omnigent.cli_diagnostics import restore_stderr
 
             restore_stderr()
-        except ModuleNotFoundError:
-            pass  # Installed without omnigent: nothing was redirected.
         except Exception as err:
-            _log.exception("Failed to restore stderr from the CLI diagnostics log: %s", err)
+            if not _server_not_installed(err):
+                _log.exception("Failed to restore stderr from the CLI diagnostics log: %s", err)
         # Clear the title before the drain so it reverts even if a
         # handler blocks for the full 30s budget below.
         self._try_clear_window_title()
