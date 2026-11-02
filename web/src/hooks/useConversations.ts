@@ -23,6 +23,7 @@ import { revokePermission } from "@/lib/permissionsApi";
 
 import {
   useInfiniteQuery,
+  useIsMutating,
   useMutation,
   useQuery,
   useQueryClient,
@@ -1623,9 +1624,28 @@ export function useBulkStopSessions() {
  * `project=""`). Each session is moved independently; partial failures don't
  * block the rest.
  */
+/**
+ * Key shared by every project write (create, rename, delete, settings, order,
+ * bulk move). Their dialogs close on submit, so the UI holds one lock while any
+ * of them is in flight instead of reconciling concurrent project writes.
+ */
+export const PROJECT_WRITE_KEY = ["project-write"] as const;
+
+function projectWriteFailed(action: string, error: Error) {
+  showToast(`Couldn't ${action}. ${error.message}`, { duration: 0 });
+}
+
+/** Whether a project write or order save is in flight; project write controls wait for it. */
+export function useProjectWriting(): boolean {
+  const writes = useIsMutating({ mutationKey: PROJECT_WRITE_KEY });
+  const orderSaves = useIsMutating({ mutationKey: ["project-order"] });
+  return writes + orderSaves > 0;
+}
+
 export function useBulkMoveToProject() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: PROJECT_WRITE_KEY,
     mutationFn: async ({ ids, project }: { ids: string[]; project: string }) => {
       const results = await Promise.allSettled(
         ids.map((id) => moveConversationToProject(id, project)),
@@ -1641,6 +1661,7 @@ export function useBulkMoveToProject() {
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
     },
+    onError: (error, { project }) => projectWriteFailed(`move sessions to "${project}"`, error),
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
@@ -2460,6 +2481,9 @@ export function useMoveToProject() {
     mutationFn: ({ id, project }: { id: string; project: string }) =>
       moveConversationToProject(id, project),
     onMutate: async ({ id, project }) => {
+      // A rename or delete in flight could strand the session under a stale name.
+      if (queryClient.isMutating({ mutationKey: PROJECT_WRITE_KEY }) > 0)
+        throw new Error("Projects are still saving. Try again when they finish.");
       // `""` unfiles (no id needed); a file target must exist in the cached
       // projects list for the overlay to be truthful about the outcome — an
       // uncached name (brand-new project) has no folder to regroup into.
@@ -2502,7 +2526,11 @@ export function useMoveToProject() {
       overlayMembership(row, target?.id ?? null, labels, project === "" ? null : project);
       return previous;
     },
-    onError: (_err, { id }, previous) => {
+    onError: (error, { id, project }, previous) => {
+      projectWriteFailed(
+        project ? `move the session to "${project}"` : "remove the session from its project",
+        error,
+      );
       if (previous === undefined) return;
       for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
         if (data !== undefined) queryClient.setQueryData(key, data);
@@ -2686,6 +2714,7 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: PROJECT_WRITE_KEY,
     mutationFn: async ({ id, name }: ProjectSummary) => {
       const ids = await fetchAllProjectSessionIds(name);
       const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));
@@ -2715,14 +2744,16 @@ export function useDeleteProject() {
       if (id !== null) await apiDeleteProject(id);
       return { succeeded, failed };
     },
+    onError: (error, { name }) => projectWriteFailed(`delete "${name}"`, error),
     onSettled: () => {
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Deleting a project archives its members, growing the archived set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      // Hold the lock until the list drops the folder, so nothing acts on it.
+      return queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }
@@ -2730,17 +2761,17 @@ export function useDeleteProject() {
 /**
  * Create an empty first-class project (`POST /v1/projects`). This is the
  * capability the label model can't express — a project with no members. The
- * server rejects a duplicate name (409); the error message is surfaced to the
- * caller for inline display.
+ * server rejects a duplicate name (409); the error message is toasted.
  */
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: PROJECT_WRITE_KEY,
     mutationFn: ({ name, icon }: { name: string; icon?: string }) =>
       apiCreateProject(name, icon ? { icon } : undefined),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-    },
+    onError: (error, { name }) => projectWriteFailed(`create "${name}"`, error),
+    // Hold the lock until the new folder is listed.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
   });
 }
 
@@ -2759,6 +2790,7 @@ export function useCreateProject() {
 export function useRenameProject() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: PROJECT_WRITE_KEY,
     mutationFn: async ({
       id,
       oldName,
@@ -2803,11 +2835,13 @@ export function useRenameProject() {
       // the stale `null` and re-creating it (which 409s on the duplicate name).
       return projectId;
     },
+    onError: (error, { oldName }) => projectWriteFailed(`rename "${oldName}"`, error),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      // Hold the lock until the list shows the new name, so nothing acts on the old one.
+      return queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }
@@ -2836,6 +2870,7 @@ export function useProjectConfig(id: string | null) {
 export function useUpdateProjectConfig() {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationKey: PROJECT_WRITE_KEY,
     mutationFn: async ({
       id,
       name,
@@ -2848,6 +2883,7 @@ export function useUpdateProjectConfig() {
       const projectId = id ?? (await apiCreateProject(name)).id;
       return apiUpdateProjectConfig(projectId, config);
     },
+    onError: (error, { name }) => projectWriteFailed(`save settings for "${name}"`, error),
     onSuccess: (project) => {
       // Seed the fresh config into the cache (not just invalidate) so the
       // composer's prefill reads the just-saved defaults on the very next visit
