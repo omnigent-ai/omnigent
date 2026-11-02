@@ -12,7 +12,7 @@ from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BackgroundTitleContext,
-    build_background_title_instructions,
+    generation_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.codex_native")
@@ -99,7 +99,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             args.extend(("--config", override))
         if launch.model:
             args.extend(("--model", launch.model))
-        instructions = build_background_title_instructions(context.additional_instructions)
+        instructions = generation_instructions(context)
         args.append(
             f"{instructions} Do not use tools.\n<user_message>\n{context.prompt}\n</user_message>"
         )

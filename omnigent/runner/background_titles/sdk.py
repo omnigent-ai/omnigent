@@ -13,10 +13,14 @@ from omnigent.runner.background_titles.service import (
     BackgroundTitleContext,
     BackgroundTitleHarnessError,
     background_title_max_output_tokens,
-    build_background_title_instructions,
+    generation_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.sdk")
+
+#: Output budget when ``context.instructions`` replaces the title prompt: a
+#: one-sentence JSON verdict, not a 2-5 word title.
+OVERRIDE_MAX_OUTPUT_TOKENS = 512
 
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
@@ -46,9 +50,13 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         "content": f"<user_message>\n{context.prompt}\n</user_message>",
         "model": "session-title",
         "tools": [],
-        "instructions": build_background_title_instructions(context.additional_instructions),
+        "instructions": generation_instructions(context),
         "reasoning": {"effort": "low"},
-        "max_output_tokens": background_title_max_output_tokens(context.additional_instructions),
+        "max_output_tokens": (
+            OVERRIDE_MAX_OUTPUT_TOKENS
+            if context.instructions
+            else background_title_max_output_tokens(context.additional_instructions)
+        ),
     }
     if context.title_model is not None:
         event_body["model_override"] = context.title_model
