@@ -55,6 +55,12 @@ interface FileViewerContextType {
    * against {@link workspaceRoot}. Null when unknown.
    */
   workspaceHome: string | null;
+  /**
+   * True while the environment that supplies {@link workspaceRoot} and
+   * {@link workspaceHome} is still being fetched; false once it has settled
+   * or can't be fetched (no permission, workspace unservable, or an error).
+   */
+  workspacePathsLoading?: boolean;
   /** Host running the session, so desktop-only file actions can check it is this machine. */
   sessionHostId?: string | null;
 }
@@ -108,9 +114,17 @@ export function useFileViewerConversationId(): string | undefined {
  * Returns the workspace root and runner home for the focused session, so chat
  * consumers can collapse an absolute / home-relative path the agent mentions
  * onto a workspace-relative one. Both are null outside AppShell or before the
- * environment resolves.
+ * environment resolves; `loading` says whether they may still arrive.
  */
-export function useWorkspacePaths(): { root: string | null; home: string | null } {
+export function useWorkspacePaths(): {
+  root: string | null;
+  home: string | null;
+  loading: boolean;
+} {
   const ctx = useContext(FileViewerContext);
-  return { root: ctx?.workspaceRoot ?? null, home: ctx?.workspaceHome ?? null };
+  return {
+    root: ctx?.workspaceRoot ?? null,
+    home: ctx?.workspaceHome ?? null,
+    loading: ctx?.workspacePathsLoading ?? false,
+  };
 }

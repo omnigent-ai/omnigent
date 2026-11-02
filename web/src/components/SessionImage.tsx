@@ -30,7 +30,7 @@ const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-ce
  * Fallback for an image that can't be shown: a compact labelled chip, so an
  * unusable attachment costs a line rather than a tall box of broken glyph.
  */
-function UnavailableImage({ alt, className }: { alt: string; className?: string }) {
+export function UnavailableImage({ alt, className }: { alt: string; className?: string }) {
   return (
     <div
       role="img"
@@ -71,7 +71,8 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
  * the transcript carries, or a same-origin session file path.
  *
  * Shares sizing and failure handling with same-origin session images.
- * Only corrupt data URIs collapse to a chip; fetched paths can fail transiently.
+ * Only corrupt local bytes (data or blob URLs) collapse to a chip; fetched paths
+ * can fail transiently.
  */
 export function InlineImage({
   src,
@@ -102,13 +103,29 @@ export function InlineImage({
         // off the main thread keeps the swap from blocking paint.
         loading="lazy"
         decoding="async"
-        // An absent src never resolved, so nothing has failed yet — latching
-        // here would strand the slot on a chip once the path arrives. A
-        // non-data src remains available for retry on error.
+        // No src yet means nothing failed. Local data/blob bytes fail for
+        // good; a fetched path stays retryable.
         onError={() => {
-          if (src !== undefined && src.startsWith("data:")) setFailedSrc(src);
+          if (src !== undefined && /^(?:data|blob):/.test(src)) setFailedSrc(src);
         }}
       />
+    </div>
+  );
+}
+
+/** Placeholder holding an image's slot on the row while its bytes load. */
+export function LoadingImage({ className }: { className?: string }) {
+  return (
+    <div
+      role="status"
+      aria-label="Loading image"
+      className={cn(
+        PREVIEW_PLACEHOLDER_BOX,
+        "rounded-md border border-border bg-muted text-muted-foreground",
+        className,
+      )}
+    >
+      <Spinner />
     </div>
   );
 }
@@ -213,19 +230,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
   }
 
   if (state === "loading" || !blobUrl) {
-    return (
-      <div
-        role="status"
-        aria-label="Loading image"
-        className={cn(
-          PREVIEW_PLACEHOLDER_BOX,
-          "rounded-md border border-border bg-muted text-muted-foreground",
-          className,
-        )}
-      >
-        <Spinner />
-      </div>
-    );
+    return <LoadingImage className={className} />;
   }
 
   return (

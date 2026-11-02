@@ -1051,6 +1051,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
+    fireEvent.click(screen.getByTestId("show-tool-result-images-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -1075,6 +1076,11 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBe("true");
     expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:show-tool-result-images")).toBe("true");
+    expect(screen.getByTestId("show-tool-result-images-toggle")).toHaveAttribute(
       "aria-checked",
       "true",
     );
@@ -1130,6 +1136,11 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(screen.getByTestId("show-tool-result-images-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(localStorage.getItem("omnigent:show-tool-result-images")).toBeNull();
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
