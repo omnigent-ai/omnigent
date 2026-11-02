@@ -1896,6 +1896,11 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
+    :param model_override: Optional per-session LLM model override, e.g.
+        ``"databricks-claude-sonnet-4-6"``; the same session-level field as
+        the JSON create's ``model_override``, so the bundle's model stays
+        its default. Validated against the shared model-id charset.
+        ``None`` means use the agent default.
     :param host_id: Optional host to launch the runner on, e.g.
         ``"host_a1b2c3d4..."``. When set, the server generates a
         binding token, writes the expected runner_id to the session
@@ -1940,6 +1945,7 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None

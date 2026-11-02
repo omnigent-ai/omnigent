@@ -1937,7 +1937,7 @@ class _SessionsChatReplAdapter:
         """
         Apply a pre-session ``/model`` pick to a freshly created session.
 
-        Neither create route carries a ``model_override`` field, so a
+        The adapter's create request does not carry the pending pick, so a
         ``/model`` typed before the first turn has to be PATCHed after
         create for the first event to pick it up via
         ``conv.model_override``. ``silent`` skips the tmux ``/model``

@@ -414,6 +414,35 @@ def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None
     return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
 
 
+def _bundle_effort_for_harness(effort: str, spec: Any) -> str:
+    """
+    Check a multipart create's requested effort against the bundle's harness.
+
+    A known harness with no effort plumbing, or an effort outside its
+    vocabulary, is refused instead of stored and dropped at every turn;
+    aliases fold to the harness's canonical value. A harness the registry
+    cannot classify (e.g. the runtime default) passes through, and launch
+    filters it.
+
+    :param effort: The already vocabulary-checked effort, e.g. ``"high"``.
+    :param spec: The uploaded bundle's validated spec.
+    :returns: The effort to store, e.g. ``"xhigh"`` for ``"ultra"`` on codex.
+    :raises OmnigentError: If the bundle's harness cannot use the effort.
+    """
+    from omnigent.models.model_catalog import spec_harness
+    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort_for_harness
+
+    harness = spec_harness(spec)
+    if efforts_for_harness(harness) is None:
+        return effort
+    try:
+        return validate_effort_for_harness(effort, harness)
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid reasoning_effort: {exc}", code=ErrorCode.INVALID_INPUT
+        ) from exc
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -1362,6 +1391,14 @@ def register_core_routes(
             bundle_bytes,
             enforce_handler_allowlist=True,
         )
+        if parsed_metadata.reasoning_effort is not None:
+            parsed_metadata = parsed_metadata.model_copy(
+                update={
+                    "reasoning_effort": _bundle_effort_for_harness(
+                        parsed_metadata.reasoning_effort, spec
+                    )
+                }
+            )
 
         if parsed_metadata.mcp_registry_services:
             from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
@@ -1417,6 +1454,7 @@ def register_core_routes(
             spec,
             user_id,
             conversation_store,
+            model_override=parsed_metadata.model_override,
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
@@ -1469,6 +1507,9 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                conversation=await asyncio.to_thread(
+                    conversation_store.get_conversation, result.session_id
+                ),
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure
