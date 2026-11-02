@@ -265,26 +265,27 @@ def test_gitlab_panel_summary_and_diff(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
-    row = panel.get_by_role(
-        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
-    )
     if initially_offline:
-        expect(panel.get_by_text("Host offline", exact=True)).to_be_visible()
+        stored = panel.get_by_test_id("github-stored-pr")
+        expect(stored.get_by_role("link", name="Add the widget !7")).to_have_attribute("href", URL)
+        expect(stored.get_by_role("status")).to_contain_text("Last sync time:")
+        expect(stored.get_by_role("status")).to_contain_text("reconnect the session’s host")
         expect(panel.get_by_role("button", name="1 passed", exact=True)).to_have_count(0)
         expect(panel.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
         expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
-        page.screenshot(path=tmp_path / f"gitlab-{entry}-offline-list.png", animations="disabled")
-        row.click()
-        stored = panel.get_by_test_id("github-stored-pr")
-        expect(stored.get_by_role("status")).to_contain_text("Last sync time:")
-        expect(stored.get_by_role("status")).to_contain_text("reconnect the session’s host")
         expect(panel.get_by_role("tab", name="Summary", exact=True)).to_have_count(0)
-        panel.get_by_role("button", name="All pull requests (1)").click()
+        expect(panel.get_by_role("list", name="Pull requests")).to_have_count(0)
+        expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_be_enabled()
+        page.screenshot(
+            path=tmp_path / f"gitlab-{entry}-offline-summary.png", animations="disabled"
+        )
         offline = False
         panel.get_by_role("button", name="Refresh", exact=True).click()
         expect(panel.get_by_role("button", name="1 passed", exact=True)).to_be_visible()
-    row.click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_be_visible()
+    expect(panel.get_by_role("list", name="Pull requests")).to_have_count(0)
+    expect(panel.get_by_role("button", name=re.compile("All pull requests"))).to_have_count(0)
     expect(panel.get_by_title("GitLab", exact=True)).to_be_visible()
     expect(panel.get_by_text("!7", exact=True)).to_be_visible()
     expect(panel.get_by_text("A widget from a nested GitLab project.", exact=True)).to_be_visible()
@@ -322,6 +323,8 @@ def test_gitlab_link_select_unlink(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(SECOND)
     panel.get_by_role("button", name="Link", exact=True).click()
+    expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
+    panel.get_by_role("button", name="All pull requests (2)").click()
     panel.get_by_role(
         "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
     ).click()
@@ -358,9 +361,6 @@ def test_gitlab_unlink_last_mr_clears_selection(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
-    panel.get_by_role(
-        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
-    ).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_visible()
@@ -384,9 +384,6 @@ def test_gitlab_partial_data_is_visible(
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     panel = page.get_by_role("complementary", name="Workspace")
-    panel.get_by_role(
-        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
-    ).click()
     expect(
         panel.get_by_text(
             "GitLab comments and checks are incomplete. Refresh to retry.", exact=True

@@ -139,27 +139,24 @@ def _stub_github(page: Page, *, pr_count: int = 1) -> None:
     at the query/string boundary, so they never swallow ``/github/changes`` or
     the per-file ``/github/diff/<path>``.
     """
-    info = _INFO
-    if pr_count > 1:
-        info = {
-            **_INFO,
-            "tracking_available": True,
-            "selected_pr_url": _INFO["pr"]["url"],
-            "prs": [
-                {
-                    "url": f"https://example.com/pr/{_PR_NUMBER + index}",
-                    "host": "example.com",
-                    "repository": "acme/app",
-                    "number": _PR_NUMBER + index,
-                    "relationship": "created",
-                }
-                for index in range(pr_count)
-            ],
-        }
+    info = {
+        **_INFO,
+        "tracking_available": True,
+        "selected_pr_url": _INFO["pr"]["url"],
+        "prs": [
+            {
+                "url": f"https://example.com/pr/{_PR_NUMBER + index}",
+                "host": "example.com",
+                "repository": "acme/app",
+                "number": _PR_NUMBER + index,
+                "relationship": "created",
+            }
+            for index in range(pr_count)
+        ],
+    }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=info))
-    if pr_count > 1:
-        # The server's stored list matches the live payload it would have answered.
-        stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
+    # The server's stored list matches the live payload it would have answered.
+    stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.route(re.compile(r"/resources/github/changes"), lambda r: r.fulfill(json=_CHANGES))
     page.route(re.compile(r"/resources/github/diff(?:\?|$)"), lambda r: r.fulfill(json=_PR_DIFF))
     page.route(
@@ -175,21 +172,31 @@ def _stub_github(page: Page, *, pr_count: int = 1) -> None:
     )
 
 
+@pytest.mark.parametrize("entry", ["rail", "canvas"])
 def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
+    entry: str,
 ) -> None:
     """The Pull Requests tab lands on Summary; Comments and Changes are one click away."""
     base_url, session_id = seeded_session
     _stub_github(page)
-    page.goto(f"{base_url}/c/{session_id}")
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 
-    open_right_rail(page)
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="Pull Requests").click()
+    if entry == "canvas":
+        page.get_by_test_id("composer-pr-link").click()
+    else:
+        open_right_rail(page)
+        rail.get_by_role("tab", name="Pull Requests").click()
 
     # PR header (shared across both inner tabs): title, number, and state.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("list", name="Pull requests")).to_have_count(0)
+    expect(rail.get_by_role("button", name=re.compile("All pull requests"))).to_have_count(0)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
     expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
@@ -426,6 +433,11 @@ def test_composer_pr_link_opens_github_tab(
         ).to_be_visible()
         if pr_count > 1:
             expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
+        else:
+            expect(panel.get_by_role("list", name="Pull requests")).to_have_count(0)
+            expect(
+                panel.get_by_role("button", name=re.compile("All pull requests"))
+            ).to_have_count(0)
     finally:
         page.screenshot(path=tmp_path / "composer-pr-link-after-click.png", animations="disabled")
 
