@@ -863,6 +863,36 @@ async def test_cleanup_conversation_tolerates_close_exception(tmp_path: Path) ->
     good_instance.close.assert_awaited_once()
 
 
+async def test_cleanup_conversation_closes_instances_concurrently(tmp_path: Path) -> None:
+    """Every close starts before any finishes, so slow closes don't add up."""
+    reg = TerminalRegistry()
+    started: list[str] = []
+    all_started = asyncio.Event()
+    slot: dict[tuple[str, str], TerminalInstance] = {}
+    for key in ("s1", "s2", "s3"):
+        instance = TerminalInstance(
+            name="bash",
+            session_key=key,
+            socket_path=tmp_path / f"{key}.sock",
+            private_dir=tmp_path / key,
+            running=True,
+        )
+
+        async def _close(key: str = key) -> None:
+            started.append(key)
+            if len(started) == 3:
+                all_started.set()
+            await all_started.wait()
+
+        instance.close = _close  # type: ignore[method-assign]
+        slot[("bash", key)] = instance
+    reg._by_conversation["conv_a"] = slot
+
+    await asyncio.wait_for(reg.cleanup_conversation("conv_a"), timeout=2)
+
+    assert sorted(started) == ["s1", "s2", "s3"]
+
+
 async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
     """
     ``shutdown`` swallows exceptions from individual ``instance.close()``

@@ -188,6 +188,19 @@ def _log_abandoned_close(instance_id: str, task: asyncio.Future[None]) -> None:
         )
 
 
+async def _close_instance(
+    instance: TerminalInstance, label: str, conversation_id: str, operation: str
+) -> None:
+    """Close one instance within ``_CLOSE_TIMEOUT_S``, logging instead of raising."""
+    try:
+        await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning("%s: close timed out for %s in conv %s", operation, label, conversation_id)
+    except Exception:
+        # Callers run in teardown paths; raising would mask the original result.
+        logger.exception("%s: close failed for %s in conv %s", operation, label, conversation_id)
+
+
 class TerminalRegistry:
     """The single registry of per-conversation tmux terminal instances.
 
@@ -646,25 +659,14 @@ class TerminalRegistry:
                     self._instance_locks.pop((conversation_id, name, sess), None)
         if not slot:
             return
-        for (name, key), instance in slot.items():
-            try:
-                await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except TimeoutError:
-                logger.warning(
-                    "cleanup_conversation: close timed out for %s:%s in conv %s",
-                    name,
-                    key,
-                    conversation_id,
-                )
-            except Exception:
-                # We're in a workflow finally block; raising here would
-                # mask the original workflow result. Log and move on.
-                logger.exception(
-                    "cleanup_conversation: close failed for %s:%s in conv %s",
-                    name,
-                    key,
-                    conversation_id,
-                )
+        # Instances are independent; close them concurrently so one slow
+        # close does not add its timeout to every other instance's.
+        await asyncio.gather(
+            *(
+                _close_instance(instance, f"{name}:{key}", conversation_id, "cleanup_conversation")
+                for (name, key), instance in slot.items()
+            )
+        )
 
     async def shutdown(self) -> None:
         """Tear down every registered terminal across all conversations.
@@ -680,24 +682,13 @@ class TerminalRegistry:
             # AP-shutdown clears all instance locks too — every
             # conversation's terminals are being torn down.
             self._instance_locks.clear()
-        for conversation_id, slot in slots:
-            for (name, key), instance in slot.items():
-                try:
-                    await asyncio.wait_for(instance.close(), timeout=_CLOSE_TIMEOUT_S)
-                except TimeoutError:
-                    logger.warning(
-                        "shutdown: close timed out for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
-                except Exception:
-                    logger.exception(
-                        "shutdown: close failed for %s:%s in conv %s",
-                        name,
-                        key,
-                        conversation_id,
-                    )
+        await asyncio.gather(
+            *(
+                _close_instance(instance, f"{name}:{key}", conversation_id, "shutdown")
+                for conversation_id, slot in slots
+                for (name, key), instance in slot.items()
+            )
+        )
 
     def active_conversation_ids(self) -> list[str]:
         """Return ids of conversations with at least one registered terminal.

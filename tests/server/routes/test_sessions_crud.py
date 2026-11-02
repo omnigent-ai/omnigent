@@ -324,6 +324,42 @@ async def test_delete_idle_parent_stops_running_grandchild(
         sessions_module._session_status_cache.pop(grandchild.id, None)
 
 
+async def test_delete_stops_running_children_concurrently(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Running children are stopped in parallel, not one runner call at a time."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    children = [
+        conv_store.create_conversation(
+            kind="sub_agent", title=f"researcher:{index}", parent_conversation_id=session_id
+        )
+        for index in range(2)
+    ]
+    both_started = asyncio.Event()
+    started: list[str] = []
+
+    async def _stop(target_id: str, _router: object) -> bool:
+        started.append(target_id)
+        if len(started) == len(children):
+            both_started.set()
+        # A sequential loop would never let the second stop start.
+        await asyncio.wait_for(both_started.wait(), timeout=5)
+        return True
+
+    for child in children:
+        sessions_module._session_status_cache[child.id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", _stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert sorted(started) == sorted(child.id for child in children)
+    finally:
+        for child in children:
+            sessions_module._session_status_cache.pop(child.id, None)
+
+
 async def test_delete_proceeds_when_stop_fails(
     client: httpx.AsyncClient,
     session_id: str,

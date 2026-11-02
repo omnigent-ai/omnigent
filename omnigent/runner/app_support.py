@@ -163,14 +163,21 @@ async def _resolve_forwarded_message_content(
     if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
 
+    # Each attachment is an independent fetch; resolve them concurrently in order.
+    results = await asyncio.gather(
+        *(
+            resolve_file_id_block(block, session_id=session_id, client=server_client)
+            for block in content
+            if isinstance(block, dict) and has_unresolved_file_id(block)
+        )
+    )
+    pending_results = iter(results)
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
         result = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            result = await resolve_file_id_block(
-                block, session_id=session_id, client=server_client
-            )
+            result = next(pending_results)
         if result is None:
             resolved.append(block)
         else:

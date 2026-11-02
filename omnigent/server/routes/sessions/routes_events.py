@@ -3884,10 +3884,14 @@ def register_events_routes(
             # Best-effort: a backend failure on one blob must not abort the
             # delete after the file rows are already gone.
             failed_blob_count = 0
-            for blob_key in orphaned_blob_keys:
-                try:
-                    await asyncio.to_thread(artifact_store.delete, blob_key)
-                except Exception as exc:
+            blob_results = await asyncio.gather(
+                *(asyncio.to_thread(artifact_store.delete, key) for key in orphaned_blob_keys),
+                return_exceptions=True,
+            )
+            for blob_key, exc in zip(orphaned_blob_keys, blob_results, strict=True):
+                if isinstance(exc, BaseException) and not isinstance(exc, Exception):
+                    raise exc
+                if isinstance(exc, Exception):
                     failed_blob_count += 1
                     _logger.warning(
                         "Failed to delete attachment blob %s for session %s: %s",

@@ -22,6 +22,7 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -198,8 +199,9 @@ class ProxyMcpManager:
         routes.extend(sorted(self._registry_services))
         if any(c.transport != "registry" for c in spec.mcp_servers):
             routes.insert(0, None)
-        for service in routes:
-            result = await self._schemas_at(service)
+        # Each route is an independent tools/list POST; discover them concurrently.
+        results = await asyncio.gather(*(self._schemas_at(service) for service in routes))
+        for service, result in zip(routes, results, strict=True):
             for schema in result.schemas:
                 name = schema.get("name")
                 if not isinstance(name, str):

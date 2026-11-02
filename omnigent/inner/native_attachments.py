@@ -824,12 +824,21 @@ async def resolve_session_item_file_references(
         content = item.get("content")
         if item.get("type") != "message" or not isinstance(content, list):
             continue
+        # A message's attachments are independent fetches; resolve them concurrently.
+        results = await asyncio.gather(
+            *(
+                resolve_file_id_block(block, session_id=session_id, client=client)
+                for block in content
+                if isinstance(block, dict) and has_unresolved_file_id(block)
+            )
+        )
+        pending_results = iter(results)
         resolved_content: list[object] = []
         for block in content:
             if not (isinstance(block, dict) and has_unresolved_file_id(block)):
                 resolved_content.append(block)
                 continue
-            result = await resolve_file_id_block(block, session_id=session_id, client=client)
+            result = next(pending_results)
             if result is None:
                 resolved_content.append(block)
                 continue

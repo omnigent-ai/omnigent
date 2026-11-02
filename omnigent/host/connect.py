@@ -3409,8 +3409,10 @@ class HostProcess:
                 success, error = False, "login expired"
                 with contextlib.suppress(Exception):
                     await session.cancel(vendor_login_id)
-            configured = await self._probe_configured_harnesses(startup=False)
-            accounts = await self._probe_harness_accounts(explicit_refresh=False)
+            configured, accounts = await asyncio.gather(
+                self._probe_configured_harnesses(startup=False),
+                self._probe_harness_accounts(explicit_refresh=False),
+            )
             self._replace_capabilities(configured, self._gateway_inference, accounts)
             await self._send_text(
                 ws,
@@ -3524,8 +3526,10 @@ class HostProcess:
             )
         finally:
             self._owned_subprocess_ops -= 1
-        configured = await self._probe_configured_harnesses(startup=False)
-        accounts = await self._probe_harness_accounts(explicit_refresh=False)
+        configured, accounts = await asyncio.gather(
+            self._probe_configured_harnesses(startup=False),
+            self._probe_harness_accounts(explicit_refresh=False),
+        )
         self._replace_capabilities(configured, self._gateway_inference, accounts)
         return HostHarnessLogoutResultFrame(
             request_id=frame.request_id,
@@ -5574,8 +5578,10 @@ class HostProcess:
                     except Exception:
                         _logger.exception("Host harness quick readiness probe failed")
             if refresh_full:
-                latest = await self._probe_configured_harnesses(startup=False)
-                latest_gateway = await self._probe_gateway_inference(startup=False)
+                latest, latest_gateway = await asyncio.gather(
+                    self._probe_configured_harnesses(startup=False),
+                    self._probe_gateway_inference(startup=False),
+                )
                 next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
                 new_configured = latest if latest is not None else configured
                 new_gateway = latest_gateway if latest_gateway is not None else gateway
