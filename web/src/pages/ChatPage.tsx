@@ -2149,6 +2149,23 @@ export function buildSlashCommandMap(
 }
 
 /**
+ * Whether the composer offers ``/clear`` for a session on *harness*.
+ *
+ * Native terminals run the harness's own /clear, which moves the terminal onto
+ * a fresh session; servers that list ``clear`` support it. claude-sdk sessions
+ * continue in a fresh session on the same machine, which only servers reporting
+ * ``session_claude_sdk_clear`` do. Elsewhere a typed /clear stays plaintext.
+ */
+export function composerOffersClear(harness: string | null, info: ServerInfo | "loading"): boolean {
+  if (info === "loading") return false;
+  if (harness === "claude-sdk") return info.session_claude_sdk_clear === true;
+  return (
+    (harness === "claude-native" || harness === "codex-native") &&
+    !!info.session_event_types?.includes("clear")
+  );
+}
+
+/**
  * Set of slash commands that should fill the textarea with
  * ``"/cmd "`` on menu selection rather than executing immediately.
  * Includes the arg-taking built-ins (each gated on its own capability
@@ -2882,13 +2899,7 @@ function ComposerImpl(
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
   const composerServerInfo = useServerInfo();
-  // /clear runs the harness's own /clear in the session terminal, which moves
-  // the terminal onto a fresh session the view then follows. Older servers
-  // reject the clear control, so a typed /clear stays plaintext there.
-  const showClear =
-    (sessionHarness === "claude-native" || sessionHarness === "codex-native") &&
-    composerServerInfo !== "loading" &&
-    !!composerServerInfo.session_event_types?.includes("clear");
+  const showClear = composerOffersClear(sessionHarness, composerServerInfo);
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.

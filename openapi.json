@@ -6184,6 +6184,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_claude_sdk_clear": {
+            "default": false,
+            "title": "Session Claude Sdk Clear",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
