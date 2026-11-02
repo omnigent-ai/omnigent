@@ -837,6 +837,31 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
     assert read_claude_session_id(bridge_dir) == "claude-session"
 
 
+_STOP_HOOK_FEEDBACK = {
+    "type": "user",
+    "isMeta": True,
+    "message": {"content": "Stop hook feedback:\nwait"},
+}
+
+
+def _write_turn(transcript_path: Path, *later_entries: dict[str, Any]) -> None:
+    entries = [
+        {"type": "user", "message": {"content": "go"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+        *later_entries,
+    ]
+    transcript_path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+
+
+def _stop_leaving_agent_running(transcript_path: Path) -> dict[str, Any]:
+    return {
+        "hook_event_name": "Stop",
+        "session_id": "claude-session",
+        "transcript_path": str(transcript_path),
+        "background_tasks": [{"id": "a1", "type": "subagent", "status": "running"}],
+    }
+
+
 @pytest.mark.parametrize(
     ("background_tasks", "agent_running"),
     [
@@ -852,7 +877,13 @@ def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
 ) -> None:
     """A main-session Stop records whether it left an unfinished background agent."""
     bridge_dir = tmp_path / "bridge"
-    stop: dict[str, Any] = {"hook_event_name": "Stop", "session_id": "claude-session"}
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path, {"type": "system", "subtype": "stop_hook_summary"})
+    stop: dict[str, Any] = {
+        "hook_event_name": "Stop",
+        "session_id": "claude-session",
+        "transcript_path": str(transcript_path),
+    }
     if background_tasks is not None:
         stop["background_tasks"] = background_tasks
 
@@ -867,14 +898,9 @@ def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
 ) -> None:
     """Only the main session's next turn clears the mark; the agent's own hooks do not."""
     bridge_dir = tmp_path / "bridge"
-    record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "Stop",
-            "session_id": "claude-session",
-            "background_tasks": [{"id": "a1", "type": "subagent", "status": "running"}],
-        },
-    )
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
     for child_event in ("UserPromptSubmit", "Stop"):
         record_hook_event(
             bridge_dir,
@@ -883,6 +909,67 @@ def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
     assert read_background_agents_after_turn(bridge_dir) is True
 
     record_hook_event(bridge_dir, {"hook_event_name": next_event, "session_id": "claude-session"})
+
+    assert read_background_agents_after_turn(bridge_dir) is False
+
+
+@pytest.mark.parametrize(
+    ("appended_entries", "still_held"),
+    [
+        (
+            [
+                {"type": "attachment", "attachment": {"type": "hook_success"}},
+                {"type": "system", "subtype": "stop_hook_summary"},
+                {"type": "user", "isSidechain": True, "message": {"content": "agent step"}},
+            ],
+            True,
+        ),
+        ([_STOP_HOOK_FEEDBACK], False),
+        ([{"type": "assistant", "message": {"content": []}}], False),
+    ],
+)
+def test_background_agent_mark_ends_when_the_main_conversation_continues(
+    tmp_path: Path, appended_entries: list[dict[str, Any]], still_held: bool
+) -> None:
+    """A blocking Stop hook resumes the turn with no new prompt; its entries end the hold."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write("not json\n")
+        for entry in appended_entries:
+            transcript.write(json.dumps(entry) + "\n")
+
+    assert read_background_agents_after_turn(bridge_dir) is still_held
+
+
+def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(
+    tmp_path: Path,
+) -> None:
+    """Claude may log a blocking hook's feedback before this hook records the Stop."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path, _STOP_HOOK_FEEDBACK, {"type": "attachment"})
+
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+
+    assert read_background_agents_after_turn(bridge_dir) is False
+
+
+@pytest.mark.parametrize("transcript", ["missing", "no_reply"])
+def test_background_agent_mark_needs_a_readable_turn_end(tmp_path: Path, transcript: str) -> None:
+    """Without the turn's last reply in the transcript, a busy session stays running."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "transcript.jsonl"
+    _write_turn(transcript_path)
+    if transcript == "no_reply":
+        transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
+    record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
+    if transcript == "missing":
+        assert read_background_agents_after_turn(bridge_dir) is True
+        transcript_path.unlink()
 
     assert read_background_agents_after_turn(bridge_dir) is False
 

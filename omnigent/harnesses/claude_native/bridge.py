@@ -3047,11 +3047,9 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 seen.add(claude_session_id)
                 state["seen_claude_session_ids"] = sorted(seen)
             if event_name == "Stop":
-                state["background_agents_after_turn"] = _has_running_background_agent(
-                    payload.get("background_tasks")
-                )
+                state["background_agents_after_turn"] = _background_agent_hold(payload)
             elif event_name in {"UserPromptSubmit", "StopFailure", "SessionStart"}:
-                state["background_agents_after_turn"] = False
+                state["background_agents_after_turn"] = None
         else:
             _logger.debug(
                 "Ignoring identity fields from side-channel hook event; "
@@ -3111,12 +3109,28 @@ def read_background_agents_after_turn(bridge_dir: Path) -> bool:
     Claude keeps reporting itself busy for as long as such an agent runs,
     although its prompt is free. Set by the main session's ``Stop`` hook and
     cleared by its next ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
+    A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
+    conversation entry after that turn's last reply also ends it.
 
     :param bridge_dir: Bridge directory path.
     :returns: ``True`` between that ``Stop`` and the next main-session turn.
     """
     state = _read_json_file(bridge_dir / _STATE_FILE)
-    return isinstance(state, dict) and state.get("background_agents_after_turn") is True
+    hold = state.get("background_agents_after_turn") if isinstance(state, dict) else None
+    if not isinstance(hold, dict):
+        return False
+    transcript_path = hold.get("transcript_path")
+    offset = hold.get("transcript_offset")
+    if not isinstance(transcript_path, str) or not isinstance(offset, int):
+        return False
+    try:
+        with open(transcript_path, "rb") as handle:
+            handle.seek(offset)
+            return not any(
+                _main_conversation_entry_type(line) in {"user", "assistant"} for line in handle
+            )
+    except OSError:
+        return False
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -3953,6 +3967,7 @@ _BACKGROUND_TASK_FORWARD_LIMIT = 100
 _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
 _BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
+_TURN_END_SCAN_BYTES = 256 * 1024
 
 
 def _is_background_shell(raw: object) -> bool:
@@ -3962,16 +3977,54 @@ def _is_background_shell(raw: object) -> bool:
     return raw.get("type") not in _BACKGROUND_AGENT_TASK_TYPES
 
 
-def _has_running_background_agent(raw_tasks: object) -> bool:
-    """Return whether a ``Stop`` hook's ``background_tasks`` lists an unfinished agent."""
-    if not isinstance(raw_tasks, list):
-        return False
-    return any(
+def _background_agent_hold(payload: _JsonObject) -> _JsonObject | None:
+    """Where the turn's last reply ends at a ``Stop`` that left an agent running, if one did."""
+    raw_tasks = payload.get("background_tasks")
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(raw_tasks, list) or not isinstance(transcript_path, str):
+        return None
+    if not any(
         isinstance(task, dict)
         and task.get("type") in _BACKGROUND_AGENT_TASK_TYPES
         and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
         for task in raw_tasks
-    )
+    ):
+        return None
+    offset = _offset_after_last_main_reply(transcript_path)
+    if offset is None:
+        return None
+    return {"transcript_path": transcript_path, "transcript_offset": offset}
+
+
+def _offset_after_last_main_reply(transcript_path: str) -> int | None:
+    """Byte offset just past the transcript's last main ``assistant`` entry, if near the end.
+
+    Claude runs ``Stop`` hooks in parallel and may already have appended a blocking
+    hook's feedback, so the file size at ``Stop`` is not the turn's end.
+    """
+    try:
+        with open(transcript_path, "rb") as handle:
+            start = max(0, handle.seek(0, os.SEEK_END) - _TURN_END_SCAN_BYTES)
+            handle.seek(start)
+            tail = handle.read()
+    except OSError:
+        return None
+    position, found = start, None
+    for line in tail.splitlines(keepends=True):
+        position += len(line)
+        if line.endswith(b"\n") and _main_conversation_entry_type(line) == "assistant":
+            found = position
+    return found
+
+
+def _main_conversation_entry_type(line: bytes) -> object:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(entry, dict) or entry.get("isSidechain"):
+        return None
+    return entry.get("type")
 
 
 def _normalize_background_task(raw: object) -> _JsonObject | None:

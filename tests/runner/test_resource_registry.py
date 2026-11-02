@@ -1274,7 +1274,8 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     """A Stop that leaves a background agent running settles the turn despite a busy file.
 
     Claude keeps its status file busy for the agent's lifetime, so the idle
-    edge's resync must not republish running; the next prompt's turn does.
+    edge's resync must not republish running; a blocking Stop hook's
+    continuation or the next prompt's turn does.
     """
     from omnigent.harnesses.claude_native.bridge import (
         bridge_dir_for_conversation_id,
@@ -1297,26 +1298,53 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
         on_tick()
         await asyncio.sleep(0)
 
+    async def stop_leaving_the_agent_running() -> None:
+        hook(
+            "Stop",
+            transcript_path=str(transcript),
+            background_tasks=[{"id": "a1", "type": "subagent", "status": "running"}],
+        )
+        if poll_before_idle_edge:
+            await tick()
+        registry.note_external_session_status(session_id, "idle")
+        await tick()
+        await tick()
+        assert not registry.session_turn_is_active(session_id)
+        assert registry.session_has_background_agents(session_id)
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type": "user", "message": {"content": "go"}}\n'
+        '{"type": "assistant", "message": {"content": []}}\n',
+        encoding="utf-8",
+    )
     record = {"pid": 123, "sessionId": claude_session_id, "kind": "interactive", "status": "busy"}
     status_file.write_text(json.dumps(record), encoding="utf-8")
     hook("UserPromptSubmit")
     await tick()
     assert statuses == ["running"]
 
-    hook("Stop", background_tasks=[{"id": "a1", "type": "subagent", "status": "running"}])
-    if poll_before_idle_edge:
-        await tick()
-    registry.note_external_session_status(session_id, "idle")
-    await tick()
-    await tick()
+    await stop_leaving_the_agent_running()
     settled = ["running", "idle"] if poll_before_idle_edge else ["running"]
     assert statuses == settled
-    assert not registry.session_turn_is_active(session_id)
-    assert registry.session_has_background_agents(session_id)
 
-    hook("UserPromptSubmit")
+    feedback = {
+        "type": "user",
+        "isMeta": True,
+        "message": {"content": "Stop hook feedback:\nwait"},
+    }
+    with transcript.open("a", encoding="utf-8") as transcript_file:
+        transcript_file.write(json.dumps(feedback) + "\n")
     await tick()
     assert statuses == [*settled, "running"]
+    assert registry.session_turn_is_active(session_id)
+    assert not registry.session_has_background_agents(session_id)
+
+    with transcript.open("a", encoding="utf-8") as transcript_file:
+        transcript_file.write('{"type": "assistant", "message": {"content": []}}\n')
+    await stop_leaving_the_agent_running()
+    hook("UserPromptSubmit")
+    await tick()
     assert registry.session_turn_is_active(session_id)
     assert not registry.session_has_background_agents(session_id)
 
