@@ -341,6 +341,11 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     });
   };
   const diagramBlock = (testId: string) => <MermaidBlock block={<div data-testid={testId} />} />;
+  const reply = (testId: string, source: string) => (
+    <MermaidFullscreenProvider resetKey="/sessions/a">
+      <MermaidBlock key={testId} block={<div data-testid={testId}>{source}</div>} />
+    </MermaidFullscreenProvider>
+  );
   const overlayDiagram = () =>
     screen.getByTitle("Exit fullscreen").parentElement!.querySelector('svg[id^="mermaid-"]');
 
@@ -376,11 +381,6 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     ["the same diagram", "flowchart LR; A-->B", "mermaid-a"],
     ["a different diagram", "flowchart LR; A-->C", undefined],
   ])("after a remount, opens only for %s", async (_case, settledSource, shownId) => {
-    const reply = (testId: string, source: string) => (
-      <MermaidFullscreenProvider resetKey="/sessions/a">
-        <MermaidBlock key={testId} block={<div data-testid={testId}>{source}</div>} />
-      </MermaidFullscreenProvider>
-    );
     const { rerender } = render(reply("streamed", "flowchart LR; A"));
     fireEvent.click(screen.getByTitle("View fullscreen"));
     rerender(reply("streamed", "flowchart LR; A-->B"));
@@ -389,6 +389,22 @@ describe("Mermaid fullscreen before the diagram is drawn", () => {
     await draw("settled", "a");
     const exit = screen.queryByTitle("Exit fullscreen");
     expect(exit?.parentElement?.querySelector('svg[id^="mermaid-"]')?.id).toBe(shownId);
+  });
+
+  it("keeps the original wait after a remount", async () => {
+    vi.useFakeTimers();
+    const { rerender } = render(reply("streamed", "flowchart LR; A-->B"));
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    act(() => {
+      vi.advanceTimersByTime(DIAGRAM_WAIT_MS - 1_000);
+    });
+
+    rerender(reply("settled", "flowchart LR; A-->B"));
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    await draw("settled", "a");
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
   });
 
   it("shows the diagram clicked last", async () => {

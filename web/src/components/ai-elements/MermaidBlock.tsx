@@ -76,7 +76,7 @@ interface PendingOpen {
   deadline: number;
 }
 
-// Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
+// Holds the cloned diagram markup and any click still waiting for Mermaid to draw.
 function useMermaidFullscreenState(resetKey?: string) {
   const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingOpen | null>(null);
@@ -87,6 +87,7 @@ function useMermaidFullscreenState(resetKey?: string) {
     setPending(null);
   }
 
+  // Reuse the sanitized inline SVG without rerunning Mermaid or copying toolbar icons.
   const open = useCallback((block: HTMLElement, source: string) => {
     const svg = block.querySelector(DIAGRAM_SVG);
     setSvgMarkup(svg ? svg.outerHTML : null);
@@ -185,7 +186,7 @@ const MermaidFullscreenContext = createContext<MermaidFullscreenControls | null>
 
 /**
  * Owns the open diagram above the chat so it survives the block remount when a
- * streamed reply settles. Closes on `resetKey` or theme change, as an unmount did.
+ * streamed reply settles. Closes on `resetKey` or theme change.
  */
 export function MermaidFullscreenProvider({
   children,
