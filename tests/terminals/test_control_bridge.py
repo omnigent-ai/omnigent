@@ -38,6 +38,7 @@ from omnigent.terminals.control_bridge import (
     _client_sizes_window,
     _clipboard_buffer_name,
     _hex_send_keys_commands,
+    _is_terminal_report,
     _read_tmux_buffer,
     _run_tmux_capture,
     _WindowNameFilter,
@@ -157,6 +158,37 @@ async def test_tmux_buffer_read_cancellation_reaps_subprocess(
         await task
     assert proc.killed is True
     assert proc.returncode == -9
+
+
+@pytest.mark.parametrize(
+    ("data", "is_report"),
+    [
+        (b"\x1b[I", True),
+        (b"\x1b[O", True),
+        (b"\x1b[?1;2c", True),
+        (b"\x1b[>0;276;0c", True),
+        (b"\x1b[0n", True),
+        (b"\x1b[24;80R", True),
+        (b"\x1b[?2026;2$y", True),
+        (b"\x1b[8;40;160t", True),
+        (b"\x1bP1$r0m\x1b\\", True),
+        (b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\", True),
+        (b"\x1b]10;rgb:ffff/ffff/ffff\x07", True),
+        (b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?1;2c", True),
+        (b"x", False),
+        (b"\r", False),
+        (b"\x1b[A", False),
+        (b"\x1b[Z", False),
+        (b"\x1b[15~", False),
+        (b"\x1b[<0;10;5M", False),
+        (b"\x1b[200~text\x1b[201~", False),
+        (b"\x1b]", False),
+        (b"\x1b[?1;2cx", False),
+    ],
+)
+def test_terminal_reports_are_not_typing(data: bytes, is_report: bool) -> None:
+    """Replies xterm.js sends on its own are told apart from keys, mouse and paste."""
+    assert _is_terminal_report(data) is is_report
 
 
 def test_hex_send_keys_commands_encodes_and_chunks() -> None:
@@ -1379,7 +1411,7 @@ async def _wait_for(query: Callable[[], Awaitable[object]], expected: object) ->
 async def test_waiting_owner_takes_window_size_when_it_types() -> None:
     """A narrow owner that only opens the pane keeps the window's size until it types.
 
-    A focus report is not typing.
+    Focus reports and xterm.js's answers to the pane's queries are not typing.
     """
     sock, target = await _new_private_tmux("cat")
     desktop = _LiveWebSocket(_resize_frame(160, 40))
@@ -1393,11 +1425,13 @@ async def test_waiting_owner_takes_window_size_when_it_types() -> None:
             "a 45-column phone that only opened the pane shrank the shared window"
         )
 
-        phone.frames.put_nowait(_input_frame(b"\x1b[I"))
+        for report in (b"\x1b[I", b"\x1b[O", b"\x1b[?2026;2$y", b"\x1b]11;rgb:0/0/0\x1b\\"):
+            phone.frames.put_nowait(_input_frame(report))
+        phone.frames.put_nowait(_resize_frame(50, 40))
         assert await _settled_window_width(sock, target) == 160
 
         phone.frames.put_nowait(_input_frame(b"x"))
-        assert await _settled_window_width(sock, target) == 45
+        assert await _settled_window_width(sock, target) == 50
     finally:
         for task in tasks:
             await _kill_and_join(sock, task)
@@ -1424,6 +1458,42 @@ async def test_waiting_owner_takes_window_size_when_sizing_owner_leaves() -> Non
 
         desktop.frames.put_nowait({"type": "websocket.disconnect"})
         await asyncio.wait_for(tasks[0], timeout=10)
+        assert await _settled_window_width(sock, target) == 45
+    finally:
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_waiting_owner_takes_window_size_when_sizing_owner_leaves_during_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sizing owner that detaches before a waiting owner's attach completes hands over."""
+    sock, target = await _new_private_tmux("cat")
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    viewer = _LiveWebSocket(_resize_frame(30, 40))
+    tasks = [_start_bridge(desktop, sock, target)]
+    queried: list[bool] = []
+
+    async def _desktop_leaves_after_query(*args: str) -> bool:
+        monkeypatch.undo()
+        queried.append(await _client_sizes_window(*args))
+        desktop.frames.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(tasks[0], timeout=10)
+        return queried[-1]
+
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        monkeypatch.setattr(
+            "omnigent.terminals.control_bridge._client_sizes_window", _desktop_leaves_after_query
+        )
+        tasks.append(_start_bridge(phone, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [45])
+        assert queried == [True]
+        tasks.append(_start_bridge(viewer, sock, target, read_only=True))
+        await _wait_for(lambda: _client_widths(sock), [30, 45])
         assert await _settled_window_width(sock, target) == 45
     finally:
         for task in tasks:
@@ -1467,8 +1537,59 @@ async def test_browser_owner_does_not_resize_attached_terminal_until_it_types() 
         os.close(controller)
 
 
+class _FakeClientQuery:
+    """``list-clients`` stand-in that exits with *returncode*, or hangs if ``None``."""
+
+    def __init__(self, returncode: int | None) -> None:
+        self.returncode = returncode
+        self.killed = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        if self.returncode is None:
+            await asyncio.Event().wait()
+        return b"attached,focused\n", b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int | None:
+        return self.returncode
+
+
+@pytest.mark.parametrize("failure", ["spawn", "exit", "timeout"])
 @pytest.mark.asyncio
-async def test_client_sizes_window_fails_open() -> None:
+async def test_client_sizes_window_fails_open(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     """A failed client query must leave the owner attaching as an ordinary sizing client."""
-    tmux = shutil.which("tmux") or "/nonexistent/tmux"
-    assert not await _client_sizes_window(tmux, "/nonexistent/tmux.sock", "main")
+    proc = _FakeClientQuery(returncode=None if failure == "timeout" else 1)
+
+    async def _spawn(*_args: object, **_kwargs: object) -> _FakeClientQuery:
+        if failure == "spawn":
+            raise FileNotFoundError("tmux")
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr("omnigent.terminals.control_bridge._CLIENT_QUERY_TIMEOUT_S", 0.01)
+    assert not await _client_sizes_window("tmux", "socket", "main")
+    assert proc.killed is (failure == "timeout")
+
+
+@pytest.mark.asyncio
+async def test_client_sizes_window_cancellation_reaps_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the client query kills and awaits its tmux child."""
+    proc = _FakeClientQuery(returncode=None)
+
+    async def _spawn(*_args: object, **_kwargs: object) -> _FakeClientQuery:
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    task = asyncio.create_task(_client_sizes_window("tmux", "socket", "main"))
+    await asyncio.sleep(0)
+    assert task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed is True

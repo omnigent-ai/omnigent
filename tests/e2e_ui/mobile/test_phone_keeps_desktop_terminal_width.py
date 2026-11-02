@@ -11,6 +11,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pyte
@@ -73,24 +74,24 @@ class _AttachObserver:
             self.received.extend(payload)
 
     def screen_lines(self) -> list[str]:
+        if not self.resizes:
+            return []
         cols, rows = self.resizes[-1]
         screen = pyte.Screen(cols, rows)
         pyte.ByteStream(screen).feed(bytes(self.received))
         return [line.rstrip() for line in screen.display]
 
-    def drawn_width(self) -> int:
-        """Widest row of the TUI's box frame, i.e. how many columns the TUI uses."""
-        if not self.resizes:
-            return 0
+    def drawn_width(self) -> int | None:
+        """Widest row of the TUI's box frame, or None before the current attach draws one."""
         lines = self.screen_lines()
         return max(
-            (len(line) for line in lines if any(ch in _FRAME_CHARS for ch in line)), default=0
+            (len(line) for line in lines if any(ch in _FRAME_CHARS for ch in line)), default=None
         )
 
 
 def _sample_drawn_width(
     page: Page, observer: _AttachObserver, seconds: float
-) -> list[tuple[float, int]]:
+) -> list[tuple[float, int | None]]:
     """Timestamped desktop frame widths; wait_for_timeout lets WS callbacks dispatch."""
     deadline = time.monotonic() + seconds
     samples = [(time.monotonic(), observer.drawn_width())]
@@ -131,8 +132,11 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
     steps: list[dict[str, object]] = []
     report: dict[str, object] = {"session_id": session_id, "steps": steps}
 
-    def step(name: str, samples: list[tuple[float, int]], phone: _AttachObserver) -> list[int]:
-        widths = [width for _, width in samples]
+    def step(
+        name: str, samples: list[tuple[float, int | None]], phone: _AttachObserver
+    ) -> list[int]:
+        # A desktop reattach redraws from scratch; a window with no frame at all counts as 0.
+        widths = [width for _, width in samples if width is not None] or [0]
         steps.append(
             {
                 "step": name,
@@ -165,7 +169,7 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline and not (
                 desktop_obs.resizes
-                and desktop_obs.drawn_width() >= desktop_obs.resizes[-1][0] * 0.8
+                and (desktop_obs.drawn_width() or 0) >= desktop_obs.resizes[-1][0] * 0.8
             ):
                 desktop.wait_for_timeout(500)
             assert desktop_obs.resizes, "desktop terminal never sent its size"
@@ -233,6 +237,11 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
     finally:
         (artifacts / "measurements.json").write_text(json.dumps(report, indent=2))
 
+    attach_urls = desktop_obs.urls + phone_obs.urls
+    assert phone_obs.resizes, "phone never attached to the session terminal and sent its size"
+    assert len({urlparse(url).path for url in attach_urls}) == 1, attach_urls
+    assert not any("read_only=true" in url for url in attach_urls), attach_urls
+    assert phone_obs.resizes[-1][0] < desktop_cols * 0.9, phone_obs.resizes
     narrowed = {
         name: width
         for name, width in [

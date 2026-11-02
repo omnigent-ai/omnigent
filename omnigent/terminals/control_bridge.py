@@ -147,9 +147,20 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
 
-# xterm.js sends these when its terminal gains or loses focus; they are not
-# typing, so they don't let a waiting owner take over the window size.
-_FOCUS_REPORTS: Final = frozenset({b"\x1b[I", b"\x1b[O"})
+# xterm.js sends these without its user typing: focus reports and answers to a
+# pane program's queries. A modified F3 key shares a cursor report's bytes.
+_TERMINAL_REPORTS: Final = re.compile(
+    rb"(?:\x1b\[[IO]|\x1b\[[?>]?[0-9;]*(?:[cnRt]|\$y)"
+    rb"|\x1bP[^\x1b]*\x1b\\|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))+"
+)
+
+# Bounds the client query each owner attach runs before attaching.
+_CLIENT_QUERY_TIMEOUT_S: Final[float] = 2.0
+
+
+def _is_terminal_report(data: bytes) -> bool:
+    """Whether a browser input frame holds only reports xterm.js sent itself."""
+    return _TERMINAL_REPORTS.fullmatch(data) is not None
 
 
 def unescape_control_output(value: bytes) -> bytes:
@@ -377,7 +388,8 @@ async def _client_sizes_window(tmux: str, socket_path: str, tmux_target: str) ->
     :param socket_path: tmux server socket path.
     :param tmux_target: The ``-t`` session target, e.g. ``"main"``.
     :returns: ``True`` if such a client is attached; ``False`` if none is or
-        the query fails, so a failure falls back to an ordinary sizing attach.
+        the query fails or times out, so a failure falls back to an ordinary
+        sizing attach.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -392,8 +404,17 @@ async def _client_sizes_window(tmux: str, socket_path: str, tmux_target: str) ->
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await proc.communicate()
     except (OSError, ValueError):
+        return False
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_CLIENT_QUERY_TIMEOUT_S)
+    except (asyncio.CancelledError, TimeoutError, OSError) as exc:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_CLIENT_QUERY_TIMEOUT_S)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return False
     if proc.returncode != 0:
         return False
@@ -788,7 +809,7 @@ async def bridge_tmux_control_to_websocket(
     # The browser's latest ``COLSxROWS``, replayed when this client takes over
     # the window size.
     browser_size: str | None = None
-    client_detached = asyncio.Event()
+    size_recheck = asyncio.Event()
 
     def _current_ws_coalesce_limit() -> int:
         """Per-frame cap: small right after input, larger for output floods."""
@@ -833,8 +854,8 @@ async def bridge_tmux_control_to_websocket(
     async def _take_window_size_when_alone() -> None:
         """Take the window size once no other client sizes the window."""
         while waiting_to_size:
-            await client_detached.wait()
-            client_detached.clear()
+            await size_recheck.wait()
+            size_recheck.clear()
             if waiting_to_size and not await _client_sizes_window(tmux, socket_path, tmux_target):
                 await _take_window_size()
 
@@ -866,8 +887,10 @@ async def bridge_tmux_control_to_websocket(
             ):
                 _queue_clipboard_buffer(buffer_name)
             return True
-        if line.startswith(b"%client-detached "):
-            client_detached.set()
+        if line.startswith((b"%session-changed ", b"%client-detached ")):
+            # Recheck once tmux has registered this attach, in case the sizing
+            # client left meanwhile, and whenever another client leaves.
+            size_recheck.set()
             return True
         if line.startswith(b"%exit"):
             return False
@@ -878,7 +901,7 @@ async def bridge_tmux_control_to_websocket(
             # deliberately NOT a close trigger.)
             return False
         # %begin/%end/%error reply blocks and other notifications
-        # (%layout-change, %session-changed, %window-*) need no browser
+        # (%layout-change, %window-*) need no browser
         # forwarding — the browser xterm renders purely from %output.
         return True
 
@@ -982,7 +1005,7 @@ async def bridge_tmux_control_to_websocket(
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()
-                    if data not in _FOCUS_REPORTS:
+                    if not _is_terminal_report(data):
                         await _take_window_size()
                     for cmd in _hex_send_keys_commands(tmux_target, data):
                         await _send_command(cmd)
