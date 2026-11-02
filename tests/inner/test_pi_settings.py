@@ -187,6 +187,23 @@ def test_prepare_managed_pi_agent_dir_keeps_links_resolving_to_the_source(tmp_pa
     assert (managed / "AGENTS.md").readlink() == alias
 
 
+@pytest.mark.parametrize("name", ["AGENTS.MD", "CLAUDE.MD"])
+def test_prepare_managed_pi_agent_dir_links_uppercase_context_files(
+    tmp_path: Path, name: str
+) -> None:
+    """Pi also reads uppercase context file names from the global agent dir."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    (global_agent / name).write_text("global", encoding="utf-8")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+
+    assert (managed / name).is_symlink()
+    assert (managed / name).samefile(global_agent / name)
+
+
 @pytest.mark.parametrize("parent_relative_root", [False, True])
 def test_relative_settings_keep_their_original_root(
     tmp_path: Path, parent_relative_root: bool
