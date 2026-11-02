@@ -693,12 +693,13 @@ async def test_timed_out_replay_resume_retries_with_turns_and_keeps_replay_first
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A reconnect owing replay retries with turns after a timeout, and the replay
-    still lands before a live completion queued during the successful attempt."""
+    """A reconnect owing replay keeps the delivery scope across a timed-out attempt:
+    a newer live turn cannot replace the recovery cursor or post ahead of replay."""
 
     class _SlowThenAnsweringClient:
         def __init__(self) -> None:
             self.params: list[dict] = []
+            self.first_entered = asyncio.Event()
             self.retry_entered = asyncio.Event()
             self.release_retry = asyncio.Event()
 
@@ -708,6 +709,7 @@ async def test_timed_out_replay_resume_retries_with_turns_and_keeps_replay_first
         async def request(self, _method: str, params: dict) -> dict:
             self.params.append(params)
             if len(self.params) == 1:
+                self.first_entered.set()
                 await asyncio.Event().wait()
             self.retry_entered.set()
             await self.release_retry.wait()
@@ -755,7 +757,23 @@ async def test_timed_out_replay_resume_retries_with_turns_and_keeps_replay_first
                 elicitation_tracker=tracker,
             )
         )
-        await asyncio.wait_for(native.retry_entered.wait(), timeout=5.0)
+        await asyncio.wait_for(native.first_entered.wait(), timeout=5.0)
+        # Queued during the attempt that times out, so they would run in the gap
+        # before the retry if the scope were released.
+        turn_started = asyncio.create_task(
+            fwd._maybe_handle_turn_event(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                method="turn/started",
+                params={"turn": {"id": "turn_2"}},
+                usage_coalescer=usage,
+                delta_coalescer=None,
+                elicitation_tracker=tracker,
+                codex_client=None,
+                forwarder_state=None,
+            )
+        )
         live = asyncio.create_task(
             fwd._handle_completed_item(
                 client,  # type: ignore[arg-type]
@@ -768,18 +786,22 @@ async def test_timed_out_replay_resume_retries_with_turns_and_keeps_replay_first
                 forwarder_state=fwd._CodexForwarderState(),
             )
         )
-        await asyncio.sleep(0)
+        await asyncio.wait_for(native.retry_entered.wait(), timeout=5.0)
+        assert not turn_started.done()
         assert not live.done()
+        # A restart now would still replay the interrupted turn.
+        assert read_bridge_state(tmp_path).active_turn_id == "turn_1"  # type: ignore[union-attr]
 
         native.release_retry.set()
-        await asyncio.wait_for(asyncio.gather(subscribe, live), timeout=5.0)
+        await asyncio.wait_for(asyncio.gather(subscribe, turn_started, live), timeout=5.0)
     finally:
         fwd._conversation_item_locks.reset(locks_token)
         await usage.close()
         await tracker.close()
 
     assert native.params == [{"threadId": "thread_1"}, {"threadId": "thread_1"}]
-    assert [body["data"]["source_id"] for _url, body in client.posts] == [
-        "thread_1:turn_1:item_1",
-        "thread_1:turn_2:item_2",
-    ]
+    assert [
+        body["data"]["source_id"]
+        for _url, body in client.posts
+        if body["type"] == "external_conversation_item"
+    ] == ["thread_1:turn_1:item_1", "thread_1:turn_2:item_2"]

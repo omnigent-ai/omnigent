@@ -91,8 +91,8 @@ _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
 # Bounds the first ``thread/resume`` attempt, which holds the session's delivery
 # scope: an unanswered resume would otherwise block every live post. Each timed-out
-# retry doubles the bound, up to the max, so a slow full-history replay still
-# completes instead of being cancelled forever.
+# retry doubles the bound, up to the max, so a resume slower than the first bound
+# (but within the max) still completes.
 _SUBSCRIBE_RESUME_TIMEOUT_SECONDS = 30.0
 _SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS = 240.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
@@ -2856,7 +2856,9 @@ async def _subscribe_until_ready(
 
     Each resume attempt, and on success the sync and replay that must precede
     live posts, holds the session's delivery scope; waits between attempts do
-    not, so a subscription that never succeeds cannot silence the session.
+    not, so a subscription that never succeeds cannot silence the session. A
+    reconnect that owes replay keeps the scope across attempts, so no live turn
+    can replace the bridge's recovery cursor before the replay lands.
 
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
@@ -2888,69 +2890,74 @@ async def _subscribe_until_ready(
     )
     saw_not_ready = False
     resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
-    while True:
-        async with _conversation_item_delivery_scope(session_id):
-            received_live_items = client.is_subscribed_to_thread(thread_id)
-            params: _JsonObject = {"threadId": thread_id}
-            if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
-                params["excludeTurns"] = True
-            try:
-                response = await asyncio.wait_for(
-                    client.request("thread/resume", params),
-                    timeout=resume_timeout,
-                )
-            except TimeoutError:
-                response = None
-                timed_out = True
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # app-server error envelopes are surfaced as RuntimeError.
-                if not _is_thread_not_ready_error(exc):
-                    _logger.warning(
-                        "failed to subscribe to Codex thread %s", thread_id, exc_info=True
+    replay_owed = replay_from_turn_id is not None or shell_pending
+    async with (
+        _conversation_item_delivery_scope(session_id) if replay_owed else contextlib.nullcontext()
+    ):
+        while True:
+            async with _conversation_item_delivery_scope(session_id):
+                received_live_items = client.is_subscribed_to_thread(thread_id)
+                params: _JsonObject = {"threadId": thread_id}
+                if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
+                    params["excludeTurns"] = True
+                try:
+                    response = await asyncio.wait_for(
+                        client.request("thread/resume", params),
+                        timeout=resume_timeout,
+                    )
+                except TimeoutError:
+                    response = None
+                    timed_out = True
+                except asyncio.CancelledError:
+                    raise
+                # App-server error envelopes are surfaced as RuntimeError.
+                except Exception as exc:
+                    if not _is_thread_not_ready_error(exc):
+                        _logger.warning(
+                            "failed to subscribe to Codex thread %s", thread_id, exc_info=True
+                        )
+                        return
+                    response = None
+                    timed_out = False
+                if response is not None:
+                    await _finish_subscription(
+                        ap_client,
+                        response,
+                        session_id=session_id,
+                        bridge_dir=bridge_dir,
+                        thread_id=thread_id,
+                        usage_coalescer=usage_coalescer,
+                        elicitation_tracker=elicitation_tracker,
+                        forwarder_state=forwarder_state,
+                        received_live_items=received_live_items,
+                        replay_from_turn_id=replay_from_turn_id,
                     )
                     return
-                response = None
-                timed_out = False
-            if response is not None:
-                await _finish_subscription(
-                    ap_client,
-                    response,
-                    session_id=session_id,
-                    bridge_dir=bridge_dir,
-                    thread_id=thread_id,
-                    usage_coalescer=usage_coalescer,
-                    elicitation_tracker=elicitation_tracker,
-                    forwarder_state=forwarder_state,
-                    received_live_items=received_live_items,
-                    replay_from_turn_id=replay_from_turn_id,
+            if timed_out:
+                _logger.warning(
+                    "Codex thread/resume for %s did not answer within %.0fs; retrying",
+                    thread_id,
+                    resume_timeout,
                 )
-                return
-        if timed_out:
-            _logger.warning(
-                "Codex thread/resume for %s did not answer within %.0fs; retrying subscription",
-                thread_id,
-                resume_timeout,
-            )
-            resume_timeout = min(resume_timeout * 2, _SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS)
-            await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
-            continue
-        if not saw_not_ready:
-            _logger.info(
-                "Codex thread %s is not ready yet (no/empty rollout); retrying subscription",
-                thread_id,
-            )
-        saw_not_ready = True
-        if ready_signal is not None and not ready_signal.is_set():
-            # Idle fresh thread: no rollout until the first turn, and
-            # no reason to poll meanwhile. Park until the caller's
-            # event loop observes the thread go active.
-            await ready_signal.wait()
-        else:
-            # No signal wired (fallback), or the thread is active but
-            # its rollout isn't flushed yet (brief race) — a short
-            # poll covers that window.
-            await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+                resume_timeout = min(resume_timeout * 2, _SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS)
+                await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+                continue
+            if not saw_not_ready:
+                _logger.info(
+                    "Codex thread %s is not ready yet (no/empty rollout); retrying subscription",
+                    thread_id,
+                )
+            saw_not_ready = True
+            if ready_signal is not None and not ready_signal.is_set():
+                # Idle fresh thread: no rollout until the first turn, and
+                # no reason to poll meanwhile. Park until the caller's
+                # event loop observes the thread go active.
+                await ready_signal.wait()
+            else:
+                # No signal wired (fallback), or the thread is active but
+                # its rollout isn't flushed yet (brief race) — a short
+                # poll covers that window.
+                await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
 
 
 async def _finish_subscription(
