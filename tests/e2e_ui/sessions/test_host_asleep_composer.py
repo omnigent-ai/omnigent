@@ -384,3 +384,53 @@ def test_session_opened_mid_wake_spins_dot_through_server_stage(
     # The next liveness poll (every 10s) sees the host online.
     host_online["online"] = True
     _expect_host_status(page, "online", tooltip="Connected")
+
+
+def test_wake_stuck_on_stage_brings_reconnect_host_back(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A wake stuck on launch progress lets Reconnect host return, with no toast.
+
+    The server keeps reporting ``provisioning`` and never answers the wake, as
+    when an Arclet box never dials in. The page clock jumps past the wake's
+    stage limit instead of waiting it out.
+
+    :param request: Supplies the recorded ``page`` after server setup.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to the host_asleep shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    page: Page = request.getfixturevalue("page")
+    _force_host_asleep(
+        page,
+        session_id,
+        sandbox_status={"stage": "provisioning", "provider": "arclet", "error": None},
+    )
+    held = _hold_wake_requests(page, session_id)
+    toasts = page.locator("[data-sonner-toast]")
+    page.clock.install()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    _expect_host_status(page, "starting", tooltip="Provisioning sandbox")
+    _open_host_menu(page, "starting")
+    page.get_by_role("menuitem", name="Reconnect host").click()
+    wake = _next_held(page, held)
+    _open_host_menu(page, "starting")
+    expect(page.get_by_role("menuitem", name="Reconnect host")).to_have_count(0)
+    page.keyboard.press("Escape")
+
+    page.clock.fast_forward("05:01")
+    _expect_host_status(page, "starting", tooltip="Provisioning sandbox")
+    _open_host_menu(page, "starting")
+    expect(page.get_by_role("menuitem", name="Reconnect host")).to_be_visible()
+    page.wait_for_timeout(_HOLD_MS)
+    page.keyboard.press("Escape")
+    expect(toasts).to_have_count(0)
+
+    # The released wake's late answer changes nothing.
+    wake.fulfill(status=200, json={"queued": False, "recovered": True})
+    _expect_host_status(page, "starting", tooltip="Provisioning sandbox")
+    expect(toasts).to_have_count(0)

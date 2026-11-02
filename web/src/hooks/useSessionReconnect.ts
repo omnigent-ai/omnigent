@@ -18,6 +18,9 @@ import { useChatStore } from "@/store/chatStore";
 /** How many scheduled health polls may report a woken sandbox's host offline before it gives up. */
 export const SANDBOX_WAKE_ONLINE_GRACE_POLLS = 3;
 
+/** How long a wake may follow a launch stage that never finishes before Reconnect host returns. */
+export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
+
 /** Identifies a reported launch stage by value; snapshots rebuild the object. */
 function launchKey(launch: SandboxStatus | null): string {
   return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
@@ -160,6 +163,20 @@ export function useSessionReconnect({
       toast.error("The sandbox didn't come online. Try Reconnect host again.");
     });
   }, [sandboxWake, launchInProgress, sessionId]);
+
+  // The count above waits on the launch, so a stage that never finishes would spin
+  // with Reconnect host hidden. Let the wake go quietly: the server's stage keeps the
+  // dot spinning, and Reconnect host returns as it does after a reload.
+  useEffect(() => {
+    if (sandboxWake === null || !launchInProgress) return;
+    const timer = setTimeout(() => {
+      const start = wakeStart.current;
+      if (start && inFlight.current === start.operation) inFlight.current = null;
+      wakeStart.current = null;
+      setSandboxWake(null);
+    }, SANDBOX_WAKE_STAGE_LIMIT_MS);
+    return () => clearTimeout(timer);
+  }, [sandboxWake, launchInProgress]);
 
   // A failed or waiting stage left over from before the click mustn't end the
   // wake; one reported since then does, even if it repeats the old one.

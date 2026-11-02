@@ -376,7 +376,9 @@ fails or, after the server answers, three regular host health checks still
 find the host offline. Extra checks, such as the one run right after the
 server answers, don't count. The checks count only once the server stops
 reporting launch progress. If the server reports the launch failed or waiting
-on the user, the dot stops and Reconnect host returns.
+on the user, the dot stops and Reconnect host returns. If the server is still
+reporting launch progress 5 minutes later, Reconnect host returns without a
+toast while the dot keeps spinning on the server's stage.
 Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
 stays in the menu then, in case that stage never finishes.
@@ -862,8 +864,9 @@ plain `uv run pytest`, which starts a private server for the test.
   drives the real SPA and server with the session patched to an asleep Arclet
   host. It checks that Reconnect host sends `retry_session`, spins the chip and
   menu dots with no toast, and turns them green once `/health` reports the host
-  online. Sibling tests cover a failed wake's error toast and retry, and a
-  session opened mid-wake. None of them resume a live sandbox.
+  online. Sibling tests cover a failed wake's error toast and retry, a
+  session opened mid-wake, and a wake whose stage outlasts its limit. None
+  of them resume a live sandbox.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

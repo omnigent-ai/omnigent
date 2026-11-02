@@ -19,7 +19,11 @@ import { retrySession } from "@/lib/sessionsApi";
 import type { PostEventResponse } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { SANDBOX_WAKE_ONLINE_GRACE_POLLS, useSessionReconnect } from "./useSessionReconnect";
+import {
+  SANDBOX_WAKE_ONLINE_GRACE_POLLS,
+  SANDBOX_WAKE_STAGE_LIMIT_MS,
+  useSessionReconnect,
+} from "./useSessionReconnect";
 
 const healthPollListeners = vi.hoisted(
   () => new Set<(liveness: Map<string, SessionLiveness>, scheduled: boolean) => void>(),
@@ -648,6 +652,87 @@ describe("useSessionReconnect", () => {
     expect(toast.error).toHaveBeenCalledExactlyOnceWith(
       "The sandbox didn't come online. Try Reconnect host again.",
     );
+  });
+
+  it.each([
+    ["after the server answers", true],
+    ["while the server hasn't answered", false],
+  ] as const)(
+    "lets a wake go quietly when its launch stage never finishes %s",
+    async (_when, answered) => {
+      vi.useFakeTimers();
+      try {
+        const pending = deferred<PostEventResponse>();
+        vi.mocked(retrySession).mockReturnValue(pending.promise);
+        useChatStore.setState({ conversationId: "session", sandboxStatus: null });
+        const { result } = renderHook(() =>
+          useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+        );
+        let reconnect!: Promise<void>;
+        await act(async () => {
+          reconnect = result.current.reconnect();
+        });
+        if (answered) {
+          await act(async () => {
+            pending.resolve({ queued: false, recovered: true });
+            await reconnect;
+          });
+        }
+        act(() => useChatStore.setState({ sandboxStatus: { stage: "provisioning" } }));
+        act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS / 2));
+        // Moving on to another in-progress stage doesn't restart the limit.
+        act(() => useChatStore.setState({ sandboxStatus: { stage: "connecting" } }));
+        act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS / 2 - 1));
+        expect(result.current.sandboxStarting).toBe(true);
+        act(() => vi.advanceTimersByTime(1));
+        expect(result.current.sandboxStarting).toBe(false);
+        expect(toast.error).not.toHaveBeenCalled();
+
+        if (!answered) {
+          // The late answer belongs to the released wake.
+          await act(async () => {
+            pending.resolve({ queued: false, recovered: true });
+            await reconnect;
+          });
+          expect(result.current.sandboxStarting).toBe(false);
+        }
+        // Reconnect host works again.
+        vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+        await act(async () => {
+          await result.current.reconnect();
+        });
+        expect(retrySession).toHaveBeenCalledTimes(2);
+        expect(result.current.sandboxStarting).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("drops the stage limit once the launch stops reporting progress", async () => {
+    vi.useFakeTimers();
+    try {
+      useChatStore.setState({
+        conversationId: "session",
+        sandboxStatus: { stage: "provisioning" },
+      });
+      vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      );
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      act(() => useChatStore.setState({ sandboxStatus: null }));
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS * 2));
+      // Only the health-poll count ends it from here.
+      expect(result.current.sandboxStarting).toBe(true);
+      finishHealthPolls(SANDBOX_WAKE_ONLINE_GRACE_POLLS);
+      expect(result.current.sandboxStarting).toBe(false);
+      expect(toast.error).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;
