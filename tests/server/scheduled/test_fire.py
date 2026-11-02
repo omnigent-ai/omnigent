@@ -1274,6 +1274,49 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
 
 
 @pytest.mark.asyncio
+async def test_sent_prompt_tells_the_agent_no_one_is_watching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The message a fire sends ends with the unattended-run note; the task keeps its prompt."""
+    import omnigent.server.routes.sessions as sessions_routes
+
+    sent: list[SessionEventInput] = []
+
+    async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _dispatch_session_event_to_runner(
+        session_id: str, conv: Any, event: SessionEventInput, *args: Any, **kwargs: Any
+    ) -> None:
+        sent.append(event)
+
+    monkeypatch.setattr(
+        sessions_routes, "_ensure_runner_session_initialized", _ensure_runner_session_initialized
+    )
+    monkeypatch.setattr(
+        sessions_routes, "_dispatch_session_event_to_runner", _dispatch_session_event_to_runner
+    )
+    task = _task(prompt="Merge the open Dependabot PRs.\n")
+
+    await fire_mod._send_prompt(
+        _deps(FakeScheduledTaskStore(rows={"task_1": task})),
+        _FakeConversation(id="conv_1", agent_id="ag_1"),
+        object(),
+        task,
+    )
+
+    assert [event.data["content"] for event in sent] == [
+        [
+            {
+                "type": "input_text",
+                "text": f"Merge the open Dependabot PRs.\n\n{fire_mod.UNATTENDED_RUN_NOTE}",
+            }
+        ]
+    ]
+    assert task.prompt == "Merge the open Dependabot PRs.\n"
+
+
+@pytest.mark.asyncio
 async def test_on_fire_returns_before_launch_completes() -> None:
     """on_fire must return fast so the scheduler timer re-arms immediately."""
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
@@ -1926,7 +1969,9 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     assert len({saved["session_id"] for saved in startup.enqueued}) == 2
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
-        assert saved["event"].data["content"] == [{"type": "input_text", "text": "do the thing"}]
+        assert saved["event"].data["content"] == [
+            {"type": "input_text", "text": f"do the thing\n\n{fire_mod.UNATTENDED_RUN_NOTE}"}
+        ]
         assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config

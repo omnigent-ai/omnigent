@@ -21,6 +21,11 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.feature_flags import resolve_feature_flags
@@ -266,6 +271,82 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [
+        ("bound-token", 200),
+        ("legacy-token-only", 200),
+        ("allow-listed", 200),
+        ("loopback", 200),
+        ("wrong-token", 403),
+        ("unowned-source", 403),
+        ("unbound-source", 403),
+        ("missing-source", 403),
+        ("empty-source", 403),
+        ("missing-token", 403),
+        ("loopback-missing-bound-token", 403),
+        ("invalid-allow-listed-token", 403),
+    ],
+)
+async def test_agent_mutations_validate_origin_at_http_boundary(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    mode: str,
+    expected_status: int,
+) -> None:
+    token = "scheduled-approval-token"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    source = conversations.create_conversation()
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant("alice@example.com", source.id, 1 if mode == "unowned-source" else 4)
+    runner_id = (
+        "stable-runner"
+        if mode in {"allow-listed", "loopback", "invalid-allow-listed-token"}
+        else token_bound_runner_id(token)
+    )
+    if mode != "unbound-source":
+        conversations.set_runner_id(source.id, runner_id)
+    headers = {
+        **_headers(),
+        ORCHESTRATION_SOURCE_HEADER: source.id,
+        RUNNER_TUNNEL_TOKEN_HEADER: token,
+    }
+    if mode == "legacy-token-only":
+        headers.pop(ORCHESTRATION_SOURCE_HEADER)
+    elif mode == "empty-source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = ""
+    elif mode == "missing-source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = uuid.uuid4().hex
+    elif mode == "wrong-token":
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = "different-token"
+    elif mode in {"loopback", "missing-token", "loopback-missing-bound-token"}:
+        headers.pop(RUNNER_TUNNEL_TOKEN_HEADER)
+    if mode in {"allow-listed", "invalid-allow-listed-token"}:
+        auth_app.state.runner_tunnel_tokens = frozenset(
+            {token if mode == "allow-listed" else "another-token"}
+        )
+    peer = "127.0.0.1" if mode.startswith("loopback") else "192.0.2.10"
+    transport = httpx.ASGITransport(app=auth_app, client=(peer, 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+        assert created.status_code == expected_status, created.text
+        if expected_status == 403:
+            listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+            assert listed.json()["scheduled_tasks"] == []
+            created = await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+            )
+            assert created.status_code == 200, created.text
+        task_id = created.json()["id"]
+        updated = await client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=headers
+        )
+        assert updated.status_code == expected_status, updated.text
+        stored = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+        assert stored.json()["state"] == ("paused" if expected_status == 200 else "active")
 
 
 async def test_automations_gate_is_checked_per_request(
@@ -1156,10 +1237,11 @@ async def test_update_clears_permission_mode_with_explicit_null(
     assert got.json()["permission_mode"] is None
 
 
+@pytest.mark.parametrize("include_agent_id", [False, True], ids=["omitted-agent", "same-agent"])
 async def test_update_omitting_permission_mode_leaves_it_unchanged(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient, db_uri: str, include_agent_id: bool
 ) -> None:
-    """A PATCH that omits ``permission_mode`` must not clear a set mode."""
+    """Omitting permission_mode retains the override when the agent does not change."""
     _make_user(db_uri)
     created = (
         await auth_client.post(
@@ -1170,13 +1252,19 @@ async def test_update_omitting_permission_mode_leaves_it_unchanged(
     ).json()
     task_id = created["id"]
 
+    fields = {"name": "renamed"}
+    if include_agent_id:
+        fields["agent_id"] = created["agent_id"]
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
-        json={"name": "renamed"},
+        json=fields,
         headers=_headers(),
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["permission_mode"] == "acceptEdits"
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["agent_id"] == created["agent_id"]
+    assert got.json()["permission_mode"] == "acceptEdits"
 
 
 async def test_update_rejects_invalid_model_override(

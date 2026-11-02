@@ -7219,8 +7219,8 @@ def test_forwarder_sends_file_change_to_observer(
             "tool_name": "apply_patch",
             "tool_input": {
                 "changes": [
-                    {"path": "/repo/new.py", "kind": {"type": "add"}},
-                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
                 ]
             },
             "tool_response": {"type": "success"},
