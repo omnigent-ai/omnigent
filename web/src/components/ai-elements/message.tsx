@@ -107,7 +107,11 @@ export const MessageAction = ({
       size={size}
       type="button"
       variant={variant}
-      className={cn("text-muted-foreground hover:text-foreground", className)}
+      className={cn(
+        "mobile-touch-target",
+        "text-muted-foreground hover:text-foreground",
+        className,
+      )}
       {...props}
     >
       {children}

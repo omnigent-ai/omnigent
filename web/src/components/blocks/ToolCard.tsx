@@ -414,7 +414,7 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
     <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground">
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground mobile-touch-target">
         <span>{label}</span>
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
@@ -493,7 +493,7 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="block w-full cursor-pointer py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground"
+      className="block w-full cursor-pointer py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground mobile-app:flex mobile-touch-target mobile-app:flex-col mobile-app:justify-center"
     >
       <span className="flex w-full items-center gap-1.5">
         <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
@@ -559,7 +559,7 @@ function ToolTitleBody({
     <span
       role="link"
       tabIndex={0}
-      className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
+      className="mobile-touch-target mobile-app:inline-flex mobile-app:items-center underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
       onClick={(e) => {
         e.stopPropagation();
         onBodyClick();
