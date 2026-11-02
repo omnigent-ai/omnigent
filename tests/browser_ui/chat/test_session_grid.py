@@ -665,7 +665,16 @@ def test_grid_mobile_entry_points(
         expect(row).to_have_class(re.compile("opacity-40"))
         expect(page.get_by_test_id("grid-drop-targets")).to_have_count(int(desktop))
         page.keyboard.press("Escape")
+        # Release after the drag library has removed its temporary click guard.
+        page.wait_for_timeout(150)
+        navigations: list[str] = []
+        page.on("framenavigated", lambda frame: navigations.append(frame.url))
         page.mouse.up()
+        page.wait_for_timeout(150)
+        assert navigations == [], "Cancelling a drag must not switch sessions on release"
+        expect(page).to_have_url(sessions[0].url)
+        row.click()
+        expect(page).to_have_url(sessions[1].url)
         page.goto(f"{sessions[0].base_url}/grid/saved")
         if desktop:
             expect(page.get_by_test_id("session-grid")).to_be_visible()

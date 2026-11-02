@@ -5019,21 +5019,11 @@ function ConversationRowImpl({
     disabled:
       (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
-  // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
-  // on the same anchor still fires a click); swallow that one click so a drag
-  // doesn't also navigate into the session. Flagged when a drag finishes,
-  // cleared on the next tick (after the click that follows pointer-up).
+  // Escape can cancel a drag while the pointer is still held. Suppress its
+  // trailing click until a fresh pointer gesture begins, regardless of delay.
   const justDraggedRef = useRef(false);
-  const wasDraggingRef = useRef(false);
   useEffect(() => {
-    const was = wasDraggingRef.current;
-    wasDraggingRef.current = isDragging;
-    if (!was || isDragging) return undefined;
-    justDraggedRef.current = true;
-    const timer = setTimeout(() => {
-      justDraggedRef.current = false;
-    }, 0);
-    return () => clearTimeout(timer);
+    if (isDragging) justDraggedRef.current = true;
   }, [isDragging]);
   // In the Pinned section each row is also a reorder target for other pins.
   const pinOrder = useContext(PinOrderContext);
@@ -5202,6 +5192,9 @@ function ConversationRowImpl({
       componentId="sidebar.conversation_switcher"
       draggable={gridsEnabled ? false : undefined}
       onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
+      onPointerDownCapture={() => {
+        justDraggedRef.current = false;
+      }}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -5242,7 +5235,7 @@ function ConversationRowImpl({
       onClick={(e) => {
         recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
         // Swallow the click that trails a drag so it doesn't navigate.
-        if (justDraggedRef.current) {
+        if (justDraggedRef.current && e.detail !== 0) {
           e.preventDefault();
           return;
         }

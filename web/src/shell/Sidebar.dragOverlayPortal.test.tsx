@@ -91,6 +91,33 @@ afterEach(async () => {
 });
 
 describe("session drag preview portal", () => {
+  it.each(["pointer", "keyboard"])(
+    "suppresses delayed cancelled-drag clicks but allows the next %s activation",
+    async (input) => {
+      vi.useFakeTimers();
+      const onClose = vi.fn();
+      renderSidebar({ onClose });
+      const link = screen.getByRole("link", { name: "conv_a" });
+      const row = link.closest("li")!;
+      startRowDrag(row);
+      expect(row).toHaveClass("opacity-40");
+      fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+      expect(row).not.toHaveClass("opacity-40");
+      await act(() => vi.advanceTimersByTimeAsync(100));
+      fireEvent.mouseUp(link);
+      fireEvent.click(link, { detail: 1 });
+      expect(onClose).not.toHaveBeenCalled();
+
+      if (input === "pointer") {
+        fireEvent.pointerDown(link, { button: 0 });
+        fireEvent.mouseDown(link, { button: 0 });
+        fireEvent.mouseUp(link);
+      }
+      fireEvent.click(link, { detail: input === "pointer" ? 1 : 0 });
+      expect(onClose).toHaveBeenCalledOnce();
+    },
+  );
+
   it.each(["mouse", "touch"])(
     "does not start a session drag or clear selection for %s gestures in the fork dialog",
     async (input) => {
