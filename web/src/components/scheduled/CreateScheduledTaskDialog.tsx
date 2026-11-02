@@ -134,14 +134,15 @@ export function CreateScheduledTaskDialog({
   // cost-control / per-turn model loading — disproportionate for a saved task).
   // "" = unselected → `model_override` / `reasoning_effort` / `permission_mode`
   // are omitted so the fire path uses the agent's configured defaults. Permission
-  // mode is offered for native coding agents that support it (Claude Code); each
-  // fire launches a fresh session, so the whole launch vocabulary is valid —
+  // mode is offered for native coding agents that support it (Claude Code).
+  // It is a session launch setting, so the whole launch vocabulary is valid —
   // including the launch-only `dontAsk` / `bypassPermissions`.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(true);
   const [pickedModel, setPickedModel] = useState<string>("");
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
+  const [permissionSelectionTouched, setPermissionSelectionTouched] = useState(false);
 
   const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(
@@ -258,6 +259,14 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  const permissionChanged =
+    permissionSelectionTouched &&
+    isEdit &&
+    !agentChanged &&
+    showModelEffort &&
+    pickedPermission !== (editingTask?.permissionMode ?? "");
+  const keepsExistingSession =
+    permissionChanged && sessionMode === "continue" && editingTask?.sessionId != null;
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
   const [trigger, setTrigger] = useState<TriggerSource | null>(null);
@@ -280,6 +289,7 @@ export function CreateScheduledTaskDialog({
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
+      setPermissionSelectionTouched(false);
       setAdvancedOpen(true);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
@@ -872,7 +882,10 @@ export function CreateScheduledTaskDialog({
                   hostId={hostId}
                   onModelChange={setPickedModel}
                   onEffortChange={setPickedEffort}
-                  onPermissionModeChange={setPickedPermission}
+                  onPermissionModeChange={(mode) => {
+                    setPickedPermission(mode);
+                    setPermissionSelectionTouched(true);
+                  }}
                   onSelectOpenChange={handleSelectOpenChange}
                 />
                 <p className="mt-1.5 text-sm text-muted-foreground">
@@ -880,6 +893,22 @@ export function CreateScheduledTaskDialog({
                   mode. Automations run unattended, so a prompting mode (Manual or Plan) will wait
                   for approval that never comes.
                 </p>
+                {permissionChanged && (
+                  <div
+                    className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"
+                    data-testid="task-permission-change-note"
+                    role="status"
+                  >
+                    <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <p>
+                      {keepsExistingSession && sessionModesSupported
+                        ? startNewSession
+                          ? "The current session keeps its permission mode. The next run starts a new session with this selection."
+                          : "This change doesn't affect the current session. To use it, select “Start a new session on the next run” above."
+                        : "This change applies only to sessions created after you save. Existing sessions keep their permission mode."}
+                    </p>
+                  </div>
+                )}
               </CollapsibleContent>
             </Collapsible>
           )}
