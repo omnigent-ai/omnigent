@@ -3153,7 +3153,16 @@ describe("chatStore — send (first-send ordering)", () => {
     });
   });
 
-  it("holds a send whose host is offline and sends it once released", async () => {
+  it.each([
+    [
+      "host_offline",
+      "The host for this session is offline. Your message will be sent when it reconnects.",
+    ],
+    [
+      "runner_starting",
+      "The runner for this session is still connecting. Your message will be sent when it's ready.",
+    ],
+  ])("holds a %s send and sends it once released", async (code, notice) => {
     // The server refuses (and records nothing) only because this client asks to
     // hold: the message must wait in the queue, not land back in the composer.
     useChatStore.setState({
@@ -3173,16 +3182,7 @@ describe("chatStore — send (first-send ordering)", () => {
       if (url.endsWith("/v1/sessions/conv_existing/events")) {
         holdHeaders.push(new Headers(init?.headers).get("x-omnigent-hold-when-host-offline"));
         if (!hostBack) {
-          return mockResponse(
-            {
-              error: {
-                code: "host_offline",
-                message:
-                  "The host for this session is offline. Your message will be sent when it reconnects.",
-              },
-            },
-            { ok: false, status: 503 },
-          );
+          return mockResponse({ error: { code, message: notice } }, { ok: false, status: 503 });
         }
         return mockResponse({ queued: true, item_id: "item_1" });
       }
@@ -3200,9 +3200,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       waitingForHost: true,
     });
-    expect(state.blocks.filter((b) => b.type === "error")).toMatchObject([
-      { code: "host_offline" },
-    ]);
+    expect(state.blocks.filter((b) => b.type === "error")).toMatchObject([{ code }]);
 
     // Still held: an idle flush must not post it into the offline host.
     useChatStore.getState().maybeFlushQueuedHead();

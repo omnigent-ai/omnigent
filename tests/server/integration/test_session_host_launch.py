@@ -2112,10 +2112,17 @@ async def _swallow_relaunch_launch_frame(
             return
 
 
-async def _post_hello(client: httpx.AsyncClient, session_id: str) -> httpx.Response:
+# Sent by a client that keeps an unsent message and resends it later.
+_HOLD_SEND_HEADERS = {"x-omnigent-hold-when-host-offline": "on"}
+
+
+async def _post_hello(
+    client: httpx.AsyncClient, session_id: str, *, headers: dict[str, str] | None = None
+) -> httpx.Response:
     """Post a plain user message to a session."""
     return await client.post(
         f"/v1/sessions/{session_id}/events",
+        headers=headers,
         json={
             "type": "message",
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
@@ -2298,6 +2305,99 @@ async def test_native_message_relaunch_runner_never_connects_keeps_runner_failed
     assert elapsed < 0.3 + budget(5.0)
     [event] = _runner_client_wait_events(caplog)
     assert (event.attributes["outcome"], event.attributes["attempts"]) == ("never_connected", 0)
+
+
+def _hold_unconnected_relaunches(
+    monkeypatch: pytest.MonkeyPatch, host_status: str | None
+) -> AsyncMock:
+    """Make relaunched runners miss a short connect wait; the host reports *host_status*.
+
+    :returns: The mocked host status query the hold decision makes.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.3)
+    # The fake host never answers the connect wait's own status probes.
+    monkeypatch.setattr(sessions_module, "_HOST_RUNNER_STATUS_TIMEOUT_S", 0.05)
+    status_query = AsyncMock(return_value=host_status)
+    monkeypatch.setattr(routes_events, "_query_host_runner_status", status_query)
+    return status_query
+
+
+@pytest.mark.parametrize("host_status", ["alive", "dead", "unknown", None])
+async def test_native_message_relaunch_holds_send_while_host_runs_the_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    host_status: str | None,
+) -> None:
+    """A holding client's send waits for a spawned runner the host still runs.
+
+    The runner's tunnel has not connected, as when the host's network path
+    fails the handshake. Only a runner the host reports alive holds the send;
+    any other answer fails the turn as before.
+    """
+    status_query = _hold_unconnected_relaunches(monkeypatch, host_status)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    try:
+        response = await _post_hello(client, session_id, headers=_HOLD_SEND_HEADERS)
+    finally:
+        launch = await responder
+
+    runner_id = token_bound_runner_id(launch.binding_token)
+    assert status_query.await_args.args[2] == runner_id
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    outcomes = [event.attributes["outcome"] for event in _runner_client_wait_events(caplog)]
+    if host_status == "alive":
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "runner_starting"
+        assert errors == []
+        assert [item for item in items if item.get("role") == "user"] == []
+        session = (await client.get(f"/v1/sessions/{session_id}")).json()
+        assert session.get("status") != "failed"
+        assert outcomes == ["never_connected", "runner_starting_held"]
+    else:
+        assert response.status_code == 202, response.text
+        assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+        assert errors[0]["message"] == _RUNNER_NOT_AVAILABLE
+        assert outcomes == ["never_connected"]
+
+
+async def test_native_message_relaunch_hold_for_starting_runner_ends(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner still unconnected when the hold ends fails the turn it was holding."""
+    from omnigent.server.routes.sessions import routes_events
+
+    _hold_unconnected_relaunches(monkeypatch, "alive")
+    monkeypatch.setattr(routes_events, "RUNNER_STARTING_HOLD_S", 0.0)
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+
+    statuses = []
+    for _ in range(2):
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        try:
+            response = await _post_hello(client, session_id, headers=_HOLD_SEND_HEADERS)
+        finally:
+            await responder
+        statuses.append(response.status_code)
+
+    assert statuses == [503, 202]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
 
 
 async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_while_connected(
