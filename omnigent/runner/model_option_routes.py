@@ -61,6 +61,7 @@ def register_model_option_routes(
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
+    _sync_session_agent: Callable[[str, str | None, str | None], Coroutine[Any, Any, None]],
     server_client: httpx.AsyncClient,
 ) -> None:
     """Register the ``/models``, ``/*-model-options``, and ``/skills/resolve`` routes on *app*.
@@ -413,6 +414,13 @@ def register_model_option_routes(
             return JSONResponse(
                 status_code=400,
                 content={"error": "invalid_request", "detail": "'arguments' must be a string."},
+            )
+        # A changed revision (installed skills, policy) rebuilds a warm spec first,
+        # as the turn itself would; a server that sends none keeps the cache.
+        agent_id, revision = body.get("agent_id"), body.get("agent_revision")
+        if isinstance(revision, str) and revision:
+            await _sync_session_agent(
+                session_id, agent_id if isinstance(agent_id, str) else None, revision
             )
         skills = await _resolve_session_skills(session_id)
         skill = find_skill_by_name(skills, name)

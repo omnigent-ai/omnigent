@@ -39,7 +39,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
@@ -139,6 +139,7 @@ class _CapturingResourceRegistry:
         self.parent_os_envs: list[Any | None] = []
         self.resource_roles: list[str | None] = []
         self.launch_lifecycles: list[str] = []
+        self.read_roots: list[list[Path]] = []
 
     def set_terminal_activity_publisher(
         self,
@@ -201,6 +202,7 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Capture a required terminal launch."""
         return await self._launch(
@@ -213,6 +215,7 @@ class _CapturingResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            additional_read_roots=additional_read_roots,
         )
 
     async def launch_auxiliary_terminal(
@@ -225,6 +228,7 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """Capture an auxiliary terminal launch."""
         return await self._launch(
@@ -237,6 +241,7 @@ class _CapturingResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            additional_read_roots=additional_read_roots,
         )
 
     async def _launch(
@@ -251,6 +256,7 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        additional_read_roots: Sequence[Path] = (),
     ) -> SessionResourceView:
         """
         Capture the launch spec and return a terminal resource view.
@@ -268,6 +274,8 @@ class _CapturingResourceRegistry:
         :param resource_role: Runner-private role marker (e.g.
             ``"claude-native"``); captured via ``resource_roles[-1]``
             for assertions.
+        :param additional_read_roots: Directories granted read-only (the
+            agent's skills); captured via ``read_roots[-1]``.
         :returns: Terminal resource view for the fake instance.
         """
         assert cwd_override is None
@@ -276,6 +284,7 @@ class _CapturingResourceRegistry:
         self.launches.append(spec)
         self.parent_os_envs.append(parent_os_env)
         self.resource_roles.append(resource_role)
+        self.read_roots.append(list(additional_read_roots))
         instance = _make_instance(terminal_name, session_key, self.tmp_path)
         return terminal_resource_view(
             session_id,
@@ -1163,6 +1172,8 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
             ),
         ),
     )
+    skill_dir = tmp_path / "bundle" / "skills" / "review"
+    agent.skills = [SkillSpec(name="review", description="d", content="c", skill_dir=skill_dir)]  # type: ignore[assignment]
 
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/sessions/conv_test"
@@ -1210,6 +1221,8 @@ async def test_create_terminal_threads_agent_parent_os_env_through(
     launch = resource_registry.launches[0]
     assert launch.os_env.sandbox is not None
     assert launch.os_env.sandbox.egress_rules == ["* api.github.com/**"]
+    # The agent's skill directories are granted to the terminal too.
+    assert resource_registry.read_roots[0] == [skill_dir]
 
 
 @pytest.mark.asyncio
@@ -1248,6 +1261,8 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
         ),
         terminals={"sandboxed_zsh": declared_zsh},
     )
+    skill_dir = tmp_path / "bundle" / "skills" / "review"
+    agent.skills = [SkillSpec(name="review", description="d", content="c", skill_dir=skill_dir)]  # type: ignore[assignment]
 
     async def _session_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_hardened"})
@@ -1291,6 +1306,7 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
     assert launch.command == "zsh"
     assert launch.args == ["-l"]
     assert launch.env == {"OPERATOR": "set"}
+    assert resource_registry.read_roots[0] == [skill_dir]
 
 
 @pytest.mark.asyncio
@@ -1753,6 +1769,7 @@ class _LaunchReturningRegistry(TerminalRegistry):
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        additional_read_roots: Any = (),
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 

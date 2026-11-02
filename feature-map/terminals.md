@@ -174,6 +174,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 
 ## Gotchas
 
+- A terminal launched for a session whose agent bundles skills (HTTP terminal
+  creation, `sys_terminal_launch`, and the native harness launches) is granted
+  each skill's directory read-only, since a `linux_bwrap` sandbox hides the
+  temp directory the runner extracts bundles into. Check a script under a
+  skill's `scripts/` runs from such a shell; installed marketplace skills are
+  bundle skills too ([skills marketplace](./skills-marketplace.md)).
 - The terminal strip and the agent terminal behind the Chat/Terminal switcher
   are different surfaces. A reattach or reconnect fix must be checked on both.
 - A host switch updates the host badge immediately. The badge changing is not

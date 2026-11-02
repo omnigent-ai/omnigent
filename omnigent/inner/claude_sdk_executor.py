@@ -51,7 +51,7 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution_lines,
 )
 from omnigent.inner import _proc
-from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.bundle_skills import bundle_resource_roots, ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
@@ -1465,6 +1465,8 @@ def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
 def prepare_claude_cli_path(
     real_cli_path: str | None,
     spec: OSEnvSpec | None,
+    *,
+    extra_read_roots: Sequence[pathlib.Path] = (),
 ) -> PreparedClaudeCli:
     """Wrap the Claude CLI in the agent's configured sandbox when possible.
 
@@ -1481,6 +1483,8 @@ def prepare_claude_cli_path(
         binary, or ``None`` when no CLI is available.
     :param spec: The agent's ``os_env`` spec.  Only ``caller_process`` specs
         with a compatible sandbox are eligible for wrapping.
+    :param extra_read_roots: Further directories the CLI must read, such as
+        the agent bundle's skills (see :func:`bundle_resource_roots`).
     :returns: A :class:`PreparedClaudeCli` naming the effective CLI path and
         whether native tools should be enabled.
     """
@@ -1514,7 +1518,9 @@ def prepare_claude_cli_path(
         # whole native-tool process tree inside a network-denying sandbox.
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
 
-    sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
+    sandbox = with_additional_read_roots(
+        sandbox, [*_claude_internal_write_roots(), *extra_read_roots]
+    )
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
     # Dry-run the spawn-time wrap now, while degrading is still possible.
@@ -1547,8 +1553,14 @@ def prepare_tight_cli_process_path(
     real_cli_path: str | None,
     *,
     cwd: str | None = None,
+    extra_read_roots: Sequence[pathlib.Path] = (),
 ) -> str | None:
-    """Wrap the Claude CLI in a tight default sandbox without enabling tools."""
+    """Wrap the Claude CLI in a tight default sandbox without enabling tools.
+
+    :param extra_read_roots: Directories the CLI must read beyond *cwd*, such
+        as the agent bundle's skills, which sit under the temp directory the
+        sandbox replaces.
+    """
 
     if real_cli_path is None:
         return None
@@ -1588,6 +1600,8 @@ def prepare_tight_cli_process_path(
     else:
         if not sandbox.active:
             return real_cli_path
+        if extra_read_roots:
+            sandbox = with_additional_read_roots(sandbox, list(extra_read_roots))
         sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
         sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
         return create_exec_launcher(real_cli_path, sandbox)
@@ -1854,10 +1868,14 @@ class ClaudeSDKExecutor(Executor):
         self._cli_wrapper_path: str | None = None
         self._cli_path: str | None = _find_system_claude()
         if self._cli_path:
+            # The bundle is extracted under the temp directory a bwrap sandbox
+            # hides; its skills and plugin manifest are granted read-only.
+            bundle_roots = bundle_resource_roots(self._bundle_dir)
             if self._os_env_spec is not None:
                 prepared = prepare_claude_cli_path(
                     self._cli_path,
                     self._os_env_spec,
+                    extra_read_roots=bundle_roots,
                 )
                 self._os_env = prepared.enable_native_tools
                 if prepared.cli_path != self._cli_path:
@@ -1867,6 +1885,7 @@ class ClaudeSDKExecutor(Executor):
                 wrapped_cli = prepare_tight_cli_process_path(
                     self._cli_path,
                     cwd=self._cwd,
+                    extra_read_roots=bundle_roots,
                 )
                 if wrapped_cli != self._cli_path:
                     self._cli_wrapper_path = wrapped_cli

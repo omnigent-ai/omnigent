@@ -116,6 +116,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+  A skill installed from the skills marketplace (`skills-marketplace.md`) is
+  listed with its repository, e.g. "Review code (from acme/skills)".
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through

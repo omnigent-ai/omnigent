@@ -64,7 +64,7 @@ from omnigent.spec.types import (
     ToolGroupsConfig,
     ToolsConfig,
 )
-from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
+from omnigent.spec.validator import is_valid_skill_name
 
 _log = logging.getLogger(__name__)
 
@@ -74,6 +74,48 @@ _CONTEXT_FILE_PRIORITY: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", ".cursorrul
 
 # Pattern for SKILL.md YAML frontmatter delimited by ---
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
+
+
+class SkillFrontmatterLoader(yaml.SafeLoader):
+    """SafeLoader that refuses YAML anchors in a skill's frontmatter.
+
+    An alias expands as the document loads, so a few hundred bytes of nested
+    aliases can build an arbitrarily large structure: a byte limit on the file
+    bounds the input, not the expansion. Skill metadata is a flat mapping of
+    scalars, so anchors have no use here and the whole class is refused —
+    which matters because the marketplace parses frontmatter from repositories
+    it does not own.
+    """
+
+    def compose_node(self, parent: yaml.Node | None, index: int) -> yaml.Node | None:
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("YAML anchors are not allowed in skill frontmatter")
+        return super().compose_node(parent, index)
+
+
+def load_skill_frontmatter(frontmatter_str: str) -> object:
+    """Parse a skill's YAML frontmatter with anchors refused.
+
+    :raises yaml.YAMLError: On malformed YAML, or any anchor use.
+    """
+    return yaml.load(frontmatter_str, Loader=SkillFrontmatterLoader)
+
+
+def _scalar_metadata(value: object, field: str, skill_md: Path) -> str:
+    """One frontmatter field as text; a collection is refused, not stringified.
+
+    ``str()`` of a nested structure can be far larger than the YAML that
+    produced it, so only scalars are converted.
+
+    :raises OmnigentError: When *value* is a collection rather than a scalar.
+    """
+    if isinstance(value, list | dict | set | tuple | bytes | bytearray):
+        raise OmnigentError(
+            f"SKILL.md frontmatter field {field!r} must be a single value, "
+            f"not a {type(value).__name__}: {skill_md}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return str(value)
 
 
 class _ConfigYamlLoader(yaml.SafeLoader):
@@ -2672,11 +2714,6 @@ def skill_matches_names(spec: SkillSpec, names: Collection[str]) -> bool:
     return spec.name in names or (spec.display_name is not None and spec.display_name in names)
 
 
-def _is_valid_bundled_skill_name(name: str) -> bool:
-    """Whether *name* passes the bundled-skill name validation."""
-    return bool(_SKILL_NAME_PATTERN.match(name)) and len(name) <= _SKILL_NAME_MAX_LEN
-
-
 def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
     """
     Keep the frontmatter name of bundled skills whose directory is not a valid name.
@@ -2692,14 +2729,25 @@ def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
     return [
         replace(skill, name=skill.display_name, display_name=None)
         if skill.display_name is not None
-        and not _is_valid_bundled_skill_name(skill.name)
-        and _is_valid_bundled_skill_name(skill.display_name)
+        and not is_valid_skill_name(skill.name)
+        and is_valid_skill_name(skill.display_name)
         else skill
         for skill in skills
     ]
 
 
-def _parse_skill(skill_md: Path) -> SkillSpec:
+def parse_untrusted_skill(skill_md: Path) -> SkillSpec:
+    """Parse a ``SKILL.md`` from a repository the server does not own.
+
+    Like :func:`_parse_skill`, with YAML anchors refused and a non-scalar
+    ``name`` or ``description`` rejected, so a small manifest cannot expand
+    into a large structure. Only the skills marketplace uses it; skills the
+    agent author or host provides keep the permissive parse.
+    """
+    return _parse_skill(skill_md, untrusted=True)
+
+
+def _parse_skill(skill_md: Path, *, untrusted: bool = False) -> SkillSpec:
     """
     Parse a single ``SKILL.md`` file into a :class:`SkillSpec`.
 
@@ -2711,6 +2759,8 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
 
     :param skill_md: Path to the ``SKILL.md`` file, e.g.
         ``skills/code-review/SKILL.md``.
+    :param untrusted: Refuse anchors and non-scalar metadata (see
+        :func:`parse_untrusted_skill`).
     :returns: A populated :class:`SkillSpec`.
     :raises OmnigentError: If the file cannot be read, or the
         frontmatter is missing, malformed, or lacks required fields.
@@ -2737,12 +2787,13 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
             code=ErrorCode.INVALID_INPUT,
         )
     frontmatter_str, content = match.groups()
+    load = load_skill_frontmatter if untrusted else yaml.safe_load
     try:
-        frontmatter = yaml.safe_load(frontmatter_str)
+        frontmatter = load(frontmatter_str)
     except yaml.YAMLError as exc:
         # Retry prose containing colons; diagnostics must not include file contents.
         try:
-            frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+            frontmatter = load(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
                 f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
@@ -2768,10 +2819,14 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
-    label = str(name)
+    label = _scalar_metadata(name, "name", skill_md) if untrusted else str(name)
     return SkillSpec(
         name=skill_md.parent.name,
-        description=str(description),
+        description=(
+            _scalar_metadata(description, "description", skill_md)
+            if untrusted
+            else str(description)
+        ),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,

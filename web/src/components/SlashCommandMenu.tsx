@@ -104,7 +104,8 @@ export function skillDisplayNames(
 
 /**
  * Inline menu text for a skill: its frontmatter display name, when that
- * differs from the typed command, ahead of the description. A skill in
+ * differs from the typed command, ahead of the description, and the
+ * repository an installed marketplace skill came from after it. A skill in
  * `asd-ste100/` named "Simplified Technical English (ASD-STE100)" is typed
  * as `/asd-ste100` but labelled with its display name.
  */
@@ -112,10 +113,18 @@ export function skillMenuDescription(skill: {
   name: string;
   description: string;
   display_name?: string | null;
+  source?: string | null;
 }): string {
   const label = skill.display_name?.trim();
-  if (!label || label === skill.name) return skill.description;
-  return skill.description ? `${label} — ${skill.description}` : label;
+  const text =
+    !label || label === skill.name
+      ? skill.description
+      : skill.description
+        ? `${label} — ${skill.description}`
+        : label;
+  const source = skill.source?.trim();
+  if (!source) return text;
+  return text ? `${text} (from ${source})` : `from ${source}`;
 }
 
 /**

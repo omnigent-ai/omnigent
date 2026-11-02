@@ -1101,6 +1101,11 @@ checks do not prove live providers, browser rendering or thought-signature parit
 
 ## Gotchas
 
+- Every native harness terminal is launched with the agent's bundle skill
+  directories granted read-only (the runner's bundles sit under the temp
+  directory `linux_bwrap` hides), so a bundled or installed skill's files are
+  readable from the harness. An open native terminal keeps the skills it
+  launched with until it restarts ([skills marketplace](./skills-marketplace.md)).
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup
   configuration and plugin inventory do not expose shared-preference controls.

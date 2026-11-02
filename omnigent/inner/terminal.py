@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
@@ -2818,6 +2818,7 @@ def create_terminal_instance(
     cwd_override: str | None = None,
     sandbox_override: str | None = None,
     conversation_link: str | None = None,
+    additional_read_roots: Sequence[Path] = (),
 ) -> TerminalCreateResult:
     """Create a terminal instance from a spec.
 
@@ -2843,6 +2844,9 @@ def create_terminal_instance(
         one of ``"none"`` or ``"linux_bwrap"``.
     :param conversation_link: Optional web UI link for the owning
         conversation, e.g. ``"/c/conv_abc123"``.
+    :param additional_read_roots: Directories granted read-only to the
+        terminal's sandbox, such as the agent's bundle skill directories,
+        which sit under the temp directory a bwrap sandbox hides.
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
@@ -2888,7 +2892,7 @@ def create_terminal_instance(
             cwd=str(fork_root),
             fork=False,  # already forked
         )
-        os_env = create_os_environment(forked_spec)
+        os_env = create_os_environment(forked_spec, additional_read_roots=additional_read_roots)
     else:
         cwd = Path(effective_os_env_spec.cwd or os.getcwd()).resolve()
         inherited_policy = None
@@ -2900,6 +2904,7 @@ def create_terminal_instance(
         os_env = create_os_environment(
             effective_os_env_spec,
             sandbox_policy=inherited_policy,
+            additional_read_roots=additional_read_roots,
             copy_on_write_environment=(
                 parent_environment.copy_on_write_environment if parent_environment else None
             ),

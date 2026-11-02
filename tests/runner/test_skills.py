@@ -694,3 +694,41 @@ async def test_codex_bundle_skill_not_duplicated_when_dir_differs_from_name(
     names = resp.json()["available"]
     # Exactly one entry for the skill (no phantom dir-named duplicate).
     assert names.count("triage") + names.count("sra--triage") == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_rebuilds_a_warm_spec_when_the_revision_changes(tmp_path: Path) -> None:
+    """A slash command after an install resolves against the new spec, not the cached one."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    old = SkillSpec(name="grill-me", description="d", content="old instructions")
+    new = SkillSpec(name="grill-me", description="d", content="new instructions")
+    added = SkillSpec(name="fresh", description="d", content="c")
+    current = {"skills": [old]}
+    resolver_calls: list[str] = []
+
+    async def _spec_resolver(agent_id: str, session_id: str | None) -> Any:
+        resolver_calls.append(agent_id)
+        return ResolvedSpec(spec=_SpecStub(list(current["skills"]), "none"), workdir=bundle)
+
+    app = create_runner_app(
+        spec_resolver=_spec_resolver,
+        server_client=_ServerClient(),  # type: ignore[arg-type]
+    )
+
+    async def resolve(name: str, revision: str | None) -> httpx.Response:
+        body: dict[str, Any] = {"name": name}
+        if revision is not None:
+            body.update(agent_id="ag_x", agent_revision=revision)
+        return await c.post("/v1/sessions/conv_warm/skills/resolve", json=body)
+
+    async for c in _client(app):
+        assert "old instructions" in (await resolve("grill-me", "rev-1")).json()["meta_text"]
+        current["skills"] = [new, added]
+        # The same revision, or none from an older server, keeps the warm spec.
+        assert (await resolve("fresh", "rev-1")).status_code == 404
+        assert (await resolve("fresh", None)).status_code == 404
+        calls = len(resolver_calls)
+        assert (await resolve("fresh", "rev-2")).status_code == 200
+        assert len(resolver_calls) > calls
+        assert "new instructions" in (await resolve("grill-me", "rev-2")).json()["meta_text"]

@@ -68,8 +68,10 @@ requires `user_owned: true` and `agent_config_edit: true`.
   deletion reports the count and waits for Remove anyway. Only that action
   should force removal.
 - Gating: remove the feature flag, restart the isolated server, and reload.
-  Customize must disappear, Harnesses must return to General, and Custom agents
-  URLs must show General.
+  Harnesses must return to General and Custom agents URLs must show General.
+  Customize disappears only when the skills marketplace
+  (`OMNIGENT_FEATURES=skills_marketplace`, see `skills-marketplace.md`) is off
+  too; with it on, Customize stays and holds Skills alone.
   Repeat against a server without the installation capability. With the feature
   and installation enabled but `agent_detail` absent or false, every Custom
   agents URL must show an update notice with no agent requests or management

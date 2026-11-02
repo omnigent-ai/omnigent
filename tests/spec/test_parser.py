@@ -4736,3 +4736,20 @@ def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
     spec = parse(tmp_path)
 
     assert spec.executor.reasoning_effort is None
+
+
+def test_only_marketplace_skills_get_the_untrusted_frontmatter_parse(tmp_path: Path) -> None:
+    from omnigent.errors import OmnigentError
+    from omnigent.spec.parser import _parse_skill, parse_untrusted_skill
+
+    # Anchors and a list description load for a bundled or host skill, as before;
+    # only a repository the marketplace indexes is held to the stricter parse.
+    skill_md = tmp_path / "notes" / "SKILL.md"
+    skill_md.parent.mkdir()
+    skill_md.write_text(
+        "---\nname: &label notes\ndescription:\n  - first\n  - *label\n---\nBody.\n"
+    )
+    spec = _parse_skill(skill_md)
+    assert (spec.name, spec.description) == ("notes", "['first', 'notes']")
+    with pytest.raises(OmnigentError, match="invalid YAML frontmatter"):
+        parse_untrusted_skill(skill_md)

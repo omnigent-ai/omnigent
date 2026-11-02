@@ -1,0 +1,369 @@
+"""Fold a session owner's installed skills into the agent bundle a runner fetches.
+
+The runner discovers ``skills/<name>/SKILL.md`` inside the directory of the
+spec it runs (the bundle root, or ``agents/<dir>/`` for a child), so adding
+installed skills under that directory needs no runner change. One bad
+tarball drops only itself; exceeding the delivery bounds is an error the
+caller sees rather than a skill silently missing from the menu.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
+
+from omnigent.entities import Agent, Conversation, InstalledSkill
+from omnigent.entities.agent import LoadedAgent
+from omnigent.mcp_selection import mcp_selection_revision
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.skills.git_source import ancestor_paths
+from omnigent.skills.limits import (
+    MAX_DELIVERY_BYTES,
+    MAX_DELIVERY_ENTRIES,
+    MAX_INSTALLED_PER_OWNER,
+    MAX_PAGE,
+    RUNNER_UNPACK_BYTES,
+    RUNNER_UNPACK_ENTRIES,
+)
+from omnigent.skills.overlay import (
+    SkillTarballError,
+    UnpackedSize,
+    overlay_skills_within,
+    validate_skill_tarball,
+)
+from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
+from omnigent.spec.parser import skill_matches_names
+from omnigent.spec.types import AgentSpec, SkillSpec
+from omnigent.spec.validator import is_valid_skill_name
+from omnigent.stores import ArtifactStore, ConversationStore
+from omnigent.stores.skill_store import SkillStore
+
+_logger = logging.getLogger(__name__)
+
+# A user's own rows plus the org's, each capped at install time.
+MAX_DELIVERED_SKILLS = 2 * MAX_INSTALLED_PER_OWNER
+# Served bundles kept in memory across runner fetches.
+OVERLAY_CACHE_BYTES = 256 * 1024 * 1024
+
+
+class SkillDeliveryError(Exception):
+    """The installed skills exceed what one session can be given; the message is user-facing."""
+
+
+@dataclass(frozen=True)
+class SessionTarget:
+    """The spec a session runs and where its files live inside the bundle.
+
+    :param spec: The parsed spec, or ``None`` when the bundle could not be loaded.
+    :param prefix: ``""`` for the root agent, else ``agents/<dir>/`` per level of nesting.
+    """
+
+    spec: AgentSpec | None
+    prefix: str
+
+
+async def session_agent_revision(
+    bundle_location: str,
+    conv: Conversation,
+    *,
+    skill_store: SkillStore | None,
+    conversation_store: ConversationStore,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
+) -> str:
+    """The revision a session's turn carries, including what decides its delivered skills.
+
+    The runner rebuilds a session's spec when the revision changes, so a
+    marketplace change reaches a warm session's next turn instead of its
+    menu listing a skill its spec lacks. That covers the owner's installs,
+    the policy, and, when URL installs are off, the browse list. Without the
+    marketplace this is the bundle-and-selection revision alone.
+    """
+    base = mcp_selection_revision(bundle_location, conv.labels)
+    if skill_store is None:
+        return base
+
+    def installed() -> str:
+        owner = conversation_store.get_session_owner(conv.id, owner_only=True)
+        return skill_store.installed_revision(owner, include_sources=not policy.allow_url_install)
+
+    token = await asyncio.to_thread(installed)
+    return f"{base}+skills.{token}.p{policy.delivery_fingerprint()}"
+
+
+def bundle_loaded(agent_cache: AgentCache | None, agent: Agent) -> LoadedAgent | None:
+    """The agent's parsed spec and extracted bundle; ``None`` when unavailable."""
+    if agent_cache is None:
+        return None
+    try:
+        return agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:  # noqa: BLE001 — the filter is advisory; the bundle still ships
+        _logger.warning("could not load spec for agent %s to filter skills", agent.id)
+        return None
+
+
+def bundle_spec(agent_cache: AgentCache | None, agent: Agent) -> AgentSpec | None:
+    """The agent's parsed spec, for its ``skills:`` filter; ``None`` when unavailable."""
+    loaded = bundle_loaded(agent_cache, agent)
+    return None if loaded is None else loaded.spec
+
+
+def session_target(spec: AgentSpec | None, sub_agent_name: str | None) -> SessionTarget:
+    """Resolve the child a session runs, by declared name at any depth, and its directory.
+
+    An unknown name falls back to the root, as the runner does.
+    """
+    if spec is None or not sub_agent_name:
+        return SessionTarget(spec, "")
+    found = _find_sub_agent(spec, sub_agent_name, "")
+    return found if found is not None else SessionTarget(spec, "")
+
+
+def _find_sub_agent(spec: AgentSpec, name: str, prefix: str) -> SessionTarget | None:
+    for child in spec.sub_agents:
+        child_prefix = f"{prefix}agents/{child.source_rel_dir or child.name}/"
+        if child.name == name:
+            return SessionTarget(child, child_prefix)
+        nested = _find_sub_agent(child, name, child_prefix)
+        if nested is not None:
+            return nested
+    return None
+
+
+def skill_allowed(spec: AgentSpec | None, skill: InstalledSkill) -> bool:
+    """Apply the agent spec's ``skills:`` filter as host skills get it.
+
+    A name list selects a skill by its command or by its frontmatter label,
+    through the same :func:`skill_matches_names` host discovery uses.
+    """
+    skills_filter = getattr(spec, "skills_filter", "all") if spec is not None else "all"
+    if skills_filter == "none":
+        return False
+    if isinstance(skills_filter, list):
+        candidate = SkillSpec(
+            name=skill.name, description="", content="", display_name=skill.display_name
+        )
+        return skill_matches_names(candidate, skills_filter)
+    return True
+
+
+class _OverlayCache:
+    """Served bundles by everything that decides their bytes, least recently used out first.
+
+    A runner fetches a session's bundle on every start and reconnect; the
+    merge decompresses the agent bundle and every skill, so it is done once
+    per distinct input set. The key holds the agent bundle's digest and each
+    skill's row id and artifact key, which is unique to one write, so any
+    change to the bundle or to the installed set is a different entry.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._entries: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple[object, ...]) -> bytes | None:
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+            return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+
+    def put(self, key: tuple[object, ...], value: bytes) -> None:
+        if len(value) > self._max_bytes // 4:
+            return
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old)
+            self._entries[key] = value
+            self._bytes += len(value)
+            while self._bytes > self._max_bytes:
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= len(evicted)
+
+
+_overlay_cache = _OverlayCache(OVERLAY_CACHE_BYTES)
+
+
+def with_installed_skills(
+    bundle_bytes: bytes,
+    *,
+    owner_id: str | None,
+    skill_store: SkillStore,
+    artifact_store: ArtifactStore,
+    target: SessionTarget | None = None,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
+) -> bytes:
+    """Return the bundle with the owner's enabled installed skills under the target's ``skills/``.
+
+    The target spec's own skills, by their canonical parsed names, always win
+    a collision; a user-scoped install wins over an org-scoped one of the same
+    name. A tarball that fails validation drops only itself, and so does a
+    skill whose repository the server's policy no longer allows.
+
+    A name the runner's spec validator refuses is skipped, since one invalid
+    skill would fail the whole spec. When the agent's own files leave too
+    little room under what a runner unpacks, the skills that do not fit are
+    left out with a warning rather than failing the session. The result is
+    cached per input set (see :class:`_OverlayCache`), unless a skill's
+    tarball could not be read.
+
+    :param target: The spec the session runs and its directory in the bundle;
+        ``None`` means the root agent with no filter.
+    :raises SkillDeliveryError: When the skills exceed :data:`MAX_DELIVERED_SKILLS`,
+        :data:`MAX_DELIVERY_BYTES` or :data:`MAX_DELIVERY_ENTRIES` together.
+    """
+    target = target or SessionTarget(None, "")
+    installed = effective_installed_skills(skill_store, owner_id, policy=policy)
+    reserved = {skill.name for skill in getattr(target.spec, "skills", None) or []}
+    selected: list[InstalledSkill] = []
+    for skill in installed:
+        if not skill_allowed(target.spec, skill) or skill.name in reserved:
+            continue
+        if not is_valid_skill_name(skill.name):
+            _logger.warning("skipping installed skill %r (%s): invalid name", skill.name, skill.id)
+            continue
+        selected.append(skill)
+    if not selected:
+        return bundle_bytes
+    # Rows carry their unpacked size, so the backstop needs no artifact read.
+    total = UnpackedSize(0, 0)
+    for skill in selected:
+        total += UnpackedSize(skill.bundle_bytes, skill.bundle_entries)
+    if total.bytes > MAX_DELIVERY_BYTES or total.entries > MAX_DELIVERY_ENTRIES:
+        raise SkillDeliveryError(
+            f"Installed skills exceed {MAX_DELIVERY_BYTES // (1024 * 1024)} MB or "
+            f"{MAX_DELIVERY_ENTRIES} files together; disable or remove some in "
+            "Settings → Skills."
+        )
+    limit = UnpackedSize(RUNNER_UNPACK_BYTES, RUNNER_UNPACK_ENTRIES)
+    key = (
+        hashlib.sha256(bundle_bytes).hexdigest(),
+        target.prefix,
+        tuple(sorted(reserved)),
+        tuple((skill.id, skill.name, skill.bundle_location) for skill in selected),
+        limit,
+    )
+    cached = _overlay_cache.get(key)
+    if cached is not None:
+        return cached
+    accepted: list[tuple[str, bytes]] = []
+    unreadable = False
+    for skill in selected:
+        try:
+            tarball = artifact_store.get(skill.bundle_location)
+            validate_skill_tarball(tarball)
+        except (SkillTarballError, OSError, KeyError, ValueError):
+            _logger.warning(
+                "skipping installed skill %s (%s): unreadable tarball",
+                skill.name,
+                skill.id,
+                exc_info=True,
+            )
+            unreadable = True
+            continue
+        accepted.append((skill.name, tarball))
+    try:
+        merged, skipped = overlay_skills_within(
+            bundle_bytes, accepted, reserved=reserved, prefix=target.prefix, limit=limit
+        )
+    except SkillTarballError:
+        _logger.warning(
+            "could not overlay installed skills; serving the bundle as is", exc_info=True
+        )
+        return bundle_bytes
+    if skipped:
+        _logger.warning(
+            "left installed skills %s out of a session's bundle: with the agent's own "
+            "files they exceed what a runner unpacks (%d MB, %d files)",
+            ", ".join(skipped),
+            RUNNER_UNPACK_BYTES // (1024 * 1024),
+            RUNNER_UNPACK_ENTRIES,
+        )
+    # A read can fail transiently, so a merge that dropped a skill is rebuilt next time.
+    # A skill left out for size is not: the key fixes every input that decided it.
+    if not unreadable:
+        _overlay_cache.put(key, merged)
+    return merged
+
+
+def effective_installed_skills(
+    skill_store: SkillStore,
+    owner_id: str | None,
+    *,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
+) -> list[InstalledSkill]:
+    """The owner's enabled installed skills, one per name, user scope winning over org.
+
+    A skill from a repository outside the policy's ``allowed_sources`` is left
+    out, and with ``allow_url_install`` off so is one from no listed source,
+    so tightening the policy stops serving it. Reads at most
+    :data:`MAX_DELIVERED_SKILLS` rows, two full pages.
+
+    :raises SkillDeliveryError: When more rows than that are visible.
+    """
+    candidates: list[InstalledSkill] = []
+    after: str | None = None
+    seen = 0
+    while True:
+        page = skill_store.list_for_user(owner_id, limit=MAX_PAGE, after=after)
+        candidates.extend(
+            skill for skill in page.data if skill.enabled and policy.allows(skill.source_url)
+        )
+        seen += len(page.data)
+        if seen > MAX_DELIVERED_SKILLS:
+            raise SkillDeliveryError(
+                f"More than {MAX_DELIVERED_SKILLS} installed skills are visible to this "
+                "session; remove some in Settings → Skills."
+            )
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    # With URL installs off, only skills from a listed source are served, so
+    # turning the switch off also stops serving what was installed by URL.
+    if not policy.allow_url_install:
+        candidates = from_listed_sources(skill_store, candidates)
+    by_name: dict[str, InstalledSkill] = {}
+    for skill in candidates:
+        current = by_name.get(skill.name)
+        if current is None or (current.scope == "org" and skill.scope == "user"):
+            by_name[skill.name] = skill
+    return list(by_name.values())
+
+
+def from_listed_sources(
+    skill_store: SkillStore, skills: list[InstalledSkill]
+) -> list[InstalledSkill]:
+    """The *skills* whose repository and ref are a listed source at a directory holding them.
+
+    One identity lookup per distinct repository and ref among *skills*, for
+    the directories that could hold them, so the work follows the bounded
+    installed set and not the number of sources.
+    """
+    wanted: dict[tuple[str, str | None], set[str]] = {}
+    for skill in skills:
+        wanted.setdefault((skill.source_url, skill.ref), set()).update(ancestor_paths(skill.path))
+    listed = {
+        (url, ref, path)
+        for (url, ref), paths in wanted.items()
+        for path in skill_store.listed_source_paths(url, ref, paths)
+    }
+    return [
+        skill
+        for skill in skills
+        if any(
+            (skill.source_url, skill.ref, path) in listed for path in ancestor_paths(skill.path)
+        )
+    ]

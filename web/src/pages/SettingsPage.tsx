@@ -284,6 +284,7 @@ import {
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
+import { SettingsSkillsSection } from "./settings/SettingsSkillsSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -350,6 +351,7 @@ export function SettingsPage() {
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "custom-agents" && <SettingsCustomAgentsSection />}
+      {section === "skills" && <SettingsSkillsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "mcp" && (
