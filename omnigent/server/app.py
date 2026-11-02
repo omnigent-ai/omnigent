@@ -4037,6 +4037,7 @@ def create_app(
         """
         from omnigent.server.routes.sessions import (
             HOST_OFFLINE_HOLD_S,
+            RUNNER_ALIVE_HOLD_S,
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
             _note_runner_idle_shutdown,
@@ -4106,6 +4107,8 @@ def create_app(
         )
         hold_started = time.monotonic()
         hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        if hold is None and not idle_shutdown:
+            hold = await _hold_for_alive_runner(runner_id, affected)
         hold_s = None if hold is None else time.monotonic() - hold_started
         if hold in ("runner_reconnected", "server_shutdown"):
             return
@@ -4145,6 +4148,14 @@ def create_app(
                     message=(
                         "The host for this session came back without the runner that was "
                         "running this turn, so the turn was lost. Send the message again to retry."
+                    ),
+                )
+            elif hold == "runner_alive_expired":
+                error = ErrorDetail(
+                    code="runner_disconnected",
+                    message=(
+                        "The runner for this session lost its connection to the server and "
+                        f"did not reconnect within {RUNNER_ALIVE_HOLD_S / 60:g} minutes."
                     ),
                 )
         if idle_shutdown:
@@ -4324,8 +4335,106 @@ def create_app(
                 )
         return outcome
 
+    async def _host_reports_runner_alive(host_id: str | None, runner_id: str) -> bool:
+        """Whether *runner_id*'s host, connected to this replica, says its process runs."""
+        from omnigent.server.routes.sessions import _query_host_runner_status
+
+        host_conn = None if host_id is None else host_registry.get(host_id)
+        if host_conn is None:
+            return False
+        status = await _query_host_runner_status(host_conn, host_registry, runner_id)
+        return status == "alive"
+
+    async def _hold_for_alive_runner(runner_id: str, affected: "list[Conversation]") -> str | None:
+        """Wait for a runner whose tunnel dropped mid-turn while its host still runs it.
+
+        A runner on a failing network path keeps working and retries its tunnel,
+        often for minutes, then resumes the turn, so the turn waits for it while
+        the host reports it alive. The hold ends once the host stops reporting it
+        alive or after :data:`RUNNER_ALIVE_HOLD_S`.
+
+        :returns: ``None`` when nothing was held, else how the hold ended:
+            ``"runner_reconnected"``, ``"server_shutdown"``, ``"runner_gone"``
+            or ``"runner_alive_expired"``.
+        """
+        from omnigent.server.routes.sessions import (
+            _MID_TURN_STATUSES,
+            HOST_OFFLINE_RECHECK_S,
+            RUNNER_ALIVE_HOLD_S,
+            _intentional_stop_sessions,
+            _session_status_cache,
+        )
+
+        held = [
+            conv
+            for conv in affected
+            if conv.id not in _intentional_stop_sessions
+            and _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES
+        ]
+        if not held:
+            return None
+        host_id = await _routing_host_id(held)
+        if not await _host_reports_runner_alive(host_id, runner_id):
+            return None
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + RUNNER_ALIVE_HOLD_S
+        outcome = "cancelled"
+        for conv in held:
+            _logger.info(
+                "Runner %s: host reports it alive, holding session=%s",
+                runner_id,
+                conv.id,
+                extra=debug_event(
+                    "runner_disconnect_held_runner_alive",
+                    session_id=conv.id,
+                    runner_id=runner_id,
+                    host_id=host_id,
+                    hold_s=RUNNER_ALIVE_HOLD_S,
+                ),
+            )
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    outcome = "runner_alive_expired"
+                    break
+                if (
+                    await tunnel_registry.wait_for_runner(
+                        runner_id, timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining)
+                    )
+                    is not None
+                ):
+                    outcome = "runner_reconnected"
+                    break
+                if shutdown_state.server_shutting_down():
+                    outcome = "server_shutdown"
+                    break
+                if not await _host_reports_runner_alive(host_id, runner_id):
+                    outcome = "runner_gone"
+                    break
+        finally:
+            for conv in held:
+                _logger.info(
+                    "Runner %s: alive-runner hold ended (%s) for session=%s",
+                    runner_id,
+                    outcome,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_disconnect_hold_ended",
+                        session_id=conv.id,
+                        runner_id=runner_id,
+                        outcome=outcome,
+                        held_s=round(loop.time() - started, 3),
+                    ),
+                )
+        return outcome
+
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
-        """Whether this replica's disconnect task holds a lost relay's turn for its host."""
+        """Whether this replica's disconnect task holds a lost relay's turn for its host.
+
+        It does while the host is offline, or while the host still runs the runner.
+        """
         task = _disconnect_grace_tasks.get(runner_id)
         if task is None or task.done():
             return False
@@ -4333,7 +4442,12 @@ def create_app(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
             return False
-        return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
+        if conv is None:
+            return False
+        host_id = await _routing_host_id([conv])
+        if await _host_offline(host_id) is True:
+            return True
+        return await _host_reports_runner_alive(host_id, runner_id)
 
     set_relay_host_offline_probe(_relay_turn_held_for_host)
 

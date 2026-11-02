@@ -8517,15 +8517,19 @@ _MID_TURN_STATUSES = ("running", "waiting")
 HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
 # How often a host-offline hold re-checks whether the host came back.
 HOST_OFFLINE_RECHECK_S: float = 60.0
+# A runner whose tunnel dropped while its host still runs it is usually stuck
+# on a failing network path and resumes the turn once it reconnects, so a
+# connected host that reports it alive keeps the turn waiting this long.
+RUNNER_ALIVE_HOLD_S: float = 30 * 60.0
 
 # Set at app startup: whether a lost relay's turn is being held by the
-# runner's disconnect task because its host went offline too.
+# runner's disconnect task, because its host went offline too or still runs it.
 _relay_turn_held_for_host: Callable[[str, str], Awaitable[bool]] | None = None
 
 
 def set_relay_host_offline_probe(probe: Callable[[str, str], Awaitable[bool]] | None) -> None:
     """
-    Register how a relay learns its runner's turns wait for an offline host.
+    Register how a relay learns its runner's turns wait for the runner's host.
 
     :param probe: Called with ``(runner_id, session_id)``; ``None`` clears it.
     :returns: None.
