@@ -130,7 +130,7 @@ def test_slack_background_status_stop_lifecycle(data_dir: Path) -> None:
         assert "9911" in start.output
         # Argv targets the slack package in the current interpreter.
         argv = popen.call_args.args[0]
-        assert argv[1:] == ["-m", "omnigent_slack"]
+        assert argv[1:] == ["-P", "-m", "omnigent_slack"]
 
         status = runner.invoke(cli, ["integration", "slack", "status"])
         assert "running" in status.output and "9911" in status.output
@@ -183,7 +183,7 @@ def test_slack_foreground_runs_subprocess(data_dir: Path) -> None:
         result = runner.invoke(cli, ["integration", "slack"])
     assert result.exit_code == 0
     argv = run.call_args.args[0]
-    assert argv[1:] == ["-m", "omnigent_slack"]
+    assert argv[1:] == ["-P", "-m", "omnigent_slack"]
 
 
 def test_slack_start_subcommand_removed(data_dir: Path) -> None:

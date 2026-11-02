@@ -4,6 +4,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import {
   isAcpHarnessAgent,
   partitionAgentsByKind,
+  partitionPickerEntries,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
 
@@ -91,5 +92,28 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: "claude-native" })).toBe(false); // native harness
     expect(isAcpHarnessAgent({ harness: null })).toBe(false);
     expect(isAcpHarnessAgent(null)).toBe(false);
+  });
+});
+
+describe("partitionPickerEntries", () => {
+  it("puts ACP harnesses with the native CLIs, not under Agents", () => {
+    // Settings' visibility list and the picker share this, so a configured
+    // acp:<slug> agent can't sit under a different heading in each.
+    const { harnesses, agents } = partitionPickerEntries([
+      agent({ name: "claude-native-ui", harness: "claude-native" }),
+      agent({ name: "kilocode", harness: "acp:kilocode" }),
+      agent({ name: "polly", harness: "claude-sdk" }),
+    ]);
+    expect(harnesses.map((a) => a.name)).toEqual(["claude-native-ui", "kilocode"]);
+    expect(agents.map((a) => a.name)).toEqual(["polly"]);
+  });
+
+  it("keeps the user's own agents under Agents even on a native harness", () => {
+    // One of these would otherwise pass for a harness row.
+    const { harnesses, agents } = partitionPickerEntries([
+      agent({ name: "my-claude", harness: "claude-native", mine: true }),
+    ]);
+    expect(harnesses).toEqual([]);
+    expect(agents.map((a) => a.name)).toEqual(["my-claude"]);
   });
 });

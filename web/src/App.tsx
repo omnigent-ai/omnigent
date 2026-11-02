@@ -1,11 +1,13 @@
-import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { lazy, Suspense, useEffect, type ComponentType, type ReactNode } from "react";
+import { Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { useLocation, useNavigate } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -54,6 +56,7 @@ const InboxPage = withPageView(
 );
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
+const GridPage = withPageView("grid", () => null);
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
@@ -61,6 +64,10 @@ const TasksPage = withPageView(
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+);
+const TaskDetailPage = withPageView(
+  "tasks.detail",
+  lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -79,6 +86,15 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
     );
   }
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
+
+function AppRedirect({ to }: { to: string }) {
+  const navigate = useNavigate();
+  const { search, hash } = useLocation();
+  useEffect(() => {
+    navigate({ pathname: to, search, hash }, { replace: true });
+  }, [navigate, to, search, hash]);
+  return null;
 }
 
 interface AppProps {
@@ -168,6 +184,14 @@ function AppRoutes({ basename }: AppProps) {
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route
+            path={`${prefix}/grid/:gridId`}
+            element={
+              <FeatureGatedPage feature="grid_sessions_display_ui">
+                <GridPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route
             path={`${prefix}/canvas`}
@@ -187,6 +211,18 @@ function AppRoutes({ basename }: AppProps) {
           />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
+            path={`${prefix}/tasks/templates`}
+            element={<TasksPage key="templates" templatesOnly />}
+          />
+          <Route
+            path={`${prefix}/tasks/:taskId`}
+            element={
+              <FeatureGatedPage feature="automations_v2">
+                <TaskDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
             path={`${prefix}/usage`}
             element={
               <FeatureGatedPage feature="usage_page">
@@ -201,7 +237,7 @@ function AppRoutes({ basename }: AppProps) {
               redirects to the canonical General section. */}
           <Route
             path={`${prefix}/settings`}
-            element={<Navigate to={`${prefix}/settings/general`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/general`} />}
           />
           <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
@@ -214,11 +250,11 @@ function AppRoutes({ basename }: AppProps) {
               the sections self-gate to admins. */}
           <Route
             path={`${prefix}/members`}
-            element={<Navigate to={`${prefix}/settings/members`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/members`} />}
           />
           <Route
             path={`${prefix}/policies`}
-            element={<Navigate to={`${prefix}/settings/policies`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/policies`} />}
           />
           <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
         </Route>
@@ -228,9 +264,12 @@ function AppRoutes({ basename }: AppProps) {
 }
 
 export default function App(props: AppProps = {}) {
+  const { pathname } = useLocation();
   return (
     <ChunkLoadErrorBoundary>
-      <AppRoutes {...props} />
+      <RenderErrorBoundary name="this page" resetKey={pathname}>
+        <AppRoutes {...props} />
+      </RenderErrorBoundary>
     </ChunkLoadErrorBoundary>
   );
 }
