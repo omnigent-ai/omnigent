@@ -176,10 +176,14 @@ def test_materialize_attachment_unresolved_file_id_logs_error(
     records = [
         record
         for record in caplog.records
-        if "unresolved file_id file_unresolved" in record.getMessage()
+        if getattr(record, "event_name", None) == "native_attachment_unresolved"
     ]
     assert len(records) == 1
     assert records[0].levelno == logging.ERROR
+    assert (
+        records[0].attributes["file_id_sha256"] == hashlib.sha256(b"file_unresolved").hexdigest()
+    )
+    assert "file_unresolved" not in records[0].getMessage()
 
 
 def test_unresolved_attachment_marker_names_the_attachment() -> None:
