@@ -4674,10 +4674,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         previous: Conversation,
         *,
-        expected_runner_id: str,
+        expected_runner_id: str | None,
         expected_host_id: str | None,
     ) -> bool:
-        """Undo a failed rotation without erasing a newer binding or the last host link."""
+        """Undo a failed rotation or detach without erasing a newer binding or host link."""
 
         def write(session: Session) -> bool:
             if expected_host_id is not None:

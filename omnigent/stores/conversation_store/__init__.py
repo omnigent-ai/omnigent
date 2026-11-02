@@ -1882,10 +1882,10 @@ class ConversationStore(ABC):
         self,
         previous: Conversation,
         *,
-        expected_runner_id: str,
+        expected_runner_id: str | None,
         expected_host_id: str | None,
     ) -> bool:
-        """Restore a failed profile rotation unless its binding changed or is authoritative."""
+        """Restore a failed rotation or detach unless its binding changed or is authoritative."""
         raise NotImplementedError
 
     @abstractmethod

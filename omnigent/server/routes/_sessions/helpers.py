@@ -10312,22 +10312,21 @@ async def _remove_failed_launch_worktree(
     """
     Remove the worktree a session create made after its runner failed to launch.
 
-    Holds the relaunch lock and acts only while the failed runner is still bound,
-    so a relaunched runner keeps its directory. The binding is cleared only after
-    the host confirms the removal; otherwise a later delete or archive can retry.
+    Holds the relaunch lock and detaches the session while the failed runner is
+    still bound, before asking the host to remove anything, so a rebind cannot
+    hand a live runner the directory. A worktree another live session uses is
+    kept, and the binding is restored whenever the worktree stays so a later
+    delete or archive can retry.
 
     :param conversation_store: Store holding the new session row.
     :param host_registry: The ``HostRegistry`` tracking live host tunnels.
     :param session_id: The session whose launch failed.
     :param runner_id: The runner the failed launch bound.
     :param delete_branch: Whether to delete the branch the create made.
-    :returns: The session after the binding is cleared, or ``None`` when the
+    :returns: The unbound session after the removal, or ``None`` when the
         worktree was kept.
     """
-    from omnigent.server.routes._host_worktree import (
-        WORKTREE_ROOT_LABEL_KEY,
-        recorded_worktree_root,
-    )
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
     try:
         async with _relaunch_locks.setdefault(session_id, asyncio.Lock()):
@@ -10339,29 +10338,44 @@ async def _remove_failed_launch_worktree(
                 or conv.workspace is None
                 or conv.git_branch is None
                 or (fingerprint := conv.labels.get(WORKTREE_ROOT_LABEL_KEY)) is None
-                or (root := recorded_worktree_root(conv.workspace, fingerprint)) is None
             ):
                 return None
-            removed = await _remove_session_worktree_best_effort(
-                host_id=conv.host_id,
-                worktree_path=root,
-                branch=conv.git_branch,
-                delete_branch=delete_branch,
-                host_registry=host_registry,
-                reason="create-launch-failure",
-            )
-            if not removed:
-                return None
-            await asyncio.to_thread(
-                conversation_store.delete_label, session_id, WORKTREE_ROOT_LABEL_KEY
-            )
-            return await asyncio.to_thread(
+            detached = await asyncio.to_thread(
                 conversation_store.clear_host_binding,
                 session_id,
                 expected_host_id=conv.host_id,
                 expected_runner_id=runner_id,
                 clear_profile=True,
             )
+            if detached.runner_id is not None or detached.host_id is not None:
+                return None
+            removed = False
+            try:
+                removed = await _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=delete_branch,
+                    host_registry=host_registry,
+                    reason="create-launch-failure",
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=session_id,
+                    expected_root_fingerprint=fingerprint,
+                )
+            finally:
+                if not removed:
+                    await asyncio.to_thread(
+                        conversation_store.rollback_runner_reassignment,
+                        conv,
+                        expected_runner_id=None,
+                        expected_host_id=None,
+                    )
+            if not removed:
+                return None
+            await asyncio.to_thread(
+                conversation_store.delete_label, session_id, WORKTREE_ROOT_LABEL_KEY
+            )
+            return detached
     except Exception:  # noqa: BLE001
         _logger.warning(
             "Worktree cleanup after a failed launch did not finish for session %s",
