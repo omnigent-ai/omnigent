@@ -4485,6 +4485,10 @@ async def _wait_for_host_bound_runner_client(
                 if not waiting_for_credentials or next_deadline != startup_deadline:
                     startup_deadline = next_deadline
                     await check_pending_owner()
+                    if connect_task.done():
+                        client, connected_at = connect_task.result()
+                        if client is not None:
+                            return client if connected_at < startup_deadline else None
                     budget_s = startup_deadline - time.monotonic()
                     if budget_s <= 0:
                         return None

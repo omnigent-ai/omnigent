@@ -446,6 +446,7 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
         "host_replaced",
         "connected_after_deadline",
         "connected_before_slow_owner_check",
+        "connected_during_deadline_update",
         "interactive_transition",
     ],
 )
@@ -467,6 +468,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(
     clock_checked = asyncio.Event()
     clock_tick = object()
     connection_results: asyncio.Queue[object] = asyncio.Queue()
+    connection_returned = asyncio.Event()
     next_status: asyncio.Queue[str] = asyncio.Queue()
     current = SimpleNamespace(runner_id="runner-owned")
     connection = SimpleNamespace(host_id="host-owned")
@@ -495,6 +497,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(
                 if result is clock_tick:
                     clock_checked.set()
                     continue
+                connection_returned.set()
                 return result
             return None
         finally:
@@ -517,7 +520,11 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(
                 pending_rechecked.set()
             reply = await next_status.get()
         if reply == "credential_pending" and on_credential_wait is not None:
-            on_credential_wait(120.0)
+            on_credential_wait(
+                119.0
+                if outcome == "connected_during_deadline_update" and status_calls > 1
+                else 120.0
+            )
         return reply
 
     monkeypatch.setattr(orchestration, "_wait_for_runner_client", wait)
@@ -597,6 +604,24 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(
 
                 store.get_conversation = slow_owner_check
                 connection_results.put_nowait(client)
+                assert await task is client
+            elif outcome == "connected_during_deadline_update":
+                clock.now = 60.0
+                owner_checks = 0
+                loop = asyncio.get_running_loop()
+
+                def connect_during_owner_check(_session_id):
+                    nonlocal owner_checks
+                    owner_checks += 1
+                    if owner_checks == 2:
+                        loop.call_soon_threadsafe(connection_results.put_nowait, client)
+                        asyncio.run_coroutine_threadsafe(connection_returned.wait(), loop).result(
+                            timeout=budget(3)
+                        )
+                    return current
+
+                store.get_conversation = connect_during_owner_check
+                next_status.put_nowait("credential_pending")
                 assert await task is client
             elif outcome == "interactive_transition":
                 clock.now = 60.0
