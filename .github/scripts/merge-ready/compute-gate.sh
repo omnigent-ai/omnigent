@@ -15,29 +15,44 @@
 #   success  | success  | all required checks green
 #   failure  | failure  | a required check is red
 #
-# Env in: EVAL, FAILED, DEPENDENCY_EVAL, DEPENDENCY_REQUIRED, POST_RED
+# Env in: EVAL, FAILED, DEPENDENCY_EVAL, DEPENDENCY_REQUIRED, POST_RED,
+#         FRESHNESS_FAILED, API_FAILED, EXPIRES_AT
 # Out:    state, short_desc, long_desc, post_status on $GITHUB_OUTPUT
 
 set -euo pipefail
 
+FRESHNESS_FAILED=${FRESHNESS_FAILED:-false}
+API_FAILED=${API_FAILED:-false}
+EXPIRES_AT=${EXPIRES_AT:-}
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+if [[ -n "$EXPIRES_AT" && ( "$EXPIRES_AT" < "$NOW" || "$EXPIRES_AT" == "$NOW" ) ]]; then
+  FRESHNESS_FAILED=true
+  FAILED+=$'\n- CI expired during evaluation; update the branch or push a new commit for fresh CI.\n'
+fi
 DEPENDENCY_FAILED=false
 if [[ "$DEPENDENCY_REQUIRED" != "false" && "$DEPENDENCY_EVAL" != "success" ]]; then
   DEPENDENCY_FAILED=true
   FAILED+=$'\n- Dependency policy/reports (see Evaluate dependency reports)\n'
 fi
 
-if [[ "$EVAL" == "success" && "$DEPENDENCY_FAILED" == "false" ]]; then
+if [[ "$EVAL" == "success" && "$DEPENDENCY_FAILED" == "false" && "$FRESHNESS_FAILED" != "true" ]]; then
   STATE=success
   SHORT="All required checks green"
+  [[ -z "$EXPIRES_AT" ]] || SHORT+="; expires $EXPIRES_AT"
   LONG=":white_check_mark: gate is green, merging now."
 else
   STATE=failure
   SHORT="Required checks not all green"
   LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green.'
+  if [[ "$API_FAILED" == "true" ]]; then
+    SHORT="GitHub API request failed; retry Merge Ready"
+  elif [[ "$FRESHNESS_FAILED" == "true" ]]; then
+    SHORT="CI freshness not satisfied (24h); update branch and run fresh CI"
+  fi
 fi
 
 POST_STATUS=false
-if [[ "$STATE" == "success" || "$POST_RED" == "true" || "$DEPENDENCY_FAILED" == "true" ]]; then
+if [[ "$STATE" == "success" || "$POST_RED" == "true" || "$DEPENDENCY_FAILED" == "true" || "$FRESHNESS_FAILED" == "true" ]]; then
   POST_STATUS=true
 fi
 echo "post_status=$POST_STATUS" >> "$GITHUB_OUTPUT"
