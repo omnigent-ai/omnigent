@@ -136,16 +136,24 @@ afterEach(() => {
 });
 
 describe("Custom agents settings", () => {
-  it("keeps duplicate names by ID and reviews server agents without mutation actions", async () => {
-    mount();
-    expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
-    expect(screen.queryByRole("link", { name: /jcode/ })).toBeNull();
-    fireEvent.click(screen.getByRole("link", { name: /Polly description/ }));
-    expect(await screen.findByRole("heading", { name: "Polly" })).toBeVisible();
-    expect(screen.getByText("Review code")).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Delete agent" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
-  });
+  it.each(["created_at", "id"])(
+    "selects the current identity by %s and keeps server agents read-only",
+    async (selection) => {
+      if (selection === "created_at") users[0].created_at += 1;
+      mount();
+      expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(1);
+      expect(screen.getByRole("link", { name: "research" })).toHaveAttribute(
+        "href",
+        `/settings/custom-agents/${selection === "created_at" ? "a1" : "a2"}`,
+      );
+      expect(screen.queryByRole("link", { name: /jcode/ })).toBeNull();
+      fireEvent.click(screen.getByRole("link", { name: /Polly description/ }));
+      expect(await screen.findByRole("heading", { name: "Polly" })).toBeVisible();
+      expect(screen.getByText("Review code")).toBeVisible();
+      expect(screen.queryByRole("button", { name: "Delete agent" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    },
+  );
 
   it("opens a bookmark with direct detail and configuration requests and no list scans", async () => {
     mount("/settings/custom-agents/a1");
@@ -249,10 +257,10 @@ describe("Custom agents settings", () => {
       );
     });
     mount();
-    expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
+    expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(1);
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: " RESEARCH " } });
     expect(screen.queryByRole("link", { name: /Polly description/ })).toBeNull();
-    expect(screen.getAllByRole("link", { name: "research" })).toHaveLength(2);
+    expect(screen.getAllByRole("link", { name: "research" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Load more agents" }));
     expect(await screen.findByRole("link", { name: "research-later" })).toBeVisible();
     fireEvent.change(screen.getByRole("searchbox"), { target: { value: "polly" } });

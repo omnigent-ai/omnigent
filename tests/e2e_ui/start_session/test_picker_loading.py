@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from playwright.async_api import Page, Route, async_playwright, expect
 
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _agents_body,
@@ -154,6 +155,7 @@ async def _drive(
                     await route.fulfill(json={"data": [], "has_more": False})
 
             await context.route(re.compile(r"/v1/agents(?:\?.*)?$"), agents)
+            await context.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
             await context.route(re.compile(r"/v1/hosts(?:\?.*)?$"), hosts)
             await context.route("**/v1/hosts/*/harnesses/*/model-options", models)
             await context.route("**/v1/hosts/*/worktrees?*", worktrees)

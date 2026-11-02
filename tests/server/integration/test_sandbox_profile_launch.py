@@ -14,6 +14,7 @@ import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient, Response
 
+from omnigent.db.utils import installed_agent_id
 from omnigent.host.frames import HostHelloFrame
 from omnigent.onboarding.sandboxes.profiles import (
     SandboxProfileAccessDenied,
@@ -1399,7 +1400,7 @@ async def test_revocation_after_acceptance_preserves_owned_failed_session(
 
 
 @pytest.mark.parametrize("caller", [_OWNER, _OTHER_USER])
-async def test_rejected_fork_cleans_private_copy_and_preserves_source(
+async def test_rejected_fork_preserves_source_and_reusable_copy(
     env: _Env, monkeypatch: pytest.MonkeyPatch, caller: str
 ) -> None:
     source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
@@ -1431,15 +1432,22 @@ async def test_rejected_fork_cleans_private_copy_and_preserves_source(
         },
     )
     assert response.status_code == 403, response.text
-    assert env.persisted() == before
     assert len(rejected_agents) == 1
     announce.assert_not_called()
+    source_agent = env.app.state.agent_store.get(source.agent_id)
+    assert source_agent is not None
     if caller == _OTHER_USER:
-        assert rejected_agents[0] != source.agent_id
-        assert env.app.state.agent_store.get(rejected_agents[0]) is None
+        # The caller's owner/name copy is reusable, so another request may already bind it.
+        copy_id = installed_agent_id(caller, source_agent.name)
+        assert rejected_agents == [copy_id]
+        assert env.app.state.agent_store.get(copy_id) is not None
+        conversations, artifacts = env.persisted()
+        assert conversations == before[0]
+        assert set(before[1]) <= set(artifacts)
+        assert [path.partition("/")[0] for path in set(artifacts) - set(before[1])] == [copy_id]
     else:
+        assert env.persisted() == before
         assert rejected_agents == [source.agent_id]
-    assert env.app.state.agent_store.get(source.agent_id) is not None
     assert env.conversations.get_conversation(source_id) == source
     assert len(env.recording.allocations) == 1
 

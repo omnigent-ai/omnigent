@@ -93,6 +93,10 @@ def test_add_uploads_the_whole_directory(tmp_path: Path, server: _FakeServer) ->
 
     assert result.exit_code == 0, result.output
     assert "Installed orion (version 3" in result.output
+    assert (
+        b'name="allow_server_name_collision"\r\n\r\ntrue\r\n'
+        in next(request for request in server.seen if request.method == "POST").read()
+    )
     assert "terminal sessions do when they relaunch" in result.output
     (bundle,) = _posted_tars(server)
     assert {"config.yaml", "agents/worker/config.yaml"} <= {n.lstrip("./") for n in bundle}

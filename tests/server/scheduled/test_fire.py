@@ -32,14 +32,16 @@ from starlette.datastructures import Headers
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
-from omnigent.server.bundles import bundle_location
+from omnigent.server.bundles import bundle_location, save_user_agent
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -258,7 +260,7 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 
 
 class FakeConversationStore:
-    def __init__(self, *, fail_create: bool = False) -> None:
+    def __init__(self, *, fail_create: bool | Exception = False) -> None:
         self.created: list[dict[str, Any]] = []
         self.updated: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
@@ -273,6 +275,8 @@ class FakeConversationStore:
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
+        if isinstance(self.fail_create, Exception):
+            raise self.fail_create
         if self.fail_create:
             raise RuntimeError("create failed")
         self._seq += 1
@@ -324,6 +328,9 @@ class FakePermissionStore:
 
     def user_exists(self, user_id: str) -> bool:
         return self.users is None or user_id in self.users
+
+    def is_admin(self, user_id: str) -> bool:
+        return False
 
     def get_user(self, user_id: str):
         from omnigent.entities.account import Account
@@ -799,8 +806,9 @@ async def test_fire_without_a_project_store_files_nothing() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", [False, True])
 async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
-    db_uri: str, tmp_path: Path
+    db_uri: str, tmp_path: Path, conflict: bool
 ) -> None:
     """The fire copies another user's agent once and repoints the task, so that
     user's later changes never reach the runs."""
@@ -811,9 +819,31 @@ async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
     location = bundle_location(agent_id, bundle)
     artifacts.put(location, bundle)
     agents.create_user_agent(agent_id, "orion", location, owner="alice@example.com")
+    SqlAlchemyConversationStore(db_uri).create_conversation(agent_id=agent_id)
     task = _task(user_id="bob@example.com", agent_id=agent_id)
     store = FakeScheduledTaskStore(rows={"task_1": task})
     deps = _deps(store, agent_store=agents, artifact_store=artifacts)
+
+    if conflict:
+        existing = save_user_agent(
+            agents,
+            artifacts,
+            owner=task.user_id,
+            name="orion",
+            bundle_bytes=build_agent_bundle("orion", description="Bob's configuration"),
+        )
+
+        async def launch(conv: Any, task: Any) -> None:
+            pytest.fail("a conflicting agent must not launch")
+
+        await build_on_fire(deps, launch_dispatch=launch)(0, task.id)
+        await _drain()
+        assert store.runs[0]["error_code"] == ErrorCode.CONFLICT
+        assert "Select your agent or use a different name" in store.runs[0]["error"]
+        assert store.runs[0]["conversation_id"] is None
+        assert agents.get(existing.id) == existing
+        assert not any("agent_id" in update for update in store.updates)
+        return
 
     moved = await fire_mod._own_task_agent(deps, task)
 
@@ -1336,14 +1366,19 @@ async def test_validation_failure_records_failed_without_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_failure_records_failed_without_session() -> None:
+@pytest.mark.parametrize(
+    "failure", [True, OmnigentError("internal details", code=ErrorCode.INTERNAL_ERROR)]
+)
+async def test_create_failure_records_failed_without_session(
+    failure: bool | Exception, caplog
+) -> None:
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _deps(store, conversation_store=FakeConversationStore(fail_create=True)),
+        _deps(store, conversation_store=FakeConversationStore(fail_create=failure)),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -1352,6 +1387,8 @@ async def test_create_failure_records_failed_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "session_create_failed"
+    assert store.runs[0]["error"] == "session creation failed"
+    assert "failed to create session" in caplog.text
     assert store.runs[0]["conversation_id"] is None
 
 

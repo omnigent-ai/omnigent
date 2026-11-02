@@ -172,13 +172,13 @@ function TaskDetail({ taskId }: { taskId: string }) {
     }
   }, [runs, runsFetchedAfterMount]);
 
-  // Resolve the agent + host display labels from their catalogs. Both are
-  // best-effort: an unknown id falls back to the raw id (agent) or a friendly
-  // default (host) rather than blanking the field.
-  // Pin the task's agent: another agent with the same name (e.g. a session's
-  // own copy) would otherwise win the catalog's name merge and leave the
-  // label showing a raw id.
-  const { data: agents } = useAvailableAgents({
+  // Older servers resolve pins through session discovery; current catalogs
+  // can hide legacy IDs that existing tasks still use.
+  const {
+    data: agents,
+    isPlaceholderData: agentsArePartial,
+    isError: agentsError,
+  } = useAvailableAgents({
     pinnedAgentIds: task != null ? [task.agentId] : [],
   });
   const { data: hosts } = useHosts();
@@ -186,8 +186,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const agentLabel = useMemo(() => {
     if (!task) return "";
-    return agents?.find((a) => a.id === task.agentId)?.display_name ?? task.agentId;
-  }, [agents, task]);
+    const agent = agents?.find((a) => a.id === task.agentId);
+    if (agent) return agent.display_name;
+    if (agents === undefined || agentsArePartial || agentsError) return task.agentId;
+    return `Agent not in current list (${task.agentId})`;
+  }, [agents, agentsArePartial, agentsError, task]);
   const hostLabel = useMemo(() => {
     if (!task) return "";
     if (task.executionTarget === "managed_sandbox") return sandboxLabel;

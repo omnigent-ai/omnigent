@@ -57,6 +57,8 @@ class _AgentStore:
     :param agents: Pre-populated map of agent_id → Agent.
     """
 
+    supports_user_agents = False
+
     def __init__(self, agents: dict[str, Agent] | None = None) -> None:
         """
         Initialize the stub.

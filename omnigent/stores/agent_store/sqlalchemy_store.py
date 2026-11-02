@@ -19,6 +19,7 @@ from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
+    installed_agent_id,
     make_named_managed_session_maker,
     now_epoch,
     run_write_transaction,
@@ -33,7 +34,7 @@ from omnigent.stores.agent_store import _UNSET, AgentStore
 _USER_AGENT_READ_CAP = 50
 
 
-def _is_original(row: SqlAgent) -> bool:
+def _is_original(row: Agent) -> bool:
     """Whether the row's bundle is stored under its own id (not a fork/switch copy)."""
     location = row.bundle_location
     return location.startswith((f"{row.id}/", f"ag_{row.id}/"))
@@ -560,17 +561,29 @@ class SqlAlchemyAgentStore(AgentStore):
                     ),
                 )
             stmt = stmt.order_by(desc(SqlAgent.created_at), desc(SqlAgent.id))
-            rows = list(session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).scalars())
-            read = rows[:_USER_AGENT_READ_CAP]
-            kept: builtins.list[Agent] = []
-            consumed = 0
-            for row in read:
-                if len(kept) >= limit:
-                    break
-                consumed += 1
-                if _is_original(row):
-                    kept.append(sql_agent_to_entity(row))
-            last_read = read[consumed - 1].id if consumed else None
+            rows = [
+                sql_agent_to_entity(row)
+                for row in session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).scalars()
+            ]
+        read = rows[:_USER_AGENT_READ_CAP]
+        # Batch-fetch at most 50 shared IDs to hide their legacy duplicates.
+        canonical = self.get_many(
+            [installed_agent_id(owner, row.name) for row in read if _is_original(row)]
+        )
+        current_ids = {
+            agent.name: agent.id
+            for agent in canonical.values()
+            if agent.kind == "user" and agent.created_by == owner and _is_original(agent)
+        }
+        kept: builtins.list[Agent] = []
+        consumed = 0
+        for row in read:
+            if len(kept) >= limit:
+                break
+            consumed += 1
+            if _is_original(row) and current_ids.get(row.name, row.id) == row.id:
+                kept.append(row)
+        last_read = read[consumed - 1].id if consumed else None
         return PagedList(
             data=kept,
             first_id=kept[0].id if kept else None,
