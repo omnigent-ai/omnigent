@@ -920,6 +920,12 @@ class ClaudeTranscriptItem:
         must correlate it by text without draining unrelated pending input.
     :param failure_context: Explicit API-error evidence for diagnostic logging;
         kept outside model-visible conversation content.
+    :param background_task_id: Task id Claude assigned a shell this tool result
+        moved to the background, e.g. ``"bh5h2361s"``. Forwarder-only.
+    :param finished_task_ids: Task ids a ``<task-notification>`` reports as
+        finished. Forwarder-only.
+    :param interrupts_turn: ``True`` for Claude's own ``[Request interrupted by
+        user]`` record, which ends a turn without a ``Stop`` hook. Forwarder-only.
     """
 
     source_id: str
@@ -931,6 +937,9 @@ class ClaudeTranscriptItem:
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
+    background_task_id: str | None = None
+    finished_task_ids: tuple[str, ...] = ()
+    interrupts_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -974,6 +983,10 @@ class TranscriptReadResult:
     :param record_items: Parsed items grouped by their complete source JSONL
         record, with the byte offset immediately after each record. Native
         child-transcript batching uses these boundaries for partial checkpoints.
+    :param latest_turn_completed: Whether the most recent conversation
+        message scanned left Claude's turn finished: ``True`` after a final
+        assistant reply, ``False`` while a tool call or input is pending, and
+        ``None`` when no conversation message was scanned.
     """
 
     line_cursor: int
@@ -984,6 +997,7 @@ class TranscriptReadResult:
     latest_model: str | None = None
     latest_custom_title: str | None = None
     record_items: tuple[TranscriptRecordItems, ...] = ()
+    latest_turn_completed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -1056,6 +1070,8 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param background_task_ids: Ids of every counted shell, including those
+        past the detail limit, so their finish notifications can be matched.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
     :param failure_message: ``StopFailure`` raw API error detail from the
@@ -1083,6 +1099,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    background_task_ids: tuple[str, ...] = ()
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
@@ -3537,6 +3554,7 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
+    latest_turn_completed: bool | None = None
     record_items: list[TranscriptRecordItems] = []
     for record in read_result.records:
         parsed: list[ClaudeTranscriptItem] = []
@@ -3587,6 +3605,9 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        turn_completed = _turn_completed_from_transcript_entry(entry)
+        if turn_completed is not None:
+            latest_turn_completed = turn_completed
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -3611,6 +3632,7 @@ def read_transcript_items_from_offset(
         latest_model=latest_model,
         latest_custom_title=latest_custom_title,
         record_items=tuple(record_items),
+        latest_turn_completed=latest_turn_completed,
     )
 
 
@@ -4041,6 +4063,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status = "completed"
     background_task_count = 0
     background_tasks: list[_JsonObject] | None = None
+    background_task_ids: tuple[str, ...] = ()
     if event_name == "Stop" and isinstance(payload, dict):
         raw_bg = payload.get("background_tasks")
         if isinstance(raw_bg, list):
@@ -4059,6 +4082,13 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 )
             ]
             background_task_count = len(running)
+            background_task_ids = tuple(
+                task_id
+                for task in running
+                if isinstance(task, dict)
+                and isinstance(task_id := task.get("id"), str)
+                and task_id
+            )
             # Detail for the UI. Non-dict / field-less entries drop out here
             # but still count above, so the tally can't under-count.
             details = [
@@ -4127,6 +4157,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_task_ids=background_task_ids,
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
@@ -8799,6 +8830,41 @@ def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
     return None
 
 
+# Stop reasons that leave the turn open; any other reason ends it.
+_TURN_CONTINUING_STOP_REASONS = frozenset({"tool_use", "pause_turn"})
+
+
+def _turn_completed_from_transcript_entry(entry: _JsonObject) -> bool | None:
+    """
+    Return whether a transcript record leaves Claude's turn finished.
+
+    :param entry: One decoded transcript JSONL record.
+    :returns: ``True`` for an assistant reply that stopped without
+        requesting a tool or for Claude's interrupt record, ``False`` for any
+        other conversation message (a tool call, a streamed fragment, or
+        user/tool-result input), and ``None`` for metadata records that say
+        nothing about the turn.
+    """
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if role == "user":
+        content = message.get("content")
+        if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict):
+            content = content[0].get("text")
+        return _is_interrupt_record_text(content)
+    if role != "assistant":
+        return None
+    content = message.get("content")
+    if isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "tool_use" for block in content
+    ):
+        return False
+    stop_reason = message.get("stop_reason")
+    return bool(stop_reason) and stop_reason not in _TURN_CONTINUING_STOP_REASONS
+
+
 def read_claude_context_state(bridge_dir: Path) -> _JsonObject | None:
     """
     Read the most recent statusLine snapshot from ``context.json``.
@@ -9261,6 +9327,7 @@ def _attachment_transcript_items_from_entry(
                 },
                 response_id=_response_id_from_source(source_key),
                 subagent_return_id=return_id,
+                finished_task_ids=_finished_task_ids(prompt),
             )
         ]
     if attachment.get("commandMode") != "prompt":
@@ -9824,13 +9891,36 @@ def _subagent_handback_id(origin: object) -> str | None:
     return task_id if isinstance(task_id, str) and task_id else None
 
 
+_TERMINAL_TASK_STATUS_RE = re.compile(
+    r"<status>\s*(?:completed|failed|cancelled|killed)\s*</status>"
+)
+_TASK_NOTIFICATION_BODY_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL)
+_NOTIFIED_TASK_ID_RE = re.compile(r"<task-id>\s*([^<]+?)\s*</task-id>")
+# Claude writes this record when Escape ends a turn; no ``Stop`` hook follows.
+# Kept in sync with ``_CLAUDE_INTERRUPT_RECORD_RE`` in the server session helpers.
+_INTERRUPT_RECORD_RE = re.compile(r"^\[Request interrupted by user(?: for tool use)?\]$")
+
+
 def _is_task_completion_text(text: str) -> bool:
     return (
         text.lstrip().startswith("<task-notification>")
         and _is_agent_notification_text(text)
-        and re.search(r"<status>\s*(?:completed|failed|cancelled|killed)\s*</status>", text)
-        is not None
+        and _TERMINAL_TASK_STATUS_RE.search(text) is not None
     )
+
+
+def _finished_task_ids(text: str) -> tuple[str, ...]:
+    """Return the task ids that ``<task-notification>`` blocks report as finished."""
+    return tuple(
+        task_id
+        for body in _TASK_NOTIFICATION_BODY_RE.findall(text)
+        if _TERMINAL_TASK_STATUS_RE.search(body) is not None
+        for task_id in _NOTIFIED_TASK_ID_RE.findall(body)
+    )
+
+
+def _is_interrupt_record_text(text: object) -> bool:
+    return isinstance(text, str) and _INTERRUPT_RECORD_RE.match(text.strip()) is not None
 
 
 def _local_command_transcript_items_from_entry(
@@ -10065,6 +10155,7 @@ def _user_transcript_items_from_entry(
                     },
                     response_id=fallback_response_id,
                     subagent_return_id=return_id,
+                    finished_task_ids=_finished_task_ids(content),
                 )
             )
             return (
@@ -10126,6 +10217,7 @@ def _user_transcript_items_from_entry(
                 agent_message_candidate=_is_agent_notification_text(
                     _unwrap_pasted_content_markers(content)
                 ),
+                interrupts_turn=_is_interrupt_record_text(content),
             )
         )
         return None, items
@@ -10158,6 +10250,7 @@ def _user_transcript_items_from_entry(
                         },
                         response_id=fallback_response_id,
                         subagent_return_id=return_id,
+                        finished_task_ids=_finished_task_ids(text),
                     )
                 )
                 item_index += 1
@@ -10193,6 +10286,7 @@ def _user_transcript_items_from_entry(
                 },
                 response_id=response_id,
                 subagent_return_id=_completed_subagent_tool_id(entry),
+                background_task_id=_launched_background_task_id(entry),
             )
         )
         item_index += 1
@@ -10213,6 +10307,8 @@ def _user_transcript_items_from_entry(
                     and _is_agent_notification_text(text)
                     for block in user_blocks
                 ),
+                interrupts_turn=len(user_blocks) == 1
+                and _is_interrupt_record_text(user_blocks[0].get("text")),
             ),
         )
     return (None if saw_user_text else current_response_id), items
@@ -10611,6 +10707,15 @@ def _strip_inline_image_data(value: object) -> object:
             return {"type": "text", "text": _stripped_image_placeholder(source)}
         return {key: _strip_inline_image_data(val) for key, val in value.items()}
     return value
+
+
+def _launched_background_task_id(entry: _JsonObject) -> str | None:
+    """Read the task id Claude assigns a shell it runs in the background."""
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict):
+        return None
+    task_id = result.get("backgroundTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
 
 
 def _completed_subagent_tool_id(entry: _JsonObject) -> str | None:
