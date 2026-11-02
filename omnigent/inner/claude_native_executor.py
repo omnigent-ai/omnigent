@@ -362,13 +362,28 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            # The pane is still alive here: this turn's error reports the close,
-            # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
             message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            if exc.transcript_progress:
+                _logger.warning(
+                    "claude-native: output progressed during readiness; leaving the pane running",
+                    extra={"session_id": self._request_session_id},
+                )
+            else:
+                # This turn reports the close; suppress a second terminal-exit failure.
+                cleanup_error = self._reap_failed_turn(expected_close=True)
+                if cleanup_error is not None:
+                    message = f"{message} Cleanup also failed: {cleanup_error}"
+            yield ExecutorError(
+                message=message,
+                title="Message not delivered" if exc.transcript_progress else None,
+                remediation=(
+                    "Claude produced output while this message was waiting and was left running. "
+                    "Open the terminal, then resend your message when the input is ready."
+                    if exc.transcript_progress
+                    else None
+                ),
+                undelivered=True,
+            )
             return
         except ClaudeSignInPending as exc:
             # The pane is parked on a launcher sign-in the person finishes from
