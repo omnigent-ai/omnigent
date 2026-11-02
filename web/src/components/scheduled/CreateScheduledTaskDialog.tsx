@@ -83,8 +83,7 @@ export function CreateScheduledTaskDialog({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Seed values applied to Name/Prompt when the dialog opens (e.g. from a
-   *  "Suggestions" suggestion chip). Omitted → the fields start empty. */
+  /** Seed values applied when opening from a template card. */
   initialName?: string;
   initialPrompt?: string;
   /** Open on a Jira/Slack/GitHub trigger template instead of a plain prompt. */
@@ -277,7 +276,7 @@ export function CreateScheduledTaskDialog({
   // while the dialog stays open. Each fresh open is AUTHORITATIVE — the fields
   // are set to the initial values, or cleared to "" when none are supplied — so
   // a stale prefill can never leak into a subsequent manual open regardless of
-  // how the prior instance was closed, and switching chips reseeds.
+  // how the prior instance was closed, and opening another template reseeds.
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
@@ -357,6 +356,10 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
+  const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
+  useEffect(() => {
+    if (workspaceHostOffline) setWorkspaceBrowserOpen(false);
+  }, [workspaceHostOffline]);
   // Host whose `configured_harnesses` drives the picker's "needs setup" badges.
   // Before a host is picked (or for an older unpinned task), fall back to the
   // first ONLINE host so unconfigured agents show "needs setup" right away.
@@ -764,13 +767,17 @@ export function CreateScheduledTaskDialog({
           {!sandboxMode && hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
-              <p className="text-sm text-muted-foreground">
-                Defaults to the host&apos;s home directory. Pick a directory to pin it.
+              <p id="task-workspace-help" className="text-sm text-muted-foreground">
+                {workspaceHostOffline
+                  ? "Connect your host to select a workspace."
+                  : "Defaults to the host's home directory. Pick a directory to pin it."}
               </p>
               <Button
                 type="button"
                 variant="outline"
                 className="w-full justify-start gap-2"
+                disabled={workspaceHostOffline}
+                aria-describedby="task-workspace-help"
                 onClick={() => setWorkspaceBrowserOpen(true)}
                 data-testid="task-workspace-browse"
               >
@@ -778,7 +785,7 @@ export function CreateScheduledTaskDialog({
                 <span className="truncate">{workspace || "Browse folders…"}</span>
               </Button>
               <WorkspacePickerDialog
-                open={workspaceBrowserOpen}
+                open={workspaceBrowserOpen && !workspaceHostOffline}
                 onOpenChange={setWorkspaceBrowserOpen}
                 hostId={hostId}
                 initialPath={workspace}
