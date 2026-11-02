@@ -471,6 +471,49 @@ async def test_old_codex_with_routing_armed_keeps_user_hooks(
         await server.close()
 
 
+@pytest.mark.parametrize("workspace_is_codex_home_parent", [True, False])
+async def test_user_hooks_are_bridged_only_when_codex_will_not_load_them_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workspace_is_codex_home_parent: bool
+) -> None:
+    """
+    A trusted session in the user's home must not also bridge the user's hooks.
+
+    Codex skips a project ``.codex`` only when it is ``CODEX_HOME``, so with the
+    private home a session whose cwd holds the real Codex home already runs the
+    user's hooks from that project layer. Fails if the private ``hooks.json``
+    repeats them there, or drops them for any other workspace.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real_codex_home = (
+        workspace / ".codex" if workspace_is_codex_home_parent else tmp_path / "real-codex-home"
+    )
+    real_codex_home.mkdir()
+    (real_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command", "command": "user-start"}]}]
+                }
+            }
+        )
+    )
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    _set_codex_version(monkeypatch, (0, 136, 0))
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.trust_project = True
+    await server.start()
+    try:
+        hooks_path = codex_home / "hooks.json"
+        assert not hooks_path.is_symlink()
+        assert ("user-start" in hooks_path.read_text()) is not workspace_is_codex_home_parent
+    finally:
+        await server.close()
+
+
 async def test_trust_failure_is_fail_open_with_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
