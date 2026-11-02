@@ -7,6 +7,21 @@ sink as `event_name` plus string `attributes`; booleans appear as `True` or
 `False`. Deploy both the server and the runner before expecting the fields on
 both ends. Host diagnostics likewise require the updated host and server.
 
+## Missing credentials during runner startup
+
+A never-connected runner whose token source temporarily returns no credential
+retries within its original 120-second window. Its exact-launch marker contains
+only the runner ID and deadline. The host reports `credential_pending` with
+`credential_wait_remaining_s`; the server subtracts query transit time and keeps
+the earliest deadline while retaining the original message and runner binding.
+Repeated status polls cannot renew this window.
+
+Interactive `sign_in_pending` retains its separate 150-second budget. A runner
+that sends a rejected token keeps the ordinary rejection limit; this recovery
+does not extend that failure. Stop, cancellation, process exit and rebinding
+still end the wait. Peers without the optional budget retain ordinary startup
+grace. Updated server, host and runner builds are needed for the full recovery.
+
 ## Host connections
 
 `host_tunnel` rows with `phase = connected` or `disconnected` carry `host_id`

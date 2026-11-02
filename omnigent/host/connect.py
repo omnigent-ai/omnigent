@@ -206,6 +206,7 @@ from omnigent.runner.identity import (
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
+    runner_credential_wait_remaining,
     runner_sign_in_is_pending,
     token_bound_runner_id,
 )
@@ -2573,6 +2574,7 @@ class HostProcess:
             # Shield shared completions from a status request's cancellation.
             await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
+        credential_wait_remaining_s = None
         if handle is None:
             status = "unknown"
         else:
@@ -2593,9 +2595,26 @@ class HostProcess:
                 and not handle.stop_requested
             ):
                 status = "sign_in_pending"
+            elif (
+                status == "alive"
+                and not handle.stop_requested
+                and handle.connect_marker is not None
+            ):
+                credential_wait_remaining_s = await asyncio.to_thread(
+                    runner_credential_wait_remaining, handle.connect_marker, frame.runner_id
+                )
+                if (
+                    credential_wait_remaining_s is not None
+                    and self._runners.get(frame.runner_id) is handle
+                    and not handle.stop_requested
+                ):
+                    status = "credential_pending"
+                else:
+                    credential_wait_remaining_s = None
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
+            credential_wait_remaining_s=credential_wait_remaining_s,
         )
 
     async def _watch_runner(self, runner_id: str) -> None:
@@ -2657,11 +2676,23 @@ class HostProcess:
             handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
         )
         if auth_rejected:
-            error = (
-                "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-                f"on this host, then retry. Details: {error}"
+            from omnigent.runner.transports.ws_tunnel.serve import (
+                RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
             )
+
+            if RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX in error:
+                # The runner sent no credential, so the server did not reject this host.
+                error = (
+                    "The runner had no credential to send, so it could not connect. Check this "
+                    f"host's sign-in with `{cli_invocation()} login {self._login_hint_url()}`, "
+                    f"then retry. Details: {error}"
+                )
+            else:
+                error = (
+                    "The server rejected this host's credentials, so the runner could not "
+                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{self._login_hint_url()}` on this host, then retry. Details: {error}"
+                )
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,

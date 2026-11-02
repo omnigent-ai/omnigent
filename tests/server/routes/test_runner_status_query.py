@@ -12,6 +12,7 @@ the cold path, never slow it down.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,7 +35,7 @@ class _FakeHostConn:
     def __init__(self, host_id: str = "host_test") -> None:
         """Initialize with an empty pending-query map."""
         self.host_id = host_id
-        self.pending_runner_status: dict[str, asyncio.Future[dict[str, str | None]]] = {}
+        self.pending_runner_status: dict[str, asyncio.Future[dict[str, str | float | None]]] = {}
 
 
 class _ReplyingRegistry:
@@ -48,10 +49,11 @@ class _ReplyingRegistry:
         ``"unknown"``).
     """
 
-    def __init__(self, conn: _FakeHostConn, reply: str) -> None:
+    def __init__(self, conn: _FakeHostConn, reply: str, **metadata: object) -> None:
         """Record the connection to resolve against and the canned reply."""
         self._conn = conn
         self._reply = reply
+        self._metadata = metadata
         self.sent: list[str] = []
 
     def send_text(self, conn: _FakeHostConn, data: str) -> None:
@@ -65,7 +67,7 @@ class _ReplyingRegistry:
         assert isinstance(frame, HostRunnerStatusFrame)
         future = conn.pending_runner_status.get(frame.request_id)
         if future is not None and not future.done():
-            future.set_result({"status": self._reply})
+            future.set_result({"status": self._reply, **self._metadata})  # type: ignore[arg-type]
 
 
 class _SilentRegistry:
@@ -125,6 +127,44 @@ async def test_query_returns_host_verdict(verdict: str) -> None:
     assert isinstance(frame, HostRunnerStatusFrame)
     assert frame.runner_id == "runner_x"
     # The pending entry is cleaned up on the reply path.
+    assert conn.pending_runner_status == {}
+
+
+@pytest.mark.parametrize(
+    ("remaining", "expected_status"),
+    [(60.0, "credential_pending"), (120, "credential_pending")]
+    + [
+        (value, "alive")
+        for value in (None, True, False, "60", -1, 0, 121, float("inf"), float("nan"))
+    ],
+)
+async def test_credential_wait_budget_is_bounded_and_excludes_query_transit(
+    monkeypatch: pytest.MonkeyPatch, remaining: object, expected_status: str
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    queried_at = 1000.0
+    monkeypatch.setattr(helpers, "time", SimpleNamespace(monotonic=lambda: queried_at))
+    conn = _FakeHostConn()
+    registry = _ReplyingRegistry(conn, "credential_pending", credential_wait_remaining_s=remaining)
+    original_send = registry.send_text
+
+    def delayed_reply(*args) -> None:
+        nonlocal queried_at
+        queried_at += 3.0
+        original_send(*args)
+
+    monkeypatch.setattr(registry, "send_text", delayed_reply)
+    deadlines: list[float] = []
+    status = await _query_host_runner_status(
+        conn,
+        registry,
+        "runner_x",
+        on_credential_wait=deadlines.append,  # type: ignore[arg-type]
+    )
+
+    assert status == expected_status
+    assert deadlines == ([1000.0 + remaining] if expected_status == "credential_pending" else [])
     assert conn.pending_runner_status == {}
 
 
