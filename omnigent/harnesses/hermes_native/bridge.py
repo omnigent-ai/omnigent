@@ -65,28 +65,23 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # detected by the pane settling (no byte changes across consecutive captures).
 # This many stable polls in a row marks the input box ready.
 _SETTLE_STABLE_POLLS = 3
-# On a NEW session, Hermes blocks its prompt_toolkit input loop while it cold-
-# starts the Omnigent MCP server (a heavyweight ``python -m`` subprocess). A
-# paste delivered during that window is silently dropped — the pane can look
-# "settled" (a static banner) even though no widget is capturing keys yet. A
-# dropped first message is doubly bad: it not only loses the turn, it permanently
-# off-by-ones the server's pending-input FIFO (see
-# :mod:`omnigent.runtime.pending_inputs` — the i-th persisted user row drains the
-# i-th queued web message), scrambling EVERY later message's reconciliation.
-#
-# The settle heuristic cannot tell "static banner" from "ready prompt", so we
-# confirm delivery against Hermes' OWN store instead: an accepted turn writes a
-# new ``messages`` row (Hermes flushes a row per agentic step), so a new row
-# appearing is the authoritative "message accepted" signal. If none appears we
-# re-deliver ONCE — safe against double-delivery precisely because the store
-# confirmed nothing landed — and otherwise raise so the turn fails cleanly (its
-# optimistic bubble rolls back) rather than silently desyncing the FIFO.
+# A fresh Hermes TUI reads no input for 15-25 s while it boots (plugin discovery,
+# state.db init, MCP registration, agent init); a paste sent meanwhile is silently
+# dropped even though the pane looks settled. :func:`inject_user_message` therefore
+# confirms delivery against Hermes' own store and re-drives it until a deadline.
+# Pane-settle budget for each re-delivery (the first uses the caller's timeout).
 _RETRY_SETTLE_S = 10.0
 # How long to wait for Hermes to persist a new ``messages`` row confirming it
 # accepted the injected turn. Generous: assistant rows stream within seconds of
 # acceptance, so a confirmation this slow means the keystrokes were dropped.
 _DELIVERY_CONFIRM_TIMEOUT_S = 12.0
 _DELIVERY_POLL_INTERVAL_S = 0.3
+# Total budget for Hermes to accept the message, measured from the first paste.
+# Sized to out-wait a fresh TUI's 15-25 s boot with margin for a slow host; a TUI
+# that still reads no input by then is wedged, not booting.
+_DELIVERY_DEADLINE_S = 75.0
+# Pause before each re-delivery; the last value repeats for later rounds.
+_REDELIVERY_BACKOFF_S = (2.0, 4.0, 8.0)
 
 
 def mint_hermes_session_id() -> str:
@@ -814,13 +809,16 @@ def inject_user_message(
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
     submits), settles, then submits with a *single* Enter.
 
-    On a NEW session Hermes blocks input while cold-starting its MCP server, so
-    the first paste can be silently dropped — and a dropped first message
-    permanently off-by-ones the server's pending-input FIFO, scrambling every
-    later turn. To prevent that, when Hermes' ``state.db`` is readable we confirm
-    the turn landed (a new ``messages`` row appears); if it didn't we re-deliver
-    ONCE (safe — the store proved nothing landed, so this can't double-submit) and
-    otherwise raise so the turn fails cleanly instead of desyncing the FIFO.
+    On a NEW session Hermes reads no input until its 15-25 s boot finishes, so the
+    first paste can be silently dropped — and a dropped first message permanently
+    off-by-ones the server's pending-input FIFO (:mod:`omnigent.runtime.pending_inputs`:
+    the i-th persisted user row drains the i-th queued web message), scrambling every
+    later turn. To prevent that, when Hermes' ``state.db`` is readable we confirm the
+    turn landed (Hermes writes a ``messages`` row per agentic step, so a new row is
+    its own "accepted" signal); until it does we keep re-delivering with backoff —
+    Enter alone when the pasted draft is already on screen, a fresh paste otherwise —
+    up to :data:`_DELIVERY_DEADLINE_S`, then raise so the turn fails cleanly (its
+    optimistic bubble rolls back) instead of desyncing the FIFO.
 
     :param bridge_dir: The hermes-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).
@@ -844,7 +842,12 @@ def inject_user_message(
     # is unambiguous proof Hermes accepted this turn.
     db_path = _state_db_path(bridge_dir)
     baseline_id = _max_message_id(db_path) if db_path is not None else None
+    # A needle already on screen (a prior turn's echo of the same text) cannot
+    # attest that THIS paste committed, so retries then re-paste instead.
+    needle_attests_paste = bool(needle) and needle not in _capture_pane(socket_path, tmux_target)
 
+    started = time.monotonic()
+    deadline = started + _DELIVERY_DEADLINE_S
     _deliver_once(
         socket_path, tmux_target, content, bridge_dir, needle, settle_timeout_s=timeout_s
     )
@@ -853,20 +856,41 @@ def inject_user_message(
         # No readable store to confirm against — best-effort single delivery,
         # preserving prior behavior for setups without a per-session HERMES_HOME.
         return
-    if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
-        return
-    # The first delivery did not land (the TUI was still initializing). Re-deliver
-    # once — the store confirmed no row was written, so there is no double-submit
-    # risk — giving the pane a longer settle to let MCP startup finish.
-    _deliver_once(
-        socket_path, tmux_target, content, bridge_dir, needle, settle_timeout_s=_RETRY_SETTLE_S
-    )
-    if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
-        return
-    raise RuntimeError(
-        "hermes did not accept the message (the TUI may still be initializing); "
-        "no new transcript row appeared after two delivery attempts"
-    )
+    attempts = 1
+    while True:
+        if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
+            if attempts > 1:
+                _logger.info(
+                    "hermes accepted the message on attempt %d, %.1fs after the first paste",
+                    attempts,
+                    time.monotonic() - started,
+                )
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"hermes did not accept the message within {_DELIVERY_DEADLINE_S:.0f}s "
+                "(the TUI may still be initializing); no new transcript row appeared "
+                f"after {attempts} delivery attempts"
+            )
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "hermes terminal exited before accepting the message; restart the session"
+            )
+        time.sleep(_REDELIVERY_BACKOFF_S[min(attempts - 1, len(_REDELIVERY_BACKOFF_S) - 1)])
+        if needle_attests_paste and needle in _capture_pane(socket_path, tmux_target):
+            # The draft committed but its Enter was dropped or folded into the paste:
+            # submit it as-is — a re-paste would double the text.
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        else:
+            _deliver_once(
+                socket_path,
+                tmux_target,
+                content,
+                bridge_dir,
+                needle,
+                settle_timeout_s=_RETRY_SETTLE_S,
+            )
+        attempts += 1
 
 
 def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
