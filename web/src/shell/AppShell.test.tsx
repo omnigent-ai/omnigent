@@ -44,6 +44,7 @@ import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
+  hostOnline: true as boolean | null,
 }));
 const realUseSession = vi.hoisted(() => ({
   hook: null as unknown as typeof UseSessionModule.useSession,
@@ -57,7 +58,7 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   // replaced so tests can pin runner/host liveness directly.
   ...(await importOriginal<typeof RunnerHealthModule>()),
   useSessionRunnerOnline: () => runnerHealthState.runnerOnline,
-  useSessionHostOnline: () => true,
+  useSessionHostOnline: () => runnerHealthState.hostOnline,
 }));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
@@ -310,6 +311,11 @@ const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
+import {
+  claimPendingShellInput,
+  hasPendingShellInput,
+  useShellCommandOpener,
+} from "@/lib/shellCommand";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
@@ -676,6 +682,7 @@ function withWindowOrigin(origin: string, run: () => void) {
 
 beforeEach(() => {
   runnerHealthState.runnerOnline = undefined;
+  runnerHealthState.hostOnline = true;
   useConvMock.mockReset();
   useTerminalsMock.mockReset();
   useTerminalsMock.mockReturnValue({
@@ -2165,45 +2172,45 @@ describe("Workspace rail maximize", () => {
   });
 });
 
-describe("Sidebar across the md breakpoint", () => {
-  // Resizable viewport: matchMedia answers the md queries from `width` and
-  // fires change listeners for the queries a resize flips.
-  function mockViewportWidth(initialWidth: number) {
-    let width = initialWidth;
-    const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-    const matches = (query: string) => {
-      if (query === "(min-width: 768px)") return width >= 768;
-      if (query === "(max-width: 767.98px)") return width < 768;
-      return false;
-    };
-    const baseMatchMedia = window.matchMedia;
-    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
-      ...baseMatchMedia(query),
-      matches: matches(query),
-      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (!listeners.has(query)) listeners.set(query, new Set());
-        listeners.get(query)?.add(listener);
-      },
-      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        listeners.get(query)?.delete(listener);
-      },
-    }));
-    onTestFinished(() => matchMedia.mockRestore());
-    return (nextWidth: number) =>
-      act(() => {
-        const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
-        width = nextWidth;
-        for (const [query, queryListeners] of listeners) {
-          const event = { matches: matches(query), media: query } as MediaQueryListEvent;
-          if (before.get(query) === event.matches) continue;
-          for (const listener of queryListeners) {
-            if (typeof listener === "function") listener(event);
-            else listener.handleEvent(event);
-          }
+// Resizable viewport: matchMedia answers the md queries from `width` and
+// fires change listeners for the queries a resize flips.
+function mockViewportWidth(initialWidth: number) {
+  let width = initialWidth;
+  const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  const matches = (query: string) => {
+    if (query === "(min-width: 768px)") return width >= 768;
+    if (query === "(max-width: 767.98px)") return width < 768;
+    return false;
+  };
+  const baseMatchMedia = window.matchMedia;
+  const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+    ...baseMatchMedia(query),
+    matches: matches(query),
+    addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      if (!listeners.has(query)) listeners.set(query, new Set());
+      listeners.get(query)?.add(listener);
+    },
+    removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      listeners.get(query)?.delete(listener);
+    },
+  }));
+  onTestFinished(() => matchMedia.mockRestore());
+  return (nextWidth: number) =>
+    act(() => {
+      const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+      width = nextWidth;
+      for (const [query, queryListeners] of listeners) {
+        const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+        if (before.get(query) === event.matches) continue;
+        for (const listener of queryListeners) {
+          if (typeof listener === "function") listener(event);
+          else listener.handleEvent(event);
         }
-      });
-  }
+      }
+    });
+}
 
+describe("Sidebar across the md breakpoint", () => {
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
     const resize = mockViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
@@ -5927,5 +5934,220 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("AppShell open in shell", () => {
+  function ShellOpenerProbe() {
+    const openShellCommand = useShellCommandOpener();
+    const location = useLocation();
+    if (openShellCommand === null) return <div>no shell opener</div>;
+    return (
+      <>
+        <button type="button" onClick={() => openShellCommand("npm test")}>
+          open command
+        </button>
+        <Link to="/c/conv_other">other session</Link>
+        <div data-testid="probe-path">{location.pathname}</div>
+      </>
+    );
+  }
+
+  function renderOpenerProbe(
+    permissionLevel: number,
+    terminals = ["zsh"],
+    binding: { host_id?: string | null; created_at?: number } = {},
+  ) {
+    mockConversations([
+      { id: "conv_sdk", permission_level: permissionLevel, ...binding },
+      { id: "conv_other", permission_level: permissionLevel },
+    ]);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals },
+    } as ReturnType<typeof useSessionAgent>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(sessionShellTree(client, "/c/conv_sdk", <ShellOpenerProbe />));
+  }
+
+  afterEach(() => {
+    claimPendingShellInput("conv_sdk", "terminal_zsh_u1");
+    vi.unstubAllGlobals();
+  });
+
+  function createdShellResponse() {
+    return new Response(
+      JSON.stringify({
+        id: "terminal_zsh_u1",
+        metadata: { terminal_name: "zsh", session_key: "u1", running: true },
+      }),
+      { status: 201, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  /** Stub fetch so the create POST waits for the returned ``finish``. */
+  function deferShellCreate() {
+    let finishCreate: (response: Response) => void = () => {};
+    const fetchMock = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          if (init?.method === "POST") finishCreate = resolve;
+          else resolve(new Response("{}", { status: 200 }));
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const posts = () => fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    return { posts, finish: (response: Response) => finishCreate(response) };
+  }
+
+  it("creates the default shell and queues the command for its first prompt", async () => {
+    mockViewportWidth(1280);
+    writeSessionWorkspaceState("conv_sdk", { open: false });
+    const fetchMock = vi.fn(async () => createdShellResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    renderOpenerProbe(4);
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+    const createCall = (
+      fetchMock.mock.calls as unknown as [string, RequestInit | undefined][]
+    ).find(
+      ([url, init]) =>
+        url === "/v1/sessions/conv_sdk/resources/terminals" && init?.method === "POST",
+    );
+    expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({ terminal: "zsh" });
+    await waitFor(() =>
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument(),
+    );
+    expect(claimPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe("npm test");
+  });
+
+  it("opens the new shell full screen on a phone", async () => {
+    // WHY: the Workspace rail is hidden below md, so a rail tab would leave
+    // the pasted command out of sight.
+    mockViewportWidth(390);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => createdShellResponse()),
+    );
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open"),
+    );
+    expect(screen.getByTestId("terminals-panel").getAttribute("data-initial-key")).toContain("zsh");
+    expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true);
+  });
+
+  it("tells the user when the shell can't be created", async () => {
+    const errorToast = vi.spyOn(toast, "error");
+    onTestFinished(() => errorToast.mockRestore());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: "terminal limit reached" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    );
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+
+    await waitFor(() => expect(errorToast).toHaveBeenCalled());
+    expect(errorToast.mock.calls[0][0]).toBe("Couldn't open a shell");
+    expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(false);
+  });
+
+  it("doesn't start a second shell while one is still being created", async () => {
+    const infoToast = vi.spyOn(toast, "info");
+    onTestFinished(() => infoToast.mockRestore());
+    const create = deferShellCreate();
+    renderOpenerProbe(4);
+    const button = screen.getByRole("button", { name: "open command" });
+
+    fireEvent.click(button);
+    await waitFor(() => expect(create.posts()).toHaveLength(1));
+    fireEvent.click(button);
+
+    expect(infoToast).toHaveBeenCalledWith("A shell is already opening", expect.anything());
+    expect(create.posts()).toHaveLength(1);
+    create.finish(createdShellResponse());
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+  });
+
+  it("leaves the session the user moved to alone when a phone create finishes", async () => {
+    // WHY: the shell belongs to the first session; revealing it would take
+    // over the second session's screen.
+    mockViewportWidth(390);
+    const create = deferShellCreate();
+    renderOpenerProbe(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+    await waitFor(() => expect(create.posts()).toHaveLength(1));
+    fireEvent.click(screen.getByRole("link", { name: "other session" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other"),
+    );
+    create.finish(createdShellResponse());
+
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+    expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other");
+    expect(screen.queryByTestId("terminals-panel")?.getAttribute("data-state")).not.toBe("open");
+  });
+
+  it("leaves the session the user moved to alone when a desktop create finishes", async () => {
+    mockViewportWidth(1280);
+    writeSessionWorkspaceState("conv_sdk", { open: false });
+    writeSessionWorkspaceState("conv_other", { open: false });
+    const create = deferShellCreate();
+    renderOpenerProbe(4);
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "open command" }));
+    await waitFor(() => expect(create.posts()).toHaveLength(1));
+    fireEvent.click(screen.getByRole("link", { name: "other session" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other"),
+    );
+    create.finish(createdShellResponse());
+
+    await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
+    expect(screen.getByTestId("probe-path")).toHaveTextContent("/c/conv_other");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(readSessionWorkspaceState("conv_other")?.open).toBe(false);
+  });
+
+  it("offers no opener to a viewer who would attach read-only", () => {
+    renderOpenerProbe(1);
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
+  });
+
+  it("offers no opener when the agent declares no shells", () => {
+    renderOpenerProbe(4, []);
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
+  });
+
+  it("offers no opener while the session's host is offline", () => {
+    runnerHealthState.hostOnline = false;
+    runnerHealthState.runnerOnline = false;
+    renderOpenerProbe(4, ["zsh"], { host_id: "host_laptop" });
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
+  });
+
+  it("offers no opener for a local session whose runner is gone", () => {
+    runnerHealthState.hostOnline = null;
+    runnerHealthState.runnerOnline = false;
+    renderOpenerProbe(4, ["zsh"], { host_id: null, created_at: 0 });
+
+    expect(screen.getByText("no shell opener")).toBeInTheDocument();
   });
 });

@@ -9,6 +9,8 @@
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  SHELL_PASTE_ACK_TIMEOUT_MS,
+  SHELL_PASTE_LATE_RESULT_MS,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
@@ -1247,5 +1249,349 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+
+  describe("pasteWhenShellReady", () => {
+    function inputFrames(socket: FakeWebSocket): string[] {
+      return socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    }
+
+    function pasteFrames(socket: FakeWebSocket, type = "paste"): unknown[] {
+      return socket.sent.flatMap((frame) => {
+        if (typeof frame !== "string") return [];
+        const message = JSON.parse(frame) as { type?: string };
+        return message.type === type ? [message] : [];
+      });
+    }
+
+    function answerPaste(socket: FakeWebSocket, result: object) {
+      socket.emit("message", { data: JSON.stringify({ type: "paste-result", ...result }) });
+    }
+
+    function acceptPaste(socket: FakeWebSocket, id: number) {
+      socket.emit("message", { data: JSON.stringify({ type: "paste-accepted", id }) });
+    }
+
+    async function writePane(socket: FakeWebSocket, session: TerminalSession, text: string) {
+      const term = (session as unknown as { term: Terminal }).term;
+      const bytes = new TextEncoder().encode(text);
+      const data = new ArrayBuffer(bytes.length);
+      new Uint8Array(data).set(bytes);
+      socket.emit("message", { data });
+      await new Promise<void>((resolve) => {
+        term.write("", resolve);
+      });
+    }
+
+    it("hands the command to the bridge once the socket opens", () => {
+      // WHY: the bridge waits for the shell's prompt and pastes with tmux, so
+      // the browser must not type the lines itself, where Enter would run them.
+      const { socket, session } = makeSession();
+      const claim = vi.fn(() => "echo one\necho two");
+      session.pasteWhenShellReady(claim);
+      expect(claim).not.toHaveBeenCalled();
+
+      socket.open();
+
+      expect(claim).toHaveBeenCalledTimes(1);
+      expect(pasteFrames(socket)).toEqual([{ type: "paste", id: 1, text: "echo one\necho two" }]);
+      expect(inputFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    it("reports nothing after the bridge pasted", () => {
+      vi.useFakeTimers();
+      try {
+        const { socket, session } = makeSession();
+        const refused = vi.fn();
+        socket.open();
+        session.pasteWhenShellReady(() => "ls", refused);
+        answerPaste(socket, { id: 1, pasted: true });
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
+
+        expect(inputFrames(socket)).toEqual([]);
+        expect(refused).not.toHaveBeenCalled();
+        session.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("reports a command the bridge refused", () => {
+      const { socket, session } = makeSession();
+      const refused: [string, string][] = [];
+      socket.open();
+      session.pasteWhenShellReady(
+        () => "echo one\necho two",
+        (text, reason) => refused.push([text, reason]),
+      );
+
+      answerPaste(socket, { id: 99, pasted: false, reason: "not-ready" });
+      expect(refused).toEqual([]);
+      answerPaste(socket, { id: 1, pasted: false, reason: "not-ready" });
+      session.pasteWhenShellReady(
+        () => "ls\npwd",
+        (text, reason) => refused.push([text, reason]),
+      );
+      answerPaste(socket, { id: 2, pasted: false, reason: "unsafe" });
+
+      expect(refused).toEqual([
+        ["echo one\necho two", "not-ready"],
+        ["ls\npwd", "unsafe"],
+      ]);
+      expect(inputFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    it("tells the caller when the socket closes before the bridge answers", () => {
+      // WHY: the bridge may already have pasted, so the browser can't retry,
+      // but the user must know to check the prompt.
+      vi.useFakeTimers();
+      try {
+        const { socket, session } = makeSession();
+        const refused: [string, string][] = [];
+        socket.open();
+        session.pasteWhenShellReady(
+          () => "make deploy",
+          (text, reason) => refused.push([text, reason]),
+        );
+        // Unacknowledged, so the close must also stop the xterm fallback.
+        socket.readyState = FakeWebSocket.CLOSED;
+        socket.emit("close", { code: 1006, reason: "" });
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
+
+        expect(refused).toEqual([["make deploy", "interrupted"]]);
+        expect(inputFrames(socket)).toEqual([]);
+        // The next command stays queued for the view's next session to claim.
+        const claim = vi.fn(() => "pwd");
+        session.pasteWhenShellReady(claim);
+        expect(claim).not.toHaveBeenCalled();
+        expect(pasteFrames(socket)).toHaveLength(1);
+        session.dispose();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("tells the caller when the session is disposed before the bridge answers", () => {
+      // WHY: dispose aborts the close listener, and the chat already handed
+      // the command over, so this is the user's only notice.
+      vi.useFakeTimers();
+      try {
+        const { socket, session } = makeSession();
+        const refused: [string, string][] = [];
+        socket.open();
+        session.pasteWhenShellReady(
+          () => "make deploy",
+          (text, reason) => refused.push([text, reason]),
+        );
+        session.dispose();
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
+
+        expect(refused).toEqual([["make deploy", "interrupted"]]);
+        expect(inputFrames(socket)).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("resolves whenShellPasteIdle once the bridge answers", async () => {
+      const { socket, session } = makeSession();
+      socket.open();
+      await session.whenShellPasteIdle();
+      session.pasteWhenShellReady(() => "ls");
+      let idle = false;
+      void session.whenShellPasteIdle().then(() => {
+        idle = true;
+      });
+      acceptPaste(socket, 1);
+      await Promise.resolve();
+      expect(idle).toBe(false);
+
+      answerPaste(socket, { id: 1, pasted: true });
+      await Promise.resolve();
+      expect(idle).toBe(true);
+      session.dispose();
+    });
+
+    it("stays busy while the next queued paste goes out", async () => {
+      // WHY: a waiter that resumed after the next paste started would re-dial
+      // mid-paste and drop that command.
+      const { socket, session } = makeSession();
+      socket.open();
+      session.pasteWhenShellReady(() => "ls");
+      session.pasteWhenShellReady(() => "pwd");
+      let idle = false;
+      void session.whenShellPasteIdle().then(() => {
+        idle = true;
+      });
+
+      answerPaste(socket, { id: 1, pasted: true });
+      await Promise.resolve();
+      expect(pasteFrames(socket)).toMatchObject([{ id: 1 }, { id: 2 }]);
+      expect(session.hasShellPasteInFlight()).toBe(true);
+      expect(idle).toBe(false);
+
+      answerPaste(socket, { id: 2, pasted: true });
+      await Promise.resolve();
+      expect(idle).toBe(true);
+      session.dispose();
+    });
+
+    it("does nothing when the input was already claimed elsewhere", () => {
+      const { socket, session } = makeSession();
+      session.pasteWhenShellReady(() => null);
+      socket.open();
+
+      expect(pasteFrames(socket)).toEqual([]);
+      session.dispose();
+    });
+
+    describe("when the runner never answers", () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it.each([
+        ["a single line", "ls -la"],
+        ["editor keystrokes without a newline", "ggdGZZ"],
+        ["several lines", "echo one\necho two"],
+      ])("refuses %s instead of typing it, even in bracketed mode", async (_case, text) => {
+        // WHY: an old runner can't say what reads the pane; typed keys could
+        // edit a file or answer a startup question without Enter.
+        const { socket, session } = makeSession();
+        socket.open();
+        await writePane(socket, session, "\x1b[?2004h$ ");
+        vi.useFakeTimers();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => text,
+          (refusedText, reason) => refused.push([refusedText, reason]),
+        );
+
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS - 1);
+        expect(refused).toEqual([]);
+        vi.advanceTimersByTime(1);
+
+        expect(inputFrames(socket)).toEqual([]);
+        expect(pasteFrames(socket, "paste-cancel")).toEqual([{ type: "paste-cancel", id: 1 }]);
+        expect(refused).toEqual([[text, "unsupported"]]);
+        // A late refusal (the bridge honored the cancel) changes nothing.
+        answerPaste(socket, { id: 1, pasted: false, reason: "cancelled" });
+        expect(refused).toEqual([[text, "unsupported"]]);
+        session.dispose();
+      });
+
+      it("warns when a slow bridge pasted a command the browser gave up on", () => {
+        // WHY: the user was told it wasn't pasted, yet it now sits at the prompt.
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "echo one\necho two",
+          (text, reason) => refused.push([text, reason]),
+        );
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        acceptPaste(socket, 1);
+        answerPaste(socket, { id: 1, pasted: true });
+        answerPaste(socket, { id: 1, pasted: true });
+
+        expect(refused).toEqual([
+          ["echo one\necho two", "unsupported"],
+          ["echo one\necho two", "late"],
+        ]);
+        session.dispose();
+      });
+
+      it("warns about an unanswered abandoned paste when the socket closes", () => {
+        // WHY: a slow bridge may have pasted after all; its answer can no longer arrive.
+        vi.useFakeTimers();
+        const refused: [string, string][] = [];
+        const onRefused = (text: string, reason: string) => refused.push([text, reason]);
+        const recent = makeSession();
+        recent.socket.open();
+        recent.session.pasteWhenShellReady(() => "ls", onRefused);
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        recent.socket.readyState = FakeWebSocket.CLOSED;
+        recent.socket.emit("close", { code: 1006, reason: "" });
+        expect(refused).toEqual([
+          ["ls", "unsupported"],
+          ["ls", "interrupted"],
+        ]);
+        recent.session.dispose();
+
+        // Past the window a current bridge would have answered.
+        refused.length = 0;
+        const settled = makeSession();
+        settled.socket.open();
+        settled.session.pasteWhenShellReady(() => "pwd", onRefused);
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS + SHELL_PASTE_LATE_RESULT_MS);
+        settled.socket.readyState = FakeWebSocket.CLOSED;
+        settled.socket.emit("close", { code: 1006, reason: "" });
+        expect(refused).toEqual([["pwd", "unsupported"]]);
+        settled.session.dispose();
+      });
+
+      it("reports a paste interrupted once when the socket is closing at the timeout", () => {
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "ls",
+          (text, reason) => refused.push([text, reason]),
+        );
+        socket.readyState = 2;
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        socket.readyState = FakeWebSocket.CLOSED;
+        socket.emit("close", { code: 1006, reason: "" });
+
+        expect(pasteFrames(socket, "paste-cancel")).toEqual([]);
+        expect(refused).toEqual([["ls", "interrupted"]]);
+        session.dispose();
+      });
+
+      it("forgets an abandoned paste quietly when the view is torn down", () => {
+        // WHY: closing the shell on purpose is not a dropped connection.
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "ls",
+          (text, reason) => refused.push([text, reason]),
+        );
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+
+        session.dispose();
+        expect(refused).toEqual([["ls", "unsupported"]]);
+      });
+
+      it("waits past the timeout once the bridge accepted the paste", async () => {
+        // WHY: a bridge waiting for a slow prompt may still paste; a refusal
+        // toast meanwhile would be wrong.
+        const { socket, session } = makeSession();
+        socket.open();
+        await writePane(socket, session, "\x1b[?2004h$ ");
+        vi.useFakeTimers();
+        const refused: string[] = [];
+        session.pasteWhenShellReady(
+          () => "ls -la",
+          (text) => refused.push(text),
+        );
+        acceptPaste(socket, 1);
+
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS * 2);
+        expect(inputFrames(socket)).toEqual([]);
+        answerPaste(socket, { id: 1, pasted: true });
+
+        expect(inputFrames(socket)).toEqual([]);
+        expect(refused).toEqual([]);
+        session.dispose();
+      });
+    });
   });
 });

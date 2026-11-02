@@ -4,11 +4,17 @@ import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
+import {
+  isShellCodeClassName,
+  isShellSessionClassName,
+  shellCommandFromCodeBlock,
+  useShellCommandOpener,
+} from "@/lib/shellCommand";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
-import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, SquareTerminalIcon, XIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -589,9 +595,38 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
+function ChatCodeBlockOpenInShellButton({ onOpen }: { onOpen: () => void }) {
+  return (
+    <Button
+      aria-label="Open in shell"
+      className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+      onClick={onOpen}
+      size="icon-sm"
+      title="Open in shell"
+      type="button"
+      variant="ghost"
+    >
+      <SquareTerminalIcon />
+    </Button>
+  );
+}
+
+function codeClassName(children: ReactNode): string | undefined {
+  return isValidElement<{ className?: string }>(children) ? children.props.className : undefined;
+}
+
 export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
+  const openShellCommand = useShellCommandOpener();
+  const className = codeClassName(children);
+  const shellCommand =
+    openShellCommand !== null && isShellCodeClassName(className)
+      ? shellCommandFromCodeBlock(code, isShellSessionClassName(className))
+      : "";
+  const openInShell = useCallback(() => {
+    if (shellCommand !== "") openShellCommand?.(shellCommand);
+  }, [openShellCommand, shellCommand]);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for when column alignment matters.
@@ -614,6 +649,7 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
+        {shellCommand !== "" && <ChatCodeBlockOpenInShellButton onOpen={openInShell} />}
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>

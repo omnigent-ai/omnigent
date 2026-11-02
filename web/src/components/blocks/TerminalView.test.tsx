@@ -18,11 +18,12 @@ import { toast } from "sonner";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
 import { resolveInitialAttachUrl, watchDirectUpgrade } from "@/lib/terminals";
+import { claimPendingShellInput, queuePendingShellInput } from "@/lib/shellCommand";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
-import type { ConnectionState } from "./TerminalSession";
+import type { ConnectionState, ShellPasteRefusedHandler } from "./TerminalSession";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -69,6 +70,8 @@ function FileViewerHarness({
 }
 
 const terminalSessionMock = vi.hoisted(() => ({
+  /** What each session's whenShellPasteIdle returns; null resolves at once. */
+  pasteIdle: null as Promise<void> | null,
   instances: [] as {
     url: string;
     container: HTMLDivElement;
@@ -81,6 +84,10 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    pasteWhenShellReady: ReturnType<
+      typeof vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>
+    >;
+    whenShellPasteIdle: ReturnType<typeof vi.fn<() => Promise<void>>>;
   }[],
 }));
 
@@ -93,6 +100,10 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    pasteWhenShellReady =
+      vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>();
+    whenShellPasteIdle = vi.fn(() => terminalSessionMock.pasteIdle ?? Promise.resolve());
+    hasShellPasteInFlight = vi.fn(() => terminalSessionMock.pasteIdle !== null);
 
     constructor(
       container: HTMLDivElement,
@@ -119,6 +130,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        pasteWhenShellReady: this.pasteWhenShellReady,
+        whenShellPasteIdle: this.whenShellPasteIdle,
       });
     }
   },
@@ -129,6 +142,7 @@ beforeEach(() => {
   act(() => toast.dismiss());
   render(<Toaster visibleToasts={100} />);
   terminalSessionMock.instances = [];
+  terminalSessionMock.pasteIdle = null;
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
   vi.mocked(resolveInitialAttachUrl).mockReset();
   vi.mocked(watchDirectUpgrade).mockReset();
@@ -231,6 +245,66 @@ describe("control-mode terminal", () => {
       terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
     ).toBe(true);
     expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42, endLine: 50 });
+  });
+});
+
+describe("pending shell input", () => {
+  afterEach(() => {
+    claimPendingShellInput("conv_abc", "terminal_bash_s1");
+    claimPendingShellInput("conv_abc", "terminal_other");
+  });
+
+  it("hands input queued before the attach to the session once", async () => {
+    queuePendingShellInput("conv_abc", "terminal_bash_s1", "npm test");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const paste = terminalSessionMock.instances[0].pasteWhenShellReady;
+    expect(paste).toHaveBeenCalledTimes(1);
+    const [claim] = paste.mock.calls[0];
+    expect(claim()).toBe("npm test");
+    expect(claim()).toBeNull();
+  });
+
+  it("hands input queued after the attach to the live session", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const paste = terminalSessionMock.instances[0].pasteWhenShellReady;
+    expect(paste).not.toHaveBeenCalled();
+
+    act(() => queuePendingShellInput("conv_abc", "terminal_other", "ls"));
+    expect(paste).not.toHaveBeenCalled();
+    act(() => queuePendingShellInput("conv_abc", "terminal_bash_s1", "ls"));
+
+    expect(paste).toHaveBeenCalledTimes(1);
+    expect(paste.mock.calls[0][0]()).toBe("ls");
+  });
+
+  it("leaves queued input alone on a read-only attach", async () => {
+    queuePendingShellInput("conv_abc", "terminal_bash_s1", "ls");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    expect(terminalSessionMock.instances[0].pasteWhenShellReady).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unsafe", "Command not pasted", /couldn't take this command without running it/],
+    ["not-ready", "Command not pasted", /didn't reach an empty prompt/],
+    ["interrupted", "Command may not have been pasted", /Check the prompt before pressing Enter/],
+    ["unsupported", "Command not pasted", /update Omnigent there/],
+    ["late", "Command pasted after all", /Check the prompt before pressing Enter/],
+    ["failed", "Command not pasted", /couldn't paste this command/],
+  ] as const)("explains a %s refusal", async (reason, title, description) => {
+    queuePendingShellInput("conv_abc", "terminal_bash_s1", "a\nb");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const [, onRefused] = terminalSessionMock.instances[0].pasteWhenShellReady.mock.calls[0];
+    act(() => onRefused?.("a\nb", reason));
+
+    expect(await screen.findByText(title)).toBeInTheDocument();
+    expect(screen.getByText(description)).toBeInTheDocument();
   });
 });
 
@@ -1253,6 +1327,33 @@ describe("unmount", () => {
     expect(terminalSessionMock.instances).toHaveLength(0);
   });
 
+  it("waits for an in-flight shell paste before re-dialing the direct path", async () => {
+    // WHY: the chat already handed the command to this session; a re-dial
+    // mid-paste would drop it.
+    let pasteIdle: () => void = () => {};
+    terminalSessionMock.pasteIdle = new Promise<void>((resolve) => {
+      pasteIdle = resolve;
+    });
+    vi.mocked(resolveInitialAttachUrl).mockImplementationOnce(async (_direct, relay) => relay);
+    vi.mocked(watchDirectUpgrade).mockResolvedValueOnce(true);
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={DIRECT_URL}
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const relaySession = terminalSessionMock.instances[0];
+    await waitFor(() => expect(relaySession.whenShellPasteIdle).toHaveBeenCalled());
+    expect(relaySession.dispose).not.toHaveBeenCalled();
+
+    act(() => pasteIdle());
+
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(relaySession.dispose).toHaveBeenCalled();
+  });
+
   it("keeps the upgrade watch live under StrictMode and aborts it on unmount", async () => {
     let upgradeSignal: AbortSignal | undefined;
     vi.mocked(resolveInitialAttachUrl).mockImplementationOnce(async (_direct, relay) => relay);
@@ -1332,6 +1433,49 @@ describe("late direct-attach advert", () => {
     expect(readvertised).not.toBe(relayed);
     expect(readvertised.container).toBe(relayed.container);
     expect(relayed.dispose).toHaveBeenCalled();
+  });
+
+  it("lets an in-flight shell paste finish before the advert retires the session", async () => {
+    // WHY: the chat already handed the command to this session; retiring it
+    // mid-paste would lose the command.
+    const props = { sessionId: "conv_abc", terminalId: "terminal_bash_s1" };
+    const { rerender } = render(<TerminalView {...props} />);
+    await act(async () => {});
+    const relayed = terminalSessionMock.instances[0];
+    let pasteIdle: () => void = () => {};
+    terminalSessionMock.pasteIdle = new Promise<void>((resolve) => {
+      pasteIdle = resolve;
+    });
+
+    rerender(
+      <TerminalView
+        {...props}
+        directAttachUrl={
+          "ws://127.0.0.1:54321/v1/sessions/conv_abc" +
+          "/resources/terminals/terminal_bash_s1/attach?token=t"
+        }
+      />,
+    );
+    await act(async () => {});
+    expect(relayed.dispose).not.toHaveBeenCalled();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    act(() => pasteIdle());
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(relayed.dispose).toHaveBeenCalled();
+    expect(terminalSessionMock.instances[1].container).toBe(relayed.container);
+  });
+
+  it("retires a session mid-paste at once when the attach target changes", async () => {
+    const props = { sessionId: "conv_abc", terminalId: "terminal_bash_s1" };
+    const { rerender } = render(<TerminalView {...props} />);
+    await act(async () => {});
+    const writable = terminalSessionMock.instances[0];
+    terminalSessionMock.pasteIdle = new Promise<void>(() => {});
+
+    rerender(<TerminalView {...props} readOnly />);
+
+    expect(writable.dispose).toHaveBeenCalled();
   });
 });
 

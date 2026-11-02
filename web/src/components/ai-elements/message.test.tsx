@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
+import { ShellCommandOpenerContext } from "@/lib/shellCommand";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
 import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
@@ -380,5 +381,55 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse open in shell", () => {
+  it("offers shell code blocks to the shell opener with the prompt stripped", async () => {
+    const opened: string[] = [];
+    render(
+      <ShellCommandOpenerContext.Provider value={(command) => opened.push(command)}>
+        <MessageResponse>{"```bash\n$ npm install\n$ npm test\n```"}</MessageResponse>
+      </ShellCommandOpenerContext.Provider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open in shell" }));
+
+    expect(opened).toEqual(["npm install\nnpm test"]);
+  });
+
+  it("does not offer non-shell code blocks", async () => {
+    render(
+      <ShellCommandOpenerContext.Provider value={() => {}}>
+        <MessageResponse>{"```python\nprint('hi')\n```"}</MessageResponse>
+      </ShellCommandOpenerContext.Provider>,
+    );
+
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Open in shell" })).toBeNull();
+  });
+
+  it.each([
+    [
+      "a pipeline it can't separate from output",
+      "```console\n$ printf 'one\\n' |\n> sed 's/one/two/'\ntwo\n```",
+    ],
+    ["a console session without a $ prompt", "```console\n% ls\nfile.txt\n```"],
+  ])("does not offer a transcript with %s", async (_case, markdown) => {
+    render(
+      <ShellCommandOpenerContext.Provider value={() => {}}>
+        <MessageResponse>{markdown}</MessageResponse>
+      </ShellCommandOpenerContext.Provider>,
+    );
+
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Open in shell" })).toBeNull();
+  });
+
+  it("does not offer shell code blocks without an opener", async () => {
+    render(<MessageResponse>{"```bash\nls -la\n```"}</MessageResponse>);
+
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Open in shell" })).toBeNull();
   });
 });

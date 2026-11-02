@@ -29,6 +29,11 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import {
+  claimPendingShellInput,
+  hasPendingShellInput,
+  subscribePendingShellInput,
+} from "@/lib/shellCommand";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
@@ -39,6 +44,7 @@ import {
 } from "./TerminalClipboardPrompt";
 import {
   type ConnectionState,
+  type ShellPasteRefusal,
   type TerminalActivityListener,
   type TerminalInputListener,
   applyTerminalCopy,
@@ -84,6 +90,67 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+/** Toast text for a chat command that was not pasted into the shell. */
+export function shellPasteRefusalMessage(reason: ShellPasteRefusal): {
+  title: string;
+  description: string;
+} {
+  const copyHint = "Copy it from the chat instead.";
+  switch (reason) {
+    case "interrupted":
+      return {
+        title: "Command may not have been pasted",
+        description: `The connection to the shell dropped. Check the prompt before pressing Enter, or ${copyHint.toLowerCase()}`,
+      };
+    case "not-ready":
+      return {
+        title: "Command not pasted",
+        description: `The shell didn't reach an empty prompt in time. ${copyHint}`,
+      };
+    case "busy":
+      return {
+        title: "Command not pasted",
+        description: `Another command is still being pasted into this shell. ${copyHint}`,
+      };
+    case "too-large":
+      return {
+        title: "Command not pasted",
+        description: `The command is too long to paste. ${copyHint}`,
+      };
+    case "read-only":
+      return {
+        title: "Command not pasted",
+        description: `This shell is attached read-only. ${copyHint}`,
+      };
+    case "unsupported":
+      return {
+        title: "Command not pasted",
+        description: `This host's runner can't paste into a shell yet; update Omnigent there. ${copyHint}`,
+      };
+    case "late":
+      return {
+        title: "Command pasted after all",
+        description:
+          "The shell answered late and pasted it. Check the prompt before pressing Enter.",
+      };
+    case "empty":
+      return {
+        title: "Command not pasted",
+        description: "Nothing was left to paste after removing control characters.",
+      };
+    case "failed":
+      return {
+        title: "Command not pasted",
+        description: `The shell couldn't paste this command. ${copyHint}`,
+      };
+    case "unsafe":
+      return {
+        title: "Command not pasted",
+        description: `The shell couldn't take this command without running it. ${copyHint}`,
+      };
+  }
+}
 
 function isReconnectableTerminalClose(code: number): boolean {
   return (
@@ -300,6 +367,8 @@ export function TerminalView({
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
   const attachGenerationRef = useRef(0);
+  // The session, terminal and access mode of the latest attach.
+  const attachTargetRef = useRef<string | null>(null);
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
@@ -326,6 +395,20 @@ export function TerminalView({
   const notifyInput = useCallback(() => {
     onInputRef.current?.();
   }, []);
+
+  // Hand a command queued by the chat's "Open in shell" to this view's session.
+  const offerPendingShellInput = useCallback(() => {
+    const session = sessionRef.current;
+    if (session === null || readOnly || !hasPendingShellInput(sessionId, terminalId)) return;
+    session.pasteWhenShellReady(
+      () => claimPendingShellInput(sessionId, terminalId),
+      (_text, reason) => {
+        const { title, description } = shellPasteRefusalMessage(reason);
+        toast.info(title, { description });
+      },
+    );
+  }, [sessionId, terminalId, readOnly]);
+  useEffect(() => subscribePendingShellInput(offerPendingShellInput), [offerPendingShellInput]);
 
   const queueSessionClipboardCopy = useCallback(
     (request: TerminalClipboardRequest & { kind: "automatic" | "user" }) => {
@@ -535,13 +618,22 @@ export function TerminalView({
       // on top of the session that replaced it.
       const generation = (attachGenerationRef.current += 1);
       upgradeCtlRef.current?.abort();
-      disposeActiveSession();
-      node.replaceChildren();
-      // Reset to ``connecting`` for every fresh attach so a stale
-      // overlay from a previous mount doesn't flash during the
-      // handshake. The session's WS ``open`` handler transitions us
-      // to ``connected``.
-      notifyState({ kind: "connecting" });
+      const target = JSON.stringify([sessionId, terminalId, readOnly]);
+      const outgoing = sessionRef.current;
+      // A new advert for the same terminal mid-paste waits for the paste:
+      // the chat already handed this session the command, so cutting it off
+      // would lose it. Any other change retires the session at once.
+      const retireAfterPaste =
+        outgoing !== null && attachTargetRef.current === target && outgoing.hasShellPasteInFlight();
+      attachTargetRef.current = target;
+      const retireOutgoing = () => {
+        disposeActiveSession();
+        node.replaceChildren();
+        // A stale overlay must not flash during the handshake; the session's
+        // WS ``open`` handler moves on to ``connected``.
+        notifyState({ kind: "connecting" });
+      };
+      if (!retireAfterPaste) retireOutgoing();
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -566,6 +658,11 @@ export function TerminalView({
         // behavior queueMicrotask provided; the URL resolution (when a
         // direct URL exists) adds real async time, so re-check after
         // every await.
+        if (retireAfterPaste) {
+          await outgoing.whenShellPasteIdle();
+          if (superseded()) return;
+          retireOutgoing();
+        }
         await Promise.resolve();
         if (superseded()) return;
         // Browser WebSockets carry the host ID in the query string so they
@@ -598,6 +695,7 @@ export function TerminalView({
           notifyFileLink,
         );
         sessionRef.current = terminalSession;
+        offerPendingShellInput();
         // Relay-connected with a direct URL on offer: negotiate the
         // loopback upgrade in the background. In Chrome this is what
         // raises the Local Network Access prompt; the probe socket
@@ -607,6 +705,9 @@ export function TerminalView({
         if (directUrl !== undefined && url === relayUrl) {
           const upgraded = await watchDirectUpgrade(directUrl, upgradeCtl.signal);
           if (superseded() || !upgraded) return;
+          // Re-dialing mid-paste would drop a command the chat already handed over.
+          await terminalSession.whenShellPasteIdle();
+          if (superseded()) return;
           disposeActiveSession();
           setConnectAttempt((attempt) => attempt + 1);
         }
@@ -629,6 +730,7 @@ export function TerminalView({
       notifyInput,
       notifyClipboardRequest,
       notifyFileLink,
+      offerPendingShellInput,
       disposeActiveSession,
     ],
   );
