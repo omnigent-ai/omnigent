@@ -32,6 +32,19 @@ class OAuthCallbackIntentFilterTest {
     }
 
     @Test
+    fun `share QR conversation links reach the link receiver`() {
+        val links =
+            listOf(
+                "omnigent://omnigent.example.com/c/2144378716924436",
+                "omnigent://omnigent.example.com:8443/c/208533c837b2451bbee7ac060b04e5f1",
+                "omnigent://localhost:6767/c/abc123",
+            )
+        for (link in links) {
+            assertEquals(link, listOf(DeepLinkActivity::class.java.name), receivers(link))
+        }
+    }
+
+    @Test
     fun `the receiver names the sign-in it is completing`() {
         assertEquals(
             "Completing sign-in…",
