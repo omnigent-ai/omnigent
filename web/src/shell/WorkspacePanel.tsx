@@ -621,20 +621,62 @@ function TerminalTabsStrip({
 }
 
 // ---------------------------------------------------------------------------
-// RailTerminalView — the xterm for the active shell tab, mounted in the rail's
-// content slot. A thin wrapper around TerminalView that resolves the terminal
-// id from its tab key and tracks per-terminal connection/activity status.
+// RailTerminalView — the xterm for one shell tab, mounted in the rail's content
+// slot. A thin wrapper around TerminalView that resolves the terminal id from
+// its tab key and tracks per-terminal connection/activity status.
 // ---------------------------------------------------------------------------
+
+/** Shown shells that stay attached while hidden; each holds a WebSocket and a WebGL context. */
+export const MAX_WARM_RAIL_TERMINALS = 4;
+
+/**
+ * Mounts each shell once it's shown and keeps the most recent few attached
+ * behind other tabs. Keyed by conversation, so a session switch starts fresh.
+ */
+function RailTerminals({
+  openTerminals,
+  shownKey,
+  ...viewProps
+}: {
+  conversationId: string;
+  openTerminals: string[];
+  /** The visible shell's key, or null while another tab is shown. */
+  shownKey: string | null;
+  readOnly: boolean;
+  autoFocus: boolean;
+}) {
+  const [recentKeys, setRecentKeys] = useState<string[]>([]);
+  const liveKeys = recentKeys.filter((key) => openTerminals.includes(key));
+  const nextKeys =
+    shownKey === null || liveKeys[liveKeys.length - 1] === shownKey
+      ? liveKeys
+      : [...liveKeys.filter((key) => key !== shownKey), shownKey].slice(-MAX_WARM_RAIL_TERMINALS);
+  // Persist closed-tab pruning too, so a relaunched terminal id stays unmounted until shown.
+  // Adjusting state during render mounts a newly shown shell in this same commit.
+  if (nextKeys !== liveKeys || liveKeys.length !== recentKeys.length) setRecentKeys(nextKeys);
+  return nextKeys.map((key) => (
+    <RailTerminalView
+      key={key}
+      {...viewProps}
+      terminalKey={key}
+      shown={key === shownKey}
+      autoFocus={viewProps.autoFocus && key === shownKey}
+    />
+  ));
+}
 
 function RailTerminalView({
   conversationId,
   terminalKey,
   readOnly,
+  shown,
   autoFocus,
 }: {
   conversationId: string;
   terminalKey: string;
   readOnly: boolean;
+  /** False while kept attached behind another tab. */
+  shown: boolean;
   /** Grab keyboard focus when the WS connects. Only for a shell the user just
    *  opened by hand — a shell restored on a session switch leaves focus in the
    *  chat composer. */
@@ -643,26 +685,34 @@ function RailTerminalView({
   const { terminals } = useTerminals(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   const terminal = terminals.find((t) => terminalTabKey(t) === terminalKey) ?? null;
-  if (!terminal) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
-        Shell not available.
-      </div>
-    );
-  }
   return (
-    <div key={terminal.id} className="flex h-full min-h-0 flex-col">
-      <Suspense fallback={null}>
-        <TerminalView
-          sessionId={conversationId}
-          terminalId={terminal.id}
-          readOnly={readOnly}
-          focusOnConnect={autoFocus}
-          directAttachUrl={terminal.directAttachUrl}
-          onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
-          onActivity={() => markTerminalActive(terminal.id)}
-        />
-      </Suspense>
+    <div
+      // Not display:none, which would zero xterm's fit. xterm's scrollbar re-enables
+      // visibility, so opacity and pointer-events hide it too.
+      className={cn(
+        "absolute inset-0 flex flex-col",
+        !shown && "pointer-events-none invisible opacity-0",
+      )}
+      aria-hidden={!shown}
+    >
+      {terminal ? (
+        <Suspense key={terminal.id} fallback={null}>
+          <TerminalView
+            sessionId={conversationId}
+            terminalId={terminal.id}
+            readOnly={readOnly}
+            active={shown}
+            focusOnConnect={autoFocus}
+            directAttachUrl={terminal.directAttachUrl}
+            onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
+            onActivity={() => markTerminalActive(terminal.id)}
+          />
+        </Suspense>
+      ) : (
+        <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
+          Shell not available.
+        </div>
+      )}
     </div>
   );
 }
@@ -1772,6 +1822,16 @@ function WorkspacePanelImpl({
           data-workspace-panel-content
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
         >
+          {!pending && (
+            <RailTerminals
+              key={conversationId}
+              conversationId={conversationId}
+              openTerminals={openTerminals}
+              shownKey={terminalShown ? selectedTerminalKey : null}
+              readOnly={!isOwnerLevel(permissionLevel)}
+              autoFocus={autoFocusSelectedTerminal}
+            />
+          )}
           {showContentSearch && showFilesPanel && !pending && (
             <div
               className={cn(
@@ -1810,23 +1870,13 @@ function WorkspacePanelImpl({
               />
             </div>
           )}
+          {/* A shown shell renders in RailTerminals above, so its branch is null. */}
           {pending ? (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
               <Spinner />
               <span className="text-ui">Starting workspace…</span>
             </div>
-          ) : terminalShown ? (
-            // Show the selected shell's xterm only while its terminal is actually
-            // present. The selection is sticky (AppShell never prunes it off the
-            // list), so during a transient terminals-list churn this falls back to
-            // the default view and the xterm reappears when the terminal returns.
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-              autoFocus={autoFocusSelectedTerminal}
-            />
-          ) : selectedFilePath !== null ? (
+          ) : terminalShown ? null : selectedFilePath !== null ? (
             <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
               <FileViewer
                 syncUrl={!contained}
