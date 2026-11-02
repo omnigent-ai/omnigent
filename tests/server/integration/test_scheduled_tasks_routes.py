@@ -1237,10 +1237,11 @@ async def test_update_clears_permission_mode_with_explicit_null(
     assert got.json()["permission_mode"] is None
 
 
+@pytest.mark.parametrize("include_agent_id", [False, True], ids=["omitted-agent", "same-agent"])
 async def test_update_omitting_permission_mode_leaves_it_unchanged(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient, db_uri: str, include_agent_id: bool
 ) -> None:
-    """A PATCH that omits ``permission_mode`` must not clear a set mode."""
+    """Omitting permission_mode retains the override when the agent does not change."""
     _make_user(db_uri)
     created = (
         await auth_client.post(
@@ -1251,13 +1252,19 @@ async def test_update_omitting_permission_mode_leaves_it_unchanged(
     ).json()
     task_id = created["id"]
 
+    fields = {"name": "renamed"}
+    if include_agent_id:
+        fields["agent_id"] = created["agent_id"]
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
-        json={"name": "renamed"},
+        json=fields,
         headers=_headers(),
     )
     assert patched.status_code == 200, patched.text
     assert patched.json()["permission_mode"] == "acceptEdits"
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.json()["agent_id"] == created["agent_id"]
+    assert got.json()["permission_mode"] == "acceptEdits"
 
 
 async def test_update_rejects_invalid_model_override(
