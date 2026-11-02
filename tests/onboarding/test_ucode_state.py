@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from omnigent.onboarding.ucode_state import (
     UcodeWorkspaceState,
+    _parse_agent_state,
     read_current_ucode_state,
     read_ucode_state,
 )
@@ -261,3 +268,145 @@ def test_workspace_host_does_not_depend_on_claude_url() -> None:
         available_tools=[],
     )
     assert state.workspace_host == "https://example.cloud.databricks.com"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uv POSIX archive layout and shell helper")
+@pytest.mark.parametrize(
+    "archive_mode", [None, 0o644, 0o755], ids=["missing", "not-executable", "working"]
+)
+@pytest.mark.parametrize("launcher_name", ["ucode", "ug"])
+def test_auth_helper_survives_uv_archive_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive_mode: int | None, launcher_name: str
+) -> None:
+    """A generated helper keeps its workspace/profile through cache cleanup."""
+    archive_bin = tmp_path / "archive-v0" / "ephemeral" / "bin"
+    archive_bin.mkdir(parents=True)
+    archived = archive_bin / launcher_name
+    if archive_mode is not None:
+        archived.write_text("#!/bin/sh\nprintf 'ephemeral-token'\n")
+        archived.chmod(archive_mode)
+    persistent_bin = tmp_path / "installed tools"
+    persistent_bin.mkdir()
+    package = tmp_path / "ucode"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "cli.py").write_text(
+        "import sys\ndef main():\n    print('\\n'.join(sys.argv[1:]))\n"
+    )
+    launcher = persistent_bin / launcher_name
+    launcher.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.path.insert(0, {str(tmp_path)!r})\n"
+        "from ucode.cli import main\nmain()\n"
+    )
+    launcher.chmod(0o755)
+    other_archive_bin = tmp_path / "archive-v0" / "other" / "bin"
+    other_archive_bin.mkdir(parents=True)
+    other_archived = other_archive_bin / launcher_name
+    other_archived.write_text("#!/bin/sh\nexit 1\n")
+    other_archived.chmod(0o755)
+    symlink_bin = tmp_path / "symlinks"
+    symlink_bin.mkdir()
+    (symlink_bin / launcher_name).symlink_to(other_archived)
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join(map(str, (archive_bin, symlink_bin, other_archive_bin, persistent_bin))),
+    )
+    argv = [
+        str(archived),
+        "auth-token",
+        "--host",
+        _WORKSPACE_URL,
+        "--profile",
+        "gateway profile",
+        "--use-pat",
+    ]
+    state_file = _write_state(
+        tmp_path,
+        {
+            "workspaces": {
+                _WORKSPACE_URL: {
+                    "agents": {
+                        "codex": {
+                            "base_url": f"{_WORKSPACE_URL}/ai-gateway/codex/v1",
+                            "auth_command": shlex.join(argv),
+                            "auth": {"command": str(archived), "args": argv[1:]},
+                        }
+                    }
+                }
+            }
+        },
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_file)
+    original_state = state_file.read_bytes()
+
+    state = read_ucode_state(_WORKSPACE_URL)
+
+    assert state is not None
+    agent = state.agent("codex")
+    assert agent is not None and agent.auth_command is not None
+    expected = argv if archive_mode == 0o755 else [str(launcher), *argv[1:]]
+    assert shlex.split(agent.auth_command) == expected
+    assert agent.auth == {"command": expected[0], "args": argv[1:]}
+    result = subprocess.run(
+        ["/bin/sh", "-c", agent.auth_command],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    assert result.stdout.splitlines() == (
+        ["ephemeral-token"] if archive_mode == 0o755 else argv[1:]
+    )
+    assert state_file.read_bytes() == original_state
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/opt/custom/ucode auth-token --host https://example.databricks.com",
+        "/tmp/archive-v0/old/bin/other auth-token --host https://example.databricks.com",
+        "/tmp/archive-v0/old/bin/ucode auth-token --host https://example.databricks.com | cat",
+        "/tmp/archive-v0/old/bin/ucode auth-token --custom-option value",
+        "/tmp/archive-v0/old/bin/ucode auth-token --profile $PROFILE",
+        "/tmp/archive-v0/old/bin/ucode auth-token --profile ~",
+        "/tmp/archive-v0/old/bin/ucode auth-token --profile gateway*",
+        "/tmp/archive-v0/old/bin/ucode auth-token --profile #comment",
+        "printf token",
+    ],
+)
+def test_auth_helper_preserves_custom_commands(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only generated uv-cache helpers are eligible for launcher replacement."""
+    monkeypatch.setenv("PATH", "/opt")
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.shutil.which", lambda name, path: f"/opt/{name}"
+    )
+    assert _parse_agent_state({"auth_command": command}).auth_command == command
+
+
+def test_auth_helper_keeps_archive_when_no_persistent_launcher_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing replacement leaves the configured helper and its failure visible."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    command = "/tmp/archive-v0/old/bin/ucode auth-token --profile gateway"
+    assert _parse_agent_state({"auth_command": command}).auth_command == command
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uv POSIX archive layout and shell helper")
+@pytest.mark.parametrize("launcher_name", ["ucode", "ug"])
+def test_auth_helper_does_not_substitute_unrelated_ug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launcher_name: str
+) -> None:
+    """The ug executable on PATH can belong to ugrep instead of ucode."""
+    archived = tmp_path / "archive-v0" / "old" / "bin" / launcher_name
+    launcher = tmp_path / "ug"
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    command = shlex.join([str(archived), "auth-token", "--profile", "gateway"])
+    auth = {"command": str(archived), "args": ["auth-token", "--profile", "gateway"]}
+    agent = _parse_agent_state({"auth_command": command, "auth": auth})
+    assert agent.auth_command == command
+    assert agent.auth == auth

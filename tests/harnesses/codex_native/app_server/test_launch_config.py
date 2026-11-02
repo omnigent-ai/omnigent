@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shlex
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -1113,3 +1116,108 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.reasoning_effort == expected
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_ucode_auth_survives_removed_uv_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installed: bool
+) -> None:
+    """A regenerated launch uses a usable helper without changing its authority."""
+    expired = tmp_path / "uv" / "archive-v0" / "removed" / "bin" / "ucode"
+    helper = tmp_path / "current helper" / "ucode"
+    helper.parent.mkdir()
+    helper.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    helper.chmod(0o700)
+    argv = ["auth-token", "--host", _UCODE_HOST, "--profile", "profile with space", "--use-pat"]
+    command = shlex.join([str(expired), *argv])
+    from omnigent.onboarding.ucode_setup import _UCODE_UVX_SOURCE
+
+    prefix = [str(helper)] if installed else [str(helper), "--from", _UCODE_UVX_SOURCE, "ucode"]
+
+    def find_tool(name: str, path: str | None = None) -> str | None:
+        return str(helper) if name == ("ucode" if installed else "uvx") else None
+
+    monkeypatch.setattr("omnigent.onboarding.ucode_setup.shutil.which", find_tool)
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": command, "auth_refresh_interval_ms": 60000},
+    )
+    config = tomllib.loads(overrides)
+    provider = config["model_providers"]["omnigent_databricks"]
+    assert config["model"] == "test-model"
+    assert provider["base_url"] == _UCODE_BASE_URL
+    auth = provider["auth"]
+    assert auth["refresh_interval_ms"] == 60000
+    assert auth["command"] == "sh"
+    assert shlex.split(auth["args"][1]) == [*prefix, *argv]
+    completed = subprocess.run([auth["command"], *auth["args"]], capture_output=True, text=True)
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == [*prefix[1:], *argv]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uv POSIX archive layout and shell helper")
+@pytest.mark.parametrize("fallback", ["installed", "uvx"])
+@pytest.mark.parametrize("launcher_name", ["ucode", "ug"])
+@pytest.mark.parametrize("auth_form", ["direct", "shell"])
+def test_build_codex_native_server_repairs_archived_ucode_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_form: str,
+    launcher_name: str,
+    fallback: str,
+) -> None:
+    """Codex's emitted auth helper works after the generated uv archive is removed."""
+    archived = tmp_path / "archive-v0" / "removed" / "bin" / launcher_name
+    launcher = tmp_path / (launcher_name if fallback == "installed" else "uvx")
+    launcher.write_text(
+        f"#!{sys.executable}\n# from ucode.cli import main\n"
+        "import sys\nprint('\\n'.join(sys.argv[1:]))\n"
+    )
+    launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    args = [
+        "auth-token",
+        "--host",
+        _UCODE_HOST,
+        "--profile",
+        'gateway "profile"',
+        "--browser-login",
+    ]
+    command = shlex.join([str(archived), *args])
+    auth = {
+        "command": str(archived) if auth_form == "direct" else "/bin/sh",
+        "args": args if auth_form == "direct" else ["-c", command],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 60000,
+    }
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": command, "auth": auth},
+    )
+    config = tomllib.loads(overrides)
+    provider = config["model_providers"]["omnigent_databricks"]
+    assert config["model"] == "test-model"
+    assert provider["base_url"] == _UCODE_BASE_URL
+    emitted_auth = provider["auth"]
+    from omnigent.onboarding.ucode_setup import _UCODE_UVX_SOURCE
+
+    prefix = [str(launcher)]
+    if fallback == "uvx":
+        prefix.extend(["--from", _UCODE_UVX_SOURCE, "ucode"])
+    assert emitted_auth == {
+        **auth,
+        "command": str(launcher) if auth_form == "direct" else "/bin/sh",
+        "args": [*prefix[1:], *args]
+        if auth_form == "direct"
+        else ["-c", shlex.join([*prefix, *args])],
+    }
+    result = subprocess.run(
+        [emitted_auth["command"], *emitted_auth["args"]],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [*prefix[1:], *args]
