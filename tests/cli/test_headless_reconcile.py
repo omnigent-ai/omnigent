@@ -8,6 +8,7 @@ import pytest
 from omnigent_client import OmnigentClient, OmnigentError
 
 from omnigent.chat import _query_sessions_once
+from omnigent.cli_diagnostics import suppresses_recovery_hint
 
 
 @pytest.mark.parametrize("completion_stream", [2, 3], ids=["probe", "later-turn"])
@@ -172,3 +173,5 @@ async def test_headless_raises_when_turn_fails_after_streaming_text(
 
     assert str(excinfo.value) == failure
     assert excinfo.value.code == "RuntimeError"
+    # The runner ran the turn, so the stale-host `omnigent stop` hint would mislead.
+    assert suppresses_recovery_hint(excinfo.value)

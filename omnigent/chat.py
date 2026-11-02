@@ -53,7 +53,11 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
-from omnigent.cli_diagnostics import printable
+from omnigent.cli_diagnostics import (
+    SUPPRESS_RECOVERY_HINT_ATTR,
+    printable,
+    suppresses_recovery_hint,
+)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import (
     announce_conversation_url,
@@ -2748,12 +2752,13 @@ async def _run_bound_turn(
         if ctx.status != "failed":
             return
         error = ctx.response.error
-        turn_failures.append(
-            ClientOmnigentError(
-                error.message if error is not None and error.message else "turn failed",
-                code=error.code if error is not None else None,
-            )
+        failure = ClientOmnigentError(
+            error.message if error is not None and error.message else "turn failed",
+            code=error.code if error is not None else None,
         )
+        # The runner ran the turn, so `omnigent stop` cannot fix this failure.
+        setattr(failure, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        turn_failures.append(failure)
 
     chat = SessionsChat(
         namespace=client.sessions,
@@ -4596,7 +4601,10 @@ def _run_one_shot(
         # raises as an OmnigentError. Surface its message as a clean
         # CLI error instead of an opaque traceback so ``-p`` users see
         # why the turn produced no output.
-        raise click.ClickException(str(exc)) from exc
+        error = click.ClickException(str(exc))
+        if suppresses_recovery_hint(exc):
+            setattr(error, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise error from exc
 
 
 # ---------------------------------------------------------------------------

@@ -130,7 +130,7 @@ def test_databricks_run_with_empty_helper_token_exits_non_zero(
                 [
                     str(omnigent_python),
                     "-m",
-                    "omnigent.cli",
+                    "omnigent",
                     "run",
                     "--harness",
                     "claude-sdk",
@@ -166,3 +166,4 @@ def test_databricks_run_with_empty_helper_token_exits_non_zero(
     assert proc.returncode != 0, "the auth failure exited 0" + detail
     assert "Claude SDK provider authentication failed" in proc.stderr, detail
     assert "databricks auth login" in proc.stderr, detail
+    assert "stale host processes" not in proc.stderr, detail
