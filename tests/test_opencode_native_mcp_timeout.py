@@ -77,15 +77,16 @@ def test_build_omnigent_mcp_server_emits_timeout(monkeypatch: pytest.MonkeyPatch
         "tool call that runs longer than 60 s"
     )
 
-    # opencode's mcp entry timeout is in MILLISECONDS (it feeds the MCP SDK's
-    # per-request deadline, default 60000 ms). It must cover at least the
-    # relay's own budget, expressed in ms.
+    # v2's mcp entry timeout is ``{catalog, execution}`` in MILLISECONDS (it feeds
+    # the MCP SDK's per-request deadline, default 60000 ms). ``execution`` must
+    # cover at least the relay's own budget, expressed in ms.
     relay_budget_ms = claude_native_bridge._TOOL_CALL_TIMEOUT_S * 1000  # 300 s
-    assert isinstance(entry["timeout"], (int, float)), (
-        f"'timeout' must be a number, got {type(entry['timeout']).__name__!r}"
+    assert isinstance(entry["timeout"], dict), (
+        f"'timeout' must be a {{catalog, execution}} dict, got {type(entry['timeout']).__name__!r}"
     )
-    assert entry["timeout"] >= relay_budget_ms, (
-        f"opencode MCP timeout {entry['timeout']} ms < relay budget {relay_budget_ms} ms; "
+    execution_ms = entry["timeout"]["execution"]
+    assert execution_ms >= relay_budget_ms, (
+        f"opencode MCP execution timeout {execution_ms} ms < relay budget {relay_budget_ms} ms; "
         "a call the relay is still running can be killed by the client (or, if the "
         "value was written in seconds, opencode reads it as milliseconds and kills "
         "every call almost immediately)"
@@ -137,8 +138,8 @@ def test_build_mcp_block_propagates_server_timeout() -> None:
         "into the opencode entry; spec authors cannot configure a call budget for "
         "declared MCP servers"
     )
-    # MCPServerConfig.timeout is seconds; opencode's entry is milliseconds.
-    assert slow_entry["timeout"] == 300_000
+    # MCPServerConfig.timeout is seconds; v2 timeouts are {catalog, execution} in ms.
+    assert slow_entry["timeout"] == {"catalog": 300_000, "execution": 300_000}
 
     fast_entry = block["fast-server"]
     assert "timeout" not in fast_entry, (
