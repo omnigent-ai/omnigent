@@ -4500,6 +4500,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "KUBECONFIG": "/home/alice/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
+        "GIT_SSL_CAINFO": "/etc/openshell-tls/ca-bundle.pem",
+        "GIT_SSL_CAPATH": "/etc/openshell-tls/certs",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL": "sonnet",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
@@ -4564,6 +4566,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # BROWSER names the user's URL opener; dropping it sends CLI logins in the
     # runner to a local browser instead of the one the user configured.
     assert env["BROWSER"] == "www-browser"
+    # git's CA paths are trust stores, not secrets; git ignores SSL_CERT_FILE.
+    assert env["GIT_SSL_CAINFO"] == "/etc/openshell-tls/ca-bundle.pem"
+    assert env["GIT_SSL_CAPATH"] == "/etc/openshell-tls/certs"
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"

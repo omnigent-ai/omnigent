@@ -193,6 +193,15 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+def test_real_builders_pass_git_ca_paths(monkeypatch):
+    """git's CA paths must survive filtering, or git over HTTPS breaks behind a TLS proxy."""
+    git_ca = {"GIT_SSL_CAINFO": "/etc/corp-ca.pem", "GIT_SSL_CAPATH": "/etc/corp-certs"}
+    monkeypatch.setattr("os.environ", dict(git_ca))
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert {name: env.get(name) for name in git_ca} == git_ca, harness
+
+
 def test_real_builders_pass_ssh_auth_sock(monkeypatch):
     """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
     sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
