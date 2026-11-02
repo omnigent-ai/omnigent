@@ -24,6 +24,7 @@ from omnigent.runner.tool_dispatch import (
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _SCHEDULED_TASK_TOOLS,
     _execute_scheduled_task_tool,
+    execute_tool,
 )
 from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
 
@@ -101,9 +102,9 @@ class _RecordingClient:
 @pytest.mark.asyncio
 async def test_create_posts_payload() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "name": "nightly"}))
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
-        json.dumps(
+    out = await execute_tool(
+        tool_name="sys_scheduled_task_create",
+        arguments=json.dumps(
             {
                 **_REVIEW_FIELDS,
                 "name": "nightly",
@@ -162,6 +163,19 @@ async def test_current_runner_refuses_incomplete_review_before_dispatch(
     error = json.loads(result)["error"]
     assert missing_field in error
     assert ("List the task" in error) == (tool_name == "sys_scheduled_task_update")
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", ["null", "[]", "42", '"text"', "true"])
+async def test_scheduled_task_dispatch_rejects_non_object_arguments(arguments: str) -> None:
+    client = _RecordingClient()
+    result = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create", arguments, server_client=client
+    )
+    assert json.loads(result) == {
+        "error": "sys_scheduled_task_create: arguments must be an object"
+    }
     assert client.calls == []
 
 
@@ -225,9 +239,9 @@ async def test_list_gets() -> None:
 @pytest.mark.asyncio
 async def test_update_patches_by_id() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "state": "paused"}))
-    await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update",
-        json.dumps(
+    await execute_tool(
+        tool_name="sys_scheduled_task_update",
+        arguments=json.dumps(
             {
                 **_REVIEW_FIELDS,
                 "scheduled_task_id": _TASK_ID,

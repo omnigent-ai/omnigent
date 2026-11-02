@@ -836,8 +836,14 @@ def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
 
 
 @pytest.mark.parametrize("action", ["create", "update"])
-@pytest.mark.parametrize("prompt", [None, "", " \n\t", 1, ["instructions"]])
-def test_scheduled_task_approval_denies_invalid_prompts(action: str, prompt: object) -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("prompt", value) for value in [None, "", " \n\t", 1, ["instructions"]]]
+    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"]]],
+)
+def test_scheduled_task_approval_denies_invalid_review_values(
+    action: str, field: str, value: object
+) -> None:
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     result = ask_on_scheduled_task_change(
@@ -847,20 +853,29 @@ def test_scheduled_task_approval_denies_invalid_prompts(action: str, prompt: obj
             "data": {
                 "arguments": {
                     "scheduled_task_id": "0123456789abcdef0123456789abcdef",
-                    "prompt": prompt,
+                    "prompt": "Review every issue.",
                     "permission_mode": None,
+                    field: value,
                 }
             },
         }
     )
     assert result["result"] == "DENY"
-    assert "prompt must be a non-empty string" in result["reason"]
+    assert f"{field} must be a non-empty string" in result["reason"]
 
 
-@pytest.mark.parametrize("action", ["create", "update"])
-@pytest.mark.parametrize("missing_field", ["prompt", "permission_mode"])
+@pytest.mark.parametrize(
+    ("action", "missing_field", "agent_id"),
+    [
+        ("create", "prompt", None),
+        ("create", "permission_mode", None),
+        ("update", "prompt", None),
+        ("update", "permission_mode", None),
+        ("update", "permission_mode", "another-agent"),
+    ],
+)
 def test_legacy_scheduled_task_approval_identifies_omitted_fields(
-    action: str, missing_field: str
+    action: str, missing_field: str, agent_id: str | None
 ) -> None:
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
@@ -870,6 +885,8 @@ def test_legacy_scheduled_task_approval_identifies_omitted_fields(
         "permission_mode": "auto",
     }
     arguments.pop(missing_field)
+    if agent_id is not None:
+        arguments["agent_id"] = agent_id
     result = ask_on_scheduled_task_change(
         {
             "type": "tool_call",
@@ -881,11 +898,31 @@ def test_legacy_scheduled_task_approval_identifies_omitted_fields(
         assert result["result"] == "DENY"
     else:
         assert result["result"] == "ASK"
-        if action == "create":
-            assert "agent default (no task override)" in result["reason"]
+        if missing_field == "prompt":
+            expected_prompt = "(unchanged; not supplied by legacy caller)"
+            expected_permission = "auto"
         else:
+            expected_prompt = "Review every issue."
+            if action == "create":
+                expected_permission = "agent default (no task override)"
+            elif agent_id is not None:
+                expected_permission = (
+                    "existing override retained if agent_id is unchanged; "
+                    "cleared to agent default (no task override) if agent_id changes "
+                    "(not supplied by legacy caller)"
+                )
+            else:
+                expected_permission = "unchanged (not supplied by legacy caller)"
+        assert (
+            f"Effective task permission mode: {expected_permission}"
+            in result["reason"].splitlines()
+        )
+        assert result["reason"].endswith(
+            f"Full automation instructions:\n{expected_prompt}\nApprove?"
+        )
+        if action == "update":
             assert "Legacy partial update" in result["reason"]
-            assert "not supplied by legacy caller" in result["reason"]
+            assert "unchanged values were not supplied" not in result["reason"]
 
 
 # ── block_skills: native Skill tool (PreToolUse hook path) ─────────────────

@@ -467,11 +467,17 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     legacy_notice = ""
     if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
         legacy_notice = (
-            "Legacy partial update: unchanged values were not supplied for review. "
+            "Legacy partial update: some review values were not supplied. "
             "Inspect the existing automation before approving.\n"
         )
         if "permission_mode" not in args:
-            permission_mode = "unchanged (not supplied by legacy caller)"
+            permission_mode = (
+                "existing override retained if agent_id is unchanged; "
+                "cleared to agent default (no task override) if agent_id changes "
+                "(not supplied by legacy caller)"
+                if "agent_id" in args
+                else "unchanged (not supplied by legacy caller)"
+            )
     settings = _scheduled_task_settings(args, skip="prompt")
     return (
         f"Agent wants to {action} {subject}.\n"
