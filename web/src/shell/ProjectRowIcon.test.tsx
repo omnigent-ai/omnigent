@@ -32,4 +32,14 @@ describe("ProjectRowIcon", () => {
     // The lucide folder icon renders as an inline svg.
     expect(container.querySelector("svg")).not.toBeNull();
   });
+
+  it("tints the folder with the project's palette color, and ignores it beside an emoji", () => {
+    const { rerender, container } = render(<ProjectRowIcon icon={null} color="nord" />);
+    expect(container.querySelector('[data-project-color="nord"]')).toHaveStyle({
+      color: "#5e81ac",
+    });
+
+    rerender(<ProjectRowIcon icon="🚀" color="nord" />);
+    expect(container.querySelector("[data-project-color]")).toBeNull();
+  });
 });

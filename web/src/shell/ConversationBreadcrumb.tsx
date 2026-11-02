@@ -29,6 +29,7 @@ export function ConversationBreadcrumb({
   conversationTitle,
   projectName,
   projectIcon,
+  projectColor,
   projectTag,
   titleSlot,
   titleLinkTo,
@@ -49,6 +50,8 @@ export function ConversationBreadcrumb({
    * `projectTag` is omitted); the interactive tag carries its own icon.
    */
   projectIcon?: string | null;
+  /** The filed project's palette color, or `null`/absent for a muted folder. */
+  projectColor?: string | null;
   /**
    * Leading folder segment. When set (the desktop title shortcut), it replaces
    * the static folder icon with an interactive "Move to…" trigger and self-gates
@@ -112,20 +115,28 @@ export function ConversationBreadcrumb({
                 <span
                   className={cn(
                     "breadcrumb-folder flex shrink-0 items-center text-muted-foreground hover:opacity-100",
-                    // A full-color emoji reads as washed-out when faded, so only
-                    // dim the monochrome folder fallback.
-                    projectIcon ? "opacity-100" : "opacity-40",
+                    // A full-color emoji or colored folder reads as washed-out
+                    // when faded, so only dim the muted folder fallback.
+                    projectIcon || projectColor ? "opacity-100" : "opacity-40",
                   )}
                   aria-label={`Project: ${projectName}`}
                 >
-                  <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
+                  <ProjectRowIcon
+                    icon={projectIcon}
+                    color={projectColor}
+                    className="size-4 text-[16px]"
+                  />
                 </span>
               </TooltipTrigger>
               <TooltipContent side="bottom" align="start">
                 <div>
                   <span className="font-semibold text-ui">{conversationTitle}</span>
                   <div className="flex gap-1 text-muted-foreground">
-                    <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
+                    <ProjectRowIcon
+                      icon={projectIcon}
+                      color={projectColor}
+                      className="size-4 text-[16px]"
+                    />
                     {projectName}
                   </div>
                 </div>
