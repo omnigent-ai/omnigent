@@ -1602,3 +1602,136 @@ def test_clear_bridge_state_removes_egress_certificate_failure(tmp_path: Path) -
     clear_bridge_state(bridge_dir)
 
     assert read_certificate_failure(bridge_dir) is None
+
+
+def test_output_limit_control_state_survives_reconnect_setup(tmp_path: Path) -> None:
+    """Rebinding the same native owner cannot reset the recovery bound or Stop fence."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_a")
+    completed = read_bridge_state(tmp_path)
+    assert completed is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+    assert codex_native_bridge.claim_output_limit_continuation(
+        tmp_path, completed, "recovery_receipt"
+    )
+    assert not codex_native_bridge.claim_output_limit_continuation(
+        tmp_path, completed, "recovery_receipt"
+    )
+    assert codex_native_bridge.complete_output_limit_continuation(
+        tmp_path, completed, "turn_b", client_message_id="recovery_receipt"
+    )
+    stopped = codex_native_bridge.record_codex_interrupt(
+        tmp_path, expected=read_bridge_state(tmp_path)
+    )
+    assert stopped is not None
+    assert stopped.interrupted_turn_id == "turn_b"
+    assert stopped.interrupt_generation == 1
+    assert stopped.output_limit_turn_ids == ("turn_a", "turn_b")
+
+    write_bridge_state(
+        tmp_path,
+        replace(
+            stopped, interrupt_generation=0, interrupted_turn_id=None, output_limit_turn_ids=()
+        ),
+    )
+    assert read_bridge_state(tmp_path) == stopped
+    assert clear_active_turn_id_if_matches(tmp_path, "turn_b")
+    assert not codex_native_bridge.claim_output_limit_continuation(
+        tmp_path, stopped, "recovery_receipt"
+    )
+
+    # A later user turn owns a fresh allowance on the same thread.
+    update_active_turn_id(tmp_path, "manual_turn")
+    later = read_bridge_state(tmp_path)
+    assert later is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "manual_turn")
+    assert codex_native_bridge.claim_output_limit_continuation(tmp_path, later, "later_receipt")
+    assert codex_native_bridge.complete_output_limit_continuation(
+        tmp_path, later, "turn_c", client_message_id="later_receipt"
+    )
+    assert read_bridge_state(tmp_path).output_limit_turn_ids == ("manual_turn", "turn_c")
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "session_id",
+        "thread_id",
+        "socket_path",
+        "codex_home",
+        "interrupt_generation",
+        "active_turn_id",
+        "pending_shell_command_id",
+    ],
+)
+def test_output_limit_acknowledgement_preserves_newer_bridge_owner(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """An acknowledgement cannot overwrite another native owner or control revision."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_a")
+    completed = read_bridge_state(tmp_path)
+    assert completed is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+    assert codex_native_bridge.claim_output_limit_continuation(
+        tmp_path, completed, "recovery_receipt"
+    )
+    claimed = read_bridge_state(tmp_path)
+    assert claimed is not None
+    newer = replace(
+        claimed, **{changed_field: 1 if changed_field == "interrupt_generation" else "new_owner"}
+    )
+    write_bridge_state(tmp_path, newer)
+
+    assert not codex_native_bridge.complete_output_limit_continuation(
+        tmp_path, completed, "turn_b", client_message_id="recovery_receipt"
+    )
+    assert read_bridge_state(tmp_path) == newer
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("interrupt_generation", -1),
+        ("interrupt_generation", True),
+        ("interrupt_generation", "1"),
+        ("output_limit_turn_ids", "turn_a"),
+        ("output_limit_turn_ids", [None]),
+        ("output_limit_turn_ids", [""]),
+        ("output_limit_turn_ids", ["a", "b", "c"]),
+    ],
+)
+def test_invalid_recovery_metadata_is_unavailable(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Corrupt control metadata cannot silently restore an automatic retry allowance."""
+    _seed_active_turn(tmp_path, "turn_a")
+    state_file = tmp_path / "state.json"
+    payload = json.loads(state_file.read_text())
+    payload[field] = value
+    state_file.write_text(json.dumps(payload))
+
+    assert read_bridge_state(tmp_path) is None
+    assert codex_native_bridge.read_bridge_state_result(tmp_path).status == "invalid_state"
+
+
+@pytest.mark.parametrize("changed_owner", ["session_id", "thread_id", "socket_path", "codex_home"])
+def test_clear_turn_with_expected_owner_preserves_transferred_state(
+    tmp_path: Path, changed_owner: str
+) -> None:
+    """A deferred failure cannot clear a successor that retained the same native turn id."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_source")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    successor = replace(observed, **{changed_owner: "new_owner"})
+    write_bridge_state(tmp_path, successor)
+    called = []
+    assert not clear_active_turn_id_if_matches(
+        tmp_path, "turn_source", expected_owner=observed, on_cleared=lambda: called.append(True)
+    )
+    assert read_bridge_state(tmp_path) == successor
+    assert called == []

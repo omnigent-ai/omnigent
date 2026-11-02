@@ -715,9 +715,18 @@ class NativeInterruptRunner:
             cancel_pending_mcp_startup,
             clear_active_turn_id_if_matches,
             read_mcp_startup,
+            record_codex_interrupt,
         )
 
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
+        if state is None or state.session_id != conv_id:
+            return Response(status_code=204)
+        observed = state
+        try:
+            state = record_codex_interrupt(bridge_dir, expected=observed)
+        except OSError:  # Preserve native Stop even when the local disk is full.
+            self._logger.warning("Could not persist the Codex Stop fence", exc_info=True)
+            state = observed
         if state is None:
             return Response(status_code=204)
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)

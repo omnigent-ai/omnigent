@@ -194,6 +194,10 @@ class CodexNativeBridgeState:
     :param pending_shell_command_id: Submission awaiting authoritative turn reconciliation.
     :param pending_shell_parent_turn_id: Turn that was active before that submission.
     :param active_shell_turn_id: Standalone shell turn that cannot process prompts.
+    :param interrupt_generation: Stop requests observed by the executor, including while idle.
+    :param interrupted_turn_id: Active turn or pending recovery source at the latest Stop.
+    :param output_limit_turn_ids: Source and proven continuation of the latest recovery.
+    :param output_limit_client_message_id: Native delivery id allocated before automatic input.
     """
 
     session_id: str
@@ -205,6 +209,10 @@ class CodexNativeBridgeState:
     pending_shell_command_id: str | None = None
     pending_shell_parent_turn_id: str | None = None
     active_shell_turn_id: str | None = None
+    interrupt_generation: int = 0
+    interrupted_turn_id: str | None = None
+    output_limit_turn_ids: tuple[str, ...] = ()
+    output_limit_client_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1081,10 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "pending_shell_command_id": state.pending_shell_command_id,
                     "pending_shell_parent_turn_id": state.pending_shell_parent_turn_id,
                     "active_shell_turn_id": state.active_shell_turn_id,
+                    "interrupt_generation": state.interrupt_generation,
+                    "interrupted_turn_id": state.interrupted_turn_id,
+                    "output_limit_turn_ids": state.output_limit_turn_ids,
+                    "output_limit_client_message_id": state.output_limit_client_message_id,
                 },
                 handle,
                 sort_keys=True,
@@ -1093,6 +1105,26 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if current is not None and (
+            current.session_id,
+            current.thread_id,
+            current.socket_path,
+            current.codex_home,
+        ) == (state.session_id, state.thread_id, state.socket_path, state.codex_home):
+            state = replace(
+                state,
+                interrupt_generation=max(state.interrupt_generation, current.interrupt_generation),
+                interrupted_turn_id=(
+                    current.interrupted_turn_id
+                    if current.interrupt_generation >= state.interrupt_generation
+                    else state.interrupted_turn_id
+                ),
+                output_limit_turn_ids=state.output_limit_turn_ids or current.output_limit_turn_ids,
+                output_limit_client_message_id=(
+                    state.output_limit_client_message_id or current.output_limit_client_message_id
+                ),
+            )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1650,6 +1682,24 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
         or not codex_home
     ):
         return CodexNativeBridgeStateRead(None, "invalid_state")
+    interrupt_generation = raw.get("interrupt_generation", 0)
+    output_limit_turn_ids = raw.get("output_limit_turn_ids", [])
+    output_limit_client_message_id = raw.get("output_limit_client_message_id")
+    if (
+        type(interrupt_generation) is not int
+        or interrupt_generation < 0
+        or not isinstance(output_limit_turn_ids, list)
+        or len(output_limit_turn_ids) > 2
+        or any(not isinstance(value, str) or not value for value in output_limit_turn_ids)
+        or (
+            output_limit_client_message_id is not None
+            and (
+                not isinstance(output_limit_client_message_id, str)
+                or not output_limit_client_message_id
+            )
+        )
+    ):
+        return CodexNativeBridgeStateRead(None, "invalid_state")
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None
     )
@@ -1672,6 +1722,12 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             active_shell_turn_id=(
                 value if isinstance(value := raw.get("active_shell_turn_id"), str) else None
             ),
+            interrupt_generation=interrupt_generation,
+            interrupted_turn_id=(
+                value if isinstance(value := raw.get("interrupted_turn_id"), str) else None
+            ),
+            output_limit_turn_ids=tuple(output_limit_turn_ids),
+            output_limit_client_message_id=output_limit_client_message_id,
         ),
         "ready",
     )
@@ -1724,6 +1780,157 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
                 ),
             ),
         )
+
+
+def record_codex_interrupt(
+    bridge_dir: Path, *, expected: CodexNativeBridgeState
+) -> CodexNativeBridgeState | None:
+    """Fence Stop only for the bridge owner resolved by the control request."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if not _bridge_owner_matches(state, expected) or state is None:
+            return None
+        expected_source = expected.active_turn_id or (
+            expected.output_limit_turn_ids[0] if expected.output_limit_turn_ids else None
+        )
+        known_continuation = (
+            len(state.output_limit_turn_ids) == 2
+            and state.output_limit_turn_ids[0] == expected_source
+            and state.active_turn_id == state.output_limit_turn_ids[1]
+        )
+        if state.active_turn_id not in {None, expected.active_turn_id} and not known_continuation:
+            return None
+        updated = replace(
+            state,
+            interrupt_generation=state.interrupt_generation + 1,
+            interrupted_turn_id=(
+                state.active_turn_id
+                or expected.active_turn_id
+                or (
+                    state.output_limit_turn_ids[0]
+                    if len(state.output_limit_turn_ids) == 1
+                    else None
+                )
+            ),
+        )
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
+
+
+def claim_output_limit_continuation(
+    bridge_dir: Path, completed: CodexNativeBridgeState, client_message_id: str
+) -> bool:
+    """Persist one attempt only while its owning thread is idle and uninterrupted."""
+    turn_id = completed.active_turn_id
+    if turn_id is None or not client_message_id:
+        return False
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if (
+            not _output_limit_owner_matches(current, completed)
+            or current is None
+            or current.active_turn_id is not None
+            or current.pending_shell_command_id is not None
+            or current.active_shell_turn_id is not None
+            or current.interrupted_turn_id == turn_id
+            or turn_id in current.output_limit_turn_ids
+            or len(current.output_limit_turn_ids) == 1
+        ):
+            return False
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            replace(
+                current,
+                output_limit_turn_ids=(turn_id,),
+                output_limit_client_message_id=client_message_id,
+            ),
+        )
+        return True
+
+
+def complete_output_limit_continuation(
+    bridge_dir: Path,
+    completed: CodexNativeBridgeState,
+    continued_turn_id: str,
+    *,
+    client_message_id: str,
+) -> bool:
+    """Adopt the native acknowledgement without replacing newer input or Stop."""
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if (
+            not _output_limit_owner_matches(current, completed)
+            or current is None
+            or current.active_turn_id not in {None, continued_turn_id}
+            or current.pending_shell_command_id is not None
+            or current.output_limit_client_message_id != client_message_id
+            or current.output_limit_turn_ids
+            not in {(completed.active_turn_id,), (completed.active_turn_id, continued_turn_id)}
+        ):
+            return False
+        assert completed.active_turn_id is not None
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            replace(
+                current,
+                active_turn_id=continued_turn_id,
+                output_limit_turn_ids=(completed.active_turn_id, continued_turn_id),
+            ),
+        )
+        return True
+
+
+def _bridge_owner_matches(
+    current: CodexNativeBridgeState | None, expected: CodexNativeBridgeState
+) -> bool:
+    """Match the session, native thread, transport and credential home."""
+    return current is not None and (
+        current.session_id,
+        current.thread_id,
+        current.socket_path,
+        current.codex_home,
+    ) == (expected.session_id, expected.thread_id, expected.socket_path, expected.codex_home)
+
+
+def _output_limit_owner_matches(
+    current: CodexNativeBridgeState | None, completed: CodexNativeBridgeState
+) -> bool:
+    """Retain the Stop generation captured at the source's native completion."""
+    return (
+        _bridge_owner_matches(current, completed)
+        and current is not None
+        and current.interrupt_generation == completed.interrupt_generation
+    )
+
+
+def record_output_limit_continuation_receipt(
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    thread_id: str,
+    turn_id: str,
+    client_message_id: str,
+) -> CodexNativeBridgeState | None:
+    """Bind only a native clientId echo matching our persisted automatic request."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if (
+            state is None
+            or state.session_id != session_id
+            or state.thread_id != thread_id
+            or state.output_limit_client_message_id != client_message_id
+            or not client_message_id
+            or not state.output_limit_turn_ids
+            or state.output_limit_turn_ids[0] == turn_id
+            or state.active_turn_id not in {None, turn_id}
+            or (
+                len(state.output_limit_turn_ids) == 2 and state.output_limit_turn_ids[1] != turn_id
+            )
+        ):
+            return None
+        updated = replace(state, output_limit_turn_ids=(state.output_limit_turn_ids[0], turn_id))
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
 
 
 def mark_shell_command_pending(
@@ -1841,6 +2048,7 @@ def clear_active_turn_id_if_matches(
     completed_turn_id: str | None,
     *,
     on_cleared: Callable[[], None] | None = None,
+    expected_owner: CodexNativeBridgeState | None = None,
 ) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.
@@ -1862,6 +2070,7 @@ def clear_active_turn_id_if_matches(
         ``"turn_abc123"``. ``None`` means Codex did not include an id;
         if a turn is live it is left intact (returns ``False``), and if
         no turn is live the call is a no-op (returns ``True``).
+    :param expected_owner: Optional session/thread/transport owner checked under the lock.
     :param on_cleared: Optional callback invoked while the state lock is
         still held, only when the turn is cleared (or no state exists).
         Running it under the lock serializes a dependent side effect (such
@@ -1887,6 +2096,8 @@ def clear_active_turn_id_if_matches(
 
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
+        if expected_owner is not None and not _bridge_owner_matches(state, expected_owner):
+            return False
         if state is None:
             _run_on_cleared()
             return True

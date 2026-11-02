@@ -4077,6 +4077,11 @@ def test_interrupt_with_active_turn_and_pending_mcp_stops_both(
     ]
     assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
 
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None
+    assert stopped.interrupt_generation == 1
+    assert stopped.interrupted_turn_id == "turn_active"
+
 
 def test_interrupt_with_no_active_turn_cancels_mcp_startup(
     monkeypatch: pytest.MonkeyPatch,
@@ -4118,10 +4123,7 @@ def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
     tmp_path: Path,
 ) -> None:
     """
-    Stop with nothing running and nothing starting stays a no-op.
-
-    An idle session must not send spurious ``turn/interrupt`` requests to
-    the app-server on every Stop press.
+    Stop while idle fences pending recovery without sending a native interrupt.
     """
     _FakeCodexNativeClient.requests = []
     _FakeCodexNativeClient.created = []
@@ -4137,6 +4139,11 @@ def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
 
     assert interrupted is False
     assert _FakeCodexNativeClient.requests == []
+
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None
+    assert stopped.interrupt_generation == 1
+    assert stopped.interrupted_turn_id is None
 
 
 @pytest.mark.parametrize(
@@ -4235,3 +4242,43 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+@pytest.mark.parametrize("transferred", [False, True])
+def test_interrupt_fence_write_failure_still_interrupts_native_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transferred: bool
+) -> None:
+    """A full disk cannot disable Stop for an active native turn."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _FakeCodexNativeClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+
+    def fail_fence(*args: object, **kwargs: object) -> None:
+        if transferred:
+            from dataclasses import replace
+
+            from omnigent.harnesses.codex_native.bridge import write_bridge_state
+
+            current = read_bridge_state(tmp_path)
+            assert current is not None
+            write_bridge_state(
+                tmp_path,
+                replace(
+                    current,
+                    session_id="successor",
+                    thread_id="successor_thread",
+                    active_turn_id="successor_turn",
+                ),
+            )
+        raise OSError("disk full")
+
+    monkeypatch.setattr("omnigent.inner.codex_native_executor.record_codex_interrupt", fail_fence)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    assert asyncio.run(executor.interrupt_session("key")) is True
+    assert _FakeCodexNativeClient.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_active"})
+    ]

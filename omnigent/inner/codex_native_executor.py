@@ -52,6 +52,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_unmirrored_codex_settings,
     reconcile_shell_command_state,
+    record_codex_interrupt,
     update_active_turn_id,
 )
 from omnigent.harnesses.codex_native.shell_input import (
@@ -868,7 +869,16 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
-        state = read_bridge_state(self._bridge_dir)
+        observed = read_bridge_state(self._bridge_dir)
+        if observed is None or not _session_is_active(
+            observed.session_id, self._request_session_id
+        ):
+            return False
+        try:
+            state = record_codex_interrupt(self._bridge_dir, expected=observed)
+        except OSError:  # A full disk must not prevent the native interrupt itself.
+            _logger.warning("Could not persist the Codex Stop fence", exc_info=True)
+            state = observed
         if state is None:
             return False
         # Flip the local map first: the cancelled record is what the web

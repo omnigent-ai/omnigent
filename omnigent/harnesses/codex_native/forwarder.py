@@ -14,8 +14,9 @@ import urllib.request
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 
@@ -42,10 +43,12 @@ from omnigent.harnesses.codex_native.bridge import (
     MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
+    claim_output_limit_continuation,
     clear_active_turn_id_if_matches,
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
+    complete_output_limit_continuation,
     pending_mcp_servers,
     read_bridge_state,
     read_certificate_failure,
@@ -55,6 +58,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_output_limit_continuation_receipt,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -434,6 +438,19 @@ _RECENT_USAGE_FRAMES_PER_THREAD = 64
 
 
 @dataclass
+class _PendingOutputLimitError:
+    """A known native error held briefly for its owning completion, then surfaced."""
+
+    client: httpx.AsyncClient
+    session_id: str
+    bridge_dir: Path
+    owner: CodexNativeBridgeState
+    error: _CodexTerminalError
+    usage_coalescer: _SessionUsageCoalescer
+    timer: asyncio.Task[None] | None = None
+
+
+@dataclass
 class _CodexForwarderState:
     """
     Mutable state for one long-lived Codex forwarder connection.
@@ -496,6 +513,12 @@ class _CodexForwarderState:
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
+    :param open_tool_items_by_turn: Unfinished tools on this routed thread, by turn.
+        An unscoped tool start fences all recovery until its result is known.
+    :param pending_output_limit_errors: Output-limit notifications awaiting their
+        owning native turn's accepted completion.
+    :param output_limit_interrupt_attempts: Accepted continuation ids already sent
+        a cancellation because Stop or newer input won the acknowledgement race.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
         enforce user-before-assistant ordering: before posting a turn's
@@ -571,6 +594,9 @@ class _CodexForwarderState:
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
+    open_tool_items_by_turn: dict[str | None, set[str]] = field(default_factory=dict)
+    pending_output_limit_errors: dict[str, _PendingOutputLimitError] = field(default_factory=dict)
+    output_limit_interrupt_attempts: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
@@ -790,6 +816,11 @@ class _CodexForwarderState:
             )
             self.child_streams[thread_id] = stream
         return stream
+
+    async def close_output_limit_errors(self) -> None:
+        """Surface known failures before disconnect closes their HTTP client."""
+        for pending in list(self.pending_output_limit_errors.values()):
+            await _surface_pending_output_limit_error(self, pending)
 
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
@@ -2498,6 +2529,7 @@ async def supervise_forwarder(
                 and not isinstance(result, asyncio.CancelledError)
             ]
             for close in (
+                forwarder_state.close_output_limit_errors,
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
@@ -3408,6 +3440,16 @@ async def _handle_event(
     # Child discovery remains connection-wide; output state is per thread.
     if method == "item/started" and forwarder_state is not None:
         item = params.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") in _OUTPUT_LIMIT_TOOL_ITEM_TYPES
+            and event_state is not None
+        ):
+            turn_id = _turn_id_from_payload(params)
+            item_id = item.get("id")
+            event_state.open_tool_items_by_turn.setdefault(turn_id, set()).add(
+                item_id if isinstance(item_id, str) and item_id else "unknown-tool"
+            )
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
@@ -3500,6 +3542,24 @@ async def _handle_event(
         return
     if method == "item/completed":
         item = params.get("item")
+        if (
+            not is_child
+            and codex_client is not None
+            and event_state is not None
+            and isinstance(item, dict)
+        ):
+            await _maybe_interrupt_late_output_limit_continuation(
+                codex_client,
+                bridge_dir=bridge_dir,
+                session_id=route_session_id,
+                forwarder_state=event_state,
+                params=params,
+                item=item,
+            )
+        if event_state is not None and isinstance(item, dict):
+            open_tools = event_state.open_tool_items_by_turn.get(_turn_id_from_payload(params))
+            if open_tools is not None and isinstance(item_id := item.get("id"), str):
+                open_tools.discard(item_id)
         # Nested-spawn registration uses the connection's complete child map.
         # Transcript dedup and partial text belong only to the routed child.
         item_state = (
@@ -4003,6 +4063,217 @@ async def _maybe_fail_turn_on_certificate_failure(
     return True
 
 
+_CODEX_OUTPUT_LIMIT_REASON = "Incomplete response returned, reason: max_output_tokens"
+_OUTPUT_LIMIT_CONTINUE_TEXT = (
+    "The previous response stopped at its output limit. Continue from where it stopped, "
+    "using the existing conversation and completed tool results. Do not repeat completed "
+    "tool calls. If an operation's outcome is unknown, stop and explain instead of retrying it."
+)
+_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS = 10.0
+_OUTPUT_LIMIT_TERMINAL_WAIT_SECONDS = 10.0
+
+
+def _is_recovered_output_limit_source(bridge_dir: Path | None, turn_id: str | None) -> bool:
+    """A successful recovery keeps its original response retired across reconnects."""
+    if bridge_dir is None or turn_id is None:
+        return False
+    state = read_bridge_state(bridge_dir)
+    return (
+        state is not None
+        and len(state.output_limit_turn_ids) == 2
+        and state.output_limit_turn_ids[0] == turn_id
+    )
+
+
+async def _interrupt_output_limit_continuation(
+    codex_client: CodexAppServerClient,
+    *,
+    forwarder_state: _CodexForwarderState,
+    thread_id: str,
+    turn_id: str,
+) -> None:
+    """Cancel only an identified automatic turn, with one bounded RPC attempt."""
+    if turn_id in forwarder_state.output_limit_interrupt_attempts:
+        return
+    forwarder_state.output_limit_interrupt_attempts.add(turn_id)
+    try:
+        async with asyncio.timeout(_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS):
+            await codex_client.request(
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
+            )
+    except Exception:  # Cancellation never reissues the continuation.
+        _logger.warning("Could not cancel superseded Codex continuation", exc_info=True)
+
+
+async def _maybe_interrupt_late_output_limit_continuation(
+    codex_client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+    params: _JsonObject,
+    item: _JsonObject,
+) -> None:
+    """Use the native delivery receipt to recognize a late accepted automatic input."""
+    client_message_id = item.get("clientId")
+    thread_id = _thread_id_from_params(params)
+    turn_id = _turn_id_from_payload(params)
+    if (
+        item.get("type") != "userMessage"
+        or not isinstance(client_message_id, str)
+        or not client_message_id
+        or thread_id is None
+        or turn_id is None
+    ):
+        return
+    state = record_output_limit_continuation_receipt(
+        bridge_dir,
+        session_id=session_id,
+        thread_id=thread_id,
+        turn_id=turn_id,
+        client_message_id=client_message_id,
+    )
+    if state is not None and state.interrupted_turn_id == state.output_limit_turn_ids[0]:
+        await _interrupt_output_limit_continuation(
+            codex_client,
+            forwarder_state=forwarder_state,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
+
+
+async def _surface_pending_output_limit_error(
+    forwarder_state: _CodexForwarderState, pending: _PendingOutputLimitError
+) -> None:
+    """Retire and publish a known failure once, without authorizing any native work."""
+    turn_id = pending.owner.active_turn_id
+    assert turn_id is not None
+    async with _conversation_item_delivery_scope(pending.session_id):
+        if forwarder_state.pending_output_limit_errors.get(turn_id) is not pending:
+            return
+        forwarder_state.pending_output_limit_errors.pop(turn_id)
+        if pending.timer is not None and pending.timer is not asyncio.current_task():
+            pending.timer.cancel()
+            await asyncio.gather(pending.timer, return_exceptions=True)
+        forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+        clear_active_turn_id_if_matches(pending.bridge_dir, turn_id, expected_owner=pending.owner)
+        await _post_turn_status_edge(
+            pending.client,
+            pending.session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error:output-limit-uncompleted",
+                error=pending.error,
+            ),
+        )
+        await pending.usage_coalescer.flush()
+
+
+def _defer_output_limit_error(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    forwarder_state: _CodexForwarderState,
+    owner: CodexNativeBridgeState,
+    error: _CodexTerminalError,
+    usage_coalescer: _SessionUsageCoalescer,
+) -> None:
+    """Wait briefly for accepted completion; missing boundaries remain visible failures."""
+    turn_id = owner.active_turn_id
+    assert turn_id is not None
+    if turn_id in forwarder_state.pending_output_limit_errors:
+        return
+    pending = _PendingOutputLimitError(
+        client=client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        owner=owner,
+        error=error,
+        usage_coalescer=usage_coalescer,
+    )
+    forwarder_state.pending_output_limit_errors[turn_id] = pending
+
+    async def expire() -> None:
+        await asyncio.sleep(_OUTPUT_LIMIT_TERMINAL_WAIT_SECONDS)
+        try:
+            await _surface_pending_output_limit_error(forwarder_state, pending)
+        except Exception:  # Known failures remain logged if their status cannot be posted.
+            _logger.error("Could not surface the deferred Codex output-limit error", exc_info=True)
+
+    pending.timer = asyncio.create_task(expire(), name="codex-output-limit-terminal-wait")
+
+
+async def _auto_continue_after_output_limit(
+    codex_client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    completed: CodexNativeBridgeState,
+    forwarder_state: _CodexForwarderState,
+    error: _CodexTerminalError,
+) -> bool:
+    """Continue an accepted output-limit completion once on its original native thread.
+
+    The bridge claim survives forwarder reconnects and consumes the attempt before
+    sending. An ambiguous acknowledgement is never retried. Native thread settings
+    retain the selected model, effort, credentials, permissions and full history.
+    """
+    turn_id = completed.active_turn_id
+    if (
+        getattr(codex_client, "supports_user_message_ids", False) is not True
+        or _CODEX_OUTPUT_LIMIT_REASON not in error.message
+        or forwarder_state.open_tool_items_by_turn.get(turn_id)
+        or forwarder_state.open_tool_items_by_turn.get(None)
+    ):
+        return False
+    client_message_id = uuid4().hex
+    try:
+        if not claim_output_limit_continuation(bridge_dir, completed, client_message_id):
+            return False
+    except OSError:  # Recovery must not start without its durable bound.
+        _logger.warning("Could not persist the Codex continuation bound", exc_info=True)
+        return False
+    try:
+        async with asyncio.timeout(_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS):
+            response = await codex_client.request(
+                "turn/start",
+                {
+                    "threadId": completed.thread_id,
+                    "clientUserMessageId": client_message_id,
+                    "input": [{"type": "text", "text": _OUTPUT_LIMIT_CONTINUE_TEXT}],
+                },
+            )
+    except Exception:  # The consumed attempt leaves the original error visible.
+        _logger.warning("Codex output-limit continuation was not acknowledged", exc_info=True)
+        return False
+    result = response.get("result")
+    turn = result.get("turn") if isinstance(result, dict) else None
+    continued_turn_id = turn.get("id") if isinstance(turn, dict) else None
+    if (
+        not isinstance(continued_turn_id, str)
+        or not continued_turn_id
+        or continued_turn_id == turn_id
+    ):
+        return False
+    try:
+        adopted = complete_output_limit_continuation(
+            bridge_dir, completed, continued_turn_id, client_message_id=client_message_id
+        )
+    except OSError:  # An untracked accepted turn is cancelled, never resubmitted.
+        _logger.warning("Could not persist the accepted Codex continuation", exc_info=True)
+        adopted = False
+    if not adopted:
+        await _interrupt_output_limit_continuation(
+            codex_client,
+            forwarder_state=forwarder_state,
+            thread_id=completed.thread_id,
+            turn_id=continued_turn_id,
+        )
+    _logger.info("Codex output-limit continuation acknowledged")
+    return True
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -4058,12 +4329,42 @@ async def _maybe_handle_turn_event(
                 return True
             turn_id = _turn_id_from_payload(params)
             if forwarder_state is not None:
-                if turn_id in forwarder_state.surfaced_terminal_error_turns:
+                if (
+                    turn_id in forwarder_state.surfaced_terminal_error_turns
+                    or _is_recovered_output_limit_source(bridge_dir, turn_id)
+                ):
                     _logger.info(
                         "Codex forwarder ignored duplicate terminal error: turn_id=%s",
                         turn_id,
                     )
                     return True
+                if (
+                    bridge_dir is not None
+                    and codex_client is not None
+                    and getattr(codex_client, "supports_user_message_ids", False) is True
+                    and turn_id is not None
+                    and _CODEX_OUTPUT_LIMIT_REASON in error.message
+                ):
+                    active = read_bridge_state(bridge_dir)
+                    if (
+                        active is not None
+                        and active.thread_id == _thread_id_from_params(params)
+                        and active.active_turn_id == turn_id
+                        and turn_id not in active.output_limit_turn_ids
+                        and len(active.output_limit_turn_ids) != 1
+                        and not forwarder_state.open_tool_items_by_turn.get(turn_id)
+                        and not forwarder_state.open_tool_items_by_turn.get(None)
+                    ):
+                        _defer_output_limit_error(
+                            client,
+                            session_id=session_id,
+                            bridge_dir=bridge_dir,
+                            forwarder_state=forwarder_state,
+                            owner=active,
+                            error=error,
+                            usage_coalescer=usage_coalescer,
+                        )
+                        return True
                 # Child threads have no on-disk bridge to correlate against.
                 if bridge_dir is not None and (
                     turn_id is None
@@ -4084,6 +4385,7 @@ async def _maybe_handle_turn_event(
                         ),
                     )
                     return True
+                forwarder_state.open_tool_items_by_turn.pop(turn_id, None)
                 if turn_id is not None:
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
             compaction_model: str | None = None
@@ -4115,6 +4417,12 @@ async def _maybe_handle_turn_event(
             await usage_coalescer.flush()
         return True
     if method == "turn/started":
+        started_turn_id = _terminal_turn_id_from_params(params)
+        if (
+            forwarder_state is not None
+            and started_turn_id in forwarder_state.surfaced_terminal_error_turns
+        ) or _is_recovered_output_limit_source(bridge_dir, started_turn_id):
+            return True
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
@@ -4395,6 +4703,7 @@ async def _handle_terminal_turn_boundary_inner(
     # Reconcile control state before any network-backed output flush. Transcript
     # and status posts retain their original order below, but a slow consumer
     # can no longer leave a completed Codex turn steerable in bridge state.
+    completed = read_bridge_state(bridge_dir) if bridge_dir is not None else None
     terminal = _prepare_terminal_turn_event(
         bridge_dir,
         method,
@@ -4427,8 +4736,59 @@ async def _handle_terminal_turn_boundary_inner(
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
-    if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
+    edge = terminal.edge
+    if forwarder_state is not None and terminal_turn_id is not None:
+        pending = forwarder_state.pending_output_limit_errors.pop(terminal_turn_id, None)
+        pending_error = pending.error if pending is not None else None
+        if pending is not None and pending.timer is not None:
+            pending.timer.cancel()
+            await asyncio.gather(pending.timer, return_exceptions=True)
+        interrupted = _turn_status_is_interrupted(_turn_status_from_params(params))
+        if (
+            edge is not None
+            and edge.error is None
+            and pending_error is not None
+            and not interrupted
+        ):
+            edge = replace(edge, status="failed", error=pending_error)
+        if (
+            edge is not None
+            and edge.error is not None
+            and _CODEX_OUTPUT_LIMIT_REASON in edge.error.message
+        ):
+            turn = params.get("turn")
+            items = turn.get("items") if isinstance(turn, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") in _OUTPUT_LIMIT_TOOL_ITEM_TYPES
+                        and item.get("status") in {"inProgress", "in_progress", "running"}
+                    ):
+                        forwarder_state.open_tool_items_by_turn.setdefault(
+                            terminal_turn_id, set()
+                        ).add(str(item.get("id", "unknown-tool")))
+            forwarder_state.surfaced_terminal_error_turns.add(terminal_turn_id)
+            if (
+                method == "turn/completed"
+                and not interrupted
+                and bridge_dir is not None
+                and completed is not None
+                and completed.thread_id == _thread_id_from_params(params)
+                and completed.active_turn_id == terminal_turn_id
+                and codex_client is not None
+                and await _auto_continue_after_output_limit(
+                    codex_client,
+                    bridge_dir=bridge_dir,
+                    completed=completed,
+                    forwarder_state=forwarder_state,
+                    error=edge.error,
+                )
+            ):
+                edge = None
+        forwarder_state.open_tool_items_by_turn.pop(terminal_turn_id, None)
+    if edge is not None:
+        await _post_turn_status_edge(client, session_id, edge)
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -5360,7 +5720,7 @@ def _prepare_terminal_turn_event(
         forwarder_state is not None
         and terminal_turn_id is not None
         and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
-    ):
+    ) or _is_recovered_output_limit_source(bridge_dir, terminal_turn_id):
         if bridge_dir is not None:
             clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
         _logger.info(
@@ -7312,6 +7672,11 @@ _TOOL_ITEM_BUILDERS: dict[str, _ToolItemBuilder] = {
     "imageGeneration": _image_generation_tool_call,
 }
 _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
+_OUTPUT_LIMIT_TOOL_ITEM_TYPES = _TOOL_ITEM_TYPES | {
+    "mcpToolCall",
+    "dynamicToolCall",
+    _CODEX_COLLAB_AGENT_ITEM_TYPE,
+}
 
 # Codex ``/review`` enter/exit thread items. The web UI has no dedicated
 # review-mode affordance, so these are mirrored as a visible assistant-message
