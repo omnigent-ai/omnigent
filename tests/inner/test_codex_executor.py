@@ -3956,18 +3956,22 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Title sidecars retain auth/provider config without loading extensions."""
+    import tomlkit
+
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
     (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     (source / "AGENTS.md").write_text("global guidance")
+    (source / "models.json").write_text('{"models": []}')
     (source / "config.toml").write_text(
         'model_provider = "Databricks"\n'
         '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
         "[plugins.example]\nenabled = true\n"
         '[mcp_servers.github]\nenabled = true\ncommand = "github-mcp"\n'
         '[marketplaces.example]\nsource = "https://example"\n'
+        '[profiles.work]\nmodel_catalog_json = "models.json"\n'
     )
     target = tmp_path / "temp_codex_home"
     target.mkdir()
@@ -3983,30 +3987,47 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     assert "plugins" not in config_text
     assert "mcp_servers" not in config_text
     assert "marketplaces" not in config_text
+    config = tomlkit.parse(config_text)
+    assert config["profiles"]["work"]["model_catalog_json"] == str(source / "models.json")
 
 
-def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
-    """Writing to the session's ``config.toml`` copy does not affect the source.
+@pytest.mark.parametrize("catalog_layer", ["base", "inline-profile"])
+@pytest.mark.parametrize("relative_catalog", [True, False], ids=["relative", "absolute"])
+def test_populate_codex_home_config_config_toml_copy_is_isolated(
+    tmp_path: Path, catalog_layer: str, relative_catalog: bool
+) -> None:
+    """Copied config keeps its catalog's origin and session edits stay private."""
+    import tomlkit
 
-    Proves that ``/model`` inside a session cannot mutate the shared
-    ``~/.codex/config.toml`` and silently change another session's model or
-    cost-policy enforcement.
-    """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
-    (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    catalog = source / "models.json"
+    catalog.write_text('{"models": []}')
+    catalog_setting = catalog.name if relative_catalog else str(catalog)
+    profile = "[profiles.work]\n" if catalog_layer == "inline-profile" else ""
+    original = f"{profile}model_catalog_json = {json.dumps(catalog_setting)} # user catalog\n"
+    (source / "config.toml").write_text(original)
     target = tmp_path / "temp_codex_home"
     target.mkdir()
 
-    _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source, minimal_config=False)
+
+    copied = (target / "config.toml").read_text()
+    config = tomlkit.parse(copied)
+    layer = config["profiles"]["work"] if catalog_layer == "inline-profile" else config
+    assert Path(layer["model_catalog_json"]).is_absolute()
+    assert Path(layer["model_catalog_json"]).read_text() == '{"models": []}'
+    assert "# user catalog" in copied
 
     # Simulate a /model write inside the session.
     (target / "config.toml").write_text('[default]\nmodel = "gpt-4o-mini"')
+    _populate_codex_home_config(target, source, minimal_config=False)
+    assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-4o-mini"'
 
     # Source must be untouched.
-    assert (source / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
+    assert (source / "config.toml").read_text() == original
 
 
 def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path) -> None:
