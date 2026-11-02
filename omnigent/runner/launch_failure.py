@@ -627,6 +627,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "agent_startup_pending": "The agent is still starting in the session terminal.",
     "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",
     "codex_thread_not_started": "Codex stopped before it could start, so this turn never ran.",
+    "prompt_blocked_by_hook": "A hook blocked this message, so the agent did not run it.",
     "native_turn_error": "The agent ran into an error during this turn.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
     "transient_upstream_error": (
