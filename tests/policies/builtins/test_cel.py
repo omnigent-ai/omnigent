@@ -12,7 +12,12 @@ pytest.importorskip("celpy", reason="cel-python not installed")
 
 import celpy
 
-from omnigent.policies.builtins.cel import _PROGRAM_CACHE_SIZE, _compile, cel_policy
+from omnigent.policies.builtins.cel import (
+    _PROGRAM_CACHE_SIZE,
+    _compile,
+    _warn_non_decision,
+    cel_policy,
+)
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext
 from omnigent.spec.types import (
@@ -217,16 +222,39 @@ def test_state_updates_must_be_a_list() -> None:
 # ── Abstain (non-map returns) ───────────────────────────────────
 
 
-def test_non_map_return_abstains() -> None:
-    """Non-map return (e.g. bool, string) abstains."""
-    evaluate = cel_policy(expression="true")
-    assert evaluate({"type": "request"}) is None
+@pytest.mark.parametrize(
+    ("expression", "expected_fragment"),
+    [
+        ('event.type == "tool_call"', "BoolType instead of a map"),
+        ('"DENY"', "StringType instead of a map"),
+        ('{"result": "BLOCK"}', "unknown result 'BLOCK'"),
+    ],
+)
+def test_non_decision_return_abstains_with_one_warning(
+    expression: str, expected_fragment: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Non-decision returns abstain and warn once, though engines rebuild per event."""
+    _warn_non_decision.cache_clear()
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        for _ in range(2):
+            evaluate = cel_policy(expression=expression)
+            assert evaluate({"type": "tool_call", "data": {"name": "sys_os_shell"}}) is None
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert expected_fragment in warnings[0]
+    assert expression in warnings[0]
 
 
-def test_map_without_result_key_abstains() -> None:
-    """Map missing the result key abstains."""
-    evaluate = cel_policy(expression='{"reason": "no verdict"}')
-    assert evaluate({"type": "request"}) is None
+@pytest.mark.parametrize("expression", ["null", '{"reason": "no verdict"}'])
+def test_documented_abstain_returns_do_not_warn(
+    expression: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``null`` and a map without ``result`` are deliberate abstains."""
+    _warn_non_decision.cache_clear()
+    evaluate = cel_policy(expression=expression)
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        assert evaluate({"type": "request"}) is None
+    assert caplog.records == []
 
 
 # ── CEL features ────────────────────────────────────────────────
