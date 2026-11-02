@@ -745,6 +745,10 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_text(message)
 
+    # Also checked before the capture; a recheck after attach covers a sizing
+    # client that leaves meanwhile.
+    waiting_to_size = not read_only and await _client_sizes_window(tmux, socket_path, tmux_target)
+
     # Seed the browser terminal with the current screen BEFORE attaching so no
     # pre-attach content is missing. Failure is non-fatal — a live pane redraw
     # will repaint it shortly.
@@ -753,7 +757,6 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)
 
-    waiting_to_size = not read_only and await _client_sizes_window(tmux, socket_path, tmux_target)
     argv = [tmux, "-S", socket_path, "-f", "/dev/null", "-C", "attach"]
     if read_only or waiting_to_size:
         # Not ``-r``: tmux >= 3.7 rejects ``send-keys`` whose implicit target

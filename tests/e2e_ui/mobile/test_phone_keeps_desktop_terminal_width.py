@@ -141,7 +141,7 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
             {
                 "step": name,
                 "desktop_min_drawn_width": min(widths),
-                "desktop_last_drawn_width": widths[-1],
+                "desktop_last_drawn_width": samples[-1][1] or 0,
                 "phone_attach_urls": len(phone.urls),
                 "phone_resizes": list(phone.resizes),
                 "samples": [[round(at - started, 2), width] for at, width in samples],
@@ -227,9 +227,14 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
                     phone_obs,
                 )
                 report["phone_video"] = str(phone.video.path()) if phone.video else None
-            after_close = step(
-                "phone closed", _sample_drawn_width(desktop, desktop_obs, _HOLD_S), phone_obs
-            )
+            closed_samples = _sample_drawn_width(desktop, desktop_obs, _HOLD_S)
+            # Judge the end state by the current attach's frame, not one from before a reattach.
+            redraw_deadline = time.monotonic() + 30
+            while closed_samples[-1][1] is None and time.monotonic() < redraw_deadline:
+                desktop.wait_for_timeout(250)
+                closed_samples.append((time.monotonic(), desktop_obs.drawn_width()))
+            step("phone closed", closed_samples, phone_obs)
+            final_width = closed_samples[-1][1] or 0
             report["desktop_video"] = str(desktop.video.path()) if desktop.video else None
             (artifacts / "desktop-final-screen.txt").write_text(
                 "\n".join(desktop_obs.screen_lines()) + "\n", encoding="utf-8"
@@ -248,7 +253,7 @@ def test_phone_opening_session_keeps_desktop_terminal_width(
             ("app root", min(at_app_root)),
             ("session default view", min(in_default_view)),
             ("session Terminal view", min(in_terminal_view)),
-            ("10s after the phone closed", after_close[-1]),
+            ("10s after the phone closed", final_width),
         ]
         if width < baseline * 0.9
     }

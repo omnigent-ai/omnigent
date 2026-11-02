@@ -402,15 +402,29 @@ async def test_close_after_client_disconnect_does_not_escape_teardown() -> None:
 @pytest.mark.asyncio
 async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
     """Cancelling the route cannot leave bridge reader/sender tasks detached."""
+    tmux = shutil.which("tmux")
+    assert tmux
     sock, target = await _new_private_tmux("sleep 30")
+    # Another attached client keeps this owner's size task waiting.
+    other_client = await asyncio.create_subprocess_exec(
+        *(tmux, "-S", str(sock), "-C", "attach", "-t", target),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+    )
+    await _wait_for(lambda: _client_widths(sock), [80])
     ws = _FakeWebSocket(inbound=[])
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
             ws, socket_path=str(sock), tmux_target=target, read_only=False
         )
     )
+
+    async def _size_task_waiting() -> bool:
+        pending = {pending.get_name() for pending in asyncio.all_tasks() if not pending.done()}
+        return "tmux-control-size" in pending
+
     try:
-        await asyncio.sleep(0.2)
+        await _wait_for(_size_task_waiting, True)
         assert task.cancel()
         [task_result] = await asyncio.gather(task, return_exceptions=True)
         assert isinstance(task_result, asyncio.CancelledError)
@@ -422,10 +436,14 @@ async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
                 "tmux-control-forward",
                 "tmux-control-clipboard",
                 "tmux-ws-to-control",
+                "tmux-control-size",
             }
         )
     finally:
         await _kill_tmux(sock)
+        with contextlib.suppress(ProcessLookupError):
+            other_client.kill()
+        await other_client.wait()
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
@@ -1502,25 +1520,52 @@ async def test_waiting_owner_takes_window_size_when_sizing_owner_leaves_during_a
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_output_during_client_query_reaches_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pane output written while an owner's client query runs reaches its browser."""
+    sock, target = await _new_private_tmux("cat")
+    browser = _LiveWebSocket(_resize_frame(80, 24))
+
+    async def _pane_prints_during_query(*args: str) -> bool:
+        await _tmux_output(sock, "send-keys", "-t", target, "-l", "printed-during-query")
+        await asyncio.sleep(0.3)
+        return await _client_sizes_window(*args)
+
+    async def _browser_received_output() -> bool:
+        return b"printed-during-query" in b"".join(browser.sent)
+
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge._client_sizes_window", _pane_prints_during_query
+    )
+    task = _start_bridge(browser, sock, target)
+    try:
+        await _wait_for(_browser_received_output, True)
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_browser_owner_does_not_resize_attached_terminal_until_it_types() -> None:
     """A browser opening a session also attached from a local terminal keeps that size."""
     tmux = shutil.which("tmux")
     assert tmux
     sock, target = await _new_private_tmux("cat")
-    controller, tty = pty.openpty()
-    fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
-    local_terminal = subprocess.Popen(
-        [tmux, "-S", str(sock), "attach", "-t", target],
-        stdin=tty,
-        stdout=tty,
-        stderr=tty,
-        start_new_session=True,
-        env={**os.environ, "TERM": "xterm-256color"},
-    )
-    os.close(tty)
+    pty_fds: list[int] = []
+    local_terminal: subprocess.Popen[bytes] | None = None
     browser = _LiveWebSocket(_resize_frame(160, 40))
     tasks: list[asyncio.Task[None]] = []
     try:
+        pty_fds.extend(pty.openpty())
+        tty = pty_fds[1]
+        fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
+        local_terminal = subprocess.Popen(
+            [tmux, "-S", str(sock), "attach", "-t", target],
+            stdin=tty,
+            stdout=tty,
+            stderr=tty,
+            start_new_session=True,
+            env={**os.environ, "TERM": "xterm-256color"},
+        )
         await _wait_for(lambda: _window_width(sock, target), 70)
         tasks.append(_start_bridge(browser, sock, target))
         await _wait_for(lambda: _client_widths(sock), [70, 160])
@@ -1532,9 +1577,11 @@ async def test_browser_owner_does_not_resize_attached_terminal_until_it_types() 
         for task in tasks:
             await _kill_and_join(sock, task)
         await _kill_tmux(sock)
-        local_terminal.kill()
-        local_terminal.wait()
-        os.close(controller)
+        if local_terminal is not None:
+            local_terminal.kill()
+            local_terminal.wait()
+        for fd in pty_fds:
+            os.close(fd)
 
 
 class _FakeClientQuery:
@@ -1543,6 +1590,7 @@ class _FakeClientQuery:
     def __init__(self, returncode: int | None) -> None:
         self.returncode = returncode
         self.killed = False
+        self.waited = False
 
     async def communicate(self) -> tuple[bytes, bytes]:
         if self.returncode is None:
@@ -1554,6 +1602,7 @@ class _FakeClientQuery:
         self.returncode = -9
 
     async def wait(self) -> int | None:
+        self.waited = True
         return self.returncode
 
 
@@ -1573,7 +1622,8 @@ async def test_client_sizes_window_fails_open(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
     monkeypatch.setattr("omnigent.terminals.control_bridge._CLIENT_QUERY_TIMEOUT_S", 0.01)
     assert not await _client_sizes_window("tmux", "socket", "main")
-    assert proc.killed is (failure == "timeout")
+    reaped = failure == "timeout"
+    assert (proc.killed, proc.waited) == (reaped, reaped)
 
 
 @pytest.mark.asyncio
@@ -1592,4 +1642,4 @@ async def test_client_sizes_window_cancellation_reaps_subprocess(
     assert task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert proc.killed is True
+    assert (proc.killed, proc.waited) == (True, True)
