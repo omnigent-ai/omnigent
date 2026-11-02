@@ -7,6 +7,7 @@ import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { MermaidFullscreenProvider } from "@/components/ai-elements/MermaidBlock";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -268,7 +269,9 @@ export default function App(props: AppProps = {}) {
   return (
     <ChunkLoadErrorBoundary>
       <RenderErrorBoundary name="this page" resetKey={pathname}>
-        <AppRoutes {...props} />
+        <MermaidFullscreenProvider resetKey={pathname}>
+          <AppRoutes {...props} />
+        </MermaidFullscreenProvider>
       </RenderErrorBoundary>
     </ChunkLoadErrorBoundary>
   );
