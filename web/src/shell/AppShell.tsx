@@ -2128,6 +2128,7 @@ function AppShellImpl() {
   // shell themselves; non-owners attach read-only and couldn't type the paste.
   const shellCommandOpener =
     agentSupportsShells &&
+    !!conversationId &&
     isOwnerLevel(permissionLevel) &&
     liveness?.kind !== "host_offline" &&
     liveness?.kind !== "local_stranded"

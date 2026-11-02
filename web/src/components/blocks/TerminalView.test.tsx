@@ -103,6 +103,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     pasteWhenShellReady =
       vi.fn<(claim: () => string | null, onRefused?: ShellPasteRefusedHandler) => void>();
     whenShellPasteIdle = vi.fn(() => terminalSessionMock.pasteIdle ?? Promise.resolve());
+    hasShellPasteInFlight = vi.fn(() => terminalSessionMock.pasteIdle !== null);
 
     constructor(
       container: HTMLDivElement,
@@ -292,6 +293,7 @@ describe("pending shell input", () => {
     ["not-ready", "Command not pasted", /didn't reach an empty prompt/],
     ["interrupted", "Command may not have been pasted", /Check the prompt before pressing Enter/],
     ["duplicated", "Command may have been pasted twice", /Check the prompt before pressing Enter/],
+    ["late", "Command pasted after all", /Check the prompt before pressing Enter/],
     ["failed", "Command not pasted", /couldn't paste this command/],
   ] as const)("explains a %s refusal", async (reason, title, description) => {
     queuePendingShellInput("conv_abc", "terminal_bash_s1", "a\nb");
@@ -1431,6 +1433,49 @@ describe("late direct-attach advert", () => {
     expect(readvertised).not.toBe(relayed);
     expect(readvertised.container).toBe(relayed.container);
     expect(relayed.dispose).toHaveBeenCalled();
+  });
+
+  it("lets an in-flight shell paste finish before the advert retires the session", async () => {
+    // WHY: the chat already handed the command to this session; retiring it
+    // mid-paste would lose the command.
+    const props = { sessionId: "conv_abc", terminalId: "terminal_bash_s1" };
+    const { rerender } = render(<TerminalView {...props} />);
+    await act(async () => {});
+    const relayed = terminalSessionMock.instances[0];
+    let pasteIdle: () => void = () => {};
+    terminalSessionMock.pasteIdle = new Promise<void>((resolve) => {
+      pasteIdle = resolve;
+    });
+
+    rerender(
+      <TerminalView
+        {...props}
+        directAttachUrl={
+          "ws://127.0.0.1:54321/v1/sessions/conv_abc" +
+          "/resources/terminals/terminal_bash_s1/attach?token=t"
+        }
+      />,
+    );
+    await act(async () => {});
+    expect(relayed.dispose).not.toHaveBeenCalled();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    act(() => pasteIdle());
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(relayed.dispose).toHaveBeenCalled();
+    expect(terminalSessionMock.instances[1].container).toBe(relayed.container);
+  });
+
+  it("retires a session mid-paste at once when the attach target changes", async () => {
+    const props = { sessionId: "conv_abc", terminalId: "terminal_bash_s1" };
+    const { rerender } = render(<TerminalView {...props} />);
+    await act(async () => {});
+    const writable = terminalSessionMock.instances[0];
+    terminalSessionMock.pasteIdle = new Promise<void>(() => {});
+
+    rerender(<TerminalView {...props} readOnly />);
+
+    expect(writable.dispose).toHaveBeenCalled();
   });
 });
 

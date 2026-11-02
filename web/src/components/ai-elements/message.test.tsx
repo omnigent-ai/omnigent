@@ -409,6 +409,19 @@ describe("MessageResponse open in shell", () => {
     expect(screen.queryByRole("button", { name: "Open in shell" })).toBeNull();
   });
 
+  it("does not offer a transcript whose commands it can't separate from output", async () => {
+    render(
+      <ShellCommandOpenerContext.Provider value={() => {}}>
+        <MessageResponse>
+          {"```console\n$ printf 'one\\n' |\n> sed 's/one/two/'\ntwo\n```"}
+        </MessageResponse>
+      </ShellCommandOpenerContext.Provider>,
+    );
+
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Open in shell" })).toBeNull();
+  });
+
   it("does not offer shell code blocks without an opener", async () => {
     render(<MessageResponse>{"```bash\nls -la\n```"}</MessageResponse>);
 

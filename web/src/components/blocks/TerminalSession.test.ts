@@ -10,6 +10,7 @@ import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SHELL_PASTE_ACK_TIMEOUT_MS,
+  SHELL_PASTE_LATE_RESULT_MS,
   SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
@@ -1332,8 +1333,16 @@ describe("TerminalSession", () => {
       answerPaste(socket, { id: 99, pasted: false, reason: "not-ready" });
       expect(refused).toEqual([]);
       answerPaste(socket, { id: 1, pasted: false, reason: "not-ready" });
+      session.pasteWhenShellReady(
+        () => "ls\npwd",
+        (text, reason) => refused.push([text, reason]),
+      );
+      answerPaste(socket, { id: 2, pasted: false, reason: "unsafe" });
 
-      expect(refused).toEqual([["echo one\necho two", "not-ready"]]);
+      expect(refused).toEqual([
+        ["echo one\necho two", "not-ready"],
+        ["ls\npwd", "unsafe"],
+      ]);
       expect(inputFrames(socket)).toEqual([]);
       session.dispose();
     });
@@ -1385,6 +1394,30 @@ describe("TerminalSession", () => {
       expect(idle).toBe(false);
 
       answerPaste(socket, { id: 1, pasted: true });
+      await Promise.resolve();
+      expect(idle).toBe(true);
+      session.dispose();
+    });
+
+    it("stays busy while the next queued paste goes out", async () => {
+      // WHY: a waiter that resumed after the next paste started would re-dial
+      // mid-paste and drop that command.
+      const { socket, session } = makeSession();
+      socket.open();
+      session.pasteWhenShellReady(() => "ls");
+      session.pasteWhenShellReady(() => "pwd");
+      let idle = false;
+      void session.whenShellPasteIdle().then(() => {
+        idle = true;
+      });
+
+      answerPaste(socket, { id: 1, pasted: true });
+      await Promise.resolve();
+      expect(pasteFrames(socket)).toMatchObject([{ id: 1 }, { id: 2 }]);
+      expect(session.hasShellPasteInFlight()).toBe(true);
+      expect(idle).toBe(false);
+
+      answerPaste(socket, { id: 2, pasted: true });
       await Promise.resolve();
       expect(idle).toBe(true);
       session.dispose();
@@ -1448,6 +1481,50 @@ describe("TerminalSession", () => {
         session.dispose();
       });
 
+      it("warns when a slow bridge pasted a command the fallback refused", () => {
+        // WHY: the user was told it wasn't pasted, yet it now sits at the prompt.
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        socket.open();
+        const refused: [string, string][] = [];
+        session.pasteWhenShellReady(
+          () => "echo one\necho two",
+          (text, reason) => refused.push([text, reason]),
+        );
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        answerPaste(socket, { id: 1, pasted: true });
+
+        expect(refused).toEqual([
+          ["echo one\necho two", "unsafe"],
+          ["echo one\necho two", "late"],
+        ]);
+        session.dispose();
+      });
+
+      it("warns about an unanswered fallback when the socket closes", () => {
+        // WHY: a slow bridge may have pasted too; its answer can no longer arrive.
+        vi.useFakeTimers();
+        const refused: [string, string][] = [];
+        const onRefused = (text: string, reason: string) => refused.push([text, reason]);
+        const recent = makeSession();
+        recent.socket.open();
+        recent.session.pasteWhenShellReady(() => "ls", onRefused);
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        expect(inputFrames(recent.socket)).toEqual(["ls"]);
+        recent.socket.readyState = FakeWebSocket.CLOSED;
+        recent.socket.emit("close", { code: 1006, reason: "" });
+        expect(refused).toEqual([["ls", "interrupted"]]);
+        recent.session.dispose();
+
+        // Past the window a current bridge would have answered.
+        const settled = makeSession();
+        settled.socket.open();
+        settled.session.pasteWhenShellReady(() => "pwd", onRefused);
+        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS + SHELL_PASTE_LATE_RESULT_MS);
+        settled.session.dispose();
+        expect(refused).toEqual([["ls", "interrupted"]]);
+      });
+
       it("waits past the timeout once the bridge accepted the paste", async () => {
         // WHY: a bridge waiting for a slow prompt must not race an xterm paste
         // that could land in whatever the pane is running.
@@ -1480,14 +1557,19 @@ describe("TerminalSession", () => {
         socket.open();
         session.pasteWhenShellReady(() => "ls -la");
         vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
-        session.pasteWhenShellReady(
-          () => "echo one\necho two",
-          (text, reason) => refused.push([text, reason]),
-        );
-        vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        for (const text of ["echo one\necho two", "echo one\recho two"]) {
+          session.pasteWhenShellReady(
+            () => text,
+            (refusedText, reason) => refused.push([refusedText, reason]),
+          );
+          vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        }
 
         expect(inputFrames(socket)).toEqual(["ls -la"]);
-        expect(refused).toEqual([["echo one\necho two", "unsafe"]]);
+        expect(refused).toEqual([
+          ["echo one\necho two", "unsafe"],
+          ["echo one\recho two", "unsafe"],
+        ]);
         session.dispose();
       });
 
@@ -1496,14 +1578,18 @@ describe("TerminalSession", () => {
         const { socket, session } = makeSession();
         socket.open();
         session.pasteWhenShellReady(() => "ls");
+        socket.readyState = FakeWebSocket.CLOSED;
         socket.emit("close", { code: 1006, reason: "" });
         vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
         expect(inputFrames(socket)).toEqual([]);
 
+        // The command stays queued for the view's next session to claim.
         const claim = vi.fn(() => "pwd");
         session.pasteWhenShellReady(claim);
         session.dispose();
         vi.advanceTimersByTime(SHELL_PASTE_ACK_TIMEOUT_MS);
+        expect(claim).not.toHaveBeenCalled();
+        expect(pasteFrames(socket)).toHaveLength(1);
         expect(inputFrames(socket)).toEqual([]);
       });
     });

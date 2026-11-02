@@ -1400,16 +1400,19 @@ async def test_failed_shell_paste_deletes_its_buffer(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("state", "flags", "payload"),
+    ("state", "text", "flags", "payload"),
     [
         # tmux >= 3.7 reports the shell's mode; tmux wraps the text itself.
-        (_pane_state("1"), ("-p",), b"ls\npwd"),
-        (_pane_state(""), ("-r",), b"ls\x16\npwd"),
+        (_pane_state("1"), "ls\npwd", ("-p",), b"ls\npwd"),
+        (_pane_state(""), "ls\npwd", ("-r",), b"ls\x16\npwd"),
+        # fish's mode is only assumed on older tmux, which suits a single line.
+        (_pane_state("", "fish"), "ls -la", ("-p",), b"ls -la"),
     ],
 )
 async def test_shell_paste_flags_follow_the_paste_method(
     monkeypatch: pytest.MonkeyPatch,
     state: _PastePaneState,
+    text: str,
     flags: tuple[str, ...],
     payload: bytes,
 ) -> None:
@@ -1425,11 +1428,31 @@ async def test_shell_paste_flags_follow_the_paste_method(
 
     monkeypatch.setattr(control_bridge, "_read_paste_pane_state", fake_state)
     monkeypatch.setattr(control_bridge, "_run_tmux_command", fake_tmux)
-    assert await _paste_shell_command("tmux", "sock", "main", "ls\npwd") is None
+    assert await _paste_shell_command("tmux", "sock", "main", text) is None
     [(args, stdin)] = calls
     paste_args = args[args.index("paste-buffer") + 1 :]
     assert paste_args[: len(flags) + 1] == (*flags, "-d")
     assert stdin == payload
+
+
+@pytest.mark.asyncio
+async def test_shell_paste_refuses_multiline_fish_without_a_reported_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unbracketed, every newline would run a line, so nothing is pasted."""
+    tmux_calls: list[tuple[str, ...]] = []
+
+    async def fake_state(*_args: object) -> _PastePaneState:
+        return _pane_state("", "fish")
+
+    async def fake_tmux(_tmux: str, _socket: str, *args: str, stdin: bytes | None = None) -> bytes:
+        tmux_calls.append(args)
+        return b""
+
+    monkeypatch.setattr(control_bridge, "_read_paste_pane_state", fake_state)
+    monkeypatch.setattr(control_bridge, "_run_tmux_command", fake_tmux)
+    assert await _paste_shell_command("tmux", "sock", "main", "ls\npwd") == "unsafe"
+    assert tmux_calls == []
 
 
 @pytest.mark.asyncio
@@ -1442,7 +1465,8 @@ async def test_cancelled_shell_paste_never_reaches_the_pane(
 
     async def fake_state(*_args: object) -> _PastePaneState:
         cancelled.set()
-        return _pane_state("", line_editing=False)
+        # A ready bash prompt, so only the cancel keeps the text out.
+        return _pane_state("1", "bash", (0, 0), None)
 
     async def fake_tmux(_tmux: str, _socket: str, *args: str, stdin: bytes | None = None) -> bytes:
         tmux_calls.append(args)
@@ -1625,6 +1649,31 @@ async def test_control_bridge_refuses_paste_without_a_shell_prompt(
         ]
         pane = await _run_tmux_capture(str(sock), target) or b""
         assert b"first-line" not in pane
+        assert b"only-line" not in pane
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_refuses_a_single_line_without_a_shell_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lone line is not pasted into a program that isn't a shell either."""
+    monkeypatch.setattr(control_bridge, "_SHELL_PASTE_READY_TIMEOUT_S", 0.5)
+    sock, target = await _new_private_tmux("cat")
+    ws = _FakeWebSocket(inbound=[_paste_frame(1, "only-line")])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        await poll_until_async(lambda: len(_paste_results(ws)) == 1, timeout_s=10)
+        assert _paste_results(ws) == [
+            {"type": "paste-result", "id": 1, "pasted": False, "reason": "not-ready"}
+        ]
+        pane = await _run_tmux_capture(str(sock), target) or b""
         assert b"only-line" not in pane
     finally:
         await _kill_and_join(sock, task)

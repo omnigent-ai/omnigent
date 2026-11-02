@@ -35,40 +35,31 @@ export function isShellCodeClassName(className: string | undefined): boolean {
     );
 }
 
-const PROMPT_PREFIX = /^\s*\$ /;
+const FIRST_PROMPT = /^(\s*)\$ /;
 // The shell's secondary prompt (PS2), shown before each continuation line.
-const CONTINUATION_PREFIX = /^> /;
-// ``<<EOF``, ``<<-'EOF'`` or ``<< "EOF"``, but not a ``<<<`` here-string.
-const HEREDOC_START = /(?<!<)<<(?!<)-?\s*(['"]?)([A-Za-z_]\w*)\1/g;
+const CONTINUATION_PREFIX = "> ";
+const SECONDARY_PROMPT_LINE = /^\s*>(?:\s|$)/;
+// A here-document (not a ``<<<`` here-string), or a line ending in a pipe,
+// ``&&`` or ``||``: the command goes on past its first line.
+const HEREDOC_OPERATOR = /(?<!<)<<(?!<)/;
+const TRAILING_OPERATOR = /(?:\||&&)\s*$/;
 
-/** Why the transcript command so far still needs another line. */
-interface OpenCommand {
-  /** The line ended with a backslash outside single quotes. */
-  continued: boolean;
-  /** The quote a line left open, or null. */
-  quote: "'" | '"' | null;
-  /** Here-document delimiters still awaited, in order. */
-  heredocs: string[];
+/** Whether a line ends in an unescaped backslash, which joins the next line. */
+function endsWithLineContinuation(line: string): boolean {
+  const trailing = /\\*$/.exec(line)?.[0].length ?? 0;
+  return trailing % 2 === 1;
 }
 
-const CLOSED_COMMAND: OpenCommand = { continued: false, quote: null, heredocs: [] };
-
-function isOpen(command: OpenCommand): boolean {
-  return command.continued || command.quote !== null || command.heredocs.length > 0;
-}
-
-/** The command's state after one more of its lines (prompt already removed). */
-function afterLine(command: OpenCommand, line: string): OpenCommand {
-  const [delimiter, ...laterHeredocs] = command.heredocs;
-  if (delimiter !== undefined) {
-    const closed = line.trim() === delimiter;
-    return { ...CLOSED_COMMAND, heredocs: closed ? laterHeredocs : command.heredocs };
-  }
-  let quote = command.quote;
+/** Whether a command leaves a quote open (bash rules, ``#`` comments skipped). */
+function hasOpenQuote(command: string): boolean {
+  let quote: "'" | '"' | null = null;
   let escaped = false;
-  for (let index = 0; index < line.length; index++) {
-    const char = line[index];
-    if (quote === "'") {
+  let inComment = false;
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (inComment) {
+      if (char === "\n") inComment = false;
+    } else if (quote === "'") {
       if (char === "'") quote = null;
     } else if (escaped) {
       escaped = false;
@@ -78,12 +69,61 @@ function afterLine(command: OpenCommand, line: string): OpenCommand {
       if (char === '"') quote = null;
     } else if (char === "'" || char === '"') {
       quote = char;
-    } else if (char === "#" && (index === 0 || /\s/.test(line[index - 1]))) {
-      break;
+    } else if (char === "#" && (index === 0 || /[\s;&|()<>]/.test(command[index - 1]))) {
+      inComment = true;
     }
   }
-  const heredocs = command.quote === null ? [...line.matchAll(HEREDOC_START)].map((m) => m[2]) : [];
-  return { continued: escaped, quote, heredocs };
+  return quote !== null;
+}
+
+/**
+ * Whether a prompted command may continue in ways the transcript can't show
+ * apart from output, so pasting it could drop lines or promote output.
+ */
+function isAmbiguousCommand(lines: string[]): boolean {
+  // Trailing blank lines are dropped before pasting, so a final backslash shows.
+  const command = lines.join("\n").trimEnd();
+  return (
+    HEREDOC_OPERATOR.test(command) ||
+    TRAILING_OPERATOR.test(command) ||
+    endsWithLineContinuation(command) ||
+    hasOpenQuote(command) ||
+    // A "#" may comment out a backslash that seemed to join the next line.
+    (lines.length > 1 && command.includes("#"))
+  );
+}
+
+/**
+ * The prompted commands of a transcript, or null when one can't be safely
+ * told apart from its output.
+ */
+function transcriptCommands(lines: string[], indent: string): string[] | null {
+  const prompt = `${indent}$ `;
+  const commands: string[][] = [];
+  // The command the previous line belonged to, or null after output.
+  let current: string[] | null = null;
+  for (const line of lines) {
+    if (line.startsWith(prompt)) {
+      current = [line.slice(prompt.length)];
+      commands.push(current);
+    } else if (current !== null && endsWithLineContinuation(current[current.length - 1])) {
+      const unindented = line.startsWith(indent) ? line.slice(indent.length) : line;
+      // Left in, "> " would be a redirection that truncates a file.
+      current.push(
+        unindented.startsWith(CONTINUATION_PREFIX)
+          ? unindented.slice(CONTINUATION_PREFIX.length)
+          : unindented,
+      );
+    } else if (current !== null && SECONDARY_PROMPT_LINE.test(line)) {
+      // Right after a command this is either its next line (a pipeline, loop,
+      // quote or here-document) or output that starts with ">".
+      return null;
+    } else {
+      current = null;
+    }
+  }
+  if (commands.some(isAmbiguousCommand)) return null;
+  return commands.map((command) => command.join("\n"));
 }
 
 /** Whether a UTF-16 code unit is a control character other than tab or LF. */
@@ -105,40 +145,22 @@ function withoutControlCharacters(text: string): string {
  * The command text a shell code block hands to a new shell.
  *
  * A block whose first non-blank line starts with ``$ `` is a transcript: only
- * its ``$ `` lines and their continuations are kept, without the prompts. A
- * continuation follows a trailing backslash, or carries the ``> `` secondary
- * prompt after an unfinished line (open quote or here-document). Trailing
- * newlines and control characters other than tab are dropped.
+ * its ``$ `` lines (at that line's indent) are kept, without the prompts, plus
+ * lines joined by a trailing backslash, without a ``> `` secondary prompt.
+ * A transcript whose commands can't be safely told apart from their output
+ * (a here-document, open quote or trailing operator, or a ``>`` line right
+ * after a command) yields nothing. Trailing newlines and control characters
+ * other than tab are dropped.
  *
  * @param code The code block's text, e.g. ``"$ npm test\\nok\\n"``.
  * @returns The command, e.g. ``"npm test"``; empty when nothing remains.
  */
 export function shellCommandFromCodeBlock(code: string): string {
   const lines = withoutControlCharacters(code.replace(/\r\n?/g, "\n")).split("\n");
-  let commandLines = lines;
   const firstLine = lines.find((line) => line.trim() !== "");
-  if (firstLine !== undefined && PROMPT_PREFIX.test(firstLine)) {
-    commandLines = [];
-    let command = CLOSED_COMMAND;
-    for (const line of lines) {
-      let kept: string;
-      if (PROMPT_PREFIX.test(line)) {
-        kept = line.replace(PROMPT_PREFIX, "");
-        command = CLOSED_COMMAND;
-      } else if (isOpen(command) && CONTINUATION_PREFIX.test(line)) {
-        // Left in, "> " would be a redirection that truncates a file.
-        kept = line.replace(CONTINUATION_PREFIX, "");
-      } else if (command.continued) {
-        kept = line;
-      } else {
-        // Output, including output that starts with "> ".
-        command = CLOSED_COMMAND;
-        continue;
-      }
-      commandLines.push(kept);
-      command = afterLine(command, kept);
-    }
-  }
+  const firstPrompt = firstLine === undefined ? null : FIRST_PROMPT.exec(firstLine);
+  const commandLines = firstPrompt === null ? lines : transcriptCommands(lines, firstPrompt[1]);
+  if (commandLines === null) return "";
   return commandLines
     .join("\n")
     .replace(/^(?:[ \t]*\n)+/, "")

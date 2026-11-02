@@ -166,7 +166,8 @@ _SHELL_PASTE_DROPPED_RE: Final = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # Line editors where Ctrl-V inserts the next key literally, so ``^V LF`` adds a
 # newline to the edit buffer instead of running the line.
 _QUOTED_INSERT_SHELLS: Final = frozenset({"bash", "zsh"})
-# fish (>= 3.0) always enables bracketed paste and binds Ctrl-V to paste.
+# fish (>= 3.0) always enables bracketed paste and binds Ctrl-V to paste. Before
+# tmux 3.7 reports the mode, multi-line text is refused rather than assumed safe.
 _ALWAYS_BRACKETED_SHELLS: Final = frozenset({"fish"})
 _QUOTED_INSERT: Final = "\x16"
 
@@ -588,6 +589,10 @@ async def _paste_shell_command(
             return "not-ready"
         previous = state
         await asyncio.sleep(_SHELL_PASTE_POLL_INTERVAL_S)
+    mode_reported = state is not None and state.bracket_paste_flag == "1"
+    if method == "bracketed" and not mode_reported and "\n" in command:
+        # fish's mode is assumed, not reported; unbracketed, each LF runs a line.
+        return "unsafe"
     if method == "bracketed":
         payload, paste_flags = command, ("-p",)
     else:

@@ -128,6 +128,12 @@ export function shellPasteRefusalMessage(reason: ShellPasteRefusal): {
         title: "Command may have been pasted twice",
         description: "The shell answered late. Check the prompt before pressing Enter.",
       };
+    case "late":
+      return {
+        title: "Command pasted after all",
+        description:
+          "The shell answered late and pasted it. Check the prompt before pressing Enter.",
+      };
     case "empty":
       return {
         title: "Command not pasted",
@@ -361,6 +367,8 @@ export function TerminalView({
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
   const attachGenerationRef = useRef(0);
+  // The session, terminal and access mode of the latest attach.
+  const attachTargetRef = useRef<string | null>(null);
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
@@ -610,13 +618,24 @@ export function TerminalView({
       // on top of the session that replaced it.
       const generation = (attachGenerationRef.current += 1);
       upgradeCtlRef.current?.abort();
-      disposeActiveSession();
-      node.replaceChildren();
-      // Reset to ``connecting`` for every fresh attach so a stale
-      // overlay from a previous mount doesn't flash during the
-      // handshake. The session's WS ``open`` handler transitions us
-      // to ``connected``.
-      notifyState({ kind: "connecting" });
+      const target = JSON.stringify([sessionId, terminalId, readOnly]);
+      const outgoing = sessionRef.current;
+      // A new advert for the same terminal mid-paste waits for the paste:
+      // the chat already handed this session the command, so cutting it off
+      // would lose it. Any other change retires the session at once.
+      const retireAfterPaste =
+        outgoing !== null && attachTargetRef.current === target && outgoing.hasShellPasteInFlight();
+      attachTargetRef.current = target;
+      const retireOutgoing = () => {
+        disposeActiveSession();
+        node.replaceChildren();
+        // Reset to ``connecting`` for every fresh attach so a stale
+        // overlay from a previous mount doesn't flash during the
+        // handshake. The session's WS ``open`` handler transitions us
+        // to ``connected``.
+        notifyState({ kind: "connecting" });
+      };
+      if (!retireAfterPaste) retireOutgoing();
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -641,6 +660,11 @@ export function TerminalView({
         // behavior queueMicrotask provided; the URL resolution (when a
         // direct URL exists) adds real async time, so re-check after
         // every await.
+        if (retireAfterPaste) {
+          await outgoing.whenShellPasteIdle();
+          if (superseded()) return;
+          retireOutgoing();
+        }
         await Promise.resolve();
         if (superseded()) return;
         // Browser WebSockets carry the host ID in the query string so they

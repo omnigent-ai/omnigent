@@ -51,15 +51,13 @@ describe("shellCommandFromCodeBlock", () => {
     );
   });
 
-  it("strips secondary prompts from a transcript's continuation lines", () => {
+  it("strips secondary prompts from a transcript's backslash continuations", () => {
     // WHY: a "> " left on the line would redirect output into a file and
     // truncate it.
     expect(shellCommandFromCodeBlock("$ printf '%s\\n' \\\n> hello\nhello\n")).toBe(
       "printf '%s\\n' \\\nhello",
     );
-    expect(shellCommandFromCodeBlock("$ cat <<'EOF'\n> one\n> EOF\none\n")).toBe(
-      "cat <<'EOF'\none\nEOF",
-    );
+    expect(shellCommandFromCodeBlock("$ echo 'a\\\n> b'\na\\\nb\n")).toBe("echo 'a\\\nb'");
   });
 
   it("keeps a real redirection on a continuation line", () => {
@@ -67,26 +65,44 @@ describe("shellCommandFromCodeBlock", () => {
     expect(shellCommandFromCodeBlock("echo hi \\\n> out.txt")).toBe("echo hi \\\n> out.txt");
   });
 
-  it("skips output that merely starts with a secondary prompt", () => {
-    // WHY: only an unfinished command gets a "> " line; after a complete one
-    // it is output, and pasting it would run it on Enter.
+  it("skips output that starts with a secondary prompt after other output", () => {
     expect(shellCommandFromCodeBlock("$ ls\nfile.txt\n> quoted output\n")).toBe("ls");
-    expect(shellCommandFromCodeBlock("$ cat notes.md\n> rm -rf build\n")).toBe("cat notes.md");
-    expect(
-      shellCommandFromCodeBlock("$ printf '%s\\n' '> echo UNINTENDED'\n> echo UNINTENDED\n"),
-    ).toBe("printf '%s\\n' '> echo UNINTENDED'");
-    expect(shellCommandFromCodeBlock("$ cat <<EOF\n> one\n> EOF\n> quoted\n")).toBe(
-      "cat <<EOF\none\nEOF",
-    );
-    expect(shellCommandFromCodeBlock("$ echo hi # it's\n> rm -rf build\n")).toBe("echo hi # it's");
-    expect(shellCommandFromCodeBlock("$ cat <<<'x'\n> rm -rf build\n")).toBe("cat <<<'x'");
   });
 
-  it("keeps secondary-prompt lines of an open quote", () => {
-    expect(
-      shellCommandFromCodeBlock('$ git commit -m "first\n> second"\n[main 1a2b3c] first\n'),
-    ).toBe('git commit -m "first\nsecond"');
-    expect(shellCommandFromCodeBlock("$ echo 'a\\\n> b'\na\\\nb\n")).toBe("echo 'a\\\nb'");
+  it("only reads prompts at the first prompt's indent", () => {
+    // WHY: indented "$ " lines are output, such as a README that `cat` prints.
+    expect(shellCommandFromCodeBlock("  $ cat README.md\n    $ rm -rf dist\n  $ ls\n")).toBe(
+      "cat README.md\nls",
+    );
+    expect(shellCommandFromCodeBlock("  $ docker run \\\n  >   --rm image\n")).toBe(
+      "docker run \\\n  --rm image",
+    );
+  });
+
+  it("keeps a comment that follows a shell operator", () => {
+    expect(shellCommandFromCodeBlock("$ echo hi;# it's\nhi\n")).toBe("echo hi;# it's");
+  });
+
+  // WHY: these commands may go on past their first line, and the transcript
+  // can't show which following lines are input. Pasting only part would leave
+  // an incomplete command, and pasting a "> " output line would run it on Enter.
+  it.each([
+    ["output after a complete command", "$ cat notes.md\n> rm -rf build\n"],
+    ["quoted prompt text", "$ printf '%s\\n' '> echo UNINTENDED'\n> echo UNINTENDED\n"],
+    ["a here-document", "$ cat <<'EOF'\n> one\n> EOF\none\n"],
+    ["a here-document without prompts", "$ cat <<EOF\nhello\nEOF\n"],
+    ["a here-document opener in a comment", "$ echo '> touch marker' # <<EOF\n> touch marker\n"],
+    ["a here-string", "$ cat <<<'x'\n> rm -rf build\n"],
+    ["a pipeline", "$ printf 'one\\n' |\n> sed 's/one/two/'\ntwo\n"],
+    ["a trailing &&", "$ make build &&\nmake test\n"],
+    ["a loop", '$ for f in a b; do\n> echo "$f"\n> done\na\nb\n'],
+    ["an open quote", '$ git commit -m "first\n> second"\n[main 1a2b3c] first\n'],
+    ["an unterminated quote", '$ echo "unterminated\n'],
+    ["a comment after an operator", "$ echo hi;# it's\n> rm -rf build\n"],
+    ["a backslash at the end", "$ ls \\\n"],
+    ["a backslash inside a comment", "$ ls # C:\\\nfile.txt\n"],
+  ])("offers nothing for a transcript with %s", (_case, transcript) => {
+    expect(shellCommandFromCodeBlock(transcript)).toBe("");
   });
 
   it("drops leading blank lines and normalizes CRLF", () => {

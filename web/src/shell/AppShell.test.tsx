@@ -6010,11 +6010,13 @@ describe("AppShell open in shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "open command" }));
 
     await waitFor(() => expect(hasPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe(true));
-    const createCall = (fetchMock.mock.calls as unknown as [string, RequestInit][]).find(
+    const createCall = (
+      fetchMock.mock.calls as unknown as [string, RequestInit | undefined][]
+    ).find(
       ([url, init]) =>
-        url === "/v1/sessions/conv_sdk/resources/terminals" && init.method === "POST",
+        url === "/v1/sessions/conv_sdk/resources/terminals" && init?.method === "POST",
     );
-    expect(JSON.parse(createCall?.[1].body as string)).toMatchObject({ terminal: "zsh" });
+    expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({ terminal: "zsh" });
     expect(claimPendingShellInput("conv_sdk", "terminal_zsh_u1")).toBe("npm test");
   });
 
