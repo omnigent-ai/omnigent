@@ -110,29 +110,40 @@ function useMermaidFullscreenState(resetKey?: string) {
     );
   }, []);
 
-  const waitingBlock = diagram?.svgMarkup === null ? diagram.block : null;
+  // Mirror the block's latest drawing: a streaming fence redraws it in place.
+  const shownBlock = diagram?.block ?? null;
+  useEffect(() => {
+    if (shownBlock === null) return;
+    let drawn: Element | null = null;
+    const showLatest = () => {
+      const svg = shownBlock.isConnected ? shownBlock.querySelector(DIAGRAM_SVG) : null;
+      if (svg === null || svg === drawn) return;
+      drawn = svg;
+      const svgMarkup = svg.outerHTML;
+      const now = Date.now();
+      setDiagram((current) => {
+        if (current?.block !== shownBlock || current.svgMarkup === svgMarkup) return current;
+        return current.svgMarkup === null && now >= current.deadline
+          ? null
+          : { ...current, svgMarkup };
+      });
+    };
+    const observer = new MutationObserver(showLatest);
+    observer.observe(shownBlock, { childList: true, subtree: true });
+    showLatest();
+    return () => observer.disconnect();
+  }, [shownBlock]);
+
+  const waiting = diagram?.svgMarkup === null;
   const deadline = diagram?.deadline ?? 0;
   useEffect(() => {
-    if (waitingBlock === null) return;
-    const finish = (svgMarkup: string | null) =>
-      setDiagram((current) => {
-        if (current?.block !== waitingBlock || current.svgMarkup !== null) return current;
-        return svgMarkup === null ? null : { ...current, svgMarkup };
-      });
-    const showWhenDrawn = () => {
-      const svg = waitingBlock.isConnected ? waitingBlock.querySelector(DIAGRAM_SVG) : null;
-      if (Date.now() >= deadline) finish(null);
-      else if (svg) finish(svg.outerHTML);
-    };
-    const observer = new MutationObserver(showWhenDrawn);
-    observer.observe(waitingBlock, { childList: true, subtree: true });
-    const timer = window.setTimeout(() => finish(null), deadline - Date.now());
-    showWhenDrawn();
-    return () => {
-      observer.disconnect();
-      window.clearTimeout(timer);
-    };
-  }, [waitingBlock, deadline]);
+    if (!waiting) return;
+    const timer = window.setTimeout(
+      () => setDiagram((current) => (current?.svgMarkup === null ? null : current)),
+      deadline - Date.now(),
+    );
+    return () => window.clearTimeout(timer);
+  }, [waiting, deadline]);
 
   const active = diagram !== null;
   useEffect(() => {

@@ -292,27 +292,38 @@ describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
     15_000,
   );
 
-  it("keeps the diagram open when a streamed reply settles", async () => {
-    const reply = (mode: "streaming" | "static") => (
+  it("keeps the diagram open and current as a streamed reply grows and settles", async () => {
+    const grown = `${source}\n  Beta --> Gamma`;
+    const reply = (mode: "streaming" | "static", diagram: string, fence: string) => (
       <MermaidFullscreenProvider resetKey="/sessions/a">
-        <MessageResponse mode={mode}>{markdown}</MessageResponse>
+        <MessageResponse mode={mode}>{`\`\`\`mermaid\n${diagram}\n${fence}`}</MessageResponse>
       </MermaidFullscreenProvider>
     );
-    const { container, rerender } = render(reply("streaming"), {
+    const { container, rerender } = render(reply("streaming", source, ""), {
       container: root,
       reactStrictMode: true,
     });
-    const streamedSvg = await findInlineDiagram(container);
-    const streamedMarkup = streamedSvg.outerHTML;
+    const partialSvg = await findInlineDiagram(container);
+    const streamedBlock = container.querySelector(".chat-mermaid")!;
     fireEvent.click(screen.getByTitle("View fullscreen"));
-
-    rerender(reply("static"));
-    expect(streamedSvg.isConnected).toBe(false);
-    await findInlineDiagram(container);
-
     const overlay = screen.getByTitle("Exit fullscreen").parentElement!;
+    const overlayMarkup = () => overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML;
+
+    // An unclosed fence redraws the same block in place as the source grows.
+    rerender(reply("streaming", grown, ""));
+    await waitFor(() => expect(overlay.textContent).toContain("Gamma"), { timeout: 10_000 });
+    expect(partialSvg.isConnected).toBe(false);
+    expect(container.querySelector(".chat-mermaid")).toBe(streamedBlock);
+    const inlineMarkup = () => streamedBlock.querySelector('svg[id^="mermaid-"]')?.outerHTML;
+    await waitFor(() => expect(overlayMarkup()).toBe(inlineMarkup()));
+
+    const streamedMarkup = overlayMarkup();
+    rerender(reply("static", grown, "```"));
+    expect(streamedBlock.isConnected).toBe(false);
+    expect(overlayMarkup()).toBe(streamedMarkup);
+    const settledSvg = await findInlineDiagram(container);
+    await waitFor(() => expect(overlayMarkup()).toBe(settledSvg.outerHTML));
     expect(overlay.parentElement).toBe(embedded ? root : document.body);
-    expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(streamedMarkup);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
   }, 15_000);
