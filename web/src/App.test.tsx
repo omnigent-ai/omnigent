@@ -1,8 +1,9 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { Outlet, MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { RoutingProvider, basenamedRouting, reactRouterRouting } from "@/lib/routing";
 
 vi.mock("@/lib/analytics", () => ({
   useOmnigentPageView: vi.fn(),
@@ -16,14 +17,29 @@ vi.mock("@/shell/AppShell", () => ({
     </div>
   ),
 }));
-vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
+vi.mock("@/pages/ChatPage", () => ({
+  ChatPage: () => (
+    <div>
+      chat page
+      <input aria-label="Page draft" />
+      <Link to="/c/other">Another chat</Link>
+    </div>
+  ),
+}));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
-  const { useLocation } = await import("react-router-dom");
+  const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
-    SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
+    SettingsPage: () => {
+      const { pathname, search, hash } = useLocation();
+      return (
+        <div data-testid="settings-location" data-navigation-type={useNavigationType()}>
+          {pathname + search + hash}
+        </div>
+      );
+    },
   };
 });
 vi.mock("@/extensions/ExtensionPageHost", () => ({
@@ -68,14 +84,17 @@ import App from "./App";
 const chunkError = vi.hoisted(
   () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
 );
+const pageFault = vi.hoisted(() => ({ error: undefined as Error | null | undefined }));
 vi.mock("@/pages/TasksPage", () => ({
   TasksPage: () => {
-    throw chunkError;
+    if (pageFault.error !== null) throw pageFault.error ?? chunkError;
+    return <p>Tasks recovered</p>;
   },
 }));
 vi.mock("@/pages/SetupPage", () => ({
   SetupPage: () => {
-    throw chunkError;
+    if (pageFault.error !== null) throw pageFault.error ?? chunkError;
+    return <p>Setup recovered</p>;
   },
 }));
 
@@ -105,6 +124,8 @@ describe("chunk load recovery", () => {
 
   it.each([
     { path: "/tasks", basename: undefined, needsSetup: false },
+    { path: "/tasks/templates", basename: undefined, needsSetup: false },
+    { path: "/mount/tasks/templates", basename: "/mount", needsSetup: false },
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("recovers from a failed page at $path", async ({ path, basename, needsSetup }) => {
@@ -120,6 +141,89 @@ describe("chunk load recovery", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Unable to load this page");
     expect(reload).toHaveBeenCalledOnce();
   });
+});
+
+describe("ordinary page render failures", () => {
+  const reload = vi.fn();
+  const renderError = new Error("Page render failed");
+  const suppressExpectedError = (event: ErrorEvent) => {
+    if (event.error === renderError) event.preventDefault();
+  };
+
+  beforeEach(() => {
+    pageFault.error = renderError;
+    reload.mockReset();
+    vi.stubGlobal("location", { reload });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    window.addEventListener("error", suppressExpectedError);
+  });
+
+  afterEach(() => {
+    cleanup();
+    pageFault.error = undefined;
+    window.removeEventListener("error", suppressExpectedError);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    { path: "/tasks", basename: undefined, needsSetup: false },
+    { path: "/mount/tasks", basename: "/mount", needsSetup: false },
+    { path: "/setup", basename: undefined, needsSetup: true },
+  ])("offers recovery at $path without reloading", async ({ path, basename, needsSetup }) => {
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, accounts_enabled: needsSetup, needs_setup: needsSetup }}
+      >
+        <MemoryRouter initialEntries={[path]}>
+          <App basename={basename} />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to display this page.");
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(reload).not.toHaveBeenCalled();
+
+    pageFault.error = null;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(
+      await screen.findByText(needsSetup ? "Setup recovered" : "Tasks recovered"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { path: "/tasks", basename: undefined },
+    { path: "/mount/tasks", basename: "/mount" },
+  ])(
+    "resets an ordinary page failure when the pathname changes at $path",
+    async ({ path, basename }) => {
+      function HostNavigation() {
+        const navigate = useNavigate();
+        return (
+          <button type="button" onClick={() => navigate(`${basename ?? ""}/c/healthy`)}>
+            Navigate
+          </button>
+        );
+      }
+      render(
+        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+          <MemoryRouter initialEntries={[path]}>
+            <HostNavigation />
+            <App basename={basename} />
+          </MemoryRouter>
+        </CapabilitiesProvider>,
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent("Unable to display this page.");
+
+      fireEvent.click(screen.getByRole("button", { name: "Navigate" }));
+
+      expect(await screen.findByText("chat page")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(reload).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function renderUsageRoute(enabled: boolean) {
@@ -151,6 +255,15 @@ function renderRoute(
 }
 
 describe("Canvas route", () => {
+  it("preserves healthy chat state across pathname changes", () => {
+    renderRoute("/c/first");
+    const draft = screen.getByRole("textbox", { name: "Page draft" });
+    fireEvent.change(draft, { target: { value: "Unsent work" } });
+    fireEvent.click(screen.getByRole("link", { name: "Another chat" }));
+    expect(screen.getByRole("textbox", { name: "Page draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent work");
+  });
+
   it("shows a spinner, not 'not found', while server info is still loading", () => {
     renderRoute("/canvas", {}, "loading");
     expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
@@ -247,6 +360,34 @@ describe("Automation detail release feature route", () => {
 });
 
 describe("Settings routes", () => {
+  describe.each(["", "/embed"])("redirects under '%s'", (basename) => {
+    it.each([
+      ["/settings", "/settings/general"],
+      ["/members", "/settings/members"],
+      ["/policies", "/settings/policies"],
+    ])("preserves URL context through the routing adapter: %s", async (from, to) => {
+      const useHostNavigate = vi.fn(reactRouterRouting.useNavigate);
+      const routing = basenamedRouting(basename, {
+        ...reactRouterRouting,
+        useNavigate: useHostNavigate,
+      });
+      render(
+        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+          <MemoryRouter initialEntries={[`${basename}${from}?o=123&view=compact#details`]}>
+            <RoutingProvider value={routing}>
+              <App basename={basename} />
+            </RoutingProvider>
+          </MemoryRouter>
+        </CapabilitiesProvider>,
+      );
+
+      const location = await screen.findByTestId("settings-location");
+      expect(location.textContent).toBe(`${basename}${to}?o=123&view=compact#details`);
+      expect(location).toHaveAttribute("data-navigation-type", "REPLACE");
+      expect(useHostNavigate).toHaveBeenCalled();
+    });
+  });
+
   it("redirects bare settings to the canonical General section", async () => {
     renderRoute("/settings");
 
