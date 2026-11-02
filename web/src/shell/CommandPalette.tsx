@@ -7,6 +7,7 @@ import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarClockIcon,
+  FolderPlusIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -36,6 +37,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
+import { NewProjectDialog } from "./NewProjectButton";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
 export interface CommandPaletteProps {
@@ -148,6 +150,8 @@ export function CommandPalette({
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
+  // Outlives the palette: choosing "New project" closes the palette and opens this.
+  const [newProjectName, setNewProjectName] = useState<string | null>(null);
 
   // Reset the query when the palette closes so it reopens clean.
   useEffect(() => {
@@ -173,6 +177,13 @@ export function CommandPalette({
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
         run: () => navigate("/"),
+      },
+      {
+        id: "new-project",
+        label: "New project",
+        icon: FolderPlusIcon,
+        keywords: ["create project", "folder"],
+        run: () => setNewProjectName(""),
       },
       {
         id: "go-inbox",
@@ -327,12 +338,23 @@ export function CommandPalette({
     }
   };
 
+  const trimmedQuery = query.trim();
+  // Like an editor's "Create file <name>": offered once the search settles empty.
+  const offerNamedProject =
+    searching &&
+    debouncedQuery === query &&
+    !searchFetching &&
+    !loadError &&
+    sessions.length === 0 &&
+    contentSessions.length === 0 &&
+    trimmedQuery !== "";
   // The two search groups resolve independently, so a title match can render
   // above an already-highlighted content match. Keep the top row selected
   // until the user moves the selection for this query.
   const firstItemValue =
     visibleSessions[0]?.id ??
     contentSessions[0]?.id ??
+    (offerNamedProject ? "create:new-project" : undefined) ??
     (filteredActions[0] ? `action:${filteredActions[0].id}` : "");
   const [selectedValue, setSelectedValue] = useState("");
   const userMovedSelection = useRef(false);
@@ -413,155 +435,182 @@ export function CommandPalette({
     );
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        aria-describedby={undefined}
-        // Mobile: a top-anchored full-screen sheet sized to --omnigent-viewport-height,
-        // so the input and results sit above the soft keyboard. sm:max-w-full
-        // overrides DialogContent's sm:max-w-sm between 640px and md.
-        className={cn(
-          "overflow-hidden p-0",
-          isMobile
-            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none sm:max-w-full"
-            : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
-        )}
-        style={
-          isMobile
-            ? {
-                top: 0,
-                height: "var(--omnigent-viewport-height, 100dvh)",
-                maxHeight: "var(--omnigent-viewport-height, 100dvh)",
-                // Pad both insets: the macOS title bar or safe-top clears the window
-                // controls or notch; safe-bottom keeps the last row above the home
-                // indicator when the keyboard is closed (the viewport then spans it).
-                paddingTop: "var(--mac-titlebar-height, var(--omnigent-safe-top, 0px))",
-                paddingBottom: "var(--omnigent-safe-bottom, 0px)",
-              }
-            : undefined
-        }
-        showCloseButton={false}
-      >
-        <DialogTitle className="sr-only">{paletteLabel}</DialogTitle>
-        {/* shouldFilter=false: the server filters sessions and we filter actions
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent
+          aria-describedby={undefined}
+          // Mobile: a top-anchored full-screen sheet sized to --omnigent-viewport-height,
+          // so the input and results sit above the soft keyboard. sm:max-w-full
+          // overrides DialogContent's sm:max-w-sm between 640px and md.
+          className={cn(
+            "overflow-hidden p-0",
+            isMobile
+              ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none sm:max-w-full"
+              : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
+          )}
+          style={
+            isMobile
+              ? {
+                  top: 0,
+                  height: "var(--omnigent-viewport-height, 100dvh)",
+                  maxHeight: "var(--omnigent-viewport-height, 100dvh)",
+                  // Pad both insets: the macOS title bar or safe-top clears the window
+                  // controls or notch; safe-bottom keeps the last row above the home
+                  // indicator when the keyboard is closed (the viewport then spans it).
+                  paddingTop: "var(--mac-titlebar-height, var(--omnigent-safe-top, 0px))",
+                  paddingBottom: "var(--omnigent-safe-bottom, 0px)",
+                }
+              : undefined
+          }
+          showCloseButton={false}
+        >
+          <DialogTitle className="sr-only">{paletteLabel}</DialogTitle>
+          {/* shouldFilter=false: the server filters sessions and we filter actions
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
-        {/* Command's base class is `size-full`, so it already fills the sheet. */}
-        <Command
-          shouldFilter={false}
-          vimBindings={false}
-          label={paletteLabel}
-          value={selectedValue}
-          onValueChange={setSelectedValue}
-          onKeyDown={(event) => {
-            if (SELECTION_KEYS.has(event.key)) userMovedSelection.current = true;
-          }}
-        >
-          {isMobile ? (
-            // Search field and an explicit close button share a top row; the
-            // full-screen sheet has no ⌘K/Esc affordance the way the desktop
-            // dialog does, so the X is how touch users dismiss it.
-            <div className="flex items-center gap-1 p-1">
-              <div className="min-w-0 flex-1">
-                <CommandInput
-                  value={query}
-                  onValueChange={setQuery}
-                  placeholder={placeholder}
-                  data-testid="command-palette-input"
-                />
-              </div>
-              <Button
-                variant="ghost"
-                size="icon-lg"
-                className="shrink-0 rounded-full"
-                onClick={close}
-                aria-label="Close search"
-              >
-                <XIcon className="size-5 text-muted-foreground" />
-              </Button>
-            </div>
-          ) : (
-            <CommandInput
-              value={query}
-              onValueChange={setQuery}
-              placeholder={placeholder}
-              data-testid="command-palette-input"
-            />
-          )}
-          <CommandList
-            className={isMobile ? "max-h-none flex-1" : undefined}
-            // Hovering a row selects it in cmdk, which counts as the user's pick.
-            onPointerMove={(event) => {
-              if ((event.target as Element).closest("[cmdk-item]")) {
-                userMovedSelection.current = true;
-              }
+          {/* Command's base class is `size-full`, so it already fills the sheet. */}
+          <Command
+            shouldFilter={false}
+            vimBindings={false}
+            label={paletteLabel}
+            value={selectedValue}
+            onValueChange={setSelectedValue}
+            onKeyDown={(event) => {
+              if (SELECTION_KEYS.has(event.key)) userMovedSelection.current = true;
             }}
           >
-            {(loadError || (sessionsOnly && isFetching)) && (
-              <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
-                {loadError
-                  ? loadMoreError
-                    ? "Couldn't load more sessions."
-                    : "Couldn't load sessions."
-                  : "Loading sessions…"}
-                {loadError && (
-                  <button
-                    type="button"
-                    className="ml-2 underline"
-                    disabled={retrying}
-                    onClick={retryLoad}
-                  >
-                    Retry
-                  </button>
-                )}
-              </p>
+            {isMobile ? (
+              // Search field and an explicit close button share a top row; the
+              // full-screen sheet has no ⌘K/Esc affordance the way the desktop
+              // dialog does, so the X is how touch users dismiss it.
+              <div className="flex items-center gap-1 p-1">
+                <div className="min-w-0 flex-1">
+                  <CommandInput
+                    value={query}
+                    onValueChange={setQuery}
+                    placeholder={placeholder}
+                    data-testid="command-palette-input"
+                  />
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon-lg"
+                  className="shrink-0 rounded-full"
+                  onClick={close}
+                  aria-label="Close search"
+                >
+                  <XIcon className="size-5 text-muted-foreground" />
+                </Button>
+              </div>
+            ) : (
+              <CommandInput
+                value={query}
+                onValueChange={setQuery}
+                placeholder={placeholder}
+                data-testid="command-palette-input"
+              />
             )}
-            {!loadError && !(sessionsOnly && isFetching) && (
-              <CommandEmpty>{searchFetching ? "Searching…" : "No results found"}</CommandEmpty>
-            )}
-            {sessions.length > 0 && (
-              <CommandGroup heading="Sessions">
-                {visibleSessions.map(renderSession)}
-                {searching && renderShowMore("title", titleSearch, visibleSessions)}
-              </CommandGroup>
-            )}
-            {contentSessions.length > 0 && (
-              <CommandGroup heading="In messages">
-                {contentSessions.map(renderSession)}
-                {renderShowMore("content", contentSearch, contentSessions)}
-              </CommandGroup>
-            )}
-            {sessionsOnly && sessions.length > visibleSessions.length && (
-              <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
-                Showing {visibleSessions.length} of {sessions.length} matches. Type more to narrow
-                your search.
-              </p>
-            )}
-            {sessionsOnly && hasNextPage && loadedPages >= pageLimit && !loadError && (
-              <Button
-                variant="ghost"
-                className="w-full"
-                disabled={isFetching}
-                onClick={() => setPageLimit(loadedPages + SESSION_SEARCH_PAGE_BATCH)}
-              >
-                Search older sessions
-              </Button>
-            )}
-            {filteredActions.length > 0 && (
-              <CommandGroup heading="Actions">
-                {filteredActions.map((a) => {
-                  const Icon = a.icon;
-                  return (
-                    <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
-                      <Icon />
-                      <span className="flex-1 truncate text-left">{a.label}</span>
+            <CommandList
+              className={isMobile ? "max-h-none flex-1" : undefined}
+              // Hovering a row selects it in cmdk, which counts as the user's pick.
+              onPointerMove={(event) => {
+                if ((event.target as Element).closest("[cmdk-item]")) {
+                  userMovedSelection.current = true;
+                }
+              }}
+            >
+              {(loadError || (sessionsOnly && isFetching)) && (
+                <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+                  {loadError
+                    ? loadMoreError
+                      ? "Couldn't load more sessions."
+                      : "Couldn't load sessions."
+                    : "Loading sessions…"}
+                  {loadError && (
+                    <button
+                      type="button"
+                      className="ml-2 underline"
+                      disabled={retrying}
+                      onClick={retryLoad}
+                    >
+                      Retry
+                    </button>
+                  )}
+                </p>
+              )}
+              {!loadError && !(sessionsOnly && isFetching) && (
+                <CommandEmpty>{searchFetching ? "Searching…" : "No results found"}</CommandEmpty>
+              )}
+              {sessions.length > 0 && (
+                <CommandGroup heading="Sessions">
+                  {visibleSessions.map(renderSession)}
+                  {searching && renderShowMore("title", titleSearch, visibleSessions)}
+                </CommandGroup>
+              )}
+              {contentSessions.length > 0 && (
+                <CommandGroup heading="In messages">
+                  {contentSessions.map(renderSession)}
+                  {renderShowMore("content", contentSearch, contentSessions)}
+                </CommandGroup>
+              )}
+              {sessionsOnly && sessions.length > visibleSessions.length && (
+                <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+                  Showing {visibleSessions.length} of {sessions.length} matches. Type more to narrow
+                  your search.
+                </p>
+              )}
+              {sessionsOnly && hasNextPage && loadedPages >= pageLimit && !loadError && (
+                <Button
+                  variant="ghost"
+                  className="w-full"
+                  disabled={isFetching}
+                  onClick={() => setPageLimit(loadedPages + SESSION_SEARCH_PAGE_BATCH)}
+                >
+                  Search older sessions
+                </Button>
+              )}
+              {(filteredActions.length > 0 || offerNamedProject) && (
+                <CommandGroup heading="Actions">
+                  {offerNamedProject && (
+                    <CommandItem
+                      value="create:new-project"
+                      onSelect={() => {
+                        close();
+                        setNewProjectName(trimmedQuery);
+                      }}
+                    >
+                      <FolderPlusIcon />
+                      <span className="flex-1 truncate text-left">
+                        New project &ldquo;{trimmedQuery}&rdquo;
+                      </span>
                     </CommandItem>
-                  );
-                })}
-              </CommandGroup>
-            )}
-          </CommandList>
-        </Command>
-      </DialogContent>
-    </Dialog>
+                  )}
+                  {filteredActions.map((a) => {
+                    const Icon = a.icon;
+                    return (
+                      <CommandItem
+                        key={a.id}
+                        value={`action:${a.id}`}
+                        onSelect={() => runAction(a)}
+                      >
+                        <Icon />
+                        <span className="flex-1 truncate text-left">{a.label}</span>
+                      </CommandItem>
+                    );
+                  })}
+                </CommandGroup>
+              )}
+            </CommandList>
+          </Command>
+        </DialogContent>
+      </Dialog>
+      <NewProjectDialog
+        open={newProjectName !== null}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setNewProjectName(null);
+        }}
+        initialName={newProjectName ?? ""}
+      />
+    </>
   );
 }
