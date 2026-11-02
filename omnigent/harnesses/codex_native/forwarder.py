@@ -2854,11 +2854,10 @@ async def _subscribe_until_ready(
     detect activity and set the signal. A short poll still covers the
     brief window between "thread active" and the rollout being flushed.
 
-    Each resume attempt, and on success the sync and replay that must precede
-    live posts, holds the session's delivery scope; waits between attempts do
-    not, so a subscription that never succeeds cannot silence the session. A
-    reconnect that owes replay keeps the scope across attempts, so no live turn
-    can replace the bridge's recovery cursor before the replay lands.
+    The delivery scope is released between resume attempts unless replay is
+    owed; a successful attempt keeps it through sync and replay. Replay-owed
+    reconnects keep it so no live turn replaces the bridge's recovery cursor
+    before the replay lands.
 
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
@@ -2900,6 +2899,7 @@ async def _subscribe_until_ready(
                 params: _JsonObject = {"threadId": thread_id}
                 if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
                     params["excludeTurns"] = True
+                timed_out = False
                 try:
                     response = await asyncio.wait_for(
                         client.request("thread/resume", params),

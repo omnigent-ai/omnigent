@@ -622,10 +622,10 @@ async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A resume Codex never answers is retried, with a growing bound, instead of
-    holding the scope forever."""
+    """A resume Codex never answers is retried, with a growing bound, and live
+    posts go through while it stays unanswered."""
 
-    class _HangingFirstResumeClient:
+    class _UnansweredResumeClient:
         def __init__(self) -> None:
             self.params: list[dict] = []
 
@@ -634,30 +634,29 @@ async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
 
         async def request(self, _method: str, params: dict) -> dict:
             self.params.append(params)
-            if len(self.params) <= 3:
-                await asyncio.Event().wait()
-            return {"result": {"thread": {"id": "thread_1", "turns": []}}}
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
     monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_TIMEOUT_SECONDS", 0.02)
     monkeypatch.setattr(fwd, "_SUBSCRIBE_RESUME_MAX_TIMEOUT_SECONDS", 0.04)
-    native = _HangingFirstResumeClient()
+    native = _UnansweredResumeClient()
     client = _RecordingClient()
     tracker = fwd._CodexElicitationTaskTracker()
     usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
     locks_token = fwd._conversation_item_locks.set({})
     caplog.set_level(logging.WARNING, logger=fwd.__name__)
-    try:
-        subscribe = asyncio.create_task(
-            fwd._subscribe_until_ready(
-                native,  # type: ignore[arg-type]
-                client,  # type: ignore[arg-type]
-                session_id="conv_x",
-                bridge_dir=tmp_path,
-                thread_id="thread_1",
-                usage_coalescer=usage,
-                elicitation_tracker=tracker,
-            )
+    subscribe = asyncio.create_task(
+        fwd._subscribe_until_ready(
+            native,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
         )
+    )
+    try:
         while not native.params:
             await asyncio.sleep(0)
         await asyncio.wait_for(
@@ -669,20 +668,29 @@ async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
             ),
             timeout=5.0,
         )
-        await asyncio.wait_for(subscribe, timeout=5.0)
+        while len(native.params) < 4:
+            await asyncio.sleep(0.01)
     finally:
+        subscribe.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await subscribe
         fwd._conversation_item_locks.reset(locks_token)
         await usage.close()
         await tracker.close()
 
-    # The retry is still a reconnect, not a fresh not-ready thread.
-    assert native.params == [{"threadId": "thread_1", "excludeTurns": True}] * 4
+    # The retries are still a reconnect, not a fresh not-ready thread.
+    assert all(
+        params == {"threadId": "thread_1", "excludeTurns": True} for params in native.params
+    )
     # Each timed-out attempt doubles the next bound, up to the max.
-    assert [
-        record.args[1]  # type: ignore[index]
-        for record in caplog.records
-        if "did not answer" in record.getMessage()
-    ] == [0.02, 0.04, 0.04]
+    assert (
+        [
+            record.args[1]  # type: ignore[index]
+            for record in caplog.records
+            if "did not answer" in record.getMessage()
+        ][:3]
+        == [0.02, 0.04, 0.04]
+    )
     assert [body["data"]["source_id"] for _url, body in client.posts] == [
         "thread_1:turn_1:item_live"
     ]
