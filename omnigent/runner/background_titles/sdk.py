@@ -7,7 +7,7 @@ import json
 import logging
 import uuid
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
     BackgroundTitleContext,
@@ -123,7 +123,23 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                             "background title harness failed process=%s detail=%s",
                             process_key,
                             detail,
-                            extra={"session_id": runner_primary_session_id()},
+                            extra=debug_event(
+                                "background_title_harness_failed",
+                                session_id=runner_primary_session_id(),
+                                process_key=process_key,
+                                harness=context.harness,
+                                model_source="title_override"
+                                if context.title_model
+                                else "session",
+                                max_output_tokens=event_body["max_output_tokens"],
+                                received_text_chars=sum(len(part) for part in text_parts),
+                                failure_category=(
+                                    "output_token_limit"
+                                    if "response exceeded" in detail[:4096].casefold()
+                                    and "output token maximum" in detail[:4096].casefold()
+                                    else "harness_error"
+                                ),
+                            ),
                         )
                         raise BackgroundTitleHarnessError(detail)
                     elif event_type == "response.completed":
