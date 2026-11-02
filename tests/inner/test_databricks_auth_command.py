@@ -16,7 +16,6 @@ def _run_generated_helper(
     command: str,
     tmp_path: Path,
     *,
-    force_refresh_works: bool,
     cached_token_works: bool,
     bearer: str | None = None,
 ) -> str:
@@ -26,8 +25,6 @@ def _run_generated_helper(
     :param command: The generated helper command.
     :param tmp_path: Directory the fake CLI is written into and prepended to
         ``PATH``.
-    :param force_refresh_works: Whether ``--force-refresh`` succeeds. ``False``
-        is the stale-refresh-token case.
     :param cached_token_works: Whether plain ``auth token`` succeeds.
     :param bearer: Value for ``DATABRICKS_BEARER``, or ``None`` to unset it.
     :returns: The helper's stdout, stripped.
@@ -39,19 +36,14 @@ def _run_generated_helper(
     fake.write_text(
         "#!/bin/sh\n"
         'case "$*" in *--help*) echo "  --force-refresh"; exit 0;; esac\n'
-        'case "$*" in *--force-refresh*)\n'
-        '  [ "$FORCE_OK" = 1 ] && { echo \'{"access_token":"fresh"}\'; exit 0; }\n'
-        "  exit 1;;\n"
-        "*)\n"
-        '  [ "$CACHED_OK" = 1 ] && { echo \'{"access_token":"cached"}\'; exit 0; }\n'
-        "  exit 1;;\n"
-        "esac\n"
+        f'case "$*" in *--force-refresh*) : > {tmp_path / "force-refreshed"};; esac\n'
+        '[ "$CACHED_OK" = 1 ] && { echo \'{"access_token":"cached"}\'; exit 0; }\n'
+        "exit 1\n"
     )
     fake.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
-        "FORCE_OK": "1" if force_refresh_works else "0",
         "CACHED_OK": "1" if cached_token_works else "0",
     }
     # The command's last-resort fallback shells to the databricks-sdk mint
@@ -88,40 +80,23 @@ def _recorded_fallback(tmp_path: Path) -> str:
 
 
 @pytest.mark.posix_only
-def test_the_generated_helper_serves_the_cached_token_when_a_refresh_fails(
+def test_the_generated_helper_serves_the_cached_token_without_forcing_a_refresh(
     tmp_path: Path,
 ) -> None:
     """
-    A stale refresh token must not cost a perfectly valid cached access token.
+    Many concurrent sessions share one refresh token, so none may force-rotate it.
 
-    ``--force-refresh`` is worth attempting — it renews a still-valid token and
-    keeps a long gateway session off a mid-session 401 — but it fails outright
-    once the refresh token has gone stale. Forcing it unconditionally turned
-    that into a hard auth failure with a usable credential sitting right there.
+    Racing forced refreshes replay a spent single-use refresh token, the IdP
+    revokes the grant, and every session 401s until the user logs in again.
     """
     from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
     command = databricks_bearer_token_command("https://example.databricks.com", "agent")
 
-    # Healthy: the forced refresh answers, so the token is the fresh one.
-    assert (
-        _run_generated_helper(command, tmp_path, force_refresh_works=True, cached_token_works=True)
-        == "fresh"
-    )
-    # The live incident: the refresh token is stale, the cached one is fine.
-    assert (
-        _run_generated_helper(
-            command, tmp_path, force_refresh_works=False, cached_token_works=True
-        )
-        == "cached"
-    )
+    assert _run_generated_helper(command, tmp_path, cached_token_works=True) == "cached"
+    assert not (tmp_path / "force-refreshed").exists()
     # Genuinely unauthenticated: nothing to print, and no crash.
-    assert (
-        _run_generated_helper(
-            command, tmp_path, force_refresh_works=False, cached_token_works=False
-        )
-        == ""
-    )
+    assert _run_generated_helper(command, tmp_path, cached_token_works=False) == ""
 
 
 def test_the_generated_helper_selects_by_profile_when_one_is_named() -> None:
@@ -158,10 +133,7 @@ def test_the_named_profile_wins_and_the_recorded_command_stays_unused(
         "https://example.databricks.com", "agent", fallback_command=_recorded_fallback(tmp_path)
     )
 
-    assert (
-        _run_generated_helper(command, tmp_path, force_refresh_works=True, cached_token_works=True)
-        == "fresh"
-    )
+    assert _run_generated_helper(command, tmp_path, cached_token_works=True) == "cached"
     assert not (tmp_path / "fallback-ran").exists()
 
 
@@ -181,12 +153,7 @@ def test_the_recorded_command_runs_when_the_named_profile_yields_nothing(
         "https://example.databricks.com", "DEFAULT", fallback_command=_recorded_fallback(tmp_path)
     )
 
-    assert (
-        _run_generated_helper(
-            command, tmp_path, force_refresh_works=False, cached_token_works=False
-        )
-        == "recorded"
-    )
+    assert _run_generated_helper(command, tmp_path, cached_token_works=False) == "recorded"
     assert (tmp_path / "fallback-ran").exists()
 
 
@@ -212,7 +179,6 @@ def test_a_working_profile_outranks_an_ambient_bearer(
         _run_generated_helper(
             command,
             tmp_path,
-            force_refresh_works=False,
             cached_token_works=True,
             bearer="stale-shell-export",
         )
@@ -241,7 +207,6 @@ def test_the_ambient_bearer_backstops_a_profile_that_cannot_mint(
         _run_generated_helper(
             command,
             tmp_path,
-            force_refresh_works=False,
             cached_token_works=False,
             bearer="injected",
         )
@@ -259,12 +224,7 @@ def test_without_a_recorded_command_an_unauthenticated_profile_stays_empty(
 
     command = databricks_bearer_token_command("https://example.databricks.com", "agent")
 
-    assert (
-        _run_generated_helper(
-            command, tmp_path, force_refresh_works=False, cached_token_works=False
-        )
-        == ""
-    )
+    assert _run_generated_helper(command, tmp_path, cached_token_works=False) == ""
 
 
 def _write_broker_sidecar(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace_host: str):

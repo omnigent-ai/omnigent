@@ -292,17 +292,11 @@ class TestCodexExecutor(unittest.TestCase):
                 for override in executor._codex_config_overrides
             )
         )
-        # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # stays behind a `--help` capability probe — an older CLI rejects the
-        # unknown flag and yields an empty token → silent 401.
         auth_override = next(
             o for o in executor._codex_config_overrides if "databricks auth token" in o
         )
-        self.assertIn("databricks auth token --help", auth_override)
-        # And even where it exists it is only ATTEMPTED: it fails outright on a
-        # stale refresh token, so an empty result must fall back to the cached
-        # token rather than turning a usable credential into an auth failure.
-        self.assertIn("--force-refresh", auth_override)
+        # Concurrent forced refreshes race the shared refresh token into revocation.
+        self.assertNotIn("--force-refresh", auth_override)
         # (the TOML fragment escapes the shell's quotes, so match on the test)
         self.assertIn("if [ -z ", auth_override)
         self.assertIn("$token", auth_override)
