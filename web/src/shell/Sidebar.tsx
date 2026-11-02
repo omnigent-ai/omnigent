@@ -3964,6 +3964,9 @@ function ConversationSection({
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
   const gridMembers = new Set(grids?.activeGrid ? gridSessionIds(grids.activeGrid.layout) : []);
+  // A provisional row has no server id yet, so it can't be a Move up/down target.
+  const reorderNeighbour = (row: Conversation | undefined) =>
+    reorderGroup && row && !row.provisional ? row.id : undefined;
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const protectsCollapsedBadge = isCollapsed && marker != null;
@@ -4080,8 +4083,8 @@ function ConversationSection({
                   onToggleSelected={onToggleSelected}
                   onProjectAssigned={onProjectAssigned}
                   reorderGroup={reorderGroup}
-                  previousId={reorderGroup && conversations[index - 1]?.id}
-                  nextId={reorderGroup && conversations[index + 1]?.id}
+                  previousId={reorderNeighbour(conversations[index - 1])}
+                  nextId={reorderNeighbour(conversations[index + 1])}
                 />
               ))}
             </ul>
@@ -5120,15 +5123,14 @@ function ConversationRowImpl({
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
+  // Owners' live rows reorder; any row in the same list is a target.
+  const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
   // archive / rename modes. Dragging it onto a project folder files it there;
   // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
   // routes the drop; the row only advertises itself and its source project +
   // pinned state via the draggable `data`.
-  // Custom ordering moves the rows the viewer can already drag to manage; any
-  // row in the same list is a target. The list's drop handler commits the move.
-  const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
   const {
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,

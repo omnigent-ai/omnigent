@@ -663,6 +663,17 @@ it("keeps Custom on its base's caches and saves cutoff-second arrivals through s
   expect(result.current.loadedRows.map((r) => r.id)).toContain("history");
   expect(setItem).toHaveBeenCalled();
   setItem.mockRestore();
+  // Loading more history, including the cutoff second, never writes the preference.
+  const writes = vi.spyOn(Storage.prototype, "setItem");
+  act(() =>
+    client.setQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"], (data) => ({
+      ...data!,
+      pages: [...data!.pages, sessionRowsPage([row("older"), { ...row("tie"), created_at: 100 }])],
+    })),
+  );
+  await waitFor(() => expect(result.current.loadedRows.map((r) => r.id)).toContain("tie"));
+  expect(writes).not.toHaveBeenCalled();
+  expect(result.current.view.custom?.ids).toEqual(["arrival", "mine"]);
   act(() => result.current.updateView({ ordering: "created" }));
   expect(result.current.sortBy).toBe("created_at");
   act(() => result.current.updateView({ ordering: "custom" }));

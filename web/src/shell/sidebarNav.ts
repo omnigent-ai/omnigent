@@ -226,8 +226,6 @@ export function customSortOrder(order: SidebarCustomOrder): CustomSortOrder {
 // Newest first; equal timestamps fall back to id, so arrival order never shows.
 // Freeze update timestamps for the active chat and hovered list; creation
 // timestamps stay immutable, including when the selected order changes.
-// A Custom order puts saved rows at their positions, sessions created since it
-// started above them (newest first), and the remaining history below them.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
@@ -241,6 +239,7 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
+  // Custom: saved rows by position, later-created sessions above, history (ties too) below.
   const rank = (c: Conversation): number =>
     custom ? (custom.positions.get(c.id) ?? (c.created_at > custom.since ? -1 : Infinity)) : 0;
   return [...conversations].sort((a, b) => {
@@ -252,7 +251,7 @@ export function sortConversations(
   });
 }
 
-function sidebarSortBy(base: SidebarCustomOrder["base"]): SessionSortBy {
+export function sidebarSortBy(base: SidebarCustomOrder["base"]): SessionSortBy {
   return base === "created" ? "created_at" : "updated_at";
 }
 

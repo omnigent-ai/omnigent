@@ -18,7 +18,7 @@ import {
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
-import { customSortOrder } from "@/shell/sidebarNav";
+import { customSortOrder, sidebarSortBy } from "@/shell/sidebarNav";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { dedupeSessionRows, mergeScopeRows, sessionRowsPage } from "@/lib/sidebarData";
 import {
@@ -52,8 +52,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
     ? storedView
     : DEFAULT_SIDEBAR_VIEW;
-  const sortBy: SessionSortBy =
-    sidebarBaseOrdering(view) === "created" ? "created_at" : "updated_at";
+  const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
   const customOrder = useMemo(
     () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
     [view],
@@ -62,8 +61,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     (patch: Partial<SidebarViewPreferences>) => {
       const next = { ...storedView, ...patch };
       writeSidebarViewPreferences(next);
-      const nextSortBy = sidebarBaseOrdering(next) === "created" ? "created_at" : "updated_at";
       if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(storedView)) {
+        const nextSortBy = sidebarSortBy(sidebarBaseOrdering(next));
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
           void client.invalidateQueries({ queryKey, refetchType: "none" });

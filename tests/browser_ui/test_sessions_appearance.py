@@ -139,7 +139,8 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     page.reload()
     expect(rows).to_have_text(updated)
 
-    source = rows.filter(has_text="Quiet session").bounding_box()
+    # Updated would now be Quiet, Busy, Recent, so this drop leaves a distinct Custom order.
+    source = rows.filter(has_text="Recent session").bounding_box()
     target_row = rows.filter(has_text="Busy session")
     target = target_row.bounding_box()
     assert source and target
@@ -152,7 +153,7 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     expect(target_row).to_have_css("background-color", "rgba(0, 0, 0, 0)")
     expect(rows).to_have_text(updated)
     page.mouse.up()
-    custom = titles("Quiet session", "Busy session", "Recent session")
+    custom = titles("Recent session", "Busy session", "Quiet session")
     expect(rows).to_have_text(custom)
 
     sessions.append(

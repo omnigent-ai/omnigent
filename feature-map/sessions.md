@@ -1111,7 +1111,8 @@ plain `uv run pytest`, which starts a private server for the test.
   message. That is expected; run them with plain `uv run pytest`.
 - Custom positions apply to loaded rows: a session moved up from deep history
   takes its place again once its page loads. History loaded after Custom started
-  follows Created or Updated until a move below it saves those positions. Each
+  follows Created or Updated until a move below it saves those positions. A move
+  made while Created or Updated is selected starts Custom over from that list. Each
   tab reads the saved order once, so another tab's change shows after reload and
   the last tab to save wins. Only your own live sessions can be dragged; shared
   and archived rows keep their Custom place but can't be moved.

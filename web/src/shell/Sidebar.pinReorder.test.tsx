@@ -253,17 +253,22 @@ describe("Custom session order", () => {
   const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view") ?? "{}");
   const link = (id: string) => screen.getByRole("link", { name: id });
   const renderGrouping = () => renderSidebar({ features: { sidebar_grouping_ui: true } });
+  const listRows = (...extra: ReturnType<typeof conv>[]) =>
+    vi
+      .mocked(useConversations)
+      .mockImplementation(() =>
+        conversationPage([
+          conv("conv_c", { created_at: 3, updated_at: 10 }),
+          conv("conv_d", { created_at: 2, updated_at: 30, status: "running" }),
+          conv("conv_e", { created_at: 1, updated_at: 20 }),
+          ...extra,
+        ]),
+      );
 
   beforeEach(() => {
     mocks.pinned = [];
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
-    vi.mocked(useConversations).mockImplementation(() =>
-      conversationPage([
-        conv("conv_c", { created_at: 3, updated_at: 10 }),
-        conv("conv_d", { created_at: 2, updated_at: 30, status: "running" }),
-        conv("conv_e", { created_at: 1, updated_at: 20 }),
-      ]),
-    );
+    listRows();
   });
   afterEach(() => {
     localStorage.clear();
@@ -293,23 +298,32 @@ describe("Custom session order", () => {
     expect(fireEvent.click(row, { detail: 1 })).toBe(true);
   });
 
-  it("only takes drops from the dragged session's own group", async () => {
+  it("only takes drops from the dragged session's own group, including onto shared rows", async () => {
     localStorage.setItem(
       "omnigent:sidebar-view",
       JSON.stringify({ grouping: "status", ordering: "created" }),
     );
+    localStorage.setItem("omnigent:session-filter", "all");
+    listRows(conv("conv_f", { created_at: 0, updated_at: 0, owner: "other@example.com" }));
     renderGrouping();
-    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e"]);
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
+    // A shared row holds a place in the order but can't be moved itself.
+    fireEvent.contextMenu(link("conv_f"));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("move-session-up")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
 
     await dropOnto("conv_e", "conv_d", {
       expectTarget: false,
       whileOver: () => expect(link("conv_d")).not.toHaveClass("outline-dashed"),
     });
-    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e"]);
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
     expect(saved().ordering).toBe("created");
 
     await dropOnto("conv_e", "conv_c", { expectTarget: false });
-    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c"]);
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c", "conv_f"]);
+    await dropOnto("conv_c", "conv_f", { expectTarget: false });
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_f", "conv_c"]);
   });
 
   it.each([
@@ -323,6 +337,8 @@ describe("Custom session order", () => {
     ],
     ["right-click menu", (id: string) => fireEvent.contextMenu(link(id))],
   ])("moves a session down and up from its %s", (_menu, openMenu) => {
+    // A just-created row has no server id yet, so it is never a Move target.
+    listRows(conv("temp:new", { created_at: 99, updated_at: 99, provisional: true }));
     renderGrouping();
 
     openMenu("conv_c");
