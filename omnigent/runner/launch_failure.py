@@ -299,6 +299,8 @@ _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
     r"provider auth command `(?P<command>[^`\n]+)` (?P<outcome>exited with status"
     r"|produced an empty token|timed out|failed to start|wrote non-UTF-8)"
 )
+# The Databricks CLI login that renews a profile token, e.g. "Run `databricks auth login`".
+_DATABRICKS_CLI_LOGIN = re.compile(r"databricks auth login\b")
 _EXIT_STATUS_PREFIX = re.compile(r"^\s*(?:exit status: -?\d+|signal: \d+[^:\n]*):?\s*")
 _STORAGE_EXHAUSTED_FRAGMENTS = ("no space left on device", "disk quota exceeded")
 # Shells that wrap a token helper; the helper to run is in their arguments.
@@ -454,6 +456,12 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
     elif shell_wrapped:
         remediation = (
             "Sign in to the model provider again on the host, then send your message again."
+        )
+    elif _DATABRICKS_CLI_LOGIN.search(message):
+        # A Databricks-backed helper names the CLI login that renews its token.
+        remediation = (
+            "Run `databricks auth login` on the host to sign in again, then send your message "
+            "again."
         )
     else:
         remediation = (
