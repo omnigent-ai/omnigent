@@ -2596,6 +2596,46 @@ async def test_on_runner_connect_offline_runner_logs_warning_without_traceback(
 
 
 @pytest.mark.asyncio
+async def test_on_runner_connect_matches_binding_a_cached_row_has_not_seen(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session bound a moment ago attaches even while its cached row shows no runner."""
+    import dataclasses
+
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_just_bound"
+    (conv_id,) = _bind_sessions(db_uri, runner_id)
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    fresh_rows = SqlAlchemyConversationStore.get_conversations
+
+    def _stale_rows(
+        self: SqlAlchemyConversationStore, conversation_ids: list[str]
+    ) -> dict[str, Conversation]:
+        return {
+            key: dataclasses.replace(conv, runner_id=None)
+            for key, conv in fresh_rows(self, conversation_ids).items()
+        }
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "get_conversations", _stale_rows)
+    resolved: list[tuple[str, str | None]] = []
+
+    def _resolve(conv_id: str, *, conversation: Conversation) -> RoutedRunner:
+        resolved.append((conv_id, conversation.runner_id))
+        return RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+
+    app.state.runner_router.client_for_session_resources = _resolve  # type: ignore[assignment]
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert resolved == [(conv_id, runner_id)]
+
+
+@pytest.mark.asyncio
 async def test_on_runner_connect_other_resolve_error_keeps_exception(
     db_uri: str,
     tmp_path: Path,

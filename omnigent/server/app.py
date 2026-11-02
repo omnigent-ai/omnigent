@@ -1,6 +1,7 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -4584,10 +4585,16 @@ def create_app(
         for _, candidates in groupby(convs, key=is_independent):
             # Awaited reads let attachment yield between batches, even for native mirrors.
             for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
+                batch_ids = [conv.id for conv in batch]
                 try:
                     async with store_slots:
                         current = await asyncio.to_thread(
-                            conversation_store.get_conversations, [conv.id for conv in batch]
+                            conversation_store.get_conversations, batch_ids
+                        )
+                        # Conversation reads may come from a cache that lags a
+                        # just-written binding; match on the authoritative one.
+                        bound_runner_ids = await asyncio.to_thread(
+                            conversation_store.get_runner_ids, batch_ids
                         )
                 except Exception:
                     # A failed lookup must not strand the remaining batches.
@@ -4599,8 +4606,10 @@ def create_app(
                     return
                 for snapshot in batch:
                     conv = current.get(snapshot.id)
-                    if conv is None or conv.runner_id != runner_id:
+                    if conv is None or bound_runner_ids.get(snapshot.id) != runner_id:
                         continue
+                    if conv.runner_id != runner_id:
+                        conv = dataclasses.replace(conv, runner_id=runner_id)
                     with runner_log_scope(conv.id, runner_id):
                         _logger.info(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
