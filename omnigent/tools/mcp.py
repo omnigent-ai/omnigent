@@ -60,6 +60,28 @@ from omnigent.spec.types import MCPServerConfig, RetryPolicy
 
 _T = TypeVar("_T")
 
+# Runner env a stdio server keeps only by declaring it in its own ``env``. The
+# Databricks SDK merges an ambient profile into every client the server builds.
+_UNINHERITED_PARENT_ENV_VARS = frozenset({"DATABRICKS_CONFIG_PROFILE"})
+
+
+def _inherited_stdio_env() -> dict[str, str]:
+    """
+    Return the runner env that a stdio MCP server with its own ``env`` starts from.
+
+    Drops the runner-auth secrets and :data:`_UNINHERITED_PARENT_ENV_VARS`, so
+    such a server sees no more of the runner's identity than one that declares
+    no ``env`` and gets the MCP SDK's default allowlist.
+
+    :returns: A copy of ``os.environ`` without those variables, e.g. with
+        ``PATH`` and ``HOME`` but no ``DATABRICKS_CONFIG_PROFILE``.
+    """
+    env = strip_runner_auth_secrets(os.environ)
+    for name in _UNINHERITED_PARENT_ENV_VARS:
+        env.pop(name, None)
+    return env
+
+
 # Type aliases for the (read, write) stream pair returned by MCP
 # transports. Uses anyio's concrete stream types parameterized
 # over the MCP session message type.
@@ -1343,11 +1365,9 @@ class McpServerConnection:
             # ``env=None`` inherits the SDK's ``get_default_environment``
             # allowlist (no runner-auth secret). The ``config.env`` branch
             # overlays author-declared vars (e.g. ``GITHUB_TOKEN``) on the
-            # full parent env, so strip the runner tunnel binding token
-            # first: an MCP server command is spec-author code.
-            env=(strip_runner_auth_secrets(os.environ) | self.config.env)
-            if self.config.env
-            else None,
+            # parent env minus the runner's identity: an MCP server command
+            # is spec-author code.
+            env=(_inherited_stdio_env() | self.config.env) if self.config.env else None,
         )
         read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
         return read_stream, write_stream
