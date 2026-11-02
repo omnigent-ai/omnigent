@@ -18,6 +18,9 @@ from omnigent.tools.builtins.web_search_keenable import (
     _resolve_max_results as _resolve_max_results_keenable,
 )
 from omnigent.tools.builtins.web_search_nimble import _resolve_max_results
+from omnigent.tools.builtins.web_search_serply import (
+    _resolve_max_results as _resolve_max_results_serply,
+)
 from omnigent.tools.builtins.web_search_tavily import (
     _resolve_max_results as _resolve_max_results_tavily,
 )
@@ -601,6 +604,7 @@ def test_no_search_provider_fails_loudly(
     assert "nimble" in result.lower()
     assert "tavily" in result.lower()
     assert "keenable" in result.lower()
+    assert "serply" in result.lower()
 
 
 # ── search_provider: keenable ────────────────────────
@@ -804,6 +808,222 @@ def test_keenable_max_results_clamped() -> None:
     assert _resolve_max_results_keenable({"max_results": "0"}) == 1  # below min → clamped up
     assert _resolve_max_results_keenable({"max_results": "500"}) == 20  # above max → clamped down
     assert _resolve_max_results_keenable({"max_results": "abc"}) == 5  # non-numeric → default
+
+
+# ── search_provider: serply ──────────────────────────
+
+
+def test_serply_backend_via_spec_config(tool_ctx: ToolContext) -> None:
+    """
+    With search_provider=serply and api_key in spec config,
+    the tool delegates to Serply web search.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "results": [
+            {
+                "title": "Serply Docs",
+                "link": "https://serply.io/docs",
+                "description": "Google search API for agents.",
+                "position": 1,
+            },
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={
+            "search_provider": "serply",
+            "api_key": "spec-serply-key",
+        },
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "serply"}), tool_ctx)
+
+    # Serply result list made it through the unified tool pipeline.
+    assert "1. Serply Docs" in result
+    assert "https://serply.io/docs" in result
+    assert "Google search API for agents." in result
+
+
+def test_serply_missing_key_returns_error(tool_ctx: ToolContext) -> None:
+    """With search_provider=serply but no api_key, returns error."""
+    tool = WebSearchTool(
+        config={"search_provider": "serply"},
+        llm_provider="anthropic",
+    )
+    result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+    assert "api_key" in result
+
+
+def test_serply_spec_config_used_in_http_call(tool_ctx: ToolContext) -> None:
+    """
+    api_key from spec config is sent as the X-Api-Key header, the web
+    endpoint is used by default, and the query string carries q / num.
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={
+            "search_provider": "serply",
+            "api_key": "spec-serply",
+            "max_results": "7",
+        },
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        tool.invoke(json.dumps({"query": "hello"}), tool_ctx)
+
+    _, kwargs = mock_get.call_args
+    assert mock_get.call_args.args[0].endswith("/v1/search/")
+    assert kwargs["headers"]["X-Api-Key"] == "spec-serply"
+    assert kwargs["headers"]["User-Agent"] == "omnigent-web-search"
+    assert kwargs["params"] == {"q": "hello", "num": 7}
+
+
+def test_serply_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
+    """A non-2xx response surfaces as a readable error, not an exception."""
+    fake_response = MagicMock()
+    fake_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=401)
+    )
+
+    tool = WebSearchTool(
+        config={"search_provider": "serply", "api_key": "bad"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert result == "Serply search error: HTTP 401"
+
+
+def test_serply_empty_results_returns_no_results(tool_ctx: ToolContext) -> None:
+    """An empty result list yields the 'No results found.' message."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "serply", "api_key": "k"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert result == "No results found."
+
+
+def test_serply_news_strips_html_and_slices(tool_ctx: ToolContext) -> None:
+    """
+    search_type=news hits the news endpoint; RSS-style HTML summaries are
+    flattened to text and the list is cut to ``max_results`` client-side
+    (the news endpoint ignores ``num``).
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "entries": [
+            {
+                "title": f"Story {i}",
+                "link": f"https://news.example/{i}",
+                "published": "Wed, 26 Aug 2026 09:00:09 GMT",
+                "source": {"href": "https://example.com", "title": "Example"},
+                "summary": '<a href="https://x">Story</a>&nbsp;&nbsp;text',
+            }
+            for i in range(20)
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={
+            "search_provider": "serply",
+            "api_key": "k",
+            "search_type": "news",
+            "max_results": "3",
+        },
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "quantum"}), tool_ctx)
+
+    assert mock_get.call_args.args[0].endswith("/v1/news/")
+    assert "1. Story 0\n   https://news.example/0\n   Story text" in result
+    assert "3. Story 2" in result
+    assert "Story 3" not in result
+
+
+def test_serply_scholar_formats_articles(tool_ctx: ToolContext) -> None:
+    """search_type=scholar hits the scholar endpoint and appends citation counts."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "articles": [
+            {
+                "title": "Quantum Computing in the NISQ era",
+                "link": "https://doi.org/10.22331/q-2018-08-06-79",
+                "description": "John Preskill - Quantum, 2018",
+                "author": {"names": "John Preskill - Quantum, 2018", "authors": []},
+                "extras": {"citations": {"count": 8592, "link": "https://example.org"}},
+                "doc": {"link": "https://example.org/paper.pdf", "type": "PDF"},
+            }
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={"search_provider": "serply", "api_key": "k", "search_type": "scholar"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "quantum computing"}), tool_ctx)
+
+    assert mock_get.call_args.args[0].endswith("/v1/scholar/")
+    assert "1. Quantum Computing in the NISQ era" in result
+    assert "https://doi.org/10.22331/q-2018-08-06-79" in result
+    assert "John Preskill - Quantum, 2018 (cited by 8592)" in result
+
+
+def test_serply_unsupported_search_type_rejected(tool_ctx: ToolContext) -> None:
+    """An unknown ``search_type`` is rejected before any HTTP call is made."""
+    tool = WebSearchTool(
+        config={"search_provider": "serply", "api_key": "k", "search_type": "images"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    mock_get.assert_not_called()
+    assert "unsupported search_type" in result
+    assert "news, scholar, web" in result
+
+
+def test_serply_max_results_clamped() -> None:
+    """``max_results`` is coerced + clamped to a 1-10 range; junk falls back to the default."""
+    assert _resolve_max_results_serply({}) == 5  # missing: default
+    assert _resolve_max_results_serply({"max_results": "0"}) == 1  # below min: clamped up
+    assert _resolve_max_results_serply({"max_results": "500"}) == 10  # above max: clamped down
+    assert _resolve_max_results_serply({"max_results": "abc"}) == 5  # non-numeric: default
+
+
+def test_serply_base_url_override(tool_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_SERPLY_BASE_URL`` redirects requests (used by stub-server tests)."""
+    monkeypatch.setenv("OMNIGENT_SERPLY_BASE_URL", "http://127.0.0.1:9/v1/")
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"results": []}
+
+    tool = WebSearchTool(
+        config={"search_provider": "serply", "api_key": "k"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_serply.httpx.get") as mock_get:
+        mock_get.return_value = fake_response
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert mock_get.call_args.args[0] == "http://127.0.0.1:9/v1/search/"
 
 
 # ── Spec config passed through ───────────────────────
