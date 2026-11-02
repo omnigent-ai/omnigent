@@ -2764,9 +2764,14 @@ describe("session PR selection", () => {
     expect(screen.queryByTestId("github-stored-pr")).toBeNull();
   });
 
-  it.each(["error", "health", "sandbox"])(
-    "replaces cached checks/merge with stored metadata and recovers: %s",
-    async (reason) => {
+  it.each([
+    { reason: "error", prCount: 2 },
+    { reason: "health", prCount: 2 },
+    { reason: "sandbox", prCount: 2 },
+    { reason: "health", prCount: 1 },
+  ])(
+    "replaces cached checks/merge with stored metadata and recovers: $reason ($prCount PRs)",
+    async ({ reason, prCount }) => {
       const user = userEvent.setup();
       const url = "https://github.com/acme/app/pull/6000";
       const attached: PullRequestAssociation = {
@@ -2780,10 +2785,11 @@ describe("session PR selection", () => {
         is_draft: false,
         state_checked_at: Date.now() / 1000 - 60,
       };
+      const prs = prCount === 1 ? [attached] : [attached, OTHER_PR];
       Object.assign(state.info!.data!, {
         tracking_available: true,
         selected_pr_url: url,
-        prs: [attached, OTHER_PR],
+        prs,
         capabilities: { merging: true },
         pr: {
           ...state.info!.data!.pr!,
@@ -2793,10 +2799,16 @@ describe("session PR selection", () => {
           head_sha: "head",
         },
       });
-      state.stored.conv_1 = [attached, OTHER_PR];
+      state.stored.conv_1 = prs;
       const { rerender } = renderPanel();
-      await screen.findByRole("list", { name: "Pull requests" });
-      expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      if (prCount === 1) {
+        await screen.findByRole("tab", { name: "Summary" });
+        expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+      } else {
+        await screen.findByRole("list", { name: "Pull requests" });
+        expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      }
+      expect(screen.getByRole("region", { name: "Merge" })).toBeVisible();
       expect(screen.getByRole("button", { name: "66 passed" })).toBeVisible();
       const online = state.info!;
       expect(screen.queryByTestId("github-stored-pr")).toBeNull();
@@ -2807,18 +2819,24 @@ describe("session PR selection", () => {
       state.sandboxAsleep = reason === "sandbox";
       rerender(<PullRequestPanel conversationId="conv_1" />);
 
-      expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+      expect(screen.queryByRole("region", { name: "Merge" })).toBeNull();
       expect(screen.queryByRole("button", { name: "66 passed" })).toBeNull();
-      const status = screen.getAllByText(
-        reason === "sandbox" ? "Sandbox asleep" : "Host offline",
-      )[0];
-      await user.hover(status);
-      expect(await screen.findByRole("tooltip")).toHaveTextContent("Last sync time:");
-      await user.unhover(status);
-      await user.click(
-        screen.getByRole("button", { name: "acme/app #6000 — Attached while online" }),
-      );
+      if (prCount > 1) {
+        const status = screen.getAllByText(
+          reason === "sandbox" ? "Sandbox asleep" : "Host offline",
+        )[0];
+        await user.hover(status);
+        expect(await screen.findByRole("tooltip")).toHaveTextContent("Last sync time:");
+        await user.unhover(status);
+        await user.click(
+          screen.getByRole("button", { name: "acme/app #6000 — Attached while online" }),
+        );
+      } else {
+        expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeVisible();
+        expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+      }
       const stored = screen.getByTestId("github-stored-pr");
+      expect(within(stored).getByRole("status")).toHaveTextContent("Last sync time:");
       expect(within(stored).getByRole("link", { name: /Attached while online/ })).toHaveAttribute(
         "href",
         url,
@@ -2831,8 +2849,16 @@ describe("session PR selection", () => {
       state.sandboxAsleep = false;
       rerender(<PullRequestPanel conversationId="conv_1" />);
       expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
-      await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
-      expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      if (prCount > 1) {
+        await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
+        expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      } else {
+        expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+        expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+      }
+      expect(screen.getByRole("region", { name: "Merge" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "66 passed" })).toBeVisible();
+      expect(screen.queryByTestId("github-stored-pr")).toBeNull();
       expect(screen.queryByText("Host offline")).toBeNull();
     },
   );

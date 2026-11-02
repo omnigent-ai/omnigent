@@ -314,9 +314,12 @@ offers Display only.
 **Offline pull requests:** link PRs to a session, then stop its host. Open the
 Pull Requests tab from the Workspace rail or composer (desktop and mobile).
 On phones, Refresh and Link sit beside Close in the single drawer header;
-in details, the header title becomes the back-to-list button.
-The list retains stored titles and status pills; each row shows **Host offline**
-(or **Sandbox asleep**) instead of checks and Merge. Hover or focus that notice
+with multiple PRs, the details header title becomes the back-to-list button.
+A single PR opens its stored summary directly under **Pull Requests**, with its
+title, status, last sync time and reconnect guidance. Unlink is in the header.
+With multiple PRs, the list retains stored titles and status pills; each row
+shows **Host offline** (or **Sandbox asleep**) instead of checks and Merge.
+Hover or focus that notice
 for the last sync time and reconnect guidance. Click a row for its stored summary,
 then **All pull requests** to return. The row menu can open, copy, or unlink the
 PR while offline; linking needs the host. Reconnect and verify live checks and
