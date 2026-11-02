@@ -1026,11 +1026,11 @@ def test_background_agent_mark_parses_each_complete_appended_line_once(
     assert parsed == [progress.encode(), reply.encode()]
 
 
-@pytest.mark.parametrize("rewrite", ["replaced", "truncated"])
+@pytest.mark.parametrize("rewrite", ["replaced", "truncated", "cut_before_turn_end"])
 def test_background_agent_mark_rescans_a_rewritten_transcript(
     tmp_path: Path, rewrite: str
 ) -> None:
-    """A transcript replaced or cut short is rescanned from the turn's last reply."""
+    """A replaced or shortened transcript is rescanned; one without the turn's reply ends it."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path)
@@ -1044,9 +1044,13 @@ def test_background_agent_mark_rescans_a_rewritten_transcript(
         replacement = tmp_path / "replacement.jsonl"
         _write_turn(replacement, _STOP_HOOK_FEEDBACK, padding)
         os.replace(replacement, transcript_path)
-    else:
+    elif rewrite == "truncated":
         _write_turn(transcript_path, _STOP_HOOK_FEEDBACK)
+    else:
+        transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
 
+    assert reader.read() is False
+    _append_entries(transcript_path, padding)
     assert reader.read() is False
 
 

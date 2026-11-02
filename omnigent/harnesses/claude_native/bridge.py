@@ -3110,8 +3110,9 @@ class BackgroundAgentsAfterTurnReader:
     although its prompt is free. Set by the main session's ``Stop`` hook and
     cleared by its next ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
     A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
-    conversation entry after that turn's last reply also ends it. Each read
-    parses only the complete transcript lines appended since the previous one.
+    conversation entry after that turn's last reply also ends it, as does a
+    transcript cut short of that reply. Each read parses only the complete
+    transcript lines appended since the previous one.
 
     :param bridge_dir: Bridge directory path.
     """
@@ -3121,7 +3122,7 @@ class BackgroundAgentsAfterTurnReader:
         self._hold: tuple[str, int] | None = None
         self._transcript_identity: tuple[int, int] | None = None
         self._scanned_to = 0
-        self._continued = False
+        self._released = False
 
     def read(self) -> bool:
         """
@@ -3139,12 +3140,15 @@ class BackgroundAgentsAfterTurnReader:
         if self._hold != (transcript_path, offset):
             self._hold = (transcript_path, offset)
             self._transcript_identity = None
-            self._continued = False
-        if self._continued:
+            self._released = False
+        if self._released:
             return False
         try:
             with open(transcript_path, "rb") as handle:
                 status = os.fstat(handle.fileno())
+                if status.st_size < offset:
+                    self._released = True
+                    return False
                 identity = (status.st_dev, status.st_ino)
                 if identity != self._transcript_identity or status.st_size < self._scanned_to:
                     self._transcript_identity, self._scanned_to = identity, offset
@@ -3154,11 +3158,11 @@ class BackgroundAgentsAfterTurnReader:
             return False
         complete = appended[: appended.rfind(b"\n") + 1]
         self._scanned_to += len(complete)
-        self._continued = any(
+        self._released = any(
             _main_conversation_entry_type(line) in {"user", "assistant"}
             for line in complete.splitlines()
         )
-        return not self._continued
+        return not self._released
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
