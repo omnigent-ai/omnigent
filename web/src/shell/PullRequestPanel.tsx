@@ -1661,8 +1661,8 @@ export function PullRequestPanel({
   }, [selected, associations?.selected_pr_url, linked, changeSelection]);
   const prs = associations?.prs ?? [];
   useEffect(() => {
-    if (prs.length === 1) setDetailsSession(conversationId);
-  }, [conversationId, prs.length]);
+    if (prs.length === 1) updateView({ showingDetails: true });
+  }, [updateView, prs.length]);
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const detailsInfo =
     linked?.length === 0 && info.data

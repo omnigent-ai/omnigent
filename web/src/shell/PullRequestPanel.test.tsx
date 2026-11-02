@@ -387,9 +387,14 @@ afterEach(() => {
 });
 
 describe("PullRequestPanel", () => {
-  it.each([false, true])(
-    "restores cached PR details after session switches and remounts (mobile=%s)",
-    async (mobile) => {
+  it.each([
+    { mobile: false, multiple: false },
+    { mobile: true, multiple: false },
+    { mobile: false, multiple: true },
+    { mobile: true, multiple: true },
+  ])(
+    "restores cached PR details after session switches and remounts ($mobile, $multiple)",
+    async ({ mobile, multiple }) => {
       state.realPrHooks = true;
       const url = state.info!.data!.pr!.url;
       const payload = {
@@ -406,6 +411,9 @@ describe("PullRequestPanel", () => {
           },
         ],
       };
+      if (multiple) {
+        payload.prs.push({ ...payload.prs[0]!, url: `${url}1`, number: 60001 });
+      }
       let refreshing = false;
       const fetchMock = vi.fn(() =>
         refreshing
@@ -415,17 +423,36 @@ describe("PullRequestPanel", () => {
       vi.stubGlobal("fetch", fetchMock);
       const user = userEvent.setup();
       const { client, rerender } = renderPanel(mobile);
-      await user.click(
-        await screen.findByRole("button", { name: "acme/app #6000 — chore: dummy PR" }),
-      );
+      if (multiple) {
+        await user.click(
+          await screen.findByRole("button", { name: "acme/app #6000 — chore: dummy PR" }),
+        );
+      }
+      await waitFor(() => {
+        expect(client.getQueryData(["github-info", "conv_1", url])).toBeDefined();
+      });
       await user.click(await screen.findByRole("tab", { name: "Comments" }));
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
       // A subsequent poll replaces the original response in the shared cache.
       payload.pr = { ...payload.pr!, title: "Updated by polling" };
       await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
       expect(await screen.findByText("Updated by polling")).toBeVisible();
 
+      expect(client.getQueryData(["pull-request-panel-view", "conv_1"])).toMatchObject({
+        subtab: "comments",
+      });
       rerender(<PullRequestPanel conversationId="conv_other" />);
-      expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+      if (multiple) {
+        expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+      } else {
+        expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      }
       fetchMock.mockClear();
       rerender(<PullRequestPanel conversationId="conv_1" />);
       expect(screen.getByText("Updated by polling")).toBeVisible();
