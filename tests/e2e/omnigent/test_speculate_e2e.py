@@ -93,14 +93,28 @@ def test_speculate_exit_status_and_composed_promotion(
 def test_first_passing_replica_wins_and_the_slow_one_is_killed(
     omnigent_python: Path, repo: Path, env: dict[str, str], tmp_path: Path
 ) -> None:
-    """r2 passes once r1 has started, so the CLI kills r1, a 60 s sleep, instead of waiting."""
-    pid = tmp_path / "pid"
-    slow = (
-        f"import os, pathlib, time; pathlib.Path({str(pid)!r}).write_text(str(os.getpid()))\n"
+    """r2 passes once r1's 60 s tool has started, so the CLI kills r1 and the tool.
+
+    r1 runs the tool in its own session, as codex runs its tools, so killing r1's process
+    group alone would leave the tool running. r2 exits and leaves the same tool running,
+    which the CLI must kill too.
+    """
+    pid, left = tmp_path / "pid", tmp_path / "left"
+    tool = (
+        "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
         "time.sleep(60)"
     )
+    slow = (
+        "import subprocess, sys\n"
+        f"subprocess.run([sys.executable, '-c', {tool!r}, {str(pid)!r}], start_new_session=True)"
+    )
     fix = (
-        f"import pathlib, time\nwhile not pathlib.Path({str(pid)!r}).exists(): time.sleep(0.01)\n"
+        "import pathlib, subprocess, sys, time\n"
+        f"tool = [sys.executable, '-c', {tool!r}, {str(left)!r}]\n"
+        "subprocess.Popen(tool, start_new_session=True)\n"
+        f"while not all(pathlib.Path(p).exists() for p in ({str(pid)!r}, {str(left)!r})):\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(1)\n"  # long enough for the CLI to see the tool before r2 exits
         "pathlib.Path('a.py').write_text('A = 1\\n'); pathlib.Path('b.py').write_text('B = 1\\n')"
     )
     argv = _speculate(omnigent_python, slow, fix)
@@ -111,6 +125,7 @@ def test_first_passing_replica_wins_and_the_slow_one_is_killed(
     assert run.returncode == 0, run.stderr.decode()
     assert time.monotonic() - start < 20
     assert _exits(int(pid.read_text()))
+    assert _exits(int(left.read_text()))
 
 
 @pytest.mark.parametrize(

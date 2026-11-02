@@ -18,6 +18,7 @@ from pathlib import Path
 import click
 
 from omnigent.host.speculate import MAX_REPLICAS, Drafter, SpeculationError, Verifier, speculate
+from omnigent.inner import _proc
 
 _REPLICA_TIMEOUT_S = 1800.0
 
@@ -144,7 +145,7 @@ def _drafter(argv: list[str]) -> Drafter:
     """Run ``argv`` plus the prompt in a replica's directory, its stdout sent to stderr.
 
     Only a command that cannot start raises. Its exit status is reported, never trusted.
-    The replica's process group is killed once the stop event is set.
+    The replica's process tree and process group are killed once the stop event is set.
     """
 
     def draft(workdir: Path, prompt: str, stop: threading.Event) -> None:
@@ -155,10 +156,13 @@ def _drafter(argv: list[str]) -> Drafter:
             stdout=sys.stderr,
             start_new_session=True,
         )
+        _proc.remember_process_group(proc)
         deadline = time.monotonic() + _REPLICA_TIMEOUT_S
         try:
             # Short waits on the event, so a replica the run no longer needs dies promptly.
             while proc.poll() is None and not stop.wait(0.1):
+                # Tools in their own sessions leave the group, so track them while visible.
+                _proc.refresh_process_tree(proc)
                 if time.monotonic() > deadline:
                     # The edits made before the timeout are still verified.
                     limit = f"{_REPLICA_TIMEOUT_S:.0f}s"
@@ -167,8 +171,10 @@ def _drafter(argv: list[str]) -> Drafter:
             if status := proc.returncode:
                 click.echo(f"replica in {workdir} exited with status {status}", err=True)
         finally:
-            # Nothing the replica started may keep editing after its snapshot. macOS raises
-            # EPERM for a group whose only member is an unreaped zombie.
+            # Nothing the replica started may keep editing after its snapshot, including the
+            # tools seen above, even once the replica exited. macOS raises EPERM for a group
+            # whose only member is an unreaped zombie.
+            _proc.kill_tree(proc)
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
