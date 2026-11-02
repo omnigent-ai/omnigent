@@ -49,6 +49,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
+    ErrorDetail,
     McpServerStartup,
     SandboxStatus,
     ServerStreamEvent,
@@ -625,6 +626,23 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+@dataclass
+class _SessionFailureObservation:
+    """Latest known failed response, retained for late diagnostics during new activity."""
+
+    response_id: str
+    error: ErrorDetail | None
+    observed_error: ErrorDetail | None
+    origin: str
+    first_observed_at_ms: int
+    evidence: dict[str, str]
+
+
+_session_failure_observations: WorkspaceScopedCache[str, _SessionFailureObservation] = (
+    WorkspaceScopedCache(lambda: cachetools.LRUCache(maxsize=4096))
+)
 
 
 @dataclass

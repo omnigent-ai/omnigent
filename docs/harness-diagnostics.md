@@ -189,6 +189,33 @@ their screen-only excerpt independently of this flag; the flag is not a master
 content switch for ordinary lifecycle logs. Other terminals still export no
 pane text in these event attributes.
 
+## Server terminal failure observations
+
+The server merges failed status observations only when they name the same
+response. A missing response ID uses the active response ID when one is known.
+The first failure remains an ERROR; later detail replacing an empty error emits
+another `session_turn_failed` with `failure_observation=enriched`,
+`previous_failure_origin`, and the original `first_failure_at_ms`. Repeats of the
+same error do not emit another failure log, and a bare repeat cannot erase the
+known error on the live stream. Different error details and new structured
+evidence (including a distinct `failure_id`) remain observable; read-progress
+metrics alone do not create another failure log.
+A distinct failure identity is logged as `failure_observation=additional` and
+does not inherit the earlier failure's classification when its own error is absent.
+
+An explicit error for a previously observed failed response while another
+response is active still logs its diagnostic with `failure_status_applied=false`;
+it does not fail or close the active response. A scheduled run completed by the initial observation
+can receive the later reason only through its exact response/run binding and
+only while both stored error fields are empty. Its status and completion time
+do not change.
+
+These caches are bounded and process-local. Eviction, restart, or replica
+handoff can prevent merging or enrichment. Failures without a known response
+remain independent observations. Queries must assemble evidence by response ID
+before classifying a failure; logging fewer repeated rows alone does not fix a
+session-based reliability numerator or retroactively reclassify earlier rows.
+
 ## Native startup failure context
 
 Native terminal startup failures carry bounded `failure_context` metadata on

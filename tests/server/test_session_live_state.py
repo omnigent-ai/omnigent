@@ -16,6 +16,7 @@ short polling deadline — the same shape as the host-tunnel route tests'
 from __future__ import annotations
 
 import time
+import uuid
 
 import pytest
 
@@ -397,6 +398,79 @@ def test_scheduled_run_completion_runs_in_callers_workspace_scope() -> None:
     finally:
         session_live_state.configure(None)
     assert sched.lookup_workspaces == [4242]
+
+
+@pytest.mark.parametrize(
+    ("later_response", "forget_binding"),
+    [("resp_original", False), ("resp_other", False), (None, False), ("resp_original", True)],
+)
+def test_scheduled_failure_enrichment_requires_original_turn(
+    db_uri: str,
+    later_response: str | None,
+    forget_binding: bool,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    task_id, run_id, conversation_id = (uuid.uuid4().hex for _ in range(3))
+    with workspace_scope(4242):
+        store.create(
+            task_id, "enrichment", "prompt", "FREQ=DAILY", "user", uuid.uuid4().hex, "UTC"
+        )
+        store.create_run(
+            run_id=run_id,
+            scheduled_task_id=task_id,
+            status="running",
+            scheduled_at=100,
+            conversation_id=conversation_id,
+        )
+    session_live_state.configure(None, store)
+    try:
+        with workspace_scope(4242):
+            session_live_state.persist_scheduled_run_completion(
+                conversation_id,
+                "failed",
+                response_id="resp_unbound",
+                only_enrich=True,
+                error_code="runner_error",
+                error="unrelated old turn",
+            )
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        with workspace_scope(4242):
+            assert store.list_runs(task_id)[0][0].status == "running"
+        with workspace_scope(4242):
+            session_live_state.persist_scheduled_run_completion(
+                conversation_id,
+                "failed",
+                response_id="resp_original",
+            )
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        with workspace_scope(4242):
+            original = store.list_runs(task_id)[0][0]
+            assert original.status == "failed" and original.error is None
+            if forget_binding:
+                session_live_state.forget_live_status(conversation_id)
+            session_live_state.persist_scheduled_run_completion(
+                conversation_id,
+                "failed",
+                response_id=later_response,
+                only_enrich=True,
+                error_code="transient_upstream_error",
+                error="actionable cause",
+            )
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        with workspace_scope(4242):
+            enriched = store.list_runs(task_id)[0][0]
+    finally:
+        session_live_state.configure(None)
+    assert (enriched.status, enriched.finished_at) == ("failed", original.finished_at)
+    expected = (
+        ("transient_upstream_error", "actionable cause")
+        if later_response == "resp_original" and not forget_binding
+        else (None, None)
+    )
+    assert (enriched.error_code, enriched.error) == expected
 
 
 @pytest.mark.asyncio

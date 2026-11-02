@@ -806,6 +806,40 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
 
+    def enrich_run_failure(
+        self,
+        run_id: str,
+        *,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """Fill only an unclassified failed run's reason, preserving its terminal state."""
+        if not error and not error_code:
+            return None
+        failed_code = encode_scheduled_task_run_status("failed")
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            task_id = session.scalar(
+                select(SqlScheduledTaskRun.scheduled_task_id).where(
+                    SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                    SqlScheduledTaskRun.id == run_id,
+                )
+            )
+            if task_id is None:
+                return None
+            # Match deletion and completion's task-before-run lock order.
+            session.get(SqlScheduledTask, (current_workspace_id(), task_id), with_for_update=True)
+            row = session.get(
+                SqlScheduledTaskRun, (current_workspace_id(), run_id), with_for_update=True
+            )
+            if row is None or row.status != failed_code or row.error or row.error_code:
+                return None
+            row.error = error
+            row.error_code = error_code
+            return _run_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "enrich_task_run_failure", write)
+
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.
 
