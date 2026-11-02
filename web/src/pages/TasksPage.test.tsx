@@ -282,7 +282,7 @@ describe("TasksPage list", () => {
     setTasks([]);
     renderPage();
     const suggestions = screen.getByTestId("tasks-suggestions");
-    expect(within(suggestions).getByText("Start from a template")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Suggested Automations")).toBeInTheDocument();
     const cards = within(suggestions).getAllByTestId(/^suggestion-/);
     expect(cards).toHaveLength(3);
     expect(cards.map((r) => r.getAttribute("data-testid"))).toEqual([
