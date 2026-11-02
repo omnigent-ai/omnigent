@@ -27,6 +27,18 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
+// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+export const SESSION_HOST_PROTOCOL = 1;
+
+export interface BrowserHostOptions {
+  sourceHostId?: string | null;
+  sessionHostProtocol?: number;
+}
+
+export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
+  return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
+}
+
 export interface BrowserRecentSessionInput {
   type: "keydown" | "keyup";
   key: "Tab" | "Control" | "Escape";
@@ -231,14 +243,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
