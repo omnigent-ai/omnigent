@@ -14,14 +14,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import fcntl
 import json
 import os
+import pty
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+import termios
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -31,6 +35,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.terminal import create_terminal_instance
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
+    _client_sizes_window,
     _clipboard_buffer_name,
     _hex_send_keys_commands,
     _read_tmux_buffer,
@@ -1291,3 +1296,179 @@ async def test_control_attach_pins_client_term_over_inherited_dumb(
         )
     finally:
         await _kill_and_join(sock, task)
+
+
+async def _tmux_output(sock: Path, *args: str) -> str:
+    tmux = shutil.which("tmux")
+    assert tmux
+    proc = await asyncio.create_subprocess_exec(
+        tmux,
+        "-S",
+        str(sock),
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return out.decode().strip()
+
+
+def _resize_frame(cols: int, rows: int) -> dict[str, object]:
+    resize = {"type": "resize", "cols": cols, "rows": rows}
+    return {"type": "websocket.receive", "text": json.dumps(resize)}
+
+
+class _LiveWebSocket(_FakeWebSocket):
+    """Fake browser whose frames the test sends while the bridge runs."""
+
+    def __init__(self, *frames: dict[str, object]) -> None:
+        super().__init__(inbound=[])
+        self.frames: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        for frame in frames:
+            self.frames.put_nowait(frame)
+
+    async def receive(self) -> dict[str, object]:
+        return await self.frames.get()
+
+
+def _input_frame(data: bytes) -> dict[str, object]:
+    return {"type": "websocket.receive", "bytes": data}
+
+
+def _start_bridge(
+    ws: _FakeWebSocket, sock: Path, target: str, *, read_only: bool = False
+) -> asyncio.Task[None]:
+    return asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=read_only
+        )
+    )
+
+
+async def _window_width(sock: Path, target: str) -> int:
+    return int(await _tmux_output(sock, "display-message", "-p", "-t", target, "#{window_width}"))
+
+
+async def _client_widths(sock: Path) -> list[int]:
+    widths = await _tmux_output(sock, "list-clients", "-F", "#{client_width}")
+    return sorted(map(int, widths.split()))
+
+
+async def _settled_window_width(sock: Path, target: str) -> int:
+    """Read the window width once, after the bridges have had time to act.
+
+    Any tmux command recomputes window sizes when it exits, so polling would
+    hide a size the bridge left stale.
+    """
+    await asyncio.sleep(0.5)
+    return await _window_width(sock, target)
+
+
+async def _wait_for(query: Callable[[], Awaitable[object]], expected: object) -> None:
+    """Wait until *query* returns *expected*, reporting its last result."""
+    observed = None
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(10):
+            while (observed := await query()) != expected:
+                await asyncio.sleep(0.05)
+    assert observed == expected, f"observed {observed!r}, expected {expected!r}"
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_waiting_owner_takes_window_size_when_it_types() -> None:
+    """A narrow owner that only opens the pane keeps the window's size until it types.
+
+    A focus report is not typing.
+    """
+    sock, target = await _new_private_tmux("cat")
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    tasks = [_start_bridge(desktop, sock, target)]
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        tasks.append(_start_bridge(phone, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [45, 160])
+        assert await _settled_window_width(sock, target) == 160, (
+            "a 45-column phone that only opened the pane shrank the shared window"
+        )
+
+        phone.frames.put_nowait(_input_frame(b"\x1b[I"))
+        assert await _settled_window_width(sock, target) == 160
+
+        phone.frames.put_nowait(_input_frame(b"x"))
+        assert await _settled_window_width(sock, target) == 45
+    finally:
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_waiting_owner_takes_window_size_when_sizing_owner_leaves() -> None:
+    """Once the sizing owner detaches, a waiting owner sizes the window, not a viewer."""
+    sock, target = await _new_private_tmux("cat")
+    desktop = _LiveWebSocket(_resize_frame(160, 40))
+    phone = _LiveWebSocket(_resize_frame(45, 40))
+    viewer = _LiveWebSocket(_resize_frame(30, 40))
+    tasks = [_start_bridge(desktop, sock, target)]
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 160)
+        tasks.append(_start_bridge(phone, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [45, 160])
+        # Attached last, the viewer would win tmux's fallback once every client
+        # is ignore-size.
+        tasks.append(_start_bridge(viewer, sock, target, read_only=True))
+        await _wait_for(lambda: _client_widths(sock), [30, 45, 160])
+        assert await _window_width(sock, target) == 160
+
+        desktop.frames.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(tasks[0], timeout=10)
+        assert await _settled_window_width(sock, target) == 45
+    finally:
+        for task in tasks:
+            await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_browser_owner_does_not_resize_attached_terminal_until_it_types() -> None:
+    """A browser opening a session also attached from a local terminal keeps that size."""
+    tmux = shutil.which("tmux")
+    assert tmux
+    sock, target = await _new_private_tmux("cat")
+    controller, tty = pty.openpty()
+    fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 70, 0, 0))
+    local_terminal = subprocess.Popen(
+        [tmux, "-S", str(sock), "attach", "-t", target],
+        stdin=tty,
+        stdout=tty,
+        stderr=tty,
+        start_new_session=True,
+        env={**os.environ, "TERM": "xterm-256color"},
+    )
+    os.close(tty)
+    browser = _LiveWebSocket(_resize_frame(160, 40))
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        await _wait_for(lambda: _window_width(sock, target), 70)
+        tasks.append(_start_bridge(browser, sock, target))
+        await _wait_for(lambda: _client_widths(sock), [70, 160])
+        assert await _settled_window_width(sock, target) == 70
+
+        browser.frames.put_nowait(_input_frame(b"x"))
+        assert await _settled_window_width(sock, target) == 160
+    finally:
+        for task in tasks:
+            await _kill_and_join(sock, task)
+        await _kill_tmux(sock)
+        local_terminal.kill()
+        local_terminal.wait()
+        os.close(controller)
+
+
+@pytest.mark.asyncio
+async def test_client_sizes_window_fails_open() -> None:
+    """A failed client query must leave the owner attaching as an ordinary sizing client."""
+    tmux = shutil.which("tmux") or "/nonexistent/tmux"
+    assert not await _client_sizes_window(tmux, "/nonexistent/tmux.sock", "main")

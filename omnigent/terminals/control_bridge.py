@@ -147,6 +147,10 @@ _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # attached browser from overwriting every other viewer's local clipboard.
 _CLIPBOARD_RECENT_INPUT_WINDOW_S: Final[float] = 5.0
 
+# xterm.js sends these when its terminal gains or loses focus; they are not
+# typing, so they don't let a waiting owner take over the window size.
+_FOCUS_REPORTS: Final = frozenset({b"\x1b[I", b"\x1b[O"})
+
 
 def unescape_control_output(value: bytes) -> bytes:
     """Un-escape a ``%output`` value back to raw pane bytes.
@@ -361,6 +365,42 @@ def _hex_send_keys_commands(target: str, data: bytes) -> list[bytes]:
         hexs = " ".join(f"{b:02x}" for b in chunk)
         commands.append(f"send-keys -t {target} -H {hexs}\n".encode())
     return commands
+
+
+async def _client_sizes_window(tmux: str, socket_path: str, tmux_target: str) -> bool:
+    """Whether a client without ``ignore-size`` is attached to *tmux_target*.
+
+    tmux lets an ``ignore-size`` client size the window only while no attached
+    client lacks that flag, so such a client keeps the window's size.
+
+    :param tmux: Absolute path to the tmux binary.
+    :param socket_path: tmux server socket path.
+    :param tmux_target: The ``-t`` session target, e.g. ``"main"``.
+    :returns: ``True`` if such a client is attached; ``False`` if none is or
+        the query fails, so a failure falls back to an ordinary sizing attach.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "list-clients",
+            "-t",
+            tmux_target,
+            "-F",
+            "#{client_flags}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+    except (OSError, ValueError):
+        return False
+    if proc.returncode != 0:
+        return False
+    return any(
+        "ignore-size" not in flags.split(",")
+        for flags in stdout.decode(errors="replace").splitlines()
+    )
 
 
 async def _run_tmux_capture(socket_path: str, tmux_target: str) -> bytes | None:
@@ -641,6 +681,12 @@ async def bridge_tmux_control_to_websocket(
     is torn down and the websocket closed best-effort with the shared
     4404/4405 codes.
 
+    An owner that attaches while another client sizes the window joins with
+    ``ignore-size`` and takes over the size on its first input, or once no other
+    sizing client remains. tmux's default ``window-size latest`` follows the
+    most recently active client but never counts a control client's input, so
+    otherwise a phone that only opened the session would shrink the pane.
+
     :param websocket: An accepted FastAPI :class:`WebSocket`.
     :param socket_path: Filesystem path to the tmux server socket.
     :param tmux_target: The ``-t`` target string identifying the session.
@@ -686,8 +732,9 @@ async def bridge_tmux_control_to_websocket(
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)
 
+    waiting_to_size = not read_only and await _client_sizes_window(tmux, socket_path, tmux_target)
     argv = [tmux, "-S", socket_path, "-f", "/dev/null", "-C", "attach"]
-    if read_only:
+    if read_only or waiting_to_size:
         # Not ``-r``: tmux >= 3.7 rejects ``send-keys`` whose implicit target
         # client is read-only, so a viewer would block the harness from typing
         # into the pane. Input is already dropped below; keep only the
@@ -738,6 +785,10 @@ async def bridge_tmux_control_to_websocket(
     # xterm's synchronous paint path) and clipboard
     # forwarding uses it to identify which attached client initiated a copy.
     last_client_input_at: float | None = None
+    # The browser's latest ``COLSxROWS``, replayed when this client takes over
+    # the window size.
+    browser_size: str | None = None
+    client_detached = asyncio.Event()
 
     def _current_ws_coalesce_limit() -> int:
         """Per-frame cap: small right after input, larger for output floods."""
@@ -768,6 +819,25 @@ async def bridge_tmux_control_to_websocket(
         except (ConnectionResetError, BrokenPipeError, OSError):
             return
 
+    async def _take_window_size() -> None:
+        """Clear this owner's ``ignore-size`` so its size governs the window."""
+        nonlocal waiting_to_size
+        if not waiting_to_size:
+            return
+        waiting_to_size = False
+        await _send_command(b"refresh-client -f !ignore-size\n")
+        if browser_size is not None:
+            # Clearing the flag alone doesn't make tmux recompute the size.
+            await _send_command(f"refresh-client -C {browser_size}\n".encode())
+
+    async def _take_window_size_when_alone() -> None:
+        """Take the window size once no other client sizes the window."""
+        while waiting_to_size:
+            await client_detached.wait()
+            client_detached.clear()
+            if waiting_to_size and not await _client_sizes_window(tmux, socket_path, tmux_target):
+                await _take_window_size()
+
     def _handle_control_line(line: bytes) -> bool:
         """Route one protocol line; return ``True`` to keep reading.
 
@@ -795,6 +865,9 @@ async def bridge_tmux_control_to_websocket(
                 and _monotonic() - last_client_input_at <= _CLIPBOARD_RECENT_INPUT_WINDOW_S
             ):
                 _queue_clipboard_buffer(buffer_name)
+            return True
+        if line.startswith(b"%client-detached "):
+            client_detached.set()
             return True
         if line.startswith(b"%exit"):
             return False
@@ -882,7 +955,7 @@ async def bridge_tmux_control_to_websocket(
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
-        nonlocal last_client_input_at
+        nonlocal last_client_input_at, browser_size
         try:
             while True:
                 msg = await websocket.receive()
@@ -903,11 +976,14 @@ async def bridge_tmux_control_to_websocket(
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
                             continue
-                        await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
+                        browser_size = f"{cols}x{rows}"
+                        await _send_command(f"refresh-client -C {browser_size}\n".encode())
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()
+                    if data not in _FOCUS_REPORTS:
+                        await _take_window_size()
                     for cmd in _hex_send_keys_commands(tmux_target, data):
                         await _send_command(cmd)
         except WebSocketDisconnect:
@@ -941,6 +1017,7 @@ async def bridge_tmux_control_to_websocket(
     if forward_done is not None:
         forward_task.add_done_callback(lambda _task: forward_done.set())
     ws_task = asyncio.create_task(_ws_to_control(), name="tmux-ws-to-control")
+    size_task = asyncio.create_task(_take_window_size_when_alone(), name="tmux-control-size")
     # "Control side ended" == the reader finished (session gone / %exit /
     # window-close) — the signal the close-code logic keys on. The forwarder
     # finishing is downstream (it drains, then sees the EOF sentinel).
@@ -978,13 +1055,13 @@ async def bridge_tmux_control_to_websocket(
                 await asyncio.wait_for(
                     asyncio.shield(clipboard_task), timeout=_FORWARD_DRAIN_TIMEOUT_S
                 )
-        for task in {*pending, clipboard_task}:
+        for task in {*pending, clipboard_task, size_task}:
             if task.done():
                 continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for task in {read_task, forward_task, clipboard_task, ws_task}:
+        for task in {read_task, forward_task, clipboard_task, ws_task, size_task}:
             if task.done() and not task.cancelled():
                 exc = task.exception()
                 if exc is not None:
@@ -992,7 +1069,7 @@ async def bridge_tmux_control_to_websocket(
     finally:
         # Outer route cancellation can bypass the normal post-wait cleanup.
         # Always stop and join every child task before detaching the tmux client.
-        bridge_tasks = {read_task, forward_task, clipboard_task, ws_task}
+        bridge_tasks = {read_task, forward_task, clipboard_task, ws_task, size_task}
         for task in bridge_tasks:
             if not task.done():
                 task.cancel()
