@@ -1527,6 +1527,7 @@ def _build_session_response(
         items=items,
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,
+        task_summary=conv.task_summary,
         kind=conv.kind,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
