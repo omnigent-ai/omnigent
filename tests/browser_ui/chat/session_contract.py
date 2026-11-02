@@ -554,6 +554,12 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             {"error": {"message": "No browser-contract environment"}},
             status=404,
         )
+    # This ordinary host has no canonical Arca machine labels.
+    contract.json(
+        f"{session_api}/resources/environments/default/filesystem/etc/metric_proxy/labels/default?base=host",
+        {"detail": "File not found"},
+        status=404,
+    )
     contract.json(
         "/health",
         lambda _request: handle._health(),

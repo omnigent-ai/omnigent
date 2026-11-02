@@ -621,3 +621,87 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
             await asyncio.sleep(0.01)
         app.state.native_pane_status[conv_id] = "running"
         assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+)
+async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    """A pane that reads idle but shows live work keeps the idle watchdog open.
+
+    The pane watcher publishes ``idle`` once the pane goes quiet, which a
+    permission prompt does too. The pane reaper spares such a pane for the
+    prompt marker or recent output and input; the watchdog must do the same.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
+        leaves the pane idle.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "conv_idle_edge_live_pane"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    monkeypatch.setattr(
+        instance, "screen_changed_within", Mock(return_value=evidence == "pane_output")
+    )
+    monkeypatch.setattr(
+        instance, "client_interaction_within", Mock(return_value=evidence == "pane_input")
+    )
+    approval_root = tmp_path / "approval-waits"
+    approval_root.mkdir()
+    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
+    if evidence == "permission_prompt":
+        bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id,
+            "claude",
+            "main",
+            instance,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            publish = app.state.session_resource_registry._session_status_publisher
+            publish(conv_id, "running", None)
+            publish(conv_id, "idle", None)
+            assert app.state.native_pane_status[conv_id] == "idle"
+            assert app.state.has_active_work() is (evidence != "no_evidence")

@@ -61,7 +61,10 @@ class ClaudeProgramStatusPoller:
     @property
     def active(self) -> bool:
         """Whether OSC or the file owns status instead of pane activity."""
-        return not self._retired and (self._reader.status is not None or self._fallback.active)
+        if self._retired:
+            return False
+        active = self._reader.status is not None or self._fallback.active
+        return active and not self._retired
 
     @property
     def blocked_on(self) -> str | None:
@@ -69,6 +72,8 @@ class ClaudeProgramStatusPoller:
         if self._retired:
             return None
         report = self._reader.status
+        if self._retired:
+            return None
         return blocked_reason(report) if report is not None else self._fallback.blocked_on
 
     def tick(self) -> None:
@@ -81,6 +86,8 @@ class ClaudeProgramStatusPoller:
         if requested:
             self._last = None
         report = self._reader.status
+        if self._retired:
+            return
         is_error = report is not None and report.state == "error"
         # Resync must not turn a standing error into repeated observations.
         if is_error and not self._error_observed:

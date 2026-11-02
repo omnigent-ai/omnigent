@@ -751,6 +751,7 @@ export function useConversations(
 /**
  * One palette search group; keyed outside `["conversations"]`, which patches rows
  * live. Dropped once unobserved, so a later search never shows a stale row.
+ * Matches archived sessions too, so a search still finds them.
  */
 export function useSessionSearch(
   searchQuery: string,
@@ -766,7 +767,7 @@ export function useSessionSearch(
         after: pageParam,
         searchQuery,
         searchScope,
-        includeArchived: false,
+        includeArchived: true,
         queryClient,
         limit,
       }),

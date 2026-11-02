@@ -28,7 +28,7 @@ export interface ToolView {
   bodyLabel?: string;
 }
 
-/** File edits: added/removed line counts on the row, and the diff when expanded. */
+/** File edits and writes: added/removed line counts on the row, and the diff when expanded. */
 const FILE_EDIT_VIEW: ToolView = {
   lineCounts: fileEditLineCounts,
   Body: FileEditBody,
