@@ -27,6 +27,7 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import legacyActions from "../../electron/test/fixtures/browserActions-v0.18.json";
 
 const CONV = "conv_relay";
@@ -848,6 +849,58 @@ describe("useBrowserAgentRelay — privileged reads", () => {
     },
   );
 
+  it.each(["screenshot", "snapshot", "click", "type"])(
+    "retries %s once with fresh host options if the view becomes local after the probe",
+    async (action) => {
+      const error = "Current session host is required to read this browser view";
+      const call = vi.fn().mockResolvedValueOnce({ ok: false, error }).mockResolvedValue({
+        ok: true,
+        result: "{}",
+        dataUrl: "data:image/png;base64,AAA",
+      });
+      installBridge({ browserScreenshot: call, browserPerformAction: call });
+      getSessionSlim.mockResolvedValue({ id: CONV, hostId: "fresh-host", parentSessionId: null });
+      await runAction(actionEvent(action));
+      expect(call).toHaveBeenCalledTimes(2);
+      expect(call.mock.calls[0]).toEqual(
+        action === "screenshot" ? [CONV] : [CONV, action, action === "snapshot" ? undefined : {}],
+      );
+      expect(call.mock.calls[1].at(-1)).toEqual({
+        sessionHostProtocol: 1,
+        sourceHostId: "fresh-host",
+      });
+      expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
+      expect(postedResult().result).toHaveProperty("ok", true);
+    },
+  );
+
+  it.each([
+    {
+      privileged: false,
+      error: "Current session host is required to read this browser view",
+      calls: 2,
+    },
+    {
+      privileged: true,
+      error: "Current session host is required to read this browser view",
+      calls: 1,
+    },
+    { privileged: false, error: "different error", calls: 1 },
+  ])(
+    "does not loop or retry unrelated/already validated failures: %j",
+    async ({ privileged, error, calls }) => {
+      const browserScreenshot = vi.fn().mockResolvedValue({ ok: false, error });
+      installBridge({
+        browserScreenshot,
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: privileged }),
+      });
+      await runAction(actionEvent("screenshot"));
+      expect(browserScreenshot).toHaveBeenCalledTimes(calls);
+      expect(getSessionSlim).toHaveBeenCalledTimes(privileged || calls === 2 ? 1 : 0);
+      expect(postedResult().result).toEqual({ ok: false, error });
+    },
+  );
+
   it("omits host options when a navigation lookup fails", async () => {
     const bridge = installBridge();
     setSessionHost(CONV, "stale-local-host");
@@ -914,5 +967,47 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       sessionHostProtocol: 1,
       sourceHostId: "remote-host",
     });
+  });
+});
+
+describe("fetchSessionHostId — concurrent walks", () => {
+  it("shares one ancestry walk, populates every caller's cache, and refetches after completion", async () => {
+    const child = { id: CONV, hostId: null, parentSessionId: "parent" };
+    const parent = { id: "parent", hostId: "local", parentSessionId: null };
+    getSessionSlim.mockImplementation(async (id: string) => (id === CONV ? child : parent));
+    const firstClient = new QueryClient();
+    const secondClient = new QueryClient();
+    expect(
+      await Promise.all([
+        fetchSessionHostId(CONV, { queryClient: firstClient }),
+        fetchSessionHostId(CONV, { queryClient: secondClient }),
+      ]),
+    ).toEqual(["local", "local"]);
+    expect(getSessionSlim.mock.calls).toEqual([[CONV], ["parent"]]);
+    for (const client of [firstClient, secondClient]) {
+      expect(client.getQueryData(["session", CONV])).toEqual(child);
+      expect(client.getQueryData(["session", "parent"])).toEqual(parent);
+    }
+    getSessionSlim.mockResolvedValue({ ...child, hostId: "moved" });
+    expect(await fetchSessionHostId(CONV)).toBe("moved");
+    expect(getSessionSlim).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps different sessions independent and forgets a failed walk", async () => {
+    getSessionSlim.mockImplementation(async (id: string) => {
+      if (id === CONV) throw new Error("unavailable");
+      return { id, hostId: "other-host", parentSessionId: null };
+    });
+    expect(
+      await Promise.all([
+        fetchSessionHostId(CONV),
+        fetchSessionHostId(CONV),
+        fetchSessionHostId("other"),
+      ]),
+    ).toEqual([null, null, "other-host"]);
+    expect(getSessionSlim.mock.calls).toEqual([[CONV], ["other"]]);
+    getSessionSlim.mockResolvedValue({ id: CONV, hostId: "recovered", parentSessionId: null });
+    expect(await fetchSessionHostId(CONV)).toBe("recovered");
+    expect(getSessionSlim).toHaveBeenCalledTimes(3);
   });
 });

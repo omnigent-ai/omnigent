@@ -168,6 +168,7 @@ function loadNavigationHarness({
   acceptedSessions = new Set(),
   deepLinks = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
+  localHostNow = Date.now,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -647,8 +648,11 @@ function loadNavigationHarness({
     },
     "./hostIdentity": {
       ...require("../src/hostIdentity"),
-      isHostThisMachine: (context) =>
-        require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
+      createHostThisMachineChecker: () =>
+        require("../src/hostIdentity").createHostThisMachineChecker({
+          cli: localHostCli,
+          now: localHostNow,
+        }),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -5548,9 +5552,11 @@ describe("main-owned local host eligibility", () => {
 
   it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
     let live = true;
+    let now = 0;
     const serverUrl = "https://server.example";
     const h = loadNavigationHarness({
       serverUrl,
+      localHostNow: () => now,
       localHostCli: {
         readLocalHostId: () => "local",
         liveDaemonRecordFor: (target) => {
@@ -5583,6 +5589,7 @@ describe("main-owned local host eligibility", () => {
       false,
     );
     live = false;
+    now = 1000;
     assert.equal(
       context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
         .hostIsThisMachine,
