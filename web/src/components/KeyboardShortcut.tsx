@@ -4,6 +4,7 @@ export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
 import { TooltipContent } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
+import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 import { cn } from "@/lib/utils";
 
 const IS_MAC = isMacPlatform();
@@ -17,6 +18,10 @@ export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
 export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
+export const SPLIT_TERMINAL_KEYS: Record<TerminalSplitAxis, string[]> = {
+  columns: [MOD_KEY, ALT_KEY, SHIFT_KEY, "\\"],
+  rows: [MOD_KEY, ALT_KEY, "-"],
+};
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
   return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
