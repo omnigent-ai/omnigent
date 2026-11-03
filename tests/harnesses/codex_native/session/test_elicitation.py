@@ -799,15 +799,16 @@ def _answer_async_question(
     bridge_dir: Path,
     fake_client: _FakeCodexAppServerClient,
     hook_response: httpx.Response,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Drive one async question whose Omnigent hook returns ``hook_response``.
 
     :param bridge_dir: Native Codex bridge directory.
     :param fake_client: Fake Codex app-server client.
     :param hook_response: Omnigent hook response for the question card.
-    :returns: Session events the forwarder posted besides the hook.
+    :returns: Elicitation hook bodies and the other session events posted.
     """
+    hook_bodies: list[dict[str, Any]] = []
     posted_events: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -818,6 +819,7 @@ def _answer_async_question(
         :returns: Omnigent hook or event response.
         """
         if request.url.path.endswith("/hooks/codex-elicitation-request"):
+            hook_bodies.append(json.loads(request.content))
             return hook_response
         posted_events.append(json.loads(request.content))
         return httpx.Response(202, json={"queued": False})
@@ -842,7 +844,7 @@ def _answer_async_question(
             await context["elicitation_tracker"].drain()
 
     asyncio.run(run())
-    return posted_events
+    return hook_bodies, posted_events
 
 
 def _compact_steer_refusal() -> CodexAppServerResponseError:
@@ -1068,8 +1070,9 @@ def test_forwarder_sends_nothing_for_unanswered_codex_async_question(
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
 
-    _answer_async_question(tmp_path, fake_client, hook_response)
+    hook_bodies, _posted_events = _answer_async_question(tmp_path, fake_client, hook_response)
 
+    assert [body["id"] for body in hook_bodies] == ["async_question:call-async-1"]
     assert fake_client.requests == []
 
 
@@ -1242,26 +1245,55 @@ def test_forwarder_delivers_codex_async_question_answer_after_compaction(
 
 
 @pytest.mark.parametrize(
-    "steer_error",
-    [ConnectionResetError("app-server connection lost"), _compact_steer_refusal()],
-    ids=["disconnected", "compaction_timed_out"],
+    ("steer_error", "advance_bridge", "steered_turn_ids"),
+    [
+        (ConnectionResetError("app-server connection lost"), False, ["turn_123"]),
+        (_compact_steer_refusal(), False, ["turn_123"]),
+        (_compact_steer_refusal(), True, ["turn_123", "turn_124"]),
+    ],
+    ids=["disconnected", "compaction_timed_out", "refused_after_compaction"],
 )
 def test_forwarder_posts_notice_when_codex_async_question_answer_is_undelivered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     steer_error: Exception,
+    advance_bridge: bool,
+    steered_turn_ids: list[str],
 ) -> None:
     """
     An answer Codex may not have received tells the user to check and resend.
 
-    :param steer_error: Failure from the steer that carries the answer.
+    Delivery is retried only once, after the refused compaction turn settles,
+    and the forwarder never reconnects the client carrying its subscription.
+
+    :param steer_error: Failure from every steer that carries the answer.
+    :param advance_bridge: Whether a new turn starts after each failed steer.
+    :param steered_turn_ids: Turns the forwarder is expected to steer.
     """
     monkeypatch.setattr(codex_native_executor, "_BRIDGE_STATE_SLOW_POLL_SECONDS", 0.01)
     monkeypatch.setattr(codex_native_executor, "_COMPACTION_WAIT_TIMEOUT_SECONDS", 0.05)
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
-    fake_client = _FakeCodexAppServerClient(error=steer_error)
+    fake_client = _FakeCodexAppServerClient()
 
-    posted_events = _answer_async_question(
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Fail the steer, then start the next turn when the bridge advances.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: Never; every steer fails.
+        :raises Exception: ``steer_error``.
+        """
+        fake_client.requests.append((method, params))
+        if advance_bridge and len(fake_client.requests) < 3:
+            _write_forwarder_bridge(
+                tmp_path, active_turn_id=f"turn_{123 + len(fake_client.requests)}"
+            )
+        raise steer_error
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    _hook_bodies, posted_events = _answer_async_question(
         tmp_path,
         fake_client,
         httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}}),
@@ -1271,9 +1303,12 @@ def test_forwarder_posts_notice_when_codex_async_question_answer_is_undelivered(
     assert fake_client.requests == [
         (
             "turn/steer",
-            {"threadId": "thread_123", "expectedTurnId": "turn_123", "input": reply_input},
+            {"threadId": "thread_123", "expectedTurnId": turn_id, "input": reply_input},
         )
+        for turn_id in steered_turn_ids
     ]
+    assert not fake_client.connected
+    assert not fake_client.closed
     marker = "async-question-undelivered-call-async-1"
     assert _undelivered_answer_notices(posted_events) == [
         {
