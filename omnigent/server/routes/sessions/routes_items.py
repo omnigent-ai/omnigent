@@ -11,6 +11,7 @@ from fastapi import (
 )
 
 from omnigent.entities import Conversation
+from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 from omnigent.errors import StaleCursorError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -61,6 +62,8 @@ _MAX_DESCENDANT_DEPTH = 10
 # ``?descendants=true`` reads at most this many sub-agents of one spawn tree;
 # a bigger tree gets the one-level listing instead, which clients walk.
 _SPAWN_TREE_READ_CAP = 2000
+# The item types ``GET /sessions/{id}/items`` can filter by.
+_ITEM_TYPE_PATTERN = f"^({'|'.join(ITEM_TYPE_TO_DATA_CLS)})$"
 
 
 def register_items_routes(
@@ -85,7 +88,7 @@ def register_items_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
-        type: str | None = Query(default=None, max_length=64),
+        type: str | None = Query(default=None, pattern=_ITEM_TYPE_PATTERN),
     ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
@@ -104,7 +107,7 @@ def register_items_routes(
         :param order: Sort order, ``"asc"`` (chronological,
             default) or ``"desc"``.
         :param type: Only items of this type, e.g. ``"message"``; ``None``
-            lists every type.
+            lists every type. An unknown type is a 422.
         :returns: A :class:`PaginatedList` of conversation items.
         :raises OmnigentError: 404 if no session exists.
         """

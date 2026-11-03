@@ -16213,14 +16213,14 @@
             }
           },
           {
-            "description": "Only items of this type, e.g. `\"message\"`; `None` lists every type.",
+            "description": "Only items of this type, e.g. `\"message\"`; `None` lists every type. An unknown type is a 422.",
             "in": "query",
             "name": "type",
             "required": false,
             "schema": {
               "anyOf": [
                 {
-                  "maxLength": 64,
+                  "pattern": "^(message|function_call|function_call_output|error|reasoning|compaction|native_tool|resource_event|routing_decision|slash_command|terminal_command)$",
                   "type": "string"
                 },
                 {
