@@ -284,6 +284,10 @@ describe("ErrorBanner", () => {
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
     ],
     [
+      "codex_provider_auth_failed",
+      "Codex couldn't get a token from the model provider's sign-in command on the host.",
+    ],
+    [
       "content_policy_refusal",
       "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
     ],

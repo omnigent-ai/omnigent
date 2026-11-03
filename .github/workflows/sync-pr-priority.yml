@@ -4,7 +4,8 @@ name: Sync PR Priority
 # Only closing links (closes/fixes/resolves #n) count -- a plain "related to
 # #n" mention is ignored. Runs on PR events and re-syncs when an issue's labels
 # change. Uses only default-branch code and never checks out or executes PR
-# files; it edits labels through the API.
+# files; it edits labels through the API. Labels set via GITHUB_TOKEN never
+# trigger this, so issue-prioritization-v2.yml syncs the ones it sets.
 
 on:
   # No `synchronize`: priority is derived from the linked issue's label and the
@@ -42,7 +43,7 @@ jobs:
       github.repository == 'omnigent-ai/omnigent' &&
       (github.event_name != 'issues' ||
        contains(fromJSON('["P0-critical", "P1-high", "P2-medium", "P3-low"]'), github.event.label.name))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -61,61 +62,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      # For issue label events, find open PRs that close this issue so we can
-      # re-sync each of them. For PR / dispatch events we already know the PR.
-      - name: Resolve PR numbers to sync
-        id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_FROM_PR: ${{ github.event.pull_request.number }}
-          PR_FROM_DISPATCH: ${{ github.event.inputs.pr_number }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${EVENT_NAME}" == "issues" ]]; then
-            # Only relevant when a priority label was (un)set on the issue.
-            # On lookup failure, warn and treat as no PRs rather than failing
-            # the whole workflow.
-            if ! prs=$(
-              gh api graphql -f query='
-                query($owner:String!,$name:String!,$number:Int!){
-                  repository(owner:$owner,name:$name){
-                    issue(number:$number){
-                      closedByPullRequestsReferences(first:50, includeClosedPrs:false){
-                        nodes { number }
-                      }
-                    }
-                  }
-                }' \
-                -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="${ISSUE_NUMBER}" \
-                --jq '.data.repository.issue.closedByPullRequestsReferences.nodes[].number'
-            ); then
-              echo "::warning::Failed to resolve PRs closing issue #${ISSUE_NUMBER}; skipping sync."
-              prs=""
-            fi
-          elif [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            prs="${PR_FROM_DISPATCH}"
-          else
-            prs="${PR_FROM_PR}"
-          fi
-
-          echo "prs<<EOF" >> "${GITHUB_OUTPUT}"
-          echo "${prs}" >> "${GITHUB_OUTPUT}"
-          echo "EOF" >> "${GITHUB_OUTPUT}"
-
+      # PR and dispatch events name the PR. An issue label event re-syncs every
+      # open PR that closes the issue; a failed lookup warns instead of failing.
       - name: Sync priority labels
-        if: steps.resolve.outputs.prs != ''
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PRS: ${{ steps.resolve.outputs.prs }}
-        run: |
-          set -euo pipefail
-          while read -r pr; do
-            [[ -z "${pr}" ]] && continue
-            echo "Syncing PR #${pr}"
-            PR_NUMBER="${pr}" python3 .github/scripts/sync_pr_priority.py
-          done <<< "${PRS}"
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: python3 .github/scripts/sync_pr_priority.py

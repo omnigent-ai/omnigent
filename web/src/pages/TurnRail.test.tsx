@@ -334,7 +334,9 @@ describe("TurnRail", () => {
     // A genuine hover moves the cursor to a fresh position.
     fireEvent.mouseEnter(ticks[1]!, { clientX: 10, clientY: 20 });
     // The preview box renders the hovered turn's user text.
-    expect(screen.getByText("prompt number 1")).toBeInTheDocument();
+    const prompt = screen.getByText("prompt number 1");
+    expect(prompt).toBeInTheDocument();
+    expect(prompt.parentElement).toHaveClass("menu-surface");
   });
 
   it("ignores a mouseenter at the same cursor position (scroll under a still cursor)", () => {

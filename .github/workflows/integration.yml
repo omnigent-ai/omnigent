@@ -34,6 +34,7 @@ permissions:
   contents: read
 
 env:
+  OMNIGENT_CI_PIPELINE: integration
   # No web SPA build during `uv sync`: this job never serves the bundle
   # and the hardened runner has no npm mirror (build would time out).
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -63,7 +64,7 @@ jobs:
   setup:
     name: setup
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -95,7 +96,7 @@ jobs:
     # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
     # junit upload. Legs run in parallel; longest gates wall-time.
     timeout-minutes: 30

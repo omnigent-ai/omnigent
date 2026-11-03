@@ -21,6 +21,10 @@ on:
         description: Review even if this commit already has a completed review.
         default: false
         type: boolean
+      source_session_id:
+        description: Optional originating Omnigent session for usage attribution.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -33,7 +37,7 @@ jobs:
       (github.event_name != 'issue_comment' ||
        (github.event.issue.pull_request != null &&
         contains(github.event.comment.body, '/ocr')))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:
       contents: read
@@ -108,7 +112,7 @@ jobs:
     name: Open Code Review
     needs: request
     if: needs.request.outputs.pr != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       actions: read
@@ -119,6 +123,8 @@ jobs:
       cancel-in-progress: false
     env:
       OCR_NO_UPDATE: '1'
+      OMNIGENT_CI_PIPELINE: open-code-review
+      OMNIGENT_CI_SOURCE_SESSION_ID: ${{ inputs.source_session_id }}
     steps:
       - name: Resolve PR and skip reviewed commits
         id: pr
@@ -187,6 +193,13 @@ jobs:
             core.setOutput('base', pr.base.ref);
             core.setOutput('head', pr.head.sha);
 
+      - name: Check out trusted attribution helpers
+        if: steps.pr.outputs.head != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Check gateway configuration
         if: steps.pr.outputs.head != ''
         id: gateway
@@ -194,17 +207,20 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           REVIEW_MODEL: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_CI_PR_NUMBER: ${{ needs.request.outputs.pr }}
+          OMNIGENT_CI_REVIEWED_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
           : "${LLM_API_KEY:?Set the LLM_API_KEY repository secret}"
           : "${GATEWAY_BASE_URL:?Set the GATEWAY_BASE_URL repository secret}"
           : "${REVIEW_MODEL:?Set OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL or OMNIGENT_CI_ANTHROPIC_MODEL}"
-          gateway="${GATEWAY_BASE_URL%/}"
-          case "$gateway" in
-            */anthropic) ;;
-            *) gateway="${gateway}/anthropic" ;;
-          esac
-          echo "url=$gateway" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url
+          from dev.ci_usage import ocr_request_headers
+          print('url=' + ci_gateway_base_url(os.environ['GATEWAY_BASE_URL'], 'anthropic'))
+          print('headers=' + ocr_request_headers())
+          PY
 
       # The action checks out the trusted base and reads PR blobs through Git.
       # It never installs dependencies or executes code from the PR head.
@@ -219,6 +235,7 @@ jobs:
           llm_url: ${{ steps.gateway.outputs.url }}
           llm_auth_token: ${{ secrets.LLM_API_KEY }}
           llm_auth_header: Authorization
+          llm_extra_headers: ${{ steps.gateway.outputs.headers }}
           llm_use_anthropic: 'true'
           # The gateway model requires adaptive thinking; the action defaults to disabled.
           llm_extra_body: '{"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}'
@@ -244,7 +261,7 @@ jobs:
           effort: medium
           review_concurrency: '2'
           review_task_timeout: '15'
-          max_tokens_budget: '600000'
+          max_tokens_budget: '1200000'
           sticky_summary: 'false'
           incremental: 'true'
           route_severity_below: low
@@ -346,6 +363,14 @@ jobs:
           log_text = log.read_text() if log.exists() else ''
           filter_failed = any(message in log_text for message in
                               ('Review filter: failed', 'Review filter failed'))
+          failed = data.get('manifest', {}).get('coverage', {}).get('failed') or []
+          # A review that only ran out of token budget is a warning, never a completion receipt.
+          # Collapse whitespace and backticks so a path cannot break the Markdown list.
+          budget_skipped = sorted(' '.join(str(item.get('path', '?')).replace('`', "'").split())
+                                  for item in failed)
+          budget_only = (data.get('status') == 'partial' and summary.get('budget_exceeded') is True
+                         and bool(failed)
+                         and all('token budget' in (item.get('reason') or '') for item in failed))
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
               output.write('## Open Code Review\n\n')
               output.write(f"Status: {data.get('status', 'unknown')}\n\n")
@@ -356,9 +381,16 @@ jobs:
               if filter_failed:
                   output.write('**Finding-filter failure:** OCR retained findings without completing '
                                'its fact-checking pass. Validate them manually.\n')
+              if budget_only:
+                  output.write('**Token budget reached:** these files were not reviewed; '
+                               'review them manually:\n\n')
+                  output.write(''.join(f'- `{path}`\n' for path in budget_skipped))
           if filter_failed:
               print('::warning::OCR finding filter failed; reported findings need manual validation.')
-          if data.get('status') not in ('complete', 'skipped'):
+          if budget_only:
+              print(f'::warning::OCR token budget reached; {len(budget_skipped)} file(s) were not '
+                    'reviewed. See the job summary for the list.')
+          elif data.get('status') not in ('complete', 'skipped'):
               raise SystemExit('::error::OCR review is incomplete; inspect the coverage in the JSON artifact.')
           if data.get('status') == 'complete':
               head = data.get('manifest', {}).get('input', {}).get('resolved_head')

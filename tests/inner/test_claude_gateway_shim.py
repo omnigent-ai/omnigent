@@ -53,6 +53,9 @@ def _body(model: str, thinking: dict[str, Any] | None) -> bytes:  # type: ignore
         ("databricks-claude-opus-4-7", {"type": "enabled", "budget_tokens": 1024}),
         # Fable shares Opus 4.7+'s display="omitted" default.
         ("databricks-claude-fable-5", {"type": "adaptive"}),
+        # Unity Catalog spellings of the same Databricks-hosted tiers.
+        ("system.ai.claude-opus-4-8", {"type": "adaptive"}),
+        ("system.ai.claude-fable-5", {"type": "adaptive"}),
     ],
 )
 def test_restore_injects_display_for_adaptive_tiers(model: str, thinking: dict[str, Any]) -> None:  # type: ignore[explicit-any]  # parametrized API dict
@@ -78,6 +81,7 @@ def test_restore_injects_display_for_adaptive_tiers(model: str, thinking: dict[s
         ("databricks-claude-opus-4-8", {"type": "disabled"}),
         # Sonnet streams visible thinking by default — never touched.
         ("databricks-claude-sonnet-4-6", {"type": "adaptive"}),
+        ("system.ai.claude-sonnet-4-6", {"type": "adaptive"}),
         # First-party ids (no databricks- prefix) are out of scope.
         ("claude-opus-4-8", {"type": "adaptive"}),
         ("claude-fable-5", {"type": "adaptive"}),
@@ -285,6 +289,60 @@ async def test_shim_forwards_non_opus_and_non_messages_traffic_verbatim(upstream
         assert upstream.requests[1].method == "GET"
         assert upstream.requests[1].path == "/v1/models"
         assert other.json() == {"upstream": "ok"}
+    finally:
+        await shim.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_url", "surfaces"),
+    [
+        (
+            "https://ws.cloud.databricks.com/ai-gateway/anthropic",
+            "omnigent, omnigent-desktop, ug, inner",
+        ),
+        ("https://ws.cloud.databricks.com/serving-endpoints/anthropic", "ug, inner"),
+    ],
+    ids=["gateway", "serving-endpoint"],
+)
+async def test_shim_restores_gateway_attribution_after_cli_settings(
+    upstream_url: str, surfaces: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
+    requests: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"recorded"))
+
+    shim = ClaudeGatewayShim(upstream_base_url=upstream_url)
+    await shim.start()
+    assert shim._client is not None
+    await shim._client.aclose()
+    shim._client = httpx.AsyncClient(transport=httpx.MockTransport(record))
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{shim.base_url}/v1/messages",
+                json={"model": "test", "messages": []},
+                headers=[
+                    ("Authorization", "Bearer synthetic-key"),
+                    ("anthropic-beta", "one"),
+                    ("anthropic-beta", "two"),
+                    ("databricks-custom-coding-agent", "stale-agent"),
+                    ("databricks-custom-client-surfaces", "ug, inner"),
+                ],
+            )
+        assert response.status_code == 200
+        assert len(requests) == 1
+        request = requests[0]
+        assert str(request.url) == upstream_url + "/v1/messages"
+        assert request.headers["Databricks-Custom-Client-Surfaces"] == surfaces
+        assert request.headers["Databricks-Custom-Coding-Agent"] == (
+            "claude-code" if surfaces.startswith("omnigent") else "stale-agent"
+        )
+        assert request.headers["Authorization"] == "Bearer synthetic-key"
+        assert request.headers.get_list("anthropic-beta") == ["one", "two"]
     finally:
         await shim.aclose()
 

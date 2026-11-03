@@ -11,10 +11,12 @@ import {
   ScanSearchIcon,
   SearchIcon,
 } from "lucide-react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -158,7 +160,14 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
+
+function CurrentPath() {
+  return <output data-testid="current-path">{useLocation().pathname}</output>;
+}
 
 describe("SubagentsPanel", () => {
   it("always renders a 'main' row linking to the root session", () => {
@@ -488,6 +497,29 @@ describe("SubagentsPanel", () => {
     expect(rows[1]).toHaveAttribute("href", "/c/conv_child_b");
     // Status-word display (which states show a word vs. a bare dot) is owned
     // by the dedicated "shows the status word only for notable states" test.
+  });
+
+  it.each([
+    [true, "/c/conv_parent"],
+    [false, "/c/conv_child_a"],
+  ])("with the panel setting %s, a child-row click lands on %s", (enabled, pathname) => {
+    writeOpenSubagentsInPanel(enabled);
+    mockChildTree({ conv_parent: [childInfo({ id: "conv_child_a", title: "researcher:auth" })] });
+    const opener = vi.fn(() => true);
+    render(
+      <MemoryRouter initialEntries={["/c/conv_parent"]}>
+        <SubagentPanelOpenerContext.Provider value={opener}>
+          <SubagentsPanel conversationId="conv_parent" rootSessionId="conv_parent" />
+        </SubagentPanelOpenerContext.Provider>
+        <CurrentPath />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByTestId("subagent-row"));
+
+    expect(screen.getByTestId("current-path")).toHaveTextContent(pathname);
+    if (enabled) expect(opener).toHaveBeenCalledWith("conv_child_a");
+    else expect(opener).not.toHaveBeenCalled();
   });
 
   it("uses spawned task titles as the primary child-row labels", () => {

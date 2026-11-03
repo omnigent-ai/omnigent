@@ -87,7 +87,118 @@ Provider-specific JSON fields belong in `pr_from_object`; common `html_url` and
 `url` fields are handled centrally. A failing provider is isolated so it cannot
 change a tool's result or prevent another provider from recording requests.
 
+## Server storage
+
+The server owns which requests belong to a session; the runner or host remains
+the only forge client. The server keeps each session's requests in one
+compressed JSON document on its metadata row
+(`omnigent_conversation_metadata.pull_requests`).
+
+**Discovery.** The runner records each request it discovers in the session
+registry, which keeps the entries the server has not acknowledged, and sends
+them as an `external_pull_requests` session event: right after recording one,
+when a turn ends, and when it first serves a session. Entries are cleared only
+after a 2xx and retried with backoff otherwise, so a request opened during a
+turn reaches the server even if nobody has the session open. Requests the host
+finds while serving a read (the branch's request) ride back in the response.
+Merging is idempotent and never re-adds an unlinked request.
+
+**Import.** A session is *synced* once the server has merged its host's whole
+list, from any proxied pull request response. Until then the host's list still
+decides. `GET /v1/sessions/{id}/pull-requests` reports `synced`, and session
+list items report `pull_requests_synced`, so clients can tell "not known yet"
+from "none". A listed session that isn't synced is imported in the background
+when its runner or host tunnel is on the serving replica.
+
+**Serving.** Once synced, the server checks a requested `pr_url` against its
+list (400 otherwise) and forwards it with `server_tracked`; with no selection it
+sends its first request as `default_pr_url`. The runner or host then serves that
+request even if its own registry never recorded it, and the server's list
+replaces `prs` in the response. Each entry keeps the request's title, state,
+and draft flag with when the server requested that fetch; an older fetch never
+overwrites a newer one, including one that changed nothing and skipped its
+write. The description, checks, comments, changed files, and diff stay on the
+host.
+
+**Freshness.** Summaries carry `state_checked_at`. A listed session whose first
+request is open (or unknown) and older than five minutes is refreshed in the
+background, at most once per five minutes, when its tunnel is on the serving
+replica; clients show older states as stale. After a turn ends the server
+refreshes the session once, unless a client's read already covered that turn.
+
+**Limits.** A session keeps at most 50 linked requests and 50 unlinks. Their
+identities must fit 12,000 stored bytes, checked when a request is added:
+linking at the limit fails with 409 before the host is asked, and reports past
+it are ignored. Titles and states fill the rest of the 16,000-byte document and
+are trimmed first when it overflows, so refreshing them never removes a link.
+
+**Unlinking.** `DELETE /v1/sessions/{id}/pull-requests?url=` unlinks on the
+server whether or not the host is online, and passes the unlink to the runner or
+host when one is reachable so its own list stops reporting the request.
+`GET /v1/sessions/{id}/pull-requests` pages with `limit` and `after` (the
+previous page's `last_id`, a request URL) and never contacts the host. Servers
+that store requests report `session_pull_requests` in `/v1/info`; against older
+servers the web reads only the live host.
+
 ## Verification
+
+### Inline GitHub conversations
+
+GitHub advertises `review_threads`, `review_thread_replies` and
+`review_thread_creation`. All default to
+false for other providers and older hosts. They use the optional `ReviewThreadsFacet`
+without changing the required methods of `PullRequestFacet`.
+
+While **Changes** is visible, `GET review-threads` fetches the first 25 threads
+with up to 20 published comments each, then polls every 10 seconds. The existing
+PR metadata request continues to use `gh pr view`. Other subtabs and the closed
+panel stop thread polling. Replies and new conversations refresh the thread
+query immediately. Additional thread and comment pages load on demand.
+
+The thread response carries `data`, `has_more`, `next_cursor`, `head_sha`,
+`base_sha` and an optional `warning`. Ordinary polls replace unpaginated comments,
+retaining locally posted replies until observed in a read. Explicitly loaded
+history is retained and marked for manual reload.
+
+Patch reads verify the expected revisions before and
+after fetching; mismatches withhold inline placement. Outdated, hidden-context,
+file-level and unavailable-diff threads remain accessible with their original
+code context. Resolved threads start collapsed.
+
+Fenced `suggestion` blocks render the referenced lines as removals and the
+replacement as additions, with line numbers. They reuse the displayed patch
+and its diff renderer for syntax and word-level highlighting.
+Outdated or hidden-context threads use the saved snippet labeled **Original
+context**. If the complete original range is unavailable, the replacement is
+shown without a comparison. Suggestions are display-only and add no requests.
+
+`POST review-threads/{id}/replies` publishes immediately with the selected host
+account. The host validates thread membership and replies to its published root
+comment. Expanded conversations show a compact **Write a reply…** input. Focus it
+to open the Markdown composer; **Cancel** collapses it while retaining the draft.
+Thread reads include code excerpts and require the same file-sharing permission
+as diff reads. Reply pagination requires session read permission; writes require
+edit permission.
+Runner and host fallback use the same provider implementation. An uncertain
+write is never retried automatically. Drafts and pending/error state stay in
+memory per session, PR and thread, including through tab and layout switches.
+
+Select a line number and use the gutter **+** or **Comment on selected lines**
+to start a separate conversation, even when that line already has a thread.
+The **+** overlays the divider between line numbers and code without widening
+the gutter.
+Drag line numbers or Shift-click to select a range on the same side within one
+diff hunk. `POST review-threads` accepts `pr_url`, `body` and an `anchor` with
+`path`, `side`, `line`, optional `start_line`, `head_sha` and `base_sha`.
+The provider checks both revisions and publishes a one-thread GraphQL review
+with `event: COMMENT` and the displayed commit. Its response identifies the
+canonical thread. New drafts retain text and coordinates per session, PR and
+file; a revision change requires explicit reselection before posting.
+
+Resolving/reopening threads remains follow-up work.
+See the [browser verification recipe](../feature-map/pull-request-conversations.md).
+
+### Provider regression checks
 
 Run the existing GitHub resource and tracking suites together with provider
 dispatcher tests, then the shared panel, composer, and canvas frontend tests.

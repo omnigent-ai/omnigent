@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
 from typing import Protocol
+from weakref import WeakValueDictionary
 
 import httpx
 
@@ -73,6 +74,23 @@ class WebSocketLike(Protocol):
     async def receive_text(self) -> str: ...
 
 
+@dataclass(frozen=True)
+class TunnelEnd:
+    """How one tunnel connection ended, before registry cleanup touched it.
+
+    :param at: Unix epoch seconds when the route's socket loop ended.
+    :param peer_code: Close code the runner's side ended with, e.g. ``1006``;
+        ``None`` when the loop ended without a peer disconnect.
+    :param peer_reason: Reason in the runner's close frame, or ``None``.
+    :param server_code: Close code this server requested before the end, or ``None``.
+    """
+
+    at: float
+    peer_code: int | None
+    peer_reason: str | None
+    server_code: int | None
+
+
 @dataclass
 class RunnerSession:
     """Per-runner state living in the registry while the tunnel is open.
@@ -99,6 +117,8 @@ class RunnerSession:
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
     :param generation: Process-unique connection generation for initialization readiness.
+    :param superseded: Whether a newer tunnel replaced this connection, retained
+        after that replacement disconnects so delayed cleanup cannot own its outage.
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
@@ -107,6 +127,8 @@ class RunnerSession:
     :param close_reason: Reason accompanying ``close_code``.
     :param peer_close_reason: Reason in the runner's own close frame, e.g.
         ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
+    :param ended: How the socket loop ended, captured before cleanup records
+        its own close; ``None`` until the route's loop ends.
     :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
@@ -120,6 +142,7 @@ class RunnerSession:
     owner: str | None
     last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     generation: int = field(default_factory=lambda: next(_connection_generations))
+    superseded: bool = field(default=False, init=False)
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
@@ -128,6 +151,7 @@ class RunnerSession:
     close_code: int | None = None
     close_reason: str | None = None
     peer_close_reason: str | None = None
+    ended: TunnelEnd | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 
@@ -256,6 +280,9 @@ class TunnelRegistry:
         if max_connect_waiters_total < 1:
             raise ValueError("max_connect_waiters_total must be at least 1")
         self._sessions: dict[str, RunnerSession] = {}
+        # Deregistered routes can still be joining initializer cleanup. Keep their
+        # replacement identity without retaining finished connections or runner ids.
+        self._latest_sessions: WeakValueDictionary[str, RunnerSession] = WeakValueDictionary()
         self._connect_waits: dict[str, RunnerConnectWaitState] = {}
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
@@ -304,6 +331,10 @@ class TunnelRegistry:
             last_frame_monotonic=time.monotonic(),
         )
         with self._lock:
+            previous = self._latest_sessions.get(runner_id)
+            if previous is not None:
+                previous.superseded = True
+            self._latest_sessions[runner_id] = session
             old = self._sessions.pop(runner_id, None)
             if old is not None:
                 self.record_close(old, code=4000, reason="tunnel replaced")

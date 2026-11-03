@@ -13,8 +13,11 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -55,6 +58,10 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # Explicit --model in pass-through args WINS (joined form): the
         # ``--model=X`` spelling must also suppress the override default.
         (None, "claude-opus-4-7", ["--model=sonnet"], ("--model=sonnet",)),
+        # A pass-through --effort (either form) is the one Claude runs at,
+        # so the persisted effort must not add a second, conflicting flag.
+        ("high", None, ["--effort", "xhigh"], ("--effort", "xhigh")),
+        ("high", None, ["--verbose", "--effort=max"], ("--verbose", "--effort=max")),
         # Full ordering: effort prefix, then pass-through, then the
         # model default last. A different order would mean the assembly
         # logic changed and the launch command no longer matches the CLI.
@@ -74,10 +81,8 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # An unrecognised effort is dropped (not a Claude effort), so it
         # never reaches the CLI as a bogus ``--effort`` value.
         ("bogus-effort", None, None, ()),
-        # A leading positional prompt (how the CLI forwards ``-p``) keeps
-        # its place ahead of pass-through value flags, and the model
-        # default is appended after — re-appending the prompt last would
-        # let a variadic flag like ``--mcp-config`` swallow it.
+        # Older clients put the prompt first; fresh launches still accept it
+        # ahead of variadic flag values and the model default.
         (
             None,
             "claude-opus-4-7",
@@ -90,6 +95,8 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         "model-default-appended",
         "explicit-model-space-wins",
         "explicit-model-joined-wins",
+        "explicit-effort-space-wins",
+        "explicit-effort-joined-wins",
         "full-ordering",
         "all-none",
         "empty-passthrough-still-adds-model",
@@ -123,10 +130,17 @@ def test_build_claude_native_base_args(
 
 
 @pytest.mark.parametrize(
-    ("reasoning_effort", "model_override", "terminal_launch_args", "resume", "expected"),
+    (
+        "reasoning_effort",
+        "model_override",
+        "terminal_launch_args",
+        "resume",
+        "skip_initial_prompt",
+        "expected",
+    ),
     [
         # Resume alone → just the --resume prefix.
-        (None, None, None, "sid-123", ("--resume", "sid-123")),
+        (None, None, None, "sid-123", False, ("--resume", "sid-123")),
         # --resume comes FIRST, before effort / pass-through / model —
         # mirroring the CLI's (*cold_resume_args, *claude_args) order.
         (
@@ -134,19 +148,123 @@ def test_build_claude_native_base_args(
             "claude-opus-4-7",
             ["--verbose"],
             "sid-123",
+            False,
             ("--resume", "sid-123", "--effort", "high", "--verbose", "--model", "claude-opus-4-7"),
         ),
         # No resume id → no --resume (fresh launch, or no local
         # transcript could be synthesized).
-        (None, None, ["--verbose"], None, ("--verbose",)),
+        (None, None, ["--verbose"], None, False, ("--verbose",)),
+        (
+            None,
+            None,
+            [
+                "old prompt\nsecond line",
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "a.json",
+                "b.json",
+            ],
+            "sid-123",
+            True,
+            (
+                "--resume",
+                "sid-123",
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "a.json",
+                "b.json",
+            ),
+        ),
+        (None, None, ["old prompt"], "sid-123", True, ("--resume", "sid-123")),
+        # An older client's explicit ``--resume -p`` prompt has not run yet.
+        (
+            None,
+            None,
+            ["new prompt", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "new prompt", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["old prompt", "--model=sonnet", "--verbose"],
+            None,
+            True,
+            ("--model=sonnet", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--permission-mode", "auto", "--mcp-config", "a.json", "b.json"],
+            "sid-123",
+            False,
+            (
+                "--resume",
+                "sid-123",
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "a.json",
+                "b.json",
+            ),
+        ),
+        (
+            None,
+            None,
+            ["--session-id", "11111111-2222-3333-4444-555555555555", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--session-id=11111111-2222-3333-4444-555555555555", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--fork-session", "--session-id", "new-id"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--fork-session", "--session-id", "new-id"),
+        ),
+        (
+            None,
+            None,
+            ["--session-id", "11111111-2222-3333-4444-555555555555"],
+            None,
+            False,
+            ("--session-id", "11111111-2222-3333-4444-555555555555"),
+        ),
     ],
-    ids=["resume-only", "resume-first-ordering", "no-resume"],
+    ids=[
+        "resume-only",
+        "resume-first-ordering",
+        "no-resume",
+        "legacy-prompt-omitted",
+        "legacy-prompt-only",
+        "unconsumed-legacy-prompt-kept-on-resume",
+        "legacy-prompt-omitted-without-transcript",
+        "flag-values-preserved",
+        "resume-drops-session-id",
+        "resume-drops-joined-session-id",
+        "fork-session-keeps-session-id",
+        "fresh-launch-keeps-session-id",
+    ],
 )
 def test_build_claude_native_base_args_resume_prefix(
     reasoning_effort: str | None,
     model_override: str | None,
     terminal_launch_args: list[str] | None,
     resume: str | None,
+    skip_initial_prompt: bool,
     expected: tuple[str, ...],
 ) -> None:
     """
@@ -166,9 +284,114 @@ def test_build_claude_native_base_args_resume_prefix(
             model_override=model_override,
             terminal_launch_args=terminal_launch_args,
             resume_external_session_id=resume,
+            skip_initial_prompt=skip_initial_prompt,
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("terminal_launch_args", "items_status", "pages", "has_prior_history", "expected", "requests"),
+    [
+        (["--verbose"], 200, [["--verbose"]], True, False, 0),
+        (
+            ["old prompt\nsecond line", "--verbose"],
+            200,
+            [["old prompt\nsecond line"]],
+            False,
+            True,
+            1,
+        ),
+        (["new prompt", "--verbose"], 200, [["old prompt"]], True, False, 1),
+        (["resume prompt"], 200, [["old prompt"], ["resume prompt"], ["later"]], True, True, 2),
+        (["resume prompt"], 200, [["old prompt"], ["later"]], True, False, 2),
+        (["old prompt"], 500, [[]], True, True, 1),
+        (["old prompt"], 500, [[]], False, False, 1),
+        (["old prompt"], None, [[]], True, True, 0),
+    ],
+    ids=[
+        "no-legacy-prompt",
+        "recorded-prompt-consumed",
+        "explicit-resume-prompt-kept",
+        "prompt-recorded-past-first-page",
+        "prompt-on-no-page-kept",
+        "unreadable-history-with-prior-session",
+        "unreadable-history-fresh-session",
+        "offline-with-prior-session",
+    ],
+)
+async def test_claude_legacy_prompt_consumed(
+    terminal_launch_args: list[str],
+    items_status: int | None,
+    pages: list[list[str]],
+    has_prior_history: bool,
+    expected: bool,
+    requests: int,
+) -> None:
+    """Only a stored prompt already recorded as a user turn is omitted."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _claude_legacy_prompt_consumed
+
+    requested_cursors: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_legacy/items"
+        assert items_status is not None
+        cursor = request.url.params.get("after")
+        requested_cursors.append(cursor)
+        index = 0 if cursor is None else int(cursor.removeprefix("item_")) + 1
+        return httpx.Response(
+            items_status,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    }
+                    for text in pages[index]
+                ],
+                "has_more": index < len(pages) - 1,
+                "last_id": f"item_{index}",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        consumed = await _claude_legacy_prompt_consumed(
+            server_client=client if items_status is not None else None,
+            session_id="conv_legacy",
+            terminal_launch_args=terminal_launch_args,
+            has_prior_history=has_prior_history,
+        )
+
+    assert consumed is expected
+    assert requested_cursors == [None, "item_0"][:requests]
+
+
+@pytest.mark.parametrize(("last_id", "requests"), [(None, 1), ("item_0", 2)])
+async def test_claude_prompt_in_history_stops_on_a_stalled_cursor(
+    last_id: str | None, requests: int
+) -> None:
+    """A page that claims more items without a new cursor makes history unknown."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _claude_prompt_in_history
+
+    requested_cursors: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_cursors.append(request.url.params.get("after"))
+        return httpx.Response(200, json={"data": [], "has_more": True, "last_id": last_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        assert await _claude_prompt_in_history(client, "conv_legacy", "old prompt") is None
+
+    assert requested_cursors == [None, "item_0"][:requests]
 
 
 def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:
@@ -197,16 +420,8 @@ def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resum
     )
 
 
-def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
-    """An apiKeyHelper launch strips the raw key + nested-session marker.
-
-    When the credential reaches Claude Code via an ``apiKeyHelper``, a raw
-    ``ANTHROPIC_API_KEY`` in the child env makes Claude open its custom-API-
-    key confirmation menu, and the first web message is typed into that menu
-    instead of the chat composer. The key must not leak into the terminal
-    child; ``CLAUDECODE`` is stripped alongside it to avoid a nested-session
-    error. ``DATABRICKS_CONFIG_PROFILE`` is always dropped.
-    """
+def test_claude_terminal_env_unset_masks_credentials_with_api_key_helper() -> None:
+    """Ambient keys and tokens must not override the selected helper."""
     config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
         api_key_helper="printf %s sk-gateway",
@@ -214,22 +429,19 @@ def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
     )
     env_unset = _claude_terminal_env_unset(config)
     assert "ANTHROPIC_API_KEY" in env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" in env_unset
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env_unset
     assert "CLAUDECODE" in env_unset
     assert "DATABRICKS_CONFIG_PROFILE" in env_unset
 
 
-def test_claude_terminal_env_unset_without_helper_keeps_key() -> None:
-    """No apiKeyHelper preserves the raw key but strips nested-session state.
-
-    Claude's own-login path (``None`` config) and a Bedrock-style config have
-    no ``apiKeyHelper``, so this helper does not strip ``ANTHROPIC_API_KEY``.
-    ``CLAUDECODE`` must still be absent because Claude Code rejects nested
-    launches in every auth mode.
-    """
+def test_claude_terminal_env_unset_without_helper_keeps_credentials() -> None:
+    """Native login, Bedrock, and token-only gateways keep their credentials."""
     expected = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
     own_login_env_unset = _claude_terminal_env_unset(None)
     assert own_login_env_unset == expected
     assert "ANTHROPIC_API_KEY" not in own_login_env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" not in own_login_env_unset
     bedrock_like = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example"},
         api_key_helper=None,
@@ -238,6 +450,12 @@ def test_claude_terminal_env_unset_without_helper_keeps_key() -> None:
     bedrock_env_unset = _claude_terminal_env_unset(bedrock_like)
     assert bedrock_env_unset == expected
     assert "ANTHROPIC_API_KEY" not in bedrock_env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" not in bedrock_env_unset
+    token_only = ClaudeNativeUcodeConfig(
+        env={"CLAUDE_CODE_USE_GATEWAY": "1", "ANTHROPIC_AUTH_TOKEN": "test-token"},
+    )
+    assert _claude_terminal_env_unset(token_only) == expected
+    assert build_native_claude_terminal_env(token_only)["ANTHROPIC_AUTH_TOKEN"] == "test-token"
 
 
 def test_native_launch_passes_synthesized_model_as_flag() -> None:
@@ -302,26 +520,85 @@ def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> No
     )
 
 
-def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> None:
-    """The env-build seam fails loud if a raw key rides the apiKeyHelper path.
-
-    ``_claude_terminal_env_unset`` strips the raw key from the terminal child
-    only because ``build_native_claude_terminal_env`` never emits one on the
-    helper path. Pin that invariant mechanically: if a future config injects a
-    raw ``ANTHROPIC_API_KEY`` into the terminal env while an ``apiKeyHelper`` is
-    configured, the build must raise rather than silently reintroduce Claude
-    Code's custom-API-key menu hang.
-    """
+@pytest.mark.parametrize("credential", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_build_native_claude_terminal_env_rejects_credentials_on_helper_path(
+    credential: str,
+) -> None:
+    """Config overrides must not reintroduce credentials that bypass the helper."""
     leaking = ClaudeNativeUcodeConfig(
         env={
             "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
-            "ANTHROPIC_API_KEY": "sk-leaked",
+            credential: "sk-leaked",
         },
         api_key_helper="printf %s sk-gateway",
         model="gateway-served-claude",
     )
-    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+    with pytest.raises(RuntimeError, match=credential):
         build_native_claude_terminal_env(leaking)
+
+
+@pytest.mark.parametrize(
+    ("configured", "managed", "ambient", "disabled"),
+    [
+        ("https://gateway.example/anthropic", None, None, True),
+        ("https://api.anthropic.com", None, None, False),
+        (None, "https://gateway.example/anthropic", None, True),
+        ("https://api.anthropic.com", "https://gateway.example/anthropic", None, True),
+        ("https://gateway.example/anthropic", "https://api.anthropic.com", None, False),
+        ("", None, "https://gateway.example/anthropic", True),
+        (None, None, "https://gateway.example/anthropic", True),
+        ("https://api.anthropic.com", None, "https://gateway.example/anthropic", False),
+        ("https://gateway.example/anthropic", None, "https://api.anthropic.com", True),
+        (None, None, None, False),
+    ],
+)
+def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
+    configured: str | None,
+    managed: str | None,
+    ambient: str | None,
+    disabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The effective Anthropic endpoint decides whether canonical fallback is safe."""
+    from omnigent.harnesses.claude_native import main as claude_native
+
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": managed} if managed else {}})
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    if ambient is None:
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", ambient)
+    config = (
+        ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": configured} if configured else {})
+        if configured is not None
+        else None
+    )
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert (terminal_env.get("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK") == "1") is disabled
+
+
+@pytest.mark.parametrize(
+    ("base_url", "configured_flag", "expected_flag"),
+    [
+        ("https://gateway.example/anthropic", "0", "1"),
+        ("https://api.anthropic.com", "0", "0"),
+        ("https://api.anthropic.com", "1", "1"),
+    ],
+)
+def test_claude_terminal_env_refusal_fallback_provider_override(
+    base_url: str, configured_flag: str, expected_flag: str
+) -> None:
+    """Gateway launches force the guard; direct Anthropic keeps explicit preferences."""
+    flag = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
+    config = ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": base_url, flag: configured_flag})
+
+    assert build_native_claude_terminal_env(config)[flag] == expected_flag
 
 
 def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
@@ -347,6 +624,7 @@ def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     env_unset = _claude_terminal_env_unset(config)
     assert "DATABRICKS_CONFIG_PROFILE" in env_unset
     assert "ANTHROPIC_API_KEY" in env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" in env_unset
     assert "CLAUDECODE" in env_unset
 
     # The built terminal env preserves the gateway endpoint and never emits a
@@ -689,6 +967,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     session_id = "conv_launch_cancelled_during_drain"
     original_error = httpx.ConnectError("original launch transport failure")
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = original_error
     session_init = _claude_auto_create_session_init(session_id, bridge_dir)
     loop = asyncio.get_running_loop()
@@ -1117,6 +1396,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
@@ -1206,6 +1486,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(ValueError, match="config is not a JSON object"):
         await _auto_create_claude_terminal_for_test(
@@ -1280,6 +1561,7 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(propagated):
         await _auto_create_claude_terminal_for_test(
@@ -1338,6 +1620,7 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     with pytest.raises(RuntimeError, match="stop after seeding"):
@@ -1394,6 +1677,7 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(OmnigentError) as excinfo:
         await _auto_create_claude_terminal_for_test(
@@ -1404,3 +1688,44 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
     assert sorted(path.name for path in workspace.iterdir()) == []
     assert not (Path.cwd() / config_dir).exists()
     registry.launch_required_terminal.assert_not_called()
+
+
+def test_claude_terminal_env_unsets_tmux_for_bash_tool_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's Bash commands must not reach the private tmux server running Claude."""
+    monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+    env_file = build_native_claude_terminal_env(None)["CLAUDE_ENV_FILE"]
+
+    # Claude Code sources the env file before each Bash command it runs.
+    result = subprocess.run(
+        ["bash", "-c", f'. {shlex.quote(env_file)}; echo "${{TMUX-unset}} ${{TMUX_PANE-unset}}"'],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "TMUX_PANE": "%0",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "unset unset"
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_claude_env_file(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own CLAUDE_ENV_FILE is left in place instead of the tmux scrub."""
+    user_file = "/home/user/claude-env.sh"
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("CLAUDE_ENV_FILE", user_file)
+    else:
+        monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": user_file})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert terminal_env.get("CLAUDE_ENV_FILE", user_file) == user_file

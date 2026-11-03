@@ -142,7 +142,7 @@ for (const [filename, missing] of [
     assert.deepEqual(analyzeSource(filename, source), []);
     const mutated = source
       .replace(
-        /^\s*visibility: (?:visibility \?\? )?"(?:all|mine|shared|archived)",\n/gm,
+        /^\s*visibility: (?:(?:visibility \?\? )?"(?:all|mine|shared|archived)"|archived \? "all" : "mine"),\n/gm,
         "",
       )
       .replace(/    visibility,\n    pinned: "true",/, '    pinned: "true",')
