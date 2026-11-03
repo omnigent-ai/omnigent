@@ -674,6 +674,33 @@ class TestConstructor(unittest.TestCase):
         self.assertIn("--force-refresh", helper)
         self.assertIn('if [ -z "$token" ]; then', helper)
 
+    def test_databricks_ambient_profile_pins_token_helper(self):
+        """With no ``databricks_profile``, the token helper names the runner's profile.
+
+        The CLI child sees ``DATABRICKS_CONFIG_PROFILE`` blanked, so a helper
+        left on ``--host`` would lose the profile and fail when two profiles
+        share the host.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {"DATABRICKS_CONFIG_PROFILE": "runner-profile"}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ),
+        ):
+            executor = ClaudeSDKExecutor(gateway=True)
+        helper = executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"]
+        self.assertIn('databricks auth token --profile "runner-profile"', helper)
+        self.assertNotIn("databricks auth token --host", helper)
+        # The SDK fallback selects by host, so it keeps the env's own credentials.
+        self.assertIn("databricks_token --host https://example.cloud.databricks.com'", helper)
+
     def test_databricks_flag_no_creds_raises(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -1093,6 +1120,37 @@ class TestConstructor(unittest.TestCase):
             )
 
         _run(_t())
+
+    def test_cli_env_blanks_ambient_databricks_profile(self):
+        """The CLI child, and the MCP servers it starts, don't inherit the runner's profile.
+
+        The Databricks SDK merges an ambient ``DATABRICKS_CONFIG_PROFILE`` into
+        every client an MCP server builds, so its own host and token then fail
+        to authenticate. Without an ambient profile, nothing is added.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        async def cli_env_for_one_turn() -> dict[str, str]:
+            captured: dict[str, str] = {}
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured.update(options.env or {})
+                raise RuntimeError("stop after env assembly")
+
+            executor = ClaudeSDKExecutor()
+            with patch.object(
+                executor, "_get_or_create_client", side_effect=fake_get_or_create_client
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+            return captured
+
+        cases = (({"DATABRICKS_CONFIG_PROFILE": "runner-profile"}, ""), ({}, None))
+        for ambient, expected in cases:
+            with self.subTest(ambient=ambient), patch.dict("os.environ", ambient, clear=True):
+                cli_env = _run(cli_env_for_one_turn())
+                self.assertEqual(cli_env.get("DATABRICKS_CONFIG_PROFILE"), expected)
 
     def test_gateway_listing_without_claude_models_pins_nothing(self):
         """A gateway that lists no Claude models leaves the aliases unpinned.
@@ -2088,6 +2146,7 @@ class TestSystemMessages(unittest.TestCase):
             base_url_override=None,
             auth_command_override=None,
             auth_refresh_interval_ms=None,
+            profile_from_env=False,
         ):
             return {
                 "ANTHROPIC_BASE_URL": base_url_override or "https://host/ai-gateway/anthropic",

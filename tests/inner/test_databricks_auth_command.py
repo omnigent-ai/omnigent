@@ -366,6 +366,52 @@ def test_the_sdk_fallback_selects_by_host_when_no_profile(
     )
 
 
+def test_an_inherited_profile_keeps_the_ambient_pat_for_the_sdk_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A profile inherited from ``DATABRICKS_CONFIG_PROFILE`` pins only the CLI mint.
+
+    A host-only ``[runner]`` section plus a PAT in ``DATABRICKS_TOKEN``, and no
+    CLI OAuth token: the SDK fallback must still mint the PAT. A configured
+    profile keeps its section authoritative, so the same setup mints nothing.
+    """
+    import logging
+    import re
+    import shlex
+
+    import databricks.sdk.config as sdk_config
+    from databricks.sdk.oauth import HostMetadata
+
+    from omnigent.inner import databricks_token
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    def no_host_metadata(*args: object, **kwargs: object) -> HostMetadata:
+        # Keeps the SDK's discovery probe off the network.
+        return HostMetadata(oidc_endpoint="")
+
+    def sdk_fallback_output(command: str) -> str:
+        match = re.search(r"omnigent\.inner\.databricks_token ([^']*)", command)
+        assert match is not None
+        assert databricks_token.main(shlex.split(match.group(1))) == 0
+        return capsys.readouterr().out
+
+    host = "https://example.databricks.com"
+    config_file = tmp_path / "databrickscfg"
+    config_file.write_text(f"[runner]\nhost = {host}\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
+    # The Claude CLI child sees the inherited profile blanked.
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-ambient")
+    monkeypatch.setattr(sdk_config, "get_host_metadata", no_host_metadata)
+    # The SDK's own log lines would land on the captured token channel.
+    monkeypatch.setattr(logging.getLogger("databricks.sdk"), "disabled", True)
+
+    inherited = databricks_bearer_token_command(host, "runner", profile_from_env=True)
+    assert 'databricks auth token --profile "runner"' in inherited
+    assert sdk_fallback_output(inherited) == "dapi-ambient\n"
+    assert sdk_fallback_output(databricks_bearer_token_command(host, "runner")) == ""
+
+
 def test_the_connect_profile_tries_the_broker_then_the_sdk_fallback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -2625,6 +2625,50 @@ def test_open_stdio_transport_overlays_env_on_parent() -> None:
     assert "PATH" in env
 
 
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [
+        ({"GITHUB_TOKEN": "ghp_xyz"}, None),
+        ({"DATABRICKS_CONFIG_PROFILE": "server-profile"}, "server-profile"),
+    ],
+)
+def test_open_stdio_transport_drops_ambient_databricks_profile(
+    declared: dict[str, str], expected: str | None
+) -> None:
+    """
+    A server with its own ``env`` doesn't inherit the runner's
+    ``DATABRICKS_CONFIG_PROFILE``; a profile it declares still wins.
+
+    What breaks if this fails: the Databricks SDK merges the runner's
+    profile into every client the server builds, so a server that
+    passes its own host and token fails to authenticate whenever the
+    runner's profile belongs to another workspace.
+    """
+
+    config = _make_stdio_config(command="fake-mcp", env=declared)
+    captured: dict[str, Any] = {}
+
+    def _capture_stdio_client(params: Any) -> Any:
+        captured["params"] = params
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+        return mock_ctx
+
+    conn = McpServerConnection(config=config)
+
+    with (
+        patch.dict("os.environ", {"DATABRICKS_CONFIG_PROFILE": "runner-profile"}),
+        patch("omnigent.tools.mcp.stdio_client", side_effect=_capture_stdio_client),
+        patch("omnigent.tools.mcp.ClientSession", return_value=_mock_session()),
+    ):
+        asyncio.run(conn.connect())
+
+    env = captured["params"].env
+    assert env.get("DATABRICKS_CONFIG_PROFILE") == expected
+    assert "PATH" in env
+
+
 def test_open_stdio_transport_empty_env_inherits_fully() -> None:
     """
     When ``config.env`` is empty, the transport passes
