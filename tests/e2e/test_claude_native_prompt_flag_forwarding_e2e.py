@@ -72,6 +72,8 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from tests.e2e.conftest import get_mock_message_requests
+
 pytestmark = pytest.mark.skipif(
     shutil.which("claude") is None or sys.platform == "win32",
     reason=(
@@ -142,11 +144,14 @@ def _forwarded_launch_kwargs(
     return captured
 
 
-def _run_real_claude(args: tuple[str, ...] | list[str]) -> str:
+def _run_real_claude(
+    args: tuple[str, ...] | list[str], *, extra_env: dict[str, str] | None = None
+) -> str:
     """
     Run the real ``claude`` binary login-free and return its combined output.
 
     :param args: Argv passed to ``claude``; ``mcp.json`` in its cwd is valid.
+    :param extra_env: Variables added to the stripped environment, e.g. a mock API URL.
     :returns: Combined stdout and stderr.
     """
     workdir = Path(tempfile.mkdtemp(prefix="prompt-forwarding-"))
@@ -161,6 +166,7 @@ def _run_real_claude(args: tuple[str, ...] | list[str]) -> str:
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(workdir),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            **(extra_env or {}),
         }
         proc = subprocess.run(
             ["claude", *args],
@@ -252,3 +258,62 @@ def test_local_launch_prompt_is_not_forwarded_as_a_value_flags_argument(
         f"cannot swallow it. Forwarded args: {forwarded!r}\nclaude output:\n"
         f"{output.strip()}"
     )
+
+
+def test_caller_prompt_file_and_inline_prompt_reach_claude_after_omnigent(
+    isolated_mock_llm_server_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Real Claude receives Omnigent's instructions, then the caller's file, then the caller's prompt.
+
+    ``augment_claude_args`` copies the caller's file into a later file flag and keeps the
+    caller's inline flag, so this relies on Claude placing file text before inline text.
+
+    :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
+    :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
+    :param monkeypatch: Points the bridge root at ``tmp_path``.
+    """
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    profile = tmp_path / "profile.md"
+    profile.write_text("FILE-MARKER caller profile\n", encoding="utf-8")
+    caller_args = [
+        "--append-system-prompt-file",
+        str(profile),
+        "--append-system-prompt",
+        "INLINE-MARKER caller prompt",
+    ]
+    augmented = bridge.augment_claude_args(
+        tuple(caller_args),
+        bridge_dir=tmp_path / "claude-native" / "bridge",
+        workspace=tmp_path,
+        python_executable=sys.executable,
+        append_system_prompt="OMNIGENT-MARKER session instructions",
+    )
+    flag_index = augmented.index("--append-system-prompt-file", len(caller_args))
+
+    output = _run_real_claude(
+        ["-p", "hello", *caller_args, *augmented[flag_index : flag_index + 2]],
+        extra_env={
+            "ANTHROPIC_BASE_URL": isolated_mock_llm_server_url,
+            "ANTHROPIC_API_KEY": "sk-ant-e2e-placeholder",
+        },
+    )
+
+    systems = [
+        entry["body"].get("system") or []
+        for entry in get_mock_message_requests(isolated_mock_llm_server_url)
+    ]
+    system_texts = [
+        system if isinstance(system, str) else "\n".join(block.get("text", "") for block in system)
+        for system in systems
+    ]
+    prompt = next((text for text in system_texts if "OMNIGENT-MARKER" in text), None)
+    assert prompt is not None, f"Claude sent no request carrying Omnigent's prompt:\n{output}"
+    positions = [
+        prompt.index(marker) for marker in ("OMNIGENT-MARKER", "FILE-MARKER", "INLINE-MARKER")
+    ]
+    assert positions == sorted(positions), prompt
+    assert prompt.count("FILE-MARKER") == 1, prompt

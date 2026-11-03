@@ -9806,14 +9806,8 @@ async def _auto_create_claude_terminal(
         # Its dead-owner cleanup also reclaims these generated skill links.
         bundle_dir = bridge_dir / "skill-bundle"
         _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
-    # Apply the per-harness startup command/args override from config
-    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-    # downstream integration can wrap this managed-host launch — e.g. Databricks'
-    # ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
-    # appends below, so the ``--`` stays first). Identity by default. This is
-    # the same resolver the local-CLI native launch uses (see cli_native.py), so
-    # both terminal-creation paths honour one config surface.
+    # Config ``harness.claude-native.{command,args}`` wraps the launch, e.g. ``isaac -- <args>``;
+    # its args prepend the augmented args. cli_native.py uses the same resolver.
     from omnigent.config import load_effective_config  # noqa: FlagLocalImports
     from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
         resolve_harness_args,

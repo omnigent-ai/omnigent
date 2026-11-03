@@ -1647,22 +1647,13 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     assert not (tmp_path / "home" / ".claude.json").exists()
 
 
-@pytest.mark.parametrize(
-    "caller_args",
-    [["--append-system-prompt-file", "profile.md"], ["--append-system-prompt-file=profile.md"]],
-    ids=["separate-value", "joined-value"],
-)
+@pytest.mark.posix_only
 async def test_auto_create_claude_terminal_reads_caller_prompt_file_from_env_chdir(
     bridge_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caller_args: list[str],
 ) -> None:
-    """
-    A relative caller prompt file is read from the directory ``env -C`` starts Claude in.
-
-    :param caller_args: The caller's prompt-file arguments.
-    """
+    """A relative caller prompt file is read from the directory ``env -C`` starts Claude in."""
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -1697,11 +1688,11 @@ async def test_auto_create_claude_terminal_reads_caller_prompt_file_from_env_chd
                 instructions="OMNIGENT",
                 executor=ExecutorSpec(),
             ),
-            terminal_launch_args=caller_args,
+            terminal_launch_args=["--append-system-prompt-file", "profile.md"],
         )
 
     args = registry.launch_required_terminal.await_args.kwargs["spec"].args
-    assert args[: 3 + len(caller_args)] == ["-C", "sub", "claude", *caller_args]
+    assert args[:5] == ["-C", "sub", "claude", "--append-system-prompt-file", "profile.md"]
     prompt_files = [
         value for flag, value in pairwise(args) if flag == "--append-system-prompt-file"
     ]

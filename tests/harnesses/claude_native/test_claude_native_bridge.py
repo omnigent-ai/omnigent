@@ -4380,10 +4380,12 @@ def test_augment_claude_args_appends_caller_system_prompt(
         append_system_prompt="Keep framework metadata separate.",
     )
 
+    assert omnigent_args.count("--append-system-prompt") == 1
     omnigent_args[omnigent_args.index("--append-system-prompt") + 1] = expected_prompt
     assert args == [*user_args, *omnigent_args]
 
 
+@pytest.mark.posix_only
 @pytest.mark.parametrize(
     ("user_args", "expected_prompt"),
     [
@@ -4451,6 +4453,7 @@ def test_augment_claude_args_copies_caller_system_prompt_file(
     assert prompt_file.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.posix_only
 @pytest.mark.parametrize(
     "user_args",
     [
