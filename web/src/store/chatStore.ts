@@ -941,6 +941,11 @@ export interface ConversationState {
    */
   judgedNativeMirrorIds: readonly string[];
   /**
+   * Sends a native mirror once matched alongside another identical send. That
+   * mirror may have been theirs, so no later one, replayed or not, proves them.
+   */
+  textProofIneligibleIds: readonly string[];
+  /**
    * Stable id set by the failedSendDraft restore path so the next send()
    * call can reuse it instead of generating a fresh UUID, preventing a
    * duplicate dispatch on retry.
@@ -2194,6 +2199,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
   judgedNativeMirrorIds: [],
+  textProofIneligibleIds: [],
   pendingRetryStableId: null,
   restoredSendDraft: null,
   sendLatchedAt: null,
@@ -2912,7 +2918,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (
         recorded?.stableId === stableId &&
         dispatchedInto?.isNativeTerminalSession &&
-        !outstandingNativeSendsOf(dispatchedInto, tempId).some(
+        !outstandingNativeSendsOf(dispatchedInto, sessionId, tempId).some(
           (other) => other.stableId !== stableId && other.text === nativeMirrorText(text),
         )
       ) {
@@ -5827,7 +5833,7 @@ async function rehydrateWindowOnReconnect(
           b.ctx.itemId && !preGapIds.has(b.ctx.itemId) && !hasCommittedItem(s.blocks, b.ctx.itemId),
       ),
     );
-    const judged = judgeNativeMirrors(s, gapMirrors, session);
+    const judged = judgeNativeMirrors(s, id, gapMirrors, session);
     const delivered = new Set([...freshItemIds, ...judged.proven]);
     const currentBlocks = withoutDeliveredSendFailureCards(
       withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
@@ -6005,7 +6011,7 @@ async function reconcileOnReconnect(
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
-    const judged = judgeNativeMirrors(s, nativeMirrorsOf(unseen), session);
+    const judged = judgeNativeMirrors(s, id, nativeMirrorsOf(unseen), session);
     const delivered = new Set([...snapshotItemIds, ...judged.proven]);
     const patch: Partial<ChatState> = {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
@@ -7847,29 +7853,46 @@ export function sendProvenByNativeMirror(
   mirrorText: string,
   outstanding: readonly OutstandingNativeSend[],
 ): OutstandingNativeSend | null {
-  const text = withoutAttachedMarkers(mirrorText);
-  if (text === "") return null;
-  const matching = outstanding.filter((send) => send.text === text);
+  const matching = sendsMatchingNativeMirror(mirrorText, outstanding);
   const [only] = matching;
   return matching.length === 1 && only?.provable === true && only.stableId ? only : null;
 }
 
+/** The outstanding sends that say what a native mirror says. */
+function sendsMatchingNativeMirror(
+  mirrorText: string,
+  outstanding: readonly OutstandingNativeSend[],
+): OutstandingNativeSend[] {
+  const text = withoutAttachedMarkers(mirrorText);
+  return text === "" ? [] : outstanding.filter((send) => send.text === text);
+}
+
 /**
  * A native session's outstanding sends, one entry each: bubbles not yet
- * mirrored, failure cards, and the failed and restored drafts.
+ * mirrored, failure cards, the failed and restored drafts, and this tab's
+ * records of unanswered and queued sends, which a bind may not have recovered yet.
  */
-function outstandingNativeSendsOf(s: ChatState, exceptTempId?: string): OutstandingNativeSend[] {
+function outstandingNativeSendsOf(
+  s: ChatState,
+  conversationId: string | null,
+  exceptTempId?: string,
+): OutstandingNativeSend[] {
   const sends: OutstandingNativeSend[] = [];
+  const eligible = (stableId: string) => !s.textProofIneligibleIds.includes(stableId);
   for (const bubble of s.pendingUserMessages) {
     const text = messageContentText(bubble.content);
     if (bubble.tempId === exceptTempId || text === "") continue;
     const stableId = dispatchedSendsByTempId.get(bubble.tempId);
-    sends.push({ text, ...(stableId ? { stableId } : {}), provable: stableId !== undefined });
+    sends.push({
+      text,
+      ...(stableId ? { stableId } : {}),
+      provable: stableId !== undefined && eligible(stableId),
+    });
   }
   for (const block of s.blocks) {
     const send = block.type === "error" ? block.unansweredSend : undefined;
     if (!send?.text || sends.some((other) => other.stableId === send.stableId)) continue;
-    sends.push({ text: send.text, stableId: send.stableId, provable: true });
+    sends.push({ text: send.text, stableId: send.stableId, provable: eligible(send.stableId) });
   }
   const restored = s.restoredSendDraft?.delivered === false ? s.restoredSendDraft : null;
   for (const draft of [restored, s.failedSendDraft]) {
@@ -7878,8 +7901,22 @@ function outstandingNativeSendsOf(s: ChatState, exceptTempId?: string): Outstand
     sends.push({
       text: nativeMirrorText(draft.text),
       ...(draft.stableId ? { stableId: draft.stableId } : {}),
-      provable: draft.mirrorable === true && draft.serverRefused !== true,
+      provable:
+        draft.mirrorable === true &&
+        draft.serverRefused !== true &&
+        (draft.stableId === undefined || eligible(draft.stableId)),
     });
+  }
+  if (conversationId !== null) {
+    const unsent = peekUnsentSend(conversationId);
+    for (const record of [...(unsent ? [unsent] : []), ...peekQueuedSends(conversationId)]) {
+      if (sends.some((send) => send.stableId === record.stableId)) continue;
+      sends.push({
+        text: nativeMirrorText(record.text),
+        stableId: record.stableId,
+        provable: false,
+      });
+    }
   }
   return sends;
 }
@@ -7907,14 +7944,24 @@ const MAX_JUDGED_NATIVE_MIRRORS = 256;
  */
 function judgeNativeMirrors(
   s: ChatState,
+  conversationId: string | null,
   mirrors: readonly { itemId: string; text: string }[],
   snapshot?: Session,
 ): { proven: Set<string>; patch: Partial<ChatState> } {
   const proven = new Set<string>();
   const unjudged = mirrors.filter((mirror) => !s.judgedNativeMirrorIds.includes(mirror.itemId));
   if (!s.isNativeTerminalSession || unjudged.length === 0) return { proven, patch: {} };
-  let outstanding = outstandingNativeSendsOf(s);
+  let outstanding = outstandingNativeSendsOf(s, conversationId);
+  const ineligible = new Set(s.textProofIneligibleIds);
   for (const mirror of unjudged) {
+    const matching = sendsMatchingNativeMirror(mirror.text, outstanding);
+    if (matching.length > 1) {
+      for (const { stableId } of matching) if (stableId) ineligible.add(stableId);
+      outstanding = outstanding.map((send) =>
+        matching.includes(send) ? { ...send, provable: false } : send,
+      );
+      continue;
+    }
     const send = sendProvenByNativeMirror(mirror.text, outstanding);
     if (send?.stableId === undefined) continue;
     if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) continue;
@@ -7924,7 +7971,19 @@ function judgeNativeMirrors(
     outstanding = outstanding.filter((other) => other !== send);
   }
   const judged = [...s.judgedNativeMirrorIds, ...unjudged.map((mirror) => mirror.itemId)];
-  return { proven, patch: { judgedNativeMirrorIds: judged.slice(-MAX_JUDGED_NATIVE_MIRRORS) } };
+  const patch: Partial<ChatState> = {
+    judgedNativeMirrorIds: judged.slice(-MAX_JUDGED_NATIVE_MIRRORS),
+  };
+  if (ineligible.size > s.textProofIneligibleIds.length) {
+    patch.textProofIneligibleIds = [...ineligible];
+    // A reload must not trust the anchor of a send that became ineligible.
+    const unsent = conversationId === null ? null : peekUnsentSend(conversationId);
+    if (unsent?.afterItemId !== undefined && ineligible.has(unsent.stableId)) {
+      const { afterItemId: _dropped, ...unanchored } = unsent;
+      rememberUnsentSend(conversationId!, unanchored);
+    }
+  }
+  return { proven, patch };
 }
 
 /**
@@ -8825,7 +8884,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           : userContentFromEvent(event);
         const mirror =
           content === null ? [] : [{ itemId: event.itemId, text: messageContentText(content) }];
-        const judged = judgeNativeMirrors(s, mirror);
+        const judged = judgeNativeMirrors(s, sourceConversationId, mirror);
         // The card and the draft retract on the same proof.
         const delivered = new Set([...committedIds, ...judged.proven]);
         const blocks = withoutDeliveredSendFailureCards(s.blocks, delivered);

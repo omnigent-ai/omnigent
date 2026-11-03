@@ -6594,10 +6594,10 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "ship it" });
     expect(errorCards()).toHaveLength(1);
 
-    // The send's own mirror still retracts it.
+    // That mirror may have been the send's, so no later one proves it.
     commitMirror("2".repeat(32), "ship it");
-    expect(useChatStore.getState().failedSendDraft).toBeNull();
-    expect(errorCards()).toEqual([]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "ship it" });
+    expect(errorCards()).toHaveLength(1);
   });
 
   /** Assert the native send "ship it" still waits for the user to retry it. */
@@ -6635,12 +6635,10 @@ describe("chatStore — delivered-but-unacked send", () => {
       expectRetryKept(kind);
       expect(errorCards()).toHaveLength(1);
 
-      // The queued message has its mirror now, so the next one is the send's.
+      // The first mirror may have been the send's, so no later one proves it.
       commitMirror("2".repeat(32), "ship it");
-      expect(errorCards()).toEqual([]);
-      const state = useChatStore.getState();
-      if (kind === "failed") expect(state.failedSendDraft).toBeNull();
-      else expect(state.restoredSendDraft).toMatchObject({ delivered: true });
+      expectRetryKept(kind);
+      expect(errorCards()).toHaveLength(1);
     },
   );
 
@@ -15868,16 +15866,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         else expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: false });
       };
       kept();
-      // Backfill retires the queued bubble its recovered mirror acknowledges;
-      // the fresh window keeps it, so the next mirror could still be either's.
+      // The recovered mirror may have been the send's, so the next one doesn't prove it.
       handleSessionEvent({
         type: "session_input_consumed",
         itemId: "e".repeat(32),
         itemType: "message",
         data: { role: "user", content: [{ type: "input_text", text: "ship it" }] },
       });
-      if (gapLength === 100) kept();
-      else expect(useChatStore.getState().blocks.some((b) => b.type === "error")).toBe(false);
+      kept();
 
       const last = sinks[1]!;
       last.push("data: [DONE]\n\n");
@@ -15964,6 +15960,73 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
 
     const last = sinks.at(-1)!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("never lets an ambiguous mirror prove a send, even replayed after it left the window and the judgment cache", async () => {
+    const id = "conv_native_replay";
+    const stableId = "b".repeat(32);
+    const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+    const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+    seedSession(id, preGap);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      isNativeTerminalSession: true,
+      blocks: [...itemsToBlocks(windowItems), unansweredSendCard({ stableId, text: "ship it" })],
+      failedSendDraft: {
+        conversationId: id,
+        text: "ship it",
+        files: [],
+        stableId,
+        mirrorable: true,
+      },
+      pendingUserMessages: [
+        { tempId: "pend_queued", content: [{ type: "input_text", text: "ship it" }], posted: true },
+      ],
+      hasMoreHistory: true,
+      oldestItemId: windowItems[0]!.id,
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    const consume = (itemId: string, text: string): void =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text }] },
+      });
+
+    // Either the queued message or the failed send could own it; it retires the bubble.
+    const mirror = { ...userMessage("mirror", "ship it"), id: "f".repeat(32) };
+    consume(mirror.id, "ship it");
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    // Enough unrelated messages to push it out of the judgment cache.
+    const unrelated = Array.from({ length: 256 }, (_, i) => gapUser("later", i));
+    for (const item of unrelated) consume(item.id, `later ${item.id}`);
+    // A reconnect replaces the window, which no longer reaches it.
+    const gap = Array.from({ length: 100 }, (_, i) => gapUser("gap", i));
+    seedSession(id, [...preGap, mirror, ...unrelated, ...gap]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === mirror.id)).toBe(false);
+    expect(useChatStore.getState().judgedNativeMirrorIds).not.toContain(mirror.id);
+
+    consume(mirror.id, "ship it");
+
+    const cards = useChatStore
+      .getState()
+      .blocks.filter((block): block is ErrorBlock => block.type === "error");
+    expect(cards.map((card) => card.unansweredSend?.stableId)).toEqual([stableId]);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ stableId });
+
+    const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
     await drainAsync(2);
@@ -22227,6 +22290,74 @@ describe("a send cut off by a reload", () => {
       }
     },
   );
+
+  it("counts a record still waiting for identity among the sends a mirror could belong to", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    sessionLabels.set("conv_reload", { "omnigent.wrapper": "codex-native-ui" });
+    seedSession("conv_reload", [userMessage("before", "something earlier")]);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_older",
+      text: "ship it",
+      authorId: "user_a",
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    // Its recovery waits for identity, so the record stays.
+    expect(peekUnsentSend("conv_reload")?.stableId).toBe("stable_older");
+    let drop: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_reload/events") && init?.method === "POST") {
+        return new Promise<Response>((_, reject) => {
+          drop = () => reject(new TypeError("Load failed"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const sending = useChatStore.getState().send("ship it", "agent_xyz");
+    await vi.waitFor(() => expect(drop).toBeDefined());
+
+    // The older send's mirror lands before this send's POST fails.
+    commitUserItem("1".repeat(32), "ship it");
+    drop!();
+    await sending;
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "ship it" });
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toHaveLength(1);
+  });
+
+  it("drops the reload anchor of a send a mirror matched alongside an identical one", async () => {
+    const before = userMessage("before", "something earlier");
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+      blocks: itemsToBlocks([before]),
+    });
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const sending = useChatStore.getState().send("ship it", "agent_xyz");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    expect(peekUnsentSend("conv_existing")).toMatchObject({ afterItemId: before.id });
+
+    // Another client's identical message is queued too when a mirror lands.
+    useChatStore.setState((s) => ({
+      pendingUserMessages: [
+        ...s.pendingUserMessages,
+        { tempId: "pend_other", content: [{ type: "input_text", text: "ship it" }], posted: true },
+      ],
+    }));
+    commitUserItem("1".repeat(32), "ship it");
+
+    expect(peekUnsentSend("conv_existing")).not.toHaveProperty("afterItemId");
+    answer!();
+    await sending;
+  });
 
   it("recovers a native send behind two identical queued messages and keeps it through their mirrors", async () => {
     const before = userMessage("before", "something earlier");
