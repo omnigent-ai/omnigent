@@ -6602,6 +6602,83 @@ describe("chatStore — delivered-but-unacked send", () => {
     },
   );
 
+  /** Send "ship it" with its POST held open; returns its stable id and a way to drop the POST. */
+  async function holdNativeSend(): Promise<{
+    stableId: string;
+    drop: () => void;
+    sent: Promise<void>;
+  }> {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+    });
+    let drop: (() => void) | undefined;
+    let stableId = "";
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        stableId = (JSON.parse(String(init.body)) as { data: { stable_id: string } }).data
+          .stable_id;
+        return new Promise<Response>((_, reject) => {
+          drop = () => reject(new TypeError("Load failed"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const sent = useChatStore.getState().send("ship it", "agent_xyz");
+    await vi.waitFor(() => expect(drop).toBeDefined());
+    return { stableId, drop: drop!, sent };
+  }
+
+  it("takes a merged mirror naming a send as delivery even when the verdict fetch would fail", async () => {
+    const { stableId, drop, sent } = await holdNativeSend();
+    const mirror = { ...userMessage("delivered", "ship it"), web_stable_id: stableId };
+    useChatStore.setState((s) => ({ blocks: [...s.blocks, ...itemsToBlocks([mirror])] }));
+    // The connection then goes away, so no follow-up request can answer.
+    fetchMock.mockImplementation(() => Promise.reject(new TypeError("Load failed")));
+    drop();
+    await sent;
+
+    expect(takeFailedSendDraft("conv_existing", false)).toBeNull();
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(errorCards()).toEqual([]);
+  });
+
+  it("ignores a mirror naming a send when it arrives on another conversation's stream", async () => {
+    const { stableId, drop, sent } = await holdNativeSend();
+    handleSessionEvent(
+      {
+        type: "session_input_consumed",
+        itemId: "mirror_other",
+        itemType: "message",
+        webStableId: stableId,
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "ship it" }],
+          web_stable_id: stableId,
+        },
+      },
+      "conv_other",
+    );
+    drop();
+    await sent;
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ stableId, text: "ship it" });
+  });
+
+  it("keeps a new identical restored draft when an earlier send's named mirror replays", async () => {
+    const first = await failNativeSend("ship it");
+    commitNamedMirror("mirror_first", "ship it", first);
+    await useChatStore.getState().send("ship it", "agent_xyz");
+    const stableId = useChatStore.getState().failedSendDraft!.stableId!;
+    takeFailedSendDraft("conv_existing", false);
+
+    commitNamedMirror("mirror_first", "ship it", first);
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+    expect(errorCards()).toHaveLength(1);
+  });
+
   it("tells identical native sends apart by the send each mirror names", async () => {
     const first = await failNativeSend("ship it");
     dropEventPosts();
@@ -14581,6 +14658,68 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       ).toEqual([twinId]);
 
       const last = sinks[1]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each([
+    { path: "ordinary backfill", gapLength: 1 },
+    { path: "the fresh-window fallback", gapLength: 100 },
+  ])(
+    "settles an open native POST when reconnect through $path recovers the mirror naming it, without a verdict fetch",
+    async ({ gapLength }) => {
+      const id = `conv_posting_named_${gapLength}`;
+      const before = userMessage("posting_pre", "before the gap");
+      seedSession(id, [before]);
+      const sinks = routeStreamOpens();
+      const route = fetchMock.getMockImplementation()!;
+      let drop: (() => void) | undefined;
+      let stableId = "";
+      let offline = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith(`/v1/sessions/${id}/events`) && init?.method === "POST") {
+          stableId = (JSON.parse(String(init.body)) as { data: { stable_id: string } }).data
+            .stable_id;
+          return new Promise<Response>((_, reject) => {
+            drop = () => reject(new TypeError("Load failed"));
+          });
+        }
+        if (offline && url.split("?")[0] === `/v1/sessions/${id}`) {
+          return Promise.reject(new TypeError("Load failed"));
+        }
+        return route(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: itemsToBlocks([before]),
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      const sending = useChatStore.getState().send("ship it", "agent_xyz");
+      await drainAsync();
+      expect(drop).toBeDefined();
+
+      const gap = Array.from({ length: gapLength - 1 }, (_, i) => gapUser("posting_gap", i));
+      const mirror = { ...userMessage("posting_mirror", "ship it"), web_stable_id: stableId };
+      seedSessionItems(id, [before, ...gap, mirror]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.webStableId === stableId)).toBe(true);
+      // The POST then fails and so would any follow-up request.
+      offline = true;
+      drop!();
+      await sending;
+
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+
+      const last = sinks.at(-1)!;
       last.push("data: [DONE]\n\n");
       last.close();
       await drainAsync(2);

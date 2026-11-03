@@ -1731,6 +1731,12 @@ const sendChains = new Map<string | symbol, SendChain>();
  */
 const inFlightSends = new Map<string, boolean>();
 
+/**
+ * The session each in-flight send posted to, by stable id: only a native mirror
+ * on that session's own stream may vouch for the send (see `webStableId`).
+ */
+const inFlightSendSessions = new Map<string, string>();
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2818,6 +2824,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      inFlightSendSessions.set(stableId, sessionId);
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
@@ -2999,8 +3006,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner
-      // took it, whatever became of the POST's answer.
-      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      // took it, whatever became of the POST's answer. So does a native mirror
+      // in this session naming the send: the server links it only on delivery.
+      const ownBlocks =
+        draftSessionId === null ? [] : (setterForState(draftSessionId)?.blocks ?? []);
+      let deliveredDespiteFailure =
+        inFlightSends.get(stableId) === true || mirrorNamesSend(ownBlocks, stableId);
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
@@ -3098,6 +3109,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      inFlightSendSessions.delete(stableId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -7408,11 +7420,22 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
 }
 
 export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
-  // A native mirror commits under its own id; the server names the web send it delivered.
   return (
     itemId !== "" &&
-    blocks.some((block) => block.ctx.itemId === itemId || block.ctx.webStableId === itemId)
+    (blocks.some((block) => block.ctx.itemId === itemId) || mirrorNamesSend(blocks, itemId))
   );
+}
+
+/**
+ * Whether a native mirror in `blocks` names `stableId` as the web send it
+ * delivered. The mirror commits under its own id; the server links it to the
+ * send only when the link is exact, so this is conclusive.
+ *
+ * @param blocks - One conversation's blocks.
+ * @param stableId - A send's stable id.
+ */
+function mirrorNamesSend(blocks: AnyBlock[], stableId: string): boolean {
+  return stableId !== "" && blocks.some((block) => block.ctx.webStableId === stableId);
 }
 
 /**
@@ -8655,11 +8678,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
-      // A native mirror keeps its own id; the server names the web send it delivered.
-      const deliveredIds = [event.itemId, ...(event.webStableId ? [event.webStableId] : [])];
-      for (const id of deliveredIds) if (inFlightSends.has(id)) inFlightSends.set(id, true);
+      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      // A native mirror keeps its own id and names the web send it delivered,
+      // which only that send's own session can vouch for.
+      const alias = event.webStableId;
+      if (alias && inFlightSendSessions.get(alias) === sourceConversationId) {
+        inFlightSends.set(alias, true);
+      }
       applyToConversation((s) => {
-        const committedIds = new Set(deliveredIds);
+        const committedIds = new Set([event.itemId, ...(alias ? [alias] : [])]);
         // A late copy of an item already shown is not a new message, and a
         // mirror naming its send proves no other send by its text.
         const content =
