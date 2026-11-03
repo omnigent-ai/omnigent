@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import column, insert, table
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.server.server_config import SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
@@ -27,12 +27,21 @@ def store(db_uri: str) -> UserSettingsStore:
 
 def _write_raw_value(db_uri: str, user_id: str, value: bytes) -> None:
     with get_or_create_engine(db_uri).begin() as connection:
+        # Untyped columns skip the value codec while letting each dialect quote ``key``.
+        raw_preferences = table(
+            "preferences",
+            column("workspace_id"),
+            column("user_id"),
+            column("key"),
+            column("value"),
+        )
         connection.execute(
-            text(
-                "INSERT INTO preferences (workspace_id, user_id, key, value) "
-                "VALUES (0, :user_id, :key, :value)"
-            ),
-            {"user_id": user_id, "key": SESSION_TITLE_INSTRUCTIONS_PREFERENCE_KEY, "value": value},
+            insert(raw_preferences).values(
+                workspace_id=0,
+                user_id=user_id,
+                key=SESSION_TITLE_INSTRUCTIONS_PREFERENCE_KEY,
+                value=value,
+            )
         )
 
 
