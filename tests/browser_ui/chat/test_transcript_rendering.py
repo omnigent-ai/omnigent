@@ -563,7 +563,7 @@ def test_worked_fold_forms_without_jolting_the_answer(
 
 
 # Samples, each frame for two seconds after the trigger opens, the paragraph carrying
-# ``marker``: its offset below the trigger and whether its diagram and code have rendered.
+# ``marker``: whether it shows, its offset below the trigger, and its diagram and code.
 _SAMPLE_OPENED_MARKDOWN = """
 (trigger, marker) => {
   window.__openedSamples = [];
@@ -576,14 +576,15 @@ _SAMPLE_OPENED_MARKDOWN = """
     while (root && !root.querySelector('[data-streamdown="mermaid-block"]')) {
       root = root.parentElement;
     }
-    if (trigger.getAttribute("aria-expanded") === "true" && root) {
-      window.__openedSamples.push({
+    if (trigger.getAttribute("aria-expanded") === "true") {
+      window.__openedSamples.push(root ? {
+        shown: true,
         offset: paragraph.getBoundingClientRect().top - trigger.getBoundingClientRect().top,
         diagram: Boolean(
           root.querySelector('[data-streamdown="mermaid-block"] svg[aria-roledescription]')),
         tokens: root.querySelectorAll(
           '[data-streamdown="code-block-body"] span[style*="--sdm-c"]').length,
-      });
+      } : { shown: false });
     }
     if (performance.now() - start < 2000) requestAnimationFrame(frame);
     else window.__openedSamplesDone = true;
@@ -608,7 +609,9 @@ def _open_and_assert_laid_out(page: Page, trigger: Locator, marker: str) -> None
     expect(trigger).to_have_attribute("aria-expanded", "true")
     page.wait_for_function("() => window.__openedSamplesDone", timeout=10_000)
     samples = page.evaluate("() => window.__openedSamples")
-    assert samples, f"{marker!r} never showed after opening"
+    assert samples, f"no frame showed {marker!r}'s section open"
+    missing = [index for index, sample in enumerate(samples) if not sample["shown"]]
+    assert not missing, f"{marker!r} was missing in opened frames {missing} of {len(samples)}"
     first = samples[0]
     assert first["diagram"], f"the diagram above {marker!r} rendered after opening"
     assert first["tokens"] > 0, f"code below {marker!r} highlighted after opening"
