@@ -35,7 +35,7 @@ from omnigent.server.scheduled.telemetry import (
     scheduled_run_scope,
     start_fire_stage,
 )
-from omnigent.server.schemas import SessionEventInput, SessionStartupInput
+from omnigent.server.schemas import ErrorDetail, SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     ConversationNotFoundError,
@@ -580,13 +580,14 @@ class ManagedStartupInputs:
         if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
             return
 
+        response_id = f"startup_{failure_id}"
         await asyncio.to_thread(
             self.conversations.append,
             session_id,
             [
                 NewConversationItem(
                     type="error",
-                    response_id=f"startup_{failure_id}",
+                    response_id=response_id,
                     stable_id=uuid5(
                         NAMESPACE_URL, f"startup-failure:{session_id}:{failure_id}"
                     ).hex,
@@ -597,7 +598,17 @@ class ManagedStartupInputs:
             ],
         )
         _publish_sandbox_status(session_id, "failed", message)
-        _publish_status(session_id, "failed", failure_origin="startup_input_failed")
+        # The failed edge carries the transcript item's cause: without it the
+        # failure log and a scheduled run record no reason, and a connected
+        # client shows no card until it reloads. The shared response id lets
+        # the client match the edge to the transcript item it loads later.
+        _publish_status(
+            session_id,
+            "failed",
+            ErrorDetail(code="startup_input_failed", message=message),
+            response_id=response_id,
+            failure_origin="startup_input_failed",
+        )
 
     async def shutdown(self) -> None:
         tasks = [task for _, task, _ in self._workers.values()] + list(self._deliveries.values())

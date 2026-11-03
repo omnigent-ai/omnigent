@@ -42,7 +42,11 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.helpers import (
+    build_agent_bundle,
+    create_test_agent,
+    start_session_stream_collector,
+)
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
 )
@@ -959,6 +963,30 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_failed_startup_status_carries_the_transcript_cause(
+    startup_env: _Env,
+) -> None:
+    env = startup_env
+    session_id = await _create(env)
+    startup = env.app.state.startup_inputs
+    collector = await start_session_stream_collector(session_id)
+    try:
+        await startup.record_launch_failure(session_id, "spend limit reached")
+        status = await collector.next_event()
+        while status.get("type") != "session.status":
+            status = await collector.next_event()
+    finally:
+        await collector.stop()
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData)
+    assert status["status"] == "failed"
+    # Same cause and response id as the transcript item, so a client that holds
+    # the item treats the edge as that failure rather than a second one.
+    assert status["error"]["code"] == error.data.code == "startup_input_failed"
+    assert status["error"]["message"] == error.data.message
+    assert status["response_id"] == error.response_id
 
 
 async def _session_count(env: _Env) -> int:
