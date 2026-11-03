@@ -137,6 +137,15 @@ interface HostWorktreesResponse {
   data: HostWorktree[];
 }
 
+class HostWorktreesFetchError extends ApiError {
+  readonly retryable: boolean;
+
+  constructor(status: number, retryable: boolean) {
+    super(`host worktrees fetch failed: HTTP ${status}`, status, null);
+    this.retryable = retryable;
+  }
+}
+
 /**
  * Fetch the git worktrees of a repository on a host.
  *
@@ -146,32 +155,38 @@ interface HostWorktreesResponse {
  *
  * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
  * @param repoPath Absolute path inside the repo to list worktrees for.
+ * @param signal Optional cancellation signal for an abandoned path query.
  * @returns The repository's worktrees (main first), or ``[]`` when the
  *   path is not a git repository.
  */
 export async function fetchHostWorktrees(
   hostId: string,
   repoPath: string,
+  signal?: AbortSignal,
 ): Promise<HostWorktree[]> {
   const params = new URLSearchParams({ path: repoPath });
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/worktrees?${params.toString()}`,
+    { signal },
   );
+  const errorText = res.ok ? "" : await res.text().catch(() => "");
   if (res.status === 400) {
-    const text = await res.text().catch(() => "");
-    if (/not a git (?:repo|repository)/i.test(text)) return [];
+    if (/not a git (?:repo|repository)/i.test(errorText)) return [];
   }
   if (!res.ok) {
-    throw new ApiError(`host worktrees fetch failed: HTTP ${res.status}`, res.status, null);
+    const exhaustedHostBudget =
+      res.status === 504 ||
+      (res.status === 409 && /did not respond to worktree listing within \d+s/i.test(errorText));
+    throw new HostWorktreesFetchError(res.status, res.status !== 400 && !exhaustedHostBudget);
   }
   const body = (await res.json()) as HostWorktreesResponse;
   return body.data;
 }
 
-// A 400 is the host's answer for this path (git failed or timed out there), so
-// retrying only multiplies that timeout. Other failures keep the default retries.
+// A 400 is the host's answer for this path. A host timeout may already have
+// consumed its 150-second budget, so immediate retries only multiply that wait.
 function shouldRetryHostWorktrees(failureCount: number, error: Error): boolean {
-  if (error instanceof ApiError && error.status === 400) return false;
+  if (error instanceof HostWorktreesFetchError && !error.retryable) return false;
   return failureCount < 3;
 }
 
@@ -179,7 +194,7 @@ function shouldRetryHostWorktrees(failureCount: number, error: Error): boolean {
 export function hostWorktreesQueryOptions(hostId: string, repoPath: string) {
   return queryOptions({
     queryKey: ["host-worktrees", hostId, repoPath] as const,
-    queryFn: () => fetchHostWorktrees(hostId, repoPath),
+    queryFn: ({ signal }) => fetchHostWorktrees(hostId, repoPath, signal),
     staleTime: 5_000,
     retry: shouldRetryHostWorktrees,
   });

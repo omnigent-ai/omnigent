@@ -5039,9 +5039,9 @@ export function NewChatLandingScreen() {
   const workspaceSettling = workspaceReadyTarget !== workspaceTarget;
   const worktreeDiscoveryPending =
     worktreesEnabled && (hostWorktreesLoading || hostWorktreesArePlaceholder);
-  // What a session start waits for. Worktree discovery is left out: a host
-  // whose `git worktree list` is slow must not hold the start, so it only
-  // drives the chip's loading state and the worktree control.
+  // Directory readiness must not wait for `git worktree list`: that optional
+  // metadata can take much longer than selecting the folder itself. Worktree
+  // choices keep their own loading gate below.
   const workspaceStartLoading =
     !sandboxSelected &&
     (hostsLoading ||
@@ -5055,9 +5055,9 @@ export function NewChatLandingScreen() {
         workspaceTrimmed === "" &&
         (autoSeedCandidate !== null ||
           (needsHomeFallback && (homeListingLoading || homeListingIsPlaceholder)))));
-  const workspaceDataLoading =
-    workspaceStartLoading || (!sandboxSelected && workspaceSettling && worktreeDiscoveryPending);
-  // Directory and worktree defaults settle independently of the model catalog.
+  const workspaceDataLoading = workspaceStartLoading;
+  // Directory defaults settle independently of worktree metadata and the
+  // model catalog.
   useEffect(() => {
     setWorkspaceReadyTarget(workspaceDataLoading ? null : workspaceTarget);
   }, [workspaceDataLoading, workspaceTarget]);
