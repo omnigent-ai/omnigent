@@ -214,6 +214,18 @@ describe("minute cadence policy", () => {
         validateSchedule(schedule, { sessionMode: "continue", subhourSupported: true }) === null,
       ).toBe(interval >= 10 && interval <= 366 * 60);
       expect(validateSchedule(schedule) === null).toBe(interval >= 60 && interval <= 366 * 60);
+      const newSession = validateSchedule(schedule, { sessionMode: "new", subhourSupported: true });
+      expect(newSession === null).toBe(interval >= 60 && interval <= 366 * 60);
+      if (interval < 60) {
+        expect(newSession).toBe(
+          "Schedules more often than hourly require continuing in the same session.",
+        );
+        for (const sessionMode of ["new", "continue"] as const) {
+          expect(validateSchedule(schedule, { sessionMode })).toBe(
+            "This server requires schedules of at least 60 minutes.",
+          );
+        }
+      }
       expect(validateSchedule(schedule, { sessionMode: "continue" }) === null).toBe(
         interval >= 60 && interval <= 366 * 60,
       );

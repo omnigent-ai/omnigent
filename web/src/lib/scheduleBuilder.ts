@@ -303,9 +303,9 @@ export function validateSchedule(
     const maximum = model.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366;
     if (!Number.isInteger(model.interval) || model.interval < minimum || model.interval > maximum) {
       if (model.customFreq === "minutely" && model.interval < MIN_NEW_SESSION_MINUTE_INTERVAL) {
+        if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
         if (sessionMode !== "continue")
           return "Schedules more often than hourly require continuing in the same session.";
-        if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
       }
       return `Interval must be a whole number of at least ${minimum} and at most ${maximum}.`;
     }
