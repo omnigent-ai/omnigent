@@ -121,6 +121,7 @@ def _patch_login_env(
     cached_tokens: list[str | None] | None = None,
     host_needs_selector: bool = False,
     default_workspace_id: str | None = None,
+    auth_info_org_ids: list[str | None] | None = None,
 ) -> list[str]:
     """Patch the login command's collaborators for a scripted run.
 
@@ -137,6 +138,8 @@ def _patch_login_env(
     :param default_workspace_id: What ``_databricks_default_workspace_id``
         returns — the workspace the CLI recorded for the host. Defaults to
         ``None`` so tests never read the developer's real ``~/.databrickscfg``.
+    :param auth_info_org_ids: When given, collects the ``org_id`` each
+        workspace auth lookup was asked for.
     :returns: A list capturing each ``subprocess.run`` argv (the
         ``databricks auth login`` invocations).
     """
@@ -159,7 +162,11 @@ def _patch_login_env(
     )
     tokens = list(cached_tokens if cached_tokens is not None else ["tok-cached"])
 
-    def _auth_info(workspace_host: str) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+    def _auth_info(
+        workspace_host: str, org_id: str | None = None
+    ) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+        if auth_info_org_ids is not None:
+            auth_info_org_ids.append(org_id)
         token = tokens.pop(0)
         if token is None:
             return None
@@ -832,11 +839,13 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
             _response(200, body={"user_id": "alice@example.com"}),
         ]
     )
+    auth_info_org_ids: list[str | None] = []
     login_calls = _patch_login_env(
         monkeypatch,
         fake_httpx=fake,
         # Force the browser login so the --host argv is observable.
         cached_tokens=[None, "tok-fresh"],
+        auth_info_org_ids=auth_info_org_ids,
     )
 
     result = CliRunner().invoke(cli_group, ["login", _SELECTOR_URL])
@@ -848,6 +857,9 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
     # The verify request routes to the workspace via ?o= (and used the token).
     assert fake.requests[-1]["params"] == {"o": _ORG_ID}
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
+    # Both token lookups ask for the selected workspace, so a profile pinned
+    # to it wins over others on the same host.
+    assert auth_info_org_ids == [_ORG_ID, _ORG_ID]
     # Persisted after verification, keyed by the query-free canonical base.
     assert load_databricks_org_id(_WORKSPACE) == _ORG_ID
     assert load_databricks_workspace_host(_WORKSPACE) == _WORKSPACE
@@ -1166,6 +1178,32 @@ def test_workspace_url_expands_bare_workspace_host(
     )
 
     assert cli_mod._workspace_api_server_url(_WORKSPACE) == _WORKSPACE_API_URL
+
+
+def test_workspace_url_names_the_requested_workspace_not_the_stored_one(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The expansion notice shows the caller's ``?o=``, not the last login's.
+
+    One host fronts several workspaces; the stored record holds whichever was
+    logged into last, so falling back to it named the wrong workspace.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    store_databricks_auth(_WORKSPACE_API_URL, _WORKSPACE, org_id="111")
+    _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_WORKSPACE}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_WORKSPACE_API_URL}/v1/me": _response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+            ),
+        },
+    )
+
+    assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}/?o=222") == _WORKSPACE_API_URL
+    assert f"Using {_WORKSPACE}/omnigent?o=222 " in capsys.readouterr().err
 
 
 def test_workspace_url_leaves_oss_server_alone(

@@ -679,6 +679,7 @@ def _resolve_databricks_auth(
     profile: str | None = None,
     *,
     host: str | None = None,
+    workspace_id: str | None = None,
 ) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve Databricks credentials and return per-request auth + host.
 
@@ -698,6 +699,9 @@ def _resolve_databricks_auth(
         profile/env fallback is NOT attempted in this mode — the
         record asked for a specific workspace, so a credential miss
         fails loud.
+    :param workspace_id: With ``host``, the ``?o=`` workspace the caller
+        targets, e.g. ``"123"``. Profiles pinned to it are tried first (see
+        :func:`_prefer_profiles_for_workspace`).
     :returns: ``(auth, host)`` — an httpx Auth for injection into
         ``httpx.Client``/``httpx.AsyncClient`` and the workspace URL,
         e.g. ``"https://example.cloud.databricks.com"``.
@@ -710,7 +714,7 @@ def _resolve_databricks_auth(
     if host is not None:
         if profile is not None:
             raise ValueError("_resolve_databricks_auth takes profile or host, not both")
-        return _resolve_databricks_auth_for_host(host)
+        return _resolve_databricks_auth_for_host(host, workspace_id=workspace_id)
 
     try:
         from databricks.sdk.config import Config
@@ -800,7 +804,9 @@ def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Conf
     return Config(**kwargs)  # type: ignore[arg-type]
 
 
-def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth, str]:
+def _resolve_databricks_auth_for_host(
+    host: str, *, workspace_id: str | None = None
+) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve per-request auth for a specific workspace host.
 
     Prefers a ``~/.databrickscfg`` profile pinned to *host*:
@@ -822,10 +828,14 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     as the person, not the service principal. Among user profiles, the
     one whose token the server last accepted for this host goes first
     (see :func:`_remember_profile`), so a stale login listed earlier is
-    not retried by every new process.
+    not retried by every new process. When *workspace_id* is given, profiles
+    pinned to that workspace go ahead of the rest of their identity class
+    (see :func:`_prefer_profiles_for_workspace`).
 
     :param host: Workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param workspace_id: The ``?o=`` workspace the caller targets, e.g.
+        ``"123"``, or ``None`` when the host names a single workspace.
     :returns: ``(auth, host)`` — an httpx Auth and the workspace URL.
     :raises DatabricksAuthError: When no credential source resolves
         for the host.
@@ -850,8 +860,13 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     # principal is then selected — otherwise the host would silently register
     # under the SP again, the exact wrong-identity symptom the ordering fixes.
     failed_user_profiles: list[str] = []
-    for profile_name in _prefer_remembered_profile(
-        _order_profiles_by_identity_preference(matches, sp_sections), remembered, sp_sections
+    for profile_name in _prefer_profiles_for_workspace(
+        _prefer_remembered_profile(
+            _order_profiles_by_identity_preference(matches, sp_sections), remembered, sp_sections
+        ),
+        config,
+        workspace_id,
+        sp_sections,
     ):
         sources = ["SDK", "CLI"]
         if profile_name in cli_logins:
@@ -1064,6 +1079,42 @@ def _prefer_remembered_profile(
     rest = [name for name in ordered if name != remembered]
     position = 1 if rest[:1] == [env_profile] else 0
     return [*rest[:position], remembered, *rest[position:]]
+
+
+def _prefer_profiles_for_workspace(
+    ordered: list[str],
+    config: configparser.ConfigParser | None,
+    workspace_id: str | None,
+    sp_sections: set[str],
+) -> list[str]:
+    """Move profiles pinned to *workspace_id* ahead of the others of their kind.
+
+    One host can front many workspaces (``?o=`` selects one), and each
+    ``databricks auth login --host <host>?o=<id>`` records its workspace as the
+    profile's ``workspace_id``. A host-only walk would mint from whichever
+    profile comes first, even one pinned to another workspace, so profiles
+    pinned to the target go first, then unpinned ones, then ones pinned
+    elsewhere. Nothing is dropped: an account-wide grant from any of them may
+    still reach the target. An explicit ``DATABRICKS_CONFIG_PROFILE`` stays
+    first and service principals stay behind every user profile, so the
+    identity preference of :func:`_order_profiles_by_identity_preference` holds.
+
+    :param ordered: Profiles in identity (and remembered) preference order.
+    :param config: The parsed ``~/.databrickscfg``, or ``None`` when absent.
+    :param workspace_id: The targeted workspace, e.g. ``"123"``, or ``None``.
+    :param sp_sections: Section names classified as service principals.
+    :returns: *ordered*, reordered when *workspace_id* is given.
+    """
+    if workspace_id is None or config is None:
+        return ordered
+    env_profile = (os.environ.get("DATABRICKS_CONFIG_PROFILE") or "").strip()
+    explicit = ordered[:1] if ordered[:1] == [env_profile] else []
+
+    def rank(name: str) -> tuple[bool, int]:
+        pinned = config[name].get("workspace_id", "").strip() if name in config else ""
+        return (name in sp_sections, 0 if pinned == workspace_id else 1 if not pinned else 2)
+
+    return explicit + sorted(ordered[len(explicit) :], key=rank)
 
 
 # Sentinel default_section: keeps [DEFAULT] a plain section carrying only its
