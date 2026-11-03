@@ -640,7 +640,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched REPL terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -783,7 +783,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Captures the launched REPL terminal spec and parent os_env."""
 
         async def launch_auxiliary_terminal(
