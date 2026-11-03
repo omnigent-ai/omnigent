@@ -1125,10 +1125,10 @@ _FIND_PATCH = (
 def test_changes_find_reveals_collapsed_and_filtered(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """Find opens a collapsed file on its match, paints the match, and steps through matches.
+    """Find reveals a collapsed file's match, highlights it, and steps through matches.
 
-    Hidden-match hints and Show need the path filter control (PR-5), which is not in this
-    build yet; component tests cover them until PR-9 extends this journey.
+    Exercises find reveal, navigation, and highlighting through both panel entry points.
+    Filter-dependent hints are covered by component tests.
     """
     base_url, session_id = seeded_session
     mobile = entry == "composer-mobile"

@@ -650,13 +650,15 @@ export function PullRequestChangesTab({
   const highlightEnd = lineMatch?.end;
   const highlight = useMemo<FindHighlight | null>(
     () =>
+      findTarget &&
       highlightSide &&
       highlightLine !== undefined &&
       highlightStart !== undefined &&
       highlightEnd !== undefined
         ? { side: highlightSide, line: highlightLine, start: highlightStart, end: highlightEnd }
         : null,
-    [highlightSide, highlightLine, highlightStart, highlightEnd],
+    // findTarget is new on each explicit navigation, so a repeat step re-centres the row.
+    [findTarget, highlightSide, highlightLine, highlightStart, highlightEnd],
   );
 
   // Seed the match when the bar opens or its query changes: the first at or below the
@@ -677,7 +679,8 @@ export function PullRequestChangesTab({
     if (!matches.length) return;
     const next =
       matches[activeIndex < 0 ? 0 : (activeIndex + direction + matches.length) % matches.length];
-    setFindTarget(next);
+    // A fresh object, so stepping to the sole match again is a new reveal request.
+    setFindTarget({ ...next });
     if (next.target.kind === "path") setPendingReveal({ path: next.target.path });
   };
   // Changing the query or an option re-seeds the match from the viewport.

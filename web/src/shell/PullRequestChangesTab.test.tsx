@@ -305,6 +305,22 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByRole("button", { name: "Find in changes" })).toBeInTheDocument();
   });
 
+  it("re-reveals and re-centres a sole match on explicit navigation", () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderTab({ conversationId: "find-sole-renav" });
+    openFind("needle at the end");
+    expect(diffOf("c.ts")).not.toBeNull();
+    fireEvent.click(sectionHeader("c.ts", true));
+    expect(diffOf("c.ts")).toBeNull();
+    const scrollsBefore = scroll.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+
+    expect(diffOf("c.ts")).not.toBeNull();
+    expect(scroll.mock.calls.length).toBeGreaterThan(scrollsBefore);
+    expect(scroll.mock.contexts).toContain(rowOf("c.ts", 2500));
+  });
+
   it("scrolls to a file header when the first match is a path match", () => {
     const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
     renderTab({ conversationId: "find-path-seed" });
