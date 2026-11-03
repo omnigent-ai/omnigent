@@ -3336,33 +3336,15 @@ async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start
         "opus",
     ]
 
-    class _SnapshotServerClient(NullServerClient):
-        """Server client whose session snapshot carries the stored launch args."""
-
-        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-            """Return the session snapshot, or empty labels."""
-            del kwargs
-            payload: dict[str, Any] = (
-                {"labels": {}}
-                if url.endswith("/labels")
-                else {"terminal_launch_args": stored_args}
-            )
-
-            class _Response(NullServerClient._Response):
-                """Canned JSON response."""
-
-                def json(self) -> dict[str, Any]:
-                    """Return the canned payload."""
-                    return payload
-
-            return _Response()
-
     captured: dict[str, Any] = {}
     await _auto_create_claude_terminal(
         "5cdbea97a2fb0c659bc09605401e2bb2",
         _RecordingClaudeRegistry(captured),
         lambda _sid, _evt: None,
-        server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
+            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
+            {"terminal_launch_args": stored_args},
+        ),
     )
 
     launched_args = list(captured["spec"].args)
