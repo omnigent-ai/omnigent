@@ -1113,15 +1113,19 @@ describe("FileViewer Address All", () => {
   });
 
   it.each([
-    ["loading", { data: undefined, isPending: true }],
-    ["failed", { data: undefined, isError: true }],
-  ])("sends nothing until the session list loads (%s)", (_label, unavailableSessionQuery) => {
+    ["session", "loading", { data: undefined, isPending: true }],
+    ["session", "failed", { data: undefined, isError: true }],
+    ["file", "loading", { data: undefined, isPending: true }],
+    ["file", "failed", { data: undefined, isError: true }],
+  ] as const)("sends nothing until the %s list loads (%s)", (unavailableList, _state, query) => {
     const mutate = vi.fn();
     useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
-    let sessionQuery = unavailableSessionQuery as ReturnType<typeof useComments>;
-    useCommentsMock.mockImplementation((_sessionId, path) =>
-      path ? makeCommentsQuery([makeComment("c1")]) : sessionQuery,
-    );
+    const unavailableQuery = query as unknown as ReturnType<typeof useComments>;
+    let loaded = false;
+    useCommentsMock.mockImplementation((_sessionId, path) => {
+      if (!loaded && (path ? "file" : "session") === unavailableList) return unavailableQuery;
+      return makeCommentsQuery(path ? [makeComment("c1")] : [makeComment("c1"), otherDraft]);
+    });
 
     const { rerender } = renderViewer({ open: true, path: "file1.py" });
     fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
@@ -1130,7 +1134,7 @@ describe("FileViewer Address All", () => {
     expect(mutate).not.toHaveBeenCalled();
     expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-address-count", "0");
 
-    sessionQuery = makeCommentsQuery([makeComment("c1"), otherDraft]);
+    loaded = true;
     rerender(viewerTree({ open: true, path: "file1.py" }));
     fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
 

@@ -669,15 +669,15 @@ function FileViewerBody({
     [allComments, fileContent, remapFormatted],
   );
   // Address All sends drafts from every file; this file's own query supplies its drafts.
-  // Until the session list loads, a send would silently skip other files' drafts.
+  // Until both lists load, a send would silently skip the unloaded list's drafts.
   const addressableCommentIds = useMemo(() => {
-    if (!sessionCommentsQuery.data) return [];
+    if (!commentsQuery.data || !sessionCommentsQuery.data) return [];
     const ids = new Set(openComments.map((c) => c.id));
     for (const c of sessionCommentsQuery.data) {
       if (c.status === "draft" && c.path !== path) ids.add(c.id);
     }
     return [...ids];
-  }, [openComments, sessionCommentsQuery.data, path]);
+  }, [openComments, commentsQuery.data, sessionCommentsQuery.data, path]);
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
     // Comment navigation supersedes a citation, including clicks outside the editor.
