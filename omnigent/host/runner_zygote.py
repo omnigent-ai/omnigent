@@ -49,11 +49,8 @@ logger = logging.getLogger(__name__)
 # fork + reply is sub-millisecond locally, so this is purely a safety net.
 _CONTROL_TIMEOUT_S = 30.0
 
-# Reported for a forked runner whose real exit code can no longer be recovered
-# because the zygote (its OS parent, the only process that could waitpid it)
-# died. The runner process itself is confirmed gone by a direct pid probe; we
-# just can't know its code, so surface a non-zero sentinel — a lost runner must
-# read as dead-and-failed, never as a clean exit or an eternal "still alive".
+# A gone runner whose exit status is unavailable from its zygote's control
+# channel still needs a nonzero result, even while that parent remains alive.
 _ZYGOTE_LOST_EXIT_CODE = 254
 
 
@@ -154,6 +151,7 @@ class ZygoteManager:
         self._log_path = log_path
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
+        self._control_failed = False
         self._generation = 0
         self._lock = threading.RLock()
 
@@ -188,6 +186,8 @@ class ZygoteManager:
         """
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
+                if self._control_failed:
+                    raise ZygoteUnavailable("runner zygote control channel is unusable")
                 return
             if self._sock is not None:
                 self._sock.close()
@@ -205,6 +205,7 @@ class ZygoteManager:
             self._generation += 1
             self._proc = proc
             self._sock = parent_sock
+            self._control_failed = False
 
             # Prewarming and session launch can race. Keep the readiness check
             # and failed-start cleanup locked so neither caller can use an
@@ -303,12 +304,8 @@ class ZygoteManager:
                 {"cmd": "poll", "pid": pid}, zygote_generation=zygote_generation
             )
         except ZygoteUnavailable:
-            # The zygote (the runner's OS parent) died, so exit status can no
-            # longer be recovered over the control socket. Probe the runner pid
-            # directly: if it is gone, surface a dead-and-failed sentinel so the
-            # daemon's watcher stops looping and reports the exit; if it is
-            # somehow still alive, report "still live" and keep polling. Never
-            # report an eternal None for a process that has actually exited.
+            # An unavailable control channel cannot supply exit status. Probe
+            # the PID directly, reporting a sentinel only once it is gone.
             return None if _proc.process_alive(pid) else _ZYGOTE_LOST_EXIT_CODE
         code = reply.get("returncode")
         return code if isinstance(code, int) else None
@@ -351,13 +348,18 @@ class ZygoteManager:
         with self._lock:
             if zygote_generation is not None and zygote_generation != self._generation:
                 raise ZygoteUnavailable("runner belongs to a previous zygote generation")
+            if self._control_failed:
+                raise ZygoteUnavailable("runner zygote control channel is unusable")
             sock = self._sock
             if sock is None:
                 raise ZygoteUnavailable("runner zygote is not running")
             try:
                 sock.sendall(json.dumps(request).encode("utf-8") + b"\n")
                 return self._read_reply(sock)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, ZygoteUnavailable) as exc:
+                # A late or partial reply cannot be assigned to the next request.
+                # Keep the socket open: daemon EOF would kill healthy children.
+                self._control_failed = True
                 raise ZygoteUnavailable(f"runner zygote control error: {exc}") from exc
 
     @staticmethod

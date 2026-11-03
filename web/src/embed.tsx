@@ -1,3 +1,4 @@
+import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { appConfig, type SidebarConfig } from "./appConfig";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 // Embed entry point.
@@ -194,6 +195,7 @@ function OmnigentProviders({
   const scopeRootRef = useCallback((el: HTMLDivElement | null) => {
     setEmbedScopeRoot(el);
     if (el) {
+      applyMobileAppTargetAttribute();
       applyStoredUiFontSize();
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
