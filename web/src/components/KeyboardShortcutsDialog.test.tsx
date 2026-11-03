@@ -14,8 +14,16 @@ const isNativeShell = vi.fn(() => false);
 const isElectronShell = vi.fn(() => false);
 const supportsBrowser = vi.fn(() => false);
 const contentSearchEnabled = vi.fn(() => false);
+const gridsEnabled = vi.fn(() => false);
+const splitTerminalEnabled = vi.fn(() => false);
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ features: { workspace_content_search: contentSearchEnabled() } }),
+  useServerInfo: () => ({
+    features: {
+      workspace_content_search: contentSearchEnabled(),
+      grid_sessions_display_ui: gridsEnabled(),
+      splittable_terminal_view_ui: splitTerminalEnabled(),
+    },
+  }),
 }));
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
@@ -31,6 +39,8 @@ beforeEach(() => {
   isElectronShell.mockReturnValue(false);
   supportsBrowser.mockReturnValue(false);
   contentSearchEnabled.mockReturnValue(false);
+  gridsEnabled.mockReturnValue(false);
+  splitTerminalEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -101,6 +111,21 @@ describe("KeyboardShortcutsDialog", () => {
     rerender(<KeyboardShortcutsList />);
     expect(keysFor("Search workspace contents")).toEqual(["Ctrl", "⇧", "F"]);
     expect(keysFor("Select a workspace tab")).toContain("1…5");
+  });
+
+  it("shows pane shortcuts only for the enabled grid and split-terminal features", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Panes")).toBeNull();
+    gridsEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Focus next pane")).toEqual(["Ctrl", "Alt", "⇧", "]"]);
+    expect(screen.queryByText("Split terminal right")).toBeNull();
+    gridsEnabled.mockReturnValue(false);
+    splitTerminalEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Focus previous pane")).toEqual(["Ctrl", "Alt", "⇧", "["]);
+    expect(keysFor("Split terminal right")).toEqual(["Ctrl", "Alt", "⇧", "\\"]);
+    expect(keysFor("Split terminal down")).toEqual(["Ctrl", "Alt", "-"]);
   });
 
   it("advertises the session-search chord without taking the Print shortcut", () => {

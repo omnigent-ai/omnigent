@@ -4,7 +4,7 @@
   "private": true,
   "description": "Pinned npm CLIs the e2e workflow installs (claude-code, codex, pi).",
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.283",
+    "@anthropic-ai/claude-code": "2.1.295",
     "@earendil-works/pi-coding-agent": "1.3.0",
     "@openai/codex": "0.142.0"
   }
