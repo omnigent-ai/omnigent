@@ -348,10 +348,12 @@ export function describeSchedule(rrule: string): string {
   const days = normalizeWeekdays(o.byweekday);
   const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
 
-  if (
-    o.freq === RRule.MINUTELY &&
-    [o.byhour, o.byminute, o.bysecond].every((value) => value === null || value === undefined)
-  ) {
+  if (o.freq === RRule.MINUTELY) {
+    // The library's toText() drops minute-rule filters; preserve them verbatim.
+    const filtered = Object.entries(o).some(
+      ([name, value]) => name.startsWith("by") && value !== null && value !== undefined,
+    );
+    if (filtered) return rrule;
     return interval === 1 ? "Every minute" : `Every ${interval} minutes`;
   }
 
