@@ -90,11 +90,14 @@ function renderTab({
   files = FILES,
   patch = PATCH,
   threads = [],
+  listing = {},
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
   patch?: string;
   threads?: ReviewThread[];
+  /** Changed-file list fields beyond the file array, such as truncation. */
+  listing?: { has_more?: boolean; total_count?: number | null };
 }) {
   const prUrl = prUrlFor(conversationId);
   const tabProps = (current: string) =>
@@ -109,7 +112,7 @@ function renderTab({
       prUrl,
       canEdit: false,
       selected: true,
-      changes: { data: { available: true, data: files } },
+      changes: { data: { available: true, data: files, ...listing } },
       prDiff: { data: { head_sha: "head", base_sha: "base", patch: current }, isLoading: false },
       reviews: {
         page: { data: threads, head_sha: "head", base_sha: "base" },
@@ -143,6 +146,7 @@ const sectionHeader = (path: string, expanded: boolean) =>
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("clears the path filter to navigate to a thread on a filtered-out file", () => {
@@ -251,6 +255,22 @@ describe("PullRequestChangesTab", () => {
     expect(findInput()).toHaveFocus();
   });
 
+  it("keeps Ctrl+F as the caret key in a comment on macOS, and Cmd+F opens Find", () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel", userAgent: "Mac" });
+    renderTab({ conversationId: "find-mac" });
+    const tab = document.querySelector<HTMLElement>('[data-slot="tabs-content"]')!;
+    const comment = document.createElement("textarea");
+    tab.append(comment);
+    comment.focus();
+
+    expect(fireEvent.keyDown(comment, { key: "f", ctrlKey: true })).toBe(true);
+    expect(comment).toHaveFocus();
+    expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
+
+    expect(fireEvent.keyDown(comment, { key: "f", metaKey: true })).toBe(false);
+    expect(findInput()).toHaveFocus();
+  });
+
   it("keeps the query and the nearest match when the patch refreshes", () => {
     const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
     const { rerender } = renderTab({ conversationId: "find-refresh" });
@@ -328,6 +348,33 @@ describe("PullRequestChangesTab", () => {
     expect(diffOf("c.ts")).not.toBeNull();
     expect(scroll.mock.calls.length).toBeGreaterThan(scrollsBefore);
     expect(scroll.mock.contexts).toContain(rowOf("c.ts", 2500));
+  });
+
+  it("steps forward past the last match and back with the Previous button", () => {
+    renderTab({ conversationId: "find-buttons" });
+    openFind("a");
+    expect(screen.getByText("1 of 7")).toBeInTheDocument();
+    for (let step = 0; step < 6; step++) {
+      fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    }
+    expect(screen.getByText("7 of 7")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    expect(screen.getByText("1 of 7")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous match" }));
+    expect(screen.getByText("7 of 7")).toBeInTheDocument();
+  });
+
+  it("counts the whole changed-file list when it is truncated", () => {
+    renderTab({
+      conversationId: "find-truncated",
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+      listing: { has_more: true, total_count: 5 },
+    });
+    openFind("needle");
+    expect(screen.getByText("Search covers the fetched patch: 2 of 5 files")).toBeInTheDocument();
   });
 
   it("scrolls to a file header when the first match is a path match", () => {

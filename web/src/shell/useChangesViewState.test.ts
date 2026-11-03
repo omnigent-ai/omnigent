@@ -10,6 +10,7 @@ describe("useChangesViewState", () => {
       first.result.current.setPathFilter("src/");
       first.result.current.setHideViewed(true);
       first.result.current.reveal("src/app.ts");
+      first.result.current.setFind({ open: true, query: "needle", regex: true });
     });
     first.unmount();
 
@@ -17,6 +18,7 @@ describe("useChangesViewState", () => {
     expect(remounted.pathFilter).toBe("src/");
     expect(remounted.hideViewed).toBe(true);
     expect([...remounted.revealedPaths]).toEqual(["src/app.ts"]);
+    expect(remounted.find).toEqual({ open: true, query: "needle", matchCase: false, regex: true });
 
     for (const [conversationId, url] of [
       ["view-state-b", prUrl],
@@ -26,6 +28,7 @@ describe("useChangesViewState", () => {
       expect(other.pathFilter).toBe("");
       expect(other.hideViewed).toBe(false);
       expect(other.revealedPaths.size).toBe(0);
+      expect(other.find).toEqual({ open: false, query: "", matchCase: false, regex: false });
     }
   });
 
@@ -36,20 +39,5 @@ describe("useChangesViewState", () => {
     expect(result.current.reveal).toBe(reveal);
     act(() => result.current.clearReveal("a.ts"));
     expect(result.current.revealedPaths.has("a.ts")).toBe(false);
-  });
-
-  it("keeps find choices across remounts and isolates them per PR", () => {
-    const prUrl = "https://github.com/o/r/pull/3";
-    const first = renderHook(() => useChangesViewState("view-state-find", prUrl));
-    act(() => first.result.current.setFind({ open: true, query: "needle", matchCase: true }));
-    first.unmount();
-
-    const remounted = renderHook(() => useChangesViewState("view-state-find", prUrl)).result
-      .current;
-    expect(remounted.find).toEqual({ open: true, query: "needle", matchCase: true, regex: false });
-
-    const other = renderHook(() => useChangesViewState("view-state-find-other", prUrl)).result
-      .current;
-    expect(other.find).toEqual({ open: false, query: "", matchCase: false, regex: false });
   });
 });

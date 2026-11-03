@@ -32,6 +32,7 @@ import {
   type usePullRequestDiff,
 } from "@/hooks/usePullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { cn } from "@/lib/utils";
 import {
@@ -698,8 +699,9 @@ export function PullRequestChangesTab({
     view.setHideViewed(false);
   };
   const onTabKeyDown = (event: React.KeyboardEvent) => {
+    // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.
     if (
-      !(event.metaKey || event.ctrlKey) ||
+      !hasCommandModifier(event) ||
       event.altKey ||
       event.shiftKey ||
       event.key.toLowerCase() !== "f"
