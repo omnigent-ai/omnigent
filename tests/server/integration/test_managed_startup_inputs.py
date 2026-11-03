@@ -1031,6 +1031,15 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     assert conv is not None and conv.labels.get(STARTUP_LABEL) == "failed"
     [error] = items
     assert isinstance(error.data, ErrorData) and "store unavailable" in error.data.message
+    # The undelivered first message stays recoverable for its sender to resend.
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["pending_inputs"] == []
+    [failed] = snapshot["failed_inputs"]
+    assert failed["content"] == _INPUT["data"]["content"]
+    assert await env.app.state.startup_inputs.failed_snapshot(conv, "someone-else") == []
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["failed_inputs"] == []
 
 
 async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(

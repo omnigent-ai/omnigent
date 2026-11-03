@@ -62,6 +62,14 @@ def input_content(item: ConversationItem) -> list[dict[str, Any]]:
     return data.get("content", [])
 
 
+def _snapshot_entry(session_id: str, item: ConversationItem) -> dict[str, Any]:
+    return {
+        "pending_id": pending_inputs.make_pending_id(session_id, item.id),
+        "content": input_content(item),
+        **({"created_by": item.created_by} if item.created_by else {}),
+    }
+
+
 async def restore_pending_inputs(store: ConversationStore, session_id: str) -> None:
     """Restore native receipt matching after an AP restart, without submitting again."""
     for item in await asyncio.to_thread(store.list_pending_inputs, session_id):
@@ -275,13 +283,21 @@ class ManagedStartupInputs:
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
             return []
         return [
-            {
-                "pending_id": pending_inputs.make_pending_id(session_id, item.id),
-                "content": input_content(item),
-                **({"created_by": item.created_by} if item.created_by else {}),
-            }
+            _snapshot_entry(session_id, item)
             for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
             if item.status != "failed"
+        ]
+
+    async def failed_snapshot(
+        self, conv: Conversation, viewer_id: str | None
+    ) -> list[dict[str, Any]]:
+        """The viewer's messages a failed launch couldn't deliver, until a runner is bound."""
+        if conv.labels.get(STARTUP_LABEL) != "failed" or conv.runner_id is not None:
+            return []
+        return [
+            _snapshot_entry(conv.id, item)
+            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
+            if item.status == "failed" and item.created_by == viewer_id
         ]
 
     def host_changed(self, app: Any, host_id: str) -> None:

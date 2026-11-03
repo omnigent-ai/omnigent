@@ -509,6 +509,11 @@ Fields:
     redraw a bubble the person stopped. Empty for non-native sessions,
     which already carry the message in `items`.
 
+  failed_inputs (array, default `[]`)
+    The viewer's own startup inputs that a failed managed launch could not
+    deliver, shaped like `pending_inputs`. Clients offer them back to the
+    composer for resending. Empty once a runner is bound to the session.
+
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",
@@ -609,7 +614,8 @@ already uploaded or registered an agent. The response is the full
     history-seeding behavior and cannot be combined with `initial_input`.
     Attribution comes from the authenticated creator; EDIT permission and input
     policies are checked again at dispatch. Pending input appears in the session
-    snapshot's `pending_inputs`. Additional messages sent to `/events` during
+    snapshot's `pending_inputs`; after a failed launch, it appears in its sender's
+    `failed_inputs` instead. Additional messages sent to `/events` during
     startup are also saved and acknowledged immediately, in submission order,
     unless the launch already failed or the bound host is gone; those take the
     ordinary error or relaunch path.

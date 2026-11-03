@@ -5085,13 +5085,20 @@ async function bindStream(
       const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
       const countEndsWith = (texts: string[], suffix: string): number =>
         texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
-      const snapshotPending: PendingUserMessage[] = dedupePending
+      const dedupedPending: PendingUserMessage[] = dedupePending
         ? candidatePending.filter((p) => {
             const text = messageContentText(p.content);
             if (text === "") return true;
             return countEndsWith(committedUserTexts, text) === 0;
           })
         : candidatePending;
+      // A rebind restores failed startup inputs only while a bubble still shows one.
+      const snapshotPending = withoutFailedStartupBubbles(dedupedPending, session);
+      const restoredDraft =
+        unsentDraft ??
+        (hydratePending || snapshotPending.length !== dedupedPending.length
+          ? failedStartupDraft(id, session)
+          : null);
       const syntheticError: ErrorBlock | null =
         session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
           ? {
@@ -5107,8 +5114,8 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
-        ...(unsentDraft !== null && state.failedSendDraft === null
-          ? { failedSendDraft: unsentDraft }
+        ...(restoredDraft !== null && state.failedSendDraft === null
+          ? { failedSendDraft: restoredDraft }
           : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
@@ -5394,6 +5401,15 @@ function reconnectStatusPatch(
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  // A launch that failed while the stream was down left its first messages showing as sending.
+  const pending = withoutFailedStartupBubbles(s.pendingUserMessages, session);
+  if (pending.length !== s.pendingUserMessages.length && s.conversationId !== null) {
+    patch.pendingUserMessages = pending;
+    patch.startupPending = false;
+    if (s.failedSendDraft === null) {
+      patch.failedSendDraft = failedStartupDraft(s.conversationId, session);
+    }
+  }
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
   // outlives it), so it settles the local send lifecycle like `idle` — it must
   // NOT reopen a streaming response. The server keeps `active_response_id`
@@ -7686,6 +7702,70 @@ function restoreUnsentSendOnceIdentified(
 }
 
 /**
+ * The viewer's startup messages a failed managed launch left undelivered, as a
+ * failed-send draft. They carry no stable id: the server already holds them as
+ * failed inputs, so a resend must go out as a new message.
+ *
+ * @param conversationId - The session whose snapshot is read.
+ * @param session - That session's snapshot.
+ * @returns The draft to restore, or `null`.
+ */
+function failedStartupDraft(
+  conversationId: string,
+  session: Session,
+): ConversationState["failedSendDraft"] {
+  const text = (session.failedInputs ?? [])
+    .map((input) =>
+      input.content.flatMap((block) => (block.type === "input_text" ? [block.text] : [])).join(""),
+    )
+    .filter((message) => message !== "")
+    .join("\n\n");
+  return text === "" ? null : { conversationId, text, files: [] };
+}
+
+/**
+ * Drop the bubbles still showing a session's failed startup inputs as sending.
+ * Matched by text, one bubble per input, since a bubble's attachments carry local ids.
+ *
+ * @param pending - The bubbles to filter.
+ * @param session - A snapshot listing the failed inputs.
+ * @returns The remaining bubbles.
+ */
+function withoutFailedStartupBubbles(
+  pending: PendingUserMessage[],
+  session: Session,
+): PendingUserMessage[] {
+  const failedTexts = (session.failedInputs ?? [])
+    .map((input) => messageContentText(input.content))
+    .filter((text) => text !== "");
+  return pending.filter((message) => {
+    const index = failedTexts.indexOf(messageContentText(message.content));
+    if (index === -1) return true;
+    failedTexts.splice(index, 1);
+    return false;
+  });
+}
+
+/**
+ * Return a failed launch's undelivered startup messages to the composer.
+ *
+ * @param conversationId - The session whose launch failed.
+ */
+function restoreFailedStartupInputs(conversationId: string): void {
+  void getSessionSlim(conversationId)
+    .then((session) => {
+      const draft = failedStartupDraft(conversationId, session);
+      if (draft === null || isConversationDisposed(conversationId)) return;
+      setterFor(conversationId)((state) => ({
+        startupPending: false,
+        pendingUserMessages: withoutFailedStartupBubbles(state.pendingUserMessages, session),
+        ...(state.failedSendDraft === null ? { failedSendDraft: draft } : {}),
+      }));
+    })
+    .catch(() => {});
+}
+
+/**
  * Reconcile a failed-send draft against a reconnect snapshot.
  *
  * A snapshot item under the draft's stable id proves delivery (see
@@ -8362,6 +8442,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
+      const startupWasPending = setterForState(event.conversationId)?.startupPending === true;
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).
@@ -8571,6 +8652,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
         return patch;
       });
+      // A failed managed launch fails its saved startup inputs before reporting it.
+      if (event.status === "failed" && startupWasPending) {
+        restoreFailedStartupInputs(event.conversationId);
+      }
       // Refetch the snapshot at turn START too: the runner persists
       // turn-scoped labels (e.g. the cost advisor's `cost_control.plan`
       // verdict) before the harness runs, so the verdict can render

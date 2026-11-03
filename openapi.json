@@ -8609,6 +8609,15 @@
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Populated by the wrapper bridge.",
             "title": "External Session Id"
           },
+          "failed_inputs": {
+            "description": "The viewer's own startup inputs a failed managed launch could not deliver, shaped like `pending_inputs`. Clients hand them back to the composer for resending. Empty once a runner is bound to the session.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Failed Inputs",
+            "type": "array"
+          },
           "git_branch": {
             "anyOf": [
               {

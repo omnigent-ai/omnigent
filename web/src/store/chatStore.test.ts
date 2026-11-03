@@ -289,6 +289,7 @@ let sessionPendingInputs: Map<
   string,
   { pending_id: string; content: unknown[]; created_by?: string }[]
 >;
+let sessionFailedInputs: Map<string, { pending_id: string; content: unknown[] }[]>;
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
@@ -420,6 +421,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       labels: sessionLabels.get(sessionId) ?? {},
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
+      failed_inputs: sessionFailedInputs.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
       subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
       mcp_startup: sessionMcpStartup.get(sessionId) ?? null,
@@ -523,6 +525,7 @@ beforeEach(() => {
   sessionItems = new Map();
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
+  sessionFailedInputs = new Map();
   sessionCostControlOverrides = new Map();
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
@@ -605,6 +608,14 @@ function seedPendingInputs(
   inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
+}
+
+/** Serve a session whose managed launch failed before delivering `text`. */
+function failManagedLaunch(id: string, text: string): void {
+  sessionLabels.set(id, { ...sessionLabels.get(id), "omnigent.startup": "failed" });
+  sessionFailedInputs.set(id, [
+    { pending_id: "pending_first", content: [{ type: "input_text", text }] },
+  ]);
 }
 
 describe("isTempConvId", () => {
@@ -3659,6 +3670,71 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([
       expect.objectContaining({ posted: true, initialDraft: undefined }),
     ]);
+  });
+
+  it.each([{ native: false }, { native: true }])(
+    "returns an accepted managed first input to the composer when the launch fails (%o)",
+    async ({ native }) => {
+      seedSession("conv_real");
+      sessionLabels.set("conv_real", {
+        "omnigent.startup": "pending",
+        ...(native ? { "omnigent.wrapper": "claude-code-native-ui" } : {}),
+      });
+      const { tempConvId, pendingMsgTempId } = beginLocalConversation(
+        "saved on server",
+        undefined,
+      )!;
+      hydrateLocalConversation(
+        tempConvId,
+        "conv_real",
+        "agent_xyz",
+        "saved on server",
+        undefined,
+        pendingMsgTempId,
+        null,
+        noopNavigate,
+        undefined,
+        undefined,
+        true,
+      );
+      await settle();
+      expect(useChatStore.getState().startupPending).toBe(true);
+
+      failManagedLaunch("conv_real", "saved on server");
+      handleSessionEvent(
+        { type: "session_status", conversationId: "conv_real", status: "failed" },
+        "conv_real",
+      );
+      await settle();
+
+      const state = useChatStore.getState();
+      expect(state.isNativeTerminalSession).toBe(native);
+      expect(state.failedSendDraft).toEqual({
+        conversationId: "conv_real",
+        text: "saved on server",
+        files: [],
+      });
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.startupPending).toBe(false);
+      const posts = fetchMock.mock.calls.filter(
+        ([u, init]) => String(u).endsWith("/events") && init?.method === "POST",
+      );
+      expect(posts).toHaveLength(0);
+    },
+  );
+
+  it("reopening a session whose managed launch failed offers its first input for resending", async () => {
+    seedSession("conv_real");
+    failManagedLaunch("conv_real", "saved on server");
+
+    await useChatStore.getState().switchTo("conv_real");
+
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_real",
+      text: "saved on server",
+      files: [],
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
   it("B1: a failed first message settles to idle (not stuck streaming)", async () => {
@@ -14668,6 +14744,47 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // while the session is still failed by it; afterwards the item is delivery.
     expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(state.pendingRetryStableId).toBeNull();
+  });
+
+  it("offers a startup input for resending when its managed launch failed during the reconnect gap", async () => {
+    seedSession("conv_launch_gap", []);
+    sessionLabels.set("conv_launch_gap", { "omnigent.startup": "pending" });
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_launch_gap",
+      abortController: controller,
+      startupPending: true,
+      pendingUserMessages: [
+        {
+          tempId: "tmp_first",
+          content: [{ type: "input_text", text: "saved on server" }],
+          posted: true,
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_launch_gap", controller, setState, getState);
+    await drainAsync();
+    failManagedLaunch("conv_launch_gap", "saved on server");
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.failedSendDraft).toEqual({
+      conversationId: "conv_launch_gap",
+      text: "saved on server",
+      files: [],
+    });
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.startupPending).toBe(false);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
   });
 
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {

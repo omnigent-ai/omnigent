@@ -460,6 +460,11 @@ export interface Session {
    */
   pendingInputs?: PendingInput[];
   /**
+   * The viewer's startup messages a failed managed launch could not deliver,
+   * offered back to the composer. Empty once a runner is bound.
+   */
+  failedInputs?: PendingInput[];
+  /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions
    * are disabled or the user has no grant. For sub-agent (child)
