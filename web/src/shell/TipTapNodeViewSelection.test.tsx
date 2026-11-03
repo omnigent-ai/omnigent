@@ -10,6 +10,7 @@ import {
 } from "@tiptap/react";
 import { StarterKit } from "@tiptap/starter-kit";
 import { CodeBlock } from "@tiptap/extension-code-block";
+import { closeHistory } from "@tiptap/pm/history";
 
 function CodeView() {
   const [version, setVersion] = useState(0);
@@ -55,6 +56,28 @@ it("does not read DOM selection for each unselected React node view", async () =
   // ProseMirror may read selection for the editor itself; the node count must
   // not produce one layout-triggering read per content DOM placement.
   expect(getSelection.mock.calls.length).toBeLessThan(10);
+});
+
+it("updates mounted portals through replacement, removal, and undo", async () => {
+  const instance = await mount(3);
+  await act(async () => {
+    instance.commands.setContent("<p>Heading</p><pre><code>replacement</code></pre>");
+  });
+  expect(screen.getAllByRole("button", { name: "Move content" })).toHaveLength(1);
+  expect(screen.getByText("replacement")).toBeVisible();
+  expect(screen.queryByText("sample")).not.toBeInTheDocument();
+
+  await act(async () => {
+    instance.view.dispatch(closeHistory(instance.state.tr));
+    const from = instance.state.doc.child(0).nodeSize;
+    instance.commands.deleteRange({ from, to: instance.state.doc.content.size });
+  });
+  expect(screen.queryByRole("button", { name: "Move content" })).not.toBeInTheDocument();
+  await act(async () => {
+    instance.commands.undo();
+  });
+  expect(screen.getAllByRole("button", { name: "Move content" })).toHaveLength(1);
+  expect(screen.getByText("replacement")).toBeVisible();
 });
 
 it.each([true, false])(

@@ -64,13 +64,20 @@ export const BoundedTaskList = TaskList.extend({
 const tableTokenizer = Table.config.markdownTokenizer!;
 const tableStart = tableTokenizer.start;
 
+// The upstream start callback only uses the header and delimiter lines.
+const boundedTableStart =
+  typeof tableStart === "function"
+    ? (source: string) => tableStart(source.slice(0, lineEnd(source, lineEnd(source, 0) + 1)))
+    : tableStart;
+
+/** Whether *source* opens with a table header and delimiter row. */
+export function startsTable(source: string): boolean {
+  return typeof boundedTableStart === "function" && boundedTableStart(source) === 0;
+}
+
 export const BoundedTable = Table.extend({
   markdownTokenizer: {
     ...tableTokenizer,
-    // The upstream start callback only uses the header and delimiter lines.
-    start:
-      typeof tableStart === "function"
-        ? (source) => tableStart(source.slice(0, lineEnd(source, lineEnd(source, 0) + 1)))
-        : tableStart,
+    start: boundedTableStart,
   },
 });

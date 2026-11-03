@@ -149,7 +149,7 @@ class ModelSignerSession(Protocol):
 
 
 def _signer_child_argv() -> list[str]:
-    return [sys.executable, "-m", "omnigent.inner.model_signer_service"]
+    return [sys.executable, "-P", "-m", "omnigent.inner.model_signer_service"]
 
 
 class SubprocessModelSigner:
@@ -228,12 +228,12 @@ class SubprocessModelSigner:
                 try:
                     proc.stdin.write(b"shutdown\n")
                     await asyncio.wait_for(proc.stdin.drain(), timeout=1)
-                except (asyncio.TimeoutError, BrokenPipeError, ConnectionError):
+                except (TimeoutError, BrokenPipeError, ConnectionError):
                     pass
             if proc.returncode is None:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=_SHUTDOWN_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await terminate_subprocess(
                         proc,
                         terminate_timeout=2,

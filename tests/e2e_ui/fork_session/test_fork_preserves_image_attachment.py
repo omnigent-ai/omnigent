@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import base64
 import re
-import time
 from pathlib import Path
 
 from playwright.sync_api import Page, Response, expect
+
+from tests._helpers.polling import poll_until
 
 _COMPOSER_LABEL = "Message the agent"
 _SCREENSHOT_NAME = "fork-attachment.png"
@@ -130,17 +131,7 @@ def test_fork_carries_image_reference_and_its_resource(
                 return status
         return None
 
-    _wait_for(lambda: _fork_file_status() is not None, timeout_s=30.0)
+    poll_until(lambda: _fork_file_status() is not None, timeout_s=30.0, interval_s=0.25)
     assert _fork_file_status() == 200, (
         f"expected the fork's own copy of the image to load, got {file_responses!r}"
     )
-
-
-def _wait_for(predicate, *, timeout_s: float = 15.0, interval_s: float = 0.25) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")

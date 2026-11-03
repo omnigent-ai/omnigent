@@ -7,6 +7,7 @@ import logging
 import os
 import shlex
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +37,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.process_logging import data_dir
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1447,10 +1449,11 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert "sys_list_models" in server["enabledTools"]
     assert server["enabledTools"] == sorted(server["enabledTools"])
     assert server["env"]["TMPDIR"]
-    # The relay's HOME is pinned to the runner's real home so its bridge-root
+    # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
     # path customizes process environment.
     assert server["env"]["HOME"] == str(Path.home())
+    assert server["env"]["OMNIGENT_DATA_DIR"] == str(data_dir())
 
 
 def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path) -> None:
@@ -1461,19 +1464,135 @@ def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path)
     assert server["command"] == sys.executable
 
 
-def test_write_mcp_config_targets_isolated_agy_gemini_dir(tmp_path: Path) -> None:
-    """write_mcp_config writes into the isolated agy Gemini dir, not ~/.gemini."""
+def test_write_mcp_config_targets_isolated_agy_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without a user config, the relay alone lands in the isolated agy Gemini dir, silently."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
+    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+    # The bridge token the shared relay requires is written into the bridge dir.
+    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    assert not [record for record in caplog.records if record.name == _mod.__name__]
+
+
+def _write_user_mcp_config(fake_home: Path, payload: str) -> Path:
+    real_config = fake_home / ".gemini" / "config" / "mcp_config.json"
+    real_config.parent.mkdir(parents=True, exist_ok=True)
+    real_config.write_text(payload, encoding="utf-8")
+    return real_config
+
+
+def test_write_mcp_config_inherits_user_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User ~/.gemini MCP servers are seeded beside the relay; the real file is untouched."""
+    fake_home = tmp_path / "real-home"
+    graft = {"command": "/usr/local/bin/graft", "args": ["mcp"], "env": {"GRAFT_INDEX": ".graft"}}
+    user_payload = json.dumps(
+        {"mcpServers": {"graft": graft, "graphify": {"command": "/usr/local/bin/graphify"}}}
+    )
+    real_config = _write_user_mcp_config(fake_home, user_payload)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    # The config lands under the isolated --gemini_dir config path, so the user's
-    # real ~/.gemini is untouched.
-    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
-    # The bridge token the shared relay requires is written into the bridge dir.
-    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    assert set(servers) == {"graft", "graphify", "omnigent"}
+    assert servers["graft"] == graft
+    assert servers["omnigent"]["command"] == "python-test"
+    assert real_config.read_text(encoding="utf-8") == user_payload
+
+
+def test_write_mcp_config_relay_wins_user_name_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user server named ``omnigent`` never displaces the session relay."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home, json.dumps({"mcpServers": {"omnigent": {"command": "/usr/local/bin/other"}}})
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    relay = build_mcp_config(bridge_dir, python_executable="python-test")["mcpServers"]
+    assert servers == relay
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["{not json", '{"mcpServers": "graft"}', None],
+    ids=["not-json", "servers-string", "directory"],
+)
+def test_write_mcp_config_tolerates_malformed_user_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    payload: str | None,
+) -> None:
+    """A malformed or unreadable user config degrades to the relay alone, with a warning."""
+    fake_home = tmp_path / "real-home"
+    if payload is None:
+        (fake_home / ".gemini" / "config" / "mcp_config.json").mkdir(parents=True)
+    else:
+        _write_user_mcp_config(fake_home, payload)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == build_mcp_config(bridge_dir, python_executable="python-test")
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _mod.__name__ and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1 and "seeding only the Omnigent relay" in warnings[0]
+
+
+@pytest.mark.posix_only
+def test_write_mcp_config_restricts_isolated_config_to_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inherited server env blocks can hold tokens, so only the owner may read the file."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home,
+        json.dumps({"mcpServers": {"graft": {"command": "graft", "env": {"GRAFT_TOKEN": "s"}}}}),
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A looser file left by an earlier write must not keep its mode.
+    stale = agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+    stale.chmod(0o644)
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["graft"]["env"] == {
+        "GRAFT_TOKEN": "s"
+    }
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
@@ -2512,35 +2631,210 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
-def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+_RETENTION_NOW = 2_000_000_000.0
+
+
+def _conversations_dir(bridge_dir: Path) -> Path:
+    """agy's conversation store under the bridge's isolated ``--gemini_dir``."""
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+
+
+def _dead_owner_bridge(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    owner_marker_age_s: float,
+) -> Path:
+    """Create a dead-owner bridge under *root* with the sweep's clock frozen."""
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    monkeypatch.setattr(_mod.time, "time", lambda: _RETENTION_NOW)
+    bridge_dir = root / "deadowner"
+    bridge_dir.mkdir(parents=True)
+    owner_marker = bridge_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    marked_at = _RETENTION_NOW - owner_marker_age_s
+    os.utime(owner_marker, (marked_at, marked_at))
+    return bridge_dir
+
+
+def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
-    import os
-    import subprocess
-    import sys
+    """A recently prepared bridge survives whole, even before agy minted a conversation."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native", monkeypatch, owner_marker_age_s=60
+    )
+    (dead_dir / "state.json").write_text("{}", encoding="utf-8")
+    (dead_dir / "bridge.json").write_text("secret", encoding="utf-8")
 
+    assert _mod.prune_orphaned_bridge_dirs() == 0
+    assert (dead_dir / "owner.pid").read_text(encoding="utf-8") == "999999"
+    assert (dead_dir / "bridge.json").read_text(encoding="utf-8") == "secret"
+
+
+def test_prune_orphaned_bridge_dirs_removes_expired_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner bridge inactive for 7 days is removed with its conversation store."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod._ORPHAN_RETENTION_SECONDS,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.mkdir(parents=True)
+    expired_at = _RETENTION_NOW - _mod._ORPHAN_RETENTION_SECONDS
+    for name in ("7d5e1c2a.db", "7d5e1c2a.db-wal", "7d5e1c2a.db-shm"):
+        (conversations / name).write_bytes(b"history")
+        os.utime(conversations / name, (expired_at, expired_at))
+    unrelated = conversations / "index.json"
+    unrelated.write_text("{}", encoding="utf-8")
+    os.utime(unrelated, (_RETENTION_NOW - 60, _RETENTION_NOW - 60))
+    # A recent name that merely contains ".db" is not a conversation database;
+    # it must not keep an otherwise expired bridge alive.
+    backup = conversations / "7d5e1c2a.db.backup"
+    backup.write_bytes(b"stale copy")
+    os.utime(backup, (_RETENTION_NOW - 60, _RETENTION_NOW - 60))
+
+    assert _mod.prune_orphaned_bridge_dirs() == 1
+    assert not dead_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_removes_bridge_with_non_directory_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired bridge whose conversation path is not a directory is reclaimed."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod._ORPHAN_RETENTION_SECONDS,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.parent.mkdir(parents=True)
+    conversations.write_bytes(b"not a directory")
+
+    assert _mod.prune_orphaned_bridge_dirs() == 1
+    assert not dead_dir.exists()
+
+
+@pytest.mark.parametrize("recent_suffix", [".db", ".db-wal", ".db-shm"])
+def test_prune_orphaned_bridge_dirs_uses_latest_conversation_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recent_suffix: str,
+) -> None:
+    """A recent database or SQLite sidecar keeps a bridge whose marker and other files are old."""
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod._ORPHAN_RETENTION_SECONDS + 1,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.mkdir(parents=True)
+    expired_at = _RETENTION_NOW - _mod._ORPHAN_RETENTION_SECONDS - 1
+    conversation_files = []
+    for suffix in (".db", ".db-wal", ".db-shm"):
+        conversation_file = conversations / f"7d5e1c2a{suffix}"
+        conversation_file.write_bytes(b"history")
+        modified_at = _RETENTION_NOW - 60 if suffix == recent_suffix else expired_at
+        os.utime(conversation_file, (modified_at, modified_at))
+        conversation_files.append(conversation_file)
+
+    assert _mod.prune_orphaned_bridge_dirs() == 0
+    assert all(
+        conversation_file.read_bytes() == b"history" for conversation_file in conversation_files
+    )
+
+
+def _fail_conversation_listing(monkeypatch: pytest.MonkeyPatch, conversations: Path) -> None:
+    """Make listing the conversations directory raise."""
+    real_listdir = os.listdir
+
+    def _failing_listdir(path: object = ".") -> list[str]:
+        if Path(path) == conversations:
+            raise PermissionError("conversation store unreadable")
+        return real_listdir(path)
+
+    monkeypatch.setattr(_mod.os, "listdir", _failing_listdir)
+
+
+def _fail_path_stat(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Make ``Path.stat()`` raise for *target* only, leaving other paths intact."""
+    real_stat = Path.stat
+
+    def _failing_stat(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if Path(self) == target:
+            raise PermissionError(f"{target} is unreadable")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", _failing_stat)
+
+
+@pytest.mark.parametrize(
+    "install_failure",
+    [
+        pytest.param(
+            lambda mp, convs, db: _fail_conversation_listing(mp, convs),
+            id="directory-listing",
+        ),
+        pytest.param(lambda mp, convs, db: _fail_path_stat(mp, convs), id="directory-stat"),
+        pytest.param(lambda mp, convs, db: _fail_path_stat(mp, db), id="database-stat"),
+    ],
+)
+def test_prune_orphaned_bridge_dirs_retains_bridge_when_conversation_scan_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    install_failure: Callable[[pytest.MonkeyPatch, Path, Path], None],
+) -> None:
+    """An unreadable conversation store fails closed instead of deleting the bridge.
+
+    Covers each separately handled filesystem probe: the directory listing, the
+    conversations-directory ``stat()``, and the per-database ``stat()``.
+    """
+    dead_dir = _dead_owner_bridge(
+        tmp_path / "antigravity-native",
+        monkeypatch,
+        owner_marker_age_s=_mod._ORPHAN_RETENTION_SECONDS + 1,
+    )
+    conversations = _conversations_dir(dead_dir)
+    conversations.mkdir(parents=True)
+    database = conversations / "7d5e1c2a.db"
+    database.write_bytes(b"history")
+    os.utime(database, (_RETENTION_NOW - _mod._ORPHAN_RETENTION_SECONDS - 1,) * 2)
+
+    install_failure(monkeypatch, conversations, database)
+
+    assert _mod.prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+    assert database.read_bytes() == b"history"
+
+
+def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only expired dead-owner bridges go; live-owner and unmarked bridges remain even when old."""
     root = tmp_path / "antigravity-native"
-    root.mkdir(parents=True)
-    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
-
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    dead_dir = root / "deadowner"
-    dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    dead_dir = _dead_owner_bridge(
+        root, monkeypatch, owner_marker_age_s=_mod._ORPHAN_RETENTION_SECONDS + 1
+    )
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda pid: pid == os.getpid())
+    expired_at = _RETENTION_NOW - _mod._ORPHAN_RETENTION_SECONDS - 1
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
-    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    live_marker = live_dir / "owner.pid"
+    live_marker.write_text(str(os.getpid()), encoding="utf-8")
+    os.utime(live_marker, (expired_at, expired_at))
 
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
 
-    pruned = _mod.prune_orphaned_bridge_dirs()
-
-    assert pruned == 1
+    assert _mod.prune_orphaned_bridge_dirs() == 1
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
