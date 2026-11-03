@@ -43,15 +43,11 @@ const gitWorkspace = vi.hoisted(() => ({
 vi.mock("@/hooks/useHostWorktrees", () => ({
   useHostWorktrees: (hostId: string | null, path: string | null) => {
     gitWorkspace.query(hostId, path);
-    return {
-      data:
-        hostId && path && gitWorkspace.available !== undefined
-          ? gitWorkspace.available
-            ? [{ path, branch: "main", is_main: true }]
-            : []
-          : undefined,
-      isFetching: gitWorkspace.checking,
-    };
+    let data: { path: string; branch: string; is_main: boolean }[] | undefined;
+    if (hostId && path && gitWorkspace.available !== undefined) {
+      data = gitWorkspace.available ? [{ path, branch: "main", is_main: true }] : [];
+    }
+    return { data, isFetching: gitWorkspace.checking };
   },
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
