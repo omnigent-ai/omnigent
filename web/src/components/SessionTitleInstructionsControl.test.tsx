@@ -123,6 +123,23 @@ describe("SessionTitleInstructionsControl", () => {
     expect(screen.getByTestId("session-title-instructions-save")).toBeEnabled();
   });
 
+  it("keeps Clear disabled while the draft has unsaved edits", async () => {
+    getMock.mockResolvedValue({ instructions: "Start with the ticket id.", max_chars: 4000 });
+    renderControl();
+    const input = await loadedInput();
+    const clear = screen.getByTestId("session-title-instructions-clear");
+    expect(clear).toBeEnabled();
+
+    fireEvent.change(input, { target: { value: "Use French titles." } });
+    expect(clear).toBeDisabled();
+    fireEvent.click(clear);
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Use French titles.");
+
+    fireEvent.change(input, { target: { value: "Start with the ticket id." } });
+    expect(clear).toBeEnabled();
+  });
+
   it("reports a failed load and retries", async () => {
     getMock.mockRejectedValueOnce(new Error("offline"));
     renderControl();

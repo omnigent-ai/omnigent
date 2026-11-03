@@ -92,12 +92,17 @@ def test_instructions_are_isolated_per_workspace(store: UserSettingsStore) -> No
         assert store.get_session_title_instructions(user_id=ALICE) == "Workspace one rule."
 
 
-def test_save_accepts_limit_and_rejects_longer(store: UserSettingsStore) -> None:
-    at_limit = "x" * SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
+@pytest.mark.parametrize(
+    "character",
+    [pytest.param("x", id="ascii"), pytest.param("\N{ROCKET}", id="four-byte")],
+)
+def test_save_accepts_limit_and_rejects_longer(store: UserSettingsStore, character: str) -> None:
+    at_limit = character * SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
     assert store.save_session_title_instructions(at_limit, user_id=ALICE) == at_limit
+    assert store.get_session_title_instructions(user_id=ALICE) == at_limit
 
     with pytest.raises(ValueError, match="exceed 4000 characters"):
-        store.save_session_title_instructions(at_limit + "x", user_id=ALICE)
+        store.save_session_title_instructions(at_limit + character, user_id=ALICE)
     assert store.get_session_title_instructions(user_id=ALICE) == at_limit
 
 
@@ -105,6 +110,7 @@ def test_save_accepts_limit_and_rejects_longer(store: UserSettingsStore) -> None
     "stored",
     [
         pytest.param(b"\x00\x07unknown codec", id="unknown-codec"),
+        pytest.param(b"\x00\x01not a zstd frame", id="corrupt-zstd"),
         pytest.param(b"\xff\xfe not utf-8", id="invalid-utf8"),
         pytest.param(b"x" * (SESSION_TITLE_INSTRUCTIONS_MAX_CHARS + 1), id="over-limit"),
         pytest.param(b"   ", id="blank"),

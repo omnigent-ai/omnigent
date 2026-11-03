@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import io
-import json
-import tarfile
 import uuid
 
 import httpx
 import yaml
+
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 CLAUDE_SDK_TEST_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_SDK_TEST_CONTEXT_WINDOW = 200_000
@@ -30,13 +29,7 @@ def build_claude_sdk_bundle(name: str, mock_llm_server_url: str) -> bytes:
             },
         },
     }
-    with io.BytesIO() as buf:
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            yaml_bytes = yaml.safe_dump(config, sort_keys=False).encode()
-            info = tarfile.TarInfo(f"{name}.yaml")
-            info.size = len(yaml_bytes)
-            tar.addfile(info, io.BytesIO(yaml_bytes))
-        return buf.getvalue()
+    return bundle_files({f"{name}.yaml": yaml.safe_dump(config, sort_keys=False).encode()})
 
 
 def create_claude_sdk_session(
@@ -48,19 +41,13 @@ def create_claude_sdk_session(
 ) -> tuple[str, str]:
     """Create a session bound to ``runner_id``; return its id and unique agent name."""
     name = f"{name_prefix}-{uuid.uuid4().hex[:8]}"
-    bundle = build_claude_sdk_bundle(name, mock_llm_server_url)
-    create_resp = httpx.post(
+    create_resp = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        build_claude_sdk_bundle(name, mock_llm_server_url),
         timeout=30.0,
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id, name

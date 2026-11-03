@@ -130,7 +130,8 @@ export function SessionTitleInstructionsControl() {
             <Button
               variant="ghost"
               size="sm"
-              disabled={saving}
+              // Clearing would also discard the unsaved draft.
+              disabled={saving || dirty}
               onClick={() => void persist(null)}
               data-testid="session-title-instructions-clear"
               componentId="settings.general.session_title_instructions.clear"
