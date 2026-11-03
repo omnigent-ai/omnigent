@@ -4526,7 +4526,7 @@ describe("AppShell clone/fork action", () => {
     expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
   });
 
-  it("offers directory recovery for an Arclet session onto every destination", () => {
+  it("offers directory recovery for an Arclet session onto a connected host", () => {
     mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
     useSessionMock.mockReturnValue({
       session: sessionSnapshot({
@@ -4538,18 +4538,23 @@ describe("AppShell clone/fork action", () => {
       isLoading: false,
       error: null,
     });
-    useHostsMock.mockReturnValue({
-      data: [
-        {
-          host_id: "host_arclet",
-          name: "Arclet",
-          owner: "owner",
-          status: "online",
-          sandbox_provider: "arclet",
-        },
-        { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
-      ],
-    } as ReturnType<typeof useHosts>);
+    const hosts = [
+      {
+        host_id: "host_arclet",
+        name: "Arclet",
+        owner: "owner",
+        status: "online",
+        sandbox_provider: "arclet",
+      },
+      { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
+    ];
+    // Pickers never see server-managed sandbox hosts, as in fetchHosts.
+    useHostsMock.mockImplementation(
+      (options) =>
+        ({
+          data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        }) as ReturnType<typeof useHosts>,
+    );
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       sessionShellTree(
@@ -4566,6 +4571,13 @@ describe("AppShell clone/fork action", () => {
     fireEvent.click(recover);
     expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
     expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+    const hostSelect = screen.getByTestId("fork-session-host-select");
+    fireEvent.pointerDown(hostSelect, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostSelect);
+    // Recovery continues in an existing directory, so it offers connected hosts only.
+    expect(screen.getByTestId("fork-session-host-option-host_laptop")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-option-host_arclet")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
     expect(forkSessionMock).not.toHaveBeenCalled();
   });
 

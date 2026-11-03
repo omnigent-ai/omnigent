@@ -115,8 +115,15 @@ function host(overrides: Partial<Host> = {}): Host {
   } as Host;
 }
 
+// Mirrors fetchHosts: pickers never see server-managed sandbox hosts; only
+// includeSandbox callers (the action-restrictions lookup) do.
 function setHosts(hosts: Host[]): void {
-  useHostsMock.mockReturnValue({ data: hosts } as ReturnType<typeof useHosts>);
+  useHostsMock.mockImplementation(
+    (options) =>
+      ({
+        data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+      }) as ReturnType<typeof useHosts>,
+  );
 }
 
 // Source session runs claude-sdk (anthropic). The picker should keep all
@@ -341,6 +348,10 @@ describe("ForkSessionDialog", () => {
     expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     openHostSelect();
     expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
+    // A source's own sandbox host is never offered as an existing destination.
+    if (provider !== null) {
+      expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+    }
     expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
   });
@@ -2096,7 +2107,7 @@ describe("ForkSessionDialog", () => {
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      // The source Arclet is not a target, but another machine is.
+      // The source Arclet is filtered from the picker; another machine is a target.
       setHosts([host({ sandbox_provider: "arclet" }), host({ host_id: "host_2", name: "laptop" })]);
       forkSessionMock.mockResolvedValue({
         id: "conv_fork",
@@ -2110,6 +2121,7 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
       openHostSelect();
       expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
       expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
@@ -2130,6 +2142,78 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).not.toHaveBeenCalled();
       expect(checkHostDirectoryMock).not.toHaveBeenCalled();
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    });
+
+    it("forks a Databricks Sandbox source onto a connected host and starts it there", async () => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_1", labels: { "omnigent.host_type": "managed" } },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      setHosts([
+        host({ sandbox_provider: "lakebox" }),
+        host({ host_id: "host_2", name: "laptop" }),
+      ]);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox"] },
+      });
+
+      // The source sandbox isn't a connected host, so the laptop is the default target.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("laptop");
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/project" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toBeUndefined();
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_2",
+        "conv_fork",
+        "/Users/a/project",
+        undefined,
+      );
+    });
+
+    it("forks an Arclet source onto another sandbox provider", async () => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_1",
+          labels: {
+            "omnigent.host_type": "managed",
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      setHosts([host({ sandbox_provider: "arclet" })]);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      });
+
+      await act(async () => {});
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
+      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await act(async () => {});
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+        provider: "lakebox",
+        workspaces: ["https://github.com/databricks-eng/universe"],
+      });
+      expect(launchRunnerMock).not.toHaveBeenCalled();
     });
 
     it.each([true, false])(

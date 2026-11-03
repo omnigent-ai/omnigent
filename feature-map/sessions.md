@@ -415,15 +415,19 @@ devices fold some row controls into the menu.
 **Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
-labelled `omnigent.host_type: managed` fork the same way. The composer's host
+labelled `omnigent.host_type: managed` fork the same way. The source's own
+sandbox host is never listed, since pickers show connected hosts only.
+**Continue in another directory…** on these sessions continues on a connected
+host; like any recovery, it never offers a new sandbox. The composer's host
 menu shows a disabled **Switch host…** item when you have write access.
 Read-only viewers retain the existing host menu without switching controls.
 Hover or focus a disabled action to read why it is unsupported.
 The reconnect dialog also disables Switch host, and Clone wherever Fork is
 disabled; directory selection cannot enable either action.
-While support is being checked, actions stay disabled. If that check fails,
-the explanation asks you to reload. A missing source-host record keeps switching
-disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
+While support is being checked, actions stay disabled: Fork waits only for the
+session snapshot, and Switch host also waits for the source host record. If a
+check fails, the explanation asks you to reload. A missing or failed source-host
+lookup keeps switching disabled while the session stays forkable. Direct dialogs show a loading status without
 an action button until the check finishes; supported forms then receive keyboard focus.
 If the reconnect dialog is already on Clone when an unsupported result arrives,
 it selects Reconnect and explains the restriction.
@@ -1056,8 +1060,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - Forking copies files and images into the new session. After a fork, open the
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
-- Databricks Sandbox, Arclet, and managed sources fork to any destination,
-  including shared sessions. Verify a managed sandbox fork with
+- Databricks Sandbox, Arclet, and managed sources fork to connected hosts and
+  every offered sandbox provider, including shared sessions. Workspace
+  recovery offers connected hosts only. Verify a managed sandbox fork with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the

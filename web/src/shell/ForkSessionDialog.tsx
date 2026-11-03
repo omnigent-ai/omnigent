@@ -1808,32 +1808,30 @@ function SupportedForkSessionForm({
                 {/* A sandbox is a usable target, so no dead-end even with no
                     host online: offer connecting one as a collapsed, optional
                     step rather than an alarming "no hosts connected" banner. */}
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setShowConnect((v) => !v)}
-                    className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                    data-testid="fork-session-connect-host-toggle"
-                  >
-                    {showConnect ? (
-                      <ChevronUpIcon className="size-3.5" />
-                    ) : (
-                      <ChevronDownIcon className="size-3.5" />
-                    )}
-                    {onlineHosts.length === 0
-                      ? "Connect a host from your terminal"
-                      : "Connect another host from your terminal"}
-                  </button>
-                  {showConnect && (
-                    <ConnectHostInstructions
-                      serverUrl={serverUrl}
-                      onSshConnected={(hostId) => {
-                        setShowConnect(false);
-                        selectHost(hostId);
-                      }}
-                    />
+                <button
+                  type="button"
+                  onClick={() => setShowConnect((v) => !v)}
+                  className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                  data-testid="fork-session-connect-host-toggle"
+                >
+                  {showConnect ? (
+                    <ChevronUpIcon className="size-3.5" />
+                  ) : (
+                    <ChevronDownIcon className="size-3.5" />
                   )}
-                </>
+                  {onlineHosts.length === 0
+                    ? "Connect a host from your terminal"
+                    : "Connect another host from your terminal"}
+                </button>
+                {showConnect && (
+                  <ConnectHostInstructions
+                    serverUrl={serverUrl}
+                    onSshConnected={(hostId) => {
+                      setShowConnect(false);
+                      selectHost(hostId);
+                    }}
+                  />
+                )}
               </>
             )}
             <ForkFieldError message={fieldError("host")} />
