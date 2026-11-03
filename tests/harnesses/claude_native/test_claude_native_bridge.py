@@ -16380,15 +16380,24 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
 
 
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (
+            "Welcome\n\n\x1b[31m! Plugin dev mode is active\x1b[0m\n",
+            " Last terminal output:\nWelcome\n! Plugin dev mode is active",
+        ),
+        (
+            "Authorization: Bearer dapi" + "x" * 32,
+            " Last terminal output:\nAuthorization: [REDACTED]",
+        ),
+    ],
+    ids=["terminal-escapes", "credential-redaction"],
+)
 def test_claude_pane_failure_tail_ends_like_other_readiness_failures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: str
 ) -> None:
-    """The not-ready reply ends with the terminal-output block other refusals use.
-
-    Failure on main: the helper does not exist, so a not-ready model switch has
-    no pane text to name.
-    """
-    pane = "Welcome\n\n! Plugin dev mode is active\n   \n"
+    """The standard failure block redacts terminal escapes and credential values."""
     monkeypatch.setattr(
         claude_native_bridge,
         "_read_json_file",
@@ -16396,9 +16405,7 @@ def test_claude_pane_failure_tail_ends_like_other_readiness_failures(
     )
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _socket, _target: pane)
 
-    assert claude_native_bridge.claude_pane_failure_tail(tmp_path) == (
-        " Last terminal output:\nWelcome\n! Plugin dev mode is active"
-    )
+    assert claude_native_bridge.claude_pane_failure_tail(tmp_path) == expected
 
 
 def test_claude_pane_failure_tail_is_empty_without_an_advertised_pane(

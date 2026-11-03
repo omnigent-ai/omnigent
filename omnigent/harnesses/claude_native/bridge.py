@@ -87,6 +87,7 @@ from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     launcher_install_prompt,
     launcher_password_prompt,
+    sanitize_diagnostic_text,
     sign_in_next_step,
     sign_in_running_elsewhere,
 )
@@ -6097,7 +6098,9 @@ def claude_pane_failure_tail(bridge_dir: Path) -> str:
     tmux_target = payload.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return ""
-    return _format_terminal_failure_tail(_capture_pane(socket_path, tmux_target))
+    return _format_terminal_failure_tail(
+        sanitize_diagnostic_text(_capture_pane(socket_path, tmux_target))
+    )
 
 
 def claude_pane_text_ready(pane: str) -> bool:
