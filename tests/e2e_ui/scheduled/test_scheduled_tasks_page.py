@@ -673,13 +673,7 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     page: Page,
     live_server: str,
 ) -> None:
-    """The Model/Effort row shows for Claude Code, both reading 'Default'.
-
-    Claude Code carries the ``permissionMode`` capability the dialog gates the
-    model/effort surface on, so opening the create dialog (which defaults to
-    Claude Code) renders ``task-model-effort-row`` with both the model and
-    effort triggers defaulting to the "Default" sentinel — nothing overridden.
-    """
+    """Claude Code offers model, effort, and permission settings with no overrides."""
     _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
@@ -695,28 +689,23 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     expect(permission_trigger).to_have_text("Default")
 
 
-def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
+@pytest.mark.parametrize(
+    ("agent_name", "has_settings"),
+    [("codex-native-ui", True), ("hello_world", False)],
+)
+def test_scheduled_task_settings_follow_harness_capabilities(
     page: Page,
     live_server: str,
+    agent_name: str,
+    has_settings: bool,
 ) -> None:
-    """The Model/Effort row is hidden for a non-capable agent, with the hint.
-
-    The e2e server seeds the built-in ``codex-native-ui`` ("Codex") agent, which
-    carries ``approvalMode`` — NOT the ``permissionMode`` capability the
-    model/effort surface is gated on. Rather than drive the create-dialog agent
-    picker into Codex (it can fold into a hover-only "More" submenu when the host
-    reports it unconfigured, which is fragile to click), we SEED a task against
-    the Codex agent and open its EDIT dialog: the row gates on the selected
-    agent, which edit mode seeds from the loaded task, so the row must be absent
-    and the "uses defaults" helper hint shown instead. (Chosen because the e2e
-    server does register Codex; the seeded-edit path is the deterministic way to
-    exercise the hidden branch.)
-    """
-    codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
-    _create_task(live_server, codex_agent_id, "Codex daily", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+    """Codex exposes model/permission settings; a plain SDK agent uses its defaults."""
+    agent_id = _builtin_agent_id(live_server, agent_name)
+    task_name = f"{agent_name} daily"
+    _create_task(live_server, agent_id, task_name, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
 
     _open_automations_page(page, live_server)
-    row = _row_by_name(page, "Codex daily")
+    row = _row_by_name(page, task_name)
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
     row.get_by_test_id("task-row-menu").click()
@@ -724,52 +713,51 @@ def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
-    # Capability gate off → the row is never rendered (nor the permission
-    # control), and the "uses defaults" helper hint stands in for it.
-    expect(page.get_by_test_id("task-model-effort-row")).to_be_hidden()
-    expect(page.get_by_test_id("task-permission-control")).to_be_hidden()
-    expect(dialog.get_by_text("Uses this agent")).to_be_visible()
+    if has_settings:
+        expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
+        expect(page.get_by_test_id("task-permission-control")).to_be_visible()
+        expect(page.get_by_test_id("task-model-trigger")).to_have_text("Default")
+        expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Default")
+    else:
+        expect(page.get_by_test_id("task-model-effort-row")).to_be_hidden()
+        expect(page.get_by_test_id("task-permission-control")).to_be_hidden()
+        expect(dialog.get_by_text("Uses this agent")).to_be_visible()
+    # With no pinned host/catalog, Codex cannot advertise model-specific efforts.
+    expect(page.get_by_test_id("task-effort-control")).to_be_hidden()
 
 
 def test_scheduled_task_create_persists_model_and_effort(
     page: Page,
     live_server: str,
-    online_host: Host,
+    claude_ready_host: Host,
 ) -> None:
-    """Picking a concrete Model + Effort on create persists both via the API.
-
-    Opens the create dialog on Claude Code, picks Opus + High through the
-    ``task-model-trigger`` / ``task-effort-trigger`` selects, submits, then reads
-    the created row back from ``GET /v1/scheduled-tasks`` and asserts its
-    ``model_override`` / ``reasoning_effort`` are the persisted picks (asserting
-    the server-side values is more robust than re-reading the row text). The
-    task pins the host, so Opus is that host's Claude Code option of that name,
-    and High is the ``"high"`` effort; a pick sends the option's id verbatim.
-    """
+    """Persist a model from the host's actual catalog and an explicit effort."""
     _open_automations_page(page, live_server)
-    # Until the host's options load, the picker shows the static aliases.
-    with page.expect_response(lambda r: r.url.endswith("/harnesses/claude-native/model-options")):
+    catalog_url = (
+        f"{live_server}/v1/hosts/{claude_ready_host.host_id}/harnesses/claude-native/model-options"
+    )
+    with page.expect_response(catalog_url) as catalog_response:
         _open_create_dialog(page)
+    response = catalog_response.value
+    assert response.ok, response.text()
+    options = response.json()["models"]
+    assert options, "The configured mock host must expose a model"
+    selected_model = options[0]
+    model_label = selected_model.get("displayName") or selected_model["id"]
 
     page.get_by_test_id("task-name-input").fill("Model effort create")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    _pick_select_option(page, "task-model-trigger", "Opus")
+    _pick_select_option(page, "task-model-trigger", model_label)
     _pick_select_option(page, "task-effort-trigger", "High")
-    expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
+    expect(page.get_by_test_id("task-model-trigger")).to_have_text(model_label)
     expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
-    # The row renders once the create resolves; assert the persisted API values.
     expect(_row_by_name(page, "Model effort create")).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == "Model effort create")
-    options = httpx.get(
-        f"{live_server}/v1/hosts/{online_host.host_id}/harnesses/claude-native/model-options",
-        timeout=30.0,
-    ).json()["models"]
-    opus = next(o["id"] for o in options if (o.get("displayName") or o["id"]) == "Opus")
-    assert created["host_id"] == online_host.host_id, created
-    assert created["model_override"] == opus, created
+    assert created["host_id"] == claude_ready_host.host_id, created
+    assert created["model_override"] == selected_model["id"], created
     assert created["reasoning_effort"] == "high", created
 
 
@@ -1013,7 +1001,7 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     live_server: str,
     entry: str,
 ) -> None:
-    """Gallery and empty-state preview save the same hourly continuing task."""
+    """Gallery and preview save a task and keep suggestions available afterward."""
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     _open_automations_page(page, live_server)
     if entry == "templates":
@@ -1074,3 +1062,6 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     assert created["rrule"].startswith("FREQ=HOURLY"), created
     # The prompt's details are covered by the dialog and renderer tests.
     assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
+    expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
+    page.get_by_test_id("suggestion-trigger-slack").click()
+    expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
