@@ -837,6 +837,42 @@ def _terminal_view(name: str, terminal_id: str = "terminal_goose_main") -> Sessi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_attempts"),
+    [
+        ("thread 019e already has an active writer", 2),
+        ("thread-store internal error: failed to read thread", 1),
+    ],
+    ids=["active_writer_retried", "other_refusal_raised"],
+)
+async def test_launch_codex_retries_once_when_another_writer_holds_the_thread(
+    monkeypatch: pytest.MonkeyPatch, message: str, expected_attempts: int
+) -> None:
+    """A resume refused by a racing app-server is retried once; other refusals raise."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.runner.native import orchestration
+
+    attempts: list[str] = []
+    created = _terminal_view("codex", terminal_id="terminal_codex_main")
+
+    async def _fake_create(session_id: str, *_args: object, **_kwargs: object) -> object:
+        attempts.append(session_id)
+        if len(attempts) == 1:
+            raise CodexAppServerResponseError({"code": -32600, "message": message})
+        return created
+
+    monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", _fake_create)
+    ctx = _ensure_ctx(_FakeEnsureRegistry())
+
+    if expected_attempts == 2:
+        assert await orchestration._launch_codex(ctx) is created
+    else:
+        with pytest.raises(CodexAppServerResponseError):
+            await orchestration._launch_codex(ctx)
+    assert attempts == ["conv_e"] * expected_attempts
+
+
+@pytest.mark.asyncio
 async def test_ensure_native_terminal_returns_existing_without_creating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
