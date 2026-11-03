@@ -3845,7 +3845,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         );
         const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
         return {
-          blocks: [...unique, ...state.blocks],
+          blocks: [...unique, ...withoutPersistedStatusErrors(state.blocks, unique)],
           hasMoreHistory: hasMore,
           oldestItemId: items[0]?.id ?? state.oldestItemId,
           loadingMoreHistory: false,

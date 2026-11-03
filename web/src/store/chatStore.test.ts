@@ -15955,6 +15955,67 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("drops a status-only failure card when scroll-up loads its persisted error", async () => {
+    const preGap = Array.from({ length: 30 }, (_, i) => gapUser("spre", i));
+    const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+    seedSession("conv_scroll_err", preGap);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const failure = { code: "startup_input_failed", message: "The message could not be delivered" };
+    const statusError: ErrorBlock = {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "startup_y", itemId: null },
+      source: "",
+      ...failure,
+      fromSessionStatus: true,
+    };
+    useChatStore.setState({
+      conversationId: "conv_scroll_err",
+      abortController: controller,
+      blocks: [...itemsToBlocks(windowItems), statusError],
+      hasMoreHistory: true,
+      oldestItemId: windowItems[0]!.id,
+    });
+
+    const loop = startStreamPump("conv_scroll_err", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The persisted error is older than the newest window the re-hydrate keeps.
+    const persistedError: ConversationItem = {
+      id: "err_startup_y",
+      response_id: "startup_y",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      ...failure,
+    };
+    const gap = Array.from({ length: 100 }, (_, i) => gapUser("sgap", i));
+    seedSessionItems("conv_scroll_err", [...preGap, persistedError, ...gap]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    const errorsOf = () =>
+      useChatStore.getState().blocks.filter((b): b is ErrorBlock => b.type === "error");
+    expect(errorsOf().map((b) => b.fromSessionStatus)).toEqual([true]);
+
+    /* oxlint-disable no-await-in-loop */
+    while (useChatStore.getState().hasMoreHistory) {
+      await useChatStore.getState().loadMoreHistory();
+      await drainAsync(2);
+    }
+    /* oxlint-enable no-await-in-loop */
+    const errors = errorsOf();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ ...failure, ctx: { itemId: persistedError.id } });
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   /** A native message-scoped live delta frame (`message_id` + chunk index). */
   function nativeDeltaFrame(messageId: string, index: number, delta: string): string {
     return sse("response.output_text.delta", { delta, message_id: messageId, index });
