@@ -44,6 +44,7 @@ import queue
 import re
 import secrets
 import select
+import selectors
 import shlex
 import socket
 import socketserver
@@ -7960,8 +7961,7 @@ def _tool_relay_handler_factory(
                 nonlocal last_heartbeat
                 if closed is not None and closed.is_set():
                     raise ConnectionAbortedError("Omnigent tool relay closed")
-                readable, _, _ = select.select([self.connection], [], [], 0)
-                if readable:
+                if connection_monitor.select(0):
                     raise ConnectionAbortedError("Omnigent tool caller disconnected")
                 now = time.monotonic()
                 if now - last_heartbeat >= _TOOL_RELAY_HEARTBEAT_S:
@@ -7969,7 +7969,8 @@ def _tool_relay_handler_factory(
                     self.wfile.flush()
                     last_heartbeat = now
 
-            with mutation:
+            with mutation, selectors.DefaultSelector() as connection_monitor:
+                connection_monitor.register(self.connection, selectors.EVENT_READ)
                 result = _run_relay_tool(
                     tool_executor, loop, name, arguments, keep_alive=keep_alive
                 )
@@ -8593,11 +8594,8 @@ def _handle_and_write_mcp_request(
     :param request_slots: Concurrency slot released after the response.
     :returns: None after the response is written.
     """
-    # A request failure must not tear down the long-lived MCP server.
-    # Heartbeat only relay-routed calls: execution and approval each have
-    # their own bounded budget. A hung LOCAL tool
-    # must stay killable by the client's static timeout, so it gets no
-    # heartbeat that would reset that deadline forever.
+    # Heartbeat relay calls only: execution and approval waits are bounded.
+    # A hung local tool must stay killable by the client's static timeout.
     progress_token = (
         _extract_progress_token(params)
         if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
@@ -8839,6 +8837,10 @@ def _call_relay_tool(
                     if line.strip():
                         raw = line.decode("utf-8")
                         break
+                else:
+                    raise ConnectionError(
+                        "Omnigent tool relay closed before delivering its result"
+                    )
             else:
                 raw = resp.read().decode("utf-8")
     # ``OSError`` (the base of ``error.URLError``) also covers the bare
@@ -8857,9 +8859,15 @@ def _call_relay_tool(
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:
-        return _mcp_error("Omnigent tool relay returned malformed JSON")
+        return _mcp_error(
+            "Omnigent tool relay returned malformed JSON. Completion is unknown; "
+            "check the affected state before retrying."
+        )
     if not isinstance(decoded, dict):
-        return _mcp_error("Omnigent tool relay returned non-object JSON")
+        return _mcp_error(
+            "Omnigent tool relay returned non-object JSON. Completion is unknown; "
+            "check the affected state before retrying."
+        )
     return decoded
 
 

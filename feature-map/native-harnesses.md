@@ -1131,6 +1131,15 @@ and cancelled approvals must no longer be actionable. Repeat the request from
 the native terminal and answer the same approval in Chat or Inbox. Remove the
 throwaway automation afterward. The 30-second save-request timeout is unchanged.
 
+The native client's own deadline must exceed the wait being tested. Codex 0.166.0
+has a separate 300-second MCP deadline that does not extend with relay progress.
+For a bounded before/after demo, launch both revisions with
+`-c mcp_servers.omnigent.tool_timeout_sec=600` and leave approval pending for
+345 seconds. This isolates the relay's unchanged 300-second execution budget;
+it does not prove the default Codex client can wait for a full approval day.
+With the default client deadline, cancellation must clear the approval without
+creating the automation. Record the client configuration with the evidence.
+
 ## Gotchas
 
 - Relay approval waits retain one pending request slot. Vendor clients that do not

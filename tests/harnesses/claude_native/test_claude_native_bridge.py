@@ -7308,6 +7308,39 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     assert "failed to call Omnigent tool relay" in error_text
 
 
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (b"", "closed before delivering its result"),
+        (b"\n \n", "closed before delivering its result"),
+        (b'{"content":', "malformed JSON"),
+        (b"[]", "non-object JSON"),
+    ],
+)
+def test_call_relay_tool_reports_unknown_completion_for_incomplete_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes, reason: str
+) -> None:
+    """An HTTP success without a final result cannot establish mutation failure."""
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"X-Omnigent-Relay-Heartbeat": "1"}
+
+    claude_native_bridge._write_json_file(
+        tmp_path / claude_native_bridge._TOOL_RELAY_FILE,
+        {"url": "http://127.0.0.1:12345", "token": "test-token"},
+    )
+    monkeypatch.setattr(
+        claude_native_bridge.request, "urlopen", lambda *_args, **_kwargs: Response(payload)
+    )
+    result = claude_native_bridge._call_relay_tool(tmp_path, "sys_scheduled_task_create", {})
+    assert result["isError"]
+    message = json.loads(result["content"][0]["text"])["error"]
+    assert "Completion is unknown" in message
+    assert "check the affected state before retrying" in message
+    assert reason in message
+
+
 @pytest.mark.asyncio
 async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     tmp_path: Path,
@@ -16642,3 +16675,62 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_relay_keeps_high_descriptor_connections_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid connection above select's fd limit stays pending and completes."""
+    fcntl = pytest.importorskip("fcntl")
+    resource = pytest.importorskip("resource")
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        pytest.skip("requires an available descriptor above 1023")
+    original_get_request = ThreadingHTTPServer.get_request
+    descriptors: list[int] = []
+
+    def high_descriptor_request(server):
+        connection, address = original_get_request(server)
+        try:
+            descriptor = fcntl.fcntl(connection, fcntl.F_DUPFD, 1024)
+        finally:
+            connection.close()
+        descriptors.append(descriptor)
+        return socket.socket(fileno=descriptor), address
+
+    monkeypatch.setattr(ThreadingHTTPServer, "get_request", high_descriptor_request)
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def executor(name, arguments):
+        started.set()
+        try:
+            await release.wait()
+            return {"completed": True}
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    bridge_dir = prepare_bridge_dir("conv_high_descriptor", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_custom"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    call = asyncio.create_task(
+        asyncio.to_thread(claude_native_bridge._call_relay_tool, bridge_dir, "sys_custom", {})
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(call), 0.15)
+        assert descriptors and descriptors[0] >= 1024
+        assert not cancelled.is_set()
+        release.set()
+        result = await asyncio.wait_for(call, 2)
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"completed": True}
+    finally:
+        release.set()
+        await asyncio.wait_for(call, 2)
+        relay.close()
