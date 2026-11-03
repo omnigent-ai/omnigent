@@ -262,7 +262,7 @@ import {
 } from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
-import { MainTerminalView } from "@/shell/MainTerminalView";
+import { MainTerminalView, TerminalRecoveryScope } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
@@ -1725,23 +1725,33 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // client whose size can resize a window the user also has open elsewhere.
   return (
     <>
-      {showTerminal && conversationId && (
-        <div key={conversationId} className="absolute inset-0 flex flex-col">
-          <MainTerminalView
-            conversationId={conversationId}
-            initialTerminalKey={terminalFirst?.terminalViewKey}
-            runnerOnline={runnerOnline}
-            lastTaskError={lastTaskError}
-            onResume={handleTerminalResume}
-            sandboxOffline={liveness.kind === "host_asleep"}
-            onSurfaceElement={setTerminalSurfaceEl}
-            // Non-owners attach read-only: a shared PTY can't attribute input
-            // per-user, so only the owner may type. Server enforces this too.
-            readOnly={!isOwnerLevel(permissionLevel)}
-            splittable
-          />
-          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
-        </div>
+      {conversationId && isTerminalFirst && (
+        <TerminalRecoveryScope
+          key={conversationId}
+          conversationId={conversationId}
+          shown={showTerminal}
+          runnerOnline={runnerOnline}
+        >
+          {(recovery) => (
+            <div className="absolute inset-0 flex flex-col">
+              <MainTerminalView
+                conversationId={conversationId}
+                initialTerminalKey={terminalFirst?.terminalViewKey}
+                runnerOnline={runnerOnline}
+                lastTaskError={lastTaskError}
+                onResume={handleTerminalResume}
+                sandboxOffline={liveness.kind === "host_asleep"}
+                onSurfaceElement={setTerminalSurfaceEl}
+                // Non-owners attach read-only: a shared PTY can't attribute input
+                // per-user, so only the owner may type. Server enforces this too.
+                readOnly={!isOwnerLevel(permissionLevel)}
+                splittable
+                recovery={recovery}
+              />
+              <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+            </div>
+          )}
+        </TerminalRecoveryScope>
       )}
       {!showTerminal && (
         <>

@@ -167,7 +167,7 @@ def test_terminal_view_recovers_on_open(
             expect(resume).to_be_enabled()
             expect(terminal.get_by_role("alert")).to_be_visible()
             assert len(pending) == 1
-            if entry == "grid":
+            if not cached_terminal:
                 surface.get_by_role("button", name="Chat view", exact=True).click()
                 surface.get_by_role("button", name="Terminal view", exact=True).click()
                 expect(terminal.get_by_role("alert")).to_be_visible()
