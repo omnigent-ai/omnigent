@@ -9,6 +9,7 @@ transport (shared with the claude-sdk ``/clear`` tests).
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import httpx
@@ -19,6 +20,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -288,6 +290,8 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
         ("claude-sdk", None, "runner", 400, "needs one of this session's prompts"),
         ("claude-sdk", 2, "none", 503, "runner is offline"),
         ("claude-sdk", 2, "running", 400, "Stop the current turn"),
+        # A message still on its way to the runner counts as a running turn.
+        ("claude-sdk", 2, "starting", 400, "Stop the current turn"),
         ("claude-sdk", 2, "editor", 403, ""),
     ],
 )
@@ -327,11 +331,16 @@ async def test_rewind_refusals_create_no_session(
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
 
-    resp = await auth_client.post(
-        f"/v1/sessions/{source_id}/rewind",
-        json={"item_id": items[item_index] if item_index is not None else "msg_bogus"},
-        headers=headers,
-    )
+    with (
+        _mark_dispatch_in_flight(source_id)
+        if placement == "starting"
+        else contextlib.nullcontext()
+    ):
+        resp = await auth_client.post(
+            f"/v1/sessions/{source_id}/rewind",
+            json={"item_id": items[item_index] if item_index is not None else "msg_bogus"},
+            headers=headers,
+        )
 
     assert resp.status_code == status, resp.text
     assert message in resp.text
