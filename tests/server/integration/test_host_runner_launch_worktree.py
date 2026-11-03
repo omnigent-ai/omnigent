@@ -50,6 +50,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests.budgets import budget
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -244,7 +245,7 @@ async def register_host(
         conn.outbound_queue.put_nowait(None)
         task = conn._drain_task_for_test  # type: ignore[attr-defined]
         with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget(1.0))
         if not task.done():
             task.cancel()
     for task in resolver_tasks:
@@ -379,10 +380,10 @@ async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     worktree_launch = asyncio.create_task(
         _launch(client, session_id, git={"branch_name": "feature/b"})
     )
-    await asyncio.wait_for(cap.create_started.wait(), timeout=1.0)
+    await asyncio.wait_for(cap.create_started.wait(), timeout=budget(1.0))
 
     source_launch = asyncio.create_task(_launch(client, session_id, git=None))
-    await asyncio.wait_for(source_harness_resolved.wait(), timeout=1.0)
+    await asyncio.wait_for(source_harness_resolved.wait(), timeout=budget(1.0))
     create_gate.set()
 
     worktree_response, source_response = await asyncio.gather(worktree_launch, source_launch)
@@ -411,7 +412,7 @@ async def test_cancellation_waits_for_host_binding_before_rollback(
 
     def _delayed_set_host_id(*args: Any, **kwargs: Any) -> Any:
         bind_started.set()
-        assert release_bind.wait(timeout=2.0)
+        assert release_bind.wait(timeout=budget(2.0))
         return original_set_host_id(*args, **kwargs)
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "set_host_id", _delayed_set_host_id)
@@ -421,13 +422,13 @@ async def test_cancellation_waits_for_host_binding_before_rollback(
     launch_task = asyncio.create_task(
         _launch(client, session_id, git={"branch_name": "feature/cancel"})
     )
-    assert await asyncio.to_thread(bind_started.wait, 2.0)
+    assert await asyncio.to_thread(bind_started.wait, budget(2.0))
     launch_task.cancel()
     release_bind.set()
     with pytest.raises(asyncio.CancelledError):
         _ = await launch_task
 
-    await asyncio.wait_for(cap.remove_started.wait(), timeout=1.0)
+    await asyncio.wait_for(cap.remove_started.wait(), timeout=budget(1.0))
     assert len(cap.remove) == 1
     assert cap.launch == []
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)

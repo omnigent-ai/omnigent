@@ -41,11 +41,12 @@ description: >-
   extends tests when sufficient, keeping e2e coverage for distinct production
   boundaries, then records each settled facet on its user-facing surface (a
   pytest-playwright --video run for web/terminal facets, a VHS tape for CLI
-  facets) — a reproduced facet as before-fix footage, an already-fixed facet as
-  proof-it-works footage. Reproducing is its job, so its session,
-  logs, and recordings are outputs it produces. It does not fix the bug or run
-  a fix proof — it hands off the reproduction (its session: journey, reproduction tests,
-  recordings, root-cause leads) to a fix step. It does not merge or push.
+  facets) — a reproduced or likely-reproduced facet as before-fix footage, an
+  already-fixed facet as proof-it-works footage. Reproducing is its job, so its
+  session, logs, and recordings are outputs it produces. It does not fix the bug
+  or run a fix proof — it hands off the reproduction (its session: journey,
+  reproduction tests, recordings, root-cause leads) to a fix step. It does not
+  merge or push.
 
 # Runs on the Claude Agent SDK. No model is pinned, so the configured provider's
 # default model is used. The large context window holds the bug report, the app

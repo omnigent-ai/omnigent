@@ -482,6 +482,85 @@ describe("AssistantBubble error retry", () => {
   });
 });
 
+describe("AssistantBubble error-only role", () => {
+  // The reconnect journey counts [data-role="assistant"] bubbles as Claude
+  // replies. An undelivered-message notice is a standalone error item with no
+  // prose, so it must not carry the assistant role and inflate that count.
+  it("tags an undelivered-message notice as an error bubble, not an assistant reply", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_undelivered",
+            stableId: "undelivered_notice",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              {
+                kind: "error",
+                itemId: "undelivered_notice",
+                message: "Message not delivered. Try sending it again.",
+                source: "runtime",
+                code: "native_prompt_not_recorded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "error");
+    expect(bubble).toHaveTextContent("Message not delivered. Try sending it again.");
+  });
+
+  it.each<{ name: string; nonError: Extract<Bubble, { kind: "assistant" }>["items"][number] }>([
+    {
+      name: "a prose reply carrying a trailing error",
+      nonError: { kind: "text", itemId: "reply_text", text: "the answer is 42", final: true },
+    },
+    {
+      name: "a failed turn with reasoning but no prose",
+      nonError: {
+        kind: "reasoning",
+        itemId: "thinking",
+        text: "Weighing the options.",
+        duration: 1,
+      },
+    },
+  ])("keeps $name on the assistant role", ({ nonError }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_mixed_failure",
+            stableId: "mixed_failure",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              nonError,
+              {
+                kind: "error",
+                itemId: "mixed_error",
+                message: "API Error: Request rejected (429): rate limit",
+                source: "execution",
+                code: "rate_limit_exceeded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "assistant");
+  });
+});
+
 describe("AssistantBubble sealed side-chat recovery", () => {
   it("removes recovery actions when the side chat is sealed but keeps the error", () => {
     const view = render(

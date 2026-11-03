@@ -23,9 +23,10 @@ serves a newer Opus alongside the fallback target to hold that apart.
 
 This drives the real journey — register a claude-sdk agent on the mock
 gateway, create a runner-bound session (real ``claude`` CLI subprocess), send
-a turn the mock refuses — and asserts the fallback landed on the served Opus
-id (visible on the Anthropic wire via the mock's request capture) and the turn
-completed.
+a turn the mock refuses — and checks the Anthropic wire via the mock's request
+capture. Claude Code before 2.1.280 must re-issue on the served Opus id; from
+2.1.280 the CLI re-asks the refused model and leaves the model switch to the
+gateway. Either way only served ids reach the wire and the turn completes.
 
 Usage::
 
@@ -35,12 +36,15 @@ Usage::
 from __future__ import annotations
 
 import contextlib
+import subprocess
 import uuid
 
 import httpx
+import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.compat import release_tuple
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -63,6 +67,9 @@ _SERVED_FALLBACK_MODEL = "gw-claude-opus-4-8"
 # is the behavior under test. A gateway serving exactly this pair is where the
 # alias-only fix stopped working.
 _SERVED_NEWER_OPUS = "gw-claude-opus-5"
+# Claude Code 2.1.280 moved the refusal-fallback model switch to the server: the
+# CLI re-asks the refused model instead of re-issuing on Opus itself.
+_SERVER_MEDIATED_FALLBACK_SINCE = (2, 1, 280)
 _SERVED_MODELS = [
     _LAUNCH_MODEL,
     _SERVED_FALLBACK_MODEL,
@@ -110,84 +117,109 @@ def _register_claude_sdk_agent(
     return name
 
 
-def test_claude_sdk_refusal_fallback_routes_to_served_model(
-    http_client: httpx.Client,
-    live_runner_id: str,
-    isolated_mock_llm_server_url: str,
-) -> None:
-    """A safeguard refusal on claude-sdk falls back to the served Opus id.
+def _claude_code_version() -> tuple[int, ...]:
+    """Release tuple of the ``claude`` CLI the runner launches, e.g. ``(2, 1, 283)``."""
+    output = subprocess.check_output(["claude", "--version"], text=True)
+    return release_tuple(output.split()[0])
 
-    The mock refuses the launch-model (Fable) turn with a ``cyber`` refusal.
-    The gateway serves two Opus generations, so the ``opus`` alias points at the
-    newer one and cannot carry the fallback: Claude Code names the older
-    canonical id from its own route table. The canonical rewrites the fix
-    derives from the listing turn that id into the gateway's spelling, so the
-    turn re-issues on a served model and completes instead of dying on a
-    canonical id the gateway rejects.
+
+def _run_refused_turn(
+    http_client: httpx.Client, live_runner_id: str, mock_llm_url: str
+) -> tuple[list[object], dict]:
+    """Send one turn the mock refuses (``cyber``) and return the wire models and result.
+
+    The refusal is queued only for the launch model; every other request falls
+    through to the queue default (a plain text answer), so the turn can complete
+    once the CLI recovers on a served model.
     """
-    reset_mock_llm(isolated_mock_llm_server_url)
+    reset_mock_llm(mock_llm_url)
     # What the gateway serves: the executor lists this once per session and
     # pins each family alias to it.
-    set_mock_served_models(isolated_mock_llm_server_url, _SERVED_MODELS)
+    set_mock_served_models(mock_llm_url, _SERVED_MODELS)
     agent_name = _register_claude_sdk_agent(
         http_client,
         name=f"refusal-fb-{uuid.uuid4().hex[:6]}",
         model=_LAUNCH_MODEL,
-        mock_llm_base_url=isolated_mock_llm_server_url,
+        mock_llm_base_url=mock_llm_url,
     )
-    # The Fable turn is refused (cyber). The Opus re-issue and any preflight
-    # calls fall through to the queue default (a plain text answer), so the
-    # turn can complete once the fallback lands on a served model.
-    configure_mock_llm(
-        isolated_mock_llm_server_url,
-        [{"refusal_category": "cyber"}],
-        key=_LAUNCH_MODEL,
-    )
+    configure_mock_llm(mock_llm_url, [{"refusal_category": "cyber"}], key=_LAUNCH_MODEL)
     session_id = create_runner_bound_session(
         http_client, agent_name=agent_name, runner_id=live_runner_id
     )
     try:
         response_id = send_user_message_to_session(
-            http_client,
-            session_id=session_id,
-            content="Please greet me.",
+            http_client, session_id=session_id, content="Please greet me."
         )
         body = poll_session_until_terminal(
             http_client, session_id=session_id, response_id=response_id, timeout=180
         )
-
-        reqs = get_mock_requests(isolated_mock_llm_server_url)
-        wire_models = [req.get("model") for req in reqs]
-
-        # The launch turn ran on Fable and was refused — the precondition.
-        assert _LAUNCH_MODEL in wire_models, (
-            f"the launch model {_LAUNCH_MODEL!r} never reached the wire; "
-            f"models seen: {wire_models}"
-        )
-        # The refusal-fallback re-issued on the gateway's spelling of the older
-        # Opus its route table names. Without the canonical rewrites the CLI sends
-        # the bare canonical id, the gateway rejects it, and no such request lands.
-        assert _SERVED_FALLBACK_MODEL in wire_models, (
-            f"the refusal-fallback did not re-issue on the served Opus id "
-            f"{_SERVED_FALLBACK_MODEL!r} — the canonical id Claude Code names was "
-            f"not rewritten to this gateway's spelling, so the fallback request "
-            f"named a model the gateway rejects. Models seen: {wire_models}"
-        )
-        # No canonical spelling ever reached the wire: the rewrite happened before
-        # the request, rather than the gateway happening to tolerate a vendor id.
-        canonical_leaks = [
-            model
-            for model in wire_models
-            if isinstance(model, str) and model.startswith("claude-")
-        ]
-        assert not canonical_leaks, (
-            f"canonical vendor ids reached the gateway unrewritten: {canonical_leaks}"
-        )
-        # And the turn completed rather than dying with the model_not_found error.
-        assert body["status"] == "completed", (
-            f"the turn did not complete after the refusal-fallback: "
-            f"status={body['status']!r} error={body.get('error')!r}"
-        )
+        wire_models = [req.get("model") for req in get_mock_requests(mock_llm_url)]
     finally:
         with contextlib.suppress(httpx.HTTPError):
             http_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
+    return wire_models, body
+
+
+def _assert_recovered_on_served_ids(wire_models: list[object], body: dict) -> None:
+    """The refused turn completed and no canonical vendor id reached the gateway."""
+    assert _LAUNCH_MODEL in wire_models, (
+        f"the launch model {_LAUNCH_MODEL!r} never reached the wire; models seen: {wire_models}"
+    )
+    canonical_leaks = [
+        model for model in wire_models if isinstance(model, str) and model.startswith("claude-")
+    ]
+    assert not canonical_leaks, (
+        f"canonical vendor ids reached the gateway unrewritten: {canonical_leaks}"
+    )
+    assert body["status"] == "completed", (
+        f"the turn did not complete after the refusal: "
+        f"status={body['status']!r} error={body.get('error')!r}"
+    )
+
+
+def test_claude_sdk_refusal_fallback_routes_to_served_model(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    isolated_mock_llm_server_url: str,
+) -> None:
+    """Before 2.1.280, a refusal re-issues the turn on the served Opus id.
+
+    The gateway serves two Opus generations, so the ``opus`` alias points at the
+    newer one and cannot carry the fallback: Claude Code names the older
+    canonical id from its own route table. The canonical rewrites turn that id
+    into the gateway's spelling, so the turn re-issues on a served model and
+    completes instead of dying on a canonical id the gateway rejects.
+    """
+    if _claude_code_version() >= _SERVER_MEDIATED_FALLBACK_SINCE:
+        pytest.skip("Claude Code 2.1.280+ re-asks the refused model; see the test below")
+    wire_models, body = _run_refused_turn(
+        http_client, live_runner_id, isolated_mock_llm_server_url
+    )
+    assert _SERVED_FALLBACK_MODEL in wire_models, (
+        f"the refusal-fallback did not re-issue on the served Opus id "
+        f"{_SERVED_FALLBACK_MODEL!r} — the canonical id Claude Code names was "
+        f"not rewritten to this gateway's spelling. Models seen: {wire_models}"
+    )
+    _assert_recovered_on_served_ids(wire_models, body)
+
+
+def test_claude_sdk_refusal_reasks_the_served_model(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    isolated_mock_llm_server_url: str,
+) -> None:
+    """From 2.1.280, a refusal re-asks the refused model under the server's fallback.
+
+    The CLI no longer switches models itself: it re-sends the turn on the same
+    model and leaves any model switch to the gateway. Omnigent must still keep
+    every request on a served id and let the turn complete.
+    """
+    if _claude_code_version() < _SERVER_MEDIATED_FALLBACK_SINCE:
+        pytest.skip("Claude Code before 2.1.280 switches models itself; see the test above")
+    wire_models, body = _run_refused_turn(
+        http_client, live_runner_id, isolated_mock_llm_server_url
+    )
+    assert wire_models.count(_LAUNCH_MODEL) >= 2, (
+        f"the refused turn was not re-asked on {_LAUNCH_MODEL!r}; models seen: {wire_models}"
+    )
+    _assert_recovered_on_served_ids(wire_models, body)

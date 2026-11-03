@@ -293,10 +293,9 @@ def test_unpinned_native_codex_session_launches_on_omnigent_default(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
 
-    # The Codex TUI startup banner names the model the session launched on
-    # ("model:     <id>   /model to change"). The SPA renders the pane on a
-    # WebGL canvas, so read the same text from the managed tmux pane.
-    banner = re.compile(r"model:\s*(\S+)")
+    # Codex shows the model in its startup banner or compact status footer.
+    # Read the same terminal text from tmux because the SPA uses a canvas.
+    banner = re.compile(r"(?:model:\s*|^\s*)(gpt-[\w.-]+)(?=\s)", re.MULTILINE)
     deadline = time.monotonic() + _TUI_BANNER_TIMEOUT_MS / 1000
     pane_text = ""
     launched: str | None = None

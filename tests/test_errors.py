@@ -84,6 +84,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.HOST_OFFLINE, 503),
         (ErrorCode.UPSTREAM_CANCELLED, 499),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, 403),
         (ErrorCode.STALE_CURSOR, 400),
@@ -123,6 +124,7 @@ def test_every_error_code_has_a_concrete_category() -> None:
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorCategory.SERVER),
         (ErrorCode.WRONG_REPLICA, ErrorCategory.SERVER),
         (ErrorCode.RUNNER_UNAVAILABLE, ErrorCategory.CONFIG),
+        (ErrorCode.HOST_OFFLINE, ErrorCategory.USER),
         (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCategory.CONFIG),
         (ErrorCode.RUNNER_CAPABILITY_MISMATCH, ErrorCategory.CONFIG),
         (ErrorCode.NOT_FOUND, ErrorCategory.USER),
@@ -200,6 +202,7 @@ def test_every_error_code_has_an_impact() -> None:
         (ErrorCode.UNAUTHORIZED, ErrorImpact.BLOCKING),
         # Transient: self-healing, no lost progress.
         (ErrorCode.RUNNER_UNAVAILABLE, ErrorImpact.TRANSIENT),
+        (ErrorCode.HOST_OFFLINE, ErrorImpact.TRANSIENT),
         (ErrorCode.WRONG_REPLICA, ErrorImpact.TRANSIENT),
         (ErrorCode.UPSTREAM_CANCELLED, ErrorImpact.TRANSIENT),
         # Benign: a rejected request that leaves the session healthy.

@@ -411,6 +411,11 @@ def print_stale_host_hint() -> None:
 SUPPRESS_RECOVERY_HINT_ATTR = "omnigent_suppress_recovery_hint"
 
 
+def printable(text: str) -> str:
+    """Escape control characters so untrusted text can't rewrite the terminal."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def suppresses_recovery_hint(exc: BaseException) -> bool:
     """
     Report whether the stale-host recovery hint should be withheld for *exc*.

@@ -103,6 +103,78 @@ describe("MessageResponse", () => {
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
 
+  describe("allowGitHubAttachmentImages", () => {
+    const asset = "https://github.com/user-attachments/assets/381e47c8-e3f1-4c3e-9b3d-aac5cfb3557b";
+
+    it("shows GitHub attachment images without a referrer", async () => {
+      render(<MessageResponse allowGitHubAttachmentImages>{`![shot](${asset})`}</MessageResponse>);
+
+      const image = await screen.findByRole("img", { name: "shot" });
+      expect(image).toHaveAttribute("src", asset);
+      expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
+    });
+
+    it.each([
+      ["another host", "https://attacker.example/pixel.png?q=secret"],
+      ["a path escaping the assets", "https://github.com/user-attachments/assets/../../x/y.png"],
+      ["a query string", `${asset}?q=secret`],
+      ["another GitHub path", "https://github.com/attacker/repo/raw/main/pixel.png"],
+      ["plain http", asset.replace("https:", "http:")],
+      ["a fragment", `${asset}#x`],
+      ["a trailing slash", `${asset}/`],
+      ["a lookalike host", asset.replace("github.com", "github.com.evil.example")],
+      ["userinfo", asset.replace("https://", "https://github.com@evil.example/")],
+      ["an id that isn't a UUID", "https://github.com/user-attachments/assets/deadbeef"],
+    ])("still blocks %s", async (_case, url) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{`![leak](${url})`}</MessageResponse>);
+
+      expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
+      expect(document.querySelector("img")).toBeNull();
+    });
+
+    it("drops every other attribute a raw-HTML GitHub image carries", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {`<img src="${asset}" alt="shot" srcset="https://evil.example/x.png 1x">`}
+        </MessageResponse>,
+      );
+
+      const image = await screen.findByRole("img", { name: "shot" });
+      expect(image).toHaveAttribute("src", asset);
+      expect(image).not.toHaveAttribute("srcset");
+    });
+
+    it("doesn't treat a raw parked-image tag as a GitHub image", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {
+            'before <omnigent-github-image src="https://evil.example/x.png"></omnigent-github-image>'
+          }
+        </MessageResponse>,
+      );
+
+      await screen.findByText(/before/);
+      expect(document.querySelector("img")).toBeNull();
+    });
+
+    it("leaves GitHub attachment images blocked without the option", async () => {
+      render(<MessageResponse>{`![shot](${asset})`}</MessageResponse>);
+
+      expect(await screen.findByText("[Image blocked: shot]")).toBeTruthy();
+    });
+
+    it("leaves links as the default renderer treats them", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {"[docs](docs/x.md) [root](/README.md)"}
+        </MessageResponse>,
+      );
+
+      expect(await screen.findByText(/\[blocked\]/)).toHaveTextContent("docs [blocked]");
+      expect(screen.getByRole("link", { name: "root" })).toHaveAttribute("href", "/README.md");
+    });
+  });
+
   it("re-renders when rendering props change even if the text is unchanged", async () => {
     const { container, rerender } = render(
       <MessageResponse className="math-config-a">same text</MessageResponse>,

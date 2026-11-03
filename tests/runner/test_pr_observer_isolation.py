@@ -11,9 +11,11 @@ import re
 import sys
 import types
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -473,3 +475,71 @@ def test_a_facet_import_failure_warns_once_then_logs_at_debug(
     assert [record.levelno for record in records] == [logging.WARNING, logging.DEBUG]
     assert all("broken" in record.getMessage() for record in records)
     assert records[0].exc_info is not None and records[0].exc_info[0] is RuntimeError
+
+
+@pytest.mark.parametrize("unlink", [False, True])
+def test_deferred_lookup_preserves_immediate_prs_and_does_not_block(
+    install: Install, monkeypatch: pytest.MonkeyPatch, unlink: bool
+) -> None:
+    facet = install(WORKING, parses=True)
+    started, release = Event(), Event()
+    calls = []
+
+    def resolve(result: object) -> list[PullRequestRef]:
+        calls.append(result)
+        started.set()
+        assert release.wait(5)
+        return [PullRequestRef.from_url(MR)]
+
+    monkeypatch.setattr(
+        facet,
+        "shell_pr_operations",
+        lambda _: [ShellPrOp(False, False, None, False, resolve_result=resolve)],
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        try:
+            observe(BOTH_CREATE, GITHUB_PR)
+            assert started.wait(5)
+            assert recorded() == {"github": GITHUB_PR}
+            observe(BOTH_CREATE, GITHUB_PR)
+            assert len(calls) == 1
+            if unlink:
+                SessionPrRegistry(SESSION).remove(MR)
+        finally:
+            release.set()
+    expected = {"github": GITHUB_PR} if unlink else {"github": GITHUB_PR, WORKING: MR}
+    assert recorded() == expected
+    assert (
+        next(pr for pr in SessionPrRegistry(SESSION).list() if pr.url == GITHUB_PR).relationship
+        == "created"
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"exit_code": 1},
+        {"session_id": 12, "exit_code": None},
+        {"interrupted": True},
+        "Process exited with code 1",
+    ],
+)
+def test_failed_or_unfinished_tools_do_not_schedule_lookups(
+    install: Install, monkeypatch: pytest.MonkeyPatch, result: object
+) -> None:
+    facet = install(WORKING, parses=True)
+    monkeypatch.setattr(
+        facet,
+        "shell_pr_operations",
+        lambda _: [ShellPrOp(False, False, None, False, resolve_result=lambda _: [])],
+    )
+
+    def unexpected_submit(*args: object, **kwargs: object) -> None:
+        pytest.fail("An unsuccessful tool must not start a PR lookup")
+
+    monkeypatch.setattr(pr_observer._lookup_pool, "submit", unexpected_submit)
+    observe_tool_completion(
+        SESSION, tool_name="Bash", arguments={"command": "git push"}, result=result
+    )
+    assert recorded() == {}

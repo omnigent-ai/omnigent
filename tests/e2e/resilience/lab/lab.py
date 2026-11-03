@@ -29,7 +29,6 @@ import re
 import secrets
 import shutil
 import signal
-import socket
 import sys
 import tempfile
 import time
@@ -43,6 +42,7 @@ import httpx
 import psutil
 import yaml
 
+from tests._helpers.live_server import reserve_port
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.model import MockModel
 from tests.e2e.resilience.lab.processes import (
@@ -164,13 +164,6 @@ def wait_for(predicate: Callable[[], T | None], *, timeout: float, what: str) ->
         time.sleep(_POLL_S)
 
 
-@contextlib.contextmanager
-def _reserve_port() -> Iterator[socket.socket]:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        yield sock
-
-
 def _write_yaml(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(value, sort_keys=False))
@@ -208,8 +201,8 @@ class Lab:
         self.client: httpx.Client | None = None
         self.observer: httpx.Client | None = None
         with contextlib.ExitStack() as ports:
-            self._server_port_reservation = ports.enter_context(_reserve_port())
-            self._model_port_reservation = ports.enter_context(_reserve_port())
+            self._server_port_reservation = ports.enter_context(reserve_port())
+            self._model_port_reservation = ports.enter_context(reserve_port())
             self._server_port = int(self._server_port_reservation.getsockname()[1])
             self._model_port = int(self._model_port_reservation.getsockname()[1])
             self._port_reservations = ports.pop_all()
@@ -502,7 +495,14 @@ class Lab:
         return self.root / "t"
 
     def _client(self, base_url: str, *, timeout: float = 30.0) -> httpx.Client:
-        client = httpx.Client(base_url=base_url, timeout=timeout, trust_env=False)
+        # Retire pooled sockets before Uvicorn's five-second idle close, whose
+        # FIN can reach a client later through a proxy.
+        client = httpx.Client(
+            base_url=base_url,
+            timeout=timeout,
+            limits=httpx.Limits(keepalive_expiry=1.0),
+            trust_env=False,
+        )
         self._clients.append(client)
         return client
 

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 export const HARNESS_MENU_CLASS_NAME =
-  "composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2";
+  "composer-agent-menu max-h-[min(clamp(20rem,40vh,36rem),var(--radix-dropdown-menu-content-available-height))] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2";
 
 export const COMPOSER_HARNESS_MENU_SIZE = "w-[17.5rem]";
 
@@ -114,7 +114,7 @@ export function HarnessMenuRowContent({
           data-harness-edit=""
           onPointerDown={onEditPointerDown}
           className={cn(
-            "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
+            "composer-agent-edit mobile-touch-target mobile-app:justify-center flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
             summaryVisibility,
             isMobile && "opacity-100",
           )}
