@@ -345,6 +345,18 @@ Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
 
+**Claude subscription authentication (`launch-cli`, `launch-web`):** with a
+valid Claude login and an explicit subscription provider, start `omnigent claude`
+and a new Claude session from the web picker. Even when the host inherits
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, `/status` should show the login.
+Restart existing hosts and terminals to pick up the change. Claude-configured
+gateways and cloud transports continue to own their authentication.
+`tests/harnesses/claude_native/test_claude_native.py::test_resolve_native_claude_config_subscription_uses_cli_login`
+checks CLI child-process credentials;
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_subscription_ignores_inherited_api_credentials`
+checks the hosted launch specification. These use synthetic credentials and do
+not prove live sign-in or artifact publishing.
+
 **Launch settings (own environment):** connect a host with Claude/Codex
 configured, and put a command and two args under
 `harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.

@@ -43,6 +43,7 @@ import {
   DownloadIcon,
   ExternalLinkIcon,
   GitBranchIcon,
+  GitCommitHorizontalIcon,
   GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
@@ -109,6 +110,7 @@ import {
   type PullRequestChecks,
   type PullRequestComment,
   type PullRequestInfo,
+  type PullRequestTimelineEvent,
 } from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_MARKDOWN_COMPONENTS,
@@ -524,6 +526,61 @@ function PullRequestCommentCard({
   );
 }
 
+function PullRequestTimelineRow({
+  event,
+  providerLabel,
+}: {
+  event: PullRequestTimelineEvent;
+  providerLabel: string;
+}) {
+  const timestamp = event.created_at ? Date.parse(event.created_at) : NaN;
+  const time = relativeTime(timestamp);
+  const forcePush = event.kind === "force_push";
+  const Icon = forcePush ? GitBranchIcon : GitCommitHorizontalIcon;
+  const url = event.url && parseHttpUrl(event.url);
+  return (
+    <li className="flex gap-2 px-3 py-2 text-xs text-muted-foreground">
+      <Icon aria-hidden className="mt-0.5 size-4 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-baseline gap-x-1">
+          <span className="font-medium text-foreground">{event.author ?? "unknown"}</span>
+          <span>{forcePush ? "force-pushed" : "committed"}</span>
+          {forcePush && event.previous_sha && (
+            <span>
+              from <code title={event.previous_sha}>{event.previous_sha.slice(0, 7)}</code>
+            </span>
+          )}
+          {forcePush && <span>{event.sha ? "to" : "the branch"}</span>}
+          {url ? (
+            <a
+              href={url.href}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open commit ${event.sha?.slice(0, 7) ?? ""} on ${providerLabel}`}
+              className="font-mono text-foreground hover:underline"
+              title={event.sha ?? undefined}
+            >
+              {event.sha?.slice(0, 7) ?? "View event"}
+            </a>
+          ) : (
+            event.sha && <code title={event.sha}>{event.sha.slice(0, 7)}</code>
+          )}
+          {time && (
+            <time dateTime={event.created_at!} title={absoluteTime(timestamp)} className="ml-auto">
+              {time}
+            </time>
+          )}
+        </div>
+        {event.message && (
+          <p className="mt-1 truncate" title={event.message}>
+            {event.message}
+          </p>
+        )}
+      </div>
+    </li>
+  );
+}
+
 function PullRequestCheckCounts({
   checks,
   compact = false,
@@ -644,21 +701,53 @@ function PullRequestSummaryTab({
   );
 }
 
-/** The Comments tab body: the PR's conversation comments in order. A partial
- *  list keeps what loaded and says the rest is missing rather than empty. */
+/** Comments and commit activity share a chronological feed. */
 function PullRequestCommentsTab({
   comments,
   commentsPartial,
+  events,
+  timelinePartial,
+  prUrl,
   providerLabel,
   hasComposer,
 }: {
   comments: PullRequestComment[];
   hasComposer: boolean;
   commentsPartial?: boolean;
+  events?: PullRequestTimelineEvent[];
+  timelinePartial?: boolean;
+  prUrl: string;
   providerLabel: string;
 }) {
   const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   const authorHues = useMemo(() => pullRequestAuthorHues(comments), [comments]);
+  const prHref = parseHttpUrl(prUrl)?.href;
+  const entries = [
+    ...comments.map((comment, index) => ({
+      created_at: comment.created_at,
+      element: (
+        <PullRequestCommentCard
+          key={commentKeys[index]}
+          comment={comment}
+          providerLabel={providerLabel}
+          authorHue={authorHues.get(comment.author?.toLowerCase() ?? "")}
+        />
+      ),
+    })),
+    ...(events ?? []).map((event) => ({
+      created_at: event.created_at,
+      element: (
+        <PullRequestTimelineRow key={event.id} event={event} providerLabel={providerLabel} />
+      ),
+    })),
+  ];
+  if (events?.length) {
+    const timestamp = (value: string | null) => {
+      const parsed = Date.parse(value ?? "");
+      return Number.isFinite(parsed) ? parsed : Infinity;
+    };
+    entries.sort((left, right) => timestamp(left.created_at) - timestamp(right.created_at));
+  }
   return (
     <div className={cn("space-y-2 p-3", !hasComposer && "pb-16")}>
       {commentsPartial && (
@@ -666,19 +755,21 @@ function PullRequestCommentsTab({
           Some comments are unavailable.
         </p>
       )}
-      {comments.length === 0 ? (
-        !commentsPartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
+      {timelinePartial && (
+        <p role="status" className="text-ui text-muted-foreground">
+          Some commit and push history is unavailable.{" "}
+          {prHref && (
+            <a href={prHref} target="_blank" rel="noreferrer" className="underline">
+              View on {providerLabel}
+            </a>
+          )}
+        </p>
+      )}
+      {entries.length === 0 ? (
+        !commentsPartial &&
+        !timelinePartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
       ) : (
-        <ul className="space-y-2">
-          {comments.map((c, i) => (
-            <PullRequestCommentCard
-              key={commentKeys[i]}
-              comment={c}
-              providerLabel={providerLabel}
-              authorHue={authorHues.get(c.author?.toLowerCase() ?? "")}
-            />
-          ))}
-        </ul>
+        <ul className="space-y-2">{entries.map((entry) => entry.element)}</ul>
       )}
     </div>
   );
@@ -1754,6 +1845,9 @@ function PullRequestPanelDetails({
               comments={comments}
               hasComposer={canPostComment}
               commentsPartial={pr.comments_partial}
+              events={pr.timeline_events}
+              timelinePartial={pr.timeline_partial}
+              prUrl={pr.url}
               providerLabel={copy.label}
             />
           </div>
