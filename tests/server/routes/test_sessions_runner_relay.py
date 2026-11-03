@@ -3591,6 +3591,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         )
         assert handle is not None
         sessions_module._session_status_cache[session_id] = "running"
+        sessions_module._session_blocked_on_cache[session_id] = "permission prompt"
         shutdown_state.mark_runner_handed_off(runner_id, reason="rebalance")
 
         with capture_debug_rows("server") as rows:
@@ -3600,6 +3601,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         assert handle.task.exception() is None
         assert session_id not in store.labels
         assert session_id not in sessions_module._session_status_cache
+        assert session_id not in sessions_module._session_blocked_on_cache
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         outcome = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
         attributes = cast("dict[str, object]", outcome["attributes"])
@@ -3614,6 +3616,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_blocked_on_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 

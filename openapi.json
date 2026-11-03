@@ -8503,7 +8503,7 @@
                 "type": "null"
               }
             ],
-            "description": "What a `\"running\"` session is parked on as of the last status edge, e.g. `\"permission prompt\"` (see `SessionStatusEvent`), so a reload can still route the user to the waiting terminal dialog. `None` when the session is not parked, or when this replica has not seen that edge (e.g. after a restart).",
+            "description": "What a `\"running\"` session is parked on as of the last status edge, e.g. `\"permission prompt\"` (see `SessionStatusEvent`), so a reload can still route the user to the waiting terminal dialog. `None` when the session is not parked. Omitted for a running session whose edge this replica has not seen (e.g. after a restart), so clients can keep a reason they already have.",
             "title": "Blocked On"
           },
           "context_window": {

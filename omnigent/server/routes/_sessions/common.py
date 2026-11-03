@@ -670,7 +670,8 @@ _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskIn
 
 # What a ``running`` session's last status edge said it is parked on (e.g. a
 # terminal permission prompt), so a reload can still say why nothing is moving.
-_session_blocked_on_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# ``None`` records an observed edge without a reason; a missing key means unknown.
+_session_blocked_on_cache: WorkspaceScopedCache[str, str | None] = WorkspaceScopedCache()
 
 
 _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()

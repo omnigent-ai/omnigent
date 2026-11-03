@@ -5403,12 +5403,11 @@ function reconnectStatusPatch(
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
-  // An older server omits the parked reason; a live edge during the fetch is newer.
-  if (
-    session.blockedOn !== undefined &&
-    !sessionStatusChangedSince(session.id, statusRevisionBeforeFetch)
-  ) {
-    patch.blockedOn = session.blockedOn;
+  // A server omits the parked reason when it has not seen the edge (or predates the
+  // field); the reason only applies while running, and a live edge during the fetch is newer.
+  if (!sessionStatusChangedSince(session.id, statusRevisionBeforeFetch)) {
+    if (session.blockedOn !== undefined) patch.blockedOn = session.blockedOn;
+    else if (session.status !== "running") patch.blockedOn = null;
   }
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;

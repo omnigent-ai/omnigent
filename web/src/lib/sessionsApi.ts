@@ -149,7 +149,8 @@ interface SessionResponseWire {
   background_tasks?: BackgroundTaskInfo[] | null;
   /**
    * What a ``"running"`` session is parked on as of the last status edge,
-   * e.g. ``"permission prompt"``. ``null`` when not parked; absent from older servers.
+   * e.g. ``"permission prompt"``. ``null`` when not parked; absent when the
+   * server has not seen that edge or predates the field.
    */
   blocked_on?: string | null;
   created_at: number;

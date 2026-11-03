@@ -2197,8 +2197,9 @@ class SessionResponse(BaseModel):
     :param blocked_on: What a ``"running"`` session is parked on as of the
         last status edge, e.g. ``"permission prompt"`` (see
         :class:`SessionStatusEvent`), so a reload can still route the user to
-        the waiting terminal dialog. ``None`` when the session is not parked,
-        or when this replica has not seen that edge (e.g. after a restart).
+        the waiting terminal dialog. ``None`` when the session is not parked.
+        Omitted for a running session whose edge this replica has not seen
+        (e.g. after a restart), so clients can keep a reason they already have.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -2495,6 +2496,15 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+
+    # Unannotated: an annotated wrap serializer replaces this model's OpenAPI schema.
+    @model_serializer(mode="wrap")
+    def _omit_unknown_blocked_on(self, handler: SerializerFunctionWrapHandler):
+        """Omit ``blocked_on`` unless set, so "unknown" stays distinct from ``null``."""
+        data = handler(self)
+        if "blocked_on" not in self.model_fields_set:
+            data.pop("blocked_on", None)
+        return data
 
 
 class UpdateSessionRequest(BaseModel):

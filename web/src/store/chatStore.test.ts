@@ -13663,6 +13663,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           agent_id: "agent_xyz",
           status: "running",
           active_response_id: "resp_same",
+          blocked_on: "permission prompt",
           created_at: 0,
           items: [],
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
@@ -13689,6 +13690,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await vi.advanceTimersByTimeAsync(6000);
       expect(sinks).toHaveLength(2);
       expect(bound.get().activeResponse?.state).toBe("streaming");
+      expect(bound.get().blockedOn).toBe("permission prompt");
 
       sinks[1]!.push(
         sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "resumed" }),
@@ -15072,34 +15074,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("keeps a live parked reason when an older server's snapshot omits it", async () => {
-    seedSession("conv_blocked_old_server", []);
+  it("keeps a live parked reason through a running snapshot that omits it, not a clear or an idle one", async () => {
+    seedSession("conv_blocked_omitted", []);
     const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    let snapshot: { status: string; blocked_on?: string | null } = { status: "running" };
+    let snapshotReads = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.startsWith("/v1/sessions/conv_blocked_omitted?") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotReads += 1;
+        return Promise.resolve(
+          mockResponse({
+            id: "conv_blocked_omitted",
+            agent_id: "agent_xyz",
+            ...snapshot,
+            created_at: 0,
+            items: [],
+            labels: {},
+          }),
+        );
+      }
+      return route(input, init);
+    });
     const controller = new AbortController();
-    const bound = bindConversationForTest("conv_blocked_old_server", {
+    const bound = bindConversationForTest("conv_blocked_omitted", {
       abortController: controller,
       sessionStatus: "running",
     });
-    const loop = startStreamPump("conv_blocked_old_server", controller, bound.set, bound.get);
+    const loop = startStreamPump("conv_blocked_omitted", controller, bound.set, bound.get);
+    const parkLive = async () => {
+      sinks[0]!.push(
+        sse("session.status", {
+          conversation_id: "conv_blocked_omitted",
+          status: "running",
+          blocked_on: "permission prompt",
+        }),
+      );
+      await drainAsync();
+    };
+    const reconcile = async () => {
+      await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      await drainAsync();
+    };
     await drainAsync();
-    sinks[0]!.push(
-      sse("session.status", {
-        conversation_id: "conv_blocked_old_server",
-        status: "running",
-        blocked_on: "permission prompt",
-      }),
-    );
-    await drainAsync();
-    const snapshotReads = () =>
-      fetchMock.mock.calls.filter(([input]) =>
-        String(input).startsWith("/v1/sessions/conv_blocked_old_server?"),
-      ).length;
-    const readsBeforeReconcile = snapshotReads();
 
-    await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
-    await drainAsync();
-    expect(snapshotReads()).toBeGreaterThan(readsBeforeReconcile);
+    // A server that has not seen the edge (restarted, or older) omits the field.
+    await parkLive();
+    await reconcile();
+    expect(snapshotReads).toBe(1);
     expect(bound.get().blockedOn).toBe("permission prompt");
+
+    snapshot = { status: "running", blocked_on: null };
+    await reconcile();
+    expect(snapshotReads).toBe(2);
+    expect(bound.get().blockedOn).toBeNull();
+
+    await parkLive();
+    snapshot = { status: "idle" };
+    await reconcile();
+    expect(snapshotReads).toBe(3);
+    expect(bound.get()).toMatchObject({ sessionStatus: "idle", blockedOn: null });
 
     sinks[0]!.push("data: [DONE]\n\n");
     sinks[0]!.close();

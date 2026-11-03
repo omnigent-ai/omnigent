@@ -331,7 +331,8 @@ export interface Session {
   /**
    * What a running session is parked on as of the last status edge, e.g.
    * `"permission prompt"`, so a reload keeps the terminal-routing label.
-   * `null` when not parked; `undefined` when the server predates the field.
+   * `null` when not parked; `undefined` when the server has not seen that
+   * edge or predates the field.
    */
   blockedOn?: string | null;
   createdAt: number;

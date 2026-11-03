@@ -13863,7 +13863,9 @@ async def _get_session_snapshot(
         agent_store=agent_store,
         agent_cache=agent_cache,
     )
-    if response.status == "running":
+    if response.status != "running":
+        response.blocked_on = None
+    elif session_id in _session_blocked_on_cache:
         response.blocked_on = _session_blocked_on_cache.get(session_id)
     response.side_chat_settings_supported = await _runner_supports_side_chat_settings(
         conv, conv_store, getattr(request.app.state, "tunnel_registry", None) if request else None

@@ -5112,8 +5112,8 @@ def _publish_status(
     elif status == "failed":
         _session_background_task_count_cache.pop(session_id, None)
         _session_background_tasks_cache.pop(session_id, None)
-    if status == "running" and blocked_on:
-        _session_blocked_on_cache[session_id] = blocked_on
+    if status == "running":
+        _session_blocked_on_cache[session_id] = blocked_on or None
     else:
         _session_blocked_on_cache.pop(session_id, None)
     event = SessionStatusEvent(

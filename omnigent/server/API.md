@@ -447,12 +447,12 @@ Fields:
     Current lifecycle state: `"idle"`, `"running"`, `"waiting"`, or
     `"failed"`.
 
-  blocked_on (string or null)
+  blocked_on (string or null, optional)
     What a `"running"` session is parked on as of its last
     `session.status` edge, e.g. `"permission prompt"` or
-    `"dialog open"`. `null` when the session is not parked, or when
-    this server replica has not seen that edge (e.g. after a restart),
-    so `null` alone does not prove a terminal prompt was answered.
+    `"dialog open"`. `null` when the session is not parked. Omitted
+    for a running session whose edge this server replica has not seen
+    (e.g. after a restart), so a client can keep a reason it already has.
 
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.

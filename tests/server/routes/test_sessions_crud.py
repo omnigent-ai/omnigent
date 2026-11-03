@@ -153,7 +153,7 @@ async def test_get_session_reports_what_a_running_session_is_blocked_on(
         resp = await client.get(f"/v1/sessions/{session_id}")
         assert resp.status_code == 200
         body = resp.json()
-        return body["status"], body.get("blocked_on")
+        return body["status"], body.get("blocked_on", "<omitted>")
 
     try:
         sessions_module._publish_status(session_id, "running", blocked_on="permission prompt")
@@ -161,6 +161,10 @@ async def test_get_session_reports_what_a_running_session_is_blocked_on(
 
         sessions_module._publish_status(session_id, "running")
         assert await status_and_blocked_on() == ("running", None)
+
+        # A replica that has not seen the edge (e.g. after a restart) must not claim a clear.
+        sessions_module._session_blocked_on_cache.pop(session_id, None)
+        assert await status_and_blocked_on() == ("running", "<omitted>")
 
         sessions_module._publish_status(session_id, "running", blocked_on="dialog open")
         sessions_module._publish_status(session_id, "idle")
