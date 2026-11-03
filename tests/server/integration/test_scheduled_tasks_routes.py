@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -20,7 +21,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -44,6 +45,7 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import FakeSandboxLauncher
 
@@ -249,10 +251,27 @@ async def test_schedule_validation_keeps_requests_responsive(
 
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
-    resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    headers = {
+        **_headers(),
+        "x-omnigent-automation-source": "ui",
+        "x-omnigent-automation-template": "jira",
+    }
+    with capture_debug_rows("server") as rows:
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(name="private-name", prompt="private-prompt"),
+            headers=headers,
+        )
     assert resp.status_code == 200, resp.text
+    [event] = [row for row in rows if row["event_name"] == "scheduled_task_created"]
+    assert event["user_id"] == "alice@example.com"
+    assert event["attributes"]["task_id"] == resp.json()["id"]
+    assert event["attributes"]["creation_source"] == "ui"
+    assert event["attributes"]["template_id"] == "jira"
+    assert "private-name" not in json.dumps(event)
+    assert "private-prompt" not in json.dumps(event)
     created = resp.json()
-    assert created["name"] == "nightly triage"
+    assert created["name"] == "private-name"
     assert created["rrule"] == _VALID_RRULE
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
@@ -546,12 +565,15 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(rrule="FREQ=SECONDLY"),
-        headers=_headers(),
-    )
+    with capture_debug_rows("server") as rows:
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(rrule="FREQ=SECONDLY"),
+            headers=_headers(),
+        )
     assert resp.status_code == 400, resp.text
+
+    assert not [row for row in rows if row["event_name"] == "scheduled_task_created"]
 
 
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
@@ -589,27 +611,81 @@ async def test_create_rejects_invalid_reasoning_effort(
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.parametrize(
+    ("agent_name", "mode"),
+    [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
+    + [
+        (CODEX_NATIVE_AGENT_NAME, mode)
+        for mode in ("default", "full-access", "read-only", "bypass")
+    ],
+)
 async def test_create_persists_permission_mode(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
 ) -> None:
-    """A valid permission mode round-trips on create and read."""
+    """A valid permission mode round-trips on create, read, and update."""
     _make_user(db_uri)
     resp = await auth_client.post(
         "/v1/scheduled-tasks",
-        json=_create_body(permission_mode="acceptEdits"),
+        json=_create_body(agent_id=builtin_agent_id(agent_name), permission_mode=mode),
         headers=_headers(),
     )
     assert resp.status_code == 200, resp.text
     created = resp.json()
-    assert created["permission_mode"] == "acceptEdits"
+    assert created["permission_mode"] == mode
     task_id = created["id"]
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
-    assert got.json()["permission_mode"] == "acceptEdits"
+    assert got.json()["permission_mode"] == mode
+    if mode == "full-access":
+        changed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}",
+            json={"permission_mode": "read-only"},
+            headers=_headers(),
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["permission_mode"] == "read-only"
 
 
-@pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_permission_save_requires_resolved_harness(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(permission_mode="acceptEdits"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    monkeypatch.setattr(
+        AgentCache,
+        "load",
+        Mock(side_effect=PermissionError("agent cache directory is inaccessible")),
+    )
+
+    if operation == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(permission_mode="plan"), headers=_headers()
+        )
+    else:
+        response = await auth_client.patch(
+            task_url, json={"permission_mode": "plan"}, headers=_headers()
+        )
+    assert response.status_code == 400, response.text
+    assert "Cannot resolve the agent's harness" in response.text
+    saved = await auth_client.get(task_url, headers=_headers())
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["permission_mode"] == "acceptEdits"
+
+    cleared = await auth_client.patch(task_url, json={"permission_mode": None}, headers=_headers())
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["permission_mode"] is None
+
+
+@pytest.mark.parametrize("permission_mode", ["unknown-permission-mode", "--danger", "Auto"])
 async def test_create_rejects_invalid_permission_mode(
     auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
 ) -> None:
@@ -620,6 +696,7 @@ async def test_create_rejects_invalid_permission_mode(
         headers=_headers(),
     )
     assert resp.status_code == 400, resp.text
+    assert "Unsupported permission_mode" in resp.text
 
 
 async def test_create_rejects_relative_workspace(
@@ -1181,14 +1258,7 @@ async def test_update_rejects_null_agent(auth_client: httpx.AsyncClient, db_uri:
 async def test_create_rejects_permission_mode_for_non_claude_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A valid mode on a non-Claude agent is rejected (server capability gate).
-
-    The web dialog only shows the permission control for Claude Code; the server
-    enforces the same gate so a codex/cursor/etc. task can't persist a mode the
-    fire path would inject as an unknown ``--permission-mode`` flag. The value
-    itself is a valid Claude mode — the rejection is purely about the agent's
-    harness.
-    """
+    """Claude's permission vocabulary cannot be saved on a Codex agent."""
     from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
 
     _make_user(db_uri)
@@ -1411,16 +1481,18 @@ async def test_schedule_search_failure_returns_400_and_rolls_back(
         raise RRuleSearchError("search budget exceeded")
 
     monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", fail_actual_schedule)
-    if operation == "create":
-        response = await auth_client.post(
-            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
-        )
-    else:
-        response = await auth_client.patch(
-            f"/v1/scheduled-tasks/{existing.id}",
-            json={"rrule": "FREQ=DAILY;BYHOUR=12"},
-            headers=_headers(),
-        )
+    with capture_debug_rows("server") as rows:
+        if operation == "create":
+            response = await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+            )
+        else:
+            response = await auth_client.patch(
+                f"/v1/scheduled-tasks/{existing.id}",
+                json={"rrule": "FREQ=DAILY;BYHOUR=12"},
+                headers=_headers(),
+            )
+    assert not any(row["event_name"] == "scheduled_task_created" for row in rows)
     assert response.status_code == 400, response.text
     assert "Could not calculate the next run time for this schedule." in response.text
     expected_outcome = (

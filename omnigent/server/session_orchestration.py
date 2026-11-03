@@ -12,7 +12,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
 from omnigent.stores.conversation_store import (
@@ -237,6 +237,17 @@ def inherited_project_fields(
     }
 
 
+def _shared_with_editors(session_id: str, user_id: str, permissions: PermissionStore) -> bool:
+    """Whether anyone besides the owner holds a stored grant that can add input."""
+    cursor: str | None = None
+    while True:
+        grants, cursor = permissions.list_for_session(session_id, after_user_id=cursor)
+        if any(g.user_id != user_id and g.level >= LEVEL_EDIT for g in grants):
+            return True
+        if cursor is None:
+            return False
+
+
 def require_owned_session(
     identifier: str,
     user_id: str,
@@ -262,11 +273,12 @@ def require_owned_session(
         if grant is None or grant.level != LEVEL_OWNER:
             break
         if private:
-            # Child access comes from the root, including public/read-only grants.
-            grants, cursor = permissions.list_for_session(current.id, limit=2)
-            if cursor is not None or any(g.user_id != user_id for g in grants):
+            # Child access comes from the root. Read-only viewers, including the
+            # public grant, cannot add input, so they cannot steer other sessions.
+            if _shared_with_editors(current.id, user_id, permissions):
                 raise OmnigentError(
-                    "Shared sessions cannot send messages or launch independent sessions",
+                    "Sessions shared with edit access cannot send messages or launch "
+                    "independent sessions",
                     code=ErrorCode.FORBIDDEN,
                 )
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":

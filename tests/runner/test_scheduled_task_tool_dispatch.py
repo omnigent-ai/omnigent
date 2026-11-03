@@ -145,7 +145,10 @@ async def test_create_posts_payload() -> None:
         "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
-    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
+    assert client.headers[-1] == {
+        ORCHESTRATION_SOURCE_HEADER: "conv_source",
+        "x-omnigent-automation-source": "agent",
+    }
 
 
 @pytest.mark.asyncio
@@ -619,7 +622,8 @@ async def test_task_calls_identify_the_calling_session() -> None:
         await _execute_scheduled_task_tool(
             tool_name, json.dumps(arguments), server_client=client, conversation_id="conv_lead"
         )
-    assert client.headers == [{ORCHESTRATION_SOURCE_HEADER: "conv_lead"}] * 4
+    sources = [(headers or {}).get(ORCHESTRATION_SOURCE_HEADER) for headers in client.headers]
+    assert sources == ["conv_lead"] * 4
 
 
 @pytest.mark.asyncio
