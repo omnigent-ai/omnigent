@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from itertools import pairwise
 from pathlib import Path
 
 import psutil
@@ -35,6 +36,7 @@ _REAP_TIMEOUT_S = 10.0
 # Post-SIGKILL wait: KILL is not ignorable, so survivors vanish fast; a
 # short bound keeps total teardown near the TERM grace, not double it.
 _KILL_WAIT_S = 5.0
+_EXECNET_BOOTSTRAP = "import sys;exec(eval(sys.stdin.readline()))"
 
 
 def _proc_argv(proc: psutil.Process) -> list[str]:
@@ -80,7 +82,7 @@ def _cmdline_references_dir(argv: list[str], needle: str) -> bool:
 
 
 def _is_pytest_process(argv: list[str]) -> bool:
-    """Whether *argv* is a pytest run rather than a spawned Omnigent process.
+    """Whether *argv* is pytest or its execnet worker, rather than an Omnigent leak.
 
     Token-based on purpose: a leaked server's ``--database-uri`` embeds the
     ``omnigent-pytest-<rand>`` data-dir name, so a substring test on the
@@ -88,9 +90,13 @@ def _is_pytest_process(argv: list[str]) -> bool:
     for pytest runs.
 
     :param argv: The process's argv.
-    :returns: ``True`` for ``pytest`` / ``python -m pytest`` invocations.
+    :returns: ``True`` for pytest invocations and execnet's piped Python bootstrap.
     """
-    return any(arg == "pytest" or os.path.basename(arg) == "pytest" for arg in argv)
+    if any(arg == "pytest" or os.path.basename(arg) == "pytest" for arg in argv):
+        return True
+    return any(
+        option == "-c" and program == _EXECNET_BOOTSTRAP for option, program in pairwise(argv)
+    )
 
 
 def find_leaked_omnigent_processes(data_dir: Path | str) -> list[psutil.Process]:

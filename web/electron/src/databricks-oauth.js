@@ -24,6 +24,8 @@
 
 "use strict";
 
+const { diagnostics } = require("./diagnostics");
+
 const crypto = require("node:crypto");
 const { shell } = require("electron");
 const { base64url, makePkce, runLoopbackAuthorization } = require("./loopback-oauth");
@@ -164,6 +166,14 @@ async function postToken(tokenUrl, body, { signal } = {}) {
     typeof code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(code) ? code : undefined;
   const id = resp.headers?.get("x-databricks-request-id") ?? resp.headers?.get("x-request-id");
   const requestId = typeof id === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(id) ? id : undefined;
+  diagnostics.record("databricks_token", {
+    origin: endpoint.origin,
+    phase: body.get("grant_type"),
+    status: resp.status,
+    code: errorCode,
+    requestId,
+    outcome: resp.ok ? "accepted" : "rejected",
+  });
   console.log("[omnigent] databricks oauth: token response", {
     origin: endpoint.origin,
     status: resp.status,

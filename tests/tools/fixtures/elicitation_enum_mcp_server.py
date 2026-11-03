@@ -2,7 +2,9 @@
 
 Exposes a single ``deploy`` tool that, when called, sends an
 ``elicitation/create`` to the client asking which environment to
-deploy to.  The schema is::
+deploy to.  The schema is:
+
+.. code-block:: json
 
     {
       "type": "object",

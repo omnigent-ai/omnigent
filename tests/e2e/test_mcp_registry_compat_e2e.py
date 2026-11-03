@@ -13,7 +13,7 @@ import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.spec import load
-from tests._helpers.compat import compat_server_python
+from tests._helpers.compat import meets_min_server_version
 
 
 def _registry_bundle() -> bytes:
@@ -64,11 +64,12 @@ def _registry_bundle() -> bytes:
 
 @pytest.mark.compat_smoke
 def test_native_inline_registry_bundle_survives_old_servers(
-    live_server: str, tmp_path: Path
+    live_server: str, server_version: str, tmp_path: Path
 ) -> None:
     """Upload and download through real HTTP without executing a turn or an MCP."""
     bundle = _registry_bundle()
-    old_server = compat_server_python() is not None
+    # Servers before 0.19.0 drop the registry transport and the selection header.
+    old_server = not meets_min_server_version(server_version, "0.19.0")
     with httpx.Client(
         base_url=live_server,
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},

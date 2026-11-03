@@ -300,7 +300,7 @@ async def wait_for_user_verdict(
     try:
         verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
         answered = True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         verdict = Verdict(approved=False)
     finally:
         cleanup(elicitation_id)

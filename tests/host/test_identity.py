@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import pytest
 import yaml
 
 from omnigent.host.identity import (
+    HOST_SLICE_KEY_ENABLED_ENV_VAR,
+    export_configured_slice_key,
     host_identity_env_override_active,
     load_host_identity_if_present,
     load_or_create_host_identity,
@@ -434,3 +437,37 @@ def test_host_identity_env_override_active_reflects_env(
     monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
     monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
     assert host_identity_env_override_active() is True
+
+
+@pytest.mark.parametrize(
+    ("env", "config", "expected"),
+    [
+        (None, {"host": {"slice_key_enabled": True}}, "1"),
+        (None, {"host": {"slice_key_enabled": False}}, "0"),
+        (None, {"host": {"name": "box"}}, None),
+        (None, {"host": {"slice_key_enabled": "yes"}}, None),
+        (None, "host: [unclosed", None),
+        ("0", {"host": {"slice_key_enabled": True}}, "0"),
+    ],
+)
+def test_export_configured_slice_key_defers_to_the_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env: str | None,
+    config: dict[str, object] | str,
+    expected: str | None,
+) -> None:
+    """
+    The config's boolean ``host.slice_key_enabled`` becomes the env var, unless
+    one is set; a non-boolean value or malformed YAML exports nothing.
+    """
+    path = tmp_path / "config.yaml"
+    path.write_text(config if isinstance(config, str) else yaml.safe_dump(config))
+    # Set first so teardown restores the variable the export may write.
+    monkeypatch.setenv(HOST_SLICE_KEY_ENABLED_ENV_VAR, env or "")
+    if env is None:
+        monkeypatch.delenv(HOST_SLICE_KEY_ENABLED_ENV_VAR)
+
+    export_configured_slice_key(path)
+
+    assert os.environ.get(HOST_SLICE_KEY_ENABLED_ENV_VAR) == expected

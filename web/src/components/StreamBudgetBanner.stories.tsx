@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { ChatStoreSeed } from "@/storybook/StoryProviders";
-import { StreamBudgetBanner } from "./StreamBudgetBanner";
+import { FloatingBannerStack, StreamBudgetBanner } from "./StreamBudgetBanner";
 
 const meta = {
   title: "Components/Presence/StreamBudgetBanner",
@@ -9,7 +9,9 @@ const meta = {
   decorators: [
     (Story) => (
       <div className="relative h-48 w-[720px] overflow-hidden rounded-xl border bg-background">
-        <Story />
+        <FloatingBannerStack>
+          <Story />
+        </FloatingBannerStack>
       </div>
     ),
   ],

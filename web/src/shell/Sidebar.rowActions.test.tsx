@@ -348,6 +348,15 @@ describe("quick pin/unpin hover button", () => {
     }
   });
 
+  it("tints the new-project icon selector with the active theme accent", () => {
+    renderSidebar();
+    fireEvent.click(screen.getByTestId("new-project"));
+
+    const iconSelector = screen.getByTestId("new-project-icon");
+    expect(iconSelector).toHaveClass("bg-primary/10");
+    expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
+  });
+
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
     // group-header wrapper must stay visible wherever hover is unavailable —
@@ -1213,15 +1222,18 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
-  it("keeps Fork visible but unavailable for a managed source", () => {
+  it("offers Fork for a managed source", () => {
     mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
     renderSidebar();
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByRole("menu")).toHaveClass("menu-surface");
     const fork = screen.getByRole("menuitem", { name: "Fork" });
-    expect(fork).toHaveAttribute("aria-disabled", "true");
+    expect(fork).not.toHaveAttribute("aria-disabled");
     fireEvent.click(fork);
-    fireEvent.keyDown(fork, { key: "Enter" });
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
   });
 
   it("opens the fork dialog for the selected session", () => {

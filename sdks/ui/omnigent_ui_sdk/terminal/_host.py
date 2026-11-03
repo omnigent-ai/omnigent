@@ -409,6 +409,7 @@ class Overlay:
             from rich.console import Group
             from rich.text import Text
 
+
             async def my_builder(target):
                 lines = [
                     f"[bold]Title[/bold]: {target.label}",
@@ -838,8 +839,8 @@ class TerminalHost:
 
     Usage::
 
-        async def on_input(text: str) -> None:
-            ...  # process input, call host.output()
+        async def on_input(text: str) -> None: ...  # process input, call host.output()
+
 
         host = TerminalHost(model_name="coder")
         async with host:
