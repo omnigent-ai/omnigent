@@ -35,7 +35,7 @@ from omnigent.server.auth import (
     SharingMode,
     UnifiedAuthProvider,
 )
-from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.managed_hosts import ONLINE_TIMEOUT_ENV_VAR, parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _grant_default_public
 from omnigent.server.sharing_settings import (
     DefaultPublicSessions,
@@ -463,7 +463,7 @@ async def test_managed_create_follows_policy(
     while a local session on the same server stays private."""
     install_fake_modal_launcher(monkeypatch, FakeSandboxLauncher())
     # Keep the background launch from outliving the test.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.1)
+    monkeypatch.setenv(ONLINE_TIMEOUT_ENV_VAR, "0.1")
     write_default_public_sessions_override(DefaultPublicSessions(policy))
     app, perms = _build_app(db_uri, tmp_path, managed=True)
     alice = client_factory(app, _USER)

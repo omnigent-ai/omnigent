@@ -281,7 +281,9 @@ guide](../modal/README.md#git-credentials-private-repositories).
   host log: `/tmp/omnigent-host.log`.
 - **Slow first launch** — the first launch from a given image waits on a cold
   registry pull before the sandbox is ready; subsequent launches reuse the cached
-  image and start in seconds.
+  image and start in seconds. If the pull alone outlasts the registration budget,
+  raise `OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S` (seconds, default 120) on the
+  server.
 - **Agent has no credentials** — verify the injected var names match the
   forwarded set (or are named in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`), and that each
   name was actually set in the launching environment.

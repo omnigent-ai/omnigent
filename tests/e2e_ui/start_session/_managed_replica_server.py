@@ -318,7 +318,8 @@ def main() -> None:
     if args.message_launch_wait_s is not None:
         import omnigent.server.managed_hosts as managed_hosts
 
-        managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = args.message_launch_wait_s
+        wait_s = args.message_launch_wait_s
+        managed_hosts.managed_launch_rendezvous_timeout_s = lambda: wait_s
     launcher = None
     if args.role == "ingress":
         app = ingress_app(args.replica_a, args.replica_b, strip_host_id=args.strip_host_id)
