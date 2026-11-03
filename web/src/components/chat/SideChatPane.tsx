@@ -69,6 +69,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -667,7 +668,10 @@ function SideChatComposer({
   };
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const pasted = clipboardFiles(event.clipboardData);
-    if (!pasted.length) return;
+    if (!pasted.length) {
+      insertPastedText(event);
+      return;
+    }
     event.preventDefault();
     if (!ready) return;
     if (pending) {
