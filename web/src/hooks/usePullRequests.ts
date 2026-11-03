@@ -339,13 +339,21 @@ function legacyPullRequestAuth(raw: PullRequestInfo): PullRequestAuth {
  *  workspace changed-files list, plus a "renamed" status. */
 export type PullRequestChangedFile = Omit<WorkspaceChangedFile, "status"> & {
   status: WorkspaceChangedFile["status"] | "renamed";
+  /** The old path of a renamed file. */
+  previous_path?: string | null;
 };
 
 export interface PullRequestChangedFilesResult {
   available: boolean;
   data: PullRequestChangedFile[];
+  /** True when the provider truncated the list. */
   has_more?: boolean;
   warning?: string;
+  /** The provider's total changed-file count, when known. */
+  total_count?: number | null;
+  /** The revision the list describes, when pinned. */
+  head_sha?: string | null;
+  base_sha?: string | null;
 }
 
 export interface PullRequestFileDiffResponse {
@@ -616,12 +624,24 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
   });
 }
 
+/** `pr_url` plus the `base:head` revision the diff and file list are pinned to. */
+function pinnedPrQuery(prUrl?: string, revision?: string): string {
+  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  const [baseSha, headSha] = revision?.split(":") ?? [];
+  if (prUrl && baseSha && headSha) {
+    query.set("base_sha", baseSha);
+    query.set("head_sha", headSha);
+  }
+  return query.size ? `?${query}` : "";
+}
+
 async function fetchPullRequestChangedFiles(
   conversationId: string,
   prUrl?: string,
+  revision?: string,
 ): Promise<PullRequestChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -647,7 +667,7 @@ export function usePullRequestChangedFiles(
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl, revision),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
@@ -705,14 +725,8 @@ async function fetchPullRequestDiff(
   prUrl?: string,
   revision?: string,
 ): Promise<PullRequestDiffResponse> {
-  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
-  const [baseSha, headSha] = revision?.split(":") ?? [];
-  if (prUrl && baseSha && headSha) {
-    query.set("base_sha", baseSha);
-    query.set("head_sha", headSha);
-  }
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${query.size ? `?${query}` : ""}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${pinnedPrQuery(prUrl, revision)}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
