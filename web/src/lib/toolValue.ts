@@ -83,6 +83,15 @@ export function parseToolOutput(output: string): ParsedToolOutput {
     : { kind: "json", value: inner, text: wrapped };
 }
 
+/**
+ * The text of a `{"content": [...blocks]}` tool result, as SDK Pi stores its own
+ * tools' results, or `null` when `value` is not one or reports an error.
+ */
+export function contentEnvelopeText(value: unknown): string | null {
+  if (!isRecord(value) || value.isError === true) return null;
+  return contentBlockText(value.content);
+}
+
 /** The text in a `{"result": "..."}` wrapper, or `null` when `value` is not one. */
 function resultWrapperText(value: unknown): string | null {
   if (!isRecord(value) || typeof value.result !== "string") return null;
@@ -100,7 +109,7 @@ function parseJsonContainer(text: string): unknown {
 }
 
 /** Joined text of an MCP content-block array, or `null` when `value` is not one. */
-function contentBlockText(value: unknown): string | null {
+export function contentBlockText(value: unknown): string | null {
   if (!Array.isArray(value) || value.length === 0) return null;
   const texts: string[] = [];
   for (const block of value) {
@@ -117,22 +126,40 @@ function contentBlockText(value: unknown): string | null {
 // "MCP error -32602: ...", "Error executing tool x: ...".
 const ERROR_TEXT_RE = /^(?:(?:error|fatal)\s*:|mcp error\b|error (?:executing|calling|running)\b)/i;
 const TOOL_USE_ERROR_RE = /^<tool_use_error>([\s\S]*?)(?:<\/tool_use_error>)?\s*$/;
+// OpenCode and the runtime's executor adapter report a failed call as
+// "[error] <message>". Case-sensitive: "[ERROR] ..." also starts build logs.
+const BRACKETED_ERROR_RE = /^\[error\](?:\s+([\s\S]*))?$/;
 const UNNAMED_ERROR = "The tool reported an error.";
 
 /** The failure message a tool reported in its output, or `null` when it succeeded. */
 export function toolErrorMessage(parsed: ParsedToolOutput): string | null {
   if (parsed.kind === "json") {
     if (!isRecord(parsed.value)) return null;
-    const { error, message } = parsed.value;
+    const { error, message, isError, content } = parsed.value;
     if (typeof error === "string" && error.length > 0) return error;
     if (isRecord(error)) return nonEmpty(error.message) ?? UNNAMED_ERROR;
     if (error === true) return nonEmpty(message) ?? UNNAMED_ERROR;
+    // A `{"content": [...], "isError": true}` result, as SDK Pi stores its failures.
+    if (isError === true) return nonEmpty(contentBlockText(content)?.trim()) ?? UNNAMED_ERROR;
     return null;
   }
   const text = stripAnsi(parsed.text).trim();
   const wrapped = TOOL_USE_ERROR_RE.exec(text);
   if (wrapped !== null) return nonEmpty(wrapped[1]!.trim()) ?? UNNAMED_ERROR;
   return ERROR_TEXT_RE.test(text) ? text : null;
+}
+
+/**
+ * A file-edit tool's reported failure. Edit tools never echo arbitrary text, so
+ * the "[error] <message>" form counts here but not for tools such as shells.
+ */
+export function editErrorMessage(output: string): string | null {
+  const parsed = parseToolOutput(output);
+  if (parsed.kind === "text") {
+    const bracketed = BRACKETED_ERROR_RE.exec(stripAnsi(parsed.text).trim());
+    if (bracketed !== null) return nonEmpty(bracketed[1]?.trim()) ?? UNNAMED_ERROR;
+  }
+  return toolErrorMessage(parsed);
 }
 
 function nonEmpty(value: unknown): string | null {
@@ -262,4 +289,70 @@ export function isoTimestampMs(text: string): number | null {
   if (calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return null;
   const ms = Date.parse(text);
   return Number.isFinite(ms) ? ms : null;
+}
+
+// The only field names whose text renders as markdown (an issue description, a PR body).
+const PROSE_KEY_WORDS = new Set(["body", "comment", "description", "note", "summary"]);
+// Field names whose text is source, a command, output or data, which must keep its exact layout.
+const CODE_KEY_WORDS = new Set([
+  "cmd",
+  "code",
+  "command",
+  "content",
+  "contents",
+  "diff",
+  "html",
+  "json",
+  "log",
+  "logs",
+  "output",
+  "patch",
+  "pattern",
+  "query",
+  "regex",
+  "script",
+  "source",
+  "sql",
+  "stack",
+  "stderr",
+  "stdout",
+  "str",
+  "string",
+  "traceback",
+  "xml",
+  "yaml",
+]);
+
+// JSON, XML or an HTML document, but not prose opening with `[link](url)` or `[1] See`.
+function looksLikeData(text: string): boolean {
+  const start = text.trimStart();
+  if (/^(?:\{|<\?xml\b|<!DOCTYPE\b)/i.test(start)) return true;
+  if (!start.startsWith("[")) return false;
+  // `[{`, `["`, `[[` and `[]` open an array even when the text is cut off.
+  if (/^\[\s*[[{"\]]/.test(start)) return true;
+  try {
+    JSON.parse(start);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a long string under `key` is prose to render as markdown rather than literal text. */
+export function isProseText(text: string, key?: string): boolean {
+  const keyWords = key === undefined ? [] : identifierWords(key);
+  if (!keyWords.some((word) => hasKeyWord(PROSE_KEY_WORDS, word))) return false;
+  if (keyWords.some((word) => hasKeyWord(CODE_KEY_WORDS, word))) return false;
+  return !looksLikeData(text);
+}
+
+// A key word or its plural (`commands`, `patches`, `queries`) in `words`.
+function hasKeyWord(words: ReadonlySet<string>, word: string): boolean {
+  const singulars = [
+    word,
+    word.replace(/s$/, ""),
+    word.replace(/es$/, ""),
+    word.replace(/ies$/, "y"),
+  ];
+  return singulars.some((singular) => words.has(singular));
 }
