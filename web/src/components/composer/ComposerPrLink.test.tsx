@@ -5,11 +5,12 @@ import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import type * as OpenLinkInAppModule from "@/lib/openLinkInApp";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 
 vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: vi.fn(() => false) }));
 vi.mock("@/lib/openLinkInApp", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/openLinkInApp")>()),
+  ...(await importOriginal<typeof OpenLinkInAppModule>()),
   followLinkWithPopupFallback: vi.fn(),
 }));
 
