@@ -6,11 +6,13 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
 
 import omnigent.inner.codex_native_executor as native_executor
+from omnigent.harnesses.codex_native.app_server import CodexAppServerClient, CodexParams
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     read_bridge_state,
@@ -208,18 +210,15 @@ async def test_native_receipt_requires_exact_delivery_identity(
     assert state.active_turn_id == "turn_newer"
 
 
-@pytest.mark.asyncio
-async def test_mismatched_request_thread_cannot_reconcile_from_bridge(
+def _lost_reply_setup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unrelated requested thread cannot borrow an exact receipt from bridge history."""
-    from unittest.mock import AsyncMock
-
-    from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
-
+) -> tuple[CodexAppServerClient, AsyncMock, AsyncMock, CodexNativeBridgeState]:
+    """Bridge-owned state plus a client whose next RPC loses its reply."""
     client = CodexAppServerClient(ws_url="ws://127.0.0.1:9")
     request = AsyncMock(side_effect=ConnectionResetError("reply lost"))
+    connect = AsyncMock()
     monkeypatch.setattr(client, "request", request)
+    monkeypatch.setattr(client, "connect", connect)
     state = CodexNativeBridgeState(
         session_id="conv_receipt",
         thread_id="thread_receipt",
@@ -227,6 +226,15 @@ async def test_mismatched_request_thread_cannot_reconcile_from_bridge(
         codex_home=str(tmp_path),
     )
     write_bridge_state(tmp_path, state)
+    return client, request, connect, state
+
+
+@pytest.mark.asyncio
+async def test_mismatched_request_thread_cannot_reconcile_from_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated requested thread cannot borrow an exact receipt from bridge history."""
+    client, request, connect, state = _lost_reply_setup(tmp_path, monkeypatch)
     with input_delivery_scope({"delivery_attempt_id": "c" * 32}):
         with pytest.raises(InjectionDeliveryAmbiguous):
             await native_executor._native_delivery_request_once(
@@ -237,3 +245,20 @@ async def test_mismatched_request_thread_cannot_reconcile_from_bridge(
                 bridge_dir=tmp_path,
             )
     request.assert_awaited_once_with("turn/start", {"threadId": "thread_other", "input": []})
+    connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shell_command_lost_reply_never_probes_for_a_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shell ack has no userMessage item, so no idempotency key or receipt read applies."""
+    client, request, connect, state = _lost_reply_setup(tmp_path, monkeypatch)
+    params: CodexParams = {"threadId": "thread_receipt", "command": "ls"}
+    with input_delivery_scope({"delivery_attempt_id": "c" * 32}):
+        with pytest.raises(InjectionDeliveryAmbiguous):
+            await native_executor._native_delivery_request_once(
+                client, "thread/shellCommand", params, state, bridge_dir=tmp_path
+            )
+    request.assert_awaited_once_with("thread/shellCommand", params)
+    connect.assert_not_awaited()

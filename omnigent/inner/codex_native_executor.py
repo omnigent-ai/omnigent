@@ -360,7 +360,7 @@ async def _read_native_delivery_receipt(
                         and item["id"]
                     ):
                         return turn_id
-    except Exception:
+    except (TimeoutError, OSError, RuntimeError, WebSocketException):
         # A missing/unreadable receipt leaves delivery uncertain; it never permits replay.
         _logger.debug("Codex delivery receipt unavailable", exc_info=True)
     return None
@@ -374,7 +374,7 @@ async def _native_delivery_request_once(
     *,
     bridge_dir: Path,
 ) -> CodexMessage | None:
-    """Pair each RPC attempt with its result, including a rejected stale steer."""
+    """Pair each RPC attempt with its result; ``None`` means a receipt confirmed a lost reply."""
     attempt_id = uuid.uuid4().hex
     stage = _DELIVERY_STAGES[method]
     expected = params.get("expectedTurnId") if method == "turn/steer" else None
