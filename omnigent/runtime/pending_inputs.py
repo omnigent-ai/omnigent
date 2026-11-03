@@ -267,8 +267,9 @@ class MatchedDrain:
         mirror may have been theirs, see :func:`mark_uncertain`), or the person
         interrupted the turn while they were queued and cancelled them (see
         :func:`mark_interrupted`).
-    :param shared_text: Another queued entry carries the matched text, so only
-        queue order picked ``matched``; the mirror may be the other's.
+    :param shared_text: Another queued entry could have produced the same mirror,
+        exactly or behind generated attachment markers, so only queue order or
+        the match tier picked ``matched``; the mirror may be the other's.
     """
 
     matched: DrainedInput | None
@@ -893,7 +894,6 @@ def resolve_matching_text(
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
-        shared_text = texts.count(exact_needle) > 1
         if match_index is None:
             match_method = "attachment_normalized_text"
             marker_matches: list[int] = []
@@ -907,7 +907,6 @@ def resolve_matching_text(
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
-            shared_text = len(marker_matches) > 1
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped
@@ -918,6 +917,17 @@ def resolve_matching_text(
             [] if shell_command else ordered[:match_index][:_MAX_ENTRIES_PER_CONVERSATION]
         )
         matched_id, matched_entry = ordered[match_index]
+        # Across both tiers: a literal marker line and a generated one read the same.
+        bare_needle = exact_needle if shell_command else _bare_text(text)
+        shared_text = (
+            sum(
+                1
+                for index, (_pid, entry) in enumerate(ordered)
+                if (texts[index] if shell_command else _bare_text(_content_text(entry.content)))
+                == bare_needle
+            )
+            > 1
+        )
         for pending_id, entry in [*skipped_entries, (matched_id, matched_entry)]:
             if hold:
                 entry.held = True
@@ -1118,6 +1128,21 @@ def _attachment_count(content: list[dict[str, Any]]) -> int:
         for block in content
         if isinstance(block, dict) and block.get("type") in _ATTACHMENT_BLOCK_TYPES
     )
+
+
+def _bare_text(text: str) -> str:
+    """
+    ``text`` without any leading attachment marker lines, whitespace collapsed.
+
+    :param text: A queued entry's text or a mirror, e.g.
+        ``"[Attached: /tmp/x.png]\n\nlook at this"``.
+    :returns: The text any queued entry or mirror could share, e.g. ``"look at this"``.
+    """
+    while True:
+        stripped, removed = _ONE_LEADING_ATTACHMENT_MARKER_RE.subn("", text, count=1)
+        if not removed:
+            return _collapse_whitespace(text)
+        text = stripped
 
 
 def _strip_generated_markers(text: str, count: int) -> str:

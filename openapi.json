@@ -4278,7 +4278,7 @@
                 "type": "null"
               }
             ],
-            "description": "On a native terminal's mirrored user message, the `stable_id` of the web send whose pending-input entry it drained by a text match, e.g. `\"3f2a...\"` (32 hex). The mirror keeps its own item id, so this is how a client learns that its send was delivered. Set only by the server, which drops a client's value; `None` when nothing was drained, the drain was positional, or the match was ambiguous.",
+            "description": "On a native terminal's mirrored user message, the `stable_id` of the web send whose pending-input entry it drained by a text match, e.g. `\"3f2a...\"` (32 hex). The mirror keeps its own item id, so this is how a client learns that its send was delivered. Set only by the server: validation drops it from any input but the server's own stored record. `None` when nothing was drained, the drain was positional, or the match was ambiguous.",
             "title": "Web Stable Id"
           }
         },

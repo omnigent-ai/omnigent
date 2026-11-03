@@ -61,7 +61,6 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
     parse_item_data,
-    without_server_only_fields,
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import (
@@ -3452,9 +3451,7 @@ def _parse_external_conversation_item(
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
     try:
-        data = parse_item_data(
-            item_type, {"type": item_type, **without_server_only_fields(item_data)}
-        )
+        data = parse_item_data(item_type, {"type": item_type, **item_data})
     except (ValueError, TypeError) as exc:
         raise OmnigentError(
             f"Invalid data payload for external item type {item_type!r}: {exc}",

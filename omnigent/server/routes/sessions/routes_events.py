@@ -38,7 +38,6 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import (
     parse_item_data,
-    without_server_only_fields,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import NativeCodingAgent
@@ -1272,8 +1271,6 @@ def register_events_routes(
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # A client may not claim another send's delivery (see ``web_stable_id``).
-        body = body.model_copy(update={"data": without_server_only_fields(body.data)})
         # Tag the audit envelope end-event with the event kind so a message,
         # interrupt, approval, stop, … are distinguishable in the audit table.
         # Transient per-chunk echoes suppress the row entirely (they are the

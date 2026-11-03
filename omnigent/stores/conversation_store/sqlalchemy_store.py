@@ -777,7 +777,7 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         status=decode_item_status(row.status),
         response_id=row.response_id,
         created_at=row.created_at,
-        data=parse_item_data(item_type, json.loads(data_json)),
+        data=parse_item_data(item_type, json.loads(data_json), trusted=True),
         created_by=row.created_by,
     )
 
