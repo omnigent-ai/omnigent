@@ -590,6 +590,7 @@ describe("run history", () => {
     setTask(task());
     setRuns([run({ conversationId: "c_1", sessionCostUsd: cost })]);
     renderPage();
+    expect(screen.getByTestId("run-duration")).toHaveTextContent("1m 42s");
     if (label === null) expect(screen.queryByTestId("run-cost")).toBeNull();
     else expect(screen.getByTestId("run-cost")).toHaveTextContent(`Session cost ${label}`);
   });
@@ -608,6 +609,7 @@ describe("run history", () => {
       "Session cost $3.00",
     ]);
     expect(screen.getByText(/Runs sharing a session show the same total/)).toBeInTheDocument();
+    expect(screen.getByText(/Separate sub-agent sessions are excluded/)).toBeInTheDocument();
   });
   it("renders the empty state when there are no runs", () => {
     setTask(task());
