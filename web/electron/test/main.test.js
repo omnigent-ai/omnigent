@@ -4313,16 +4313,20 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(network.browserSignIns, 0);
   });
 
-  it("leaves a reload's 403 alone once a newer page load replaced it", async (t) => {
-    const { h, network } = await connected(t, [20]);
-    const sessionCreates = network.sessionCreates;
-    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
-    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
-    await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
-    await wait(60);
-    assert.deepEqual(h.calls.loadFile, []);
-    assert.equal(h.api.windows.get(h.win).origin, origin);
-  });
+  for (const verdict of ["allow", "blocked", "forbidden"]) {
+    it(`leaves a newer page load alone when a reload's session check ends in ${verdict}`, async (t) => {
+      const { h, network } = await connected(t, [20]);
+      const sessionCreates = network.sessionCreates;
+      network.verdict = verdict;
+      h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+      h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+      await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
+      await wait(60);
+      assert.deepEqual(h.calls.loadFile, []);
+      assert.deepEqual(h.overlay.shows, []);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
+    });
+  }
 
   it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
     const { h, network } = await connected(t, [20]);

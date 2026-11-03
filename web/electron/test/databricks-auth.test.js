@@ -256,7 +256,7 @@ describe("Databricks browser session lifecycle", () => {
     assert.deepEqual(h.calls.load, []);
     assert.equal(h.timers.size, 0);
   });
-  it("checks a window's session in place and reports a refused renewal", async (t) => {
+  it("checks a window's session in place and reports a refused renewal unless a newer page replaced it", async (t) => {
     let blocked = false;
     const h = harness({
       ensureSession: async () => {
@@ -272,8 +272,11 @@ describe("Databricks browser session lifecycle", () => {
     await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
     assert.equal(await h.auth.checkSession(win, "test"), true);
     blocked = true;
+    assert.equal(await h.auth.checkSession(win, "test", () => true), true);
+    assert.deepEqual(h.calls.errors, []);
+    assert.equal(h.timers.size, 1);
     assert.equal(await h.auth.checkSession(win, "test"), false);
-    assert.equal(h.calls.renew.length, 2);
+    assert.equal(h.calls.renew.length, 3);
     assert.deepEqual(h.calls.load, []);
     assert.deepEqual(
       h.calls.errors.map(({ url, error }) => [url, error.errorCode]),

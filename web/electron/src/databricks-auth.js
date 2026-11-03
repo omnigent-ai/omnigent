@@ -163,7 +163,10 @@ function createDatabricksAuth({
     ctx.timer?.unref?.();
   }
 
-  function renew(ctx, { reload = false, reason = "cookie renewal" } = {}) {
+  function renew(
+    ctx,
+    { reload = false, reason = "cookie renewal", superseded = () => false } = {},
+  ) {
     if (!current(ctx)) return Promise.resolve();
     if (reload) ctx.reloadVersion = ctx.navigationVersion;
     if (ctx.pending) return ctx.pending;
@@ -197,7 +200,16 @@ function createDatabricksAuth({
           });
         }
       })
-      .catch((error) => fail(ctx, error))
+      .catch(async (error) => {
+        if (!superseded()) return fail(ctx, error);
+        if (!current(ctx)) return;
+        // A newer page loaded meanwhile: retry on the usual schedule instead of replacing it.
+        console.warn("[omnigent] databricks auth: renewal failed after a newer page load", {
+          origin: ctx.origin,
+          code: error?.errorCode,
+        });
+        await schedule(ctx).catch((scheduleError) => fail(ctx, scheduleError));
+      })
       .finally(() => {
         if (renewals.get(ctx.origin) === pending) renewals.delete(ctx.origin);
         ctx.pending = null;
@@ -208,13 +220,14 @@ function createDatabricksAuth({
 
   /**
    * Renew `win`'s session without reloading. Resolves whether the window is still
-   * connected afterwards (a failed renewal goes to `onAuthRequired`), or returns
-   * null when the window has no live connection.
+   * connected afterwards, or returns null when the window has no live connection.
+   * A failed renewal goes to `onAuthRequired` unless `superseded()` reports that a
+   * newer page has replaced the one being checked.
    */
-  function checkSession(win, reason) {
+  function checkSession(win, reason, superseded) {
     const ctx = connections.get(win);
     if (!ctx || !current(ctx)) return null;
-    return renew(ctx, { reason }).then(() => current(ctx));
+    return renew(ctx, { reason, superseded }).then(() => current(ctx));
   }
 
   function recover(win) {

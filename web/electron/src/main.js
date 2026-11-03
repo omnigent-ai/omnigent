@@ -2528,8 +2528,10 @@ function registerNavigationFallbacks(win) {
   // main-frame-only and carries httpResponseCode; reuse the setup-page
   // fallback so the user sees the status and can change server / retry.
   let navigations = 0;
+  let latestPageLoaded = false;
   win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
     const navigation = ++navigations;
+    latestPageLoaded = httpResponseCode < 400;
     if (httpResponseCode < 400) return;
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
@@ -2555,7 +2557,8 @@ function registerNavigationFallbacks(win) {
     if (httpResponseCode === 403 && serverUrl && usesBrowserAuth(pinnedOrigin(win))) {
       // Off the VPN the IP access list refuses the page; a session renewal tells
       // that (reconnect behind the overlay) apart from a real 403.
-      const checked = databricksAuth?.checkSession(win, "forbidden page load");
+      const replaced = () => navigation !== navigations && latestPageLoaded;
+      const checked = databricksAuth?.checkSession(win, "forbidden page load", replaced);
       if (checked) {
         void checked.then((connected) => {
           if (connected && navigation === navigations) showConnectFailure(win, serverUrl, status);
