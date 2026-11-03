@@ -4,8 +4,16 @@
 // Custom frequencies (with INTERVAL, multi weekday/month-day selects, and
 // yearly BYMONTH), plus the 1-hour-floor validation.
 
-import { describe, expect, it } from "vitest";
-import { describeSchedule, formatClockTime, formatNextRunAt, nextRunAtMs } from "./scheduleText";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  describeRunFailure,
+  describeSchedule,
+  formatClockTime,
+  formatNextRunAt,
+  formatRunDuration,
+  formatRunTimestamp,
+  nextRunAtMs,
+} from "./scheduleText";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
@@ -410,5 +418,142 @@ describe("formatNextRunAt (relative delta from the server's next-run, full words
   it("bucket boundaries: 60m → hours, 24h → days", () => {
     expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1 hour");
     expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1 day");
+  });
+});
+
+describe("formatRunDuration", () => {
+  it("formats sub-minute runs in bare seconds", () => {
+    expect(formatRunDuration(1000, 1003)).toBe("3s");
+    expect(formatRunDuration(1000, 1059)).toBe("59s");
+  });
+
+  it("formats minute-scale runs as 'Nm Ss', dropping a zero seconds", () => {
+    // 1m 42s.
+    expect(formatRunDuration(1000, 1000 + 102)).toBe("1m 42s");
+    // Exactly 2 minutes → no trailing seconds.
+    expect(formatRunDuration(1000, 1000 + 120)).toBe("2m");
+  });
+
+  it("formats hour-scale runs as 'Nh Mm', dropping a zero minutes", () => {
+    expect(formatRunDuration(0, 3600 + 5 * 60)).toBe("1h 5m"); // 1h 5m 0s
+    expect(formatRunDuration(0, 2 * 3600)).toBe("2h"); // exactly 2h
+  });
+
+  it("rounds a sub-second (but non-zero) run up to 1s", () => {
+    expect(formatRunDuration(1000, 1000.4)).toBe("1s");
+  });
+
+  it("returns null when the run hasn't finished or never fired", () => {
+    expect(formatRunDuration(1000, null)).toBeNull();
+    expect(formatRunDuration(null, 1000)).toBeNull();
+    expect(formatRunDuration(undefined, undefined)).toBeNull();
+  });
+
+  it("returns null for a negative or non-finite span", () => {
+    expect(formatRunDuration(2000, 1000)).toBeNull();
+    expect(formatRunDuration(Number.NaN, 1000)).toBeNull();
+  });
+});
+
+describe("formatRunTimestamp", () => {
+  // A fixed viewer-local reference. formatRunTimestamp works in local time, so
+  // build the run instants relative to NOW's local midnight to stay
+  // zone-independent.
+  const NOW = new Date("2026-07-27T15:30:00");
+
+  // The formatter uses the runtime's locale; pin it so the labels don't depend
+  // on the machine running the tests.
+  beforeEach(() => {
+    const { toLocaleTimeString, toLocaleDateString } = Date.prototype;
+    vi.spyOn(Date.prototype, "toLocaleTimeString").mockImplementation(function (
+      this: Date,
+      _locales?: Intl.LocalesArgument,
+      options?: Intl.DateTimeFormatOptions,
+    ) {
+      return toLocaleTimeString.call(this, "en-US", options);
+    });
+    vi.spyOn(Date.prototype, "toLocaleDateString").mockImplementation(function (
+      this: Date,
+      _locales?: Intl.LocalesArgument,
+      options?: Intl.DateTimeFormatOptions,
+    ) {
+      return toLocaleDateString.call(this, "en-US", options);
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  function atLocal(daysAgo: number, hour: number, minute: number): number {
+    const d = new Date(NOW.getFullYear(), NOW.getMonth(), NOW.getDate() - daysAgo, hour, minute, 0);
+    return Math.floor(d.getTime() / 1000);
+  }
+
+  it("labels a same-day run 'Today, <time>'", () => {
+    expect(formatRunTimestamp(atLocal(0, 8, 0), NOW)).toBe("Today, 8:00 AM");
+  });
+
+  it("labels a previous-calendar-day run 'Yesterday, <time>'", () => {
+    expect(formatRunTimestamp(atLocal(1, 14, 30), NOW)).toBe("Yesterday, 2:30 PM");
+  });
+
+  it("labels an older same-year run 'Mon D, <time>' without a year", () => {
+    const label = formatRunTimestamp(atLocal(10, 8, 0), NOW)!;
+    expect(label).toMatch(/^Jul \d{1,2}, 8:00 AM$/);
+    expect(label).not.toContain("2026");
+  });
+
+  it("includes the year for a run from a different year", () => {
+    const priorYear = Math.floor(new Date(2025, 11, 25, 9, 0, 0).getTime() / 1000);
+    const label = formatRunTimestamp(priorYear, NOW)!;
+    expect(label).toContain("2025");
+  });
+
+  it("returns null for a null / non-finite timestamp", () => {
+    expect(formatRunTimestamp(null, NOW)).toBeNull();
+    expect(formatRunTimestamp(undefined, NOW)).toBeNull();
+    expect(formatRunTimestamp(Number.NaN, NOW)).toBeNull();
+  });
+});
+
+describe("describeRunFailure", () => {
+  it("names the stage each fire-path error code stopped at", () => {
+    expect(describeRunFailure("reauthorization_required", "failed").stage).toBe("Owner");
+    expect(describeRunFailure("host_offline", "failed")).toEqual({
+      stage: "Host",
+      reason: "The host was offline.",
+    });
+    expect(describeRunFailure("session_create_failed", "failed").stage).toBe("Session");
+    expect(describeRunFailure("sandbox_create_failed", "failed").stage).toBe("Sandbox");
+    expect(describeRunFailure("sandbox_registration_timeout", "failed").stage).toBe("Sandbox");
+    expect(describeRunFailure("runner_start_failed", "failed").stage).toBe("Runner");
+    expect(describeRunFailure("startup_expired", "failed").stage).toBe("Startup");
+    expect(describeRunFailure("incomplete", "failed").stage).toBe("Running");
+  });
+
+  it("points settings failures at editing the automation", () => {
+    const missing = describeRunFailure("missing_host_id", "failed");
+    expect(missing.stage).toBe("Settings");
+    expect(missing.reason).toContain("Edit the automation");
+    expect(describeRunFailure("missing_workspace", "failed")).toEqual(missing);
+    expect(describeRunFailure("missing_execution_input", "failed")).toEqual(missing);
+    expect(describeRunFailure("invalid_input", "failed").reason).toContain("Edit the automation");
+  });
+
+  it("falls back to a status-worded reason with no stage for unknown or missing codes", () => {
+    expect(describeRunFailure("some_new_code", "skipped")).toEqual({
+      stage: null,
+      reason: "Run skipped.",
+    });
+    expect(describeRunFailure(null, "failed")).toEqual({ stage: null, reason: "Run failed." });
+    expect(describeRunFailure(undefined, "incomplete")).toEqual({
+      stage: null,
+      reason: "Run failed.",
+    });
+  });
+
+  it("does not treat inherited object keys as codes", () => {
+    expect(describeRunFailure("toString", "failed")).toEqual({
+      stage: null,
+      reason: "Run failed.",
+    });
   });
 });

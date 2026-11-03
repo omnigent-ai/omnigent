@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { mermaid } from "@streamdown/mermaid";
+import { mermaid } from "./mermaidPlugin";
 import type { MermaidErrorComponentProps, MermaidOptions } from "streamdown";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import type { ResolvedThemeMode } from "@/components/theme/themeMode";

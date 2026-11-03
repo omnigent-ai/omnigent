@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -219,6 +220,12 @@ def test_import_local_frames_round_trip() -> None:
         HostSkillsResultFrame(request_id="req_skills", status="ok"),
         HostSkillsResultFrame(
             request_id="req_skills",
+            status="ok",
+            skills=[{"name": "review", "description": "Review changes"}],
+            warnings=["Codex plugin skills unavailable: `codex plugin list` exited 1"],
+        ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
             status="failed",
             error_code="invalid_path",
             error="path must be absolute",
@@ -227,6 +234,29 @@ def test_import_local_frames_round_trip() -> None:
 )
 def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skills_result_from_an_older_host_is_a_complete_catalog() -> None:
+    frame = decode_host_frame(
+        json.dumps({"kind": "host.skills_result", "request_id": "r", "status": "ok"})
+    )
+    assert isinstance(frame, HostSkillsResultFrame)
+    assert frame.warnings == []
+
+
+@pytest.mark.parametrize("warnings", ["codex", [1], [None]])
+def test_skills_result_rejects_malformed_warnings(warnings: object) -> None:
+    with pytest.raises(ValueError, match="warnings"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.skills_result",
+                    "request_id": "r",
+                    "status": "ok",
+                    "warnings": warnings,
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -528,7 +558,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
 ) -> None:
     """An oversized session is sliced into ordered chunk frames that reassemble."""
     monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
-    session = _session_with_payload("x" * 500)
+    session = dataclasses.replace(_session_with_payload("x" * 500), archived=True)
 
     frames = [
         decode_host_frame(text)
@@ -548,6 +578,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
     reassembled = [assembler.add(f) for f in frames]
     assert reassembled[:-1] == [None] * (len(frames) - 1)
     assert reassembled[-1] == session
+    assert reassembled[-1].archived is True
 
 
 def _session_json(session: HostImportedLocalSession) -> str:
@@ -1881,13 +1912,15 @@ def test_create_worktree_frame_round_trip() -> None:
     """Verify HostCreateWorktreeFrame survives encode → decode.
 
     A garbled repo_path or branch_name would create the worktree in
-    the wrong place or with the wrong branch.
+    the wrong place or with the wrong branch; a lost timeout_s would cut
+    a large checkout short.
     """
     original = HostCreateWorktreeFrame(
         request_id="req_wt_1",
         repo_path="/Users/alice/myrepo",
         branch_name="feature/login",
         base_branch="main",
+        timeout_s=3600.0,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
@@ -1937,6 +1970,34 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
     decoded = decode_host_frame(json.dumps(msg))
     assert isinstance(decoded, HostCreateWorktreeFrame)
     assert decoded.existing_branch is False
+
+
+def test_create_worktree_frame_timeout_absent_defaults_none() -> None:
+    """A frame from an older server, without ``timeout_s``, decodes as ``None``."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_6", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("timeout_s")
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.timeout_s is None
+
+
+@pytest.mark.parametrize(
+    "raw_timeout",
+    ["0", "-1", "true", '"60"', "Infinity", "NaN", "1" + "0" * 400],
+    ids=["zero", "negative", "bool", "string", "infinity", "nan", "overflow"],
+)
+def test_create_worktree_frame_timeout_rejects_unusable_values(raw_timeout: str) -> None:
+    """A budget the host cannot wait on is a malformed frame, not silently kept."""
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_7", repo_path="/repo", branch_name="wip")
+    )
+    with pytest.raises(ValueError, match="timeout_s"):
+        decode_host_frame(encoded.replace('"timeout_s": null', f'"timeout_s": {raw_timeout}'))
 
 
 def test_create_worktree_result_frame_round_trip() -> None:
@@ -2755,6 +2816,43 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+def test_import_local_session_archived_flag_defaults_and_must_be_a_bool() -> None:
+    """``archived`` defaults to False from older hosts and must be a bool.
+
+    The oversized-session chunk test covers its round trip.
+    """
+    legacy_session = {
+        "external_session_id": "s1",
+        "workspace": None,
+        "items": [],
+        "source": "codex",
+    }
+    legacy = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.import_local_session",
+                "request_id": "req_imp",
+                "total": 1,
+                "session": legacy_session,
+            }
+        )
+    )
+    assert isinstance(legacy, HostImportLocalSessionFrame)
+    assert legacy.session.archived is False
+
+    with pytest.raises(ValueError, match="archived"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.import_local_session",
+                    "request_id": "req_imp",
+                    "total": 1,
+                    "session": {**legacy_session, "archived": "yes"},
+                }
+            )
+        )
 
 
 def test_legacy_runner_exit_has_unknown_connection_history() -> None:

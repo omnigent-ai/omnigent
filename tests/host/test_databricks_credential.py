@@ -6,6 +6,10 @@ import configparser
 import json
 import os
 import stat
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -456,3 +460,92 @@ def test_main_does_not_retry_a_rejected_launch_token(
     assert dc.main(["token"]) == 0
     assert capsys.readouterr().out == ""
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("initial_status", "expected_requests", "expected_output"),
+    [(503, 2, "synthetic-bearer\n"), (401, 1, "")],
+    ids=["transient-outage", "rejected-credential"],
+)
+def test_token_cli_retries_outage_but_preserves_rejection(
+    tmp_path: Path, initial_status: int, expected_requests: int, expected_output: str
+) -> None:
+    """Cross real CLI/TCP boundaries with production retry policy and synthetic credentials."""
+    workspace = "https://workspace.example.test"
+    received: list[tuple[str, str | None]] = []
+
+    class BrokerHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            received.append((self.path, self.headers.get("X-Omnigent-Host-Token")))
+            status = initial_status if len(received) == 1 else 200
+            payload = (
+                {"connected": True, "token": "synthetic-bearer", "workspace_host": workspace}
+                if status == 200
+                else {"error": "synthetic broker failure"}
+            )
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BrokerHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        home = tmp_path / "home"
+        home.mkdir()
+        sidecar = tmp_path / dc._SIDECAR_NAME
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "server": f"http://127.0.0.1:{server.server_port}",
+                    "host_id": "synthetic-host",
+                    "host_token": "synthetic-launch-token",
+                    "workspace_host": workspace,
+                }
+            )
+        )
+        sidecar.chmod(0o600)
+        repo = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.host.databricks_credential",
+                "token",
+                "--coords",
+                str(sidecar),
+                "--workspace",
+                workspace,
+            ],
+            cwd=tmp_path,
+            env={
+                "HOME": str(home),
+                "DATABRICKS_CONFIG_FILE": str(home / ".databrickscfg"),
+                "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+                "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": os.pathsep.join(
+                    str(repo / path) for path in (".", "sdks/python-client", "sdks/ui")
+                ),
+            },
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (
+            received
+            == [("/v1/hosts/synthetic-host/credentials/databricks", "synthetic-launch-token")]
+            * expected_requests
+        )
+        assert result.stdout == expected_output
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)

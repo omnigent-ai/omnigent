@@ -128,6 +128,9 @@ class ProviderCapabilities:
         :meth:`PullRequestFacet.edit_reviewers`.
     :ivar comment_posting: The user can post top-level comments through
         :meth:`PullRequestFacet.create_comment`.
+    :ivar review_threads: Include published review conversations in PR info via
+        the optional :class:`ReviewThreadsFacet`; page additional threads on demand.
+    :ivar review_thread_replies: Publish replies through :class:`ReviewThreadsFacet`.
     :ivar details_editing: The user can edit the PR's title and description
         through :meth:`PullRequestFacet.edit_details`.
     :ivar attachment_uploads: The user can upload images and videos to embed in
@@ -142,12 +145,40 @@ class ProviderCapabilities:
     merging: bool = False
     reviewer_editing: bool = False
     comment_posting: bool = False
+    review_threads: bool = False
+    review_thread_replies: bool = False
+    review_thread_creation: bool = False
     details_editing: bool = False
     attachment_uploads: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
         return asdict(self)
+
+
+@runtime_checkable
+class ReviewThreadsFacet(Protocol):
+    """Optional review conversation support, independent of the base provider protocol."""
+
+    def review_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]: ...
+
+    def review_threads(
+        self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
+    ) -> dict[str, Any]: ...
+
+    def review_thread_comments(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, after: str
+    ) -> dict[str, Any]: ...
+
+    def reply_to_review_thread(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, body: str
+    ) -> dict[str, Any]: ...
+
+    def create_review_thread(
+        self, root: str, reference: PullRequestRef, *, body: str, anchor: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)

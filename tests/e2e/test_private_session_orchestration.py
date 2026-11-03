@@ -384,9 +384,10 @@ def test_private_manager_launch_send_read_and_sharing(
                     ]
                 } == before_managed
 
+                # Read-only viewers cannot add input; an editor could steer the manager.
                 shared = client.put(
                     f"/v1/sessions/{manager}/permissions",
-                    json={"user_id": "__public__", "level": 1},
+                    json={"user_id": "bob", "level": 2},
                 )
                 assert shared.status_code == 200, shared.text
                 configure(
@@ -407,7 +408,7 @@ def test_private_manager_launch_send_read_and_sharing(
                 send(manager, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK")
                 wait_text(manager, "MANAGER_BLOCKED")
                 assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
-                assert "Shared sessions cannot" in json.dumps(get_mock_requests(mock))
+                assert "shared with edit access cannot" in json.dumps(get_mock_requests(mock))
 
                 configure(
                     "SCHEDULED_MANAGER_TASK",
@@ -418,7 +419,7 @@ def test_private_manager_launch_send_read_and_sharing(
                                     "sys_session_message",
                                     {
                                         "session_id": worker,
-                                        "message": "SCHEDULED_MUST_NOT_DELIVER",
+                                        "message": "SCHEDULED_DELIVERED",
                                     },
                                     "scheduled-message",
                                 )
@@ -433,7 +434,7 @@ def test_private_manager_launch_send_read_and_sharing(
                                 )
                             ]
                         },
-                        {"text": "SCHEDULED_MANAGER_BLOCKED"},
+                        {"text": "SCHEDULED_MANAGER_DONE"},
                     ],
                 )
                 response = client.post(
@@ -463,16 +464,17 @@ def test_private_manager_launch_send_read_and_sharing(
                 scheduled = client.get(f"/v1/scheduled-tasks/{task_id}").json()[
                     "last_run_conversation_id"
                 ]
-                wait_text(scheduled, "SCHEDULED_MANAGER_BLOCKED")
-                assert "SCHEDULED_MUST_NOT_DELIVER" not in json.dumps(items(worker))
-                assert "Scheduled sessions cannot" in json.dumps(get_mock_requests(mock))
+                # An automation run messages the owner's worker and starts one of its own.
+                wait_text(scheduled, "SCHEDULED_MANAGER_DONE")
+                wait_text(worker, "SCHEDULED_DELIVERED")
                 after_scheduled = {
                     row["id"]
                     for row in client.get("/v1/sessions", params={"visibility": "mine"}).json()[
                         "data"
                     ]
                 }
-                assert after_scheduled == before_managed | {scheduled}
+                assert scheduled in after_scheduled
+                assert len(after_scheduled - before_managed - {scheduled}) == 1
 
                 fork = client.post(
                     f"/v1/sessions/{manager}/fork",
@@ -510,4 +512,4 @@ def test_private_manager_launch_send_read_and_sharing(
                 assert "SIDE_CHAT_MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 # Native tool results reach the model without entering the UI transcript.
                 side_chat_results = tool_results("side-chat-message")
-                assert "Shared sessions cannot" in json.dumps(side_chat_results)
+                assert "shared with edit access cannot" in json.dumps(side_chat_results)

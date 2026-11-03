@@ -196,9 +196,16 @@ def test_a_settings_command_clears_a_shell_mode_draft_too(
     ],
     ids=["shell-draft", "nbsp-after-glyph", "empty-shell-box", "chat-draft"],
 )
-def test_shell_mode_draft(row: str, footer: str, expected: bool) -> None:
+@pytest.mark.parametrize("stale_frame", [False, True], ids=["complete", "clipped-after-old-frame"])
+def test_shell_mode_draft(row: str, footer: str, expected: bool, stale_frame: bool) -> None:
     """Only a shell-mode row carrying a command counts as a shell draft."""
-    pane = f"{_RULE}\n{row}\n{_RULE}\n{footer}\n"
+    pane = (
+        f"{_RULE}\n❯ previous message\n{_RULE}\n{row}\n  continuation\n"
+        if stale_frame
+        else f"{_RULE}\n{row}\n{_RULE}\n{footer}\n"
+    )
+    if stale_frame and row == "!":
+        expected = True
     assert claude_native_bridge._shell_mode_draft(pane) is expected
 
 
