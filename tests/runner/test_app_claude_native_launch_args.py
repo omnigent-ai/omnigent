@@ -554,7 +554,7 @@ def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
 
 
 @pytest.mark.parametrize(
-    ("provider_url", "configured_flag", "expected_flag"),
+    ("base_url", "configured_flag", "expected_flag"),
     [
         ("https://gateway.example/anthropic", "0", "1"),
         ("https://api.anthropic.com", "0", "0"),
@@ -562,13 +562,11 @@ def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
     ],
 )
 def test_claude_terminal_env_refusal_fallback_provider_override(
-    provider_url: str, configured_flag: str, expected_flag: str
+    base_url: str, configured_flag: str, expected_flag: str
 ) -> None:
     """Gateway launches force the guard; direct Anthropic keeps explicit preferences."""
     flag = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
-    config = ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_BASE_URL": provider_url, flag: configured_flag}
-    )
+    config = ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": base_url, flag: configured_flag})
 
     assert build_native_claude_terminal_env(config)[flag] == expected_flag
 
@@ -1355,12 +1353,7 @@ async def test_auto_create_claude_terminal_launches_with_noninteractive_ucode(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A terminal the runner creates for a web turn must not block on a ucode prompt.
-
-    Nobody is attached to a runner-created pane, so a sudo password or a browser
-    sign-in in it would wait until the runner gives up. The launch spec sets
-    ``UG_NONINTERACTIVE`` so ucode prints the sign-in link instead.
-    """
+    """A runner-created pane has nobody to answer a ucode prompt, so ucode must not wait."""
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
