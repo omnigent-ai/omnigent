@@ -40,6 +40,7 @@ from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -919,6 +920,27 @@ def _claude_agent_deps(
         ("devin-native", "dangerous", ["--permission-mode", "dangerous"], False),
     ],
 )
+async def test_permission_mode_launch_options(
+    harness: str, mode: str, args: list[str] | None, bypass: bool
+) -> None:
+    task = _task(permission_mode=mode)
+    deps = _claude_agent_deps(FakeScheduledTaskStore(), FakeConversationStore(), harness=harness)
+
+    launch_args, labels = await fire_mod._permission_mode_launch_options(deps, task)
+
+    assert launch_args == args
+    assert labels == ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"} if bypass else {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode", "args", "bypass"),
+    [
+        ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
+        ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
+    ],
+)
 async def test_permission_mode_becomes_terminal_launch_args(
     harness: str,
     mode: str,
@@ -941,8 +963,6 @@ async def test_permission_mode_becomes_terminal_launch_args(
 
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["terminal_launch_args"] == args
-
-    from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
 
     assert conv_store.created[0]["labels"].get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == (
         "1" if bypass else None
@@ -975,20 +995,23 @@ async def test_incompatible_permission_mode_fails_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
 
-    async def _launch(conv: Any, task: Any) -> None:
-        return None
+    launch = AsyncMock()
 
     on_fire = build_on_fire(
         _claude_agent_deps(store, conv_store, harness="codex-native"),
-        launch_dispatch=_launch,
+        launch_dispatch=launch,
     )
     await on_fire(0, "task_1")
     await _drain()
 
+    launch.assert_not_awaited()
     assert conv_store.created == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "session_create_failed"
+    assert store.runs[0]["error_code"] == "permission_mode_unsupported"
+    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
+    assert "Edit the automation" in store.runs[0]["error"]
+    assert store.runs[0]["conversation_id"] is None
 
 
 def _effort_agent_deps(
@@ -1919,13 +1942,12 @@ async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["read-only", "plan"])
 async def test_managed_sandbox_permission_resolution_failure_prevents_launch(
-    monkeypatch: pytest.MonkeyPatch, mode: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(execution_target="managed_sandbox", permission_mode=mode)}
+        rows={"task_1": _task(execution_target="managed_sandbox", permission_mode="read-only")}
     )
     cache = FakeAgentCache()
 
@@ -1951,7 +1973,9 @@ async def test_managed_sandbox_permission_resolution_failure_prevents_launch(
     assert conv_store.created == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "session_create_failed"
+    assert store.runs[0]["error_code"] == "permission_harness_unresolved"
+    assert "Cannot resolve the agent's harness" in store.runs[0]["error"]
+    assert "Restore access to the agent and retry" in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
 

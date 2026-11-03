@@ -663,7 +663,7 @@ async def test_permission_save_requires_resolved_harness(
     assert cleared.json()["permission_mode"] is None
 
 
-@pytest.mark.parametrize("permission_mode", ["yolo", "--danger", "Auto"])
+@pytest.mark.parametrize("permission_mode", ["unknown-permission-mode", "--danger", "Auto"])
 async def test_create_rejects_invalid_permission_mode(
     auth_client: httpx.AsyncClient, db_uri: str, permission_mode: str
 ) -> None:
@@ -674,6 +674,7 @@ async def test_create_rejects_invalid_permission_mode(
         headers=_headers(),
     )
     assert resp.status_code == 400, resp.text
+    assert "Unsupported permission_mode" in resp.text
 
 
 async def test_create_rejects_relative_workspace(

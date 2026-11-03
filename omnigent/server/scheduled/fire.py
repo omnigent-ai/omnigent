@@ -177,7 +177,7 @@ class _FireResult(Enum):
 
 
 class _CannotLaunchScheduledFire(RuntimeError):
-    """A fire cannot start because its execution target is not usable."""
+    """A fire cannot start because its target or launch settings are not usable."""
 
     def __init__(self, message: str, *, error_code: str) -> None:
         super().__init__(message)
@@ -632,6 +632,10 @@ async def _run_fire_for_task(
     try:
         effective = await _own_task_agent(deps, effective)
         conv = await _create_session(deps, effective)
+    except _CannotLaunchScheduledFire as exc:
+        _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+        await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
+        return
     except Exception:
         _logger.exception("scheduled fire: failed to create session for task %s", task.id)
         await recorder.finish(
@@ -1148,11 +1152,18 @@ async def _permission_mode_launch_options(
         return None, {}
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
     harness = await scheduled_agent_harness(agent, deps.agent_cache)
-    args = PERMISSION_LAUNCH_ARGS.get(harness or "", {}).get(task.permission_mode)
+    if harness is None:
+        raise _CannotLaunchScheduledFire(
+            "Cannot resolve the agent's harness to apply the saved permission setting. "
+            "Restore access to the agent and retry.",
+            error_code="permission_harness_unresolved",
+        )
+    args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(task.permission_mode)
     if args is None:
-        raise ValueError(
-            f"Cannot apply saved permission_mode {task.permission_mode!r} "
-            f"for agent {task.agent_id!r}: unresolved or unsupported harness {harness!r}"
+        raise _CannotLaunchScheduledFire(
+            f"Saved permission setting {task.permission_mode!r} is not supported by {harness!r}. "
+            "Edit the automation to choose a supported permission or clear the override.",
+            error_code="permission_mode_unsupported",
         )
     labels = {}
     if harness == "codex-native" and task.permission_mode == "bypass":
