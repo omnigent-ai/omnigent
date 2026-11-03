@@ -1277,8 +1277,10 @@ describe("index.css macOS desktop font smoothing", () => {
         targets: TARGETS,
       }).code,
     );
-    const macRootRule = minified.match(/(?:^|\})html\[data-electron-mac\]\{[^}]*\}/)?.[0];
-    expect(macRootRule).toMatch(/-webkit-font-smoothing:antialiased/);
+    const macRootRules = [
+      ...minified.matchAll(/(?:^|\})html\[data-electron-mac\]\{([^}]*)\}/g),
+    ].map(([, body]) => body);
+    expect(macRootRules.some((body) => /-webkit-font-smoothing:antialiased/.test(body))).toBe(true);
   });
 });
 
