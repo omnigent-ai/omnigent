@@ -1336,6 +1336,47 @@ describe("late direct-attach advert", () => {
 });
 
 describe("closed bridge overlay", () => {
+  it.each<ConnectionState>([
+    { kind: "connecting" },
+    { kind: "closed", reason: "not found", code: 4404 },
+    { kind: "error" },
+  ])(
+    "redials a $kind bridge after external recovery and preserves an already connected pane",
+    async (state) => {
+      const props = { sessionId: "conv_abc", terminalId: "terminal_codex_main" };
+      const { rerender } = render(<TerminalView {...props} resumeGeneration={0} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const previous = terminalSessionMock.instances[0];
+      act(() => previous.onState(state));
+
+      rerender(<TerminalView {...props} resumeGeneration={1} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      expect(previous.dispose).toHaveBeenCalledTimes(1);
+      const connected = terminalSessionMock.instances[1];
+      act(() => connected.onState({ kind: "connected" }));
+      rerender(<TerminalView {...props} resumeGeneration={2} />);
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+      expect(connected.dispose).not.toHaveBeenCalled();
+    },
+  );
+
+  it("redials once when its resume callback also signals successful external recovery", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    const props = { sessionId: "conv_abc", terminalId: "terminal_codex_main", onResume };
+    const { rerender } = render(<TerminalView {...props} resumeGeneration={0} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "stopped", code: 4404 });
+    });
+
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume session" })));
+    expect(onResume).toHaveBeenCalledTimes(1);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    rerender(<TerminalView {...props} resumeGeneration={1} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+  });
+
   it("renders a resume button beside the closed message and invokes the callback", async () => {
     const onResume = vi.fn().mockResolvedValue(undefined);
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" onResume={onResume} />);
@@ -1397,7 +1438,14 @@ describe("closed bridge overlay", () => {
 
   it("keeps the closed overlay visible and surfaces resume failures", async () => {
     const onResume = vi.fn().mockRejectedValue(new Error("host offline"));
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" onResume={onResume} />);
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        onResume={onResume}
+        resumeGeneration={0}
+      />,
+    );
     // Start from exactly one bridge so the later length check proves failed
     // resume did not remount xterm.
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));

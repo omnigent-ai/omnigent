@@ -306,6 +306,110 @@ async def test_session_new_server_mode_adopts_returned_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_new_records_standard_model_config_option() -> None:
+    """ACP config-option categories identify the live model; option ids are agent-defined."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "configOptions": [
+                    {
+                        "id": "active-model",
+                        "category": "model",
+                        "currentValue": "grok-4.6",
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
+    assert ex._model_config_option_id == "active-model"
+
+    # The learned id is what a warm switch targets, not the literal ``model``.
+    calls: list[tuple[str, dict]] = []
+
+    async def switch_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {
+            "result": {
+                "configOptions": [
+                    {"id": "active-model", "category": "model", "currentValue": params["value"]}
+                ]
+            }
+        }
+
+    ex._rpc = switch_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("srv-42", "grok-4.7")
+
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "srv-42", "configId": "active-model", "value": "grok-4.7"},
+        )
+    ]
+    assert ex._active_model == "grok-4.7"
+
+
+def test_config_option_update_prefers_the_model_id_over_its_category() -> None:
+    """Several matching options resolve deterministically: ``model`` wins, else the first."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_config_options(
+        [
+            {"id": "model-tier", "category": "model", "currentValue": "fast"},
+            {"id": "model", "currentValue": "grok-4.6"},
+        ]
+    )
+    assert ex._model_config_option_id == "model"
+    assert ex._active_model == "grok-4.6"
+
+    ex._note_config_options(
+        [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.7"},
+            {"id": "fallback-model", "category": "model", "currentValue": "grok-3"},
+        ]
+    )
+    assert ex._model_config_option_id == "active-model"
+    assert ex._active_model == "grok-4.7"
+
+
+@pytest.mark.asyncio
+async def test_drain_ignores_malformed_session_update_params() -> None:
+    """A ``session/update`` whose ``params`` is not an object is dropped, not fatal."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._queue.put_nowait({"jsonrpc": "2.0", "method": "session/update", "params": [1, 2]})
+    ex._queue.put_nowait({"jsonrpc": "2.0", "method": "session/update"})
+
+    await ex._drain_stale_queue()
+
+    assert ex._queue.empty()
+    assert ex._active_model is None
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_legacy_model_state() -> None:
+    """Grok 1.0.4's preview ``models`` state still reports its real launch model."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "models": {"currentModelId": "grok-4.6", "availableModels": []},
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
+
+
+@pytest.mark.asyncio
 async def test_session_new_sends_empty_mcp_servers_when_omnigent_mcp_disabled() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
     captured: dict = {}
@@ -1813,7 +1917,25 @@ for line in sys.stdin:
             "agentCapabilities": {"promptCapabilities": {"image": False}},
         }})
     elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "fake-session-1"}})
+        # The live model is reported before the response, as an agent keying its
+        # model option by category does; the client must not lose it to its drain.
+        update("fake-session-1", {"sessionUpdate": "config_option_update", "configOptions": [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.6"},
+        ]})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "fake-session-1",
+            "models": {"currentModelId": "grok-4.5", "availableModels": []},
+        }})
+    elif method == "session/set_config_option":
+        params = msg["params"]
+        if params.get("configId") == "active-model":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": [
+                {"id": "active-model", "category": "model", "currentValue": params["value"]},
+            ]}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32602, "message": "unknown configId %r" % (params.get("configId"),),
+            }})
     elif method == "session/prompt":
         sid = msg["params"]["sessionId"]
         chunk(sid, "agent_thought_chunk", "planning")
@@ -1837,6 +1959,37 @@ for line in sys.stdin:
             "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
         }})
 """
+
+
+@pytest.mark.asyncio
+async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) -> None:
+    """A model report queued behind ``session/new`` is read before the first switch.
+
+    The fake agent keys its model option ``active-model``; a configured model must
+    reach it under that id on the first turn, not the literal ``model`` fallback.
+    """
+    agent_path = tmp_path / "fake_acp_agent.py"
+    agent_path.write_text(_FAKE_ACP_AGENT)
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Fake", model="grok-4.7"))
+
+    async def elicit(tool_name: str, tool_input: dict) -> bool:
+        return True
+
+    ex._elicitation_handler = elicit  # type: ignore[assignment]
+
+    events = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], "you are a bot"):
+            events.append(ev)
+    finally:
+        await ex.close()
+
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    completions = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completions) == 1
+    assert completions[0].usage["model"] == "grok-4.7"
 
 
 @pytest.mark.asyncio
@@ -1874,7 +2027,12 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
 
     completions = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completions) == 1
-    assert completions[0].usage == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert completions[0].usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "grok-4.6",
+    }
 
     tool_reqs = [e for e in events if isinstance(e, ToolCallRequest)]
     assert tool_reqs[0].name == "shell" and tool_reqs[0].args == {"command": "echo hi"}

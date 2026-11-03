@@ -101,10 +101,12 @@ def test_blocked_reason_reaches_the_live_working_indicator(
             },
         }
     )
-    expect(working).to_contain_text("Blocked on: permission prompt", timeout=10_000)
+    expect(working).to_contain_text(
+        "Waiting for your approval in the agent's terminal.", timeout=10_000
+    )
 
     chat.emit(session_status_event(chat.session_id, "running"))
-    expect(working).not_to_contain_text("Blocked on:", timeout=10_000)
+    expect(working).not_to_contain_text("Waiting for your approval", timeout=10_000)
     expect(working.get_by_text(_WORKING_LABEL_RE)).to_be_visible(timeout=10_000)
 
     chat.emit_idle(None)

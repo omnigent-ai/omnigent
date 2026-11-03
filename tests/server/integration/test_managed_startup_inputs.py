@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
@@ -18,6 +19,7 @@ from fastapi import FastAPI
 from starlette.datastructures import Headers
 
 from omnigent.entities.conversation import ErrorData
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
@@ -26,6 +28,7 @@ from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
+from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
@@ -57,6 +60,19 @@ _INPUT = {
     "type": "message",
     "data": {"role": "user", "content": [{"type": "input_text", "text": _TEXT}]},
 }
+
+
+@pytest.fixture
+def scheduled_run_context() -> ScheduledRunLogContext:
+    return ScheduledRunLogContext(
+        task_id=uuid4().hex,
+        run_id=uuid4().hex,
+        task_workspace_id=0,
+        scheduled_at=1000,
+        trigger_key="schedule:1000",
+        target="managed_sandbox",
+        session_mode="new",
+    )
 
 
 @pytest.fixture
@@ -142,17 +158,34 @@ def _bind(env: _Env, session_id: str):
         (CODEX_NATIVE_CODING_AGENT.agent_name, True),
     ],
 )
+@pytest.mark.parametrize("scheduled", [False, True])
 async def test_saved_input_survives_service_recreation_and_dispatches_once(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, native: bool
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    native: bool,
+    scheduled,
+    scheduled_run_context,
+    caplog,
 ) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
     try:
-        session_id = await _create(env, name=name)
+        with scheduled_run_scope(scheduled_run_context if scheduled else None):
+            session_id = await _create(env, name=name)
         original = env.app.state.startup_inputs
         entry = env.conv_store.list_pending_inputs(session_id)[0]
         assert entry.status == "in_progress"
+        assert entry.data.startup_options.scheduled_run == (
+            scheduled_run_context if scheduled else None
+        )
+        assert not [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         assert snapshot["items"] == [], "accepted input must not be seeded as history"
         assert snapshot["pending_inputs"][0]["content"] == _INPUT["data"]["content"]
@@ -170,6 +203,17 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         assert len(turns) == 1 and _TEXT in json.dumps(turns[0])
         await restarted._deliver(env.app, session_id, entry)
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        sent = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        assert len(sent) == int(scheduled)
+        if scheduled:
+            assert sent[0].attributes.items() >= scheduled_run_context.model_dump().items()
+            assert sent[0].attributes["input_id"] == entry.id
+            assert sent[0].session_id == session_id
+            assert scheduled_run_context.run_id not in json.dumps(turns)
 
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         if native:
@@ -185,10 +229,16 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
 
 
 async def test_refused_delivery_retains_input_until_explicit_retry(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled_run_context,
+    caplog,
+    debug_log_rows,
 ) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
-    session_id = await _create(env)
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env)
     entry = _bind(env, session_id)
     startup = env.app.state.startup_inputs
     denied = True
@@ -205,6 +255,36 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         await startup._deliver(env.app, session_id, entry)
         assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
         assert not [event for event in forwarded if event.get("type") == "message"]
+        assert not [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        [failure] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+        ]
+        assert failure.attributes["run_id"] == scheduled_run_context.run_id
+        assert failure.attributes["outcome"] == "not_sent"
+        assert failure.attributes["failure_stage"] == "input_policy"
+        assert failure.attributes["input_id"] == entry.id
+        [refused_attempt] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+        ]
+        refused_dispatch_id = failure.attributes["dispatch_id"]
+        assert refused_dispatch_id
+        assert refused_attempt.attributes["dispatch_id"] == refused_dispatch_id
+        assert refused_attempt.attributes["input_id"] == entry.id
+        [row] = [
+            row
+            for row in debug_log_rows
+            if row["message"].startswith("Unable to deliver saved message")
+        ]
+        assert row["session_id"] == session_id
+        assert row["attributes"]["run_id"] == scheduled_run_context.run_id
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         assert any(
             item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
@@ -221,6 +301,22 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         )
         assert env.conv_store.list_pending_inputs(session_id) == []
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        [sent] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        [first_attempt, retry_attempt] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+        ]
+        assert first_attempt is refused_attempt
+        assert retry_attempt.attributes["input_id"] == sent.attributes["input_id"] == entry.id
+        retry_dispatch_id = retry_attempt.attributes["dispatch_id"]
+        assert retry_dispatch_id and retry_dispatch_id != refused_dispatch_id
+        assert sent.attributes["dispatch_id"] == retry_dispatch_id
+        assert sent.attributes["run_id"] == scheduled_run_context.run_id
     finally:
         await runner.aclose()
 
@@ -375,9 +471,13 @@ async def test_stop_cancels_local_dispatch_and_clears_saved_input(startup_env: _
     assert env.conv_store.list_pending_inputs(session_id) == []
 
 
-async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env: _Env) -> None:
+async def test_uncertain_native_submission_is_not_retried_on_restart(
+    startup_env: _Env, scheduled_run_context, caplog
+) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
-    session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
     entry = _bind(env, session_id)
     startup = env.app.state.startup_inputs
     entered = asyncio.Event()
@@ -395,6 +495,16 @@ async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env
     with pytest.raises(asyncio.CancelledError):
         await delivery
     assert env.conv_store.list_pending_inputs(session_id)[0].status == "incomplete"
+    assert not [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+    ]
+    [interrupted] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_interrupted"
+    ]
+    assert interrupted.attributes["run_id"] == scheduled_run_context.run_id
+    assert interrupted.attributes["outcome"] == "uncertain"
     entered.clear()
     await startup._deliver(env.app, session_id, entry)
     assert not entered.is_set()
@@ -1033,3 +1143,74 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "failed_stage",
+    ["runner_start", "input_claim", "prompt_send", "dispatch_bookkeeping", "post_delivery"],
+)
+async def test_saved_delivery_identifies_failed_boundary(
+    startup_env, monkeypatch, scheduled_run_context, caplog, failed_stage
+):
+    caplog.set_level(logging.INFO)
+    env = startup_env
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env)
+    entry = _bind(env, session_id)
+    forwarded = []
+    runner = _stub_runner(
+        monkeypatch, forwarded, status=503 if failed_stage == "prompt_send" else 202
+    )
+    if failed_stage == "runner_start":
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._get_runner_client",
+            AsyncMock(side_effect=ConnectionError("runner unavailable")),
+        )
+    elif failed_stage == "input_claim":
+        original = env.conv_store.transition_pending_input
+
+        def fail_claim(*args, **kwargs):
+            if kwargs.get("status") == "incomplete":
+                raise RuntimeError("claim unavailable")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(env.conv_store, "transition_pending_input", fail_claim)
+    elif failed_stage == "dispatch_bookkeeping":
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(
+            orchestration,
+            "_publish_input_consumed",
+            Mock(side_effect=RuntimeError("bookkeeping failed after acceptance")),
+        )
+    elif failed_stage == "post_delivery":
+        monkeypatch.setattr(
+            env.conv_store, "set_labels", Mock(side_effect=RuntimeError("bookkeeping failed"))
+        )
+    try:
+        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+    finally:
+        await runner.aclose()
+    failures = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].attributes["failure_stage"] == (
+        "prompt_send" if failed_stage == "dispatch_bookkeeping" else failed_stage
+    )
+    if failed_stage == "dispatch_bookkeeping":
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    assert failures[0].attributes["outcome"] == (
+        "sent"
+        if failed_stage == "post_delivery"
+        else "uncertain"
+        if failed_stage in {"prompt_send", "dispatch_bookkeeping"}
+        else "not_sent"
+    )
+    assert len(
+        [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+    ) == int(failed_stage == "post_delivery")

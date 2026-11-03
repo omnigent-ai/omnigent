@@ -121,6 +121,7 @@ def _patch_login_env(
     cached_tokens: list[str | None] | None = None,
     host_needs_selector: bool = False,
     default_workspace_id: str | None = None,
+    auth_info_org_ids: list[str | None] | None = None,
 ) -> list[str]:
     """Patch the login command's collaborators for a scripted run.
 
@@ -137,6 +138,8 @@ def _patch_login_env(
     :param default_workspace_id: What ``_databricks_default_workspace_id``
         returns — the workspace the CLI recorded for the host. Defaults to
         ``None`` so tests never read the developer's real ``~/.databrickscfg``.
+    :param auth_info_org_ids: When given, collects the ``org_id`` each
+        workspace auth lookup was asked for.
     :returns: A list capturing each ``subprocess.run`` argv (the
         ``databricks auth login`` invocations).
     """
@@ -159,7 +162,11 @@ def _patch_login_env(
     )
     tokens = list(cached_tokens if cached_tokens is not None else ["tok-cached"])
 
-    def _auth_info(workspace_host: str) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+    def _auth_info(
+        workspace_host: str, org_id: str | None = None
+    ) -> cli_mod._DatabricksWorkspaceAuthInfo | None:
+        if auth_info_org_ids is not None:
+            auth_info_org_ids.append(org_id)
         token = tokens.pop(0)
         if token is None:
             return None
@@ -832,11 +839,13 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
             _response(200, body={"user_id": "alice@example.com"}),
         ]
     )
+    auth_info_org_ids: list[str | None] = []
     login_calls = _patch_login_env(
         monkeypatch,
         fake_httpx=fake,
         # Force the browser login so the --host argv is observable.
         cached_tokens=[None, "tok-fresh"],
+        auth_info_org_ids=auth_info_org_ids,
     )
 
     result = CliRunner().invoke(cli_group, ["login", _SELECTOR_URL])
@@ -848,6 +857,9 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
     # The verify request routes to the workspace via ?o= (and used the token).
     assert fake.requests[-1]["params"] == {"o": _ORG_ID}
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
+    # Both token lookups ask for the selected workspace, so a profile pinned
+    # to it wins over others on the same host.
+    assert auth_info_org_ids == [_ORG_ID, _ORG_ID]
     # Persisted after verification, keyed by the query-free canonical base.
     assert load_databricks_org_id(_WORKSPACE) == _ORG_ID
     assert load_databricks_workspace_host(_WORKSPACE) == _WORKSPACE
@@ -1168,6 +1180,62 @@ def test_workspace_url_expands_bare_workspace_host(
     assert cli_mod._workspace_api_server_url(_WORKSPACE) == _WORKSPACE_API_URL
 
 
+@pytest.mark.parametrize("path", ["/", "/omnigent"])
+def test_workspace_url_names_the_requested_workspace_not_the_stored_one(
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    token_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The expansion notice shows the caller's ``?o=``, not the last login's.
+
+    One host fronts several workspaces; the stored record holds whichever was
+    logged into last, so falling back to it named the wrong workspace.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    store_databricks_auth(_WORKSPACE_API_URL, _WORKSPACE, org_id="111")
+    _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_WORKSPACE}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_WORKSPACE_API_URL}/v1/me": _response(
+                401,
+                headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'},
+            ),
+        },
+    )
+
+    assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}{path}?o=222") == _WORKSPACE_API_URL
+    assert f"Using {_WORKSPACE}/omnigent?o=222 " in capsys.readouterr().err
+
+
+def test_workspace_auth_info_asks_the_resolver_for_the_requested_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI helper forwards the ``?o=`` workspace to the profile walk."""
+    from omnigent.inner import databricks_executor
+
+    calls: list[dict[str, object]] = []
+
+    class _Auth:
+        profile_name = "target"
+
+        def current_token(self) -> str:
+            return "tok"
+
+    def _resolve(**kwargs: object) -> tuple[_Auth, str]:
+        calls.append(kwargs)
+        return _Auth(), _WORKSPACE
+
+    monkeypatch.setattr(databricks_executor, "_resolve_databricks_auth", _resolve)
+
+    info = cli_mod._databricks_workspace_auth_info(_WORKSPACE, "222")
+
+    assert info is not None and info.token == "tok" and info.profile_name == "target"
+    assert calls == [{"host": _WORKSPACE, "workspace_id": "222"}]
+
+
 def test_workspace_url_leaves_oss_server_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1251,6 +1319,7 @@ def test_workspace_url_with_path_probes_nothing(
 
 def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A mount invisible to anonymous probes expands via a cached bearer.
 
@@ -1302,6 +1371,9 @@ def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
         f"{_WORKSPACE_API_URL}/v1/me",
     ]
     assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "(Databricks workspace-hosted omnigent)." in captured.err
 
 
 def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
@@ -1336,10 +1408,12 @@ def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
     # anonymous probes ran. A third request here would mean a Bearer
     # header was fabricated from nothing.
     assert [r["authorization"] for r in fake.requests] == [None, None]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    # Hints go to stderr so a command's JSON stdout stays parseable.
+    assert captured.out == ""
     # The hint must name the remedy, otherwise the user is back to
     # debugging an opaque host-tunnel 404 on the bare workspace URL.
-    assert f"databricks auth login --host {_WORKSPACE}" in out
+    assert f"databricks auth login --host {_WORKSPACE}" in captured.err
 
 
 def test_workspace_url_hints_when_authed_probe_also_misses(
@@ -1375,10 +1449,11 @@ def test_workspace_url_hints_when_authed_probe_also_misses(
     # The authed retry ran and presented the cached bearer; without it
     # this test would be identical to the no-grant case.
     assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
     # The message must say credentials were already tried — pointing
     # the user at `auth login` alone would send them in a circle.
-    assert "even with the cached workspace credentials" in out
+    assert "even with the cached workspace credentials" in captured.err
 
 
 def test_workspace_url_skips_authed_probe_without_databricks_extra(
@@ -1585,12 +1660,15 @@ def test_resolve_server_url_works_without_writable_auth_state(
 
 def test_workspace_url_expands_web_ui_path_to_api_mount(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The guide's web-UI URL (``<ws>/omnigent``) expands to the API mount.
 
     The internal user guide hands out ``<ws>/omnigent`` for the browser;
     a user who pastes it into ``omnigent login`` must reach the API mount
-    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe.
+    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe. The
+    desktop passes this URL to ``host status --json`` and parses its
+    stdout, so the expansion notice must stay on stderr.
     """
 
     probed = _scripted_normalizer_httpx(
@@ -1606,6 +1684,9 @@ def test_workspace_url_expands_web_ui_path_to_api_mount(
     assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}/omnigent") == _WORKSPACE_API_URL
     # The bare root and its API mount were probed — never the UI path itself.
     assert f"{_WORKSPACE}/omnigent/v1/me" not in probed
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "(Databricks workspace-hosted omnigent)." in captured.err
 
 
 def test_workspace_url_web_ui_path_left_alone_off_workspace(
