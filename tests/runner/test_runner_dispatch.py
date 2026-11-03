@@ -8501,6 +8501,147 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_config_bundle_refuses_nested_symlink_deref(
+    tmp_path: Path,
+) -> None:
+    """A nested symlink inside a ``config_path`` directory must not be
+    dereferenced into the uploaded bundle.
+
+    Regression for host-side secret exfiltration: the top-level
+    ``config_path`` containment check does not recurse into directory
+    contents, so a symlink whose target lives outside the caller's
+    working directory must be preserved as a link or refused — its bytes
+    must never be copied into the uploaded bundle as a regular file.
+    Mirrors the sibling export_agent guard
+    (test_invoke_does_not_dereference_source_symlink).
+    """
+    import io
+    import tarfile
+
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    secret = tmp_path / "runner-secret.txt"
+    secret.write_text("RUNNER_SECRET_SENTINEL\n")
+
+    cwd = tmp_path / "work"
+    agent_dir = cwd / "agentdir"
+    (agent_dir / "sub").mkdir(parents=True)
+    (agent_dir / "config.yaml").write_text("name: helper\nprompt: do helpful things\n")
+    (agent_dir / "sub" / "leak").symlink_to(secret)
+    # The link target is outside the caller's cwd, so the top-level
+    # containment check passes it; only recursion into contents can stop it.
+    assert not secret.resolve().is_relative_to(cwd.resolve())
+
+    create_requests: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_requests.append(request)
+            return httpx.Response(
+                201,
+                json={"session_id": "conv_child", "agent_id": "ag_new", "agent_name": "helper"},
+            )
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "agentdir", "title": "helper"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=cwd,
+        )
+
+    assert len(create_requests) == 1
+    parts = _parse_multipart_create(create_requests[0])
+    with tarfile.open(fileobj=io.BytesIO(parts["bundle"]), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if member.isfile():
+                extracted = tf.extractfile(member)
+                content = extracted.read() if extracted else b""
+                assert b"RUNNER_SECRET_SENTINEL" not in content, (
+                    f"bundle member {member.name!r} leaked the out-of-cwd symlink "
+                    "target's bytes (nested symlink was dereferenced)"
+                )
+
+
+@pytest.mark.parametrize("walk_beneath", [True, False], ids=["dir_fd", "path_fallback"])
+def test_bundle_local_agent_source_packs_nested_links_as_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walk_beneath: bool
+) -> None:
+    """Both walks pack a nested symlink as a link member, not its target's
+    bytes; the server accepts the clean bundle and refuses the linked one."""
+    import io
+    import tarfile
+
+    from omnigent.errors import OmnigentError
+    from omnigent.runner import tool_dispatch
+    from omnigent.server.bundles import validate_agent_bundle
+
+    if walk_beneath and not tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
+        pytest.skip("platform lacks dir_fd traversal")
+    monkeypatch.setattr(tool_dispatch, "_BUNDLE_WALK_BENEATH_SUPPORTED", walk_beneath)
+
+    secret = tmp_path / "runner-secret.txt"
+    secret.write_text("RUNNER_SECRET_SENTINEL\n")
+    root = tmp_path / "work"
+    agent_dir = root / "agentdir"
+    (agent_dir / "sub").mkdir(parents=True)
+    config_text = (
+        "spec_version: 1\nname: helper\n"
+        "executor:\n  type: omnigent\n  config:\n    harness: claude-sdk\nprompt: hi\n"
+    )
+    (agent_dir / "config.yaml").write_text(config_text)
+    (agent_dir / "sub" / "notes.md").write_text("notes\n")
+
+    clean_bundle = tool_dispatch._bundle_local_agent_source(root, agent_dir)
+    assert validate_agent_bundle(clean_bundle).name == "helper"
+
+    (agent_dir / "sub" / "leak").symlink_to(secret)
+    bundle = tool_dispatch._bundle_local_agent_source(root, agent_dir)
+
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        members = {member.name: member for member in tf.getmembers()}
+        assert sorted(members) == ["config.yaml", "sub/leak", "sub/notes.md"]
+        assert members["sub/leak"].issym()
+        assert members["sub/leak"].linkname == str(secret)
+        extracted = tf.extractfile("config.yaml")
+        assert extracted is not None
+        assert extracted.read().decode() == config_text
+    with pytest.raises(OmnigentError, match="link"):
+        validate_agent_bundle(bundle)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX symlinks and FIFOs")
+def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
+    tmp_path: Path,
+) -> None:
+    """A component swapped for a symlink after resolution fails the walk,
+    and a FIFO is refused without blocking."""
+    from omnigent.runner import tool_dispatch
+
+    root = tmp_path / "work"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "config.yaml").write_text("name: RUNNER_SECRET_SENTINEL\n")
+    (root / "agentdir").symlink_to(outside, target_is_directory=True)
+    if tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
+        with pytest.raises(OSError):
+            tool_dispatch._bundle_local_agent_source(root, root / "agentdir" / "config.yaml")
+
+    agent_dir = root / "fifo_agent"
+    agent_dir.mkdir()
+    (agent_dir / "config.yaml").write_text("name: helper\n")
+    os.mkfifo(agent_dir / "pipe")
+    with pytest.raises(OSError, match="unsupported file type"):
+        tool_dispatch._bundle_local_agent_source(root, agent_dir)
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_config_path_escape_rejected(
     tmp_path: Path,
 ) -> None:
