@@ -254,20 +254,24 @@ function renderSidebar(
   config: SidebarConfig = sidebarConfig,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
-  return render(
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <CapabilitiesProvider info={info ?? "loading"}>
         <SidebarDataProvider config={config}>
           <ExtensionCatalogProvider extensions={extensions}>
             <TooltipProvider>
-              <MemoryRouter initialEntries={[initialEntry]}>{sidebar}</MemoryRouter>
+              <MemoryRouter initialEntries={[initialEntry]}>
+                <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />
+              </MemoryRouter>
             </TooltipProvider>
           </ExtensionCatalogProvider>
         </SidebarDataProvider>
       </CapabilitiesProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  // Re-render the same tree, as a query does when the hook mocks return new data.
+  return { ...result, refresh: () => result.rerender(tree()) };
 }
 
 // Session scope lives in the Sessions heading's filter menu; pick an option to
@@ -2798,9 +2802,12 @@ describe("Sidebar project Show more", () => {
     });
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
-    const fetchNextPage = vi.fn();
+    // The next server page brings three older sessions.
+    const fetchNextPage = vi.fn(() => {
+      projectSessionsMock.current["Customer X"] = filedSessions(15);
+    });
     projectSessionsNextPage.current["Customer X"] = fetchNextPage;
-    renderSidebar();
+    const { refresh } = renderSidebar();
     toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(5));
 
@@ -2818,6 +2825,8 @@ describe("Sidebar project Show more", () => {
       observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
     });
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    refresh();
+    expect(folderRowIds()).toEqual(filedIds(15));
 
     // Turning it back on returns the open folder to one page.
     act(() => writeProjectFolderPagination(true));
