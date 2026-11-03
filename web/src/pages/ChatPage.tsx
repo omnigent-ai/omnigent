@@ -4001,6 +4001,7 @@ function ComposerImpl(
             prs={composerGit.prs}
             prStatus={composerGit.prStatus}
             onOpen={openComposerGithubTab}
+            conversationId={composerSessionId ?? undefined}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
             <div

@@ -18309,6 +18309,39 @@
               ],
               "title": "Pr Url"
             }
+          },
+          {
+            "description": "With `base_sha`, the revision of the displayed patch; the list is rejected when the PR moved off it.",
+            "in": "query",
+            "name": "head_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Head Sha"
+            }
+          },
+          {
+            "in": "query",
+            "name": "base_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Base Sha"
+            }
           }
         ],
         "responses": {

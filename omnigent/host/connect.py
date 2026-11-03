@@ -4252,7 +4252,12 @@ class HostProcess:
                 str(params.get("after", "")),
             )
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),

@@ -39,6 +39,33 @@ _INVALID_MERMAID = (
     "    Note over A,B: proceed once; do not call Save\n"
     "    A=>B: again\n```"
 )
+_LONG_LABEL_MERMAID = """\
+```mermaid
+flowchart LR
+  subgraph nonprod["Dev / staging account"]
+    G["dev-aws-…-general1-vector-aggregator-role"]
+    S["us-west-2-vector-aggregator-role (SMK)"]
+  end
+  subgraph audit["aws-audit (prod)"]
+    W["MeterletK8sSecflowLogsWriterDev"]
+    R["MeterletK8sSecflowLogsWriterDev-us-west-2"]
+  end
+  G -- AssumeRole --> W
+  S -- AssumeRole --> R
+  W -. "matches carve-out: no alert" .-> OK(("✓"))
+  R -. "target ARN not in carve-out: alert" .-> SOC(("SA ticket"))
+```"""
+# Text of every Mermaid label whose laid-out lines spill outside its foreignObject box.
+_CLIPPED_MERMAID_LABELS = """svg => [...svg.querySelectorAll('foreignObject')].flatMap(label => {
+    const box = label.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    const clipped = [...range.getClientRects()].some(line => line.width && line.height && (
+        line.left < box.left - 1 || line.right > box.right + 1
+        || line.top < box.top - 1 || line.bottom > box.bottom + 1
+    ));
+    return clipped ? [label.textContent.trim()] : [];
+})"""
 _POINTER_CONTEXTS = [
     pytest.param(
         True,
@@ -315,17 +342,17 @@ def test_mermaid_fence_loads_its_chunk_and_renders_svg(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """The built SPA serves Mermaid's lazy chunk and renders a real diagram."""
+    """The built SPA serves Mermaid's lazy chunk and renders every label inside its box."""
     chat = chat_session_contract
-    _seed_assistant_message(
-        chat,
-        "```mermaid\nflowchart LR\n  A[Client] --> B[Server]\n```",
-    )
+    _seed_assistant_message(chat, _LONG_LABEL_MERMAID)
     page.goto(chat.url)
 
     block = page.locator('[data-streamdown="mermaid-block"]').first
     expect(block).to_be_visible(timeout=20_000)
-    expect(block.locator("svg[aria-roledescription]")).to_be_visible(timeout=20_000)
+    diagram = block.locator("svg[aria-roledescription]")
+    expect(diagram).to_be_visible(timeout=20_000)
+    page.evaluate("() => document.fonts.ready")
+    assert diagram.evaluate(_CLIPPED_MERMAID_LABELS) == []
 
 
 @pytest.mark.parametrize("diagram", ["semicolons", "separators", "invalid"])
