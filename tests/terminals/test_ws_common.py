@@ -109,17 +109,32 @@ class _FakeProcess:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stdout", "expected_alive", "expected_dead"),
-    [(b"0\n", True, False), (b"1\n", False, True)],
+    [
+        (b"0\n", True, False),
+        (b"1\n", False, True),
+        (b"\n", False, None),
+        (b"unknown\n", False, None),
+    ],
 )
 async def test_tmux_liveness_uses_pane_dead_flag(
     monkeypatch: pytest.MonkeyPatch,
     stdout: bytes,
     expected_alive: bool,
-    expected_dead: bool,
+    expected_dead: bool | None,
 ) -> None:
     process = _FakeProcess(stdout)
 
     async def _create(*args: object, **kwargs: object) -> _FakeProcess:
+        assert args == (
+            "tmux",
+            "-S",
+            "socket",
+            "display-message",
+            "-p",
+            "-t",
+            "main",
+            "#{pane_dead}",
+        )
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _create)
