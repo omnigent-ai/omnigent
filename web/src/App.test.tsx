@@ -80,6 +80,7 @@ vi.mock("@/extensions/ExtensionProvider", () => ({
 }));
 
 import App from "./App";
+import { useOmnigentPageView } from "@/lib/analytics";
 
 const chunkError = vi.hoisted(
   () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
@@ -171,6 +172,7 @@ describe("ordinary page render failures", () => {
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("offers recovery at $path without reloading", async ({ path, basename, needsSetup }) => {
+    vi.mocked(useOmnigentPageView).mockClear();
     render(
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, accounts_enabled: needsSetup, needs_setup: needsSetup }}
@@ -191,6 +193,7 @@ describe("ordinary page render failures", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(reload).not.toHaveBeenCalled();
+    if (!needsSetup) expect(useOmnigentPageView).not.toHaveBeenCalled();
   });
 
   it.each([
