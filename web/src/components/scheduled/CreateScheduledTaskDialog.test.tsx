@@ -7,7 +7,6 @@ import { testAgent } from "@/test/agentFixtures";
 // The agent/host hooks and the create mutation are mocked; WorkspacePicker is
 // stubbed (its filesystem browsing is out of scope here).
 
-import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
 import type React from "react";
@@ -27,6 +26,8 @@ import {
   shouldGuardDialogDismiss,
 } from "./CreateScheduledTaskDialog";
 import * as agentsHook from "@/hooks/useAvailableAgents";
+import * as identity from "@/lib/identity";
+import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -40,6 +41,10 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: undefined })),
+}));
+vi.mock("@/hooks/useSandboxModelOptions", async (original) => ({
+  ...(await original<typeof sandboxModelsHook>()),
+  useSandboxModelOptions: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
@@ -108,6 +113,14 @@ vi.mock("@/shell/NewChatDialog", () => ({
       data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
     >
       <span>{agentLabel}</span>
+      {harnessEntries
+        .filter((agent) => agent.name !== "claude-native-ui")
+        .map((agent) => (
+          <button key={agent.id} type="button" onClick={() => onSelectAgent(agent)}>
+            pick {agent.harness}
+          </button>
+        ))}
+
       <button
         type="button"
         data-testid="pick-harness-claude"
@@ -143,18 +156,6 @@ vi.mock("@/shell/NewChatDialog", () => ({
   ),
 }));
 
-// nativeAgentHasCapability(claude-native, "permissionMode") must be true so the
-// model/effort knobs map onto the payload; polly (claude-sdk) has no knobs.
-vi.mock("@/lib/nativeCodingAgents", async (orig) => {
-  const actual = await orig<typeof NativeCodingAgentsModule>();
-  return {
-    ...actual,
-    isNativeCodingAgent: (a: AvailableAgent) => a?.name === "claude-native-ui",
-    nativeAgentHasCapability: (a: AvailableAgent | undefined | null, cap: string) =>
-      a?.name === "claude-native-ui" && cap === "permissionMode",
-  };
-});
-
 const AGENTS: AvailableAgent[] = [
   testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
   testAgent("ag_claude_native", "claude-native-ui", {
@@ -167,6 +168,12 @@ const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
+  vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+    typeof hostsHook.useHostModelOptions
+  >);
+  vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+    data: undefined,
+  } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
   projectsQuery.current = { data: PROJECTS, isPending: false, isSuccess: true, isError: false };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
@@ -189,6 +196,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
+  localStorage.clear();
   vi.useRealTimers();
 });
 
@@ -196,7 +205,11 @@ function render(ui: Parameters<typeof renderBase>[0]) {
   return renderBase(ui, {
     wrapper: ({ children }) => (
       <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: true } }}
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_harness_settings: true,
+        }}
       >
         {children}
       </CapabilitiesProvider>
@@ -325,8 +338,9 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(submit).toBeEnabled();
   });
 
-  it("pins a workspace only after the full-screen browser confirms", () => {
-    renderDialog();
+  it("pins a workspace on confirmation and waits for reconnection if its host disconnects", () => {
+    const onOpenChange = vi.fn();
+    const { rerender } = renderDialog(onOpenChange);
     const hostTrigger = screen.getByTestId("task-host-trigger");
     fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
     fireEvent.click(hostTrigger);
@@ -340,6 +354,26 @@ describe("CreateScheduledTaskDialog validation", () => {
 
     expect(screen.queryByTestId("workspace-picker-dialog")).toBeNull();
     expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getAllByText("/home/me/repo")).toHaveLength(2);
+
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(screen.getByTestId("task-workspace-browse")).toBeEnabled();
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.getByTestId("workspace-picker-dialog")).toBeInTheDocument();
   });
 });
 
@@ -607,11 +641,17 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   });
 
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
     renderWithSandboxes();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+    expect(screen.queryByText("Connect your host to select a workspace.")).not.toBeInTheDocument();
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -718,13 +758,18 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
 
     await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
+    const browse = screen.getByTestId("task-workspace-browse");
+    expect(browse).toBeDisabled();
+    expect(browse).toHaveAccessibleDescription("Connect your host to select a workspace.");
+    fireEvent.click(browse);
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
   });
 
-  it("keeps the saved workspace in view and in the update when the host changes", async () => {
+  it("preserves a saved workspace when switching to an offline host, but disables browsing", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [
         { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
-        { host_id: "host_2", name: "desktop", owner: "me", status: "online" },
+        { host_id: "host_2", name: "desktop", owner: "me", status: "offline" },
       ],
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     render(
@@ -741,6 +786,10 @@ describe("CreateScheduledTaskDialog submit", () => {
 
     // Omitting the workspace would keep the saved one, so the form keeps showing it.
     expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+    expect(screen.getByTestId("task-workspace-browse")).toBeDisabled();
+    expect(screen.getByText("Connect your host to select a workspace.")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
@@ -1275,7 +1324,229 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
+    for (const field of ["model", "effort", "permission"]) {
+      expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+    }
+    expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
   });
+
+  it.each([false, true])(
+    "locks existing session settings with session controls supported=%s",
+    async (sessionModesSupported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: sessionModesSupported,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+      }
+      expect(screen.getByTestId("task-session-settings-note")).toHaveTextContent(
+        "To change model, effort, or permission mode, edit the existing session directly.",
+      );
+      fireEvent.change(screen.getByTestId("task-prompt-input"), {
+        target: { value: "Updated prompt" },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.prompt).toBe("Updated prompt");
+      for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+        expect(input).not.toHaveProperty(field);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "only saves edited session settings when reset stays selected=%s",
+    async (reset) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              modelOverride: "sonnet",
+              reasoningEffort: "medium",
+              permissionMode: "plan",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              hostId: "host_1",
+              workspace: "/home/me/canonical-repo",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+
+      fireEvent.click(screen.getByTestId("task-workspace-browse"));
+      fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("task-start-new-session"));
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+      for (const [field, option] of [
+        ["model", "Opus"],
+        ["effort", "High"],
+        ["permission", "Auto"],
+      ]) {
+        const control = screen.getByTestId(`task-${field}-trigger`);
+        expect(control).toBeEnabled();
+        fireEvent.keyDown(control, { key: "Enter" });
+        fireEvent.click(screen.getByRole("option", { name: option }));
+      }
+      if (!reset) {
+        fireEvent.click(screen.getByTestId("task-start-new-session"));
+        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
+        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
+        for (const field of ["model", "effort", "permission"]) {
+          expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+        }
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      if (reset) {
+        expect(input).toMatchObject({
+          modelOverride: "opus",
+          reasoningEffort: "high",
+          permissionMode: "auto",
+          sessionId: null,
+        });
+      } else {
+        for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+          expect(input).not.toHaveProperty(field);
+        }
+      }
+    },
+  );
+
+  it("allows configuring a continuing task before its first session exists", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_claude_native", sessionMode: "continue" })}
+      />,
+    );
+    for (const field of ["model", "effort", "permission"]) {
+      expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+    }
+    expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+  });
+
+  it.each(["session mode", "host"])(
+    "unlocks settings when changing the %s starts a new session",
+    async (change) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              modelOverride: "opus",
+              reasoningEffort: "high",
+              permissionMode: "auto",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+      fireEvent.keyDown(
+        screen.getByTestId(change === "host" ? "task-host-trigger" : "task-session-mode-trigger"),
+        { key: "Enter" },
+      );
+      fireEvent.click(
+        await screen.findByRole("option", {
+          name: change === "host" ? "laptop" : "New session each run",
+        }),
+      );
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeEnabled();
+      }
+      expect(screen.queryByTestId("task-session-settings-note")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input).toMatchObject({
+        modelOverride: change === "host" ? null : "opus",
+        reasoningEffort: change === "host" ? null : "high",
+        permissionMode: "auto",
+      });
+      expect(input).not.toHaveProperty("sessionId");
+      if (change === "host") {
+        expect(input.hostId).toBe("host_1");
+        expect(input).not.toHaveProperty("sessionMode");
+      } else {
+        expect(input.sessionMode).toBe("new");
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps workspace aliases locked without reset with session controls supported=%s",
+    async (sessionModesSupported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            scheduled_task_session_modes: sessionModesSupported,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              hostId: "host_1",
+              workspace: "/home/me/canonical-repo",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      // The picker returns an alias; only the server can resolve it to the saved directory.
+      fireEvent.click(screen.getByTestId("task-workspace-browse"));
+      fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+      expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+      for (const field of ["model", "effort", "permission"]) {
+        expect(screen.getByTestId(`task-${field}-trigger`)).toBeDisabled();
+      }
+      expect(screen.getByTestId("task-session-settings-note")).toBeVisible();
+      if (!sessionModesSupported) {
+        expect(screen.queryByTestId("task-start-new-session")).not.toBeInTheDocument();
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.workspace).toBe("/home/me/repo");
+      expect(input.hostId).toBe("host_1");
+      for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
+        expect(input).not.toHaveProperty(field);
+      }
+    },
+  );
 
   it("threads model + effort + permission through update on edit, nulling a cleared override", async () => {
     render(
@@ -1762,7 +2033,6 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
   it("replaces the prompt with a trigger builder, runs hourly and locks one kept session", () => {
     renderTrigger("jira");
-
     expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
@@ -1775,9 +2045,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
       "Runs your automation on all new tickets that match these conditions. Older tickets are skipped, even if they are edited to match later.",
     );
-    // The form says the source is untrusted and that link-back writes there.
-    const note = screen.getByTestId("task-trigger-untrusted-note");
-    expect(note).toHaveTextContent("Anyone who can write in what you watch can try to steer");
+    expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
+      "Each run handles up to 10 new tickets, oldest first. The rest are picked up on the next run.",
+    );
+    // The form warns the source is untrusted and says link-back writes there.
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can create a ticket in this project can add instructions that the agent may follow. The agent runs with your tools and your permissions. Make sure you trust them.",
+    );
+    const note = screen.getByTestId("task-trigger-attribution-note");
     expect(note).toHaveTextContent("Link-back posts to Jira with your account.");
     expect(note).toHaveTextContent(
       'Anything posted with your account ends with "Sent with Omnigent".',
@@ -1843,7 +2118,11 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
     const prompt = await submittedPrompt();
     const arg = mutateAsync.mock.calls[0][0];
-    expect(arg).toMatchObject({ name: "Jira tickets", sessionMode: "continue" });
+    expect(arg).toMatchObject({
+      name: "Jira tickets",
+      sessionMode: "continue",
+      templateId: "jira",
+    });
     expect(arg.rrule).toMatch(/^FREQ=HOURLY/);
     expect(prompt).toContain(
       '(project = "ES" AND labels = "omnigent" AND issuetype != "Epic" AND (summary ~ "crash")) AND created >= <that time> ORDER BY created ASC',
@@ -1887,6 +2166,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("leaves the link-back step out when then only starts the session", async () => {
     renderTrigger("slack");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Message posted");
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can post in this channel can add instructions",
+    );
     type("task-trigger-scope", "#eng-support");
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
     type("task-trigger-condition-0-value", "error");
@@ -1894,16 +2176,20 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     pick("task-trigger-then", "task-trigger-then-none");
 
     const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("slack");
     expect(prompt).toContain(
       'Watch: new Slack messages in #eng-support whose text contains "error"',
     );
     expect(prompt).not.toContain("Omnigent session:");
   });
 
-  it("hands the rendered prompt to the plain Prompt field on Edit as prompt", () => {
+  it("hands the rendered prompt to the plain Prompt field on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
+    const warning = screen.getByTestId("task-trigger-untrusted-note");
+    expect(warning).toHaveTextContent("Anyone who can open an issue in this repository can add");
     pick("task-trigger-event", "task-trigger-event-pr");
+    expect(warning).toHaveTextContent("Anyone who can open a pull request in this repository can");
     type("task-trigger-scope", "acme/app");
     type("task-trigger-instructions", "Fix it.");
     fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
@@ -1913,6 +2199,10 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
+    const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
+    fireEvent.change(prompt, { target: { value: editedPrompt } });
+    expect(await submittedPrompt()).toBe(editedPrompt);
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("github");
   });
 });
 
@@ -2013,6 +2303,458 @@ describe("scheduler capabilities", () => {
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
+    },
+  );
+});
+
+describe("automation harness settings", () => {
+  const models = [
+    {
+      id: "model-a",
+      displayName: "Model A",
+      isDefault: true,
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "low" }],
+    },
+    {
+      id: "model-b",
+      displayName: "Model B",
+      supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+    },
+  ];
+  function mockHarness(harness: string) {
+    const agent = testAgent("selected-agent", `${harness}-ui`, { harness });
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({ data: [agent] } as ReturnType<
+      typeof agentsHook.useAvailableAgents
+    >);
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: models } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    return agent;
+  }
+  async function choose(field: string, option: string) {
+    fireEvent.keyDown(screen.getByTestId(`task-${field}-trigger`), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: option }));
+  }
+
+  it.each([
+    ["codex-native", true, true, true],
+    ["pi-native", true, true, false],
+    ["devin-native", true, true, true],
+    ["cursor-native", false, false, true],
+    ["antigravity-native", false, false, true],
+    ["opencode-native", false, false, false],
+  ])("shows independent settings for %s", (harness, model, effort, permission) => {
+    mockHarness(harness);
+    renderDialog();
+    expect(!!screen.queryByTestId("task-model-trigger")).toBe(model);
+    expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
+    expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
+    expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
+  });
+
+  it("creates Codex settings and resets an effort the next model cannot support", async () => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialName="Review"
+        initialPrompt="Review changes"
+      />,
+    );
+    await choose("model", "Model A");
+    await choose("effort", "High");
+    await choose("model", "Model B");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
+    await choose("effort", "Low");
+    await choose("permission", "Read only");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      modelOverride: "model-b",
+      reasoningEffort: "low",
+      permissionMode: "read-only",
+    });
+  });
+
+  it("preserves saved Codex settings while offline, and can clear them", async () => {
+    const agent = mockHarness("codex-native");
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "offline host", status: "offline" }],
+    } as ReturnType<typeof hostsHook.useHosts>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: agent.id,
+          modelOverride: "saved-model",
+          reasoningEffort: "high",
+          permissionMode: "read-only",
+          hostId: "host_1",
+        })}
+      />,
+    );
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("high");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read only");
+    expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", "codex-native", false);
+    await choose("model", "Default");
+    await choose("permission", "Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: null,
+      reasoningEffort: null,
+      permissionMode: null,
+    });
+  });
+
+  it("clears Codex overrides when switching to a permission-only harness", async () => {
+    const codex = mockHarness("codex-native");
+    const cursor = testAgent("cursor-agent", "cursor-native-ui", { harness: "cursor-native" });
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [codex, cursor],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: codex.id,
+          modelOverride: "model-a",
+          reasoningEffort: "high",
+          permissionMode: "read-only",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "pick cursor-native" }));
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    await choose("permission", "Auto-review");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      agentId: cursor.id,
+      permissionMode: "auto-review",
+    });
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("modelOverride");
+  });
+
+  it.each(["codex-native", "cursor-native", "claude-native", "pi-native"])(
+    "uses the sandbox catalog for %s instead of the connected host's",
+    async (harness) => {
+      const agent = mockHarness(harness);
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data: {
+          models: [
+            {
+              ...models[0],
+              id: "sandbox-model",
+              displayName: "Sandbox model",
+              supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+            },
+          ],
+          configured: false,
+          status: "ready",
+        },
+      } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      render(sandboxDialog(agent.id, true));
+      expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith(null, harness, false);
+      await choose("model", "Sandbox model");
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sandbox model");
+      fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+      expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+      expect(sandboxModelsHook.useSandboxModelOptions).toHaveBeenLastCalledWith(
+        "company",
+        harness,
+        agent.id,
+        null,
+        true,
+      );
+    },
+  );
+
+  function sandboxDialog(
+    agentId: string,
+    editing = false,
+    overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {},
+  ) {
+    return (
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "company",
+          sandbox_provider_capabilities: { company: { default_models: true } },
+          scheduled_task_harness_settings: true,
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          initialName="Sandbox review"
+          initialPrompt="Review work"
+          editingTask={
+            editing
+              ? scheduledTask({
+                  agentId,
+                  executionTarget: "managed_sandbox",
+                  hostId: null,
+                  ...overrides,
+                })
+              : null
+          }
+        />
+      </CapabilitiesProvider>
+    );
+  }
+
+  it.each(["claude-native", "pi-native"])(
+    "uses provider effort support for %s sandbox models",
+    (harness) => {
+      const agent = mockHarness(harness);
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data: {
+          models: [{ id: "provider-model", isDefault: true }],
+          configured: false,
+          status: "ready",
+        },
+      } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      render(sandboxDialog(agent.id, true));
+      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["host", "sandbox"])(
+    "clears target-specific overrides when moving to another %s",
+    async (target) => {
+      const agent = mockHarness("codex-native");
+      vi.mocked(hostsHook.useHosts).mockReturnValue({
+        data: [
+          { host_id: "host_1", name: "laptop", status: "online" },
+          { host_id: "host_2", name: "desktop", status: "online" },
+        ],
+      } as ReturnType<typeof hostsHook.useHosts>);
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: agent.id,
+              hostId: "host_1",
+              modelOverride: "saved-model",
+              reasoningEffort: "high",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      const changeTarget = async () => {
+        if (target === "host") await choose("host", "desktop");
+        else {
+          fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+          fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+        }
+      };
+      await changeTarget();
+      fireEvent.click(screen.getByRole("button", { name: "pick codex-native" }));
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Default");
+      fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+      expect(screen.queryByRole("option", { name: "saved-model" })).not.toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+      await choose("host", "laptop");
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
+      await changeTarget();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        modelOverride: null,
+        reasoningEffort: null,
+      });
+    },
+  );
+
+  it("clears sandbox model settings when the connected-host harness has no model controls", async () => {
+    const agent = mockHarness("cursor-native");
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    render(sandboxDialog(agent.id, true, { modelOverride: "model-a", reasoningEffort: "high" }));
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    await choose("host", "laptop");
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: null,
+      reasoningEffort: null,
+    });
+  });
+
+  it.each([
+    ["codex-native", null],
+    ["claude-native", "default"],
+  ])("normalizes a saved default permission for %s", async (harness, expected) => {
+    const agent = mockHarness(harness!);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: agent.id, permissionMode: "default" })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBe(expected);
+  });
+
+  it.each([false, true])(
+    "blocks an explicitly unsupported sandbox in edit=%s, but recovers after a failed preview",
+    async (editing) => {
+      const agent = mockHarness("codex-native");
+      const data = {
+        models: [],
+        configured: false,
+        status: "unsupported" as const,
+        error: "This sandbox cannot run Codex.",
+      };
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data,
+        isError: false,
+      } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      const { rerender } = render(sandboxDialog(agent.id, editing));
+      if (!editing) {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+      }
+      expect(screen.getByTestId("task-harness-unsupported")).toHaveTextContent(data.error);
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      expect(mutateAsync).not.toHaveBeenCalled();
+      expect(updateMutateAsync).not.toHaveBeenCalled();
+      // React Query retains data after a refetch error; it must no longer block.
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data,
+        isError: true,
+        error: new Error("Network unavailable"),
+      } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      rerender(sandboxDialog(agent.id, editing));
+      expect(screen.queryByTestId("task-harness-unsupported")).not.toBeInTheDocument();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    },
+  );
+
+  it("restores host models and efforts across reopening while offline, and respects a fresh empty catalog", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
+    mockHarness("codex-native");
+    const first = renderDialog();
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    first.unmount();
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "Offline host", status: "offline" }],
+    } as ReturnType<typeof hostsHook.useHosts>);
+    const { rerender } = renderDialog();
+    await choose("host", "Offline host (offline)");
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    await choose("model", "Model A");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: [] } as unknown as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    // Clear the explicit selection; cached choices must not resurrect the old list.
+    await choose("model", "Default");
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(screen.queryByRole("option", { name: "Model A" })).not.toBeInTheDocument();
+  });
+
+  it("does not renew expired host choices just by reopening the dialog", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
+    mockHarness("codex-native");
+    const fetchedAt = Date.now() - 23 * 60 * 60 * 1000;
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
+      data: models,
+      dataUpdatedAt: fetchedAt,
+    } as ReturnType<typeof hostsHook.useHostModelOptions>);
+    const first = renderDialog();
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    first.unmount();
+    vi.spyOn(Date, "now").mockReturnValue(fetchedAt + 25 * 60 * 60 * 1000);
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Default" })).toBeVisible();
+    expect(screen.queryByRole("option", { name: "Model A" })).not.toBeInTheDocument();
+  });
+
+  it("restores a provider catalog during an outage but discards it when the provider reports unsupported", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
+    const agent = mockHarness("codex-native");
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const first = render(sandboxDialog(agent.id, true));
+    first.unmount();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "unavailable" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const { rerender } = render(sandboxDialog(agent.id, true));
+    await choose("model", "Model A");
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "unsupported" },
+      isError: false,
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    rerender(sandboxDialog(agent.id, true));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+      isError: false,
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    rerender(sandboxDialog(agent.id, true));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+  });
+
+  it.each([
+    ["codex-native", false],
+    ["claude-native", true],
+  ] as const)(
+    "preserves older-server permission support for %s",
+    (harness, supportsPermissions) => {
+      mockHarness(harness);
+      render(
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      if (supportsPermissions) {
+        expect(screen.getByTestId("task-permission-trigger")).toBeVisible();
+      } else {
+        expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+      }
     },
   );
 });
