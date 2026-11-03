@@ -45,11 +45,9 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
-    :param permission_mode: Per-task permission mode for native coding harnesses
-        that support one (currently Claude Code), e.g. ``"acceptEdits"`` or
-        ``"bypassPermissions"``. The fire path turns it into the runner's
-        ``["--permission-mode", <value>]`` terminal launch args. ``None`` means
-        use the agent's configured default.
+    :param permission_mode: Harness-specific permission or execution mode.
+        The fire path translates it into that harness's launch options.
+        ``None`` means use the agent's configured default.
     :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
         fire path attaches a ``cost_budget`` policy to each spawned session that
         blocks all models once cumulative spend reaches this limit. ``None``
