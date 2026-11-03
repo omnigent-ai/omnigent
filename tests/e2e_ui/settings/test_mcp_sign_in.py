@@ -17,6 +17,7 @@ from playwright.sync_api import Locator, Page, Route, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests._helpers.host import Host, isolated_host
+from tests._helpers.live_server import isolated_process_env
 from tests._helpers.oauth_mcp_server import OAuthMcpServer, oauth_mcp_server
 
 # Older servers show Needs auth without a Sign in button.
@@ -36,6 +37,12 @@ def _harness_env(home: Path, harness: str, binary: str, llm_url: str) -> dict[st
     return {
         "OMNIGENT_RUNNER_ZYGOTE": "0",
         f"OMNIGENT_{harness.upper()}_PATH": binary,
+        **_cli_env(home, llm_url),
+    }
+
+
+def _cli_env(home: Path, llm_url: str) -> dict[str, str | None]:
+    return {
         "CLAUDE_CONFIG_DIR": None,
         "CODEX_HOME": str(home / ".codex"),
         # Placeholder model keys mark the harness set up. The CLIs also call their
@@ -47,9 +54,8 @@ def _harness_env(home: Path, harness: str, binary: str, llm_url: str) -> dict[st
     }
 
 
-def _run(argv: list[str], home: Path) -> None:
-    env = {**os.environ, "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
-    env.pop("CLAUDE_CONFIG_DIR", None)
+def _run(argv: list[str], home: Path, llm_url: str) -> None:
+    env = isolated_process_env(home, _cli_env(home, llm_url), None)
     subprocess.run(argv, env=env, cwd=home, check=True, capture_output=True, timeout=60)
 
 
@@ -141,7 +147,9 @@ def test_claude_user_mcp_sign_in(
     home.mkdir(parents=True)
     with oauth_mcp_server() as server:
         _run(
-            [claude, "mcp", "add", "-s", "user", "--transport", "http", "issues", server.url], home
+            [claude, "mcp", "add", "-s", "user", "--transport", "http", "issues", server.url],
+            home,
+            mock_llm_server_url,
         )
         with _host(tmp_path, live_server, mock_llm_server_url, "claude", claude) as host:
             page = _open_settings(request, live_server, host, "claude-native")
@@ -179,8 +187,8 @@ def test_claude_plugin_mcp_sign_in(
         (plugin / ".mcp.json").write_text(
             json.dumps({"mcpServers": {"issues": {"type": "http", "url": server.url}}})
         )
-        _run([claude, "plugin", "marketplace", "add", str(market)], home)
-        _run([claude, "plugin", "install", "tracker@demo-market"], home)
+        _run([claude, "plugin", "marketplace", "add", str(market)], home, mock_llm_server_url)
+        _run([claude, "plugin", "install", "tracker@demo-market"], home, mock_llm_server_url)
         with _host(tmp_path, live_server, mock_llm_server_url, "claude", claude) as host:
             page = _open_settings(request, live_server, host, "claude-native")
             plugins_tab = page.get_by_test_id("harness-tab-plugins")
@@ -219,6 +227,7 @@ def test_codex_mcp_sign_in_by_pasting_the_redirect(
                     route.continue_()
                     return
                 response = route.fetch(max_redirects=0)
+                assert response.status == 302, response.text()
                 redirects.append(response.headers["location"])
                 route.abort("connectionrefused")
 

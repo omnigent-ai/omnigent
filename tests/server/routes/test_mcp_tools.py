@@ -22,7 +22,9 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     decode_host_frame,
 )
+from omnigent.host.mcp_login import START_TIMEOUT_SECONDS
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.routes import mcp_tools as mcp_tools_routes
 from omnigent.server.routes.mcp_tools import (
     create_mcp_tools_router,
     request_host_mcp_tools,
@@ -376,3 +378,8 @@ async def test_mcp_login_disconnect_fails_fast(tools_app) -> None:
         response = await asyncio.wait_for(task, 2)
     assert response.status_code == 502
     assert conn.pending_mcp_logins == {}
+
+
+def test_server_outwaits_a_host_start() -> None:
+    # A host that gives up on a start still stops its CLI (up to 2s) before replying.
+    assert mcp_tools_routes._MCP_LOGIN_START_TIMEOUT_S >= START_TIMEOUT_SECONDS + 5

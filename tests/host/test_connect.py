@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import click
+import psutil
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
@@ -3112,6 +3113,12 @@ async def test_incomplete_startup_discovery_is_reused_across_reconnects(
         lambda *, startup: asyncio.sleep(0, result={"codex-native": True}),
     )
     monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    closed_sign_ins: list[object] = []
+
+    async def close_sign_ins(owner: object | None = None) -> None:
+        closed_sign_ins.append(owner)
+
+    monkeypatch.setattr(host._mcp_logins, "close", close_sign_ins)
     first = _FakeTunnel()
     with pytest.raises(ConnectionError, match="test disconnect"):
         await host._serve_frames(first)  # type: ignore[arg-type]
@@ -3128,6 +3135,8 @@ async def test_incomplete_startup_discovery_is_reused_across_reconnects(
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference is None
     assert gateway_calls == 1
+    # Each closed tunnel stops the MCP sign-ins its web UI started.
+    assert closed_sign_ins == [first, second]
 
 
 @pytest.mark.parametrize(
@@ -4108,6 +4117,21 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
 
     runner.wait()
+
+
+def test_reap_orphans_leaves_mcp_sign_in_exit_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MCP sign-in CLI's exit status belongs to its login manager."""
+    host = _make_host_process()
+    sign_in = subprocess.Popen(["python3", "-c", "exit(43)"])
+    monkeypatch.setattr(host._mcp_logins, "pids", lambda: {sign_in.pid})
+    deadline = time.monotonic() + 5.0
+    while psutil.Process(sign_in.pid).status() != psutil.STATUS_ZOMBIE:
+        assert time.monotonic() < deadline, "sign-in CLI did not exit"
+        time.sleep(0.02)
+
+    host._reap_orphans_once()
+
+    assert sign_in.poll() == 43, "reaper took the MCP sign-in CLI's exit code"
 
 
 def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:

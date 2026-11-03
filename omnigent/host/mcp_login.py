@@ -33,7 +33,8 @@ _logger = logging.getLogger(__name__)
 
 LOGIN_HARNESSES = ("claude", "codex")
 LOGIN_TIMEOUT_SECONDS = 600.0
-URL_WAIT_SECONDS = 30.0
+# A start, including its wait for the lock and the sign-in page, ends within this.
+START_TIMEOUT_SECONDS = 30.0
 STATUS_TIMEOUT_SECONDS = 5.0
 CALLBACK_TIMEOUT_SECONDS = 5.0
 FINISHED_RETENTION_SECONDS = 300.0
@@ -352,7 +353,12 @@ class HostMcpLogins:
             raise LoginError("invalid", "This harness can't sign in to this MCP server")
         executable, name = target
         key = (server.summary["harness"], name)
-        async with self._start_lock:
+        deadline = asyncio.get_running_loop().time() + START_TIMEOUT_SECONDS
+        try:
+            await asyncio.wait_for(self._start_lock.acquire(), START_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise LoginError("busy", "Another sign-in is still starting") from None
+        try:
             if owner is not None and owner in self._closed_owners:
                 raise LoginError("failed", "The host disconnected")
             self._prune()
@@ -362,7 +368,7 @@ class HostMcpLogins:
             if pending >= MAX_ACTIVE_LOGINS:
                 raise LoginError("busy", "Too many sign-ins in progress")
             with self._subprocess_guard():
-                spawning = asyncio.ensure_future(self._spawn(executable, name, key))
+                spawning = asyncio.ensure_future(self._spawn(executable, name, key, deadline))
                 try:
                     login = await asyncio.shield(spawning)
                 except asyncio.CancelledError:
@@ -371,8 +377,10 @@ class HostMcpLogins:
                         await self._finish(await spawning, "cancelled")
                     raise
                 self._logins[login.login_id] = login
+        finally:
+            self._start_lock.release()
         try:
-            async with asyncio.timeout(URL_WAIT_SECONDS):
+            async with asyncio.timeout_at(deadline):
                 while login.url is None and login.state == "pending":
                     login.changed.clear()
                     await login.changed.wait()
@@ -384,7 +392,7 @@ class HostMcpLogins:
             raise
         return login.status()
 
-    async def _supports_no_browser(self, executable: str, harness: str) -> bool:
+    async def _supports_no_browser(self, executable: str, harness: str, timeout: float) -> bool:
         try:
             stat = os.stat(executable)
         except OSError:
@@ -392,14 +400,16 @@ class HostMcpLogins:
         build = (executable, stat.st_mtime_ns, stat.st_size)
         if build not in self._no_browser_support:
             ran = await _run_status_command(
-                [executable, "mcp", "login", "--help"], harness, STATUS_TIMEOUT_SECONDS
+                [executable, "mcp", "login", "--help"], harness, timeout
             )
             if ran is None or ran[0] != 0:
                 return True
             self._no_browser_support[build] = "--no-browser" in ran[1]
         return self._no_browser_support[build]
 
-    async def _spawn(self, executable: str, name: str, key: tuple[str, str]) -> _Login:
+    async def _spawn(
+        self, executable: str, name: str, key: tuple[str, str], deadline: float
+    ) -> _Login:
         import fcntl
         import pty
         import struct
@@ -407,7 +417,10 @@ class HostMcpLogins:
 
         argv = [executable, "mcp", "login", name]
         env = _cli_env(key[0])
-        if await self._supports_no_browser(executable, key[0]):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if await self._supports_no_browser(
+            executable, key[0], max(0.0, min(STATUS_TIMEOUT_SECONDS, remaining))
+        ):
             argv.append("--no-browser")
         else:
             # Older CLIs open a browser on the host; ``true`` stands in for it on Linux.

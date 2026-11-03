@@ -42,6 +42,8 @@ log = Path(os.environ["FAKE_LOG"])
 if "--help" in sys.argv:
     with open(str(log) + ".help", "a") as probes:
         probes.write("probe\\n")
+    if os.environ.get("FAKE_HELP_HANG"):
+        time.sleep(60)
     print("Usage: mcp login <NAME>" + ("" if os.environ.get("FAKE_OLD_CLI") else " --no-browser"))
     sys.exit(0)
 log.write_text(json.dumps({{"argv": sys.argv[1:], "tty": sys.stdin.isatty(),
@@ -52,7 +54,9 @@ if mode == "listen":
     import http.server
     class Listener(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            log.with_suffix(".received").write_text(self.path)
+            with open(log.with_suffix(".received"), "a") as received:
+                received.write(self.path + "\\n")
+            time.sleep(float(os.environ.get("FAKE_LISTEN_DELAY", "0")))
             self.send_response(200)
             self.end_headers()
         def log_message(self, *args):
@@ -256,11 +260,22 @@ async def test_redirect_written_to_a_busy_terminal_arrives_whole(
         os.close(write_fd)
 
 
+@pytest.mark.parametrize("slow_listener", [False, True])
 async def test_older_cli_gets_the_redirect_on_its_listener(
-    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, slow_listener: bool
 ) -> None:
     monkeypatch.setenv("FAKE_OLD_CLI", "1")
     monkeypatch.setenv("FAKE_MODE", "listen")
+    if slow_listener:
+        # The listener has the code even when its reply is late, so it is sent once.
+        monkeypatch.setenv("FAKE_LISTEN_DELAY", "1")
+        monkeypatch.setattr(mcp_login, "CALLBACK_TIMEOUT_SECONDS", 0.3)
+    typed: list[bytes] = []
+
+    async def type_into_terminal(master_fd: int, data: bytes) -> None:
+        typed.append(data)
+
+    monkeypatch.setattr(mcp_login, "_write_all", type_into_terminal)
     logins = HostMcpLogins()
     await logins.start(_server())
     started = await logins.start(_server())
@@ -272,7 +287,9 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     await logins.submit(started["login_id"], f"{redirect}?code=abc&state=s")
     finished = await _settled(logins, started["login_id"])
     assert finished["state"] == "succeeded"
-    assert fake_cli.with_suffix(".received").read_text() == "/callback?code=abc&state=s"
+    received = fake_cli.with_suffix(".received").read_text().splitlines()
+    assert received == ["/callback?code=abc&state=s"]
+    assert typed == []
     await logins.close()
 
 
@@ -300,12 +317,34 @@ async def test_cli_without_a_sign_in_page_fails_start(
     fake_cli: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("FAKE_MODE", "silent")
-    monkeypatch.setattr(mcp_login, "URL_WAIT_SECONDS", 0.5)
+    # Long enough for the flag check and spawn on a loaded runner.
+    monkeypatch.setattr(mcp_login, "START_TIMEOUT_SECONDS", 3.0)
     logins = HostMcpLogins()
     started = await logins.start(_server())
     assert (started["state"], started["authorization_url"]) == ("failed", None)
     assert started["error"] == "The harness didn't offer a sign-in page"
     await _assert_gone(json.loads(fake_cli.read_text())["pid"])
+
+
+async def test_queued_starts_finish_within_the_start_budget(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A stalled flag check holds the start lock; neither start may outlive the budget.
+    monkeypatch.setenv("FAKE_HELP_HANG", "1")
+    monkeypatch.setenv("FAKE_MODE", "silent")
+    monkeypatch.setattr(mcp_login, "START_TIMEOUT_SECONDS", 1.0)
+    logins = HostMcpLogins()
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    first, second = await asyncio.gather(
+        logins.start(_server()), logins.start(_server("other")), return_exceptions=True
+    )
+    # Stopping the CLI may follow the budget, still well inside the server's wait.
+    assert loop.time() - began < budget(1.0 + 2.5)
+    assert isinstance(first, dict) and first["state"] == "failed"
+    assert isinstance(second, LoginError) and second.status == "busy"
+    assert [login.state for login in logins._logins.values()] == ["failed"]
+    assert all(login.process.returncode is not None for login in logins._logins.values())
 
 
 async def test_cancel_restart_and_close_stop_the_cli(fake_cli: Path) -> None:

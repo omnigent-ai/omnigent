@@ -79,7 +79,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
-# The host runs the harness's ``mcp login``:
+# The host can run the harness's own ``mcp login`` for a configured server.
 CAP_MCP_LOGIN = "mcp_login"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"

@@ -294,7 +294,14 @@ describe("McpSignInDialog", () => {
   });
 
   it("keeps polling through a brief outage and gives up after repeated failures", async () => {
-    on("POST", BASE, () => json(login()));
+    on(
+      "POST",
+      BASE,
+      () => json(login()),
+      () => json(login({ login_id: "L2" })),
+    );
+    on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
+    on("GET", `${BASE}/L2`, () => json(login({ login_id: "L2" })));
     on(
       "GET",
       `${BASE}/L1`,
@@ -316,6 +323,14 @@ describe("McpSignInDialog", () => {
     const polls = calls("GET", `${BASE}/L1`).length;
     await tick();
     expect(calls("GET", `${BASE}/L1`)).toHaveLength(polls);
+
+    // The host may still be running that sign-in, so a retry stops it first.
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Try again" })));
+    await tick();
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(polls);
+    expect(calls("GET", `${BASE}/L2`)).toHaveLength(1);
+    expect(props.onSignedIn).not.toHaveBeenCalled();
   });
 
   it("refuses to link an unsafe sign-in page and stops that sign-in", async () => {

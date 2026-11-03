@@ -27,7 +27,7 @@ from omnigent.stores.host_store import HostStore
 
 # The host's 10s probe may be followed by a 5s harness sign-in status check.
 _MCP_TOOLS_TIMEOUT_S = 20.0
-# Starting waits for the harness CLI to print its authorization page (30s on the host).
+# The host ends a start within 30s and then stops any CLI it spawned, so it can reply first.
 _MCP_LOGIN_START_TIMEOUT_S = 40.0
 _MCP_LOGIN_TIMEOUT_S = 10.0
 _LOGIN_STATUS_CODES = {"not_found": 404, "invalid": 400, "busy": 503}
