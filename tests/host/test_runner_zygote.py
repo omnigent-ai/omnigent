@@ -9,6 +9,7 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib.util
 import json
@@ -22,10 +23,14 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import Mock
 
+import psutil
 import pytest
 
 import omnigent
+from omnigent.host.connect import HostProcess
+from omnigent.host.identity import HostIdentity
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
@@ -540,6 +545,120 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     proc.kill()
 
 
+def test_stop_forked_runner_does_not_wait_for_control_lock(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    """Stopping a runner must not join another forkserver control exchange."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with manager._lock:
+                stopped = workers.submit(HostProcess._stop_runner_proc, proc)
+                stopped.result(timeout=2)
+                assert not _proc.process_alive(proc.pid)
+                assert proc.returncode is None
+        assert _wait_exit(proc) == -signal.SIGTERM
+    finally:
+        proc.kill()
+        _wait_exit(proc)
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_stop_forked_runner_waits_for_exit_without_consuming_its_status(ignore_term: bool) -> None:
+    """The OS wait must handle zombies and escalate a runner ignoring TERM."""
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys; "
+            + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else "")
+            + "print('ready', flush=True); sys.stdin.buffer.read()",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == b"ready\n"
+        proc = ZygoteRunnerProc(child.pid, ZygoteManager())
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            stopped = workers.submit(HostProcess._stop_runner_proc, proc)
+            stopped.result(timeout=8)
+        assert not _proc.process_alive(child.pid)
+        assert proc.returncode is None
+        assert child.wait(timeout=1) == -(signal.SIGKILL if ignore_term else signal.SIGTERM)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        if child.stdin is not None:
+            child.stdin.close()
+        if child.stdout is not None:
+            child.stdout.close()
+
+
+def test_stop_forked_runner_preserves_cached_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = ZygoteRunnerProc(os.getpid(), ZygoteManager())
+    proc.returncode = 7
+    monkeypatch.setattr("psutil.Process.terminate", lambda _self: pytest.fail("already exited"))
+
+    HostProcess._stop_runner_proc(proc)
+
+    assert proc.returncode == 7
+
+
+@pytest.mark.parametrize("already_gone", [False, True], ids=["reused", "gone-before-handle"])
+def test_stop_forked_runner_does_not_signal_a_missing_identity(
+    monkeypatch: pytest.MonkeyPatch, already_gone: bool
+) -> None:
+    original_process = Mock()
+    original_process.is_running.return_value = False
+    process_factory = Mock(return_value=original_process)
+    if already_gone:
+        process_factory.side_effect = psutil.NoSuchProcess(123)
+    monkeypatch.setattr("psutil.Process", process_factory)
+    proc = ZygoteRunnerProc(123, ZygoteManager())
+    process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+
+    HostProcess._stop_runner_proc(proc)
+
+    original_process.terminate.assert_not_called()
+    original_process.kill.assert_not_called()
+    assert proc.returncode is None
+
+
+def test_stop_forked_runner_reports_a_signal_permission_failure(
+    monkeypatch: pytest.MonkeyPatch, managed_child
+) -> None:
+    manager, child = managed_child
+    proc = ZygoteRunnerProc(child.pid, manager)
+    monkeypatch.setattr(
+        "psutil.Process.terminate", Mock(side_effect=psutil.AccessDenied(proc.pid))
+    )
+
+    with pytest.raises(psutil.AccessDenied):
+        HostProcess._stop_runner_proc(proc)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_forked_spawn_consumes_its_exit_status(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    host = HostProcess(
+        identity=HostIdentity(host_id="host-abandoned", name="test"),
+        server_url="http://localhost:8000",
+    )
+    spawn = asyncio.get_running_loop().create_future()
+    spawn.set_result((proc, tmp_path / "runner.log"))
+    try:
+        await host._stop_abandoned_spawn(spawn)
+        assert proc.returncode == -signal.SIGTERM
+        assert not _proc.process_alive(proc.pid)
+        assert manager.poll(proc.pid) is None
+    finally:
+        proc.kill()
+
+
 def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp_path) -> None:
     """A still-live runner polls as None once the zygote is stopped.
 
@@ -738,6 +857,23 @@ def test_forked_runner_runs_in_the_requested_workspace(manager: ZygoteManager, t
     assert _wait_exit(proc) == 0
 
     assert f"cwd={workspace.resolve()}\n" in log.read_text()
+
+
+def test_runner_setup_failure_lands_in_the_runner_log(manager: ZygoteManager, tmp_path) -> None:
+    """A child that fails before the runner starts writes the cause to its own log.
+
+    The host's exit report reads only the runner log, so a setup failure such
+    as a vanished workspace must not leave that log empty.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    log = tmp_path / "runner.log"
+
+    proc = manager.fork_runner(_fork_env(0), str(log), str(tmp_path / "gone"))
+
+    assert _wait_exit(proc) == 1
+    assert "FileNotFoundError" in log.read_text()
 
 
 def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
