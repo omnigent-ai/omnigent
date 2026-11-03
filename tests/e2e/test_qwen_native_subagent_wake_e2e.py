@@ -33,7 +33,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -46,6 +45,7 @@ import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import apply_runner_env, apply_server_env
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
@@ -83,12 +83,6 @@ def _qwen_cli() -> str | None:
     if override:
         return override if Path(override).exists() else None
     return shutil.which("qwen")
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _ambient_free_environ() -> dict[str, str]:
@@ -147,7 +141,7 @@ def qwen_wake_rig(
     for path in (artifacts, workspace, home_dir):
         path.mkdir(parents=True, exist_ok=True)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
