@@ -34,6 +34,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_agent, register_test_runner
@@ -229,8 +230,9 @@ async def create_placed_session(
     runner_id: str | None = _RUNNER_ID,
     host: bool = True,
     user: str | None = None,
+    turns: int = 2,
 ) -> tuple[str, list[str]]:
-    """Create a two-turn session with run settings and placement.
+    """Create a session of *turns* turns with run settings and placement.
 
     :param user: Creating user on an app with permissions, e.g. ``"alice@example.com"``.
     :returns: The session id and its item ids (Q1, A1, Q2, A2).
@@ -250,7 +252,7 @@ async def create_placed_session(
     )
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["id"]
-    for turn in (1, 2):
+    for turn in range(1, turns + 1):
         store.append(
             session_id,
             [
@@ -289,26 +291,36 @@ def message_texts(store: SqlAlchemyConversationStore, session_id: str) -> list[s
     ]
 
 
-@pytest.mark.parametrize("runner_status", [200, 204])
+@pytest.mark.parametrize(
+    ("runner_status", "turns"),
+    [
+        pytest.param(200, 2, id="release"),
+        pytest.param(204, 2, id="older-runner"),
+        pytest.param(200, 0, id="empty-source"),
+    ],
+)
 async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
     runner_status: int,
+    turns: int,
 ) -> None:
     """``clear`` frees the old SDK client, then continues in an empty bound session.
 
     The runner gets a marked request, so only a server that continues the work
     makes it release the client; an older runner's 204 still continues. The new
     session keeps the source's host, workspace, branch, runner, sandbox
-    repositories and run settings; the source keeps its history and gets a
-    notice plus a redirect.
+    repositories and run settings but none of its files; the source keeps its
+    history and gets a notice plus a redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     live_runner.clear_status = runner_status
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store)
+    source_id, _items = await create_placed_session(client, store, turns=turns)
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_store.create("notes.txt", bytes=5, session_id=source_id)
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
     store.set_labels(source_id, sandbox_labels)
@@ -327,6 +339,8 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     initialized = [(path, body.get("session_id")) for path, body in live_runner.posts]
     assert live_runner.posts.index(release) < initialized.index(("/v1/sessions", new_id))
     assert message_texts(store, new_id) == []
+    assert file_store.list(new_id).data == []
+    assert [stored.filename for stored in file_store.list(source_id).data] == ["notes.txt"]
     fork = store.get_conversation(new_id)
     assert fork is not None
     assert (fork.runner_id, fork.host_id, fork.workspace, fork.git_branch) == (
@@ -343,7 +357,8 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert read_managed_repo_workspaces(fork.labels) == repos
     # Untitled, so the first message names it like any new chat.
     assert fork.title is None
-    assert message_texts(store, source_id)[:4] == ["Q1", "A1", "Q2", "A2"]
+    history = [text for turn in range(1, turns + 1) for text in (f"Q{turn}", f"A{turn}")]
+    assert message_texts(store, source_id)[:-1] == history
     notice = message_texts(store, source_id)[-1]
     assert "ended by `/clear`" in notice and f"(/c/{new_id})" in notice
     assert live_runner.superseded == [(source_id, new_id, "clear")]

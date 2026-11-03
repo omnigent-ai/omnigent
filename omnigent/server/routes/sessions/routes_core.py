@@ -3920,6 +3920,7 @@ def register_core_routes(
         *,
         before_item_id: str | None = None,
         keep_sandbox_labels: bool = False,
+        copy_attachments: bool = True,
     ) -> SessionResponse:
         """Fork *source_id* as :func:`fork_session` documents.
 
@@ -3927,6 +3928,8 @@ def register_core_routes(
             the items before this one, e.g. ``"msg_abc123"``.
         :param keep_sandbox_labels: Copy the source's managed-sandbox labels,
             for a fork that stays in the source's sandbox.
+        :param copy_attachments: Copy the source's file rows; ``False`` for a
+            fork that keeps no history.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4309,7 +4312,7 @@ def register_core_routes(
         # degrades — so a probe would only trade latency for the same outcome.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
-        if file_store is not None and artifact_store is not None:
+        if copy_attachments and file_store is not None and artifact_store is not None:
             files_after: str | None = None
             while True:
                 files_page = await asyncio.to_thread(
@@ -4575,6 +4578,7 @@ def register_core_routes(
         notice: Callable[[str], str],
         reason: SupersessionReason,
         prepare: Callable[[], Awaitable[None]] | None = None,
+        copy_attachments: bool = True,
     ) -> str:
         """
         Continue *source* in a fork on the same placement, superseding it.
@@ -4596,6 +4600,8 @@ def register_core_routes(
         :param reason: ``session.superseded`` reason, e.g. ``"clear"``.
         :param prepare: Runs once the request is known to be allowed, before
             the fork exists, e.g. to free the source's live client.
+        :param copy_attachments: Copy the source's files; ``False`` when the
+            fork keeps no history to reference them.
         :returns: The fork's session id.
         :raises OmnigentError: When the caller does not own *source*, it is a
             sub-agent or running a turn, or no runner or host can take the fork;
@@ -4647,6 +4653,7 @@ def register_core_routes(
             SessionForkRequest(title=title),
             before_item_id=before_item_id,
             keep_sandbox_labels=True,
+            copy_attachments=copy_attachments,
         )
         runner_bound = runner_online
         try:
@@ -4754,6 +4761,8 @@ def register_core_routes(
             notice=supersession_notice_text,
             reason="clear",
             prepare=release_source,
+            # No history is kept, so no attachment is referenced.
+            copy_attachments=False,
         )
 
     return clear_session_into_fresh_session
