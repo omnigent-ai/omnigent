@@ -97,6 +97,20 @@ describe("SessionTitleInstructionsControl", () => {
     expect(screen.getByTestId("session-title-instructions-save")).toBeDisabled();
   });
 
+  it("counts an emoji as one character, like the server", async () => {
+    getMock.mockResolvedValue({ instructions: null, max_chars: 10 });
+    renderControl();
+    const input = await loadedInput();
+
+    fireEvent.change(input, { target: { value: "🚀".repeat(10) } });
+
+    expect(input).not.toHaveAttribute("aria-invalid");
+    expect(screen.getByTestId("session-title-instructions-status")).toHaveTextContent(
+      "10 / 10 characters",
+    );
+    expect(screen.getByTestId("session-title-instructions-save")).toBeEnabled();
+  });
+
   it("keeps the draft and reports a failed save", async () => {
     saveMock.mockRejectedValue(new Error("server unavailable"));
     renderControl();

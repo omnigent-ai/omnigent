@@ -33,13 +33,15 @@ def claude_sdk_session(
 ) -> Iterator[tuple[str, str]]:
     """An untitled Claude SDK session whose model calls reach the mock."""
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    session_id, _agent_name = _create_claude_sdk_session(
-        live_server, str(_server_state["runner_id"]), mock_llm_server_url
-    )
+    session_id: str | None = None
     try:
+        session_id, _agent_name = _create_claude_sdk_session(
+            live_server, str(_server_state["runner_id"]), mock_llm_server_url
+        )
         yield live_server, session_id
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if session_id is not None:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         if respawned is not None:
             respawned.terminate()
             respawned.wait(timeout=10)

@@ -66,7 +66,9 @@ export function SessionTitleInstructionsControl() {
   }, []);
 
   const trimmed = draft.trim();
-  const tooLong = trimmed.length > maxChars;
+  // Count code points, as the server does, so an emoji counts as one character.
+  const charCount = [...trimmed].length;
+  const tooLong = charCount > maxChars;
   const ready = loadState === "ready";
   const dirty = ready && trimmed !== saved;
 
@@ -102,8 +104,8 @@ export function SessionTitleInstructionsControl() {
           {loadState === "error" && "Couldn't load your title instructions."}
           {ready &&
             (tooLong
-              ? `${trimmed.length} / ${maxChars} characters — shorten to save`
-              : `${trimmed.length} / ${maxChars} characters`)}
+              ? `${charCount} / ${maxChars} characters — shorten to save`
+              : `${charCount} / ${maxChars} characters`)}
         </span>
         <div className="flex items-center gap-2">
           {loadState === "error" && (
