@@ -94,7 +94,7 @@ export function CreateScheduledTaskDialog({
   /** Seed values applied when opening from a template card. */
   initialName?: string;
   initialPrompt?: string;
-  /** Open on a Jira/Slack/GitHub trigger template instead of a plain prompt. */
+  /** Open on a Jira/Slack/GitHub/Linear trigger template instead of a plain prompt. */
   initialTrigger?: TriggerSource | null;
   initialTemplateId?: AutomationTemplateId;
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */

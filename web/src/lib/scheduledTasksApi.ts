@@ -130,6 +130,7 @@ export const AUTOMATION_TEMPLATE_IDS = [
   "jira",
   "slack",
   "github",
+  "linear",
   "follow-up-monitor",
   "pr-sweep",
   "news-digest",
