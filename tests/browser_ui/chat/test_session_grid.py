@@ -180,6 +180,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(page.get_by_text("Transcript 0", exact=True)).to_be_visible()
         page.get_by_role("button", name="Filter sessions", exact=True).click()
         page.get_by_role("menuitemradio", name="All sessions", exact=True).click()
+        page.get_by_role("button", name="Expand right panel", exact=True).click()
+        workspace = page.get_by_role("complementary", name="Workspace", exact=True)
+        expect(workspace).to_be_visible()
+        # Measure both in one frame and retry: the rail's width animates open.
+        page.wait_for_function(
+            """() => document.querySelector('[data-grid-session="grid-0"]').getBoundingClientRect()
+                .right <= document.querySelector('aside[aria-label="Workspace"]')
+                .getBoundingClientRect().left"""
+        )
         _drag_session(page, "grid-1", "grid-0", "right")
         expect(page).to_have_url(re.compile(r"/grid/[^/]+$"))
         expect(page.get_by_test_id("new-chat-button")).not_to_have_class(
@@ -218,8 +227,6 @@ def test_session_grid_drag_persist_live_updates_and_close(
         page.get_by_role("heading", name="Research grid · 2 sessions", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
-        page.get_by_role("button", name="Expand grid workspace").click()
-        workspace = page.get_by_role("complementary", name="Workspace", exact=True)
         for index in range(2):
             cell = page.locator(f'[data-grid-session="grid-{index}"]')
             cell.get_by_text(f"Transcript {index}", exact=True).click()
@@ -311,6 +318,13 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(first_cell.get_by_test_id("main-terminal-view")).to_have_attribute(
             "data-visible", "true"
         )
+        # Pane cycling focuses the next cell's terminal, then this cell's composer.
+        page.keyboard.press("ControlOrMeta+Alt+Shift+BracketRight")
+        expect(first_cell).to_have_attribute("data-active", "true")
+        expect(first_cell.locator(".xterm-helper-textarea")).to_be_focused()
+        page.keyboard.press("ControlOrMeta+Alt+Shift+BracketRight")
+        expect(other_cell).to_have_attribute("data-active", "true")
+        expect(other_cell.get_by_test_id("side-chat-input")).to_be_focused()
         first_cell.get_by_role("button", name="Chat view", exact=True).click()
         expect(first_cell.get_by_test_id("side-chat-input")).to_have_value("Keep this chat draft")
         first_cell.get_by_role("button", name="Terminal view", exact=True).click()
@@ -365,7 +379,8 @@ def test_session_grid_drag_persist_live_updates_and_close(
         first_cell.get_by_text("Transcript 0", exact=True).click()
         expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
         assert workspace.bounding_box()["width"] == saved_width
-        page.get_by_role("button", name="Collapse grid workspace").click()
+        page.keyboard.press("ControlOrMeta+Alt+BracketRight")
+        expect(page.get_by_role("button", name="Expand grid workspace")).to_be_visible()
         assert header.bounding_box()["width"] > header_box["width"]
         _drag_session(page, "grid-2", "grid-0", "bottom")
         for index in range(3):

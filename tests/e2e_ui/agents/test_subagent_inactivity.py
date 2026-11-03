@@ -25,6 +25,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     _PostRetryTracker,
     _read_subagent_forward_state,
 )
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import open_right_rail, set_fallback_mock_llm
 
 # Claude-side sub-agent identity, shaped like the real meta files
@@ -48,16 +49,14 @@ _INTERMEDIATE_TEXT = (
 _FALSE_NOTICE_MARKER = "finished (completed)"
 _NOTICE_PREFIX = "[System: sub-agent"
 
-# Inactivity threshold in the forwarder is 5 s. Tick well past it, and give
-# the idle → runner → parent wake propagation time to land. The wake POST is
-# fire-and-forget and delivery is bound to the parent being processed on the
-# runner, so the parent is nudged during the lull (an actively-working
-# orchestrator, exactly the reported condition) and the notice is polled for
-# over a generous window.
+# Inactivity threshold in the forwarder is 5 s; tick well past it.
 _LULL_TICKS = 8
 _TICK_INTERVAL_S = 1.0
-_NOTICE_POLL_S = 90.0
-_NUDGE_INTERVAL_S = 12.0
+# The runner hands a retained completion to the parent while processing the
+# nudge and fires its wake POST without awaiting it; give that POST time to land.
+_NUDGE_REPLY_TIMEOUT_S = 90.0
+_WAKE_LANDING_S = 15.0
+_NUDGE_TEXT = "Still working — any update from the background sub-agent?"
 
 
 def _write_claude_task_spawn_on_disk(root: Path) -> Path:
@@ -210,17 +209,94 @@ def _item_text(item: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _find_false_notice(items: list[dict[str, Any]]) -> str | None:
-    """Return the false completion notice text if the parent received one.
+def _find_false_notice_text(texts: list[str]) -> str | None:
+    """Return the false completion notice if any text carries one.
 
-    :param items: The parent session's items.
-    :returns: The notice text, or ``None`` when no completion notice exists.
+    :param texts: Searchable texts, e.g. flattened items or model requests.
+    :returns: The notice, or ``None`` when no completion notice exists.
     """
-    for item in items:
-        text = _item_text(item)
-        if _NOTICE_PREFIX in text and _FALSE_NOTICE_MARKER in text:
-            return text
+    for text in texts:
+        start = text.find(_NOTICE_PREFIX)
+        if start != -1 and _FALSE_NOTICE_MARKER in text[start:]:
+            end = text.find("]", start)
+            return text[start : end + 1] if end != -1 else text[start:]
     return None
+
+
+def _mock_llm_requests(mock_url: str) -> list[str]:
+    """Return every request the mock LLM has captured, serialized for searching.
+
+    :param mock_url: Mock LLM server base URL.
+    :returns: One JSON string per captured request, oldest first.
+    """
+    resp = httpx.get(f"{mock_url}/mock/requests", timeout=15.0)
+    resp.raise_for_status()
+    return [json.dumps(request) for request in resp.json()["requests"]]
+
+
+def _parent_false_notice(
+    base_url: str, session_id: str, mock_url: str, requests_before: int
+) -> str | None:
+    """Return a false completion notice the parent was handed, if any.
+
+    The Claude-labelled parent persists injected messages only once Claude
+    records them, so the notice is looked for in the model requests too.
+
+    :param base_url: Spawned Omnigent server base URL.
+    :param session_id: Parent conversation id.
+    :param mock_url: Mock LLM server base URL.
+    :param requests_before: Captured requests to skip, from before the lull.
+    :returns: The notice text, or ``None`` when the parent never got one.
+    """
+    item_texts = [_item_text(item) for item in _session_items(base_url, session_id)]
+    request_texts = _mock_llm_requests(mock_url)[requests_before:]
+    return _find_false_notice_text(item_texts + request_texts)
+
+
+def _assistant_reply_count(items: list[dict[str, Any]]) -> int:
+    """Count the assistant messages in a session's items.
+
+    :param items: The session's items.
+    :returns: How many items are assistant messages.
+    """
+    return sum(
+        1
+        for item in items
+        if item.get("type") == "message" and (item.get("data") or {}).get("role") == "assistant"
+    )
+
+
+def _nudge_and_find_false_notice(
+    page: Page, base_url: str, session_id: str, mock_url: str, requests_before: int
+) -> str | None:
+    """Send the parent one follow-up turn and return a false completion notice if one lands.
+
+    :param page: Page open on the parent session.
+    :param base_url: Spawned Omnigent server base URL.
+    :param session_id: Parent conversation id.
+    :param mock_url: Mock LLM server base URL.
+    :param requests_before: Captured requests to skip, from before the lull.
+    :returns: The notice text, or ``None`` when none arrived after the nudge.
+    """
+    replies_before = _assistant_reply_count(_session_items(base_url, session_id))
+    composer = page.get_by_role("textbox", name="Message the agent")
+    composer.fill(_NUDGE_TEXT)
+    composer.press("Enter")
+
+    def _nudge_processed() -> bool:
+        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15.0).json()
+        replied = _assistant_reply_count(snapshot.get("items") or []) > replies_before
+        return (snapshot.get("status") == "idle" and replied) or _parent_false_notice(
+            base_url, session_id, mock_url, requests_before
+        ) is not None
+
+    poll_until(_nudge_processed, timeout_s=_NUDGE_REPLY_TIMEOUT_S)
+    landing_deadline = time.monotonic() + _WAKE_LANDING_S
+    while True:
+        notice = _parent_false_notice(base_url, session_id, mock_url, requests_before)
+        if notice is not None or time.monotonic() >= landing_deadline:
+            return notice
+        time.sleep(_TICK_INTERVAL_S)
 
 
 def test_midtask_lull_must_not_deliver_false_completion(
@@ -314,6 +390,7 @@ def test_midtask_lull_must_not_deliver_false_completion(
 
     # 5. No new transcript records or completion record: the child is still
     # in a long tool call. Tick past five seconds to publish its idle observation.
+    requests_before = len(_mock_llm_requests(mock_llm_server_url))
     for _ in range(_LULL_TICKS):
         state = _run_forwarder_tick(
             base_url=base_url,
@@ -331,30 +408,12 @@ def test_midtask_lull_must_not_deliver_false_completion(
     )
 
     # 6. Keep the parent working, exactly as the reported orchestrators were:
-    # drive a follow-up turn through the composer. The runner delivers a
-    # completion + fires its wake only while it is processing the parent, and
-    # session (re-)init creates the parent inbox and hands over any retained
-    # sub-agent completion + wake BEFORE the (doomed) native terminal launch —
-    # so the false notice lands even in CI, where the claude-native terminal
-    # cannot start. Poll the parent chat for the false wake notice.
-    def _nudge() -> None:
-        with __import__("contextlib").suppress(Exception):
-            box = page.get_by_role("textbox", name="Message the agent")
-            box.fill("Still working — any update from the background sub-agent?")
-            box.press("Enter")
-
-    notice: str | None = None
-    _nudge()
-    poll_deadline = time.monotonic() + _NOTICE_POLL_S
-    next_nudge = time.monotonic() + _NUDGE_INTERVAL_S
-    while time.monotonic() < poll_deadline:
-        notice = _find_false_notice(_session_items(base_url, session_id))
-        if notice is not None:
-            break
-        if time.monotonic() >= next_nudge:
-            _nudge()
-            next_nudge = time.monotonic() + _NUDGE_INTERVAL_S
-        time.sleep(_TICK_INTERVAL_S)
+    # drive a follow-up turn through the composer. The runner hands over any
+    # retained sub-agent completion and fires its wake while processing the
+    # parent, so once the nudge is answered a false notice is already on its way.
+    notice = _nudge_and_find_false_notice(
+        page, base_url, session_id, mock_llm_server_url, requests_before
+    )
 
     if notice is not None:
         # Reproduced. Let the false notice render on the open session page so

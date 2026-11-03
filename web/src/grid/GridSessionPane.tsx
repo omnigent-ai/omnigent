@@ -4,8 +4,11 @@ import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { useInertRef } from "@/hooks/useInertRef";
+import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -47,6 +50,8 @@ import {
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 
 export type GridWorkspacePanelProps = Pick<
@@ -58,6 +63,7 @@ export function GridSessionPane({
   sessionId,
   area,
   selected,
+  focusRequest = null,
   onActivate,
   workspaceTarget,
   workspacePanel,
@@ -66,6 +72,8 @@ export function GridSessionPane({
   sessionId: string;
   area?: string;
   selected: boolean;
+  /** A new object asks this cell to take keyboard focus. */
+  focusRequest?: object | null;
   onActivate: () => void;
   workspaceTarget: HTMLDivElement | null;
   workspacePanel: GridWorkspacePanelProps;
@@ -89,8 +97,11 @@ export function GridSessionPane({
     active,
     isOver,
   } = useDroppable({ id: sessionId, data: { title } });
+  const paneRef = useRef<HTMLElement | null>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
   const setPaneRef = useCallback(
     (node: HTMLElement | null) => {
+      paneRef.current = node;
       setDragNodeRef(node);
       setDropNodeRef(node);
     },
@@ -148,6 +159,27 @@ export function GridSessionPane({
     [sessionId],
   );
   const showTerminal = terminalFirst && view === "terminal";
+  const [terminalOpened, setTerminalOpened] = useState(showTerminal);
+  useEffect(() => {
+    if (showTerminal) setTerminalOpened(true);
+  }, [showTerminal]);
+  const setChatRef = useInertRef(showTerminal, chatRef);
+  const terminalInertRef = useInertRef<HTMLDivElement>(!showTerminal);
+  // A connected terminal focuses itself as the cell activates; otherwise focus
+  // the chat composer, or the cell itself when there is nothing to type into.
+  const handledFocusRequest = useRef<object | null>(null);
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!focusRequest || focusRequest === handledFocusRequest.current || !pane) return;
+    handledFocusRequest.current = focusRequest;
+    if (pane.contains(document.activeElement)) return;
+    const composer = showTerminal
+      ? undefined
+      : Array.from(
+          chatRef.current?.querySelectorAll<HTMLTextAreaElement>("textarea:not(:disabled)") ?? [],
+        ).at(-1);
+    (composer ?? pane).focus({ preventScroll: true });
+  }, [focusRequest, showTerminal]);
   const hadTerminal = useRef(false);
   useEffect(() => {
     if (agentTerminal) hadTerminal.current = true;
@@ -212,9 +244,7 @@ export function GridSessionPane({
     (path: string, options?: OpenFileOptions) => {
       navigateWorkspace(path, options, () => {
         onOpenWorkspace();
-        setPosition(
-          options?.line === undefined ? undefined : { line: options.line, column: options.column },
-        );
+        setPosition(citedFilePosition(options));
         setWorkspace((previous) => ({
           ...previous,
           selectedFilePath: path,
@@ -227,22 +257,24 @@ export function GridSessionPane({
     },
     [navigateWorkspace, onOpenWorkspace],
   );
+  useUiOpenFile(sessionId, selected && canBrowse, openFile);
+  const showTab = useCallback((rightRailTab: RightRailTab | null) => {
+    setWorkspace((previous) => ({
+      ...previous,
+      rightRailTab,
+      selectedFilePath: null,
+      selectedTerminalKey: null,
+      openPanels:
+        isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
+          ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
+          : previous.openPanels,
+    }));
+  }, []);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
-      navigateWorkspace("", undefined, () =>
-        setWorkspace((previous) => ({
-          ...previous,
-          rightRailTab,
-          selectedFilePath: null,
-          selectedTerminalKey: null,
-          openPanels:
-            isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
-              ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
-              : previous.openPanels,
-        })),
-      );
+      navigateWorkspace("", undefined, () => showTab(rightRailTab));
     },
-    [navigateWorkspace],
+    [navigateWorkspace, showTab],
   );
   const closeFile = useCallback(
     (path: string) => {
@@ -273,6 +305,14 @@ export function GridSessionPane({
         selectTab("github");
         onOpenWorkspace();
       },
+      openFolder: showFiles
+        ? (absolutePath: string) =>
+            navigateWorkspace(absolutePath, undefined, () => {
+              revealFolderInFilesPanel(sessionId, absolutePath);
+              showTab("files");
+              onOpenWorkspace();
+            })
+        : undefined,
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
       workspaceHome: environment.data?.home ?? null,
@@ -283,7 +323,10 @@ export function GridSessionPane({
       openFile,
       registerNavigationGuard,
       selectTab,
+      navigateWorkspace,
+      showTab,
       onOpenWorkspace,
+      showFiles,
       sessionId,
       environment.data,
       session?.hostId,
@@ -315,18 +358,19 @@ export function GridSessionPane({
           data-grid-session={sessionId}
           data-active={selected}
           aria-label={`${title}${selected ? " (active)" : ""}`}
+          tabIndex={-1}
           onClickCapture={onActivate}
           onFocusCapture={onActivate}
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background",
-            selected && "border-brand-accent/50 ring-1 ring-brand-accent/50",
+            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background outline-none",
+            selected && "border-brand-accent/50 shadow-lg",
             isDragging && "opacity-50",
           )}
         >
           <header
             className={cn(
               "flex h-8 shrink-0 items-center border-b px-1",
-              selected && "bg-brand-accent/50",
+              selected && "bg-brand-accent/10",
             )}
           >
             <button
@@ -336,7 +380,10 @@ export function GridSessionPane({
               {...listeners}
               aria-label={`Move ${title}`}
               title="Drag to another cell to swap positions"
-              className="h-full min-w-0 flex-1 touch-none cursor-grab truncate px-1 text-left text-sm leading-normal font-medium select-none active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring"
+              className={cn(
+                "h-full min-w-0 flex-1 touch-none cursor-grab truncate px-1 text-left text-sm leading-normal font-medium select-none active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring",
+                !selected && "text-muted-foreground",
+              )}
             >
               {title}
             </button>
@@ -360,28 +407,32 @@ export function GridSessionPane({
             </Button>
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-            <div className={cn("h-full", showTerminal && "hidden")} inert={showTerminal}>
-              <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+            <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
+              <RenderErrorBoundary name="chat" resetKey={sessionId}>
+                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+              </RenderErrorBoundary>
             </div>
-            {terminalFirst && (agentTerminal !== null || showTerminal) && (
+            {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
               <div
                 className={cn(
                   "absolute inset-0 flex flex-col",
                   !showTerminal && "invisible opacity-0",
                 )}
+                ref={terminalInertRef}
                 aria-hidden={!showTerminal}
-                inert={!showTerminal}
               >
-                <MainTerminalView
-                  conversationId={sessionId}
-                  visible={showTerminal}
-                  active={selected && !workspacePanel.maximized}
-                  className="pt-0"
-                  readOnly={!session || !isOwnerLevel(permissionLevel)}
-                  runnerOnline={runnerOnline}
-                  onResume={canEdit ? resume : undefined}
-                  sandboxOffline={liveness.kind === "host_asleep"}
-                />
+                <RenderErrorBoundary name="terminal" resetKey={sessionId}>
+                  <MainTerminalView
+                    conversationId={sessionId}
+                    visible={showTerminal}
+                    active={selected && !workspacePanel.maximized}
+                    className="pt-0"
+                    readOnly={!session || !isOwnerLevel(permissionLevel)}
+                    runnerOnline={runnerOnline}
+                    onResume={canEdit ? resume : undefined}
+                    sandboxOffline={liveness.kind === "host_asleep"}
+                  />
+                </RenderErrorBoundary>
               </div>
             )}
           </div>

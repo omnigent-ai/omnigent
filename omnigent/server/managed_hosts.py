@@ -331,6 +331,10 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
+# Deadline for reading a sandbox's logs before teardown, so a hung exec channel
+# cannot stall the delete or leave the sandbox running.
+SANDBOX_LOG_CAPTURE_TIMEOUT_S = 15.0
+
 # How long a message POST waits for an in-flight managed launch to
 # settle before giving up (see ManagedLaunchTracker). Covers the full
 # launch/wake pipeline ON TOP OF the host-registration wait
@@ -572,10 +576,14 @@ class ManagedLaunch:
     :param error: Failure detail once settled unsuccessfully, e.g.
         ``"managed sandbox launch failed: …"``. ``None`` while
         in flight and on success.
+    :param bound: Set once the session row records its new host. From
+        then on the host's replica can finish the launch and deliver
+        saved inputs, so a scheduled fire can hand off at this point.
     """
 
     settled: asyncio.Event
     error: str | None = None
+    bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
 
 
 class ManagedLaunchTracker:
@@ -714,6 +722,8 @@ class ManagedSandboxConfig:
         Supplies choices without selecting a default or provisioning a host.
         Raise :class:`NoReachableModels` when no model can serve the harness;
         the picker then blocks launch instead of offering Default.
+    :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
+        deployments set it explicitly for launchers that require profile selection.
     """
 
     server_url: str
@@ -727,6 +737,9 @@ class ManagedSandboxConfig:
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
+    # Request-scoped reference; teardown must not depend on launch authorization.
+    profile_selection: dict[str, Any] | None = None
+    manages_profiles: bool = False
 
 
 class NoReachableModels(Exception):
@@ -1324,6 +1337,24 @@ def _apply_keep_warm(
     return merged
 
 
+def deployment_with_sandbox_profile(
+    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+) -> ManagedSandboxDeployment:
+    """Pass a saved provider reference to fresh launcher instances."""
+    if snapshot is None:
+        return deployment
+    entry = deployment.for_provider(snapshot["provider"])
+    if entry is None:
+        raise HTTPException(status_code=400, detail="The sandbox profile provider is unavailable")
+    return replace(
+        deployment,
+        configs=tuple(
+            replace(config, profile_selection=snapshot) if config is entry else config
+            for config in deployment.configs
+        ),
+    )
+
+
 def deployment_with_inference_snapshot(
     deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
 ) -> ManagedSandboxDeployment:
@@ -1648,6 +1679,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
+    manages_profiles = False
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -1915,6 +1947,10 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         _parse_registry_config(provider, section)
         launcher_factory = _registry_launcher_factory(provider, section)
         token_ttl_s = _registry_token_ttl_s(provider)
+        from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+        metadata = sandbox_registry.get_provider_metadata(provider)
+        manages_profiles = metadata is not None and metadata.manages_profiles
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1931,6 +1967,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         host_config=host_config,
         model_discovery=model_discovery,
         git_clone=git_clone,
+        manages_profiles=manages_profiles,
     )
 
 
@@ -3768,6 +3805,26 @@ class SandboxStageObserver(Protocol):
         """
 
 
+async def _select_launch_profile(
+    launcher: SandboxHostLauncher,
+    entry: ManagedSandboxConfig,
+    owner: str,
+    *,
+    sandbox_id: str | None = None,
+) -> None:
+    from omnigent.server.provider_sandbox_profiles import select_provider_profile
+
+    snapshot = entry.profile_selection
+    if snapshot is not None:
+        if snapshot.get("user_id") != owner:
+            raise HTTPException(
+                status_code=403, detail="Sandbox profile execution identity mismatch"
+            )
+        await asyncio.to_thread(select_provider_profile, launcher, snapshot, sandbox_id=sandbox_id)
+    elif getattr(launcher, "manages_profiles", False):
+        raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3831,6 +3888,7 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = build_owner_launcher(entry, config, owner)
+    await _select_launch_profile(launcher, entry, owner)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
@@ -3924,6 +3982,7 @@ async def relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
+    await _select_launch_profile(launcher, entry, host.user_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
@@ -4426,6 +4485,7 @@ async def resume_managed_host(
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
+        await _select_launch_profile(launcher, entry, host.user_id, sandbox_id=host.sandbox_id)
         workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -4504,6 +4564,8 @@ async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
@@ -4520,6 +4582,8 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
+    :param capture_logs: Log the in-sandbox host and runner log tails before
+        terminating, e.g. after a client saw the session's turn fail.
     """
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
@@ -4528,6 +4592,10 @@ async def terminate_managed_host(
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:
+            if capture_logs and launcher is not None:
+                await _log_sandbox_logs_best_effort(
+                    launcher, sandbox_id, host_id=tombstone.host_id
+                )
             terminated = await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
@@ -4540,6 +4608,39 @@ async def terminate_managed_host(
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
                 )
+
+
+async def _log_sandbox_logs_best_effort(
+    launcher: SandboxHostLauncher, sandbox_id: str, *, host_id: str
+) -> None:
+    """Log a sandbox's host and runner log tails; never raises."""
+    try:
+        logs = await asyncio.wait_for(
+            asyncio.to_thread(launcher.capture_logs, sandbox_id),
+            timeout=SANDBOX_LOG_CAPTURE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        _logger.warning(
+            "Timed out after %ss capturing logs from managed sandbox %s for host %s",
+            SANDBOX_LOG_CAPTURE_TIMEOUT_S,
+            sandbox_id,
+            host_id,
+        )
+        return
+    except Exception:  # diagnostics must not block teardown.
+        _logger.warning(
+            "Failed to capture logs from managed sandbox %s for host %s",
+            sandbox_id,
+            host_id,
+            exc_info=True,
+        )
+        return
+    _logger.error(
+        "Managed sandbox %s logs before teardown (host %s):\n%s",
+        sandbox_id,
+        host_id,
+        logs or "<no logs captured>",
+    )
 
 
 async def _terminate_sandbox_best_effort(

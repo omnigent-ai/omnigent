@@ -49,11 +49,11 @@ class HostFsError(Exception):
 
 
 class HostFsUnavailableError(Exception):
-    """The host could not be reached for a filesystem read.
+    """A host filesystem operation lost its connection or result.
 
     Connection loss or no reply within the timeout — an infrastructure
     condition. Callers treat it like a runner-offline result (fall
-    through to the next resolver link / 502).
+    through to the next resolver link / 502). A write may already have applied.
     """
 
 
@@ -73,7 +73,8 @@ async def read_workspace_from_host(
     :param op: Operation name — ``"list_or_read"`` / ``"changes"`` /
         ``"diff"`` / ``"search"`` / ``"github_info"`` / ``"github_changes"`` /
         ``"github_diff"`` / ``"github_pr_diff"`` / ``"github_labels"`` /
-        ``"github_merge_options"`` / ``"github_reviewers"``. The ``github_*`` ops
+        ``"github_merge_options"`` / ``"github_reviewers"`` /
+        ``"github_review_threads"`` / ``"github_review_thread_comments"``. The ``github_*`` ops
         serve every git provider; their names are stable wire ids.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
@@ -144,22 +145,30 @@ async def write_workspace_from_host(
     workspace: str,
     session_id: str,
     params: dict[str, Any],
+    timeout: float = _FS_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Send a ``host.fs_write_request`` frame and await its result.
 
     The write counterpart of :func:`read_workspace_from_host` — for the small set
     of host-servable writes (currently ``"github_set_preference"``,
     ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
-    ``"github_merge"``, and ``"github_disable_auto_merge"``) so a preference change,
-    a PR attach/remove, a label or reviewer edit, or a merge works when the session's
-    runner is offline. Shares the result frame, the ``pending_fs_requests``
-    correlation map, and the error mapping with reads.
+    ``"github_details_update"``, ``"github_comment_create"``,
+    ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+    ``"github_attachment_upload"``, ``"github_merge"``,
+    and ``"github_disable_auto_merge"``) so a preference change, a PR attach/remove,
+    a label, reviewer, title, or description edit, a comment, an attachment upload, or a merge
+    works when the session's runner is offline.
+    Shares the result frame, the ``pending_fs_requests`` correlation map, and the
+    error mapping with reads.
 
     :param op: Write op name — currently ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
-        ``"github_reviewers_update"``, ``"github_merge"``, or
+        ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or
         ``"github_disable_auto_merge"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
+    :param timeout: Seconds to wait for the host, longer for a slow op like an upload.
     :returns: The refreshed payload on success.
     :raises HostFsError: When the host reports a failure (reproduces the runner's
         response).
@@ -185,17 +194,17 @@ async def write_workspace_from_host(
                 f"host '{host_conn.host_id}' connection lost during fs write"
             ) from exc
         try:
-            result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+            result = await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs write op %r within %.0fs",
                 host_conn.host_id,
                 op,
-                _FS_TIMEOUT_S,
+                timeout,
             )
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to fs write within "
-                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
+                f"{timeout:.0f}s (it may be running an older version)"
             ) from exc
     finally:
         host_conn.pending_fs_requests.pop(request_id, None)
