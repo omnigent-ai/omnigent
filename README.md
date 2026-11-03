@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -31,8 +31,8 @@ Omnigent lets you:
 
 - **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
   Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok
-  Build, Hermes, Pi, and custom agents (defined in YAML) together in the same
-  session. Ask one agent to review another's work, or split a task across
+  Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and custom agents
+  (defined in YAML) together in the same session. Ask one agent to review another's work, or split a task across
   agents that are each good at different things.
 
 - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
@@ -359,11 +359,10 @@ stdio, and Omnigent stores no credential for either — each CLI reads back the
 login or config it wrote to disk. That also means `--model` is refused rather
 than silently dropped: each runs its own default model. To pin one, configure
 an `acp:` agent whose command passes the vendor's own model flag. The exception
-is Jcode bound to an OpenAI-compatible provider in Omnigent's inference config:
-Omnigent then writes a session-private Jcode config and forwards the agent's
-`model`. Jcode's ACP
-server ignores session-scoped MCP servers, so Omnigent's MCP tools are not
-offered to it.
+is Jcode bound to an OpenAI-compatible Chat Completions provider in Omnigent's
+inference config: Omnigent then writes a session-private Jcode config and
+forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
+servers, so Omnigent's MCP tools are not offered to it.
 
 Use the vendor login rather than an API key. A builtin ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
