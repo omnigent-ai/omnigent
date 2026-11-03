@@ -114,8 +114,8 @@ def test_composer_input_font_setting_and_alignment(
     skill_pills = composer.get_by_test_id("skill-pills")
     skill = skill_pills.get_by_role("button", name="/context", exact=True)
     if mobile:
-        expect(skill_pills).to_be_hidden()
-        expect(composer.locator('[data-testid^="skill-pill-"]:visible')).to_have_count(0)
+        expect(skill_pills).to_have_count(1)
+        expect(skill_pills).to_have_css("display", "none")
     else:
         expect(skill).to_be_visible()
     skill_metrics = None if mobile else _metrics(skill)
@@ -126,8 +126,8 @@ def test_composer_input_font_setting_and_alignment(
     landing.fill("")
     expect(hint).to_be_visible()
     if mobile:
-        expect(skill_pills).to_be_hidden()
-        expect(composer.locator('[data-testid^="skill-pill-"]:visible')).to_have_count(0)
+        expect(skill_pills).to_have_count(1)
+        expect(skill_pills).to_have_css("display", "none")
     else:
         expect(skill).to_be_visible()
         skill.click()

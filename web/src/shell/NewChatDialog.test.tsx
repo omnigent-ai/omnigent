@@ -9671,6 +9671,7 @@ describe("NewChatLandingScreen skill pills", () => {
   it("renders bundled skills as desktop-only pills without hiding the prompt", () => {
     mockAgents([debbyAgent()]);
     renderLanding();
+    // Bundled skills from GET /v1/agents are discoverable without typing "/".
     expect(screen.getByTestId("skill-pills")).toHaveClass("hidden", "md:flex");
     expect(screen.getByText("Describe a task, or try a skill")).toBeVisible();
     expect(screen.getByTestId("skill-pill-debate").textContent).toBe("/debate");
