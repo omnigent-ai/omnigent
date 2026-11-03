@@ -16,7 +16,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useOmnigentAnalytics } from "@/lib/analytics";
+import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
@@ -70,6 +70,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const view = templatesOnly || searchParams.get("view") === "templates" ? "templates" : "yours";
+  useOmnigentPageView(view === "templates" ? "tasks.templates" : "tasks");
   const requestedView = useRef<string>(view);
   useEffect(() => {
     requestedView.current = view;
@@ -100,6 +101,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function openFromTemplate(id: string) {
+    trackClick(`tasks.template.${id}`, "button");
     setTemplateId(id);
     setEditingTask(null);
     setManualOpen(true);
@@ -187,6 +189,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       initialName={selectedTemplate?.prefill.name}
       initialPrompt={selectedTemplate?.prefill.prompt}
       initialTrigger={selectedTemplate?.trigger}
+      initialTemplateId={selectedTemplate?.id}
       sessionLink={sessionLink}
       editingTask={editingTask}
     />

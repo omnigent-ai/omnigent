@@ -610,28 +610,41 @@ describe("run history", () => {
     expect(screen.getByTestId("task-detail-run")).toHaveAttribute("data-run-unread", "false");
   });
 
-  it("renders a FAILED run with an amber triangle and the stage and reason it stopped at", async () => {
-    setTask(task());
-    setRuns([
-      run({
-        id: "run_fail",
-        status: "failed",
-        errorCode: "sandbox_registration_timeout",
-        conversationId: null,
-      }),
-    ]);
-    renderPage();
-    const row = screen.getByTestId("task-detail-run");
-    const icon = within(row).getByTestId("run-status-icon");
-    expect(icon).toHaveAttribute("data-run-icon", "failed");
-    expect(icon.getAttribute("class") ?? "").toContain("text-amber-500");
-    expect(within(row).getByTestId("run-failure-stage")).toHaveTextContent("Sandbox");
-    expect(within(row).getByTestId("run-failure")).toHaveTextContent(
-      "Sandbox · The sandbox didn't connect in time.",
-    );
-    fireEvent.focus(icon);
-    await waitFor(() => expect(screen.getAllByText("Failed").length).toBeGreaterThan(0));
-  });
+  it.each([
+    ["sandbox_registration_timeout", "Sandbox", "The sandbox didn't connect in time."],
+    [
+      "permission_harness_unresolved",
+      "Permissions",
+      "Couldn't load the agent's permission settings. Restore access to the agent and retry.",
+    ],
+    [
+      "permission_mode_unsupported",
+      "Permissions",
+      "The saved permission isn't supported by this agent. Edit the automation to change or clear it.",
+    ],
+  ])(
+    "renders a failed %s run with its stage and recovery message",
+    async (errorCode, stage, reason) => {
+      setTask(task());
+      setRuns([
+        run({
+          id: "run_fail",
+          status: "failed",
+          errorCode,
+          conversationId: null,
+        }),
+      ]);
+      renderPage();
+      const row = screen.getByTestId("task-detail-run");
+      const icon = within(row).getByTestId("run-status-icon");
+      expect(icon).toHaveAttribute("data-run-icon", "failed");
+      expect(icon.getAttribute("class") ?? "").toContain("text-amber-500");
+      expect(within(row).getByTestId("run-failure-stage")).toHaveTextContent(stage);
+      expect(within(row).getByTestId("run-failure")).toHaveTextContent(`${stage} · ${reason}`);
+      fireEvent.focus(icon);
+      await waitFor(() => expect(screen.getAllByText("Failed").length).toBeGreaterThan(0));
+    },
+  );
 
   it("names no stage for an unknown error code but still gives a reason", () => {
     setTask(task());
