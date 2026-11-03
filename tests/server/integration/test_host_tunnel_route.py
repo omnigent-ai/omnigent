@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
@@ -51,6 +52,7 @@ from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 
 pytestmark = pytest.mark.asyncio
@@ -999,6 +1001,9 @@ async def test_host_readiness_does_not_block_results_or_pongs(
     original_update = store.update_harness_readiness
 
     def update_readiness(host_id, configured_harnesses, **kwargs):
+        if configured_harnesses is None:
+            original_update(host_id, configured_harnesses, **kwargs)
+            return
         writes.append(dict(configured_harnesses))
         if blocked_at == "store" and len(writes) == 1:
             entered.set()
@@ -1079,19 +1084,34 @@ async def test_host_readiness_does_not_block_results_or_pongs(
         await comm.wait(timeout=budget(2.0))
 
 
-@pytest.mark.parametrize("disconnect_first", [True, False])
+@pytest.mark.parametrize(
+    "replacement_order", ["disconnect", "after_registration", "before_registration"]
+)
+@pytest.mark.parametrize("replacement_readiness", [{"codex": True}, {}, None])
 async def test_retired_readiness_write_cannot_overwrite_reconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
-    disconnect_first: bool,
+    replacement_order: str,
+    replacement_readiness: dict[str, HarnessAvailability] | None,
 ) -> None:
     app, registry, store = host_app
     entered = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    replacement_committed = threading.Event()
+    register_replacement = threading.Event()
     original_update = store.update_harness_readiness
+    original_upsert = store.upsert_on_connect
+
+    def delayed_registration(*args, **kwargs):
+        host = original_upsert(*args, **kwargs)
+        replacement_committed.set()
+        assert register_replacement.wait(timeout=budget(5.0))
+        return host
 
     def blocked_update(host_id, configured_harnesses, **kwargs):
+        if configured_harnesses != {"pi": False}:
+            return original_update(host_id, configured_harnesses, **kwargs)
         entered.set()
         try:
             assert release.wait(timeout=budget(5.0))
@@ -1115,10 +1135,12 @@ async def test_retired_readiness_write_cannot_overwrite_reconnect(
             }
         )
         assert await asyncio.to_thread(entered.wait, budget(1.0))
-        if disconnect_first:
+        if replacement_order == "disconnect":
             await comm.send_input({"type": "websocket.disconnect", "code": 1000})
             await comm.wait(timeout=budget(1.0))
             assert registry.get(_HOST_ID) is None
+        elif replacement_order == "before_registration":
+            monkeypatch.setattr(store, "upsert_on_connect", delayed_registration)
         replacement = await _connect_route(app, _TUNNEL_PATH)
         await replacement.send_input(
             {
@@ -1128,11 +1150,18 @@ async def test_retired_readiness_write_cannot_overwrite_reconnect(
                         version="0.1.0-test",
                         frame_protocol_version=1,
                         name="test-laptop",
-                        configured_harnesses={"codex": True},
+                        configured_harnesses=replacement_readiness,
                     )
                 ),
             }
         )
+        if replacement_order == "before_registration":
+            assert await asyncio.to_thread(replacement_committed.wait, budget(1.0))
+            assert registry.get(_HOST_ID) is old_conn
+            release.set()
+            assert await asyncio.to_thread(finished.wait, budget(1.0))
+            assert registry.get(_HOST_ID) is old_conn
+            register_replacement.set()
 
         async def wait_replaced() -> None:
             while registry.get(_HOST_ID) in (None, old_conn):
@@ -1142,12 +1171,20 @@ async def test_retired_readiness_write_cannot_overwrite_reconnect(
         await comm.wait(timeout=budget(1.0))
         release.set()
         assert await asyncio.to_thread(finished.wait, budget(1.0))
+        await poll_until_async(
+            lambda: (
+                (host := store.get_host(_HOST_ID)) is not None
+                and host.configured_harnesses == replacement_readiness
+            ),
+            timeout_s=budget(1.0),
+        )
         persisted = store.get_host(_HOST_ID)
         assert persisted is not None
         assert persisted.status == "online"
-        assert persisted.configured_harnesses == {"codex": True}
+        assert persisted.configured_harnesses == replacement_readiness
     finally:
         release.set()
+        register_replacement.set()
         assert await asyncio.to_thread(finished.wait, budget(2.0))
         comm.stop(exceptions=False)
         if replacement is not None:
@@ -1168,17 +1205,23 @@ async def test_host_readiness_failure_does_not_disconnect(
     original_update = store.update_harness_readiness
     writes = 0
     notified = asyncio.Event()
+    notifications = 0
 
-    def update_readiness(*args, **kwargs):
+    def update_readiness(host_id, configured_harnesses, **kwargs):
         nonlocal writes
+        if configured_harnesses is None:
+            original_update(host_id, configured_harnesses, **kwargs)
+            return
         writes += 1
         if failed_at == "store" and writes == 1:
             raise RuntimeError("test readiness persistence failure")
-        original_update(*args, **kwargs)
+        original_update(host_id, configured_harnesses, **kwargs)
 
     async def on_update(_host_id: str, _owner: str | None) -> None:
+        nonlocal notifications
+        notifications += 1
         notified.set()
-        if failed_at == "callback":
+        if failed_at == "callback" and notifications == 1:
             raise RuntimeError("test readiness callback failure")
 
     monkeypatch.setattr(store, "update_harness_readiness", update_readiness)
@@ -1203,6 +1246,20 @@ async def test_host_readiness_failure_does_not_disconnect(
         assert persisted is not None and persisted.configured_harnesses == {"pi": True}
         await _receive_ping_and_pong(comm)
         assert registry.get(_HOST_ID) is not None
+        notified.clear()
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"codex": True})
+                ),
+            }
+        )
+        await asyncio.wait_for(notified.wait(), timeout=budget(1.0))
+        assert notifications == 2
+        assert writes == (3 if failed_at == "store" else 2)
+        persisted = store.get_host(_HOST_ID)
+        assert persisted is not None and persisted.configured_harnesses == {"codex": True}
     finally:
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await comm.wait(timeout=budget(2.0))

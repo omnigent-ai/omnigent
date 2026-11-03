@@ -15,6 +15,7 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
@@ -216,7 +217,10 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     assert fetched.configured_harnesses is None
 
 
-def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> None:
+@pytest.mark.parametrize("readiness", [{"pi": True}, {}, None])
+def test_update_harness_readiness_replaces_live_map(
+    host_store: HostStore, readiness: dict[str, HarnessAvailability] | None
+) -> None:
     """A live tunnel refresh replaces readiness without reconnecting."""
     host_id = "6d86ee544f1d5b7068ac56f5927a5b5c"
     host_store.upsert_on_connect(
@@ -226,11 +230,11 @@ def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> No
         configured_harnesses={"pi": False},
     )
 
-    host_store.update_harness_readiness(host_id, {"pi": True})
+    host_store.update_harness_readiness(host_id, readiness)
 
     fetched = host_store.get_host(host_id)
     assert fetched is not None
-    assert fetched.configured_harnesses == {"pi": True}
+    assert fetched.configured_harnesses == readiness
     assert fetched.status == "online"
 
 

@@ -1281,19 +1281,24 @@ async def _readiness_loop(
     def retired() -> bool:
         return abandoned.is_set() or host_registry.get(conn.host_id, conn.workspace_id) is not conn
 
-    persisted_configured = conn.hello.configured_harnesses
+    # A predecessor can write after the hello upsert commits, before registration.
+    # Reconcile once while owning the registry entry, including unknown readiness.
+    unpersisted = object()
+    persisted_configured: object = unpersisted
     while True:
-        await requested.wait()
+        if persisted_configured is not unpersisted:
+            await requested.wait()
+        notify = requested.is_set()
         requested.clear()
         if retired():
             return
         configured = conn.hello.configured_harnesses
-        if configured is not None and configured is not persisted_configured:
+        if configured is not persisted_configured:
             try:
                 await asyncio.to_thread(
                     host_store.update_harness_readiness,
                     conn.host_id,
-                    dict(configured),
+                    dict(configured) if configured is not None else None,
                     cancelled=lambda snapshot=configured: (
                         retired() or conn.hello.configured_harnesses is not snapshot
                     ),
@@ -1310,7 +1315,7 @@ async def _readiness_loop(
             return
         if conn.hello.configured_harnesses is not configured:
             continue
-        if on_host_update is not None:
+        if notify and on_host_update is not None:
             try:
                 await on_host_update(conn.host_id, conn.owner)
             except Exception:
