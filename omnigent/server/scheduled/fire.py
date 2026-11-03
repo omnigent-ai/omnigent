@@ -355,9 +355,17 @@ UNATTENDED_RUN_NOTE = (
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
-    "request permission. When something is unclear, make a reasonable choice and keep "
-    "going. If an action needs approval or is denied, skip it and say so in your reply. "
-    "End with a reply that says what you did, what you assumed and anything you couldn't do."
+    "request permission. When something is unclear, make a reasonable assumption only "
+    "if it is easy to reverse and within the user's authorization. Record each "
+    "assumption, its basis and how easily it can be changed. For decisions that are "
+    "hard to reverse, involve significant trade-offs or would likely surprise the user, "
+    "record the options and your recommendation, and defer the affected work. Continue "
+    "independent work that does not depend on those decisions. If an action is denied or "
+    "requires unavailable approval, skip that action and explain the blocker. Continue "
+    "independent work and permitted alternatives. Do not change permission settings to "
+    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
+    "prioritizing those the user is most likely to want to change, then summarize what "
+    "you did and anything you couldn't do."
 )
 
 
