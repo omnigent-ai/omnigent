@@ -10,7 +10,7 @@ parameterization produces additional collected cases.
 | [test_auth.py](test_auth.py) | Auth | 22 |
 | [test_compaction.py](test_compaction.py) | Compaction | 11 |
 | [test_deltas.py](test_deltas.py) | Deltas | 12 |
-| [test_elicitation.py](test_elicitation.py) | Elicitation | 8 |
+| [test_elicitation.py](test_elicitation.py) | Elicitation | 12 |
 | [test_launch_config.py](test_launch_config.py) | Launch config | 18 |
 | [test_local_sessions.py](test_local_sessions.py) | Local sessions | 11 |
 | [test_plan_implementation.py](test_plan_implementation.py) | Plan implementation | 4 |
