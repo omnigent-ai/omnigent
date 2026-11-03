@@ -5,13 +5,11 @@ Use empty CODEX_HOME and OMNIGENT_CONFIG_HOME.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import shutil
 import signal
 import subprocess
-import tarfile
 import time
 import uuid
 from collections.abc import Callable
@@ -30,8 +28,10 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id, read_bridge_state
 from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
+from tests._helpers.operator_agents import post_operator_session
+from tests._helpers.session import bundle_files, send_user_text
 from tests.e2e.conftest import configure_mock_llm, release_mock_gate
-from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
+from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker
 
 _SYSTEM_CODEX_CONFIG = Path("/etc/codex/managed_config.toml")
 pytestmark = [
@@ -115,28 +115,19 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
     }
     spec["spawn"] = False
     spec["os_env"]["cwd"] = str(tmp_path)
-    with io.BytesIO() as buffer:
-        with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
-            data = yaml.safe_dump(spec).encode()
-            entry = tarfile.TarInfo("codex-native-ui.yaml")
-            entry.size = len(data)
-            bundle.addfile(entry, io.BytesIO(data))
-        payload = buffer.getvalue()
+    payload = bundle_files({"codex-native-ui.yaml": yaml.safe_dump(spec).encode()})
 
-    create = http_client.post(
+    create = post_operator_session(
+        http_client.post,
         "/v1/sessions",
-        data={
-            "metadata": json.dumps(
-                {
-                    "workspace": str(tmp_path),
-                    "labels": {
-                        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-                        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-                    },
-                }
-            )
+        payload,
+        metadata={
+            "workspace": str(tmp_path),
+            "labels": {
+                WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
+                UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+            },
         },
-        files={"bundle": ("agent.tar.gz", payload, "application/gzip")},
     )
     assert create.is_success, create.text
     session_id = create.json()["session_id"]
@@ -170,7 +161,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
         # Persist the thread before testing recovery.
         marker = f"READY_{uuid.uuid4().hex}"
         configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
-        _send_user_text(http_client, session_id=session_id, text="Reply with the ready marker")
+        send_user_text(http_client, session_id=session_id, text="Reply with the ready marker")
         _poll_for_assistant_marker(http_client, session_id=session_id, marker=marker, timeout=60)
         previous_reply = marker
 
@@ -182,7 +173,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
             configure_mock_llm(
                 mock_llm_server_url, [{"text": marker, "block": True}], match=prompt
             )
-            _send_user_text(http_client, session_id=session_id, text=prompt)
+            send_user_text(http_client, session_id=session_id, text=prompt)
             _wait_for(
                 lambda: httpx.get(
                     f"{mock_llm_server_url}/gate/pending", timeout=5, trust_env=False

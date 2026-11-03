@@ -32,6 +32,7 @@ from omnigent.runner.background_titles.service import (
     background_title_model,
     build_background_title_instructions,
 )
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from tests.runner.helpers import NullServerClient
 
 
@@ -107,6 +108,7 @@ async def _runner_client(app):
 async def test_background_title_uses_isolated_codex_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_SKILLS_DIR", "/ambient-parent-session-skills")
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
 
@@ -114,7 +116,10 @@ async def test_background_title_uses_isolated_codex_process(
         assert kwargs["agent_id"] == "agent_test"
         assert kwargs["session_id"] == "conv_test"
         assert kwargs["model_override"] == "gpt-5.4-mini"
-        return "codex", {"HARNESS_CODEX_MODEL": "gpt-5.4-mini"}
+        return "codex", {
+            "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
+            "HARNESS_CODEX_SKILLS_DIR": "/parent-session-skills",
+        }
 
     monkeypatch.setattr(
         "omnigent.runner.app._resolve_harness_config",
@@ -152,7 +157,10 @@ async def test_background_title_uses_isolated_codex_process(
         "HARNESS_CODEX_MINIMAL_CONFIG": "1",
         "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
         "HARNESS_CODEX_SKILLS_FILTER": '"none"',
+        "HARNESS_CODEX_SKILLS_DIR": "",
+        "OMNIGENT_CLIENT_SURFACE": "unknown",
     }
+    assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
     assert process_manager.released == [process_key]
 
     [(url, body)] = harness_client.requests
@@ -197,6 +205,37 @@ def test_forwarded_framework_language_rule_keeps_default_runner_prompt() -> None
         background_title_max_output_tokens(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
         == BACKGROUND_TITLE_MAX_OUTPUT_TOKENS
     )
+
+
+@pytest.mark.parametrize(
+    ("harness", "env", "expected"),
+    [
+        ("claude-sdk", None, "haiku"),
+        ("claude-sdk", "sonnet", "sonnet"),
+        ("claude-native", "sonnet", "sonnet"),
+        ("codex", "sonnet", "gpt-5.6-luna"),
+        ("claude-sdk", "   ", "haiku"),
+    ],
+    ids=[
+        "claude-default",
+        "claude-override",
+        "claude-native-override",
+        "codex-unaffected",
+        "blank",
+    ],
+)
+def test_background_title_model_claude_env_override(
+    harness: str,
+    env: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL overrides only the claude family."""
+    if env is None:
+        monkeypatch.delenv("OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL", env)
+    assert background_title_model(harness) == expected
 
 
 def test_operator_language_override_stays_custom_after_framework_suffix() -> None:
@@ -312,7 +351,7 @@ async def test_background_title_resolves_synthetic_claude_policy_gate(
         )
     ]
     [(_url, body)] = harness_client.requests
-    assert body["max_output_tokens"] == 32
+    assert body["max_output_tokens"] == 256
     assert body["model_override"] == "haiku"
 
 
@@ -459,6 +498,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 ) -> None:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
     captured: dict[str, Any] = {}
     claude_config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
@@ -468,6 +509,16 @@ async def test_claude_native_title_uses_tool_free_print_mode(
             "claude-opus-4-8": "deployment-17",
         },
     )
+    loop = asyncio.get_running_loop()
+    lookup_started = asyncio.Event()
+    lookup_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def resolve_config(*, spec: object = None) -> ClaudeNativeUcodeConfig:
+        assert spec is None
+        loop.call_soon_threadsafe(lookup_started.set)
+        loop_progressed.append(lookup_release.wait(timeout=1.0))
+        return claude_config
 
     class FakeProcess:
         returncode = 0
@@ -481,7 +532,7 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
-        lambda spec=None: claude_config,
+        resolve_config,
     )
     monkeypatch.setattr(
         "omnigent.claude_launcher.resolve_claude_launch",
@@ -489,17 +540,27 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    title = await claude_native_titles.generate_background_title(
-        BackgroundTitleContext(
-            prompt="please investigate the authentication timeout",
-            harness="claude-native",
-            spawn_env={},
-            process_manager=None,
-            cwd=tmp_path,
-            model_override="claude-sonnet-4-6",
+    task = asyncio.create_task(
+        claude_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="claude-native",
+                spawn_env={},
+                process_manager=None,
+                cwd=tmp_path,
+                model_override="claude-sonnet-4-6",
+            )
         )
     )
+    try:
+        await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
+        lookup_release.set()
+        title = await task
+    finally:
+        lookup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
+    assert loop_progressed == [True], "title provider resolution blocked the runner's event loop"
     assert title == "Debug authentication timeout"
     assert captured["command"] == "claude"
     args = list(captured["args"])
@@ -518,6 +579,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
+    assert "ANTHROPIC_API_KEY" not in captured["kwargs"]["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["kwargs"]["env"]
 
 
 @pytest.mark.asyncio
@@ -729,11 +792,13 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_stage", ["launch", "server"])
 @pytest.mark.parametrize("cancel_during_lookup", [False, True])
 async def test_codex_native_title_keeps_loop_responsive_during_profile_resolution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     cancel_during_lookup: bool,
+    lookup_stage: str,
 ) -> None:
     """Title preparation must not block unrelated runner tasks on profile lookup."""
     loop = asyncio.get_running_loop()
@@ -742,15 +807,26 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     lookup_finished = threading.Event()
     loop_progressed: list[bool] = []
 
-    def resolve_host(profile: str | None) -> None:
-        assert profile == "test-profile"
+    def wait_for_lookup() -> None:
         loop.call_soon_threadsafe(lookup_started.set)
         loop_progressed.append(lookup_release.wait(timeout=1.0))
         lookup_finished.set()
 
+    def resolve_launch(*, model: str | None, spec: object = None) -> NativeCodexLaunch:
+        assert model is None
+        assert spec is None
+        if lookup_stage == "launch":
+            wait_for_lookup()
+        return NativeCodexLaunch([], model, "test-profile")
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        if lookup_stage == "server":
+            wait_for_lookup()
+
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch",
-        lambda *, model, spec=None: NativeCodexLaunch([], model, "test-profile"),
+        resolve_launch,
     )
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server._find_codex_cli", lambda: "codex"
@@ -783,7 +859,8 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     try:
         await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
         title_roots = list(tmp_path.glob("omnigent-codex-title-*"))
-        assert len(title_roots) == 1
+        if lookup_stage == "server":
+            assert len(title_roots) == 1
         if cancel_during_lookup:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -798,7 +875,7 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
         assert await asyncio.to_thread(lookup_finished.wait, 2.0)
 
     assert loop_progressed == [True], "title profile resolution blocked the runner's event loop"
-    assert not title_roots[0].exists()
+    assert not list(tmp_path.glob("omnigent-codex-title-*"))
 
 
 @pytest.mark.asyncio
@@ -1080,7 +1157,10 @@ async def test_background_title_dispatches_any_registered_harness(
     }
     [context] = captured
     assert context.harness == "community-example"
-    assert context.spawn_env == {"EXAMPLE_MODEL": "example-model"}
+    assert context.spawn_env == {
+        "EXAMPLE_MODEL": "example-model",
+        "OMNIGENT_CLIENT_SURFACE": "unknown",
+    }
     assert context.model_override == "example-model"
     assert process_manager.get_client_calls == []
     assert process_manager.released == []
@@ -1338,6 +1418,59 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
     [(_, first_body), (_, second_body)] = harness_client.requests
     assert first_body["model_override"] == "gpt-5.6-luna"
     assert "model_override" not in second_body
+
+
+@pytest.mark.parametrize("additional_instructions", [None, "Prefix the title with today's date."])
+async def test_claude_sdk_title_can_finish_beyond_a_short_output_budget(
+    additional_instructions: str | None,
+) -> None:
+    title = "แก้ไขการตรวจสอบสิทธิ์"
+
+    class TokenLimitedClient(_FakeHarnessClient):
+        def stream(self, method, url, *, json, timeout):
+            self.requests.append((url, json))
+            # Model a provider response needing 80 tokens, including its stop marker.
+            if json["max_output_tokens"] < 80:
+                return _FakeHarnessStream(
+                    [
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "error": {
+                                    "message": (
+                                        "API Error: Claude's response exceeded "
+                                        "the output token maximum."
+                                    )
+                                }
+                            },
+                        }
+                    ]
+                )
+            return _FakeHarnessStream(
+                [
+                    {"type": "response.output_text.delta", "delta": title},
+                    {"type": "response.completed"},
+                ]
+            )
+
+    client = TokenLimitedClient()
+    manager = _FakeProcessManager(client)
+    result = await title_service.generate_background_title(
+        _title_context(
+            "claude-sdk",
+            process_manager=manager,
+            additional_instructions=additional_instructions,
+        )
+    )
+
+    assert result == title
+    [(process_key, harness, _env)] = manager.get_client_calls
+    assert harness == "claude-sdk"
+    assert manager.released == [process_key]
+    [(_url, request)] = client.requests
+    assert request["tools"] == []
+    assert request["model_override"] == background_title_model("claude-sdk")
+    assert 256 <= request["max_output_tokens"] <= 1024
 
 
 @pytest.mark.asyncio

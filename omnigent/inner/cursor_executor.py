@@ -180,7 +180,7 @@ async def _resolve_model_against_catalog(
         listing = list_models(api_key=api_key)
         raw = await listing if isinstance(listing, Awaitable) else listing
         catalog: list[object] = list(raw) if isinstance(raw, Iterable) else []
-    except Exception:  # noqa: BLE001 — any listing failure degrades to backend-side validation
+    except Exception:  # any listing failure degrades to backend-side validation
         logger.warning(
             "CursorExecutor: model listing failed; dispatching %r unverified.",
             requested,

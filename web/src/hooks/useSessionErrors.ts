@@ -17,6 +17,10 @@ type ErrorConversation = Pick<
   "id" | "updated_at" | "status" | "pending_elicitations_count" | "provisional" | "host_online"
 >;
 
+// A change to updated_at, status or host_online keys a new tail read. Drop the
+// superseded ones quickly but keep reusing the cache across a short remount.
+const SESSION_ERROR_GC_MS = 30_000;
+
 // Leave connections available for navigation and the existing chat streams.
 let activeReads = 0;
 const waitingReads: (() => void)[] = [];
@@ -92,7 +96,9 @@ function liveError(conversation: ErrorConversation): LatestSessionError | null |
     return undefined;
   }
   if (state.status === "streaming" || state.terminalPending) return null;
-  return latestActivityErrorState(state.blocks, conversation.host_online) ?? null;
+  return (
+    latestActivityErrorState(state.blocks, conversation.host_online, state.sessionStatus) ?? null
+  );
 }
 
 /** Reuse live transcripts; unopened rows share a cached, bounded tail read. */
@@ -156,6 +162,7 @@ export function useSessionErrorStates(
         c.status !== "running" &&
         (c.pending_elicitations_count ?? 0) === 0,
       staleTime: Infinity,
+      gcTime: SESSION_ERROR_GC_MS,
       retry: false,
     })),
   });

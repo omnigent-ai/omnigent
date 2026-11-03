@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Goal } from "@/lib/goalApi";
@@ -132,5 +132,22 @@ describe("GoalControl", () => {
 
     fireEvent.click(screen.getByTestId("composer-goal-mode"));
     expect(onOpen).toHaveBeenCalledOnce();
+  });
+
+  it("lets an unbreakable objective wrap inside the tooltip", async () => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={GOAL} />
+      </TooltipProvider>,
+    );
+
+    fireEvent.focus(screen.getByTestId("composer-goal-mode"));
+    await screen.findByRole("tooltip");
+    const bubble = document.querySelector('[data-slot="tooltip-content"]');
+    expect(bubble).not.toBeNull();
+    // Radix also renders a visually hidden copy for the tooltip role; the first
+    // match is the visible objective line.
+    const objective = within(bubble as HTMLElement).getAllByText(GOAL.objective)[0];
+    expect(objective).toHaveClass("line-clamp-3", "wrap-anywhere");
   });
 });

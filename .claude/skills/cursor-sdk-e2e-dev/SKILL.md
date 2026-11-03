@@ -108,7 +108,7 @@ that works, the full stack is good: key, egress, bridge, harness.
    setup`) > ambient `CURSOR_API_KEY`.
 4. **No Databricks gateway.** Cursor talks only to Cursor's backend, so a
    `databricks-*` model is silently resolved to cursor `auto` — it will *not*
-   route through the AI Gateway like claude-sdk/codex/pi.
+   route through the Unity Gateway like claude-sdk/codex/pi.
 5. **Use a model id from the account's catalog.** Bare `gpt-5` is **not** valid;
    the SDK rejects unknown ids. Valid examples seen live: `default`,
    `composer-2.5`, `claude-opus-4-8`, `gpt-5.5`. Run with `--model` and read the

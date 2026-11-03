@@ -73,7 +73,7 @@ jobs:
       UV_PYTHON_PREFERENCE: only-system
     steps:
       - name: Checkout PR branch
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # No persisted credentials anywhere in this job: it runs PR-chosen code
           # and must never have a push token on disk.
@@ -83,23 +83,23 @@ jobs:
       # The pinned Playwright image doesn't ship Node, so install Node before
       # the pnpm action (pnpm/action-setup's self-installer needs a Node binary).
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 11.15.1
           standalone: true
 
       - name: Install uv
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           # Namespaced + container-scoped to match ui-snapshot.yml (built with
@@ -121,21 +121,22 @@ jobs:
           pnpm --filter web run build:storybook
 
       - name: Compare and verify the regenerated baselines
-        # Deliberately NOT --update-snapshots: that rewrites EVERY PNG, churning
-        # baselines that already pass. Under GitHub Actions, plain compare mode
-        # updates only drifting/missing PNGs in place. The first run may therefore
-        # fail by design. The second must pass, distinguishing expected baseline
-        # updates from Storybook/index/server/render failures. The first run
-        # allows size drift so a story whose captured surface changed size is
-        # rewritten in place too, instead of aborting on the size check.
+        # CI compare updates only drifting/missing PNGs and fails those cases.
+        # Allow resized captures on the first pass, then verify failed cases
+        # with strict sizes. Clear old failures so selection is run-local.
         run: |
+          status=0
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures --ignore-size-diff \
-            --ui-skip-build || true
+            -p no:rerunfailures --ignore-size-diff --cache-clear \
+            --ui-skip-build || status=$?
+          # Only test failures (1) need verification; propagate other exit codes.
+          if [[ "$status" -ne 1 ]]; then
+            exit "$status"
+          fi
           uv run pytest tests/e2e_ui/visual -m visual \
             -v --tb=long --log-level=INFO -r a \
-            -p no:rerunfailures \
+            -p no:rerunfailures --last-failed \
             --ui-skip-build
 
       # Tar the snapshots tree (paths intact) so the commit job can restore it
@@ -145,7 +146,7 @@ jobs:
         run: tar -czf "$RUNNER_TEMP/ui-snapshots.tgz" tests/e2e_ui/visual/snapshots
 
       - name: Upload regenerated baselines
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: ${{ runner.temp }}/ui-snapshots.tgz
@@ -154,7 +155,7 @@ jobs:
 
   # 2) Commit + push on a clean runner. Runs NO PR code -- only checks out the
   #    branch, drops in the rendered PNG, and pushes -- so it is safe to hold the
-  #    App token here. `git`/`gh` are preinstalled on ubuntu-latest.
+  #    App token here. `git`/`gh` are preinstalled on the runner.
   commit:
     name: Commit + push visual baselines
     needs: render
@@ -165,12 +166,12 @@ jobs:
     permissions:
       contents: write      # push the regenerated baseline (GITHUB_TOKEN fallback)
       pull-requests: write # comment the result + drop the trigger label
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout PR branch
         if: needs.render.result == 'success'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # PR files land on disk but are never executed in this job; the push
           # token authenticates inline at the push step (not via .git/config).
@@ -179,7 +180,7 @@ jobs:
 
       - name: Download regenerated baselines
         if: needs.render.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: ui-snapshot-update-${{ github.run_id }}
           path: _ui_snapshot_artifact
@@ -205,7 +206,7 @@ jobs:
       - name: Mint App token
         id: app-token
         if: needs.render.result == 'success' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}

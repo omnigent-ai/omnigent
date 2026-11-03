@@ -90,7 +90,11 @@ async def test_model_switch_wakes_and_initializes_before_forwarding(
 
     async def forward(*args: Any, **kwargs: Any) -> _RunnerForwardResult:
         assert order == ["wake", "initialize"]
-        assert args[2] == {"type": "model_change", "model": "gpt-5.6-sol"}
+        assert args[2] == {
+            "type": "model_change",
+            "model": "gpt-5.6-sol",
+            "rollback_on_refusal": True,
+        }
         assert store.get_conversation(session_id).model_override == "gpt-5.6-sol"
         order.append("forward")
         return _RunnerForwardResult(status_code=204, body="")

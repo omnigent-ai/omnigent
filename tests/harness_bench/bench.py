@@ -95,6 +95,30 @@ class BenchMatrix:
     def has_drift(self) -> bool:
         return any(r.has_drift for r in self.reports)
 
+    @property
+    def complete(self) -> bool:
+        """Whether every selected cell has a conclusive observation.
+
+        Completeness is separate from correctness: a measured capability
+        mismatch is complete but still drifts. Offline renders, missing CLIs,
+        probe exceptions, and timeouts cannot establish a passing check.
+        """
+        return bool(self.reports) and all(
+            report.cells
+            and not report.skipped_reason
+            and all(
+                cell.observed
+                in {
+                    Verdict.SUPPORTED,
+                    Verdict.UNSUPPORTED,
+                    Verdict.PARTIAL,
+                    Verdict.NOT_APPLICABLE,
+                }
+                for cell in report.cells
+            )
+            for report in self.reports
+        )
+
 
 def _is_native(profile: BenchProfile) -> bool:
     """Whether *profile* names a native harness (drives the applicability gate)."""

@@ -1,0 +1,603 @@
+"""A connected service runs through the session gateway and existing policy path."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, Mock
+
+import httpx
+import pytest
+from mcp.types import CallToolResult, TextContent, Tool
+
+from omnigent.server.mcp_registry import (
+    McpRegistry,
+    McpRegistryConfig,
+    McpService,
+    McpUpstreamError,
+)
+from tests.server.helpers import build_agent_bundle, create_test_session
+
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def app(runtime_init, db_uri, tmp_path):
+    from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
+    from omnigent.server.app import create_app
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    return create_app(
+        agent_store=get_agent_store(),
+        conversation_store=get_conversation_store(),
+        agent_cache=get_agent_cache(),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+        file_store=SqlAlchemyFileStore(db_uri),
+    )
+
+
+async def test_registry_tools_are_attached_discovered_and_executed_on_server(
+    client, app, monkeypatch
+):
+    registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="tracker",
+                    title="Tracker",
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                )
+            ]
+        ),
+        None,
+    )
+    app.state.mcp_registry = registry
+    execute = AsyncMock(
+        side_effect=[
+            [
+                Tool(
+                    name="read_ticket",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"ticket_id": {"type": "string"}},
+                    },
+                )
+            ],
+            CallToolResult(content=[TextContent(type="text", text="Ticket TEST-123: ready")]),
+        ]
+    )
+    monkeypatch.setattr(registry, "execute", execute)
+    session = await create_test_session(client, name="registry-agent")
+    session_id = session["id"]
+    attached = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "registry"},
+    )
+    assert attached.status_code == 200, attached.text
+    assert attached.json()["url"] is None
+    listed = await client.post(
+        "/v1/mcp/tracker",
+        headers={"X-Omnigent-Session-Id": session_id},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert listed.status_code == 200, listed.text
+    assert "result" in listed.json(), listed.text
+    assert "read_ticket" in [t["name"] for t in listed.json()["result"]["tools"]]
+    called = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "tracker__read_ticket", "arguments": {"ticket_id": "TEST-123"}},
+        },
+    )
+    assert called.json()["result"]["content"][0]["text"] == "Ticket TEST-123: ready", called.text
+    assert execute.await_args.kwargs == {
+        "tool": "read_ticket",
+        "arguments": {"ticket_id": "TEST-123"},
+    }
+    # A catalog reference is all the runner receives; no endpoint or provider token.
+    agent = await client.get(f"/v1/sessions/{session_id}/agent")
+    assert agent.json()["mcp_servers"][0]["transport"] == "registry"
+    assert "example.test" not in agent.text
+
+    # A normal call must still stop at the existing policy gate.
+    from omnigent.policies.types import PolicyResult
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.spec.types import PolicyAction
+    from tests.server.routes.test_sessions_mcp_proxy_policy_retry import (
+        _engine_factory_expecting_preload,
+        _FixedPolicyEngine,
+    )
+
+    engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.DENY, reason="Operator blocked"))
+    monkeypatch.setattr(
+        sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
+    )
+    execute.reset_mock()
+    denied = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "tracker__read_ticket", "arguments": {"ticket_id": "TEST-123"}},
+        },
+    )
+    assert "Operator blocked" in denied.json()["error"]["message"]
+    execute.assert_not_awaited()
+
+
+@pytest.fixture
+def launch_registry(app):
+    app.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id=name,
+                    title=name,
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                    allowed_users=[] if name == "restricted" else None,
+                )
+                for name in ["tracker", "other", "restricted"]
+            ]
+        ),
+        None,
+    )
+    return app.state.mcp_registry
+
+
+@pytest.mark.parametrize("outcome", ["success", "rpc_error", "transport_error"])
+async def test_legacy_discovery_preserves_runner_errors(
+    client, app, launch_registry, monkeypatch, outcome
+):
+    from omnigent.server.routes import sessions as sessions_mod
+
+    session = await create_test_session(client)
+    sid = session["id"]
+    attached = await client.post(
+        f"/v1/sessions/{sid}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "registry"},
+    )
+    assert attached.status_code == 200, attached.text
+    backend = AsyncMock()
+    backend.list_tools.return_value = [Tool(name="read_ticket", inputSchema={"type": "object"})]
+    app.state.mcp_gateway_backend = backend
+    rpc_error = {"code": -32001, "message": "Runner discovery unavailable"}
+
+    def runner_response(request):
+        if outcome == "transport_error":
+            raise httpx.ConnectError("Runner unavailable", request=request)
+        if outcome == "rpc_error":
+            return httpx.Response(200, json={"error": rpc_error})
+        return httpx.Response(200, json={"result": {"schemas": [{"name": "local__read"}]}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_response), base_url="http://runner.test"
+    ) as runner:
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", AsyncMock(return_value=runner))
+        listed = await client.post(
+            f"/v1/sessions/{sid}/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+    assert listed.status_code == 200, listed.text
+    data = listed.json()
+    if outcome == "success":
+        assert [tool["name"] for tool in data["result"]["tools"]] == [
+            "local__read",
+            "tracker__read_ticket",
+        ]
+        backend.list_tools.assert_awaited_once()
+    else:
+        expected = (
+            rpc_error
+            if outcome == "rpc_error"
+            else {"code": -32000, "message": "Runner MCP execute failed."}
+        )
+        assert data == {"jsonrpc": "2.0", "id": 1, "error": expected}
+        backend.list_tools.assert_not_awaited()
+
+
+@pytest.mark.parametrize("upload", [False, True])
+async def test_launch_selection_is_present_before_sandbox_launch(
+    client, app, launch_registry, monkeypatch, upload
+):
+    from omnigent.runtime import get_agent_store, get_conversation_store
+    from omnigent.server.managed_hosts import ManagedLaunchTracker, parse_sandbox_config
+    from omnigent.server.routes.sessions import routes_core
+
+    source = await create_test_session(client, name="launch-template")
+    source_agent = get_agent_store().get(source["agent_id"])
+    before_location = source_agent.bundle_location
+    launched = []
+    launch_finished = asyncio.Event()
+
+    async def launch(*, session_id, agent_id, **kwargs):
+        conv = get_conversation_store().get_conversation(session_id)
+        assert conv.agent_id == agent_id
+        summary = await client.get(f"/v1/sessions/{session_id}/agent")
+        servers = summary.json()["mcp_servers"]
+        assert [(s["name"], s["transport"]) for s in servers] == [("tracker", "registry")]
+        assert "example.test" not in summary.text
+        launched.append(session_id)
+        launch_finished.set()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    app.state.sandbox_config = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://managed.example.test"}
+    )
+    app.state.host_store = object()
+    app.state.managed_launches = ManagedLaunchTracker()
+    metadata = {"host_type": "managed", "mcp_registry_services": ["tracker", "tracker"]}
+    if upload:
+        response = await client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle("launch-template"),
+                    "application/gzip",
+                )
+            },
+        )
+    else:
+        response = await client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
+        )
+    assert response.status_code == 201, response.text
+    await asyncio.wait_for(launch_finished.wait(), timeout=5)
+    assert len(launched) == 1
+    assert get_agent_store().get(source["agent_id"]).bundle_location == before_location
+    original = await client.get(f"/v1/sessions/{source['id']}/agent")
+    assert original.json()["mcp_servers"] == []
+    plain = await client.post("/v1/sessions", json={"agent_id": source["agent_id"]})
+    assert plain.status_code == 201, plain.text
+    assert plain.json()["agent_id"] == source["agent_id"]
+
+
+@pytest.mark.parametrize("upload", [False, True])
+@pytest.mark.parametrize(
+    "service,status", [("missing", 403), ("restricted", 403), ("../invalid", 422)]
+)
+async def test_invalid_launch_selection_creates_no_session(
+    client, launch_registry, monkeypatch, upload, service, status
+):
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.sessions import routes_core
+
+    source = await create_test_session(client)
+    launch = AsyncMock()
+    create = Mock(side_effect=AssertionError("selection must be rejected before persistence"))
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    monkeypatch.setattr(get_conversation_store(), "create_session_with_agent", create)
+    metadata = {"mcp_registry_services": [service]}
+    if upload:
+        response = await client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={"bundle": ("agent.tar.gz", build_agent_bundle("launch"), "application/gzip")},
+        )
+    else:
+        response = await client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
+        )
+    expected = 400 if upload and status == 422 else status
+    assert response.status_code == expected, response.text
+    create.assert_not_called()
+    launch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_registry_sidecars_are_rejected_before_persistence(
+    client, tmp_path, monkeypatch, nested
+):
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.session_mcp_servers import _tar_gz_dir
+    from omnigent.spec import extract_safe
+
+    root = tmp_path / "source"
+    extract_safe(build_agent_bundle("source", sub_agents=[{"name": "child"}]), root)
+    agent_root = root / "agents" / "child" if nested else root
+    mcp_dir = agent_root / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "tracker.yaml").write_text("name: tracker\ntransport: registry\n")
+    create = Mock(side_effect=AssertionError("incompatible source must not be persisted"))
+    monkeypatch.setattr(get_conversation_store(), "create_session_with_agent", create)
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", _tar_gz_dir(root), "application/gzip")},
+    )
+    assert response.status_code == 400, response.text
+    assert "inline in config.yaml" in response.text
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize("allowed", [[], ["read_ticket"]])
+async def test_launch_selection_preserves_existing_registry_tool_restrictions(
+    client, launch_registry, tmp_path, allowed
+):
+    import yaml
+
+    from omnigent.runtime import get_agent_cache, get_agent_store
+    from omnigent.server.routes.session_mcp_servers import _tar_gz_dir
+    from omnigent.spec import extract_safe
+
+    root = tmp_path / "source"
+    extract_safe(build_agent_bundle("restricted-tools"), root)
+    config_path = root / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["tools"] = {"tracker": {"type": "mcp", "transport": "registry", "tools": allowed}}
+    config_path.write_text(yaml.safe_dump(config))
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", _tar_gz_dir(root), "application/gzip")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    source = uploaded.json()
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "mcp_registry_services": ["tracker", "other"]},
+    )
+    assert response.status_code == 201, response.text
+    summary = await client.get(f"/v1/sessions/{response.json()['id']}/agent")
+    assert {s["name"] for s in summary.json()["mcp_servers"]} == {"tracker", "other"}
+    agent = get_agent_store().get(response.json()["agent_id"])
+    spec = get_agent_cache().load(agent.id, agent.bundle_location, expand_env=False).spec
+    assert next(s for s in spec.mcp_servers if s.name == "tracker").tools == allowed
+
+
+async def test_launch_selection_does_not_replace_custom_mcp(client, launch_registry):
+    source = await create_test_session(client)
+    attached = await client.post(
+        f"/v1/sessions/{source['id']}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "http", "url": "https://custom.example/mcp"},
+    )
+    assert attached.status_code == 200, attached.text
+    response = await client.post(
+        "/v1/sessions", json={"agent_id": source["agent_id"], "mcp_registry_services": ["tracker"]}
+    )
+    assert response.status_code == 409, response.text
+
+
+async def test_gateway_reports_upstream_permission_failure(
+    client, launch_registry, monkeypatch, caplog
+):
+    source = await create_test_session(client)
+    response = await client.post(
+        "/v1/sessions", json={"agent_id": source["agent_id"], "mcp_registry_services": ["tracker"]}
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    execute = AsyncMock(
+        side_effect=McpUpstreamError(
+            "MCP service denied access (HTTP 403).", kind="http", status_code=403
+        )
+    )
+    monkeypatch.setattr(launch_registry, "execute", execute)
+    called = await client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "tracker__read_ticket", "arguments": {}},
+        },
+    )
+    assert "HTTP 403" in called.json()["error"]["message"], called.text
+    assert "not retried" in called.json()["error"]["message"]
+    execute.assert_awaited_once()
+    assert f"session={session_id} failure=http http_status=403" in caplog.text
+
+
+async def test_launch_selection_preserves_initial_metadata(client, launch_registry, monkeypatch):
+    source = await create_test_session(client, name="registry-metadata")
+    metadata = {
+        "agent_id": source["agent_id"],
+        "mcp_registry_services": ["tracker"],
+        "labels": {"review_context": "prototype"},
+        "reasoning_effort": "low",
+        "model_override": "gpt-4o-mini",
+        "cost_control_mode_override": "off",
+        "subagent_routing_override": "off",
+        "harness_override": "openai-agents",
+    }
+    from omnigent.runtime import get_conversation_store
+
+    store = get_conversation_store()
+    monkeypatch.setattr(
+        store, "update_conversation", Mock(side_effect=AssertionError("overrides must be atomic"))
+    )
+    response = await client.post("/v1/sessions", json=metadata)
+    assert response.status_code == 201, response.text
+    session = response.json()
+    from omnigent.runtime import get_conversation_store
+
+    stored = get_conversation_store().get_conversation(session["id"])
+    assert stored is not None
+    assert stored.labels["review_context"] == "prototype"
+    for field in (
+        "reasoning_effort",
+        "model_override",
+        "cost_control_mode_override",
+        "subagent_routing_override",
+        "harness_override",
+    ):
+        assert getattr(stored, field) == metadata[field]
+
+
+@pytest.mark.parametrize("launch_args", [None, ["--model", "test-model"]])
+async def test_registry_child_preserves_interactive_launch_args(
+    client, launch_registry, launch_args
+):
+    from omnigent.runtime import get_conversation_store
+
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    "codex-child", executor={"config": {"harness": "codex-native"}}
+                ),
+                "application/gzip",
+            )
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    source = uploaded.json()
+    persisted = []
+    for services in ([], ["tracker"]):
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": source["agent_id"],
+                "parent_session_id": source["session_id"],
+                "terminal_launch_args": launch_args,
+                "mcp_registry_services": services,
+            },
+        )
+        assert response.status_code == 201, response.text
+        persisted.append(
+            get_conversation_store().get_conversation(response.json()["id"]).terminal_launch_args
+        )
+    assert persisted == [launch_args, launch_args]
+
+
+async def test_selection_is_session_scoped_and_forks_follow_the_agent(client, launch_registry):
+    source = await create_test_session(client, name="selection-source")
+    sibling = await client.post("/v1/sessions", json={"agent_id": source["agent_id"]})
+    sid = source["id"]
+    url = f"/v1/sessions/{sid}/agent"
+    before = await client.get(f"{url}/contents")
+    assert (
+        await client.post(f"{url}/mcp-servers", json={"name": "tracker", "transport": "registry"})
+    ).status_code == 200
+    after = await client.get(f"{url}/contents")
+    assert after.content == before.content
+    assert "X-Omnigent-MCP-Selection" not in after.headers
+    selected = await client.get(f"{url}/contents", headers={"X-Omnigent-MCP-Selection": "1"})
+    assert selected.content == before.content
+    assert json.loads(selected.headers["X-Omnigent-MCP-Selection"]) == {
+        "omnigent.mcp_service.tracker": "1"
+    }
+    unchanged = await client.get(f"/v1/sessions/{sibling.json()['id']}/agent")
+    assert unchanged.json()["mcp_servers"] == []
+    for method, path, extra in [
+        (client.post, "/v1/sessions", {"agent_id": source["agent_id"]}),
+        (client.patch, f"/v1/sessions/{sid}", {}),
+    ]:
+        rejected = await method(
+            path, json={**extra, "labels": {"omnigent.mcp_service.other": "1"}}
+        )
+        assert rejected.status_code == 400, rejected.text
+    conflict = await client.post(
+        f"{url}/mcp-servers",
+        json={"name": "tracker", "transport": "http", "url": "https://custom.example/mcp"},
+    )
+    assert conflict.status_code == 409, conflict.text
+    target = await create_test_session(client, name="fork-target")
+    for fields, expected in [({}, ["tracker"]), ({"agent_id": target["agent_id"]}, [])]:
+        forked = await client.post(f"/v1/sessions/{sid}/fork", json=fields)
+        assert forked.status_code == 201, forked.text
+        summary = await client.get(f"/v1/sessions/{forked.json()['id']}/agent")
+        assert [s["name"] for s in summary.json()["mcp_servers"]] == expected
+    assert (await client.delete(f"{url}/mcp-servers/tracker")).status_code == 204
+    assert (await client.get(f"{url}/contents")).content == before.content
+
+
+async def test_named_children_cannot_select_root_only_services(client, launch_registry):
+    from tests.server.helpers import create_test_agent
+
+    source = await create_test_agent(client, sub_agents=[{"name": "child"}])
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["id"],
+            "parent_session_id": source["_session_id"],
+            "sub_agent_name": "child",
+        },
+    )
+    assert child.status_code == 201, child.text
+    url = f"/v1/sessions/{child.json()['id']}/agent"
+    assert (await client.get(url)).json()["mcp_registry_editable"] is False
+    response = await client.post(
+        f"{url}/mcp-servers", json={"name": "tracker", "transport": "registry"}
+    )
+    assert response.status_code == 400, response.text
+    assert "authored MCP" in response.text
+    assert (await client.get(f"{url}/mcp-servers")).json()["data"] == []
+
+
+async def test_selection_edits_reach_next_turn_when_immediate_reset_is_missed(
+    client, launch_registry, monkeypatch
+):
+    from omnigent.server.routes import session_mcp_servers, sessions
+
+    source = await create_test_session(client)
+    sid = source["id"]
+    forwarded = []
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock())
+        monkeypatch.setattr(session_mcp_servers, "_reset_runner_session_agent_cache", AsyncMock())
+        for state in ["plain", "selected", "removed"]:
+            url = f"/v1/sessions/{sid}/agent/mcp-servers"
+            if state == "selected":
+                assert (
+                    await client.post(url, json={"name": "tracker", "transport": "registry"})
+                ).status_code == 200
+            elif state == "removed":
+                assert (await client.delete(f"{url}/tracker")).status_code == 204
+            response = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+                },
+            )
+            assert response.is_success, response.text
+    assert len(forwarded) == 3
+    assert len({body["agent_revision"] for body in forwarded}) == 3
+    assert [body["has_mcp_servers"] for body in forwarded] == [False, True, False]
+
+
+async def test_source_name_conflict_can_be_resolved_by_removing_selection(client, launch_registry):
+    source = await create_test_session(client)
+    selected = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source["agent_id"],
+            "mcp_registry_services": ["tracker"],
+        },
+    )
+    url = f"/v1/sessions/{selected.json()['id']}/agent/mcp-servers"
+    custom = await client.post(
+        f"/v1/sessions/{source['id']}/agent/mcp-servers",
+        json={
+            "name": "tracker",
+            "transport": "http",
+            "url": "https://example.test/custom",
+        },
+    )
+    assert custom.status_code == 200, custom.text
+    assert (await client.get(url)).status_code == 409
+    assert (await client.delete(f"{url}/tracker")).status_code == 204
+    servers = (await client.get(url)).json()["data"]
+    assert [(s["name"], s["transport"]) for s in servers] == [("tracker", "http")]

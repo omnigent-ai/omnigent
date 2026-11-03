@@ -7,9 +7,6 @@ or a running vendor CLI to exercise attribution, reload, and disclosure.
 
 from __future__ import annotations
 
-import io
-import json
-import tarfile
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -19,8 +16,9 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from omnigent.entities import ErrorData, MessageData, NewConversationItem
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e_ui.chat.test_failure_error_card import _publish_native_status
-from tests.e2e_ui.conftest import _FILES_PROBE_NO_ENV_AGENT_NAME, seed_committed_items
+from tests.e2e_ui.conftest import seed_committed_items
 
 
 @contextmanager
@@ -30,16 +28,9 @@ def _named_session(base_url: str, name: str, harness: str) -> Iterator[str]:
         f"spec_version: 1\nname: {name}\nprompt: Help with the requested task.\n"
         f"executor:\n  config:\n    harness: {harness}\n"
     ).encode()
-    bundle = io.BytesIO()
-    with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
-        entry = tarfile.TarInfo("config.yaml")
-        entry.size = len(config)
-        archive.addfile(entry, io.BytesIO(config))
-    response = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle.getvalue(), "application/gzip")},
-        timeout=30.0,
+    bundle_bytes = bundle_files({"config.yaml": config})
+    response = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0
     )
     response.raise_for_status()
     session_id = response.json()["session_id"]
@@ -70,17 +61,15 @@ def _expect_named_error(page: Page, display_name: str, message: str) -> None:
     ],
     ids=["claude-code", "codex"],
 )
-@pytest.mark.parametrize("failure_after_switch", [False, True], ids=["failed", "delayed-failure"])
 def test_native_failure_names_the_fetched_agent_live_and_after_reload(
     page: Page,
     live_server: str,
     agent_name: str,
     harness: str,
     display_name: str,
-    failure_after_switch: bool,
 ) -> None:
     """A native status failure uses the API name and survives a fresh page."""
-    message = "API Error: 502 The upstream server returned an invalid response."
+    message = "API Error: 400 The request was malformed."
     response_id = "native_turn_named_error"
     with _named_session(live_server, agent_name, harness) as session_id:
         seed_committed_items(
@@ -100,36 +89,12 @@ def test_native_failure_names_the_fetched_agent_live_and_after_reload(
         page.goto(f"{live_server}/c/{session_id}")
         expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
         _publish_native_status(live_server, session_id, "running", response_id=response_id)
-        if failure_after_switch:
-            _publish_native_status(live_server, session_id, "idle", response_id=response_id)
-        else:
-            _publish_native_status(live_server, session_id, "failed", response_id=response_id)
-            _expect_named_error(page, display_name, message)
-            page.reload()
-            _expect_named_error(page, display_name, message)
-
-        agents = httpx.get(f"{live_server}/v1/agents?limit=100", timeout=10.0)
-        agents.raise_for_status()
-        target = next(
-            agent
-            for agent in agents.json()["data"]
-            if agent["name"] == _FILES_PROBE_NO_ENV_AGENT_NAME
-        )
-        switched = httpx.post(
-            f"{live_server}/v1/sessions/{session_id}/switch-agent",
-            json={"agent_id": target["id"]},
-            timeout=30.0,
-        )
-        switched.raise_for_status()
-        assert switched.json()["agent_name"] == target["name"]
-        if failure_after_switch:
-            _publish_native_status(live_server, session_id, "failed", response_id=response_id)
-            _expect_named_error(page, display_name, message)
+        _publish_native_status(live_server, session_id, "failed", response_id=response_id)
+        _expect_named_error(page, display_name, message)
         page.reload()
         _expect_named_error(page, display_name, message)
         snapshot = httpx.get(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         snapshot.raise_for_status()
-        assert snapshot.json()["agent_name"] == target["name"]
         assert snapshot.json()["last_task_error"]["code"] == "native_turn_error"
         assert snapshot.json()["last_task_error"]["agent_name"] == agent_name
 

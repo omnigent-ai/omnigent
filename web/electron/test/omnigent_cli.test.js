@@ -1,21 +1,26 @@
 // Tests for the pure helpers in src/omnigent_cli.js, run with `node --test`
-// (no extra deps). The spawning functions need a real binary and are covered by
+// (no extra deps). Most spawning functions need a real binary and are covered by
 // the manual verification flow; here we test path resolution order, server-URL
-// matching, and status parsing — the logic that decides "is this machine
-// connected to server X?" and "which omnigent binary do we run?".
+// matching, status parsing, and runCli's failure classification — the logic that
+// decides "is this machine connected to server X?" and "which omnigent binary do we run?".
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
+const http = require("http");
+const os = require("os");
+const path = require("path");
 
 const {
   normalizeServerUrl,
   isLoopbackServer,
   sameLoopbackServer,
   parseLocalServerPidfile,
+  localServerHealthy,
   candidatePaths,
   resolveCliPath,
   cliCommandParts,
+  runCli,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
@@ -23,6 +28,8 @@ const {
   getHostConnectionFast,
   probeServerAuth,
   localHostId,
+  readLocalHostId,
+  liveDaemonRecordFor,
 } = require("../src/omnigent_cli");
 
 describe("cliCommandParts", () => {
@@ -50,6 +57,51 @@ describe("cliCommandParts", () => {
     assert.throws(() => cliCommandParts(null));
     assert.throws(() => cliCommandParts({ executable: "", prefixArgs: ["omni"] }));
     assert.throws(() => cliCommandParts({ executable: "/bin/isaac", prefixArgs: "omni" }));
+  });
+});
+
+describe("runCli", () => {
+  const nodeScript = (source) => ({ executable: process.execPath, prefixArgs: ["-e", source] });
+
+  it("resolves a clean exit with its output and no failure", async () => {
+    assert.deepEqual(await runCli(nodeScript('process.stdout.write("hi")'), []), {
+      code: 0,
+      stdout: "hi",
+      stderr: "",
+    });
+  });
+
+  it("keeps the exit code and adds the process-level failure", async () => {
+    const res = await runCli(nodeScript('console.error("SECRET"); process.exit(4)'), []);
+    assert.equal(res.code, 4);
+    assert.deepEqual(res.failure, { kind: "exited", exitCode: 4 });
+  });
+
+  it(
+    "keeps the timeout diagnosis when the child answers the kill with an exit code",
+    { skip: process.platform === "win32" && "POSIX signals", timeout: 10000 },
+    async () => {
+      const trapsSigterm = path.join(__dirname, "fixtures", "traps-sigterm.sh");
+      const res = await runCli({ executable: "/bin/sh", prefixArgs: [trapsSigterm] }, [], {
+        timeoutMs: 1000,
+      });
+      assert.equal(res.code, 7);
+      assert.deepEqual(res.failure, { kind: "timed-out", exitCode: 7 });
+    },
+  );
+
+  it("does not mistake execFile's maxBuffer kill for a timeout", async () => {
+    // 2 MiB of stdout overflows execFile's default 1 MiB maxBuffer.
+    const res = await runCli(nodeScript('process.stdout.write("x".repeat(2 * 1024 * 1024))'), []);
+    assert.equal(res.code, 1);
+    assert.deepEqual(res.failure, { kind: "failed" });
+  });
+
+  it("still reports code 1 for a spawn failure, now classified", async () => {
+    const missing = path.join(os.tmpdir(), "omnigent-no-such-cli", "omnigent");
+    const res = await runCli(missing, ["--version"]);
+    assert.equal(res.code, 1);
+    assert.deepEqual(res.failure, { kind: "cli-not-found", errorCode: "ENOENT" });
   });
 });
 
@@ -107,6 +159,69 @@ describe("parseLocalServerPidfile", () => {
     assert.equal(parseLocalServerPidfile("abc\ndef"), null); // non-numeric
     assert.equal(parseLocalServerPidfile(""), null);
     assert.equal(parseLocalServerPidfile(null), null);
+  });
+});
+
+describe("localServerHealthy", () => {
+  const prevDataDir = process.env.OMNIGENT_DATA_DIR;
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.OMNIGENT_DATA_DIR;
+    else process.env.OMNIGENT_DATA_DIR = prevDataDir;
+  });
+
+  // Point the data dir at a temp dir holding `pidfile` (or none).
+  function withPidfile(pidfile) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-pidfile-test-"));
+    if (pidfile !== undefined) fs.writeFileSync(path.join(dir, "local_server.pid"), pidfile);
+    process.env.OMNIGENT_DATA_DIR = dir;
+  }
+
+  // A loopback server answering /health; resolves its port.
+  async function healthServer() {
+    const server = http.createServer((_req, res) => res.end("ok"));
+    await new Promise((resolve) => {
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    return { server, port: server.address().port };
+  }
+
+  it("is null without a pidfile", async () => {
+    withPidfile(undefined);
+    assert.equal(await localServerHealthy(), null);
+  });
+
+  it("is null for a stale pidfile (dead pid)", async (t) => {
+    const pid = 123456;
+    const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: true }));
+    t.mock.method(process, "kill", () => {
+      throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+    });
+    withPidfile(`${pid}\n6767\n`);
+    assert.equal(await localServerHealthy(), null);
+    assert.equal(fetch.mock.callCount(), 0);
+  });
+
+  it("is null when the pid is alive but nothing serves the port", async () => {
+    const { server, port } = await healthServer();
+    await new Promise((resolve) => {
+      server.close(resolve); // port now free
+    });
+    withPidfile(`${process.pid}\n${port}\n`);
+    assert.equal(await localServerHealthy(), null);
+  });
+
+  it("returns the server when the pid is alive and /health answers", async () => {
+    const { server, port } = await healthServer();
+    try {
+      withPidfile(`${process.pid}\n${port}\n`);
+      assert.deepEqual(await localServerHealthy(), {
+        url: `http://127.0.0.1:${port}`,
+        pid: process.pid,
+        port,
+      });
+    } finally {
+      server.close();
+    }
   });
 });
 
@@ -194,6 +309,29 @@ describe("parseJsonLoose", () => {
 });
 
 describe("matchesServer", () => {
+  for (const field of ["server_url", "target", "resolved_server_url"]) {
+    it(`matches loopback aliases in ${field} without matching a different port`, () => {
+      const record = { [field]: "http://localhost:6767" };
+      assert.equal(matchesServer(record, "http://127.0.0.1:6767"), true);
+      assert.equal(matchesServer(record, "http://127.0.0.1:6768"), false);
+    });
+  }
+  for (const [recordUrl, serverUrl, expected] of [
+    ["https://localhost", "http://127.0.0.1", false],
+    ["http://localhost:80", "https://127.0.0.1", false],
+    ["https://localhost:443", "http://[::1]", false],
+    ["http://localhost:6767", "http://127.0.0.1:6767", true],
+    ["http://localhost:80/app", "http://127.0.0.1/app", true],
+    ["https://localhost:443/app", "https://[::1]/app", true],
+    ["http://localhost:6767/app", "http://127.0.0.1:6767/other", false],
+    ["http://localhost:6767/app?a=1", "http://127.0.0.1:6767/app?a=2", false],
+    ["http://alice@localhost:6767", "http://bob@127.0.0.1:6767", false],
+    ["http://localhost:6767/#one", "http://127.0.0.1:6767/#two", false],
+  ]) {
+    it(`${recordUrl} ${expected ? "matches" : "does not match"} ${serverUrl}`, () => {
+      assert.equal(matchesServer({ server_url: recordUrl }, serverUrl), expected);
+    });
+  }
   it("matches on server_url or target, ignoring trailing slashes", () => {
     assert.equal(matchesServer({ server_url: "https://x.com/" }, "https://x.com"), true);
     assert.equal(matchesServer({ target: "https://x.com" }, "https://x.com/"), true);
@@ -434,6 +572,64 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     assert.deepEqual(res, { authed: false, reachable: false });
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("liveDaemonRecordFor", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("skips a dead matching record before a live record", async () => {
+    const dead = process.pid + 1;
+    mock.method(process, "kill", (pid) => {
+      if (pid === dead) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      assert.equal(pid, process.pid);
+      return true;
+    });
+    const records = [dead, process.pid].map((pid) => ({
+      pid,
+      target: "https://server.example",
+      mode: "server",
+      host_id: "local",
+    }));
+    mock.method(fs, "readdirSync", () => ["dead.json", "live.json"]);
+    mock.method(fs, "readFileSync", (filename) =>
+      JSON.stringify(records[filename.endsWith("dead.json") ? 0 : 1]),
+    );
+    assert.equal(liveDaemonRecordFor("https://server.example").pid, process.pid);
+    assert.equal(
+      (await getHostConnectionFast("https://server.example", { probe: false })).connected,
+      true,
+    );
+    assert.equal(liveDaemonRecordFor("https://different.example"), null);
+  });
+
+  it("matches a loopback alias through the parsed daemon record", () => {
+    const record = {
+      pid: process.pid,
+      target: "local",
+      mode: "local",
+      resolved_server_url: "http://127.0.0.1:6767",
+    };
+    mock.method(fs, "readdirSync", () => ["live.json"]);
+    mock.method(fs, "readFileSync", () => JSON.stringify(record));
+    assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
+    assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
+  });
+});
+
+describe("readLocalHostId", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("follows config rewrites and normalizes the legacy prefix", () => {
+    let config = "host:\n  host_id: host_first\n";
+    mock.method(fs, "readFileSync", () => config);
+    assert.equal(readLocalHostId(), "first");
+    config = "host:\n  host_id: second\n";
+    assert.equal(readLocalHostId(), "second");
+    config = "{}";
+    assert.equal(readLocalHostId(), null);
+    config = "[bad yaml";
+    assert.equal(readLocalHostId(), null);
   });
 });
 

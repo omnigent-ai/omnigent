@@ -45,6 +45,13 @@ def test_generate_code_verifier_length() -> None:
     )
 
 
+def test_derive_code_challenge_matches_rfc7636_appendix_b() -> None:
+    """Check S256 against the independent RFC 7636 Appendix B reference vector."""
+    assert derive_code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == (
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    )
+
+
 def test_derive_code_challenge_is_deterministic() -> None:
     """Same verifier always produces the same S256 challenge.
 

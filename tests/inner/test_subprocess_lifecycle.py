@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import Mock
 
-from omnigent.inner._subprocess_lifecycle import terminate_subprocess
+from omnigent.inner._subprocess_lifecycle import terminate_direct_subprocess, terminate_subprocess
 
 
 class _NeverReapedProcess:
@@ -37,3 +37,34 @@ async def test_final_wait_after_kill_is_bounded() -> None:
     assert not reaped
     terminate.assert_called_once_with(proc)
     kill.assert_called_once_with(proc)
+
+
+async def test_direct_cleanup_never_signals_a_process_group() -> None:
+    class _AttachProcess:
+        pid = 43211
+        returncode = None
+
+        def __init__(self) -> None:
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.wait_calls = 0
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            if self.returncode is None:
+                await asyncio.Event().wait()
+            return self.returncode
+
+    proc = _AttachProcess()
+
+    assert await terminate_direct_subprocess(proc, terminate_timeout=0.01, kill_timeout=0.01)
+    assert proc.terminate_calls == 1
+    assert proc.kill_calls == 1
+    assert proc.wait_calls == 2

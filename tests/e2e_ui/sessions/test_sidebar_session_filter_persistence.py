@@ -22,7 +22,6 @@ observable (rows drop *out*, rather than merely staying put).
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Iterator
 
@@ -30,12 +29,13 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
+    create_user_session,
     spawn_multi_user_server,
 )
-from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 # Edit access (2): enough to share a session with a non-owner. Mirrors
 # LEVEL_EDIT in omnigent/server/auth.py.
@@ -48,30 +48,10 @@ _STORAGE_KEY = "omnigent:session-filter"
 
 
 def _create_session(server: MultiUserServer, *, owner_email: str, title: str) -> str:
-    """Create a session owned by *owner_email* and give it a unique *title*.
-
-    A multi-user header-auth server 401s headerless writes, so both the create
-    and the title PATCH carry the owner's ``X-Forwarded-Email``. The title makes
-    the row easy to spot among other tests' sessions on the shared server.
-    """
-    headers = {"X-Forwarded-Email": owner_email}
-    create = httpx.post(
-        f"{server.base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        headers=headers,
-        timeout=30.0,
+    """Seed a titled session owned by the explicit header identity."""
+    return create_user_session(
+        server.base_url, headers={"X-Forwarded-Email": owner_email}, metadata={"title": title}
     )
-    create.raise_for_status()
-    session_id = create.json()["session_id"]
-    resp = httpx.patch(
-        f"{server.base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        headers=headers,
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return session_id
 
 
 def _grant(server: MultiUserServer, session_id: str, user_id: str, level: int) -> None:
@@ -145,9 +125,7 @@ def test_all_sessions_filter_survives_a_reload(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-filter-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
@@ -167,8 +145,6 @@ def test_all_sessions_filter_survives_a_reload(
         expect(_row(page, owned)).to_be_visible(timeout=30_000)
         expect(_row(page, shared)).to_be_visible(timeout=30_000)
         _expect_checked_filter(page, "all")
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -190,9 +166,7 @@ def test_shared_sessions_filter_survives_a_reload(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-shared-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         # Default "My sessions" hides the shared row; picking "Shared" brings it
@@ -206,8 +180,6 @@ def test_shared_sessions_filter_survives_a_reload(
         expect(_row(page, shared)).to_be_visible(timeout=30_000)
         expect(_row(page, owned)).to_have_count(0)
         _expect_checked_filter(page, "shared")
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)

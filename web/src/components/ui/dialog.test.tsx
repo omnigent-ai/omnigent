@@ -50,3 +50,10 @@ describe("DialogContent keyboard-aware sizing", () => {
     expect(content.style.top).toBe("");
   });
 });
+
+describe("DialogContent column sizing", () => {
+  it("uses a single zero-minimum column so unbreakable content cannot widen the panel", () => {
+    renderDialog();
+    expect(screen.getByRole("dialog")).toHaveClass("grid-cols-[minmax(0,1fr)]");
+  });
+});

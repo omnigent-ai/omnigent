@@ -22,15 +22,14 @@ depend on a live Codex CLI finishing its ~15s cold boot.
 
 from __future__ import annotations
 
-import io
 import json
-import tarfile
 from urllib.parse import urlparse
 
 import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _bind_session_runner,
@@ -97,17 +96,14 @@ def _create_custom_codex_session(base_url: str, runner_id: str) -> str:
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = _CUSTOM_CODEX_AGENT_YAML.encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    data = _CUSTOM_CODEX_AGENT_YAML.encode()
+    bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = httpx.post(
+    create = post_session_bundle(
+        httpx.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"workspace": str(_REPO_ROOT)})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
+        bundle_bytes,
+        metadata={"workspace": str(_REPO_ROOT)},
         timeout=30.0,
     )
     create.raise_for_status()

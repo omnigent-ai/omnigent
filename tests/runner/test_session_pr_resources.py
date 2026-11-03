@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from threading import Barrier
@@ -14,9 +16,12 @@ import pytest
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.runner.slow_io import run_slow_io
+from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
@@ -56,6 +61,7 @@ def test_explicit_repo_is_used_for_all_pr_reads(
 
     monkeypatch.setattr(github, "_gh", gh)
     monkeypatch.setattr(github, "_git", forbidden_git)
+    monkeypatch.setattr(pr_resource, "_git_output", forbidden_git)
     info = github.github_info(tracked, session_id="session", pr_url=B)
     assert info["pr"]["title"] == "Second repository"
     assert {pr["url"] for pr in info["prs"]} == {A, B}
@@ -112,7 +118,8 @@ def test_titles_refresh_after_cache_expiry_and_keep_last_known_on_failure(
 ) -> None:
     registry = SessionPrRegistry("session")
     registry.update_titles(
-        {A: "First", B: "Second"}, timestamp=time.time() - github._PR_TITLE_CACHE_SECONDS - 1
+        {A: "First", B: "Second"},
+        timestamp=time.time() - pr_resource._PR_TITLE_CACHE_SECONDS - 1,
     )
     calls: list[list[str]] = []
 
@@ -197,26 +204,28 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = 10.0
-    monkeypatch.setattr(github, "time", SimpleNamespace(monotonic=lambda: clock, time=time.time))
+    fake_time = SimpleNamespace(monotonic=lambda: clock, time=time.time)
+    monkeypatch.setattr(github, "time", fake_time)
+    monkeypatch.setattr(pr_resource, "time", fake_time)
     registry = SessionPrRegistry("session")
     registry.record(
         [PullRequestRef.from_url(A.replace("42", str(number))) for number in range(43, 49)],
         relationship="created",
         source="test",
     )
-    monkeypatch.setattr(github, "_PR_TITLE_LOOKUP_SECONDS", 0.2)
+    monkeypatch.setattr(pr_resource, "_PR_TITLE_LOOKUP_SECONDS", 0.2)
     attempted: list[str] = []
     title_lookups = Barrier(4, timeout=budget(5))
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
         if argv[-1] != "title":
-            assert github._pr_title_deadline.get() is None
+            assert github._gh_deadline.get() is None
             assert timeout == github._gh_timeout_seconds()
             return 0, '{"title": "Selected PR"}', ""
         assert 0 < timeout <= 0.2
         attempted.append(argv[3])
-        deadline = github._pr_title_deadline.get()
+        deadline = github._gh_deadline.get()
         assert deadline is not None
         title_lookups.wait()
         # Concurrent timeouts expire at the same deadline, regardless of scheduling.
@@ -278,7 +287,7 @@ def test_title_retries_do_not_starve_queued_prs_after_backoff_expires(
         )
         if seen == pending_numbers:
             break
-        wall_clock += github._PR_TITLE_TIMEOUT_RETRY_SECONDS + 1
+        wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS + 1
     assert seen == pending_numbers
 
 
@@ -303,18 +312,18 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         return 0, '{"title": "Enterprise PR"}', ""
 
     monkeypatch.setattr(github, "_run", run)
-    token = github._pr_title_deadline.set(12.0)
-    timeout_token = github._pr_title_timed_out.set(False)
+    token = github._gh_deadline.set(12.0)
+    timeout_token = github._gh_timed_out.set(False)
     try:
         result = github._pr_json(
             str(tmp_path),
             PullRequestRef.from_url(A.replace("github.com", "github.example.org")),
             "title",
         )
-        timed_out = github._pr_title_timed_out.get()
+        timed_out = github._gh_timed_out.get()
     finally:
-        github._pr_title_timed_out.reset(timeout_token)
-        github._pr_title_deadline.reset(token)
+        github._gh_timed_out.reset(timeout_token)
+        github._gh_deadline.reset(token)
     if command_seconds == 0.6:
         assert timeouts == pytest.approx([2.0, 1.4, 0.8])
         assert result == {"title": "Enterprise PR"}
@@ -323,7 +332,7 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         assert timeouts == [2.0]
         assert result is None
         assert timed_out is True
-    assert github._pr_title_deadline.get() is None
+    assert github._gh_deadline.get() is None
 
 
 def test_slow_selected_metadata_does_not_get_extra_title_work(
@@ -335,7 +344,7 @@ def test_slow_selected_metadata_does_not_get_extra_title_work(
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
         nonlocal clock
         assert args[-1] != "title"
-        clock += github._PR_TITLE_REQUEST_SECONDS + 0.1
+        clock += pr_resource._PR_TITLE_REQUEST_SECONDS + 0.1
         return 0, '{"title": "Selected PR"}', ""
 
     monkeypatch.setattr(github, "_gh", gh)
@@ -374,9 +383,9 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
     entry = next(entry for entry in registry.list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out
-    assert github._pr_title_timed_out.get() is False
+    assert github._gh_timed_out.get() is False
 
-    wall_clock += github._PR_TITLE_TIMEOUT_RETRY_SECONDS - 0.1
+    wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS - 0.1
     github.github_info(tracked, session_id="session", pr_url=B)
     assert timeouts == [1.5]
 
@@ -387,7 +396,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
     entry = next(entry for entry in registry.list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out is False
-    wall_clock += github._PR_TITLE_TIMEOUT_RETRY_SECONDS
+    wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS
     github.github_info(tracked, session_id="session", pr_url=B)
     assert timeouts == [1.5, 1.5]
 
@@ -423,11 +432,14 @@ def test_non_deadline_failures_keep_normal_title_cache(
     entry = next(entry for entry in SessionPrRegistry("session").list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out is False
-    for elapsed in [github._PR_TITLE_TIMEOUT_RETRY_SECONDS, github._PR_TITLE_CACHE_SECONDS - 1]:
+    for elapsed in [
+        pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS,
+        pr_resource._PR_TITLE_CACHE_SECONDS - 1,
+    ]:
         wall_clock = 1000.0 + elapsed
         github.github_info(tracked, session_id="session", pr_url=B)
         assert attempted == 1
-    wall_clock = 1000.0 + github._PR_TITLE_CACHE_SECONDS
+    wall_clock = 1000.0 + pr_resource._PR_TITLE_CACHE_SECONDS
     github.github_info(tracked, session_id="session", pr_url=B)
     assert attempted == 2
 
@@ -439,7 +451,12 @@ def test_unassociated_selection_is_rejected(tracked: str) -> None:
 
 def test_auth_failure_preserves_pr_list(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github, "_gh", lambda *_args, **_kwargs: (1, "", "not authenticated"))
+    accounts = [{"login": "alice", "host": "github.com", "active": True}]
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, accounts))
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: "alice")
     info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert info["accounts"] == accounts
+    assert info["selected_account"] == "alice"
     assert info["authenticated"] is False
     assert info["selected_pr_url"] == B
     assert len(info["prs"]) == 2
@@ -572,6 +589,120 @@ def test_context_reports_deleted_fork(
         github.github_file_diff(tracked, "main", "new.py", session_id="session", pr_url=B)
 
 
+@pytest.mark.parametrize("pr_url", [None, B])
+async def test_pr_reads_report_lock_contention_and_allow_retry(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, pr_url: str | None
+) -> None:
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    registry = SessionPrRegistry("session")
+    before = registry.path.read_bytes()
+    reader = WorkspaceReader(Path(tracked))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        with FileLock(str(registry.path) + ".lock"):
+            with pytest.raises(ValueError, match="PR tracking is busy; try again"):
+                reader.github_info(session_id="session", pr_url=pr_url)
+            response = await client.get(
+                "/v1/sessions/session/resources/github",
+                params={"pr_url": pr_url} if pr_url else {},
+            )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "PR tracking is busy; try again."
+        assert registry.path.read_bytes() == before
+        response = await client.get(
+            "/v1/sessions/session/resources/github",
+            params={"pr_url": pr_url} if pr_url else {},
+        )
+    assert response.status_code == 200, response.text
+    assert {pr["url"] for pr in response.json()["prs"]} == {A, B}
+    assert reader.github_info(session_id="session", pr_url=pr_url)["pr"]["number"] == 42
+
+
+async def test_runner_serves_a_pr_the_server_vouches_for(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh host never recorded the session's PR; the server's vouching is enough."""
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/fresh/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        refused = await client.get(path, params={"pr_url": A})
+        served = await client.get(path, params={"pr_url": A, "server_tracked": "1"})
+        default = await client.get(path, params={"default_pr_url": A, "server_tracked": "1"})
+    assert refused.status_code == 400
+    assert served.status_code == 200, served.text
+    assert served.json()["pr"]["number"] == 42
+    assert default.json()["selected_pr_url"] == A
+    assert SessionPrRegistry("fresh").list() == []
+
+
+async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider CLI reads have their own threads, so stuck ``git status`` can't delay them."""
+    gh_threads: list[str] = []
+
+    def fake_gh(*_args: object, **_kwargs: object) -> tuple[int, str, str]:
+        gh_threads.append(threading.current_thread().name)
+        return 0, '{"number": 42}', ""
+
+    monkeypatch.setattr(github, "_gh", fake_gh)
+    release_git = threading.Event()
+    listings_started = [threading.Event() for _ in range(4)]
+
+    def stuck_listing(started: threading.Event) -> None:
+        started.set()
+        release_git.wait(budget(30))
+
+    listings = [asyncio.create_task(run_slow_io(stuck_listing, e)) for e in listings_started]
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        await poll_until_async(
+            lambda: all(e.is_set() for e in listings_started), timeout_s=budget(5)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await asyncio.wait_for(
+                client.get(
+                    "/v1/sessions/fresh/resources/github",
+                    params={"pr_url": A, "server_tracked": "1"},
+                ),
+                timeout=budget(5),
+            )
+    finally:
+        release_git.set()
+        await asyncio.gather(*listings)
+
+    assert response.status_code == 200, response.text
+    assert gh_threads and all(name.startswith("runner-provider-cli_") for name in gh_threads)
+
+
+@pytest.mark.parametrize("operation", ["github_changes", "github_pr_diff", "github_file_diff"])
+def test_selected_pr_reads_report_lock_contention(tracked: str, operation: str) -> None:
+    registry = SessionPrRegistry("session")
+    reader = WorkspaceReader(Path(tracked))
+    kwargs = (
+        {"relative_path": "file.py", "base": "main"} if operation == "github_file_diff" else {}
+    )
+    with FileLock(str(registry.path) + ".lock"):
+        with pytest.raises(ValueError, match="PR tracking is busy; try again"):
+            getattr(reader, operation)(session_id="session", pr_url=B, **kwargs)
+
+
 @pytest.mark.parametrize("action", ["attach", "remove"])
 async def test_pr_update_reports_lock_contention_and_allows_retry(
     tracked: str, monkeypatch: pytest.MonkeyPatch, action: str
@@ -694,5 +825,8 @@ def test_enterprise_without_auth_retains_selection(
     monkeypatch.setattr(github, "_gh", gh)
     info = github.github_info(tracked, session_id="session", pr_url=url)
     assert info["selected_pr_url"] == url
+    assert info["authenticated"] is False
+    assert info["accounts"] == []
+    assert info["selected_account"] is None
     assert info["pr"] is None
     assert len(info["prs"]) == 3

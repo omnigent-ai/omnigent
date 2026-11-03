@@ -7,7 +7,9 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
-from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.runner.subagent_work import (
+    _format_subagent_wake_notice,
+)
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
@@ -31,6 +33,7 @@ def _spec(
     agents: tuple[str, ...] = (),
     spawn: bool = False,
     builtins: tuple[str, ...] = (),
+    browser: bool = True,
 ) -> AgentSpec:
     """
     Stub only the AgentSpec fields the instruction builders read.
@@ -45,6 +48,7 @@ def _spec(
                 builtins=[SimpleNamespace(name=name) for name in builtins],
             ),
             spawn=spawn,
+            tool_groups=SimpleNamespace(browser=browser),
         ),
     )
 
@@ -433,3 +437,26 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
 
     whitespace_only = cast(AgentSpec, SimpleNamespace(instructions="   \n  "))
     assert raw_author_instructions(whitespace_only) is None
+
+
+# ─── ``tool_groups.browser: false`` drops the browser guidance ────
+
+
+def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
+    """
+    With the ``browser_*`` tools unregistered, the prompt must not steer
+    the model toward them: author text composes alone, and an unauthored
+    spec yields ``None`` rather than guidance for tools it lacks.
+    """
+    spec = _spec("You are a helpful assistant.", browser=False)
+    assert build_instructions_nullable(spec, None, []) == "You are a helpful assistant."
+    assert build_instructions_nullable(_spec(None, browser=False), None, []) is None
+
+
+def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+    """Only the browser guidance follows the browser gate; the sub-agent
+    wake notice still rides its own dispatch gate."""
+    spec = _spec(None, spawn=True, browser=False)
+    result = build_instructions_nullable(spec, None, [])
+    assert result == SUBAGENT_WAKE_NOTICE_INSTRUCTION
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result

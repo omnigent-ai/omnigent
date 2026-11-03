@@ -103,6 +103,7 @@ def prepare_codex_worker(
     codex_path: str,
     cwd: Path,
     codex_home: Path,
+    skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     spawn_env_names: Sequence[str],
     signer_readiness: SignerReadiness | None = None,
@@ -137,6 +138,8 @@ def prepare_codex_worker(
 
     codex_dir = Path(codex_path).resolve(strict=False).parent
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
+    if skills_dir is not None:
+        policy = with_additional_read_roots(policy, [skills_dir])
     policy = with_additional_write_roots(policy, [codex_home])
     if signer_readiness is not None:
         if signer_readiness.ca_bundle_path.parent != signer_readiness.socket_path.parent:

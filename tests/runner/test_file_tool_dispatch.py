@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import subagent_work
 from omnigent.runner.tool_dispatch import _execute_file_tool, execute_tool
 
 _CONVERSATION_ID = "conv_sec20870"
@@ -326,7 +327,7 @@ async def _run_spawn(
     from omnigent.runner import app as runner_app
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async with httpx.AsyncClient(
@@ -343,9 +344,9 @@ async def _run_spawn(
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app.unregister_child_session(_CHILD_ID)
-            runner_app.unregister_subagent_work(_CHILD_ID)
-            runner_app._session_inboxes_ref.pop(_PARENT_ID, None)
+            subagent_work.unregister_child_session(_CHILD_ID)
+            subagent_work.unregister_subagent_work(_CHILD_ID)
+            subagent_work._session_inboxes_ref.pop(_PARENT_ID, None)
 
 
 @pytest.mark.asyncio
@@ -504,7 +505,6 @@ async def test_send_without_file_ids_is_unchanged_and_skips_copy(
 @pytest.mark.asyncio
 async def test_send_by_session_id_rejects_file_ids_before_server_call() -> None:
     """By-session-id sends cannot forward files."""
-    from omnigent.runner import app as runner_app
 
     async def _handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected server call: {request.method} {request.url}")
@@ -529,7 +529,7 @@ async def test_send_by_session_id_rejects_file_ids_before_server_call() -> None:
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app._session_inboxes_ref.pop(_PARENT_ID, None)
+            subagent_work._session_inboxes_ref.pop(_PARENT_ID, None)
 
     assert "file_ids" in output
     assert "existing session by id" in output
@@ -547,7 +547,6 @@ async def test_send_rejects_invalid_file_ids_before_server_call(
     file_ids: list[str],
 ) -> None:
     """Malformed file_ids are rejected before child lookup or copy."""
-    from omnigent.runner import app as runner_app
 
     async def _handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected server call: {request.method} {request.url}")
@@ -573,7 +572,7 @@ async def test_send_rejects_invalid_file_ids_before_server_call(
                 session_inbox=session_inbox,
             )
         finally:
-            runner_app._session_inboxes_ref.pop(_PARENT_ID, None)
+            subagent_work._session_inboxes_ref.pop(_PARENT_ID, None)
 
     assert output.startswith("Error: sys_session_send invalid 'file_ids':"), output
 

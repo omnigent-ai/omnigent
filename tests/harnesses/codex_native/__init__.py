@@ -1,0 +1,1 @@
+"""Codex-native adapter tests."""

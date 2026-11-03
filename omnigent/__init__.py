@@ -35,7 +35,7 @@ _mirror_legacy_env()
 # hook), per statusline refresh, and per tool call — and eagerly importing the
 # datamodel/executor graph here cost those spawns ~250 ms each. Names resolve
 # on first attribute access and are cached in module globals; the import-graph
-# guards live in tests/test_claude_native_message_display_hook.py and the
+# guards live in tests/harnesses/claude_native/test_claude_native_message_display_hook.py and the
 # wall-clock trend in the ``native_hook_spawn`` benchmark journey.
 import importlib  # noqa: E402
 from typing import TYPE_CHECKING, Any  # noqa: E402

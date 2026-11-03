@@ -113,7 +113,7 @@ a clean PR must pass every one.
 ### Maintainer override
 
 A maintainer can waive the scan on a specific PR with the **`skip-security-scan`**
-label (same convention as `skip-e2e-ui-test`). The waiver is only honored when it
+label. The waiver is only honored when it
 is *maintainer-effective*: the label is present **and** the PR author is a
 maintainer, or a maintainer's latest decisive review is `APPROVED`. The label
 alone does nothing — applying labels needs triage access, and the extra

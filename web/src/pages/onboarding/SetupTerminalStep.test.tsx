@@ -28,6 +28,25 @@ describe("SetupTerminalStep", () => {
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
   });
 
+  it("shows the error and its existing recovery action on separate lines", async () => {
+    const errorMessage = "Sign-in to https://team.example.com/ didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const onRun = vi.fn().mockResolvedValue({
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    });
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText(errorMessage)).toHaveClass("text-destructive");
+    expect(screen.queryByText(`${errorMessage} ${errorAction}`)).toBeNull();
+    const actionLine = screen.getByText(errorAction);
+    expect(actionLine).toHaveClass("text-cyan-700");
+    expect(actionLine.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+  });
+
   it("installs first when onInstallCli is present, then runs the action", async () => {
     const calls: string[] = [];
     const onInstallCli = vi.fn(async () => {
@@ -168,6 +187,25 @@ describe("SetupTerminalStep", () => {
 
     unmount();
     expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("fills the bar from the start when there's no install step", () => {
+    let emit: (line: string) => void = () => {};
+    const props = {
+      onRun: () => new Promise<{ ok: boolean }>(() => {}),
+      onSetupLog: (cb: (line: string) => void) => {
+        emit = cb;
+        return () => {};
+      },
+      onBack: vi.fn(),
+    };
+    const { container, rerender } = render(<SetupTerminalStep {...props} />);
+    const bar = () => container.querySelector<HTMLElement>("[style*='width']")?.style.width;
+    expect(bar()).toBe("10%");
+    act(() => emit("$ omnigent host --server https://team.example.com/"));
+    expect(bar()).toBe("35%");
+    rerender(<SetupTerminalStep {...props} connection={{ phase: "connecting" }} />);
+    expect(bar()).toBe("70%");
   });
 
   it("fires onBack from Back on the failure screen", async () => {

@@ -48,7 +48,7 @@ Apple finishes processing.
   via an xcodebuild `CURRENT_PROJECT_VERSION=…` override. Nothing in the repo is
   modified, so every `beta`/`release` upload gets a unique, monotonic build
   number with no version churn in git. Don't bump it by hand.
-- **Marketing version** (`CFBundleShortVersionString`, currently `0.1.0`) is set
+- **Marketing version** (`CFBundleShortVersionString`, currently `0.3.2`) is set
   manually. Bump `MARKETING_VERSION` for both the Debug and Release
   configurations of the **Omnigent** target in Xcode (or via `fastlane
 increment_version_number`) when shipping a new user-facing version.

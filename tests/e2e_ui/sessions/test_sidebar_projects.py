@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -81,20 +82,24 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
 
 def test_move_session_into_new_project(
     page: Page,
-    seeded_session: tuple[str, str],
+    seeded_session_pair: tuple[str, str, str],
 ) -> None:
     """Filing a session into a freshly-created project moves the row into it.
 
     The session starts under "Sessions"; after creating the project (+ button)
     and picking it from "Add to project", a project folder with that name
     appears under the "Projects" group and the row lives under it (once
-    expanded) and no longer under "Sessions".
+    expanded) and no longer under "Sessions". With Custom ordering available,
+    dropping another session over a member row still files it, and releasing a
+    row over itself neither navigates nor blocks the next click.
     """
-    base_url, session_id = seeded_session
+    base_url, session_id, other_id = seeded_session_pair
     title = f"e2e-proj-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
+    _set_title(base_url, other_id, f"{title}-other")
     project = f"Project {uuid.uuid4().hex[:6]}"
 
+    enable_grouping_ui(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     row = _row(page, session_id)
@@ -111,6 +116,43 @@ def test_move_session_into_new_project(
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+    other = _row(page, other_id)
+    other.scroll_into_view_if_needed()
+    box = other.bounding_box()
+    assert box
+    x, y = box["x"] + 30, box["y"] + box["height"] / 2
+    time_origin = page.evaluate("performance.timeOrigin")
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    page.mouse.move(x, y)
+    page.mouse.up()
+    expect(other).not_to_have_class(re.compile("opacity-40"))
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    assert page.evaluate("performance.timeOrigin") == time_origin
+
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    target = _row(page, session_id).bounding_box()
+    assert target
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith(f"/v1/sessions/{other_id}")
+        )
+    ) as filed:
+        page.mouse.up()
+    assert filed.value.ok
+    expect(_section(page, project).locator(f'a[href="/c/{other_id}"]')).to_be_visible()
+    view = page.evaluate('JSON.parse(localStorage.getItem("omnigent:sidebar-view"))') or {}
+    assert view.get("ordering", "updated") == "updated"
+
+    _row(page, other_id).get_by_role("link").click()
+    expect(page).to_have_url(f"{base_url}/c/{other_id}")
 
 
 def test_fork_of_filed_session_joins_the_folder_without_reload(
@@ -268,11 +310,11 @@ def test_project_header_action_is_clickable_on_touch_tablet(
         context.close()
 
 
-def test_project_menu_is_keyboard_accessible_on_desktop(
+def test_project_actions_are_keyboard_accessible_on_desktop(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Tab reveals the desktop menu and Enter opens a project-scoped session."""
+    """The desktop shortcut opens a session; the menu omits the duplicate."""
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": 1280, "height": 800})
     project = f"Keyboard project {uuid.uuid4().hex[:6]}"
@@ -284,22 +326,28 @@ def test_project_menu_is_keyboard_accessible_on_desktop(
 
     header = page.get_by_role("button", name=project, exact=True)
     kebab = page.get_by_role("button", name=f"Project actions for {project}")
-    actions = kebab.locator("xpath=..")
+    shortcut = page.get_by_role("link", name=f"New session in {project}", exact=True)
+    actions = kebab.locator("xpath=../..")
     expect(actions).to_have_css("opacity", "0")
     header.hover()
     expect(actions).to_have_css("opacity", "1")
     page.mouse.move(1279, 0)
     expect(actions).to_have_css("opacity", "0")
 
-    # Start at the folder, then use the browser's real Tab order to reach ⋯.
+    # The shortcut precedes the menu in the browser's real Tab order.
     header.focus()
     page.keyboard.press("Tab")
-    expect(kebab).to_be_focused()
+    expect(shortcut).to_be_focused()
     expect(actions).to_have_css("opacity", "1")
-    expect(page.get_by_test_id("project-new-session")).to_have_count(0)
+    page.keyboard.press("Tab")
+    expect(kebab).to_be_focused()
     page.keyboard.press("Enter")
-    new_session = page.get_by_test_id("project-new-session-menu")
-    expect(new_session).to_be_focused()
+    expect(page.get_by_test_id("project-new-session-menu")).to_be_hidden()
+    expect(page.get_by_test_id("rename-project")).to_be_focused()
+    page.keyboard.press("Escape")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(shortcut).to_be_focused()
     page.keyboard.press("Enter")
     expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
 
@@ -327,7 +375,7 @@ def test_project_menu_is_visible_without_hover(
     page.goto(f"{base_url}/c/{session_id}")
     _move_to_new_project(page, _row(page, session_id), project)
     page.get_by_role("button", name=project, exact=True).hover()
-    expect(page.get_by_test_id("project-new-session")).to_have_count(0)
+    expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
 
     context = browser.new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
@@ -335,7 +383,13 @@ def test_project_menu_is_visible_without_hover(
         touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
         header = touch.get_by_role("button", name=project, exact=True)
         expect(header).to_be_visible()
-        expect(touch.get_by_test_id("project-new-session")).to_have_count(0)
+        shortcut = touch.get_by_role(
+            "link", name=f"New session in {project}", exact=True, include_hidden=True
+        )
+        if has_touch:
+            expect(shortcut).to_be_hidden()
+        else:
+            expect(shortcut).to_be_visible()
         kebab = touch.get_by_role("button", name=f"Project actions for {project}")
 
         for expanded in [True, False]:
@@ -353,7 +407,7 @@ def test_project_menu_is_visible_without_hover(
                 );
             }""")
             title_box = header.locator("span.truncate").bounding_box()
-            action_box = kebab.bounding_box()
+            action_box = (kebab if has_touch else shortcut).bounding_box()
             assert title_box is not None and action_box is not None
             assert title_box["x"] + title_box["width"] <= action_box["x"]
 
@@ -363,14 +417,18 @@ def test_project_menu_is_visible_without_hover(
         else:
             kebab.click()
         menu_item = touch.get_by_test_id("project-new-session-menu")
-        expect(menu_item).to_be_visible()
+        if has_touch:
+            expect(menu_item).to_be_visible()
+        else:
+            expect(menu_item).to_be_hidden()
         expect(
             touch.get_by_role("button", name=project, exact=True, include_hidden=True)
         ).to_have_attribute("aria-expanded", before)
         if has_touch:
             menu_item.tap()
         else:
-            menu_item.click()
+            touch.keyboard.press("Escape")
+            shortcut.click()
         expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
         if viewport["width"] < 768:
             expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()

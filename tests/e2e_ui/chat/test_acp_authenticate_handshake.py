@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import gzip
 import io
-import json
 import shlex
 import subprocess
 import sys
@@ -38,6 +37,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online
 
 _ACP_SLUG = "grok-like-agent"
@@ -166,11 +166,8 @@ def grok_like_acp_session(
     agent_script.write_text(_FAKE_GROK_ACP_AGENT)
     command = shlex.join([sys.executable, str(agent_script)])
 
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _acp_launcher_bundle(command), "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _acp_launcher_bundle(command), timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
@@ -179,12 +176,7 @@ def grok_like_acp_session(
     try:
         # Earlier tests may deliberately stop the session-scoped runner.
         respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
-        patch_resp = httpx.patch(
-            f"{live_server}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        )
-        patch_resp.raise_for_status()
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
         yield (live_server, session_id)
     finally:
         try:

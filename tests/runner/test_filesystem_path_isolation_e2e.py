@@ -19,7 +19,7 @@ from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
@@ -201,14 +201,20 @@ async def test_symlink_read_escape_blocked_via_http(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, {"scope": "reach"}], ids=["unmarked", "scope-reach"])
 async def test_symlink_write_escape_blocked_via_http(
     client: httpx.AsyncClient,
     planted: Path,
+    params: dict[str, str] | None,
 ) -> None:
-    """Writing through an in-workspace symlink must not mutate the out-of-root file."""
+    """Writing through an in-workspace symlink must not mutate the out-of-root file.
+
+    Only reads take ``scope=reach``, so the mark changes nothing here.
+    """
     outside = planted / "outside_secret.txt"
     resp = await client.put(
         f"{_BASE}/filesystem/escape.txt",
+        params=params,
         json={"content": "OVERWRITTEN-BY-ATTACKER", "encoding": "utf-8"},
     )
     assert resp.status_code != 200, resp.text
@@ -220,12 +226,107 @@ async def test_symlink_write_escape_blocked_via_http(
 async def test_read_through_symlinked_directory_blocked(
     client: httpx.AsyncClient,
 ) -> None:
-    """A read into a symlinked out-of-root directory is blocked."""
+    """A read into, or a listing of, a symlinked out-of-root directory is blocked
+    unless the request carries ``scope=reach``."""
     # ``vendor`` -> out-of-root ``personal/``; ``vendor/id_rsa`` has no ``..`` so
     # string validation passes and only the resolved-path guard can refuse it.
     resp = await client.get(f"{_BASE}/filesystem/vendor/id_rsa")
     assert resp.status_code != 200, resp.text
     assert _SECRET not in resp.text
+
+    listed = await client.get(f"{_BASE}/filesystem/vendor")
+    assert listed.status_code == 400, listed.text
+    assert listed.json()["error"]["code"] == "invalid_path"
+
+
+@pytest.mark.asyncio
+async def test_reach_scope_follows_a_symlinked_directory_out_of_the_workspace(
+    client: httpx.AsyncClient,
+) -> None:
+    """``scope=reach`` is the server vouching for the owner, who may already
+    browse the link's target by absolute path. The link then lists and reads
+    like any folder; entries keep their workspace-relative paths so the tree
+    can keep requesting them the same way.
+    """
+    listed = await client.get(f"{_BASE}/filesystem/vendor", params={"scope": "reach"})
+    assert listed.status_code == 200, listed.text
+    assert [e["path"] for e in listed.json()["data"]] == ["vendor/id_rsa"]
+
+    read = await client.get(f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach"})
+    assert read.status_code == 200, read.text
+    assert read.json()["content"] == _SECRET
+
+    download = await client.get(
+        f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach", "download": "true"}
+    )
+    assert download.status_code == 200, download.text
+    assert download.content == _SECRET.encode()
+
+
+def _confined_app(
+    workspace: Path, *, read_paths: list[str] | None = None
+) -> tuple[FastAPI, OSEnvironment]:
+    """Runner app over *workspace* whose environment declares itself confined.
+
+    ``sandbox=none`` with ``active=True`` exercises the confined policy branch
+    without a platform sandbox backend (bwrap is Linux-only); *read_paths* are
+    the policy's declared read grants. The caller closes the environment.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=read_paths),
+        ),
+    )
+    assert os_env is not None
+    os_env.sandbox = replace(os_env.sandbox, active=True)
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_iso"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return app, os_env
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [True, False], ids=["read-grant", "no-grant"])
+async def test_reach_scope_under_a_confined_policy_needs_a_grant(
+    planted: Path,
+    granted: bool,
+) -> None:
+    """Under a confined policy the mark admits a link's target exactly as its
+    absolute path would be: listed, read and downloaded when a read grant covers
+    it, refused as ``path_unreachable`` otherwise."""
+    read_paths = [str((planted / "personal").resolve())] if granted else None
+    app, os_env = _confined_app(planted / "workspace", read_paths=read_paths)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as confined:
+            listed = await confined.get(f"{_BASE}/filesystem/vendor", params={"scope": "reach"})
+            read = await confined.get(
+                f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach"}
+            )
+            download = await confined.get(
+                f"{_BASE}/filesystem/vendor/id_rsa",
+                params={"scope": "reach", "download": "true"},
+            )
+    finally:
+        os_env.close()
+
+    if granted:
+        assert listed.status_code == 200, listed.text
+        assert [e["path"] for e in listed.json()["data"]] == ["vendor/id_rsa"]
+        assert read.status_code == 200, read.text
+        assert read.json()["content"] == _SECRET
+        assert download.status_code == 200, download.text
+        assert download.content == _SECRET.encode()
+    else:
+        for resp in (listed, read, download):
+            assert resp.status_code == 403, resp.text
+            assert resp.json()["error"]["code"] == "path_unreachable"
 
 
 @pytest.mark.asyncio

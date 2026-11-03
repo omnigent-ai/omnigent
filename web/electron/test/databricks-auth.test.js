@@ -8,6 +8,9 @@ const {
   readDatabricksAuthMode,
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
+  isTransientRenewalError,
+  IP_ACL_BLOCKED,
+  SESSION_TRANSPORT,
   createDatabricksAuth,
 } = require("../src/databricks-auth");
 
@@ -335,6 +338,7 @@ describe("Databricks browser session lifecycle", () => {
     await drain();
     assert.equal(h.calls.renew.length, 1);
     assert.equal(h.calls.errors.length, 1);
+    assert.equal(h.calls.errors[0].error.errorCode, "SESSION_REJECTED");
   });
   it("does not use an arbitrary foreign navigation as an expiry signal", async (t) => {
     const h = harness();
@@ -410,5 +414,40 @@ describe("Databricks browser session lifecycle", () => {
     assert.equal(h.timers.size, 0);
     assert.deepEqual(h.calls.load, []);
     assert.deepEqual(h.calls.errors, []);
+  });
+});
+
+describe("transient renewal error classification", () => {
+  it("retries only network, timeout, server-side, and IP access list failures", () => {
+    // The shapes fetch rejects with for a refused connection and an AbortSignal.timeout.
+    const refused = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }),
+    });
+    const timedOut = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    const failure = (message, props) => Object.assign(new Error(message), props);
+    for (const [error, transient] of [
+      [refused, true],
+      [timedOut, true],
+      [new TypeError("fetch failed"), true],
+      [new Error("net::ERR_NAME_NOT_RESOLVED"), true],
+      [failure("Databricks session creation timed out", { errorCode: SESSION_TRANSPORT }), true],
+      [failure("Databricks session response aborted", { errorCode: SESSION_TRANSPORT }), true],
+      [new Error("Databricks session response aborted"), false],
+      [failure("token endpoint 503", { status: 503 }), true],
+      [failure("token endpoint 429", { status: 429 }), true],
+      [failure("HTTP 403", { status: 403, errorCode: IP_ACL_BLOCKED }), true],
+      [failure("no stored Databricks token", { errorCode: "NO_STORED_TOKEN" }), false],
+      [failure("token endpoint 400", { status: 400, errorCode: "invalid_grant" }), false],
+      [failure("token endpoint 401", { status: 401 }), false],
+      [failure("net::ERR_FAILED", { status: 403 }), false],
+      [new Error("Databricks session creation redirected to authentication"), false],
+      [new Error("fetch failed"), false],
+      [failure("Workspace selection cancelled", { name: "AbortError" }), false],
+      [new TypeError("Invalid URL"), false],
+      ["net::ERR_FAILED", false],
+      [null, false],
+    ]) {
+      assert.equal(isTransientRenewalError(error), transient, String(error?.message ?? error));
+    }
   });
 });

@@ -1999,7 +1999,8 @@ async def test_http_connect_passes_none_headers_when_empty() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
+@pytest.mark.parametrize("transport", ["auto", "streamable-http"])
+async def test_http_falls_back_to_sse_when_streamable_fails(transport: str) -> None:
     """
     When ``streamablehttp_client`` raises (e.g. the server only
     speaks legacy SSE), ``_open_http_transport`` falls back to
@@ -2059,7 +2060,14 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
                 "omnigent.tools.mcp.ClientSession",
                 return_value=mock_session,
             ):
-                conn = McpServerConnection(config=config)
+                conn = McpServerConnection(config=config, http_transport=transport)
+                if transport == "streamable-http":
+                    with pytest.raises(RuntimeError, match="server returned text/html"):
+                        await conn.connect()
+                    assert mock_streamable.called
+                    assert not captured_sse_kwargs
+                    await conn.close()
+                    return
                 tools = await conn.connect()
 
     # Streamable HTTP was tried first and failed, so the fallback ran.
@@ -2972,7 +2980,8 @@ def test_is_sse_endpoint_detects_sse_paths() -> None:
 
 
 @pytest.mark.asyncio()
-async def test_open_http_transport_routes_sse_url_straight_to_sse() -> None:
+@pytest.mark.parametrize("transport,path", [("auto", "/mcp/sse"), ("sse", "/mcp")])
+async def test_open_http_transport_routes_sse_url_straight_to_sse(transport, path) -> None:
     """
     An ``…/sse`` URL goes directly to the SSE transport.
 
@@ -2983,7 +2992,9 @@ async def test_open_http_transport_routes_sse_url_straight_to_sse() -> None:
     """
     from contextlib import AsyncExitStack
 
-    conn = McpServerConnection(config=MCPServerConfig(name="c", url="http://h:1/mcp/sse"))
+    conn = McpServerConnection(
+        config=MCPServerConfig(name="c", url=f"http://h:1{path}"), http_transport=transport
+    )
     calls: list[str] = []
 
     async def fake_sse(stack, timeout, headers):
@@ -3091,3 +3102,17 @@ async def test_managed_mcp_records_pr_before_result_formatting(
         result = await connection._invoke_tool("create_pull_request", {}, session_id="conv_mcp")
         assert url in result
     assert [pr.url for pr in SessionPrRegistry("conv_mcp").list()] == ([] if failed else [url])
+
+
+@pytest.mark.asyncio()
+async def test_bounded_discovery_rejects_repeated_cursor() -> None:
+    with _mock_mcp_transport() as session:
+        session.list_tools.return_value.nextCursor = "same-page"
+        conn = McpServerConnection(config=_make_http_config(), discovery_limit=501)
+        try:
+            with pytest.raises(ValueError, match="repeated a cursor"):
+                await conn.connect()
+            assert session.list_tools.await_count == 2
+            session.list_tools.assert_awaited_with(cursor="same-page")
+        finally:
+            await conn.close()

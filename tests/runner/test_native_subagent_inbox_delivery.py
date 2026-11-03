@@ -19,11 +19,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -48,34 +50,34 @@ def _clean_subagent_registry() -> Iterator[None]:
     the test and restore the originals after.
     """
     saved = (
-        dict(runner_app._subagent_work_by_child),
-        {k: set(v) for k, v in runner_app._subagent_work_by_parent.items()},
-        dict(runner_app._session_inboxes_ref),
-        set(runner_app._drained_delivered_subagent_children),
-        set(runner_app._subagent_recovery_done),
-        dict(runner_app._subagent_recovery_locks),
+        dict(subagent_work._subagent_work_by_child),
+        {k: set(v) for k, v in subagent_work._subagent_work_by_parent.items()},
+        dict(subagent_work._session_inboxes_ref),
+        set(subagent_work._drained_delivered_subagent_children),
+        set(subagent_work._subagent_recovery_done),
+        dict(subagent_work._subagent_recovery_locks),
     )
-    runner_app._subagent_work_by_child.clear()
-    runner_app._subagent_work_by_parent.clear()
-    runner_app._session_inboxes_ref.clear()
-    runner_app._drained_delivered_subagent_children.clear()
-    runner_app._subagent_recovery_done.clear()
-    runner_app._subagent_recovery_locks.clear()
+    subagent_work._subagent_work_by_child.clear()
+    subagent_work._subagent_work_by_parent.clear()
+    subagent_work._session_inboxes_ref.clear()
+    subagent_work._drained_delivered_subagent_children.clear()
+    subagent_work._subagent_recovery_done.clear()
+    subagent_work._subagent_recovery_locks.clear()
     try:
         yield
     finally:
-        runner_app._subagent_work_by_child.clear()
-        runner_app._subagent_work_by_child.update(saved[0])
-        runner_app._subagent_work_by_parent.clear()
-        runner_app._subagent_work_by_parent.update(saved[1])
-        runner_app._session_inboxes_ref.clear()
-        runner_app._session_inboxes_ref.update(saved[2])
-        runner_app._drained_delivered_subagent_children.clear()
-        runner_app._drained_delivered_subagent_children.update(saved[3])
-        runner_app._subagent_recovery_done.clear()
-        runner_app._subagent_recovery_done.update(saved[4])
-        runner_app._subagent_recovery_locks.clear()
-        runner_app._subagent_recovery_locks.update(saved[5])
+        subagent_work._subagent_work_by_child.clear()
+        subagent_work._subagent_work_by_child.update(saved[0])
+        subagent_work._subagent_work_by_parent.clear()
+        subagent_work._subagent_work_by_parent.update(saved[1])
+        subagent_work._session_inboxes_ref.clear()
+        subagent_work._session_inboxes_ref.update(saved[2])
+        subagent_work._drained_delivered_subagent_children.clear()
+        subagent_work._drained_delivered_subagent_children.update(saved[3])
+        subagent_work._subagent_recovery_done.clear()
+        subagent_work._subagent_recovery_done.update(saved[4])
+        subagent_work._subagent_recovery_locks.clear()
+        subagent_work._subagent_recovery_locks.update(saved[5])
 
 
 class _SnapshotServerClient(NullServerClient):
@@ -138,7 +140,7 @@ def _child_summary(**overrides: Any) -> dict[str, Any]:
         "tool": "reviewer",
         "session_name": "review",
         "current_task_status": "completed",
-        "labels": {runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID},
+        "labels": {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID},
     }
     summary.update(overrides)
     return summary
@@ -252,9 +254,9 @@ async def _post_native_idle(
     parent's session snapshot; when omitted the parent reads as top-level.
     """
     if seed_parent_inbox:
-        runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+        subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     if register_work:
-        runner_app.register_subagent_work(
+        subagent_work.register_subagent_work(
             parent_session_id=PARENT_SESSION_ID,
             child_session_id=CHILD_SESSION_ID,
             agent="reviewer",
@@ -286,12 +288,139 @@ async def _post_native_idle(
             },
         )
 
-    inbox = runner_app._session_inboxes_ref.get(PARENT_SESSION_ID)
+    inbox = subagent_work._session_inboxes_ref.get(PARENT_SESSION_ID)
     items: list[dict[str, Any]] = []
     if inbox is not None:
         while not inbox.empty():
             items.append(inbox.get_nowait())
     return resp.status_code, items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_harness", ["codex-native", "claude-native"])
+@pytest.mark.parametrize("origin", ["dispatch", "snapshot", "init-envelope", "restart"])
+@pytest.mark.parametrize("wrapper", [None, "codex-native-ui", "codex-native-ui-subagent"])
+async def test_parent_wake_follows_child_ownership(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_harness: str,
+    origin: str,
+    wrapper: str | None,
+) -> None:
+    """Wake for independent workers, but not Codex-owned threads, including recovery."""
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
+    labels = {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID}
+    if wrapper is not None:
+        labels[WRAPPER_LABEL_KEY] = wrapper
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    child_body["labels"] = labels
+
+    class WakeClient(_SnapshotServerClient):
+        """Record wake messages while serving persisted child identity and results."""
+
+        def __init__(self) -> None:
+            super().__init__(child_body)
+            self.wakes: list[dict[str, Any]] = []
+
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/child_sessions"):
+                children = [_child_summary(labels=labels)] if origin == "restart" else []
+                return self._Resp({"data": children, "has_more": False})
+            if url.endswith("/items"):
+                return self._Resp({"data": [_CHILD_RESULT_ITEM], "has_more": False})
+            return await super().get(url, **kwargs)
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url == f"/v1/sessions/{PARENT_SESSION_ID}/events":
+                self.wakes.append(kwargs["json"])
+            return await super().post(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        # The child is an independent codex-native worker; a claude-native
+        # child's bare idle would need the forwarder's turn_completed flag.
+        is_parent = agent_id == "ag_orchestrator"
+        return AgentSpec(
+            spec_version=1,
+            name="orchestrator" if is_parent else "reviewer",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": parent_harness if is_parent else "codex-native"},
+            ),
+        )
+
+    server = WakeClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"},
+        )
+        assert response.status_code == 201, response.text
+        if origin == "init-envelope":
+            from omnigent.runner.session_init_protocol import (
+                SESSION_INIT_PAYLOAD_KEY,
+                SESSION_INIT_PROTOCOL_VERSION,
+                RunnerSessionInitEnvelope,
+                RunnerSessionInitSnapshot,
+            )
+
+            envelope = RunnerSessionInitEnvelope(
+                protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+                server_version="0.16.0",
+                session_id=CHILD_SESSION_ID,
+                agent_id="ag_reviewer",
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=1,
+                    updated_at=1,
+                    parent_session_id=PARENT_SESSION_ID,
+                    labels=labels,
+                ),
+            )
+            response = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": CHILD_SESSION_ID,
+                    "agent_id": "ag_reviewer",
+                    SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+                },
+            )
+            assert response.status_code == 201, response.text
+        if origin == "dispatch":
+            subagent_work.register_subagent_work(
+                parent_session_id=PARENT_SESSION_ID,
+                child_session_id=CHILD_SESSION_ID,
+                agent="reviewer",
+                title="review",
+                wrapper_label=wrapper,
+            )
+        # The duplicate idle must not deliver or wake a second time.
+        for _ in range(2):
+            response = await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "review complete: LGTM"},
+                },
+            )
+            assert response.status_code == 204, response.text
+        # Yield to the scheduled wake POST, which completes against the in-memory client.
+        await asyncio.sleep(0)
+
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None
+    assert entry.wrapper_label == wrapper
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
+    assert inbox.qsize() == 1
+    assert inbox.get_nowait()["output"] == "review complete: LGTM"
+    if wrapper == "codex-native-ui-subagent":
+        assert server.wakes == []
+    else:
+        assert len(server.wakes) == 1
+        assert "sys_read_inbox" in server.wakes[0]["data"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -414,7 +543,7 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
 
     assert http == 204
     assert items == []
-    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
     assert entry is not None
     assert entry.status == "completed"
     assert entry.delivered is False
@@ -455,18 +584,18 @@ async def test_retained_result_is_delivered_when_parent_inbox_is_created(
             json={"type": "external_session_status", "data": {"status": "idle", "output": "x"}},
         )
         assert acked.status_code == 204
-        assert PARENT_SESSION_ID not in runner_app._session_inboxes_ref
+        assert PARENT_SESSION_ID not in subagent_work._session_inboxes_ref
 
         # The parent's inbox appears on this process; a second creation is a no-op.
         await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
         await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
     assert inbox.qsize() == 1
     delivered = inbox.get_nowait()
     assert delivered["task_id"] == CHILD_SESSION_ID
     assert delivered["status"] == "completed"
-    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
     assert entry is not None
     assert entry.delivered is True
 
@@ -493,8 +622,8 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
     assert len(items1) == 1  # drained by the helper
 
     # Mark the child delivered-and-drained, exactly as sys_read_inbox does.
-    runner_app.unregister_subagent_work(CHILD_SESSION_ID, remember_drained_delivery=True)
-    assert runner_app.get_subagent_work(CHILD_SESSION_ID) is None
+    subagent_work.unregister_subagent_work(CHILD_SESSION_ID, remember_drained_delivery=True)
+    assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
 
     # Replay the idle — snapshot carries a parent, so a naive recovery would
     # rebuild the entry and re-deliver. The tombstone guard must prevent that.
@@ -513,7 +642,7 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
         spec_resolver=_resolver,
         server_client=_SnapshotServerClient(child_body),  # type: ignore[arg-type]
     )
-    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
     async with _runner_client(app) as client:
         replay = await client.post(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
@@ -580,7 +709,7 @@ async def test_runner_restart_recovers_undrained_terminal_child(
         )
 
     assert response.status_code == 201
-    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
     assert inbox.qsize() == 1
     payload = inbox.get_nowait()
     assert payload["conversation_id"] == CHILD_SESSION_ID
@@ -603,8 +732,8 @@ async def test_runner_restart_recovers_undrained_terminal_child(
     "labels",
     [
         {
-            runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID,
-            runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID,
+            subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID,
+            subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID,
         },
         {},
     ],
@@ -618,14 +747,14 @@ async def test_runner_restart_skips_drained_and_unstamped_children(
     :param _clean_subagent_registry: Isolates module-level runner state.
     :param labels: Either a drained turn's labels or a legacy child's none.
     """
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     server_client = _RecoveryServerClient([_child_summary(labels=labels)])
     app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
 
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].empty()
-    assert runner_app.get_subagent_work(CHILD_SESSION_ID) is None
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
+    assert subagent_work.get_subagent_work(CHILD_SESSION_ID) is None
     assert not any(url.endswith("/items") for url, _ in server_client.requests)
 
 
@@ -634,10 +763,10 @@ async def test_runner_restart_replays_continued_turn_with_stale_receipt(
     _clean_subagent_registry: None,
 ) -> None:
     """A receipt for an earlier turn cannot mask a continued child's new turn."""
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     labels = {
-        runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
-        runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn1",
+        subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_turn2",
+        subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: "subagent_turn1",
     }
     app = create_runner_app(
         server_client=_RecoveryServerClient([_child_summary(labels=labels)]),  # type: ignore[arg-type]
@@ -645,7 +774,7 @@ async def test_runner_restart_replays_continued_turn_with_stale_receipt(
 
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
     assert payload["work_id"] == "subagent_turn2"
     assert payload["output"] == "review complete: LGTM"
 
@@ -664,11 +793,11 @@ async def test_drain_before_session_init_still_recovers(
     app = create_runner_app(
         server_client=_RecoveryServerClient([_child_summary()]),  # type: ignore[arg-type]
     )
-    assert PARENT_SESSION_ID not in runner_app._session_inboxes_ref
+    assert PARENT_SESSION_ID not in subagent_work._session_inboxes_ref
 
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
     assert payload["conversation_id"] == CHILD_SESSION_ID
     assert payload["output"] == "review complete: LGTM"
 
@@ -682,7 +811,7 @@ async def test_runner_restart_recovers_text_less_final_turn_as_no_output(
     Walking past it to an older message would surface a previous turn's text
     as this turn's result.
     """
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     child_items = [
         {"type": "message", "role": "assistant", "content": []},
         _CHILD_RESULT_ITEM,
@@ -693,7 +822,7 @@ async def test_runner_restart_recovers_text_less_final_turn_as_no_output(
 
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
     assert payload["status"] == "completed"
     assert payload["output"] == ""
 
@@ -703,7 +832,7 @@ async def test_runner_restart_recovers_failed_child_error(
     _clean_subagent_registry: None,
 ) -> None:
     """A failed child replays its durable error without reading its transcript."""
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     server_client = _RecoveryServerClient(
         [
             _child_summary(
@@ -716,7 +845,7 @@ async def test_runner_restart_recovers_failed_child_error(
 
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
     assert payload["status"] == "failed"
     assert payload["output"] == "pane died"
     assert not any(url.endswith("/items") for url, _ in server_client.requests)
@@ -727,22 +856,22 @@ async def test_runner_restart_retries_after_child_history_read_failure(
     _clean_subagent_registry: None,
 ) -> None:
     """A failed transcript read leaves the scan unfinished so the drain retries it."""
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     server_client = _RecoveryServerClient(
         [_child_summary()], failed_item_sessions={CHILD_SESSION_ID}
     )
     app = create_runner_app(server_client=server_client)  # type: ignore[arg-type]
 
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
-    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].empty()
-    assert PARENT_SESSION_ID not in runner_app._subagent_recovery_done
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
+    assert PARENT_SESSION_ID not in subagent_work._subagent_recovery_done
 
     server_client.failed_item_sessions.clear()
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
-    payload = runner_app._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
+    payload = subagent_work._session_inboxes_ref[PARENT_SESSION_ID].get_nowait()
     assert payload["conversation_id"] == CHILD_SESSION_ID
-    assert PARENT_SESSION_ID in runner_app._subagent_recovery_done
+    assert PARENT_SESSION_ID in subagent_work._subagent_recovery_done
 
 
 @pytest.mark.asyncio
@@ -758,7 +887,7 @@ async def test_concurrent_recovery_scans_deliver_exactly_once(
             await asyncio.sleep(0)
             return await super().get(url, **kwargs)
 
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
     app = create_runner_app(
         server_client=_YieldingRecoveryServerClient([_child_summary()]),  # type: ignore[arg-type]
     )
@@ -768,7 +897,7 @@ async def test_concurrent_recovery_scans_deliver_exactly_once(
         app.state.recover_undrained_subagent_results(PARENT_SESSION_ID),
     )
 
-    assert runner_app._session_inboxes_ref[PARENT_SESSION_ID].qsize() == 1
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].qsize() == 1
 
 
 @pytest.mark.asyncio
@@ -784,8 +913,8 @@ async def test_routed_child_off_its_native_spec_still_delivers(
     path that never runs — the parent waited forever while the pi sibling
     (whose spec harness is already non-native) was the only one to report.
     """
-    runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
+    subagent_work.register_subagent_work(
         parent_session_id=PARENT_SESSION_ID,
         child_session_id=CHILD_SESSION_ID,
         agent="claude_code",
@@ -814,7 +943,7 @@ async def test_routed_child_off_its_native_spec_still_delivers(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
@@ -914,8 +1043,8 @@ async def test_recovered_child_continues_same_dispatch_before_delivering_result(
             "/v1/sessions", json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"}
         )
         assert parent.status_code == 201, parent.text
-        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
-        entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+        inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
+        entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
         assert entry is not None and entry.work_id == DISPATCH_ID
         assert entry.status not in {"failed", "completed", "cancelled"}
         assert inbox.empty(), "runner crash was delivered as a finished child result"
@@ -1015,12 +1144,13 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     server.patch = AsyncMock(return_value=server._Resp({}))
     app = create_runner_app(server_client=server)  # type: ignore[arg-type]
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
-    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
     assert entry is not None and entry.work_id == DISPATCH_ID
-    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+    inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
 
     assert (
-        runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180) == []
+        subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180)
+        == []
     )
     assert inbox.empty()
     await _drain_inbox(inbox, server_client=server, conversation_id=PARENT_SESSION_ID)
@@ -1035,7 +1165,7 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
         reconciled.set()
 
     sweep = asyncio.create_task(
-        runner_app.run_subagent_launch_reaper(interval_s=0.001, reconcile_pending=reconcile)
+        subagent_work.run_subagent_launch_reaper(interval_s=0.001, reconcile_pending=reconcile)
     )
     try:
         await asyncio.wait_for(reconciled.wait(), timeout=5)
@@ -1052,15 +1182,66 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     await _cleanup_drained_subagent_work(payload, server_client=server)
     server.patch.assert_awaited_once_with(
         f"/v1/sessions/{CHILD_SESSION_ID}",
-        json={"labels": {runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID}},
+        json={"labels": {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID}},
         timeout=30.0,
     )
     await app.state.reconcile_pending_subagent_results()
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
     assert inbox.empty()
-    late = runner_app.mark_subagent_work_terminal(
+    late = subagent_work.mark_subagent_work_terminal(
         CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
     )
     assert late.delivered and not late.delivered_now
     assert inbox.empty()
     assert child["runner_id"] == "other-live-runner"
+
+
+def _wake_candidate(
+    child_session_id: str,
+    *,
+    wrapper_label: str | None,
+    completed_at: float | None,
+) -> subagent_work._SubagentWorkEntry:
+    return subagent_work._SubagentWorkEntry(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=child_session_id,
+        work_id=f"subagent_{child_session_id}",
+        agent="reviewer",
+        title="review",
+        wrapper_label=wrapper_label,
+        completed_at=completed_at,
+    )
+
+
+def test_stranded_wake_rescue_skips_a_later_codex_owned_thread() -> None:
+    """A suppressed thread finishing last must not shadow an independent child's wake.
+
+    The stranded-wake rescue picks one entry per parent to re-send. Selecting the
+    absolute latest would choose a Codex-owned thread that completed after an
+    independent child, and the ownership guard would then drop the wake the child
+    is still owed.
+    """
+    independent = _wake_candidate(
+        "conv_worker", wrapper_label="codex-native-ui", completed_at=100.0
+    )
+    codex_owned = _wake_candidate(
+        "conv_side", wrapper_label="codex-native-ui-subagent", completed_at=200.0
+    )
+
+    picked = subagent_work.latest_wake_eligible_subagent_work([independent, codex_owned])
+
+    assert picked is independent
+
+
+def test_stranded_wake_rescue_has_nothing_for_a_codex_only_parent() -> None:
+    """A parent whose only entries are Codex-owned threads owes no inbox wake."""
+    entries = [
+        _wake_candidate(
+            "conv_thread_a", wrapper_label="codex-native-ui-subagent", completed_at=100.0
+        ),
+        _wake_candidate(
+            "conv_thread_b", wrapper_label="codex-native-ui-subagent", completed_at=200.0
+        ),
+    ]
+
+    assert subagent_work.latest_wake_eligible_subagent_work(entries) is None

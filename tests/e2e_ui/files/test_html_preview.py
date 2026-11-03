@@ -8,11 +8,17 @@ Regression coverage for two bugs in the HTML artifact preview
   * #777 — links in a rendered HTML file did not open. The same empty sandbox
     blocked popups/navigation; the fix injects ``<base target="_blank">`` and
     relaxes the sandbox so links open a real new tab.
+  * Same-page ``#fragment`` links escaped to a new window at the host page's
+    URL (a ``srcdoc`` frame resolves fragment-only links against its embedder,
+    and the base target sent them out); they must scroll the preview in place,
+    while a handler the artifact registers on ``window`` afterwards must still
+    be able to cancel such a click.
 
-It also covers the new "Open in new tab" toolbar button, which pops the
-artifact into a blank, app-controlled tab and renders it inside the same
-sandboxed (opaque-origin) iframe — full-window viewing without giving the
-artifact the app's own origin.
+It also covers zoom shortcuts pressed inside the preview, which scale only the
+rendered file instead of the whole app, and the "Open in new tab" toolbar
+button, which pops the artifact into a blank, app-controlled tab and renders it
+inside the same sandboxed (opaque-origin) iframe — full-window viewing without
+giving the artifact the app's own origin.
 
 The file is seeded via the filesystem PUT endpoint (no agent run), so the test
 is deterministic, and the fixture's JavaScript is self-contained (no network),
@@ -25,13 +31,16 @@ prove the script actually executed.
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import FrameLocator, Locator, Page, expect
+
+from tests._helpers.polling import poll_until
 
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes
 # seeded files into the server process's cwd — the repo root (this file is
@@ -49,9 +58,14 @@ _EXPECTED_SANDBOX = (
 
 _HTML_PATH = "preview_artifact.html"
 
+# Tall filler so the same-page anchor target starts well below the preview fold.
+_FILLER = "\n".join(
+    f"    <p>Filler paragraph {i} providing vertical space.</p>" for i in range(60)
+)
+
 # Self-contained fixture: a script flips a sentinel element from a "blocked"
 # marker to a "ran" marker, and creates a link at runtime. No network needed.
-_HTML_CONTENT = """\
+_HTML_CONTENT = f"""\
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -63,7 +77,15 @@ _HTML_CONTENT = """\
     <p id="js-status">js-blocked</p>
     <a id="static-link" href="https://example.com/static">static link</a>
     <p id="dynamic-link-host"></p>
+    <a id="toc-link" href="#section-3">Jump to section 3</a>
+    <a id="guarded-link" href="#section-3">Guarded jump</a>
+    <a id="relative-link" href="other.html">relative link</a>
     <script>
+      // An artifact handler registered on window after the preview's own script must still
+      // be able to cancel a same-page link, here through the legacy return-false form.
+      window.onclick = function (event) {{
+        return !(event.target && event.target.id === "guarded-link");
+      }};
       // Proof that scripts run (#778).
       document.getElementById("js-status").textContent = "js-ran";
       // A link created at runtime — covered by the injected <base target>.
@@ -73,6 +95,9 @@ _HTML_CONTENT = """\
       a.textContent = "dynamic link";
       document.getElementById("dynamic-link-host").appendChild(a);
     </script>
+{_FILLER}
+    <h2 id="section-3">Section 3</h2>
+    <p>Target of the in-page link.</p>
   </body>
 </html>
 """
@@ -80,6 +105,33 @@ _HTML_CONTENT = """\
 
 def _cleanup_session_workdir(session_id: str) -> None:
     shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+
+
+def _click_without_popup(
+    page: Page, link: Locator, target: Locator, *, scrolls: bool = True
+) -> None:
+    """Click ``link`` with no new page opening; ``target`` scrolls into view, or stays put."""
+    opened: list[Page] = []
+    pages_before = len(page.context.pages)
+
+    def note_popup(popup: Page) -> None:
+        opened.append(popup)
+
+    page.context.on("page", note_popup)
+    try:
+        link.click()
+        if scrolls:
+            expect(target).to_be_in_viewport()
+        # The click itself would have created a popup; a brief settle catches a late event.
+        page.wait_for_timeout(500)
+        if not scrolls:
+            expect(target).not_to_be_in_viewport()
+    finally:
+        page.context.remove_listener("page", note_popup)
+    assert len(page.context.pages) == pages_before
+    assert not opened, "same-page anchor opened a new window at " + ", ".join(
+        p.url for p in opened
+    )
 
 
 @pytest.fixture
@@ -99,11 +151,11 @@ def seeded_html(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
         _cleanup_session_workdir(session_id)
 
 
-def test_html_preview_runs_scripts_and_targets_links(
+def test_html_preview_links_and_sandboxed_popout(
     page: Page,
     seeded_html: tuple[str, str],
 ) -> None:
-    """HTML preview runs JS (#778) and forces links to open in a new tab (#777)."""
+    """Preview links work inline and in an isolated, sandboxed pop-out."""
     base_url, session_id = seeded_html
     # Keep the viewport wide so the responsive toolbar renders its actions
     # inline (the "Open in new tab" button is found by role, not via overflow).
@@ -134,25 +186,27 @@ def test_html_preview_runs_scripts_and_targets_links(
     # The runtime-created link is present, confirming the script fully executed.
     expect(preview.locator("#dynamic-link")).to_have_text("dynamic link")
 
+    # A same-page ``#fragment`` link must scroll the preview: a srcdoc frame otherwise
+    # resolves it against the host page's URL and the ``_blank`` base target opens it
+    # externally.
+    target = preview.locator("#section-3")
+    expect(target).not_to_be_in_viewport()
+    # The artifact's own ``window.onclick`` (registered after the preview's script) cancels the
+    # guarded link, so nothing scrolls or opens: artifact handlers keep precedence.
+    _click_without_popup(
+        page, preview.get_by_role("link", name="Guarded jump"), target, scrolls=False
+    )
+    _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
+    expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
-def test_html_preview_open_in_new_tab_button(
-    page: Page,
-    seeded_html: tuple[str, str],
-) -> None:
-    """The "Open in new tab" button pops the artifact into an isolated, sandboxed tab.
-
-    Security regression guard: the artifact must render inside a *sandboxed*
-    (opaque-origin) iframe in an app-controlled blank tab — NOT at the app's own
-    origin (which a ``blob:``/``data:`` URL would do, exposing the app's storage
-    and credentialed API to untrusted artifact JS).
-    """
-    base_url, session_id = seeded_html
-    page.set_viewport_size({"width": 1600, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
-
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
-    expect(file_viewer.locator('iframe[title="HTML preview"]')).to_be_visible(timeout=10_000)
+    # Every other link still opens in a new tab (#777), also after a same-page activation:
+    # the handler touches neither the links nor the injected base. A relative one resolves
+    # against the embedder, as before.
+    with page.context.expect_page() as popup_info:
+        preview.get_by_role("link", name="relative link").click()
+    popup = popup_info.value
+    expect(popup).to_have_url(f"{base_url}/c/other.html")
+    popup.close()
 
     open_btn = file_viewer.get_by_role("button", name="Open in new tab")
     expect(open_btn).to_be_visible()
@@ -197,4 +251,149 @@ def test_html_preview_open_in_new_tab_button(
     )
     assert parent_access_blocked
 
+    # Same-page links stay inside the popped tab's frame too (its host page is
+    # ``about:blank``, so the fragment would otherwise resolve there).
+    target = preview.locator("#section-3")
+    expect(target).not_to_be_in_viewport()
+    _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
+    assert popped.url == "about:blank"
+
     popped.close()
+
+
+def _box(locator: Locator) -> dict[str, float]:
+    box = locator.bounding_box()
+    assert box is not None, "element is not rendered"
+    return box
+
+
+def _host_scale(page: Page) -> list[float]:
+    """Viewport width and pixel ratio, which a browser-level zoom would change."""
+    return page.evaluate("() => [window.innerWidth, window.devicePixelRatio]")
+
+
+def _expect_scaled(heading: Locator, base_height: float, scale: float) -> None:
+    # The frame relays out at 1/scale of the pane like browser zoom, so block widths
+    # stay put on screen while text height scales.
+    assert abs(_box(heading)["height"] / base_height - scale) < 0.02
+
+
+_ZOOM_VIEWPORT = {"width": 1600, "height": 900}
+
+
+def _expect_button_above(button: Locator, selected: Locator) -> None:
+    """Wait for ``button`` to sit just above ``selected`` on screen."""
+    expect(button).to_be_visible()
+    boxes: dict[str, dict[str, float]] = {}
+
+    def aligned() -> bool:
+        boxes["button"], boxes["selection"] = _box(button), _box(selected)
+        button_box, selected_box = boxes["button"], boxes["selection"]
+        return (
+            abs(button_box["x"] - selected_box["x"]) < 4
+            and abs(button_box["y"] + button_box["height"] + 6 - selected_box["y"]) < 4
+        )
+
+    # The button moves on a debounced selection report after the frame resizes.
+    try:
+        poll_until(aligned, timeout_s=5, interval_s=0.1)
+    except AssertionError as error:
+        raise AssertionError(
+            f"Add comment at {boxes['button']}, selection at {boxes['selection']}"
+        ) from error
+
+
+def _hold_for_recording(page: Page) -> None:
+    """Leave each zoom step on screen long enough to follow in a recorded run."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(1_200)
+
+
+def _press_in_preview(page: Page, preview: FrameLocator, chord: str) -> bool:
+    """Press ``chord`` with focus in the preview; return whether the frame cancelled it."""
+    preview.locator("body").evaluate(
+        """() => {
+            window.__zoomKeyCancelled = null;
+            // Registered after the bridge, so it observes the bridge's decision.
+            const onKey = (e) => {
+                if (["Control", "Meta", "Shift", "Alt"].includes(e.key)) return;
+                window.__zoomKeyCancelled = e.defaultPrevented;
+                window.removeEventListener("keydown", onKey);
+            };
+            window.addEventListener("keydown", onKey);
+        }"""
+    )
+    page.keyboard.press(chord)
+    # Key events dispatch synchronously, so the listener has run by now.
+    return preview.locator("body").evaluate("() => window.__zoomKeyCancelled")
+
+
+@pytest.mark.browser_context_args(viewport=_ZOOM_VIEWPORT, record_video_size=_ZOOM_VIEWPORT)
+def test_html_preview_zoom_shortcuts_scale_only_the_preview(
+    request: pytest.FixtureRequest,
+    seeded_html: tuple[str, str],
+) -> None:
+    """Cmd/Ctrl +, - and 0 inside the preview zoom the rendered file, not the app."""
+    base_url, session_id = seeded_html
+    # Create the page after setup so a recording starts at the user's journey.
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    preview = file_viewer.frame_locator('iframe[title="HTML preview"]')
+    heading = preview.get_by_role("heading", name="HTML preview fixture")
+    expect(preview.locator("#js-status")).to_have_text("js-ran", timeout=10_000)
+    # The bridge takes over the shortcuts once the parent connects; it paints the
+    # (empty) comment highlights as soon as that happens.
+    preview_frame = (
+        file_viewer.locator('iframe[title="HTML preview"]').element_handle().content_frame()
+    )
+    assert preview_frame is not None
+    preview_frame.wait_for_function("() => CSS.highlights.has('omni-comment')", timeout=10_000)
+    badge = file_viewer.get_by_test_id("html-preview-zoom")
+    base_height = _box(heading)["height"]
+    host_before = _host_scale(page)
+    viewer_before = _box(file_viewer)
+    _hold_for_recording(page)
+
+    heading.click()
+    assert _press_in_preview(page, preview, "Control+Equal")
+    expect(badge).to_have_text("Preview zoom 110%")
+    _expect_scaled(heading, base_height, 1.1)
+    _hold_for_recording(page)
+    # The badge is transient and leaves no visible chrome behind.
+    expect(badge).to_have_text("", timeout=5_000)
+
+    assert _press_in_preview(page, preview, "Meta+Equal")
+    expect(badge).to_have_text("Preview zoom 125%")
+    _expect_scaled(heading, base_height, 1.25)
+    _hold_for_recording(page)
+
+    # Commenting still lines up with the zoomed text: the button sits just above the
+    # selection's on-screen position.
+    status_line = preview.locator("#js-status")
+    status_line.select_text()
+    add_comment = page.get_by_role("button", name="Add comment")
+    _expect_button_above(add_comment, status_line)
+    _hold_for_recording(page)
+
+    # Zooming reflows the text; the button follows the selection to its new place.
+    selected_before = _box(status_line)
+    assert _press_in_preview(page, preview, "Control+Minus")
+    expect(badge).to_have_text("Preview zoom 110%")
+    _expect_scaled(heading, base_height, 1.1)
+    assert _box(status_line) != selected_before
+    _expect_button_above(add_comment, status_line)
+    _hold_for_recording(page)
+
+    assert _press_in_preview(page, preview, "Control+0")
+    expect(badge).to_have_text("Preview zoom 100%")
+    _expect_scaled(heading, base_height, 1.0)
+    _hold_for_recording(page)
+
+    # Other shortcuts still reach the page untouched.
+    assert _press_in_preview(page, preview, "Control+9") is False
+
+    # The app itself never zoomed.
+    assert _host_scale(page) == host_before
+    assert _box(file_viewer) == viewer_before

@@ -22,24 +22,18 @@ Run with::
 from __future__ import annotations
 
 import contextlib
-import os
-import signal
 import socket
 import socketserver
-import subprocess
 import threading
 import time
-import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 import pytest
-import yaml
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
-from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.host import isolated_host
 from tests.e2e.conftest import POLL_INTERVAL_S
 
 # How long the proxy serves 404 while the "server container restarts".
@@ -162,81 +156,6 @@ class _RestartableProxy:
         self._server.server_close()
 
 
-def _spawn_host_daemon_via(
-    *,
-    tmp_path: Path,
-    server_url: str,
-    mock_llm_server_url: str,
-) -> tuple[subprocess.Popen[bytes], str, Path]:
-    """Spawn an isolated host daemon pointed at *server_url*.
-
-    Mirrors ``tests/e2e/test_host_e2e.py``'s spawner, but takes the URL the
-    daemon should dial (here: the restartable proxy) instead of assuming the
-    direct live-server URL.
-
-    :param tmp_path: Per-test temp dir used as the daemon's ``HOME``.
-    :param server_url: URL the daemon registers with — the PROXY address.
-    :param mock_llm_server_url: Mock LLM server base URL.
-    :returns: ``(proc, host_id, daemon_log)``.
-    """
-    omni_dir = tmp_path / ".omnigent"
-    omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = uuid.uuid4().hex
-    host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
-    (omni_dir / "config.yaml").write_text(
-        yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": host_name}},
-            default_flow_style=False,
-            sort_keys=True,
-        )
-    )
-    daemon_log = tmp_path / "host-daemon.log"
-    env = {
-        **os.environ,
-        "HOME": str(tmp_path),
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-        "OPENAI_API_KEY": "mock-key",
-        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
-    }
-    with open(daemon_log, "w") as log_fh:
-        proc = subprocess.Popen(
-            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", server_url],
-            env=apply_runner_env(env),
-            cwd=compat_runner_cwd(),
-            stdout=subprocess.DEVNULL,
-            stderr=log_fh,
-        )
-    return proc, host_id, daemon_log
-
-
-def _wait_for_host_online(
-    client: httpx.Client,
-    host_id: str,
-    timeout: float = 30.0,
-) -> None:
-    """Poll GET /v1/hosts until *host_id* appears online.
-
-    :param client: HTTP client pointed at the (direct) server.
-    :param host_id: Host ID to wait for.
-    :param timeout: Max seconds to wait.
-    :raises AssertionError: If the host never appears online.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
-            if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        except httpx.ConnectError:
-            # The proxy/server may still be coming up; keep polling until the
-            # deadline expires.
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
-
-
 @pytest.mark.timeout(180)
 def test_host_survives_transient_404_during_server_restart(
     live_server: str,
@@ -257,76 +176,69 @@ def test_host_survives_transient_404_during_server_restart(
     parsed = urlparse(live_server)
     assert parsed.hostname is not None and parsed.port is not None
     proxy = _RestartableProxy(parsed.hostname, parsed.port)
-    proc: subprocess.Popen[bytes] | None = None
     try:
         proxy_url = f"http://127.0.0.1:{proxy.port}"
 
         # Sanity: the server is reachable through the proxy, like a user URL.
         assert httpx.get(f"{proxy_url}/health", timeout=10.0).status_code == 200
 
-        proc, host_id, daemon_log = _spawn_host_daemon_via(
-            tmp_path=tmp_path,
-            server_url=proxy_url,
-            mock_llm_server_url=mock_llm_server_url,
-        )
-        _wait_for_host_online(http_client, host_id, timeout=30.0)
+        with isolated_host(
+            tmp_path,
+            proxy_url,
+            env={"OPENAI_BASE_URL": f"{mock_llm_server_url}/v1", "OPENAI_API_KEY": "mock-key"},
+            ready=lambda host: host.wait_online(http_client),
+        ) as host:
+            proc, host_id, daemon_log = host.proc, host.host_id, host.log_path
 
-        # "Restart the server container": the proxy serves 404 for the
-        # tunnel route and severs the live tunnel, so the daemon
-        # reconnects into the 404 window.
-        proxy.go_down()
-        time.sleep(_RESTART_WINDOW_S)
-        proxy.go_up()
+            # "Restart the server container": the proxy serves 404 for the
+            # tunnel route and severs the live tunnel, so the daemon
+            # reconnects into the 404 window.
+            proxy.go_down()
+            time.sleep(_RESTART_WINDOW_S)
+            proxy.go_up()
 
-        # The daemon must ride out the window: give it time to notice the
-        # restored backend and re-register, checking it never exits.
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            rc = proc.poll()
-            assert rc is None, (
-                f"Host daemon exited with code {rc} during a transient "
-                f"{_RESTART_WINDOW_S:.0f}s 404 window (a normal server "
-                "restart behind a reverse proxy). "
-                + (
-                    "HOST_FATAL_EXIT_CODE — classified permanent. "
-                    if rc == HOST_FATAL_EXIT_CODE
-                    else ""
+            # The daemon must ride out the window: give it time to notice the
+            # restored backend and re-register, checking it never exits.
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                rc = proc.poll()
+                assert rc is None, (
+                    f"Host daemon exited with code {rc} during a transient "
+                    f"{_RESTART_WINDOW_S:.0f}s 404 window (a normal server "
+                    "restart behind a reverse proxy). "
+                    + (
+                        "HOST_FATAL_EXIT_CODE — classified permanent. "
+                        if rc == HOST_FATAL_EXIT_CODE
+                        else ""
+                    )
+                    + f"Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
                 )
-                + f"Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
-            )
-            resp = http_client.get("/v1/hosts")
-            if resp.status_code == 200 and any(
-                h["host_id"] == host_id and h["status"] == "online"
-                for h in resp.json().get("hosts", [])
-            ):
-                break
-            time.sleep(POLL_INTERVAL_S)
-        else:
-            raise AssertionError(
-                "Host daemon did not come back online within 30s of the "
-                f"server returning. Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
+                resp = http_client.get("/v1/hosts")
+                if resp.status_code == 200 and any(
+                    h["host_id"] == host_id and h["status"] == "online"
+                    for h in resp.json().get("hosts", [])
+                ):
+                    break
+                time.sleep(POLL_INTERVAL_S)
+            else:
+                raise AssertionError(
+                    "Host daemon did not come back online within 30s of the "
+                    f"server returning. Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
+                )
+
+            # And it must not have died at any point (belt-and-braces: the poll
+            # above can exit on the first iteration if re-registration was fast).
+            assert proc.poll() is None, (
+                f"Host daemon exited (code {proc.poll()}) after the restart window. "
+                f"Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
             )
 
-        # And it must not have died at any point (belt-and-braces: the poll
-        # above can exit on the first iteration if re-registration was fast).
-        assert proc.poll() is None, (
-            f"Host daemon exited (code {proc.poll()}) after the restart window. "
-            f"Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
-        )
-
-        # Prove the daemon actually reconnected INTO the 404 window (rather
-        # than the poll above observing pre-restart state): its log must show
-        # the ridden-out 404.
-        assert "HTTP 404" in daemon_log.read_text(), (
-            "Daemon log never recorded the 404 window - the test did not "
-            f"exercise the ride-out path. Log tail:\n{daemon_log.read_text()[-2000:]}"
-        )
+            # Prove the daemon actually reconnected INTO the 404 window (rather
+            # than the poll above observing pre-restart state): its log must show
+            # the ridden-out 404.
+            assert "HTTP 404" in daemon_log.read_text(), (
+                "Daemon log never recorded the 404 window - the test did not "
+                f"exercise the ride-out path. Log tail:\n{daemon_log.read_text()[-2000:]}"
+            )
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
         proxy.close()

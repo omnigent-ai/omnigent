@@ -3,8 +3,8 @@ default:
 
 export FASTLANE_SKIP_UPDATE_CHECK := "1"
 
-# iOS device override (default: iPhone 17 Pro)
-DEVICE := env("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
+# iOS simulator name override (default: an available iPhone, preferring a booted one)
+DEVICE := env("OMNIGENT_IOS_SIMULATOR", "")
 
 # --- uv Python env ---
 
@@ -15,6 +15,12 @@ _check-uv:
 
 _ensure-uv:
     uv sync --extra all --group dev
+
+# Installs the pre-commit and pre-push git hooks (see default_install_hook_types
+# in .pre-commit-config.yaml). Worktrees share the main checkout's .git, so one
+# install covers all of them.
+_ensure-hooks: _ensure-uv
+    uv run --no-sync pre-commit install
 
 # --- iOS Ruby dependencies ---
 
@@ -41,7 +47,7 @@ _ensure-omnidev:
 check: _check-uv _check-ios _check-omnidev
 
 [group('setup')]
-ensure: _ensure-uv _ensure-ios _ensure-omnidev
+ensure: _ensure-uv _ensure-hooks _ensure-ios _ensure-omnidev
 
 # --- Local dev ---
 
@@ -115,7 +121,7 @@ electron-dev: _ensure-web _ensure-electron
 electron-build: _ensure-web _ensure-electron
     pnpm --filter ./web/electron run build
 
-# Build (if needed) and launch the packaged app (reads MDM managed prefs).
+# Build (if needed) and launch the development package (reads dev-domain prefs).
 # Flags: --rebuild (force a fresh build even if one exists),
 #        --v2-flow (force the new server-selector wizard on),
 #        --reset-state (first uninstall the CLI + wipe app data for a fresh
@@ -153,7 +159,7 @@ electron-run *flags:
         arm64) archdir="mac-arm64" ;;
         *) archdir="mac" ;;  # electron-builder names the x64 output "mac"
     esac
-    find_app() { ls -d "web/electron/dist/$archdir/Omnigent.app" 2>/dev/null | head -1 || true; }
+    find_app() { ls -d "web/electron/dist-dev/$archdir/Omnigent Dev.app" 2>/dev/null | head -1 || true; }
     app="$(find_app)"
     if [ "$rebuild" = 1 ] || [ -z "$app" ]; then
         echo "Building the packaged app (this takes a few minutes)…"
@@ -162,9 +168,9 @@ electron-run *flags:
         app="$(find_app)"
     fi
     [ -n "$app" ] || { echo "No $archdir build found after building."; exit 1; }
-    echo "Quitting any running Omnigent…"
-    osascript -e 'quit app "Omnigent"' 2>/dev/null || true
-    pkill -x Omnigent 2>/dev/null || true
+    echo "Quitting any running Omnigent Dev…"
+    osascript -e 'quit app "Omnigent Dev"' 2>/dev/null || true
+    pkill -x 'Omnigent Dev' 2>/dev/null || true
     sleep 1
     if [ "$reset_state" = 1 ]; then
         # Uninstall the CLI. The shared uninstaller exits non-zero both when no
@@ -183,9 +189,9 @@ electron-run *flags:
         # Wipe the desktop app data directly so a fresh-user reset works even with
         # no CLI installed (the uninstaller's global guard skips desktop-data in
         # that case). Intentional destroy — see the confirmation above.
-        rm -rf "$HOME/Library/Application Support/Omnigent" \
-               "$HOME/Library/Caches/Omnigent" \
-               "$HOME/Library/Logs/Omnigent"
+        rm -rf "$HOME/Library/Application Support/Omnigent Dev" \
+               "$HOME/Library/Caches/Omnigent Dev" \
+               "$HOME/Library/Logs/Omnigent Dev"
     fi
     if [ "$v2" = 1 ]; then
         echo "Launching $app (v2 flow forced)"
@@ -194,6 +200,57 @@ electron-run *flags:
         echo "Launching $app"
         open -n "$app"
     fi
+
+#   set <url>[,<url>...] [--internal]   offer servers; --internal sets databricksInternalFeaturesEnabled
+#   import                              copy this Mac's MDM values for the release app
+#   show | clear
+# Relaunch to apply. Real MDM profiles and release builds are untouched.
+# Test managed preferences for local builds (ai.omnigent.desktop-dev).
+[group('electron')]
+[positional-arguments]
+electron-mdm cmd="show" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(uname)" = "Darwin" ] || { echo "electron-mdm is macOS-only."; exit 1; }
+    domain=ai.omnigent.desktop-dev
+    managed="/Library/Managed Preferences/ai.omnigent.desktop.plist"
+    usage="usage: just electron-mdm [set <url>[,<url>...] [--internal] | import | show | clear]"
+    unset_all() {
+        defaults delete "$domain" serverUrls 2>/dev/null || true
+        defaults delete "$domain" databricksInternalFeaturesEnabled 2>/dev/null || true
+    }
+    cmd="${1:-show}"
+    shift || true
+    case "$cmd" in
+        set)
+            [ $# -ge 1 ] || { echo "$usage"; exit 2; }
+            IFS=',' read -ra urls <<< "$1"
+            shift
+            internal=0
+            for f in "$@"; do
+                case "$f" in
+                    --internal) internal=1 ;;
+                    *) echo "unknown flag: $f"; echo "$usage"; exit 2 ;;
+                esac
+            done
+            unset_all
+            defaults write "$domain" serverUrls -array "${urls[@]}"
+            [ "$internal" = 0 ] || defaults write "$domain" databricksInternalFeaturesEnabled -bool true
+            ;;
+        import)
+            [ -r "$managed" ] || { echo "No managed preferences for ai.omnigent.desktop on this Mac."; exit 1; }
+            # import merges, so drop the old values first for an exact copy.
+            unset_all
+            defaults import "$domain" "$managed"
+            ;;
+        clear) unset_all ;;
+        show) ;;
+        *) echo "$usage"; exit 2 ;;
+    esac
+    for key in serverUrls databricksInternalFeaturesEnabled; do
+        printf '%s = ' "$key"
+        defaults read "$domain" "$key" 2>/dev/null || echo "(unset)"
+    done
 
 # --- Lint ---
 
@@ -204,6 +261,10 @@ lint: _ensure-uv
 [group('lint')]
 lint-all: _ensure-uv
     uv run --no-sync pre-commit run --all-files
+
+# Install (or reinstall) the git hooks without the rest of `just ensure`.
+[group('lint')]
+hooks: _ensure-hooks
 
 [group('lint')]
 typecheck-python: _ensure-uv
@@ -221,3 +282,11 @@ lint-ts:
 [group('lint')]
 normalize-locks: _ensure-uv
     uv run --no-sync scripts/normalize_uv_lock_registry.py uv.lock || true
+
+# Resolve the declared dependencies through a package mirror without writing
+# uv.lock; fails when a floor needs a release the mirror does not serve yet.
+# Dependency groups resolve too, so a dev-only gap can fail it as well.
+# No `_ensure-uv`: its `uv sync` would re-resolve and rewrite uv.lock first.
+[group('lint')]
+check-internal-mirror index="https://pypi-proxy.cloud.databricks.com/simple":
+    uv lock --dry-run --default-index {{ index }}

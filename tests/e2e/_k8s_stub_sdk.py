@@ -1,9 +1,10 @@
 """Stub of the optional ``kubernetes`` client for the sandbox disk-bounds e2e.
 
-Materialized onto the server subprocess's PYTHONPATH by
-``test_kubernetes_sandbox_disk_bounds_e2e``. It satisfies the SDK surface the
-launcher touches and records every Job manifest passed to
-``create_namespaced_job`` into ``$OMNIGENT_TEST_K8S_CAPTURE_FILE``. The pod
+Materialized onto the server subprocess's PYTHONPATH by the kubernetes-sandbox
+e2e tests. It satisfies the SDK surface the launcher touches and records every
+Job manifest passed to ``create_namespaced_job`` (and every launch-token Secret
+passed to ``create_namespaced_secret``) into
+``$OMNIGENT_TEST_K8S_CAPTURE_FILE``. The pod
 listing stays empty so the pod-ready wait gives up after the configured
 ``pod_ready_timeout_s`` — the manifest is captured before that wait.
 
@@ -64,7 +65,10 @@ STUB_FILES: dict[str, str] = {
         "        pass\n"
         "\n"
         "    def create_namespaced_secret(self, namespace, body, **kw):\n"
-        '        _capture({"call": "create_namespaced_secret", "namespace": namespace})\n'
+        "        _capture(\n"
+        '            {"call": "create_namespaced_secret",\n'
+        '             "namespace": namespace, "manifest": body}\n'
+        "        )\n"
         "        return SimpleNamespace()\n"
         "\n"
         "    def list_namespaced_pod(self, namespace, **kw):\n"

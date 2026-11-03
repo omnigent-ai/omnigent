@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
 use crate::browser;
+use crate::install::PYTHON_VERSION;
 use crate::omnigent_cmd;
 use crate::pod::Pod;
 use crate::process::ProcSpec;
@@ -35,7 +36,7 @@ const CONVERSATION_PREFILL_FIXTURES: &[&str] = &[
 /// Commands the TUI (and watcher) send to the supervisor.
 #[derive(Debug, Clone)]
 pub enum Cmd {
-    /// Restart a single process.
+    /// Restart the selected process (host selection restarts the backend pair).
     Restart(ProcId),
     /// Restart the backend pair: server, then host after `/health`.
     RestartBackend,
@@ -275,6 +276,8 @@ impl Supervisor {
             });
         }
 
+        // (fixture file name, created session id) for this run's imports.
+        let mut imported = Vec::new();
         while let Some(joined) = imports.join_next().await {
             let Ok((file_name, marker, result)) = joined else {
                 self.event("conversation prefill task failed");
@@ -282,6 +285,12 @@ impl Supervisor {
             };
             match result {
                 Ok(Ok(output)) if output.status.success() => {
+                    match imported_session_id(&String::from_utf8_lossy(&output.stdout)) {
+                        Some(id) => imported.push((file_name.clone(), id.to_string())),
+                        None => self.event(format!(
+                            "prefilled {file_name} but could not read its session id"
+                        )),
+                    }
                     if let Err(error) = std::fs::write(&marker, b"seeded\n") {
                         self.event(format!(
                             "prefilled {file_name} but could not write its marker: {error}"
@@ -310,6 +319,52 @@ impl Supervisor {
                 Err(_) => self.event(format!("conversation prefill timed out for {file_name}")),
             }
         }
+
+        if !imported.is_empty() {
+            // Fixture order, not completion order, so the seeded layout is stable.
+            imported.sort();
+            let ids = imported.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+            self.seed_sidebar_metadata(&ids).await;
+        }
+    }
+
+    /// Seed sidebar date buckets and repository labels for this run's imported fixtures.
+    async fn seed_sidebar_metadata(&self, session_ids: &[String]) {
+        let script = self
+            .pod
+            .repo_root
+            .join("dev/omnidev/fixtures/seed_sidebar_metadata.py");
+        // Use the managed interpreter; this stdlib-only script needs no project environment.
+        let mut command = Command::new("uv");
+        command
+            .args(["run", "--no-project", "--python", PYTHON_VERSION, "python"])
+            .arg(&script)
+            .arg(self.pod.chat_db())
+            .args(session_ids)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match timeout(Duration::from_secs(30), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                self.event(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                };
+                self.event(format!(
+                    "could not seed sidebar metadata ({}): {detail}",
+                    output.status
+                ));
+            }
+            Ok(Err(error)) => self.event(format!("could not start sidebar metadata seed: {error}")),
+            Err(_) => self.event("sidebar metadata seed timed out"),
+        }
     }
 
     /// Restart server then host, gated on `/health`. Used by manual restart and
@@ -332,9 +387,13 @@ impl Supervisor {
 
     async fn restart_one(&mut self, id: ProcId) {
         match id {
-            // Restarting the server alone would strand the host on a dead
-            // backend, so treat it as a backend restart.
-            ProcId::Server | ProcId::Host => self.start_backend_restart().await,
+            ProcId::Server => {
+                self.event("restarting server");
+                self.stop(ProcId::Server).await;
+                self.set_status(ProcId::Server, ProcStatus::Restarting);
+                self.spawn(ProcId::Server);
+            }
+            ProcId::Host => self.start_backend_restart().await,
             ProcId::Vite => {
                 if self.vite_enabled {
                     self.event("restarting vite");
@@ -654,11 +713,88 @@ async fn http_ok(addr: &str, path: &str, host: &str) -> bool {
     status.starts_with("HTTP/1.") && status.split_whitespace().nth(1) == Some("200")
 }
 
+/// The session id from `omnigent session import` output ("Imported N item(s) into <id>").
+fn imported_session_id(stdout: &str) -> Option<&str> {
+    let (_, id) = stdout.trim().rsplit_once(" into ")?;
+    let id = id.trim();
+    (!id.is_empty() && !id.contains(char::is_whitespace)).then_some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::Ports;
+    use crate::profile::Profile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn reads_the_imported_session_id() {
+        let out = "Imported 12 item(s) into 0123456789abcdef0123456789abcdef\n";
+        assert_eq!(
+            imported_session_id(out),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(imported_session_id("Imported 0 item(s) into \n"), None);
+        assert_eq!(imported_session_id("some other output"), None);
+    }
+
+    #[tokio::test]
+    async fn manual_server_restart_preserves_host() {
+        let dir = std::env::temp_dir().join(format!(
+            "omnidev-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let profile: Profile = toml::from_str(
+            r#"
+            server.command = ["/bin/sleep", "60"]
+            host.command = ["/bin/sleep", "60"]
+            vite.command = ["/bin/sleep", "60"]
+            backend_dir = "."
+            web_dir = "."
+            "#,
+        )
+        .unwrap();
+        let pod = Arc::new(Pod {
+            repo_root: dir.clone(),
+            dir: dir.clone(),
+            ports: Ports {
+                server: 6767,
+                vite: 5173,
+            },
+            vite_host: "127.0.0.1".into(),
+            trusted_origins: Vec::new(),
+            profile: Some(profile),
+        });
+        let shared = Shared::new(&pod);
+        let mut supervisor = Supervisor::new(pod, shared.clone(), false, false);
+        supervisor.spawn(ProcId::Server);
+        supervisor.spawn(ProcId::Host);
+        let server_pid = supervisor.slots[ProcId::Server.idx()].pgid.unwrap();
+        let host_pid = supervisor.slots[ProcId::Host.idx()].pgid.unwrap();
+
+        supervisor.restart_one(ProcId::Server).await;
+        assert_ne!(
+            supervisor.slots[ProcId::Server.idx()].pgid,
+            Some(server_pid)
+        );
+        assert_eq!(supervisor.slots[ProcId::Host.idx()].pgid, Some(host_pid));
+        assert_eq!(
+            shared.lock().unwrap().status[ProcId::Host.idx()],
+            ProcStatus::Running(host_pid as u32)
+        );
+
+        supervisor.stop(ProcId::Host).await;
+        supervisor.stop(ProcId::Server).await;
+        drop(supervisor);
+        drop(shared);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn http_probe_sends_requested_path_and_host() {

@@ -482,6 +482,145 @@ def _make_redirect_then_ok_client(
     return _Client
 
 
+def _make_sequence_client(
+    responses: list[httpx.Response],
+    request_bodies: list[dict[str, object]],
+) -> type:
+    """Build an httpx.Client stub that returns responses in order."""
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url
+            request_bodies.append(dict(json))
+            index = min(len(request_bodies) - 1, len(responses) - 1)
+            return responses[index]
+
+    return _Client
+
+
+def test_post_evaluate_with_retry_recovers_from_429_with_stable_elicitation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient 429 retries the same logical policy evaluation."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [
+        httpx.Response(429, text="rate limited", request=request),
+        httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
+    ]
+    request_bodies: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {"type": "PHASE_REQUEST"}}, 5.0, "policy hook"
+    )
+
+    assert resp is responses[1]
+    assert error is None
+    assert sleeps == [1.0]
+    assert len(request_bodies) == 2
+    elicitation_id = request_bodies[0]["_omnigent_elicitation_id"]
+    assert isinstance(elicitation_id, str)
+    assert elicitation_id.startswith("elicit_evaluate_")
+    assert all(body["_omnigent_elicitation_id"] == elicitation_id for body in request_bodies)
+
+
+def test_post_evaluate_with_retry_bounds_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 honors ``Retry-After`` without exceeding the delay cap."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "30"}, request=request),
+        httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
+    ]
+    request_bodies: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is responses[1]
+    assert error is None
+    assert sleeps == [10.0]
+
+
+def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated 429s stop at the existing retry budget and fail closed."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [httpx.Response(429, text="rate limited", request=request)]
+    request_bodies: list[dict[str, object]] = []
+    now = 0.0
+    sleeps: list[float] = []
+
+    def _sleep(delay: float) -> None:
+        nonlocal now
+        sleeps.append(delay)
+        now += delay
+
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: now)
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is None
+    assert error is not None
+    assert "retry budget exhausted" in error
+    assert "server returned 429" in error
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 10.0]
+    assert len(request_bodies) == 6
+    assert len({body["_omnigent_elicitation_id"] for body in request_bodies}) == 1
+
+
+def test_post_evaluate_with_retry_keeps_non_429_4xx_single_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-rate-limit 4xx remains final without sleeping or retrying."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [httpx.Response(422, text="invalid request", request=request)]
+    request_bodies: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is None
+    assert error == "server returned 422: invalid request"
+    assert sleeps == []
+    assert len(request_bodies) == 1
+
+
 def test_post_evaluate_with_retry_reauths_on_login_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -591,6 +730,55 @@ def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
     )
     initial = native_policy_hook._EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     assert sleeps == [initial, initial], "a severed held poll re-POSTs inside the re-park grace"
+
+
+def test_post_evaluate_with_retry_slow_429_spends_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 429 after a held poll is a rate limit, not a gateway sever."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    sleeps: list[float] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+    held = native_policy_hook._EVALUATE_POLICY_HELD_POLL_FLOOR_S + 290.0
+    bodies: list[dict[str, object]] = []
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            bodies.append(json)
+            if len(bodies) > 2:
+                return ok
+            clock["t"] += held
+            return httpx.Response(429, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None
+    assert "retry budget exhausted" in error
+    assert "server returned 429" in error
+    assert len(bodies) == 1
+    assert sleeps == []
+    assert "re-parking" not in capsys.readouterr().err
 
 
 def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(

@@ -873,6 +873,95 @@ def test_session_scope_processor_stamps_every_span() -> None:
     assert "session.id" not in (spans["outside.scope"].attributes or {})
 
 
+def test_active_skill_processor_stamps_spans_while_active() -> None:
+    """
+    Every span created while a skill is active is tagged
+    ``omnigent.skill.active``; spans after the reset are untouched. This is
+    what makes "which tools ran during skill X" derivable with no per-tool code.
+    """
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(telemetry._make_active_skill_processor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    token = telemetry.set_active_skill("code-review")
+    with tracer.start_as_current_span("tool:Bash"):
+        with tracer.start_as_current_span("tool:Read"):  # child, never stamped by hand
+            pass
+    telemetry.reset_active_skill(token)
+    with tracer.start_as_current_span("tool:after"):
+        pass
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert spans["tool:Bash"].attributes.get("omnigent.skill.active") == "code-review"
+    assert spans["tool:Read"].attributes.get("omnigent.skill.active") == "code-review"
+    assert "omnigent.skill.active" not in (spans["tool:after"].attributes or {})
+    assert telemetry._active_skill_var.get() is None
+
+
+def test_make_span_attribute_processor_is_generic() -> None:
+    """The factory stamps any attribute from any value getter, e.g. a context var."""
+    import contextvars
+
+    var: contextvars.ContextVar[str | None] = contextvars.ContextVar("t", default=None)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(telemetry.make_span_attribute_processor("my.attr", var.get))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    token = var.set("value-1")
+    with tracer.start_as_current_span("span.in"):
+        pass
+    var.reset(token)
+    with tracer.start_as_current_span("span.out"):
+        pass
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert spans["span.in"].attributes.get("my.attr") == "value-1"
+    assert "my.attr" not in (spans["span.out"].attributes or {})
+
+
+def test_telemetry_guarded_no_op_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A guarded ``record_*`` does not call through when telemetry is off."""
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "false")
+    calls: list[int] = []
+
+    @telemetry.telemetry_guarded
+    def record(n: int) -> None:
+        calls.append(n)
+
+    assert record(1) is None
+    assert calls == []
+
+
+def test_telemetry_guarded_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A guarded ``record_*`` never propagates exceptions when telemetry is on."""
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "1")
+
+    @telemetry.telemetry_guarded
+    def boom() -> None:
+        raise RuntimeError("should be swallowed")
+
+    assert boom() is None
+
+
+def test_telemetry_guarded_passes_through_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When enabled and no error, the wrapped function runs normally."""
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "1")
+    calls: list[int] = []
+
+    @telemetry.telemetry_guarded
+    def record(n: int) -> None:
+        calls.append(n)
+
+    record(5)
+    assert calls == [5]
+
+
 def test_init_sets_service_name_from_argument(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

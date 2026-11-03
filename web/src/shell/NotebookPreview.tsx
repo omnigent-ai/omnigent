@@ -1,15 +1,28 @@
 import type { RefObject, UIEvent } from "react";
 import type { BundledLanguage } from "shiki";
 import AnsiDefault from "ansi-to-react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CodeBlockContent } from "@/components/ai-elements/code-block";
 import { cn } from "@/lib/utils";
+import { ExternalPreviewLink } from "./ExternalPreviewLink";
+import { isWorkspaceRelativeSrc } from "./TipTapWorkspaceImage";
 
 // ansi-to-react is CJS with a TS-compiled `exports.default`; depending on the
 // bundler interop (Vite dev prebundle vs vitest vs production build) the
 // default import is either the component or the whole exports object.
 const Ansi = ("default" in AnsiDefault ? AnsiDefault.default : AnsiDefault) as typeof AnsiDefault;
+
+// URLs open outside the app window, as in the Markdown preview; a plain anchor
+// would navigate the app itself off its server.
+const NOTEBOOK_MARKDOWN_COMPONENTS: Components = {
+  a: ({ node: _node, href, ...props }) =>
+    href && !isWorkspaceRelativeSrc(href) ? (
+      <ExternalPreviewLink href={href} {...props} />
+    ) : (
+      <a href={href} {...props} />
+    ),
+};
 
 // ---------------------------------------------------------------------------
 // NotebookPreview — read-only render of a Jupyter notebook (.ipynb, nbformat 4).
@@ -247,7 +260,9 @@ export function NotebookPreview({
           return (
             // eslint-disable-next-line react/no-array-index-key
             <div key={i} className="prose dark:prose-invert prose-sm max-w-none pl-16">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{joinSource(cell.source)}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={NOTEBOOK_MARKDOWN_COMPONENTS}>
+                {joinSource(cell.source)}
+              </ReactMarkdown>
             </div>
           );
         }

@@ -32,13 +32,10 @@ with stub executables), and cleans up all daemons.
 
 from __future__ import annotations
 
-import io
 import json
 import os
-import socket
 import stat
 import subprocess
-import tarfile
 import tempfile
 import threading
 import time
@@ -50,6 +47,9 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+
+from tests._helpers.live_server import find_free_port
+from tests._helpers.session import bundle_files, post_session_bundle
 
 # Worktree root: tests/e2e/<this file> -> parents[2]. Threaded onto every
 # subprocess PYTHONPATH so the spawned server / daemons / CLI import THIS
@@ -118,12 +118,6 @@ def _subprocess_env(home: Path | None = None) -> dict[str, str]:
     return env
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _client() -> httpx.Client:
     # trust_env=False: never route loopback through the CI egress proxy.
     return httpx.Client(trust_env=False, timeout=30.0)
@@ -141,16 +135,11 @@ def _wrapper_bundle() -> bytes:
 
     with tempfile.TemporaryDirectory() as tmp:
         yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat
-        # translator (the spec has no spec_version) — same convention as
-        # the ``_create_native_claude_session`` e2e_ui fixture.
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+    # Non-config.yaml arcname routes through the omnigent compat
+    # translator (the spec has no spec_version) — same convention as
+    # the ``_create_native_claude_session`` e2e_ui fixture.
+    data = yaml_text.encode()
+    return bundle_files({"claude-native-ui.yaml": data})
 
 
 def _create_wrapper_session(server_url: str, title: str) -> str:
@@ -167,10 +156,12 @@ def _create_wrapper_session(server_url: str, title: str) -> str:
         WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
     }
     with _client() as c:
-        resp = c.post(
+        resp = post_session_bundle(
+            c.post,
             f"{server_url}/v1/sessions",
-            data={"metadata": json.dumps({"labels": labels})},
-            files={"bundle": ("claude-native-ui.tar.gz", _wrapper_bundle(), "application/gzip")},
+            _wrapper_bundle(),
+            metadata={"labels": labels},
+            filename="claude-native-ui.tar.gz",
             timeout=120.0,
         )
         resp.raise_for_status()
@@ -197,7 +188,7 @@ class _CrossHostEnv:
 
 
 def _boot_server(root: Path) -> tuple[subprocess.Popen, str]:
-    port = _free_port()
+    port = find_free_port()
     url = f"http://127.0.0.1:{port}"
     (root / "server").mkdir(parents=True, exist_ok=True)
     log = open(root / "server" / "server.log", "w")  # noqa: SIM115 — Popen lifetime

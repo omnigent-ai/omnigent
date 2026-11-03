@@ -167,6 +167,10 @@ async def test_startup_failure_is_visible_at_error_and_belongs_to_child(
     assert attributes["app_server_pid"] == 4242
     assert attributes.get("app_server_returncode") is None
     assert attributes["codex_version"] == "0.154.0"
+    assert attributes["error_impact"] == "blocking"
+    assert attributes["error_phase"] == "harness_startup"
+    # A live TUI leaves the category to the exception classifier.
+    assert "error_category" not in attributes
 
     row = record_to_row(record, source="runner")
     assert row["session_id"] == startup.session_id
@@ -371,8 +375,11 @@ async def test_timeout_captures_tui_exit_when_discovery_misses_it(
     assert record.attributes["app_server_state"] == "running"
     if capture == "1":
         assert "unexpected argument '--invalid'" in record.attributes["terminal_last_output"]
+        # The captured usage error attributes the dead TUI, not the timeout.
+        assert record.attributes["error_category"] == "config"
     else:
         assert "terminal_last_output" not in record.attributes
+        assert record.attributes["error_category"] == "runner"
 
 
 async def test_stale_terminal_exit_does_not_stop_replacement_launch(
@@ -787,7 +794,12 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
     ) -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(patch=AsyncMock(return_value=SimpleNamespace(status_code=200)))
 
-    supervise = AsyncMock()
+    record_at_forwarding: list[str | None] = []
+    supervise = AsyncMock(
+        side_effect=lambda **_: record_at_forwarding.append(
+            read_bridge_startup_error(startup.bridge_dir)
+        )
+    )
     monkeypatch.setattr(
         forwarder, "wait_for_thread_started", AsyncMock(return_value="thread-ready")
     )
@@ -800,7 +812,8 @@ async def test_success_starts_forwarder_without_reporting_startup_failure(
         await _discover(startup)
 
     assert _failure_records(caplog) == []
-    assert read_bridge_startup_error(startup.bridge_dir) is None
+    # No startup failure is on record once forwarding begins.
+    assert record_at_forwarding == [None]
     state = read_bridge_state(startup.bridge_dir)
     assert state is not None
     assert state.session_id == startup.session_id

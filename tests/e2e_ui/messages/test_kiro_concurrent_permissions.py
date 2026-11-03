@@ -42,13 +42,15 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _TEST_AGENT_YAML,
@@ -306,17 +308,6 @@ if __name__ == "__main__":
 '''
 
 
-def _wait_for(
-    predicate: Callable[[], bool], *, timeout_s: float = 30.0, interval_s: float = 0.5
-) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
-
-
 def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
@@ -395,46 +386,21 @@ def _create_kiro_native_session(base_url: str, runner_id: str, workspace: Path) 
     session workspace to a scratch directory so the kiro workspace MCP config
     is not written into the repo checkout.
     """
-    import io
-    import tarfile
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        KIRO_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="kiro",
+        metadata={"workspace": str(workspace)},
     )
-    from omnigent.harnesses.kiro_native.main import _materialize_kiro_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        spec_path = _materialize_kiro_agent_spec(Path(tmp), model=None)
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("kiro-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    metadata = {
-        "labels": {
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: KIRO_NATIVE_WRAPPER_VALUE,
-        },
-        "workspace": str(workspace),
-    }
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("kiro-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
+
+
+@pytest.fixture
+def kiro_shim_processes() -> dict[str, subprocess.Popen[bytes]]:
+    """Expose only this fixture's children for process interruption scenarios."""
+    return {}
 
 
 @pytest.fixture
@@ -442,6 +408,7 @@ def kiro_shim_session(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
+    kiro_shim_processes: dict[str, subprocess.Popen[bytes]],
 ) -> Iterator[tuple[str, str, Path]]:
     """A runner-bound kiro-native session backed by the fake ``kiro-cli`` TUI.
 
@@ -457,12 +424,22 @@ def kiro_shim_session(
     if request.config.getoption("--ui-base-url"):
         pytest.skip("kiro permission-mirror e2e requires an isolated spawned server")
 
+    source = getattr(request, "param", _FAKE_KIRO_SOURCE)
+    server_root = _REPO_ROOT
+    if isinstance(source, dict):
+        checkout = source["server_checkout"]
+        if not checkout:
+            pytest.skip("set OMNIGENT_E2E_KIRO_LEGACY_SERVER_CHECKOUT to an older server checkout")
+        server_root = Path(checkout).resolve()
+        assert (server_root / "omnigent/server/app.py").is_file()
+        source = source["source"]
+
     from omnigent.harnesses.kiro_native.bridge import bridge_dir_for_session_id
     from omnigent.runner.identity import token_bound_runner_id
 
     server_tmp = tmp_path_factory.mktemp("e2e_ui_kiro_shim_server")
     shim_path = server_tmp / "kiro-cli"
-    shim_path.write_text(_FAKE_KIRO_SOURCE, encoding="utf-8")
+    shim_path.write_text(source, encoding="utf-8")
     shim_path.chmod(0o755)
 
     workspace = server_tmp / "workspace"
@@ -480,8 +457,11 @@ def kiro_shim_session(
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
 
+    from dev.repro_env.runtime import isolated_env
+
     shared_env = {
-        **os.environ,
+        **isolated_env(dict(os.environ), server_tmp),
+        "OMNIGENT_DATA_DIR": os.environ["OMNIGENT_DATA_DIR"],
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_KIRO_PATH": str(shim_path),
         # The fake TUI renders kiro's ``❯`` / ``─`` markers; make sure tmux and
@@ -489,7 +469,13 @@ def kiro_shim_session(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
-    server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
+    shared_env.pop("OMNIGENT_PROCESS_LOG_FILE", None)
+    server_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+        "PYTHONPATH": str(server_root),
+        "OMNIGENT_WEB_UI_DIST": str(_REPO_ROOT / "omnigent/server/static/web-ui"),
+    }
     runner_env = {
         **shared_env,
         "OMNIGENT_RUNNER_ID": runner_id,
@@ -509,6 +495,7 @@ def kiro_shim_session(
                 sys.executable,
                 "-c",
                 "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+                + "import omnigent; print('server source:', omnigent.__file__, flush=True); "
                 + "from omnigent.cli import main; main()",
                 "server",
                 "--host",
@@ -523,6 +510,7 @@ def kiro_shim_session(
                 str(agent_yaml_path),
             ],
             env=server_env,
+            cwd=server_root,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
@@ -569,6 +557,7 @@ def kiro_shim_session(
                 f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
             )
 
+        kiro_shim_processes["runner"] = runner_proc
         session_id = _create_kiro_native_session(base_url, runner_id, workspace)
         bridge_dir = bridge_dir_for_session_id(session_id)
         yield (base_url, session_id, bridge_dir)
@@ -624,7 +613,7 @@ def test_concurrent_kiro_permissions_surface_serially(
     _send(page, "Run the three setup commands that each need shell approval.")
 
     # Kiro raised three concurrent permission requests in one recorder batch…
-    _wait_for(
+    poll_until(
         lambda: set(_REQUEST_IDS) <= _recorder_request_ids(record_file),
         timeout_s=120.0,
     )
@@ -645,8 +634,8 @@ def test_concurrent_kiro_permissions_surface_serially(
     expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first).to_be_visible(
         timeout=30_000
     )
-    _wait_for(lambda: _REQUEST_IDS[0] in _recorder_response_ids(record_file), timeout_s=60.0)
-    _wait_for(
+    poll_until(lambda: _REQUEST_IDS[0] in _recorder_response_ids(record_file), timeout_s=60.0)
+    poll_until(
         lambda: (
             "requires approval" in _kiro_pane_text(bridge_dir)
             and "setup-step-beta" in _kiro_pane_text(bridge_dir)

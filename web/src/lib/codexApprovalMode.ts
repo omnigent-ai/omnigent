@@ -1,10 +1,10 @@
 // Running-session approval switcher for codex-native. Unlike the create-time
 // presets in `nativeHarnessModes` (which map to `terminal_launch_args`), the
 // live switch drives Codex's own `/permissions` popup by keystroke injection,
-// so its options and labels mirror that popup. The popup is version-dependent:
-// newer builds add a "Read Only" stance that 0.146 lacks, so the list is the
-// superset. The full-bypass sandbox stance stays launch-only (the server 400s
-// it on a runtime switch), so it's absent here.
+// so its options and labels mirror that popup. Read Only isn't offered: the
+// popup lists it only for sessions already running a read-only permission
+// profile, so users start a new read-only session instead. The full-bypass
+// sandbox stance stays launch-only (the server 400s it on a runtime switch).
 
 export interface CodexRuntimeApprovalPreset {
   value: string;
@@ -16,8 +16,8 @@ export interface CodexRuntimeApprovalPreset {
 export const CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.approval_mode";
 
 /**
- * The three runtime approval stances Codex's `/permissions` popup offers, in
- * its order. `approval_mode` PATCHes accept exactly these values.
+ * The three runtime approval stances the picker can switch into, in Codex's
+ * `/permissions` popup order.
  */
 export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[] = [
   {
@@ -35,16 +35,16 @@ export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[]
     label: "Full Access",
     description: "Edit any file and access the internet without approval",
   },
-  {
-    value: "read-only",
-    label: "Read Only",
-    description: "Read files only; approval required to edit files or access the internet",
-  },
 ];
+
+// A session launched read-only still reports it as its live mode, so it keeps
+// a label even though the picker can't switch into it.
+const CODEX_NATIVE_READ_ONLY_LABEL = "Read Only";
 
 /** Human label for an approval-mode value, falling back to the raw value. */
 export function codexApprovalModeLabel(mode: string | null | undefined): string {
   if (!mode) return "";
+  if (mode === "read-only") return CODEX_NATIVE_READ_ONLY_LABEL;
   return CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.find((m) => m.value === mode)?.label ?? mode;
 }
 

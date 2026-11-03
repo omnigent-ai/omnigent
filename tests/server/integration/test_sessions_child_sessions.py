@@ -21,23 +21,27 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import tarfile
+import threading
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
 import httpx
 import pytest
 import yaml
+from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-from tests.server.helpers import build_agent_bundle, create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -360,6 +364,91 @@ async def test_parent_session_snapshot_replays_child_pending_elicitation(
     assert prompts[0]["elicitation_id"] == "elicit_child_q1"
     assert prompts[0]["params"]["message"] == "Approve child command"
     assert prompts[0]["params"]["target_session_id"] == child.id
+
+
+async def test_late_ancestor_mirror_keeps_child_current_elicitation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror that ran late on its thread must not revert or revive the parent card."""
+    from omnigent.runtime import pending_elicitations
+
+    session = await _create_parent_session(client, agent_name="late-ancestor-mirror")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="kiro:approval",
+        agent_id=session["agent_id"],
+    )
+
+    def request(state: str) -> dict[str, Any]:
+        return {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_child_q1",
+            "params": {"mode": "form", "message": "Approve", "native_delivery": {"state": state}},
+        }
+
+    pending_elicitations.record_publish(child.id, request("ready"))
+    pending_elicitations.record_publish(child.id, request("sending"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("sending")
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    _, mirrored = pending_elicitations.lookup("elicit_child_q1", conversation_id=session["id"])
+    assert mirrored["params"]["native_delivery"] == {"state": "sending"}
+    assert mirrored["params"]["target_session_id"] == child.id
+
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    assert pending_elicitations.count_for(session["id"]) == 0
+
+    # A late resolved mirror must not clear a card the child asked again.
+    pending_elicitations.record_publish(child.id, request("ready"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    assert pending_elicitations.count_for(session["id"]) == 1
+
+    # A resolution that lands while a request mirror is publishing still wins.
+    original_publish = session_stream.publish
+    entered, release = threading.Event(), threading.Event()
+
+    def paused_publish(conversation_id: str, event: dict[str, Any]) -> int:
+        if conversation_id == session["id"] and event["type"] == "response.elicitation_request":
+            entered.set()
+            assert release.wait(5)
+        return original_publish(conversation_id, event)
+
+    monkeypatch.setattr(session_stream, "publish", paused_publish)
+    request_mirror = threading.Thread(
+        target=sessions_module._publish_elicitation_request_to_ancestors,
+        args=(conv_store, child.id, request("ready")),
+    )
+    request_mirror.start()
+    assert entered.wait(5)
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    resolved_mirror = threading.Thread(
+        target=sessions_module._publish_elicitation_resolved_to_ancestors,
+        args=(conv_store, child.id, "elicit_child_q1"),
+    )
+    resolved_mirror.start()
+    resolved_mirror.join(0.2)
+    release.set()
+    request_mirror.join(5)
+    resolved_mirror.join(5)
+    assert pending_elicitations.count_for(session["id"]) == 0
 
 
 async def test_child_sessions_zero_pending_when_index_empty(
@@ -1614,6 +1703,14 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     message_body = message_resp.json()
     assert message_body["queued"] is True
     assert message_body["pending_id"].startswith("pending_")
+    forwarded_event = forwarded[1]["body"]
+    assert re.fullmatch(r"[0-9a-f]{32}", forwarded_event["delivery_attempt_id"])
+    assert isinstance(forwarded_event["input_enqueued_at_ms"], int)
+    assert forwarded_event["input_enqueued_at_ms"] > 0
+    from omnigent.runtime import get_agent_store
+
+    parent_agent = get_agent_store().get(parent["agent_id"])
+    assert parent_agent is not None
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/resources/terminals",
@@ -1633,6 +1730,10 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "model": expected_model,
                 "harness": harness,
                 "agent_id": parent["agent_id"],
+                "agent_revision": parent_agent.bundle_location,
+                "pending_id": message_body["pending_id"],
+                "delivery_attempt_id": forwarded_event["delivery_attempt_id"],
+                "input_enqueued_at_ms": forwarded_event["input_enqueued_at_ms"],
             },
         },
     ]
@@ -1805,6 +1906,160 @@ async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str
     )
     assert child_resp.status_code == 201, child_resp.text
     return child_resp.json()
+
+
+@pytest.mark.parametrize(
+    "effort,reset_model", [("max", "default"), ("default", "off"), (None, "reset")]
+)
+async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    effort: str | None,
+    reset_model: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.side_chat import (
+        CAP_SIDE_CHAT_SETTINGS,
+        EFFORT_RESET_LABEL,
+    )
+    from omnigent.server.routes._sessions.orchestration import _forward_codex_side_chat_turn
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.schemas import SessionEventInput
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    register_test_runner(app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS])
+    # The runner advertises a handshake but has no HTTP service in this test.
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+
+    parent = await _create_parent_session(client, agent_name="side-settings")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.update_conversation(
+        parent["id"],
+        model_override="gpt-5.5",
+        reported_model="gpt-5.6-luna",
+        reasoning_effort="high" if effort is not None else None,
+    )
+    store.set_runner_id(parent["id"], "runner_parent")
+    created = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread-side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert created.status_code == 202, created.text
+    child_id = created.json()["child_session_id"]
+    child = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child["side_chat_settings_supported"] is True
+    assert child["model_override"] == "gpt-5.6-luna"
+    initial_runner = AsyncMock(spec=httpx.AsyncClient)
+    initial_runner.post.return_value = httpx.Response(202)
+    await _forward_codex_side_chat_turn(
+        store.get_conversation(child_id),
+        SessionEventInput(type="message", data={"content": "Untouched follow-up"}),
+        initial_runner,
+    )
+    assert initial_runner.post.call_args.kwargs["json"]["model_override"] == "gpt-5.6-luna"
+    assert child["reasoning_effort"] == ("high" if effort is not None else None)
+    store.update_conversation(parent["id"], model_override="gpt-5.6-luna", reasoning_effort="low")
+    parent_before = store.get_conversation(parent["id"])
+    assert parent_before is not None
+
+    async def no_terminal_change(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("A side-thread setting must not drive a terminal")
+
+    monkeypatch.setattr(routes_core, "_forward_session_change_to_runner", no_terminal_change)
+    saved_effort = None if effort == "default" else effort
+    response = await client.patch(
+        f"/v1/sessions/{child['id']}",
+        json={
+            "model_override": "gpt-6-sol",
+            **({"reasoning_effort": effort} if effort is not None else {}),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] == "gpt-6-sol"
+    assert response.json()["reasoning_effort"] == saved_effort
+    assert response.json()["side_chat_settings_supported"] is True
+    refused_reset = await client.patch(
+        f"/v1/sessions/{child_id}",
+        json={"model_override": reset_model, "reasoning_effort": "low"},
+    )
+    assert refused_reset.status_code == 400, refused_reset.text
+    assert "Choose a specific model" in refused_reset.text
+    after_reset = store.get_conversation(child_id)
+    assert after_reset.model_override == "gpt-6-sol"
+    assert after_reset.reasoning_effort == saved_effort
+    original_upsert = sqlalchemy_store._upsert_labels
+
+    def fail_label_write(*args: Any, **kwargs: Any) -> None:
+        original_upsert(*args, **kwargs)
+        raise RuntimeError("label persistence failed")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(sqlalchemy_store, "_upsert_labels", fail_label_write)
+        with pytest.raises(RuntimeError, match="label persistence failed"):
+            await client.patch(
+                f"/v1/sessions/{child_id}",
+                json={
+                    "model_override": "gpt-5.5",
+                    "reasoning_effort": "low" if effort == "default" else "default",
+                },
+            )
+    after_failure = store.get_conversation(child_id)
+    assert after_failure.model_override == after_reset.model_override
+    assert after_failure.reasoning_effort == after_reset.reasoning_effort
+    assert after_failure.labels == after_reset.labels
+    assert after_failure.labels.get(EFFORT_RESET_LABEL) == (
+        "true" if effort == "default" else "false" if effort is not None else None
+    )
+    repeated = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread-side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert repeated.json()["child_session_id"] == child_id
+    saved = store.get_conversation(child["id"])
+    assert saved is not None
+    forwarded = []
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/sessions/{child['parent_session_id']}/events"
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(capture), base_url="http://runner"
+    ) as runner:
+        await _forward_codex_side_chat_turn(
+            saved,
+            SessionEventInput(
+                type="message",
+                data={
+                    "content": [{"type": "input_text", "text": "Follow up"}],
+                },
+            ),
+            runner,
+        )
+    assert forwarded == [
+        {
+            "type": "message",
+            "content": [{"type": "input_text", "text": "Follow up"}],
+            "codex_side_thread_id": "thread-side",
+            "model_override": "gpt-6-sol",
+            **({"reasoning_effort": saved_effort} if effort is not None else {}),
+        }
+    ]
+    parent_after = store.get_conversation(child["parent_session_id"])
+    assert parent_after is not None
+    assert parent_after.model_override == parent_before.model_override
+    assert parent_after.reasoning_effort == parent_before.reasoning_effort
 
 
 async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
@@ -2037,6 +2292,122 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     assert resp.status_code == 503, resp.text
 
 
+@pytest.mark.parametrize(
+    ("parent_runner", "expected_status"),
+    [("runner_replacement", 409), ("runner_side", 409), ("runner_side", 202)],
+    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
+)
+async def test_side_chat_message_after_runner_loss(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    parent_runner: str,
+    expected_status: int,
+) -> None:
+    """Only a replaced parent runner proves the fork is gone; an outage is not sealed."""
+    child = await _create_native_child(client, name=f"msg-side-chat-{request.node.callspec.id}")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        child["id"],
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    )
+    conv_store.replace_runner_id(child["id"], "runner_side")
+    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
+
+    async def _none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
+    monkeypatch.setattr(routes_events_module, "_heal_subagent_runner_binding_via_parent", _none)
+
+    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
+
+    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
+        # Stand in for the launching host's "dead" verdict; the helper has its own unit test.
+        if request.node.callspec.id == "host-reports-runner-gone":
+            return True
+        return await real_fork_lost(*args, **kwargs)
+
+    async def _no_policy(*_args: Any, **_kwargs: Any) -> None:
+        # A denying policy would persist a reply, so a lost fork must be rejected first.
+        if expected_status == 409:
+            pytest.fail("input policy ran for a side chat whose fork is gone")
+
+    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
+    monkeypatch.setattr(routes_events_module, "_evaluate_input_policy", _no_policy)
+
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    resp = await client.post(f"/v1/sessions/{child['id']}/events", json=message)
+
+    assert resp.status_code == expected_status, resp.text
+    after = conv_store.get_conversation(child["id"])
+    assert after is not None
+    if expected_status == 409:
+        assert conv_store.list_items(child["id"]).data == []
+        assert after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE
+    else:
+        assert CLOSED_LABEL_KEY not in after.labels
+
+
+@pytest.mark.parametrize(
+    ("parent_runner", "host_reports_dead", "expected_status"),
+    [
+        ("runner_replacement", False, 409),
+        ("runner_side", True, 409),
+        ("runner_side", False, 503),
+    ],
+    ids=["parent-relaunched", "host-reports-runner-gone", "transient-outage"],
+)
+async def test_side_chat_retry_after_runner_loss(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_runner: str,
+    host_reports_dead: bool,
+    expected_status: int,
+) -> None:
+    """Resume seals a lost fork, while a temporary outage remains recoverable."""
+    child = await _create_native_child(client, name="retry-side-chat")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(
+        child["id"],
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    )
+    conv_store.replace_runner_id(child["id"], "runner_side")
+    conv_store.replace_runner_id(child["parent_session_id"], parent_runner)
+
+    async def _none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    real_fork_lost = routes_events_module._codex_side_chat_fork_lost
+
+    async def _fork_lost(*args: Any, **kwargs: Any) -> bool:
+        return host_reports_dead or await real_fork_lost(*args, **kwargs)
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _none)
+    monkeypatch.setattr(routes_events_module, "_codex_side_chat_fork_lost", _fork_lost)
+    response = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == expected_status, response.text
+    after = conv_store.get_conversation(child["id"])
+    assert after is not None
+    assert (after.labels.get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE) == (expected_status == 409)
+    assert conv_store.list_items(child["id"]).data == []
+
+
 async def test_non_subagent_session_not_healed_via_parent(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2081,9 +2452,11 @@ async def test_non_subagent_session_not_healed_via_parent(
     assert not heal_called, "heal must not run for a top-level session"
 
 
-async def test_sdk_subagent_heal_skips_session_init(
+@pytest.mark.parametrize("recovery_path", ["heal", "refresh"])
+async def test_sdk_subagent_recovery_skips_session_init(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    recovery_path: str,
 ) -> None:
     """
     For SDK (non-native) sub-agents, message-send after heal must NOT call
@@ -2123,8 +2496,12 @@ async def test_sdk_subagent_heal_skips_session_init(
         base_url="http://runner",
     )
 
-    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
-        return fake_runner
+    heal_attempted = False
+
+    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
+        nonlocal heal_attempted
+        heal_attempted = True
+        return fake_runner if recovery_path == "heal" else None
 
     init_called: list[bool] = []
 
@@ -2132,10 +2509,10 @@ async def test_sdk_subagent_heal_skips_session_init(
         init_called.append(True)
         return False
 
-    async def _runner_none(*_a: Any, **_k: Any) -> None:
-        return None
+    async def _runner_after_heal(*_a: Any, **_k: Any) -> httpx.AsyncClient | None:
+        return fake_runner if heal_attempted else None
 
-    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_after_heal)
     monkeypatch.setattr(
         routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
     )
@@ -2150,8 +2527,9 @@ async def test_sdk_subagent_heal_skips_session_init(
     )
 
     assert resp.status_code in {200, 202}, resp.text
+    assert heal_attempted
     assert not init_called, (
-        "_ensure_runner_session_initialized must not be called for SDK sub-agents after heal"
+        "_ensure_runner_session_initialized must not be called for recovered SDK sub-agents"
     )
 
 
@@ -2211,3 +2589,64 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     assert child_ids == {child.id}, (
         f"parent's children must be exactly the untouched source, got {child_ids}"
     )
+
+
+@pytest.mark.parametrize("runner_state", ["current", "old", "offline"])
+async def test_side_chat_settings_support_follows_parent_runner_handshake(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_state: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+
+    registry = app.state.tunnel_registry
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+    supported = runner_state == "current"
+    if runner_state != "offline":
+        register_test_runner(
+            app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS] if supported else []
+        )
+    register_test_runner(
+        app, "runner_stale", capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS]
+    )
+    parent = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.set_runner_id(parent["id"], "runner_parent")
+    child = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {
+                "thread_id": "side-thread",
+                "agent_nickname": "Side chat",
+            },
+        },
+    )
+    assert child.status_code == 202, child.text
+    child_id = child.json()["child_session_id"]
+    store.set_runner_id(child_id, "runner_stale")
+    response = await client.get(f"/v1/sessions/{child_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["side_chat_settings_supported"] is supported
+    assert (await client.get(f"/v1/sessions/{parent['id']}")).json()[
+        "side_chat_settings_supported"
+    ] is False
+    if supported:
+        registry.deregister("runner_parent", retire=False)
+        assert (await client.get(f"/v1/sessions/{child_id}")).json()[
+            "side_chat_settings_supported"
+        ] is False
+        register_test_runner(app, "runner_parent")
+    refused = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
+    assert refused.status_code == 503, refused.text
+    assert store.get_conversation(child_id).reasoning_effort is None
+    register_test_runner(app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS])
+    recovered = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["side_chat_settings_supported"] is True
+    assert recovered.json()["reasoning_effort"] == "low"

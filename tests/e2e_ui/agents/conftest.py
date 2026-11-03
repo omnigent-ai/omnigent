@@ -16,16 +16,16 @@ which is what the Agents-rail tests assert on.
 
 from __future__ import annotations
 
-import io
 import json
 import subprocess
-import tarfile
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import httpx
 import pytest
+
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 # Private helpers from the parent conftest — same import pattern the
 # sibling chat tests use for ``open_right_rail`` / ``TwoAgentChatSession``.
@@ -199,29 +199,17 @@ def joke_subagents_session(
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Non-config.yaml arcname routes the bundle through the omnigent
-        # compat adapter, whose loader parses the inline `type: agent`
-        # tools. The spec_version:1 parser does not accept this shorthand.
-        info = tarfile.TarInfo(name=f"{_JOKE_DIRECTOR_NAME}.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
+    # Non-config.yaml arcname routes the bundle through the omnigent
+    # compat adapter, whose loader parses the inline `type: agent`
+    # tools. The spec_version:1 parser does not accept this shorthand.
+    bundle_bytes = bundle_files({f"{_JOKE_DIRECTOR_NAME}.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield JokeSubagentsSession(

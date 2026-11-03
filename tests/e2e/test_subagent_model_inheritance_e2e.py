@@ -129,7 +129,7 @@ def _mock_requests(mock_llm_server_url: str) -> list[dict[str, Any]]:
     """
     Fetch every request body the mock LLM captured.
 
-    This is the test's stand-in for the report's "Databricks AI Gateway
+    This is the test's stand-in for the report's "Databricks Unity Gateway
     metrics" view: which models actually received provider traffic.
 
     :param mock_llm_server_url: Mock LLM server base URL.

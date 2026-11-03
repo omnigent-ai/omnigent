@@ -50,6 +50,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests.budgets import budget
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -149,6 +150,7 @@ async def register_host(
         create_error: str | None = None,
         create_gate: asyncio.Event | None = None,
         launch_status: str = "launched",
+        workspace: str | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
@@ -172,7 +174,8 @@ async def register_host(
                 future.set_result(
                     {
                         "status": "ok",
-                        "worktree_path": f"{frame.repo_path}-worktrees/{dirname}",
+                        "worktree_path": f"{_SOURCE_REPO}-worktrees/{dirname}",
+                        "workspace": workspace,
                         "branch": frame.branch_name,
                         "error": None,
                     }
@@ -193,7 +196,7 @@ async def register_host(
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
                     return
-                frame = decode_host_frame(frame_text)
+                frame = decode_host_frame(frame_text.data)
                 if isinstance(frame, HostStatFrame):
                     fut = conn.pending_stats.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
@@ -242,7 +245,7 @@ async def register_host(
         conn.outbound_queue.put_nowait(None)
         task = conn._drain_task_for_test  # type: ignore[attr-defined]
         with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=budget(1.0))
         if not task.done():
             task.cancel()
     for task in resolver_tasks:
@@ -377,10 +380,10 @@ async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     worktree_launch = asyncio.create_task(
         _launch(client, session_id, git={"branch_name": "feature/b"})
     )
-    await asyncio.wait_for(cap.create_started.wait(), timeout=1.0)
+    await asyncio.wait_for(cap.create_started.wait(), timeout=budget(1.0))
 
     source_launch = asyncio.create_task(_launch(client, session_id, git=None))
-    await asyncio.wait_for(source_harness_resolved.wait(), timeout=1.0)
+    await asyncio.wait_for(source_harness_resolved.wait(), timeout=budget(1.0))
     create_gate.set()
 
     worktree_response, source_response = await asyncio.gather(worktree_launch, source_launch)
@@ -409,7 +412,7 @@ async def test_cancellation_waits_for_host_binding_before_rollback(
 
     def _delayed_set_host_id(*args: Any, **kwargs: Any) -> Any:
         bind_started.set()
-        assert release_bind.wait(timeout=2.0)
+        assert release_bind.wait(timeout=budget(2.0))
         return original_set_host_id(*args, **kwargs)
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "set_host_id", _delayed_set_host_id)
@@ -419,13 +422,13 @@ async def test_cancellation_waits_for_host_binding_before_rollback(
     launch_task = asyncio.create_task(
         _launch(client, session_id, git={"branch_name": "feature/cancel"})
     )
-    assert await asyncio.to_thread(bind_started.wait, 2.0)
+    assert await asyncio.to_thread(bind_started.wait, budget(2.0))
     launch_task.cancel()
     release_bind.set()
     with pytest.raises(asyncio.CancelledError):
         _ = await launch_task
 
-    await asyncio.wait_for(cap.remove_started.wait(), timeout=1.0)
+    await asyncio.wait_for(cap.remove_started.wait(), timeout=budget(1.0))
     assert len(cap.remove) == 1
     assert cap.launch == []
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
@@ -586,3 +589,90 @@ async def test_launch_runner_rollback_preserves_existing_branch(
     assert conv is not None
     assert conv.runner_id is None
     assert conv.git_branch is None
+
+
+@pytest.mark.parametrize("launch_status", ["launched", "failed"])
+@pytest.mark.parametrize("inherited_identity", [True, False])
+async def test_launch_runner_preserves_subdirectory_and_rolls_back_root(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    launch_status: str,
+    inherited_identity: bool,
+) -> None:
+    """Launch in the selected subdirectory, but remove the whole worktree on failure."""
+    root = f"{_SOURCE_REPO}-worktrees/feature-subdir"
+    workspace = f"{root}/packages/app"
+    cap = register_host(workspace=workspace, launch_status=launch_status)
+    session_id = await _bare_session(client, "subdirectory-launch-agent")
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    previous_root = worktree_root_fingerprint(_SOURCE_REPO) if inherited_identity else None
+    if previous_root is not None:
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            session_id, {WORKTREE_ROOT_LABEL_KEY: previous_root}
+        )
+    response = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": session_id,
+            "workspace": f"{_SOURCE_REPO}/packages/app",
+            "git": {"branch_name": "feature/subdir"},
+        },
+    )
+    assert response.status_code == (200 if launch_status == "launched" else 502), response.text
+    assert cap.create[0].repo_path == f"{_SOURCE_REPO}/packages/app"
+    assert cap.launch[0].workspace == workspace
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    if launch_status == "launched":
+        assert conv.workspace == workspace
+        assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(root)
+        assert cap.remove == []
+    else:
+        assert conv.workspace is None
+        assert cap.remove[0].worktree_path == root
+        assert conv.labels.get(WORKTREE_ROOT_LABEL_KEY) == previous_root
+
+
+@pytest.mark.parametrize("different_worktree", [True, False])
+@pytest.mark.parametrize("launch_status", ["launched", "failed"])
+async def test_bind_existing_subdirectory_preserves_inherited_cleanup_root(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    different_worktree: bool,
+    launch_status: str,
+) -> None:
+    """Binding a fork in the same directory keeps its source's cleanup identity."""
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    cap = register_host(launch_status=launch_status)
+    workspace = "/other-worktree" if different_worktree else f"{_SOURCE_REPO}/web"
+    session_id = await _bare_session(client, "bind-existing-subdir")
+    store = SqlAlchemyConversationStore(db_uri)
+    expected = worktree_root_fingerprint(_SOURCE_REPO)
+    store.set_labels(session_id, {WORKTREE_ROOT_LABEL_KEY: expected})
+    response = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": session_id,
+            "workspace": workspace,
+            "git": {"branch_name": "feature/login", "existing_worktree": True},
+        },
+    )
+    assert response.status_code == (200 if launch_status == "launched" else 502), response.text
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    if different_worktree and launch_status == "launched":
+        assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+    else:
+        assert conv.labels[WORKTREE_ROOT_LABEL_KEY] == expected
+    assert conv.workspace == (workspace if launch_status == "launched" else None)
+    assert cap.create == []

@@ -26,7 +26,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner.app import _evaluate_policy_via_omnigent
+from omnigent.runner.policy_proxy import (
+    _evaluate_policy_via_omnigent,
+)
 
 _RUNNER_LOGGER = "omnigent.runner.app"
 

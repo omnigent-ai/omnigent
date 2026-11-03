@@ -122,11 +122,11 @@ async def test_auto_harness_session_sees_every_family() -> None:
         seen,
     )
     assert _names(listing) == ["claude-code", "codex", "pi", "mystery"]
-    assert "/v1/sessions/conv_parent" not in seen
+    assert "/v1/sessions/conv_parent" in seen
 
 
 @pytest.mark.asyncio
-async def test_plain_session_skips_the_routing_lookup_entirely() -> None:
+async def test_plain_session_still_looks_up_host_readiness() -> None:
     seen: list[str] = []
     listing = await _agent_list(
         {
@@ -138,7 +138,7 @@ async def test_plain_session_skips_the_routing_lookup_entirely() -> None:
         seen,
     )
     assert _names(listing) == ["claude-code", "codex", "pi", "mystery"]
-    assert "/v1/sessions/conv_parent" not in seen
+    assert "/v1/sessions/conv_parent" in seen
 
 
 @pytest.mark.asyncio
@@ -207,4 +207,4 @@ async def test_repeat_listings_reuse_the_cached_confinement() -> None:
     }
     assert _names(await _agent_list(session, seen)) == ["codex", "mystery"]
     assert _names(await _agent_list(session, seen)) == ["codex", "mystery"]
-    assert seen.count("/v1/sessions/conv_parent") == 1
+    assert seen.count("/v1/sessions/conv_parent") == 3  # One routing lookup, two readiness reads.

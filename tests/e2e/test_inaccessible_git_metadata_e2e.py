@@ -19,10 +19,7 @@ Usage::
 from __future__ import annotations
 
 import os
-import secrets
-import signal
 import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -31,10 +28,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.e2e.conftest import find_free_port
+from tests._helpers.server_runner import server_runner
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Maximum seconds for the runner to come online once the server is healthy.
 _RUNNER_ONLINE_TIMEOUT_S: float = 60.0
@@ -93,117 +88,30 @@ def runner_under_test(
     tmp_path: Path,
     denied_git_workspace: Path,
 ) -> Iterator[_RunnerUnderTest]:
-    """Spawn a real server plus a CLI-style runner bound to the workspace.
-
-    The server is started in a neutral directory; the runner is started
-    exactly the way ``_start_cli_runner_process`` launches it, with
-    ``OMNIGENT_RUNNER_WORKSPACE`` set to *denied_git_workspace*.
-
-    :returns: Handles for the spawned runner and the server base URL.
-    """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-    port = find_free_port()
-    base_url = f"http://localhost:{port}"
-
+    """Keep server cwd neutral; observe runner startup beneath the unreadable .git."""
     server_cwd = tmp_path / "server-cwd"
     server_cwd.mkdir()
-    db_path = tmp_path / "e2e.db"
-    artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
-    server_log = tmp_path / "server.log"
-    runner_log = tmp_path / "runner.log"
-
-    env: dict[str, str] = {
-        **os.environ,
+    env = {
         "OPENAI_API_KEY": "mock-key",
-        # Absolute sdks entries: the subprocesses run outside the checkout,
-        # where relative PYTHONPATH entries and cwd-based imports don't resolve.
-        "PYTHONPATH": os.pathsep.join(
-            [
-                str(_REPO_ROOT),
-                str(_REPO_ROOT / "sdks" / "python-client"),
-                str(_REPO_ROOT / "sdks" / "ui"),
-                os.environ.get("PYTHONPATH", ""),
-            ]
-        ),
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
     }
-
-    server_fh = open(server_log, "w")  # noqa: SIM115
-    server_proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-        ],
-        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        cwd=str(server_cwd),
-        stdout=server_fh,
-        stderr=subprocess.STDOUT,
-    )
-
-    runner_fh = open(runner_log, "w")  # noqa: SIM115
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-P", "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-            "OMNIGENT_RUNNER_WORKSPACE": str(denied_git_workspace),
-        },
-        cwd=str(denied_git_workspace),
-        stdout=runner_fh,
-        stderr=subprocess.STDOUT,
-    )
-
-    health_deadline = time.time() + HEALTH_TIMEOUT_S
-    server_healthy = False
-    while time.time() < health_deadline:
-        try:
-            if httpx.get(f"{base_url}/health", timeout=2).status_code == 200:
-                server_healthy = True
-                break
-        except httpx.HTTPError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-
-    try:
-        if not server_healthy:
-            raise RuntimeError(
-                f"Server did not become healthy within {HEALTH_TIMEOUT_S}s.\n"
-                f"Server log: {_log_tail(server_log)}"
-            )
+    with server_runner(
+        tmp_path,
+        workspace=denied_git_workspace,
+        server_cwd=server_cwd,
+        server_env=env,
+        health_timeout=HEALTH_TIMEOUT_S,
+        poll_interval=POLL_INTERVAL_S,
+    ) as stack:
+        stack.start_runner(cwd=denied_git_workspace, python_args=["-P"], env=env, wait_ready=False)
+        assert stack.runner is not None
         yield _RunnerUnderTest(
-            base_url=base_url,
-            runner_id=runner_id,
-            proc=runner_proc,
-            log_path=runner_log,
+            base_url=stack.base_url,
+            runner_id=stack.runner_id,
+            proc=stack.runner,
+            log_path=stack.log_path("runner"),
         )
-    finally:
-        for proc in (runner_proc, server_proc):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-        for proc, grace in ((runner_proc, 5), (server_proc, 10)):
-            try:
-                proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        runner_fh.close()
-        server_fh.close()
 
 
 def test_runner_online_despite_unreadable_ancestor_git_metadata(

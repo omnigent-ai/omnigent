@@ -3,18 +3,20 @@
 // users can select rendered text and attach review comments — parity with the
 // Markdown (TipTap) and code (Monaco/Shiki) comment surfaces.
 //
-// The iframe stays sandboxed WITHOUT `allow-same-origin` (see HTML_PREVIEW_SANDBOX),
-// so the parent can't touch its DOM directly. All selection capture and
+// The default iframe has an opaque origin; an embedded host may provide its own
+// isolated content frame. All selection capture and
 // highlight painting happens inside the iframe via the injected bridge, relayed
 // over a private MessageChannel. See htmlCommentBridge.ts for the protocol and
 // trust model.
 
 import { createPortal } from "react-dom";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
-import { getEmbedRoot } from "@/lib/host";
+import { useIsEmbedded } from "@/lib/embedded";
+import { getEmbedRoot, getOmnigentHtmlPreviewFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
 import { type ActiveSelection, HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 import {
@@ -25,7 +27,20 @@ import {
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
+import {
+  formatHtmlPreviewZoom,
+  htmlPreviewZoomStyle,
+  nextHtmlPreviewZoom,
+} from "./htmlPreviewZoom";
 import { TruncatedBanner } from "./TruncatedBanner";
+
+// Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
+const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
+  "./htmlCommentBridgeRuntime.js?no-inline",
+  import.meta.url,
+).href;
+const BRIDGE_READY_TIMEOUT_MS = 5_000;
+const ZOOM_BADGE_MS = 1_500;
 
 interface HtmlCommentViewerProps {
   conversationId: string;
@@ -44,6 +59,8 @@ interface FloatingAnchor {
   start_index: number;
   end_index: number;
   anchor_content: string;
+  /** Hidden until the frame re-reports the selection after a zoom reflow. */
+  awaitingReflow: boolean;
 }
 
 function genNonce(): string {
@@ -81,18 +98,62 @@ export function HtmlCommentViewer({
   onSetActiveSelection,
 }: HtmlCommentViewerProps) {
   const canEdit = useCanEdit(conversationId);
+  const isEmbedded = useIsEmbedded();
+  const HtmlPreviewFrame = getOmnigentHtmlPreviewFrame();
+  // Only the default srcdoc frame inherits the host CSP. Isolated host frames
+  // use the inline bridge to avoid cross-origin requests back to the host.
+  const loadBridgeExternally = isEmbedded && !HtmlPreviewFrame;
 
-  // A fresh nonce + srcDoc per content load. Changing srcDoc reloads the iframe
-  // document, which re-runs the bridge and (via the new nonce) re-establishes
+  // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
+  // which re-runs the bridge and (via the new nonce) re-establishes
   // the channel — clearing any stale highlights from the previous content.
   const { nonce, srcDoc } = useMemo(() => {
     const n = genNonce();
-    return { nonce: n, srcDoc: injectCommentBridge(content, n) };
-  }, [content]);
+    return {
+      nonce: n,
+      srcDoc: injectCommentBridge(
+        content,
+        n,
+        loadBridgeExternally ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+      ),
+    };
+  }, [content, loadBridgeExternally]);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
+  const channelRef = useRef<MessageChannel | null>(null);
+  const readyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
+  // Preview-only zoom; it survives content reloads, which remount just the frame.
+  const [zoom, setZoom] = useState(1);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const [zoomBadgeVisible, setZoomBadgeVisible] = useState(false);
+  const zoomBadgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
+    },
+    [],
+  );
+
+  const clearReadyTimer = useCallback(() => {
+    if (readyTimerRef.current !== null) clearTimeout(readyTimerRef.current);
+    readyTimerRef.current = null;
+  }, []);
+
+  const setIframeRef = useCallback(
+    (iframe: HTMLIFrameElement | null) => {
+      if (iframeRef.current !== iframe) {
+        clearReadyTimer();
+        channelRef.current?.port1.close();
+        channelRef.current = null;
+        portRef.current = null;
+      }
+      iframeRef.current = iframe;
+    },
+    [clearReadyTimer],
+  );
 
   // Latest values for the port message handler without re-establishing the channel.
   const commentsRef = useRef(comments);
@@ -104,105 +165,120 @@ export function HtmlCommentViewer({
   const activeSelectionRef = useRef(activeSelection);
   activeSelectionRef.current = activeSelection;
 
-  // Establish the MessageChannel once the iframe document has loaded. Parent-
-  // initiated handshake (post init on load) avoids a ready/listen race.
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    let channel: MessageChannel | null = null;
+  const postState = () => {
+    const port = portRef.current;
+    if (!port) return;
+    port.postMessage({
+      source: BRIDGE_SOURCE,
+      nonce,
+      type: BRIDGE_MSG.setComments,
+      comments: commentsRef.current.map((c) => commentPayload(contentRef.current, c)),
+    });
+    port.postMessage({
+      source: BRIDGE_SOURCE,
+      nonce,
+      type: BRIDGE_MSG.setActive,
+      active: activePayload(contentRef.current, activeSelectionRef.current),
+    });
+  };
 
-    const handleInbound = (raw: unknown) => {
-      const msg = parseBridgeMessage(raw, nonce);
-      if (!msg) return;
-      if (msg.type === BRIDGE_MSG.ready) {
-        // Flush current state now that the frame is connected.
-        postState();
-      } else if (msg.type === BRIDGE_MSG.selection) {
-        const offsets = findAnchorInSource(contentRef.current, msg.text, msg.occ);
-        // Selecting a range that already has a comment activates it (which
-        // scrolls the panel to its card) rather than offering to add a new one.
-        const existing =
-          offsets &&
-          commentsRef.current.find(
-            (c) =>
-              c.status === "draft" &&
-              c.start_index === offsets.start_index &&
-              c.end_index === offsets.end_index,
-          );
-        if (existing) {
-          onSetActiveSelectionRef.current({
-            start_index: existing.start_index,
-            end_index: existing.end_index,
-            anchor_content: existing.anchor_content ?? "",
-            comment_id: existing.id,
-          });
-          setFloating(null);
-          return;
-        }
-        const rect = iframe.getBoundingClientRect();
-        setFloating({
-          x: rect.left + msg.rect.left,
-          y: rect.top + msg.rect.top - 6,
-          start_index: offsets?.start_index ?? 0,
-          end_index: offsets?.end_index ?? 0,
-          anchor_content: msg.text,
+  const handleInbound = (raw: unknown) => {
+    const msg = parseBridgeMessage(raw, nonce);
+    if (!msg) return;
+    if (msg.type === BRIDGE_MSG.ready) {
+      clearReadyTimer();
+      // Flush current state now that the frame is connected.
+      postState();
+    } else if (msg.type === BRIDGE_MSG.selection) {
+      const offsets = findAnchorInSource(contentRef.current, msg.text, msg.occ);
+      // Selecting a range that already has a comment activates it (which
+      // scrolls the panel to its card) rather than offering to add a new one.
+      const existing =
+        !msg.reflow &&
+        offsets &&
+        commentsRef.current.find(
+          (c) =>
+            c.status === "draft" &&
+            c.start_index === offsets.start_index &&
+            c.end_index === offsets.end_index,
+        );
+      if (existing) {
+        onSetActiveSelectionRef.current({
+          start_index: existing.start_index,
+          end_index: existing.end_index,
+          anchor_content: existing.anchor_content ?? "",
+          comment_id: existing.id,
         });
-      } else if (msg.type === BRIDGE_MSG.commentClick) {
-        const c = commentsRef.current.find((x) => x.id === msg.id);
-        if (c) {
-          onSetActiveSelectionRef.current({
-            start_index: c.start_index,
-            end_index: c.end_index,
-            anchor_content: c.anchor_content ?? "",
-            comment_id: c.id,
-          });
-        }
         setFloating(null);
-      } else if (msg.type === BRIDGE_MSG.selectionCleared) {
-        onSetActiveSelectionRef.current(null);
-        setFloating(null);
+        return;
       }
-    };
+      const iframe = iframeRef.current;
+      if (!iframe) return;
+      const rect = iframe.getBoundingClientRect();
+      // The frame reports unscaled coordinates; the zoom wrapper scales them.
+      const scale = zoomRef.current;
+      const anchor: FloatingAnchor = {
+        x: rect.left + msg.rect.left * scale,
+        y: rect.top + msg.rect.top * scale - 6,
+        start_index: offsets?.start_index ?? 0,
+        end_index: offsets?.end_index ?? 0,
+        anchor_content: msg.text,
+        awaitingReflow: false,
+      };
+      // A reflow only moves a button that is still offered, never a dismissed one.
+      setFloating((current) => (msg.reflow && !current ? null : anchor));
+    } else if (msg.type === BRIDGE_MSG.commentClick) {
+      const c = commentsRef.current.find((x) => x.id === msg.id);
+      if (c) {
+        onSetActiveSelectionRef.current({
+          start_index: c.start_index,
+          end_index: c.end_index,
+          anchor_content: c.anchor_content ?? "",
+          comment_id: c.id,
+        });
+      }
+      setFloating(null);
+    } else if (msg.type === BRIDGE_MSG.selectionCleared) {
+      onSetActiveSelectionRef.current(null);
+      setFloating(null);
+    } else if (msg.type === BRIDGE_MSG.zoom) {
+      const next = nextHtmlPreviewZoom(zoomRef.current, msg.action);
+      if (next !== zoomRef.current) {
+        zoomRef.current = next;
+        setZoom(next);
+        // The frame resizes and re-reports the selection at its new position.
+        setFloating((current) => current && { ...current, awaitingReflow: true });
+      }
+      setZoomBadgeVisible(true);
+      if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
+      zoomBadgeTimerRef.current = setTimeout(() => setZoomBadgeVisible(false), ZOOM_BADGE_MS);
+    }
+  };
 
-    const postState = () => {
-      const port = portRef.current;
-      if (!port) return;
-      port.postMessage({
-        source: BRIDGE_SOURCE,
-        nonce,
-        type: BRIDGE_MSG.setComments,
-        comments: commentsRef.current.map((c) => commentPayload(contentRef.current, c)),
-      });
-      port.postMessage({
-        source: BRIDGE_SOURCE,
-        nonce,
-        type: BRIDGE_MSG.setActive,
-        active: activePayload(contentRef.current, activeSelectionRef.current),
-      });
-    };
-
-    const onLoad = () => {
-      const win = iframe.contentWindow;
-      if (!win) return;
-      channel?.port1.close();
-      channel = new MessageChannel();
-      channel.port1.onmessage = (ev) => handleInbound(ev.data);
-      portRef.current = channel.port1;
-      // targetOrigin "*" is required: the sandboxed frame has an opaque ("null")
-      // origin, so we cannot name a concrete origin. The transferred port + the
-      // nonce are the trust mechanism, not the origin.
-      win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [
-        channel.port2,
-      ]);
-    };
-
-    iframe.addEventListener("load", onLoad);
-    return () => {
-      iframe.removeEventListener("load", onLoad);
-      channel?.port1.close();
-      portRef.current = null;
-    };
-  }, [nonce]);
+  // Parent-initiated handshake on the iframe's load event avoids a ready/listen
+  // race and makes the timeout measure the bridge startup, not document parsing.
+  const onLoad = () => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) {
+      console.warn(
+        "HTML comment bridge cannot connect: preview frame did not expose its content window.",
+      );
+      return;
+    }
+    channelRef.current?.port1.close();
+    const channel = new MessageChannel();
+    channelRef.current = channel;
+    // The port pins this closure, so mutable values in handleInbound must come from refs.
+    channel.port1.onmessage = (ev) => handleInbound(ev.data);
+    portRef.current = channel.port1;
+    // "*" is required for opaque frames; hosts may also use a separate origin.
+    // The renderer enforces isolation; the port + nonce bind bridge messages.
+    win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [channel.port2]);
+    clearReadyTimer();
+    readyTimerRef.current = setTimeout(() => {
+      console.warn("HTML comment bridge did not become ready; comments are unavailable.");
+    }, BRIDGE_READY_TIMEOUT_MS);
+  };
 
   // Push comment-list changes into the frame.
   useEffect(() => {
@@ -234,9 +310,13 @@ export function HtmlCommentViewer({
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, []);
 
-  const preview = (
+  const preview = HtmlPreviewFrame ? (
+    <HtmlPreviewFrame key={nonce} htmlContent={srcDoc} iframeRef={setIframeRef} onLoad={onLoad} />
+  ) : (
     <iframe
-      ref={iframeRef}
+      key={nonce}
+      ref={setIframeRef}
+      onLoad={onLoad}
       srcDoc={srcDoc}
       sandbox={HTML_PREVIEW_SANDBOX}
       title="HTML preview"
@@ -247,14 +327,35 @@ export function HtmlCommentViewer({
   return (
     <div className="flex h-full flex-col">
       {truncated && <TruncatedBanner />}
-      <div className="min-h-0 flex-1">{preview}</div>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div className="h-full w-full" style={htmlPreviewZoomStyle(zoom)}>
+          {preview}
+        </div>
+        <div
+          role="status"
+          data-testid="html-preview-zoom"
+          className={
+            zoomBadgeVisible
+              ? "pointer-events-none absolute right-3 top-3 rounded-md border border-border bg-popover px-2 py-1 text-xs font-medium tabular-nums text-popover-foreground shadow-md"
+              : "sr-only"
+          }
+        >
+          {zoomBadgeVisible && (
+            <>
+              <span className="sr-only">Preview zoom </span>
+              {formatHtmlPreviewZoom(zoom)}
+            </>
+          )}
+        </div>
+      </div>
       {floating &&
+        !floating.awaitingReflow &&
         canEdit &&
         createPortal(
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className={`fixed z-50 ${ADD_COMMENT_BUTTON_CLASS_NAME}`}
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onClick={() => {
               onSetActiveSelection({

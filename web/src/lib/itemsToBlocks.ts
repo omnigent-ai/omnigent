@@ -48,6 +48,7 @@ import {
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
+  assistantMessagePhase,
   isCompactionItem,
   isErrorItem,
   isFunctionCallItem,
@@ -61,7 +62,8 @@ import {
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
-import { taskNotificationMarkerContent } from "./systemMessage";
+import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
+import { readSubagentActivity } from "./subagentActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -239,7 +241,21 @@ function answersFromToolResult(
 }
 
 function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
+  const data = item as unknown as Record<string, unknown>;
+  if (readSubagentActivity(data)) {
+    return {
+      type: "native_tool",
+      ctx: ctxFor(item),
+      toolType: "subagent_activity",
+      label: formatNativeLabel("subagent_activity", data),
+      data,
+    };
+  }
   if (isMessageItem(item) && item.role === "user") {
+    if (!item.is_meta && (item.created_by || item.user_authored === true)) {
+      return userMessageToBlock(item);
+    }
+    if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and
     // starts a new turn on it. Render it as a muted system marker so the
@@ -335,6 +351,7 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
 }
 
 function assistantMessageToBlock(item: MessageItem): TextDone {
+  const phase = assistantMessagePhase(item.phase);
   const text = item.content
     .filter((b): b is { type: "output_text"; text: string } => b.type === "output_text")
     .map((b) => b.text)
@@ -345,6 +362,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     fullText: text,
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
+    ...(phase !== undefined ? { phase } : {}),
   };
 }
 

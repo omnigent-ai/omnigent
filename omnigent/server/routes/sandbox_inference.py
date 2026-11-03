@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -16,8 +17,15 @@ from omnigent.inference_config import (
     parse_inference_config,
     resolve_bound_provider,
 )
-from omnigent.server.auth import LEVEL_READ, AuthProvider
-from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
+from omnigent.server.auth import AuthProvider
+from omnigent.server.managed_hosts import NoReachableModels
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._session_create_validation import validate_session_agent
+
+_logger = logging.getLogger(__name__)
+_DEFAULT_MODEL_OPTIONS_TIMEOUT_S = 10.0
+# The provider's reason reaches the browser verbatim; keep it to a sentence.
+_NO_REACHABLE_MODELS_REASON_MAX_CHARS = 300
 
 
 def inference_service(request: Request) -> Any:
@@ -163,24 +171,35 @@ def create_sandbox_inference_router(
 
     @router.get("/sandbox-providers/{provider}/harnesses/{harness}/model-options")
     async def model_options(
-        request: Request, provider: str, harness: str, agent_id: str | None = None
+        request: Request,
+        response: Response,
+        provider: str,
+        harness: str,
+        agent_id: str | None = None,
     ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
+        response.headers["Cache-Control"] = "private, no-store"
         auth = None
+        spec = None
         if agent_id is not None:
-            agent = await asyncio.to_thread(agent_store.get, agent_id)
-            if agent is None:
+            # Clients read a missing agent's 404 from ``detail``; keep that shape.
+            if await asyncio.to_thread(agent_store.get, agent_id) is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
-            if agent.session_id:
-                await require_access_and_level(
-                    user_id, agent.session_id, LEVEL_READ, permission_store, conversation_store
-                )
+            # The same check as binding the agent: its owner, or READ on any
+            # session that shares the agent row.
+            agent = await validate_session_agent(
+                user_id=user_id,
+                agent_id=agent_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
             spec = (
                 await asyncio.to_thread(
                     agent_cache.load,
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
             ).spec
             harness = actual_harness(spec, harness)
@@ -203,7 +222,7 @@ def create_sandbox_inference_router(
                 if isinstance(exc, OmnigentError)
                 else "Invalid inference configuration",
             }
-        return {
+        result: dict[str, Any] = {
             "configured": False,
             "models": [],
             "configuration_revision": None,
@@ -211,5 +230,50 @@ def create_sandbox_inference_router(
             "default_model": None,
             "status": "unconfigured",
         }
+        deployment = getattr(request.app.state, "sandbox_config", None)
+        target = deployment.for_provider(provider) if deployment is not None else None
+        # An agent's own provider takes precedence over the sandbox's default catalog.
+        if target is None or not target.managed_launch_supported or auth is not None:
+            return result
+        if spec is not None and (spec.executor.config.get("profile") or spec.executor.profile):
+            return result
+        ambient = await inference_service(request).ambient_catalog(provider, harness, user_id)
+        if ambient is not None:
+            return ambient
+        if target.default_model_options is not None:
+            result["provider_label"] = "AI Gateway"
+            try:
+                rows = await asyncio.wait_for(
+                    target.default_model_options(harness, user_id),
+                    timeout=_DEFAULT_MODEL_OPTIONS_TIMEOUT_S,
+                )
+                if not all(isinstance(row.get("id"), str) and row["id"] for row in rows):
+                    raise ValueError("default_model_options rows must carry a model id")
+                # Advisory rows never carry a default marker; Default stays a separate row.
+                models = [{**row, "isDefault": False} for row in rows]
+                result.update(models=models, status="ready" if models else "empty")
+                if not models:
+                    result["error"] = "The gateway lists no usable models for this harness."
+            except NoReachableModels as exc:
+                reason = exc.args[0] if len(exc.args) == 1 and isinstance(exc.args[0], str) else ""
+                reason = reason.strip()[:_NO_REACHABLE_MODELS_REASON_MAX_CHARS]
+                _logger.info(
+                    "Sandbox provider reports no reachable models for %s/%s: %s",
+                    provider,
+                    harness,
+                    reason or "(no reason)",
+                )
+                result["status"] = "unsupported"
+                if reason:
+                    result["error"] = reason
+            except Exception:  # optional preview must not block a default launch
+                _logger.warning(
+                    "AI Gateway model preview failed for %s/%s", provider, harness, exc_info=True
+                )
+                result.update(
+                    status="unavailable",
+                    error="Could not load AI Gateway models. You can use Default.",
+                )
+        return result
 
     return router

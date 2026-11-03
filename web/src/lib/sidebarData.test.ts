@@ -101,4 +101,47 @@ describe("scope refresh", () => {
     expect(next.windowSize).toBe(60);
     expect(next.pages[0].last_id).toBe("b");
   });
+  it("keeps equal-updated_at rows in one order across Load more and the next refresh", () => {
+    // Same-second rows arrive in the server's tie order, which is not id order.
+    const first = [row("b", 100), row("c", 100), row("a", 100)];
+    const second = [row("e", 100), row("d", 100)];
+    const loaded = refreshScopeWindow(undefined, sessionRowsPage(first, true), 3);
+    const afterLoadMore = appendScopePage(loaded, sessionRowsPage(second, false), 3);
+    const refreshed = refreshScopeWindow(
+      afterLoadMore,
+      sessionRowsPage([...first, ...second], false),
+      6,
+    );
+    expect(refreshed.pages[0].data.map((session) => session.id)).toEqual(
+      afterLoadMore.pages[0].data.map((session) => session.id),
+    );
+    // The continuation cursor stays the server's last row, not the last displayed one.
+    expect(refreshed.pages[0].last_id).toBe("d");
+  });
+});
+
+it("uses creation time for scope boundaries, appended pages, and capped refreshes", () => {
+  const newest = { ...row("new", 10), created_at: 30 };
+  const middle = { ...row("middle", 20), created_at: 20 };
+  const oldest = { ...row("old", 30), created_at: 10 };
+  expect(
+    mergeScopeRows([newest, oldest], [middle], true, true, "old", "middle", "created_at").rows.map(
+      (r) => r.id,
+    ),
+  ).toEqual(["new", "middle"]);
+  const current = {
+    pages: [sessionRowsPage([newest, middle], true)],
+    pageParams: [undefined],
+    windowSize: 2,
+  };
+  const appended = appendScopePage(current, sessionRowsPage([oldest]), 1, "created_at");
+  expect(appended.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+  const refreshed = refreshScopeWindow(
+    appended,
+    sessionRowsPage([newest, { ...middle, updated_at: 99 }], true),
+    2,
+    "created_at",
+  );
+  expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+  expect(refreshed.pages[0].last_id).toBe("old");
 });

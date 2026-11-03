@@ -23,15 +23,14 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import json
-import tarfile
 from typing import Any
 
 import httpx
 import yaml
 
 from omnigent.server.auth import LEVEL_READ
+from tests._helpers.session import bundle_files
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -81,12 +80,7 @@ def _build_minimal_agent_bundle() -> bytes:
             },
         }
     ).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config)
-        tf.addfile(info, io.BytesIO(config))
-    return buf.getvalue()
+    return bundle_files({"config.yaml": config})
 
 
 def _ensure_agent(client: httpx.Client) -> str:

@@ -23,11 +23,13 @@ from collections.abc import Iterator
 import pytest
 from playwright.sync_api import Browser, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
-    ADMIN_EMAIL,
     MultiUserServer,
     spawn_multi_user_server,
 )
+
+_ADMIN_EMAIL = "sharing-off@ui.test"
 
 # Mirrors AppShell.tsx's shareDisabledReason for the sharing-off case.
 _OFF_REASON = "Sharing has been disabled for this Omnigent server."
@@ -49,6 +51,7 @@ def sharing_off_server(
         mock_llm_server_url,
         server_tmp,
         extra_server_env={"OMNIGENT_SHARING_MODE": "off"},
+        admin_email=_ADMIN_EMAIL,
     )
 
 
@@ -58,16 +61,15 @@ def test_sharing_off_disables_share_button_with_tooltip(
 ) -> None:
     """``OMNIGENT_SHARING_MODE=off`` grays out the header Share button and
     explains why — the server-side kill switch surfaced in the SPA."""
-    context = browser.new_context(extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL})
-    page = context.new_page()
-    page.goto(f"{sharing_off_server.public_url}/c/{sharing_off_server.session_id}")
+    with user_page(browser, headers={"X-Forwarded-Email": _ADMIN_EMAIL}) as page:
+        page.goto(f"{sharing_off_server.public_url}/c/{sharing_off_server.session_id}")
 
-    share = page.get_by_role("button", name="Share session")
-    expect(share).to_be_visible(timeout=60_000)
-    expect(share).to_be_disabled()
+        share = page.get_by_role("button", name="Share session")
+        expect(share).to_be_visible(timeout=60_000)
+        expect(share).to_be_disabled()
 
-    page.get_by_label(f"Share session disabled: {_OFF_REASON}").hover()
-    tooltip = page.locator("[data-slot=tooltip-content]", has_text=_OFF_REASON)
-    expect(tooltip).to_be_visible(timeout=5_000)
-    # A disabled Share control opens no dialog.
-    expect(page.get_by_role("dialog")).to_have_count(0)
+        page.get_by_label(f"Share session disabled: {_OFF_REASON}").hover()
+        tooltip = page.locator("[data-slot=tooltip-content]", has_text=_OFF_REASON)
+        expect(tooltip).to_be_visible(timeout=5_000)
+        # A disabled Share control opens no dialog.
+        expect(page.get_by_role("dialog")).to_have_count(0)

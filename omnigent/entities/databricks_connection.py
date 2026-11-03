@@ -18,7 +18,7 @@ class DatabricksConnection:
 
     :param user_id: The omnigent user id the connection belongs to.
     :param workspace_host: The connected workspace origin (``https://…``); the
-        OAuth + AI Gateway MCP endpoints are relative to it.
+        OAuth + Unity Gateway MCP endpoints are relative to it.
     :param databricks_user: The connected Databricks user name (email).
     :param databricks_user_id: The connected Databricks SCIM user id.
     :param access_token: Decrypted OAuth access token, or ``None`` on a

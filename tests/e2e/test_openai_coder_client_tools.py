@@ -33,6 +33,7 @@ import httpx
 
 # Load the coder tool set for client-side tool execution.
 from omnigent.client_tools import get_tool_set as _get_tool_set
+from tests._helpers.messages import all_message_text as _extract_all_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -202,23 +203,6 @@ def _run_with_tunneling(
             }
         )
     return {"status": status, "output": output, "error": None}
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all assistant text from a terminal response body.
-
-    :param body: The terminal response body from GET /v1/responses/{id}.
-    :returns: All assistant text blocks joined by newlines, lowercased.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def _collect_function_calls(body: dict[str, Any]) -> list[dict[str, Any]]:

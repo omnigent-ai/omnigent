@@ -3,13 +3,12 @@
 Routes: ``/v1/sessions/{session_id}/policies[/{policy_id}]``
 
 The session policies router is only mounted when ``create_app`` receives
-a ``policy_store``. These tests provide their own app/client that include it.
+a ``policy_store``. These tests use the shared policy app with a route-only client.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -18,34 +17,10 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
-
-
-@pytest.fixture()
-def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    """Build a FastAPI app that includes the policy store."""
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        policy_store=SqlAlchemyPolicyStore(db_uri),
-    )
 
 
 @pytest_asyncio.fixture()

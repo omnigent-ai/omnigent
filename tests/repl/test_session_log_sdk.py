@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from omnigent_client import StaleCursorError
+from omnigent_client import PaginatedList, StaleCursorError
 
 from omnigent.repl import _session_log
 from omnigent.repl._session_log import (
@@ -60,14 +60,14 @@ class _FakeSessions:
         limit: int,
         after: str | None,
         order: str,
-    ) -> list[dict[str, object]]:
+    ) -> PaginatedList:
         assert order == "asc"
         self.list_calls.append((session_id, after))
         rows = self.items.get(session_id, [])
         start = 0
         if after is not None:
             start = next(i for i, row in enumerate(rows) if row["id"] == after) + 1
-        return rows[start : start + limit]
+        return PaginatedList(data=rows[start : start + limit])
 
 
 def _client(items: dict[str, list[dict[str, object]]]) -> SimpleNamespace:
@@ -278,8 +278,8 @@ async def test_fetch_items_via_sessions_stops_on_empty_page_or_missing_id() -> N
 
 async def test_fetch_items_via_sessions_stops_on_none_page() -> None:
     class _NoneSessions:
-        async def list_items(self, *args: object, **kwargs: object) -> None:
-            return None
+        async def list_items(self, *args: object, **kwargs: object) -> PaginatedList:
+            return PaginatedList.from_dict({"data": None})
 
     client = SimpleNamespace(sessions=_NoneSessions())
 
@@ -290,12 +290,12 @@ async def test_fetch_items_via_sessions_restarts_after_stale_cursor() -> None:
     attempts = 0
 
     class _FlakySessions:
-        async def list_items(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+        async def list_items(self, *args: object, **kwargs: object) -> PaginatedList:
             nonlocal attempts
             attempts += 1
             if attempts < 3:
                 raise StaleCursorError("cursor gone", code="stale_cursor")
-            return [{"id": "i1"}]
+            return PaginatedList(data=[{"id": "i1"}])
 
     client = SimpleNamespace(sessions=_FlakySessions())
 
@@ -307,7 +307,7 @@ async def test_fetch_items_via_sessions_propagates_persistent_stale_cursor() -> 
     attempts = 0
 
     class _AlwaysStale:
-        async def list_items(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+        async def list_items(self, *args: object, **kwargs: object) -> PaginatedList:
             nonlocal attempts
             attempts += 1
             raise StaleCursorError("cursor gone", code="stale_cursor")

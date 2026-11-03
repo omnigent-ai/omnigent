@@ -64,6 +64,42 @@ _SESSION_LABELS = {
 }
 
 
+class PiNativeCliOutdatedError(RuntimeError):
+    """The installed Pi CLI is below Omnigent's supported floor.
+
+    The message names the installed version, the floor, and the upgrade
+    command, so the native-terminal-start error path can show it verbatim.
+    """
+
+
+def check_pi_cli_version_floor(version: tuple[int, int, int]) -> None:
+    """Fail the launch when the installed Pi CLI is below Omnigent's floor.
+
+    A Pi older than the installer's ``min_version`` rejects ``--provider
+    omnigent`` and exits 1, which otherwise surfaces as a generic
+    terminal-start failure the person retries unchanged.
+
+    :param version: Probed Pi CLI version, e.g. ``(0, 84, 2)``.
+    :raises PiNativeCliOutdatedError: When *version* is below the floor.
+    """
+    from omnigent.onboarding.harness_install import (
+        PI_KEY,
+        harness_install_display,
+        harness_install_spec,
+    )
+
+    spec = harness_install_spec(PI_KEY)
+    floor = spec.min_version if spec is not None else None
+    if floor is None or version >= tuple(int(part) for part in floor.split(".")):
+        return
+    installed = ".".join(str(part) for part in version)
+    raise PiNativeCliOutdatedError(
+        f"The installed Pi CLI ({installed}) is older than the minimum Omnigent "
+        f"supports ({floor}). Upgrade with: {harness_install_display(PI_KEY)}, "
+        "then start the session again."
+    )
+
+
 @dataclass(frozen=True)
 class NativePiLaunch:
     """Resolved native Pi process launch."""
@@ -137,6 +173,12 @@ def resolve_pi_executable(
     return resolved
 
 
+# Pi 0.79.0 added ``--approve``; 0.80.4 added the ``agent_settled`` RPC event
+# that marks a prompt's run as fully finished (after retries and compaction).
+PI_APPROVE_MIN_VERSION = (0, 79, 0)
+PI_AGENT_SETTLED_MIN_VERSION = (0, 80, 4)
+
+
 def pi_version(executable: str) -> tuple[int, int, int] | None:
     """Return the Pi CLI version as ``(major, minor, patch)``, or ``None``.
 
@@ -186,7 +228,7 @@ def pi_supports_approve(executable: str) -> bool:
     ver = pi_version(executable)
     if ver is None:
         return False
-    return ver >= (0, 79, 0)
+    return ver >= PI_APPROVE_MIN_VERSION
 
 
 def build_pi_launch(

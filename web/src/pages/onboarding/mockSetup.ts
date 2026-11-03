@@ -11,16 +11,20 @@
 //   mock=1                        enable the mock (required)
 //   managed=<url>,<url>           MDM-preset servers (comma-separated)
 //   recents=<url>,<url>           recent servers (comma-separated)
-//   installed=1                   returning user (omnigent CLI already installed)
+//   installed=1                   omnigent CLI already installed
+//   returning=1                   connected before (implied by recents=)
+//   localRunning=1                local server already up ("Open" vs "Start")
+//   remote=1                      offer the remote environment on the runner step
 //   step=server                   open straight on the server list
 //   error=<msg>                   show a connect-error banner
 //
 // Examples (all against the vite dev server):
 //   new + no MDM ............ ?mock=1
-//   returning + no MDM ...... ?mock=1&installed=1&recents=https://old.example.com
+//   returning + no MDM ...... ?mock=1&installed=1&recents=http://localhost:6767,https://old.example.com
 //   new + MDM ............... ?mock=1&managed=https://field-eng.example.com,https://corp.example.com
-//   returning + MDM ......... ?mock=1&installed=1&managed=https://field-eng.example.com
+//   returning + MDM ......... ?mock=1&installed=1&returning=1&managed=https://field-eng.example.com
 
+import { isLocalInstall } from "./ServerSelectStep";
 import type { ServerSelectorV2Setup } from "./ServerSelectorV2";
 
 /** Whether the mock is requested (`?mock=1`). */
@@ -50,6 +54,9 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
   const managedServers = urlList(params, "managed");
   const recentServers = urlList(params, "recents");
   const installed = params.get("installed") === "1";
+  const connectedBefore = params.get("returning") === "1";
+  const localServerRunning = params.get("localRunning") === "1";
+  const remote = params.get("remote") === "1";
   const error = params.get("error") ?? undefined;
   const initialStep = params.get("step") === "server" ? ("server" as const) : undefined;
 
@@ -61,6 +68,7 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
   // onInstallLog registers the sink; onInstallCli emits into it and resolves
   // when the stream finishes.
   let installLog: ((line: string) => void) | null = null;
+  let runnerLog: ((line: string) => void) | null = null;
 
   return {
     initialUrl: recentServers[0] ?? managedServers[0] ?? "http://localhost:6767",
@@ -69,6 +77,8 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
     recentServers,
     managedServers,
     installed,
+    connectedBefore,
+    localServerRunning,
     mockInstall: true,
     onConnect: async (url) => {
       log("onConnect", url);
@@ -105,11 +115,47 @@ export function maybeMockSetup(params: URLSearchParams): ServerSelectorV2Setup |
         if (installLog === cb) installLog = null;
       };
     },
+    getRunnerOptions: async (url) => {
+      log("getRunnerOptions", url);
+      return { remote, bundledCli: remote };
+    },
+    onConnectRunner: (url, runner) => {
+      log("onConnectRunner", { url, runner });
+      const lines =
+        runner === "remote"
+          ? [
+              `$ remote-env host --server ${url}`,
+              "Starting the remote environment…",
+              "Host is running",
+            ]
+          : [
+              `$ omnigent host --server ${url}`,
+              "Signing in to the server if needed…",
+              "Connected this laptop.",
+            ];
+      return new Promise((resolve) => {
+        let i = 0;
+        const timer = setInterval(() => {
+          if (i < lines.length) runnerLog?.(lines[i++]);
+          else {
+            clearInterval(timer);
+            resolve({ ok: true });
+          }
+        }, 300);
+      });
+    },
+    onRunnerLog: (cb) => {
+      runnerLog = cb;
+      return () => {
+        if (runnerLog === cb) runnerLog = null;
+      };
+    },
     onRemoveServer: (url) => log("onRemoveServer", url),
     onCopy: (text) => log("onCopy", text),
     onCheckServer: async (url) => {
       log("onCheckServer", url);
-      return { status: "ok" as const };
+      // The local install is down unless localRunning=1; everything else is up.
+      return { status: isLocalInstall(url) && !localServerRunning ? "unreachable" : "ok" };
     },
     onCloudSetup: () => log("onCloudSetup"),
     onSwitchToLegacy: () => log("onSwitchToLegacy"),

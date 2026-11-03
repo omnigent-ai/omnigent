@@ -1,7 +1,7 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 import omnigent_slack.service as service_module
@@ -471,13 +471,43 @@ async def _configure_user(
     )
 
 
+# Hang guard for the waits below. Generous so a loaded CI worker can't trip it;
+# every wait still returns the moment its condition holds.
+_WAIT_TIMEOUT_S = 10.0
+
+_T = TypeVar("_T")
+
+
+async def _poll_until(condition: Callable[[], _T], what: str) -> _T:
+    """Poll until ``condition()`` is truthy and return its value."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _WAIT_TIMEOUT_S
+    while not (result := condition()):
+        if loop.time() >= deadline:
+            raise AssertionError(f"Timed out waiting for {what}")
+        await asyncio.sleep(0.02)
+    return result
+
+
+async def _wait_for_turns(service: SlackOmnigentService) -> None:
+    """Wait until the service's spawned turn tasks have finished.
+
+    ``shutdown`` CANCELS an in-flight turn (and posts a restart notice), so a
+    test asserting on a turn's outcome must let it complete first. Turn tasks
+    never propagate (``_run_turn_tracked`` swallows exceptions).
+    """
+    tasks = list(service._turn_tasks)
+    if not tasks:
+        return
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=_WAIT_TIMEOUT_S)
+
+
 async def _wait_for_stream_stop(client: FakeSlackClient) -> FakeStream:
     """Wait until a turn has opened a stream and finalized it."""
-    for _ in range(50):
-        if client.streams and client.stream.stopped:
-            return client.stream
-        await asyncio.sleep(0.02)
-    raise AssertionError("Timed out waiting for a stream to stop")
+    return await _poll_until(
+        lambda: client.stream if client.streams and client.stream.stopped else None,
+        "a stream to stop",
+    )
 
 
 async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) -> None:
@@ -494,6 +524,7 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
@@ -548,6 +579,7 @@ async def test_managed_session_skips_the_runner_launch(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The create asked for a managed host and NO runner was launched.
@@ -582,6 +614,7 @@ async def test_external_session_still_launches_a_runner(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.created_host_types == ["external"]
@@ -625,6 +658,7 @@ async def test_failed_handle_unclaims_event_so_it_can_retry(tmp_path: Path) -> N
     store.get_session = original_get_session  # type: ignore[method-assign]
     await service.handle_app_mention(**args)  # type: ignore[arg-type]
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The retry actually ran the turn (it wasn't deduped away).
@@ -654,6 +688,7 @@ async def test_session_title_falls_back_when_permalink_unavailable(tmp_path: Pat
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert len(omnigent.created) == 1
@@ -678,6 +713,7 @@ async def test_session_info_omits_missing_fields(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     info_text = slack.posts[0]["text"]
@@ -702,6 +738,7 @@ async def test_no_ack_when_session_cannot_start_host_unavailable(tmp_path: Path)
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert slack.acks == []
@@ -727,6 +764,7 @@ async def test_failed_launch_deletes_the_created_session(tmp_path: Path) -> None
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The created session was cleaned up, no binding was recorded, and the user
@@ -763,6 +801,7 @@ async def test_failed_launch_cleanup_failure_still_posts_guidance(tmp_path: Path
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert len(slack.posts) == 1
@@ -785,6 +824,7 @@ async def test_channel_stream_passes_recipient_ids(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert stream.start_kwargs["channel"] == "C1"
@@ -872,6 +912,7 @@ async def test_no_delta_idle_answer_keeps_ack_until_visible(tmp_path: Path) -> N
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert stream.text == "Here is the answer."
@@ -932,6 +973,7 @@ async def test_back_to_back_messages_get_paragraph_break(tmp_path: Path) -> None
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The two messages are separated by a blank line, not concatenated.
@@ -1011,6 +1053,7 @@ async def test_sdk_harness_messages_get_paragraph_break(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert (
@@ -1076,6 +1119,7 @@ async def test_native_boundary_unchanged_by_commits(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert (
@@ -1121,6 +1165,7 @@ async def test_commit_before_any_delta_adds_no_leading_break(tmp_path: Path) -> 
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert slack.streamed_text == "Here is the answer."
@@ -1164,6 +1209,7 @@ async def test_repeated_commit_adds_a_single_break(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert slack.streamed_text == "First thought.\n\nSecond thought."
@@ -1214,6 +1260,7 @@ async def test_sdk_narration_reads_as_separate_blocks(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert slack.streamed_text == "\n\n".join(_SDK_NARRATION)
@@ -1238,6 +1285,7 @@ async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The full answer is delivered (deltas + stop tail) with one stream, no
@@ -1291,7 +1339,7 @@ async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) 
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
-    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The stream delivered the real answer, not the error.
@@ -1340,6 +1388,7 @@ async def test_turn_error_without_answer_finalizes_with_generic_message(tmp_path
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The generic failure is shown; the raw detail is NOT leaked to the channel.
@@ -1381,6 +1430,7 @@ async def test_exhausted_reconnect_shows_non_alarming_text(tmp_path: Path) -> No
         context={"bot_user_id": "B1"},
     )
     await _wait_for_ack_deleted(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The notice is a public post (not ephemeral): the non-alarming stream-drop
@@ -1410,6 +1460,7 @@ async def test_stream_closed_mid_turn_continues_in_new_stream(tmp_path: Path) ->
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The reply split into more than one streaming message when Slack closed the
@@ -1443,6 +1494,7 @@ async def test_stream_message_not_found_also_reopens(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Reopened into a fresh stream and delivered the full answer — no generic
@@ -1485,7 +1537,7 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         context={"bot_user_id": "B1"},
     )
     # The initial session-info post can arrive before the answer even starts.
-    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
@@ -1509,6 +1561,7 @@ async def test_empty_app_mention_prompts_without_creating_session(tmp_path: Path
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.created == []
@@ -1539,6 +1592,7 @@ async def test_channel_thread_reply_without_mention_is_ignored(tmp_path: Path) -
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.created == []
@@ -1556,6 +1610,7 @@ async def test_direct_message_creates_session(tmp_path: Path) -> None:
     await _configure_user(store, "T1", "U1")
 
     stream = await _run_dm_and_stop(service, slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert len(omnigent.created) == 1
@@ -1615,6 +1670,7 @@ async def test_direct_message_threaded_reply_reuses_existing_session(tmp_path: P
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.created == []
@@ -1648,6 +1704,7 @@ async def test_direct_message_top_level_starts_new_session_per_thread(tmp_path: 
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # A new session was created for the new thread, keyed on the message ts.
@@ -1682,6 +1739,7 @@ async def test_message_while_server_busy_is_deflected(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Deflected (not run) with a busy notice pointing at the web UI.
@@ -1740,10 +1798,7 @@ async def test_second_message_while_local_stream_active_is_deflected(tmp_path: P
         )
 
     await _send("first", "101.1", "Ev1")
-    for _ in range(100):  # wait until the first turn is actually streaming
-        if omnigent.turns:
-            break
-        await asyncio.sleep(0.02)
+    await _poll_until(lambda: omnigent.turns, "the first turn to start streaming")
     await _send("second", "102.1", "Ev2")
 
     # Only the first turn ran; the second was deflected despite the idle snapshot.
@@ -1751,6 +1806,7 @@ async def test_second_message_while_local_stream_active_is_deflected(tmp_path: P
     busy = [e for e in slack.ephemerals if "still working on your previous" in e["text"].lower()]
     assert len(busy) == 1
     release.set()
+    await _wait_for_turns(service)
     await service.shutdown()
 
 
@@ -1780,6 +1836,7 @@ async def test_message_while_awaiting_action_points_to_pending_request(tmp_path:
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.turns == []
@@ -1860,6 +1917,7 @@ async def test_idle_follow_up_message_runs_in_thread(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The follow-up ran against the existing session (no new session created).
@@ -1890,6 +1948,7 @@ async def test_direct_message_with_bot_mention_is_handled(tmp_path: Path) -> Non
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert len(omnigent.created) == 1
@@ -1914,6 +1973,7 @@ async def test_channel_message_without_session_is_ignored(tmp_path: Path) -> Non
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.created == []
@@ -1943,6 +2003,7 @@ async def test_duplicate_event_is_ignored(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert len(omnigent.turns) == 1
@@ -1968,6 +2029,7 @@ async def test_generic_message_with_bot_mention_is_ignored(tmp_path: Path) -> No
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.turns == []
@@ -1986,6 +2048,7 @@ async def test_unconfigured_user_is_prompted_and_no_turn_runs(tmp_path: Path) ->
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # No session created; the user is nudged into setup instead.
@@ -2024,6 +2087,7 @@ async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> No
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.turns == []
@@ -2064,6 +2128,7 @@ async def test_non_owner_reply_rejected_without_session_record(tmp_path: Path) -
         client=slack,
         context={"bot_user_id": "B1"},
     )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # No session was created for U2, no setup prompt — just the private notice.
@@ -2099,6 +2164,7 @@ async def test_owner_reply_in_own_thread_is_allowed(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The owner's turn ran (a fresh session, since the store had no record).
@@ -2122,6 +2188,7 @@ async def test_turn_runs_against_the_fixed_operator_server(tmp_path: Path) -> No
         context={"bot_user_id": "B1"},
     )
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Routed to the operator-fixed server (the only URL the pool is asked for).
@@ -2163,21 +2230,15 @@ class ServerErrorClient(FakeOmnigentClient):
 
 
 async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
-    for _ in range(50):
-        if len(client.posts) >= count:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"Timed out waiting for {count} posts")
+    await _poll_until(lambda: len(client.posts) >= count, f"{count} posts")
 
 
 async def _wait_for_ack_deleted(client: FakeSlackClient) -> None:
     # Wait until the "Working on it…" ack has been deleted and a follow-up post
     # has landed — i.e. stop_with() fully completed (delete then postMessage).
-    for _ in range(50):
-        if client.deleted_ts and client.posts:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("Timed out waiting for ack deletion and follow-up post")
+    await _poll_until(
+        lambda: client.deleted_ts and client.posts, "ack deletion and follow-up post"
+    )
 
 
 async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None:
@@ -2194,6 +2255,7 @@ async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # No session persisted; the user is told to reconfigure.
@@ -2221,10 +2283,8 @@ async def test_auth_required_prompts_relogin(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    for _ in range(50):
-        if setup.relogin_prompted:
-            break
-        await asyncio.sleep(0.02)
+    await _poll_until(lambda: setup.relogin_prompted, "the re-login prompt")
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # No placeholder was posted (session never started).
@@ -2271,10 +2331,8 @@ async def test_auth_required_mid_stream_prompts_relogin(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    for _ in range(50):
-        if setup.relogin_prompted:
-            break
-        await asyncio.sleep(0.02)
+    await _poll_until(lambda: setup.relogin_prompted, "the re-login prompt")
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The mid-stream auth failure routed to the re-login DM prompt.
@@ -2305,10 +2363,8 @@ async def test_auth_required_in_dm_skips_in_channel_pointer(tmp_path: Path) -> N
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    for _ in range(50):
-        if setup.relogin_prompted:
-            break
-        await asyncio.sleep(0.02)
+    await _poll_until(lambda: setup.relogin_prompted, "the re-login prompt")
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert len(setup.relogin_prompted) == 1
@@ -2337,6 +2393,7 @@ async def test_server_error_creating_session_reports(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # No placeholder was posted (session never started).
@@ -2368,6 +2425,7 @@ async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
@@ -2402,6 +2460,7 @@ async def test_harness_not_configured_412_surfaces_server_message(tmp_path: Path
         context={"bot_user_id": "B1"},
     )
     await _wait_for_posts(slack, 1)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Session was not persisted (startup failed) and the actionable message shows.
@@ -2455,6 +2514,7 @@ async def test_managed_sandbox_not_ready_asks_for_a_retry(tmp_path: Path) -> Non
         context={"bot_user_id": "B1"},
     )
     await _wait_for_ack_deleted(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.turn_host_types == ["managed"]
@@ -2488,6 +2548,7 @@ async def test_external_runner_unavailable_asks_for_a_retry(tmp_path: Path) -> N
         context={"bot_user_id": "B1"},
     )
     await _wait_for_ack_deleted(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.turn_host_types == ["external"]
@@ -2645,13 +2706,17 @@ class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
 
 async def _wait_for_card(client: FakeSlackClient) -> dict[str, Any]:
     """Wait for the approval card (a post carrying an actions block)."""
-    for _ in range(100):
-        for post in client.posts:
-            blocks = post.get("blocks") or []
-            if any(b.get("type") == "actions" for b in blocks):
-                return post
-        await asyncio.sleep(0.02)
-    raise AssertionError("Timed out waiting for an approval card")
+    return await _poll_until(
+        lambda: next(
+            (
+                post
+                for post in client.posts
+                if any(b.get("type") == "actions" for b in post.get("blocks") or [])
+            ),
+            None,
+        ),
+        "an approval card",
+    )
 
 
 def _card_target(card: dict[str, Any]) -> Any:
@@ -2678,11 +2743,7 @@ async def _wait_for_resolved(omnigent: "FakeOmnigentClient", count: int = 1) -> 
     "first stream stopped" no longer marks turn completion — wait on the
     server-visible verdict instead.
     """
-    for _ in range(100):
-        if len(omnigent.resolved) >= count:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"Timed out waiting for {count} resolved elicitation(s)")
+    await _poll_until(lambda: len(omnigent.resolved) >= count, f"{count} resolved elicitation(s)")
 
 
 async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
@@ -2705,6 +2766,7 @@ async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert delivered is True
@@ -2748,6 +2810,7 @@ async def test_short_pre_card_text_is_flushed_before_the_card(tmp_path: Path) ->
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The first (pre-card) segment carried "work" and was FORCE-flushed to screen
@@ -2801,20 +2864,22 @@ async def test_idle_stream_flushes_buffered_text_before_turn_end(
     )
     # Before the turn ends, the idle window should have force-flushed the buffered
     # "partial answer" onto the screen.
-    for _ in range(100):
-        if slack.streams and slack.streams[0].forced_flush_order is not None:
-            break
-        await asyncio.sleep(0.02)
-    else:
+    try:
+        await _poll_until(
+            lambda: slack.streams and slack.streams[0].forced_flush_order is not None,
+            "buffered text to flush during the idle window",
+        )
+    except AssertionError:
         release.set()
         await service.shutdown()
-        raise AssertionError("buffered text was not flushed during the idle window")
+        raise
 
     # It was revealed WHILE the turn was still open (before we let it end).
     assert slack.streams[0].text == "partial answer"
 
     release.set()
     await _wait_for_stream_stop(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
 
@@ -2838,6 +2903,7 @@ async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=False)
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.resolved == [("conv_1", "elicit_1", False)]
@@ -2864,7 +2930,7 @@ async def test_elicitation_resolved_externally_finalizes_without_posting(tmp_pat
     await _wait_for_card(slack)
     # No Slack click — resolve elsewhere; the fixture then emits the push.
     omnigent.resolve_externally.set()
-    await _wait_for_turn_end(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # We posted NO verdict (answered elsewhere), the card shows the neutral
@@ -2935,6 +3001,7 @@ async def test_elicitation_card_post_failure_declines_and_unregisters(tmp_path: 
     # The turn's ApprovalClient waits for a resolve; the card-post failure declines
     # it, which unblocks the stream and ends the turn without the 600s backstop.
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The request was declined server-side so the park releases (no orphaned wait).
@@ -3114,10 +3181,10 @@ async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -
     await service.handle_elicitation_action(
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=False)
     )
-    for _ in range(100):
-        if slack.streams and all(s.stopped for s in slack.streams):
-            break
-        await asyncio.sleep(0.02)
+    await _poll_until(
+        lambda: slack.streams and all(s.stopped for s in slack.streams), "every stream to stop"
+    )
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The stale prior summary was NOT delivered anywhere.
@@ -3143,6 +3210,7 @@ async def test_tool_approval_timeout_declines(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Timed out → declined to the server so the parked turn doesn't hang, and the
@@ -3161,6 +3229,7 @@ async def test_stale_approval_click_is_reported_as_not_delivered(tmp_path: Path)
     delivered = await service.handle_elicitation_action(
         session_id="sess_gone", elicitation_id="elicit_gone", verdict=Verdict(accepted=True)
     )
+    await _wait_for_turns(service)
     await service.shutdown()
     assert delivered is False
 
@@ -3190,6 +3259,7 @@ async def test_form_elicitation_forwards_selections_as_content(tmp_path: Path) -
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "0"})
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     assert omnigent.resolved == [("conv_1", "elicit_form", True)]
@@ -3247,7 +3317,11 @@ async def test_unsupported_typed_input_links_to_web_ui(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turn_end(slack)
+    # The turn stays parked awaiting the web UI; wait for the link, then tear down.
+    await _poll_until(
+        lambda: any("/approve/conv_1/elicit_typed" in str(p.get("text")) for p in slack.posts),
+        "the web-UI link",
+    )
     await service.shutdown()
 
     # A link to the approve page was posted; no approval card, no auto-resolve.
@@ -3283,6 +3357,7 @@ async def test_url_mode_binary_renders_approval_card(tmp_path: Path) -> None:
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # Rendered as an Approve/Deny card and resolved via the endpoint — no web link.
@@ -3316,7 +3391,7 @@ async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path)
     )
     await _wait_for_resolved(omnigent)
     # The verdict unblocks the answer stream; let it finish before cancelling tasks.
-    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The post-answer text was delivered (in the post-seal segment), not dropped.
@@ -3381,7 +3456,7 @@ async def test_post_elicitation_answer_recovered_when_stream_silent(tmp_path: Pa
     await service.handle_elicitation_action(
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
     )
-    await _wait_for_turn_end(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The final answer was recovered and delivered exactly once; the turn task
@@ -3417,6 +3492,7 @@ async def test_elicitation_clears_working_placeholder(tmp_path: Path) -> None:
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
     await _wait_for_resolved(omnigent)
+    await _wait_for_turns(service)
     await service.shutdown()
 
 
@@ -3449,23 +3525,6 @@ class EventScriptClient(FakeOmnigentClient):
         yield {"type": "session.status", "status": "idle"}
 
 
-async def _wait_for_turn_end(slack: FakeSlackClient) -> None:
-    """Wait until the turn finished: its final stream segment is stopped.
-
-    An interruption seal splits the answer, so "any stream stopped" is not a
-    completion signal. The turn ends only once its last-opened segment stops
-    with no further append pending, which is stable once the loop settles.
-    """
-    for _ in range(100):
-        if slack.streams and all(s.stopped for s in slack.streams):
-            # Give the loop a beat to open a follow-on segment if more is coming.
-            await asyncio.sleep(0.02)
-            if slack.streams and all(s.stopped for s in slack.streams):
-                return
-        await asyncio.sleep(0.02)
-    raise AssertionError("Timed out waiting for the turn to end")
-
-
 async def _run_scripted_turn(tmp_path: Path, events: list[dict[str, Any]]) -> "FakeSlackClient":
     store = await _store(tmp_path)
     slack = FakeSlackClient()
@@ -3477,7 +3536,7 @@ async def _run_scripted_turn(tmp_path: Path, events: list[dict[str, Any]]) -> "F
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turn_end(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
     return slack
 
@@ -3528,7 +3587,7 @@ async def test_answer_then_trailing_notice_is_not_duplicated(tmp_path: Path) -> 
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turn_end(slack)
+    await _wait_for_turns(service)
     await service.shutdown()
 
     # The answer appears exactly once across all stream segments — not duplicated
@@ -3587,7 +3646,9 @@ async def test_interruption_preserves_chronological_order(tmp_path: Path) -> Non
     assert slack.streams[0].open_order < deny["order"] < slack.streams[1].open_order
 
 
-async def _wait_for_turns(omnigent: FakeOmnigentClient, count: int = 1) -> None:
+# The upstream `_wait_for_turns(service)` above waits on the service's turn-task registry;
+# the attachment tests below drive the fake client directly, so they get their own poll.
+async def _wait_for_fake_turns(omnigent: FakeOmnigentClient, count: int = 1) -> None:
     for _ in range(50):
         if len(omnigent.turns) >= count:
             return
@@ -3633,7 +3694,7 @@ async def test_dm_with_file_uploads_and_references_attachment(tmp_path: Path) ->
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turns(omnigent)
+    await _wait_for_fake_turns(omnigent)
     await service.shutdown()
 
     assert cdn.calls.call_count == 1
@@ -3681,7 +3742,7 @@ async def test_dm_attachment_failure_becomes_visible_note(tmp_path: Path) -> Non
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turns(omnigent)
+    await _wait_for_fake_turns(omnigent)
     await service.shutdown()
 
     assert len(omnigent.uploads) == 1
@@ -3724,7 +3785,7 @@ async def test_dm_attachment_over_size_cap_is_skipped_with_note(tmp_path: Path) 
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_turns(omnigent)
+    await _wait_for_fake_turns(omnigent)
     await service.shutdown()
 
     assert omnigent.uploads == []

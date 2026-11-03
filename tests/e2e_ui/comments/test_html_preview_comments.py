@@ -36,6 +36,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
+
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes seeded
 # files into the server process's cwd — the repo root (this file is
 # ``<repo>/tests/e2e_ui/comments/...``, so the repo root is ``parents[3]``).
@@ -142,10 +144,21 @@ def test_html_preview_add_comment(
     # (not inside the frame), so find it on the page.
     add_comment_btn = page.get_by_role("button", name="Add comment")
     expect(add_comment_btn).to_be_visible(timeout=10_000)
+    frame_width = preview.locator("body").evaluate("() => window.innerWidth")
     add_comment_btn.click()
 
     # CommentsPanel opens alongside the preview.
     expect(file_viewer.locator("span.font-semibold", has_text="Comments")).to_be_visible()
+    # The panel narrows the frame, which re-reports the still-visible selection;
+    # that must not bring back the dismissed floating button.
+    poll_until(
+        lambda: preview.locator("body").evaluate("() => window.innerWidth") != frame_width,
+        timeout_s=10,
+        interval_s=0.1,
+    )
+    # Outlast the frame's 150 ms selection debounce before checking the button stays gone.
+    page.wait_for_timeout(500)
+    expect(page.locator("[data-add-comment-btn]")).to_have_count(0)
     selection_text = preview.locator("body").evaluate("() => window.getSelection().toString()")
     assert selection_text == _ANCHOR_SENTENCE, "fresh draft selection should remain visible"
 
@@ -180,6 +193,93 @@ def test_html_preview_add_comment(
         f"source position {raw_idx} of the anchor sentence"
     )
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
+
+
+def test_html_comment_external_runtime_connects_under_strict_csp(
+    page: Page,
+    built_spa: None,
+) -> None:
+    """The emitted external bridge connects when inherited CSP blocks inline JS."""
+    del built_spa
+    assets = list(
+        (_REPO_ROOT / "omnigent/server/static/web-ui/assets").glob("htmlCommentBridgeRuntime-*.js")
+    )
+    assert len(assets) == 1, f"expected one emitted bridge asset, found {assets}"
+
+    probe_url = "https://app.example/probe"
+    asset_url = f"https://app.example/assets/{assets[0].name}"
+    page.route(
+        probe_url,
+        lambda route: route.fulfill(
+            body="<!doctype html><html><body></body></html>",
+            content_type="text/html",
+            headers={"content-security-policy": "default-src 'self'; script-src 'self'"},
+        ),
+    )
+    page.route(
+        asset_url,
+        lambda route: route.fulfill(path=assets[0], content_type="application/javascript"),
+    )
+    page.goto(probe_url)
+
+    nonce = "external-bridge-e2e"
+    page.evaluate(
+        r"""
+        ({ assetUrl, nonce }) => {
+          const protocol = JSON.stringify({
+            source: "omni-html-comment",
+            types: {
+              init: "omni:init",
+              ready: "omni:ready",
+              setComments: "omni:setComments",
+              setActive: "omni:setActive",
+              selection: "omni:selection",
+              commentClick: "omni:commentClick",
+              selectionCleared: "omni:selectionCleared",
+              zoom: "omni:zoom",
+            },
+          }).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+          const iframe = document.createElement("iframe");
+          iframe.id = "external-bridge-probe";
+          iframe.dataset.ready = "false";
+          iframe.setAttribute("sandbox", "allow-scripts");
+          iframe.addEventListener("load", () => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = (event) => {
+              const message = event.data;
+              if (
+                message?.source === "omni-html-comment" &&
+                message?.nonce === nonce &&
+                message?.type === "omni:ready"
+              ) {
+                iframe.dataset.ready = "true";
+              }
+            };
+            iframe.contentWindow.postMessage(
+              { source: "omni-html-comment", nonce, type: "omni:init" },
+              "*",
+              [channel.port2],
+            );
+          });
+          iframe.srcdoc = `<!doctype html><html><body>
+            <script>window.__omniCspInlineCanary = true;<\/script>
+            <script src="${assetUrl}" data-omni-nonce="${nonce}"
+              data-omni-protocol="${protocol}"><\/script>
+          </body></html>`;
+          document.body.append(iframe);
+        }
+        """,
+        {"assetUrl": asset_url, "nonce": nonce},
+    )
+
+    iframe_el = page.locator("#external-bridge-probe")
+    expect(iframe_el).to_have_attribute("data-ready", "true", timeout=10_000)
+    preview = page.frame_locator("#external-bridge-probe")
+    expect(preview.locator(f'script[src="{asset_url}"][data-omni-nonce="{nonce}"]')).to_have_count(
+        1
+    )
+    canary_ran = preview.locator("body").evaluate("() => window.__omniCspInlineCanary === true")
+    assert not canary_ran, "inline canary ran; CSP did not reach the srcdoc frame"
 
 
 def _open_preview(page: Page, base_url: str, session_id: str):
@@ -358,7 +458,7 @@ def test_clicking_comment_scrolls_highlight_into_view(
     # Open the comments panel via the toolbar (the seeded comment isn't shown
     # until the panel is open).
     file_viewer.get_by_role("button", name="Show comments").click()
-    file_viewer.get_by_role("button", name=re.compile("Addressed")).click()
+    file_viewer.get_by_role("button", name=re.compile("Sent")).click()
     expect(file_viewer.get_by_text("deep comment")).to_be_visible()
     page.wait_for_timeout(200)
     assert _highlight_count(preview) == 0, "addressed anchors stay hidden until activated"

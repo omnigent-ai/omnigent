@@ -53,6 +53,9 @@ def isolated_env(environ: dict[str, str], output: Path) -> dict[str, str]:
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_AUTH_PROVIDER",
+        # Set for an agent running under Omnigent; inherited, the instance's
+        # processes would write into that agent's runner log.
+        "OMNIGENT_PROCESS_LOG_FILE",
     }
     env = {
         key: value
@@ -86,7 +89,10 @@ def _port() -> int:
 def write_model_config(
     config_home: Path, mock_url: str, claude_model: str, codex_model: str
 ) -> None:
+    from tests.helpers.ui_configuration import _CODEX_MOCK_PRICING_PER_MILLION
+
     config_home.mkdir(parents=True, exist_ok=True)
+    input_rate, output_rate, cache_read_rate = _CODEX_MOCK_PRICING_PER_MILLION
     config = {
         # The supervisor's lease owns lifetime, including idle investigation time.
         "runner": {"idle_timeout_s": 0},
@@ -108,6 +114,13 @@ def write_model_config(
                     "api_key": "mock-key",
                     "wire_api": "responses",
                     "models": {"default": codex_model},
+                    # The mock model is outside the pricing catalog; price it like the
+                    # standalone e2e fixture so codex-native sessions report a cost.
+                    "pricing": {
+                        "input_per_million": input_rate,
+                        "output_per_million": output_rate,
+                        "cache_read_per_million": cache_read_rate,
+                    },
                 },
             },
         },

@@ -1,7 +1,7 @@
 """Static guards on how a routed model reaches a live TUI.
 
 Every check here is a source-level invariant, not a behavior: the behavior is
-covered in ``tests/test_claude_native_bridge.py`` (the injector) and
+covered in ``tests/harnesses/claude_native/test_claude_native_bridge.py`` (the injector) and
 ``tests/server/test_turn_routing.py`` (the hook path).
 
 A routed switch is typed as ``/model <id>``. Claude Code answers it with "Set

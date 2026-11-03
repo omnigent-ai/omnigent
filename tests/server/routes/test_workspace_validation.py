@@ -103,7 +103,7 @@ async def host_setup() -> AsyncIterator[tuple[HostRegistry, _FakeWebSocket, asyn
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             if not isinstance(frame, HostStatFrame):
                 continue
             reply = stat_replies.get(frame.path)
@@ -134,7 +134,7 @@ async def host_setup() -> AsyncIterator[tuple[HostRegistry, _FakeWebSocket, asyn
         conn.outbound_queue.put_nowait(None)
         try:
             await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             drain_task.cancel()
 
 

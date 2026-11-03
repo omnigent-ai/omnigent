@@ -72,7 +72,8 @@ def test_daily_ask_key_routes_to_user_daily_store(
             StateUpdate(
                 key=USER_DAILY_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.SET, value=0.05
             )
-        ]
+        ],
+        approved=True,
     )
 
     today = utc_day(now_epoch())
@@ -137,7 +138,7 @@ async def test_approval_updates_in_memory_so_same_engine_does_not_reask(
         conversation_id=conv.id,
         initial_labels={},
         # $3 today, nothing approved yet → first tool call crosses the $2 checkpoint.
-        initial_user_daily_cost={"cost_usd": 3.0, "ask_approved_usd": 0.0},
+        initial_user_daily_cost=[{"cost_usd": 3.0, "ask_approved_usd": 0.0}],
         conversation_store=conversation_store,
     )
     ctx = EvaluationContext(
@@ -150,7 +151,7 @@ async def test_approval_updates_in_memory_so_same_engine_does_not_reask(
     assert first.action == PolicyAction.ASK  # crosses $2, not yet approved
 
     # Approve: applies the ASK's reserved daily state-update.
-    engine.apply_state_updates(first.state_updates)
+    engine.apply_state_updates(first.state_updates, approved=True)
 
     second = await engine.evaluate(ctx)
     # WITHOUT the in-memory refresh this would ASK again (stale snapshot);

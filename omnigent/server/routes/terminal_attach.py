@@ -48,8 +48,9 @@ Read-only mode
 --------------
 
 When the URL has ``?read_only=true``, binary input frames are dropped
-silently at the server *and* the runner. The tmux control-mode client is also
-marked read-only so tmux refuses input from this attachment.
+silently at the server *and* the runner. The tmux control-mode client is not
+attached with ``-r``: tmux >= 3.7 would then reject the harness's own
+``send-keys`` whenever the viewer is the most recently active client.
 
 Write attach is owner-only
 --------------------------
@@ -75,7 +76,7 @@ from typing import Final
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import OmnigentError
 from omnigent.runtime import (
     get_runner_ws_factory,
@@ -151,7 +152,7 @@ def create_terminal_attach_router(
             resolve_terminal_entry_by_resource_id,
         )
 
-        await _authorize_terminal_attach(
+        user_id = await _authorize_terminal_attach(
             websocket,
             session_id=session_id,
             read_only=read_only,
@@ -159,6 +160,9 @@ def create_terminal_attach_router(
             permission_store=permission_store,
             conversation_store=conversation_store,
         )
+        # WebSockets bypass the HTTP middleware that attributes debug-log rows
+        # to the request's user; this handler task is per-connection.
+        set_current_user_id(user_id)
         await websocket.accept()
         _logger.info(
             "terminal attach connected for session %s terminal %s",
@@ -283,7 +287,7 @@ async def _authorize_terminal_attach(
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore | None,
-) -> None:
+) -> str | None:
     """
     Authorize a terminal-attach WebSocket before accepting it.
 
@@ -312,12 +316,14 @@ async def _authorize_terminal_attach(
         all checks (single-user/dev mode).
     :param conversation_store: Conversation store consulted by the
         access check. Required when *permission_store* is set.
+    :returns: The caller's user id, or ``None`` when it cannot be resolved
+        (only possible with permissions disabled).
     :raises WebSocketException: With ``WS_1008_POLICY_VIOLATION`` when
         auth is misconfigured, the caller is unauthenticated, or the
         caller lacks the required level for the requested mode.
     """
     if permission_store is None:
-        return
+        return auth_provider.get_user_id(websocket) if auth_provider is not None else None
     if auth_provider is None or conversation_store is None:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,
@@ -354,6 +360,7 @@ async def _authorize_terminal_attach(
             code=status.WS_1008_POLICY_VIOLATION,
             reason="not authorized",
         ) from exc
+    return user_id
 
 
 class _RunnerWSClosed(Exception):

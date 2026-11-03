@@ -17,11 +17,45 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
 
 _logger = logging.getLogger(__name__)
+
+REAUTH_MAX_AGE_ENV = "OMNIGENT_OIDC_REAUTH_MAX_AGE"
+# Nonzero: Entra caps id_token exp at auth_time + max_age. Freshness is
+# enforced by the callback's auth_time >= reauth_at check.
+DEFAULT_REAUTH_MAX_AGE_SECONDS = 300
+
+
+def parse_reauth_max_age(raw: str | None) -> int:
+    """
+    Read the ``max_age`` a forced re-auth sends, from :data:`REAUTH_MAX_AGE_ENV`.
+
+    A value that is not a positive integer falls back to the default with a
+    warning, so a typo cannot bring back a token that expires on arrival.
+
+    :param raw: The env var's value, e.g. ``"90"``; ``None`` or blank when unset.
+    :returns: Seconds to send as ``max_age``, e.g. ``300``.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return DEFAULT_REAUTH_MAX_AGE_SECONDS
+    try:
+        seconds = int(value)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        _logger.warning(
+            "%s must be a positive number of seconds; using %d",
+            REAUTH_MAX_AGE_ENV,
+            DEFAULT_REAUTH_MAX_AGE_SECONDS,
+        )
+        return DEFAULT_REAUTH_MAX_AGE_SECONDS
+    return seconds
+
 
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
 
@@ -57,6 +91,7 @@ def mint_session_token(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -73,6 +108,8 @@ def mint_session_token(
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback,
+        never included in runner, refresh, or CLI-issued credentials.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -84,6 +121,8 @@ def mint_session_token(
     }
     if account_generation is not None:
         payload["account_generation"] = account_generation
+    if cli_login_ticket is not None:
+        payload["cli_login_ticket"] = cli_login_ticket
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -94,6 +133,7 @@ def mint_session_cookie(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -103,10 +143,16 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
-        user_id, cookie_secret, ttl_hours * 3600, provider, account_generation=account_generation
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        cli_login_ticket=cli_login_ticket,
     )
 
 
@@ -145,7 +191,7 @@ class OIDCConfig:
     :param issuer: OIDC issuer URL, e.g.
         ``"https://accounts.google.com"``.
     :param client_id: OAuth client ID registered with the IdP.
-    :param client_secret: OAuth client secret.
+    :param client_secret: OAuth client secret, or empty for public PKCE clients.
     :param redirect_uri: Full callback URL, e.g.
         ``"https://myapp.example.com/auth/callback"``.
     :param cookie_secret: HMAC key for session cookie signing
@@ -175,6 +221,13 @@ class OIDCConfig:
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
         ``"email"``. Only affects the generic-OIDC path.
+    :param reauth_max_age_seconds: ``max_age`` sent on a forced re-auth,
+        from ``OMNIGENT_OIDC_REAUTH_MAX_AGE``, e.g. ``300``.
+    :param require_reauth: When ``False``, forced re-authentication
+        logins (CLI tickets, device consent) still send
+        ``prompt=login`` and ``max_age`` but skip verifying the
+        id_token's ``auth_time``. Validated for every provider, but
+        GitHub never forces re-authentication, so it has no effect there.
     """
 
     issuer: str
@@ -194,6 +247,8 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    reauth_max_age_seconds: int = DEFAULT_REAUTH_MAX_AGE_SECONDS
+    require_reauth: bool = True
 
     @property
     def base_url(self) -> str:
@@ -240,8 +295,9 @@ class OIDCConfig:
     def from_env() -> OIDCConfig:
         """Read and validate all OIDC env vars.
 
-        Fetches the OIDC discovery document for standard providers,
-        or uses hardcoded endpoints for GitHub.
+        Uses explicit endpoints or discovery for standard providers,
+        and hardcoded endpoints for GitHub. Public clients must opt in
+        to token endpoint authentication method ``none``.
 
         :returns: A validated :class:`OIDCConfig`.
         :raises RuntimeError: If any required env var is missing or
@@ -259,7 +315,25 @@ class OIDCConfig:
 
         issuer = _require("OMNIGENT_OIDC_ISSUER")
         client_id = _require("OMNIGENT_OIDC_CLIENT_ID")
-        client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
+        auth_method = (
+            os.environ.get("OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD") or "client_secret_post"
+        ).strip()
+        if auth_method not in {"client_secret_post", "none"}:
+            raise RuntimeError(
+                "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD must be client_secret_post or none"
+            )
+        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        if auth_method == "none":
+            if is_github:
+                raise RuntimeError("GitHub login requires client_secret_post authentication")
+            if os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip():
+                raise RuntimeError(
+                    "Unset OMNIGENT_OIDC_CLIENT_SECRET when "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none"
+                )
+            client_secret = ""
+        else:
+            client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
         # Redirect URI: an explicit value wins; otherwise derive it from
         # OMNIGENT_DOMAIN (the same var the Caddy HTTPS overlay uses) as
         # ``https://<domain>/auth/callback``. A domain-based deploy then
@@ -286,6 +360,7 @@ class OIDCConfig:
             )
 
         session_ttl_hours = int(os.environ.get("OMNIGENT_OIDC_SESSION_TTL_HOURS", "8"))
+        reauth_max_age_seconds = parse_reauth_max_age(os.environ.get(REAUTH_MAX_AGE_ENV))
         logout_redirect_uri = (
             os.environ.get("OMNIGENT_OIDC_LOGOUT_REDIRECT_URI", "").strip() or None
         )
@@ -338,8 +413,60 @@ class OIDCConfig:
                     "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is also set."
                 )
 
+        # Some IdPs (e.g. Cloudflare Access) omit auth_time or ignore
+        # max_age, so forced re-authentication can never be verified.
+        # Only an explicit false value waives the check; typos fail startup.
+        raw_require_reauth = os.environ.get("OMNIGENT_OIDC_REQUIRE_REAUTH", "").strip().lower()
+        if raw_require_reauth not in {"", "1", "true", "yes", "0", "false", "no"}:
+            raise RuntimeError("OMNIGENT_OIDC_REQUIRE_REAUTH must be 1/true/yes or 0/false/no")
+        require_reauth = raw_require_reauth not in {"0", "false", "no"}
+        if not require_reauth and not is_github:
+            _logger.warning(
+                "OMNIGENT_OIDC_REQUIRE_REAUTH is disabled: CLI, host, and "
+                "device-approval logins still ask %s to re-authenticate, but "
+                "the id_token's auth_time is not verified. If the IdP reuses "
+                "its session, only the consent screen confirms the request.",
+                issuer,
+            )
+
         # Determine provider type and resolve endpoints.
-        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        endpoints = {
+            name: os.environ.get(f"OMNIGENT_OIDC_{name.upper()}", "").strip()
+            for name in ("authorization_endpoint", "token_endpoint", "jwks_uri")
+        }
+        if any(endpoints.values()):
+            if is_github:
+                raise RuntimeError("OIDC endpoint overrides are not supported for GitHub login")
+            if not all(endpoints.values()):
+                raise RuntimeError(
+                    "Set all three OIDC endpoint overrides: OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT, "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT, and OMNIGENT_OIDC_JWKS_URI"
+                )
+            for name, endpoint in endpoints.items():
+                try:
+                    parsed = urlsplit(endpoint)
+                    valid = (
+                        bool(parsed.hostname)
+                        and parsed.username is None
+                        and parsed.password is None
+                        and not parsed.fragment
+                        and (parsed.port is None or parsed.port > 0)
+                        and not any(character.isspace() for character in endpoint)
+                        and (
+                            parsed.scheme == "https"
+                            or (
+                                parsed.scheme == "http"
+                                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                            )
+                        )
+                    )
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise RuntimeError(
+                        f"OMNIGENT_OIDC_{name.upper()} must be an absolute HTTPS URL "
+                        "without userinfo or a fragment (HTTP is allowed only for loopback)"
+                    )
 
         if is_github:
             # Empty string (forwarded by `${VAR:-}` wrappers) → default.
@@ -361,19 +488,23 @@ class OIDCConfig:
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
+                require_reauth=require_reauth,
             )
 
         # Standard OIDC: fetch discovery document.
         scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or "openid email profile").strip()
         discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
-        try:
-            resp = httpx.get(discovery_url, timeout=10.0)
-            resp.raise_for_status()
-            doc = resp.json()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
-            ) from exc
+        if all(endpoints.values()):
+            doc = endpoints
+        else:
+            try:
+                resp = httpx.get(discovery_url, timeout=10.0)
+                resp.raise_for_status()
+                doc = resp.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
+                ) from exc
 
         authorization_endpoint = doc.get("authorization_endpoint")
         token_endpoint = doc.get("token_endpoint")
@@ -404,4 +535,6 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            reauth_max_age_seconds=reauth_max_age_seconds,
+            require_reauth=require_reauth,
         )

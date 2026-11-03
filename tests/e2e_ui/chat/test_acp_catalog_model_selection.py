@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import gzip
 import io
-import json
 import re
 import shlex
 import subprocess
@@ -54,6 +53,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online
 
 _ACP_SLUG = "fake-cline"
@@ -218,21 +218,13 @@ def acp_session_factory(
 
     def _create(*agent_args: str) -> tuple[str, str]:
         command = shlex.join([sys.executable, str(agent_script), *agent_args])
-        create_resp = httpx.post(
-            f"{live_server}/v1/sessions",
-            data={"metadata": json.dumps({})},
-            files={"bundle": ("agent.tar.gz", _acp_launcher_bundle(command), "application/gzip")},
-            timeout=30.0,
+        create_resp = post_session_bundle(
+            httpx.post, f"{live_server}/v1/sessions", _acp_launcher_bundle(command), timeout=30.0
         )
         create_resp.raise_for_status()
         session_id = create_resp.json()["session_id"]
         created.append(session_id)
-        patch_resp = httpx.patch(
-            f"{live_server}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        )
-        patch_resp.raise_for_status()
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
         return (live_server, session_id)
 
     try:
@@ -258,29 +250,21 @@ def _session_status(base_url: str, session_id: str) -> str:
     return str(response.json()["status"])
 
 
-def _wait_for_turn_round_trip(base_url: str, session_id: str, timeout_s: float = 120.0) -> None:
-    """Wait for the session to leave ``idle`` and settle back to ``idle``.
+def _wait_for_idle(base_url: str, session_id: str, timeout_s: float = 30.0) -> None:
+    """Wait for idle after the current turn's assistant reply is visible.
 
-    Polling for ``idle`` right after a send false-fires on the pre-turn idle,
-    so the session must be observed leaving idle first.
+    The reply proves the turn ran even if it finished before the first poll.
 
     :param base_url: Server base URL.
     :param session_id: The driven session.
-    :param timeout_s: Overall deadline for the round trip.
+    :param timeout_s: Overall deadline for returning to idle.
     """
     deadline = time.monotonic() + timeout_s
-    left_idle = False
     while time.monotonic() < deadline:
-        status = _session_status(base_url, session_id)
-        if status != "idle":
-            left_idle = True
-        elif left_idle:
+        if _session_status(base_url, session_id) == "idle":
             return
         time.sleep(0.2)
-    pytest.fail(
-        f"session {session_id} never completed a turn round-trip "
-        f"(leave idle -> return to idle) within {timeout_s:.0f}s"
-    )
+    pytest.fail(f"session {session_id} did not return to idle within {timeout_s:.0f}s")
 
 
 def test_configured_model_reaches_catalog_style_acp_agent(
@@ -346,12 +330,9 @@ def test_web_turn_produces_output_when_agent_defaults_to_metered_model(
     # The user message persists in the transcript...
     expect(page.get_by_text("test", exact=True).first).to_be_visible(timeout=30_000)
 
-    # ...and the turn dispatches and completes (leave idle -> back to idle).
-    _wait_for_turn_round_trip(base_url, session_id)
-
-    # The reported failure point: the session is idle again with only the user
-    # message persisted and zero assistant output. With the model correctly
-    # switched off the metered default, the agent's reply renders here.
+    # The reply proves dispatch; a fast turn can finish before status polling
+    # ever observes busy. A silent metered turn still fails this assertion.
     expect(page.get_by_text(re.compile(re.escape(_MODEL_MARKER))).first).to_be_visible(
-        timeout=30_000
+        timeout=120_000
     )
+    _wait_for_idle(base_url, session_id)

@@ -221,8 +221,14 @@ def test_content_hash_ignores_bot_managed_labels() -> None:
         "community",
     )
     lifecycle = IssueContent(1, "Broken", "Details", ("Feature", "needs-info"), "community")
+    # The repro-agent flips validating/validated:* on the same content; those must
+    # not re-grade (only a real body/title edit does).
+    validation = IssueContent(
+        1, "Broken", "Details", ("Bug", "validating", "validated:likely_repro"), "community"
+    )
     changed = IssueContent(1, "Broken", "New details", ("Bug",), "community")
 
     assert base.content_hash == managed.content_hash
     assert base.content_hash == lifecycle.content_hash
+    assert base.content_hash == validation.content_hash
     assert base.content_hash != changed.content_hash

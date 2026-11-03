@@ -447,6 +447,31 @@ def test_native_message_replays_one_aggregate_with_id_and_index() -> None:
     ]
 
 
+def test_retiring_native_previews_keeps_response_scoped_text() -> None:
+    cid = "conv_native_retire"
+    inflight_text.record_publish(cid, _created("resp_1"))
+    inflight_text.record_publish(cid, _delta("response text"))
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "native preview", final=True))
+
+    inflight_text.retire_native_previews(cid)
+
+    snapshot = inflight_text.snapshot_for(cid)
+    assert [event.get("message_id") for event in snapshot] == [None, None]
+    assert snapshot[-1]["delta"] == "response text"
+
+
+def test_retiring_native_previews_preserves_unfinished_messages() -> None:
+    cid = "conv_native_retire_unfinished"
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "finished", final=True))
+    inflight_text.record_publish(cid, _native_delta("m2", 0, "still streaming"))
+
+    inflight_text.retire_native_previews(cid)
+
+    assert [
+        (event["message_id"], event["delta"]) for event in inflight_text.snapshot_for(cid)
+    ] == [("m2", "still streaming")]
+
+
 def test_native_messages_replay_in_order_not_blobbed() -> None:
     """Each native message keeps its own reconnect aggregate."""
     cid = "conv_native_multi"

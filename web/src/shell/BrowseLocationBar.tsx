@@ -1,4 +1,4 @@
-import { ArrowLeftIcon, FolderDotIcon } from "lucide-react";
+import { CornerLeftUpIcon, FolderDotIcon } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -169,7 +169,7 @@ function ParentFolderButton({
             className="shrink-0 text-muted-foreground hover:text-foreground"
             onClick={() => parent && onNavigate(parent)}
           >
-            <ArrowLeftIcon />
+            <CornerLeftUpIcon />
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">Back one folder</TooltipContent>

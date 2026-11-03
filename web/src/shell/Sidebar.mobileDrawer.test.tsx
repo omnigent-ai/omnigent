@@ -1,54 +1,21 @@
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 // Behaviour tests for the mobile sidebar drawer shape: it stops short of the
 // right edge so a strip of the chat stays visible, tapping that strip dismisses
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
 // Settings float at the top and bottom of the drawer.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    hasNextPage: false,
-    isFetchingNextPage: false,
-    fetchNextPage: vi.fn(),
-  }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return conversationHooksMock();
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 vi.mock("@/lib/serverOrigin", () => ({
   isCurrentServerLocal: () => false,
@@ -57,62 +24,11 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
-function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
-  return {
-    id,
-    object: "conversation",
-    title: id,
-    created_at: 0,
-    updated_at: 0,
-    labels: {},
-    permission_level: null,
-    status: "idle",
-    ...partial,
-  };
-}
-
 function mockConversations(conversations: Conversation[]) {
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: conversations,
-              first_id: conversations[0]?.id ?? null,
-              last_id: conversations.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: string } = {}) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[props.route ?? "/"]}>
-            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(conversations));
 }
 
 beforeEach(() => {
@@ -204,31 +120,20 @@ describe("mobile sidebar drawer", () => {
     );
   });
 
-  it("gives both floating chips one shared glass treatment", () => {
-    // These drifted apart once — Settings landed opaque with a heavier shadow
-    // than Search. The look now lives in a single CSS class, so assert both
-    // wear it and neither carries a competing background or shadow utility.
+  it("keeps both floating actions icon-only on mobile", () => {
     renderSidebar();
 
     const search = screen.getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("sidebar-settings-float").closest("a, button")!;
 
-    // Where the chip sits, and which breakpoint it shows at, legitimately
-    // differ; everything about how it looks must not.
-    // `relative` is the Button base's own position, which tailwind-merge drops
-    // from the floating copy in favour of `absolute` — placement, not looks.
     for (const button of [search, settings]) {
-      expect(button).toHaveClass(
-        "sidebar-glass-chip",
-        "max-md:size-11",
-        "max-md:rounded-full",
-        "max-md:text-foreground",
-      );
+      expect(button).toHaveClass("max-md:size-11", "max-md:text-foreground");
+      expect(button).not.toHaveClass("sidebar-glass-chip", "max-md:rounded-full");
     }
   });
 
-  it("gives the session list a gutter so the last row clears the floating chip", () => {
-    // The chip doesn't scroll, so without this it would cover the last row,
+  it("gives the session list a gutter so the last row clears the floating action", () => {
+    // The action doesn't scroll, so without this it would cover the last row,
     // hiding its title and state badge and blocking the tap target.
     renderSidebar();
 
@@ -262,6 +167,7 @@ describe("mobile sidebar drawer keyboard inset", () => {
   afterEach(() => {
     delete (window as unknown as Record<string, unknown>).omnigentNative;
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("pads the drawer bottom by the keyboard inset when the iOS keyboard is open", () => {
@@ -293,6 +199,27 @@ describe("mobile sidebar drawer keyboard inset", () => {
     );
   });
 
+  it("leaves the list scroll alone when the keyboard opens for focus outside it", () => {
+    // Focused rename rows are re-centered in Sidebar.rowActions.test.tsx.
+    setIOSViewport(844, 844);
+    renderSidebar();
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    composer.focus();
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+
+    act(() => {
+      (window.visualViewport as unknown as { height: number }).height = 508;
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+      paddingBottom: "336px",
+    });
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    composer.remove();
+  });
+
   it("applies no bottom padding off the iOS shell even when the viewport shrinks", () => {
     // A shrunk visual viewport but no iOS shell marker: the browser/Electron
     // keyboard is handled by normal layout, so the drawer must not pad itself.
@@ -308,5 +235,165 @@ describe("mobile sidebar drawer keyboard inset", () => {
     expect(screen.getByRole("complementary", { name: "Conversations" }).style.paddingBottom).toBe(
       "",
     );
+  });
+});
+
+/** Dispatch a touch event with `fingers` touches down on `target` at `time` ms. */
+function touch(target: Element, type: string, x: number, time: number, fingers = 1): void {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "touches", {
+    value:
+      type === "touchend"
+        ? []
+        : Array.from({ length: fingers }, () => ({ clientX: x, clientY: 300 })),
+  });
+  Object.defineProperty(event, "timeStamp", { value: time });
+  act(() => {
+    target.dispatchEvent(event);
+  });
+}
+
+function stubMobileLayout(mobile: boolean): void {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: mobile && query.includes("max-width"),
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
+}
+
+// A leftward swipe on the open drawer slides it shut under the finger, the
+// reverse of the iOS shell's left-edge swipe that opens it.
+describe("mobile sidebar drawer swipe to close", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function renderDrawer(props: { route?: string; dragProgress?: number } = {}) {
+    const onClose = vi.fn();
+    const { setOpen } = renderSidebar({ onClose, ...props });
+    const drawer = screen.getByRole("complementary", { name: "Conversations" });
+    drawer.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
+    return { onClose, drawer, setOpen };
+  }
+
+  it("follows the finger and closes once released past a third of its width", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 60);
+    touch(drawer, "touchmove", 100, 120);
+
+    expect(drawer.style.transform).toBe("translateX(-50%)");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("0.5");
+    expect(onClose).not.toHaveBeenCalled();
+
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(drawer.style.transform).toBe("");
+  });
+
+  it("springs back open without closing after a short drag", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 270, 80);
+    touch(drawer, "touchmove", 250, 160);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(drawer.style.transform).toBe("");
+  });
+
+  it("drops the drag when a second finger lands, so the drawer can still close", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer, setOpen } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 270, 80);
+    touch(drawer, "touchmove", 250, 160);
+    expect(drawer.style.transform).toBe("translateX(-12.5%)");
+
+    touch(drawer, "touchstart", 250, 200, 2);
+    touch(drawer, "touchend", 0, 260);
+
+    expect(drawer.style.transform).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+
+    setOpen(false);
+
+    expect(drawer).toHaveAttribute("data-collapsed", "true");
+    expect(drawer.style.transform).toBe("");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
+  });
+
+  it("clears a drag cut off by the drawer closing, so reopening shows no stale offset", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer, setOpen } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 80);
+    touch(drawer, "touchmove", 200, 160);
+    expect(drawer.style.transform).toBe("translateX(-25%)");
+
+    setOpen(false);
+    expect(drawer).toHaveAttribute("data-collapsed", "true");
+    expect(drawer.style.transform).toBe("");
+
+    touch(drawer, "touchmove", 100, 200);
+    touch(drawer, "touchend", 0, 240);
+    setOpen(true);
+
+    expect(drawer.style.transform).toBe("");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("leaves a row long-press to drag-to-reorder", async () => {
+    stubMobileLayout(true);
+    vi.useFakeTimers();
+    const { onClose, drawer } = renderDrawer();
+    const row = screen.getByRole("link", { name: "conv_a" }).closest("li")!;
+    const dragPreview = () => document.body.querySelector('[class*="max-w-[16rem]"]');
+
+    try {
+      touch(row, "touchstart", 300, 0);
+      await act(() => vi.advanceTimersByTimeAsync(300));
+      expect(dragPreview()).not.toBeNull();
+
+      touch(row, "touchmove", 250, 300);
+      touch(row, "touchmove", 100, 360);
+      expect(drawer.style.transform).toBe("");
+      touch(row, "touchend", 0, 400);
+
+      expect(drawer.style.transform).toBe("");
+      expect(onClose).not.toHaveBeenCalled();
+    } finally {
+      // dnd-kit defers removing its document listeners by 50 ms.
+      await act(() => vi.advanceTimersByTimeAsync(50));
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["the desktop layout", { mobile: false }, ""],
+    ["Settings", { mobile: true, route: "/settings" }, ""],
+    // The native edge swipe owns the drawer while its progress is live.
+    ["a native edge swipe", { mobile: true, dragProgress: 0.5 }, "translateX(-50%)"],
+  ])("ignores the swipe during %s", (_label, { mobile, ...props }, transform) => {
+    stubMobileLayout(mobile);
+    const { onClose, drawer } = renderDrawer(props);
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 80);
+    touch(drawer, "touchmove", 100, 160);
+    expect(drawer.style.transform).toBe(transform);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(drawer.style.transform).toBe(transform);
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

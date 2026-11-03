@@ -295,17 +295,16 @@ def test_agent_reaches_for_embedded_browser_on_neutral_browse_ask(
     The live form of the reported journey, on the real ``claude-native``
     wrapper against the real gateway:
 
-    1. open a claude-native session in the app with the Browser pane
-       available (Electron bridge stubbed, as in ``test_browser_tab``) and
-       the empty Browser pane showing in the right Workspace rail;
+    1. open a claude-native session with the browser bridge stubbed and no
+       Browser soft tab open yet;
     2. ask the agent — neutrally, no tool coaching — to look at a web page;
     3. the agent answers via its OWN web tooling (WebFetch / shell) and the
        embedded browser is never driven: no ``browser_navigate`` call ever
-       lands in the canonical transcript, and the pane stays empty.
+       lands in the canonical transcript, so no Browser soft tab opens.
 
     Asserts the fixed behavior — the transcript records the agent reaching
-    for the embedded browser — so the test FAILS on the buggy build, naming
-    the tools the agent used instead.
+    for the embedded browser and the Browser soft tab appears — so the test
+    FAILS on the buggy build, naming the tools the agent used instead.
 
     :param page: Playwright page fixture (fresh context per test).
     :param live_server: Spawned server fixture; its runner is reused.
@@ -319,15 +318,11 @@ def test_agent_reaches_for_embedded_browser_on_neutral_browse_ask(
         page.goto(f"{live_server}/c/{session_id}")
         _ensure_chat_view(page)
 
-        # Show the (empty) embedded-browser pane alongside the chat: the
-        # user-visible half of the bug is that it STAYS empty while the
-        # agent browses with its own tooling.
+        # The Browser is no longer a permanent navigation tab. Agent navigation
+        # must create and select its closable soft tab on demand.
         open_right_rail(page)
         rail = page.get_by_role("complementary", name="Workspace")
-        browser_tab = rail.get_by_role("tab", name=re.compile("Browser"))
-        expect(browser_tab).to_be_visible(timeout=30_000)
-        browser_tab.click()
-        expect(browser_tab).to_have_attribute("aria-selected", "true")
+        expect(rail.get_by_role("tab", name=re.compile("Browser"))).to_have_count(0)
 
         _send(page, _NEUTRAL_BROWSE_ASK)
 
@@ -350,6 +345,9 @@ def test_agent_reaches_for_embedded_browser_on_neutral_browse_ask(
             "the transcript) — it used its own web tooling instead. Tool "
             f"calls this turn were: {call_names!r}"
         )
+        browser_tab = rail.get_by_role("tab", name="Browser 1", exact=True)
+        expect(browser_tab).to_have_attribute("aria-selected", "true")
+        expect(rail.get_by_role("button", name="Close Browser 1", exact=True)).to_be_visible()
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         if respawned is not None:

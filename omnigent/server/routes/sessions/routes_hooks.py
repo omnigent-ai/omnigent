@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -22,6 +23,8 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.policy_allow_cache import ALLOW_CACHE_FIELD, MAX_ALLOW_CACHE_SECONDS
+from omnigent.pi_extension_ui import timeout_seconds, to_elicitation_params, to_ui_response
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -30,10 +33,12 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.caps import RuntimeCaps
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.runtime.policies.builder import (
     any_policies_apply,
     build_policy_engine,
+    policy_specs_cache_age,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.server._elicitation_registry import (
@@ -49,6 +54,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -77,6 +83,7 @@ from omnigent.server.routes._sessions.helpers import (
     _allow_remember_eligible,
     _build_actor,
     _build_evaluation_context,
+    _claude_native_permission_directories,
     _claude_native_remember_host,
     _client_supplied_hook_elicitation_id,
     _emit_server_routing_decision,
@@ -102,11 +109,47 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.policy_store import PolicyStore
 
 #: Policy-name vendor for a native agent key, where the two differ. Mirrors
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+def _no_policy_allow_body(
+    caps: RuntimeCaps, session_id: str, policy_store: PolicyStore | None
+) -> dict[str, object]:
+    """Build the ALLOW body for an evaluation where no policies apply.
+
+    When the operator enables the allow cache, the body says how long the
+    session's native hooks may reuse this answer instead of asking again: the
+    configured window, capped, minus the age of the policy lists behind the
+    answer. A policy change therefore reaches native hooks within the window.
+
+    :param caps: The server's runtime caps.
+    :param session_id: The evaluated session, e.g. ``"conv_abc123"``.
+    :param policy_store: The policy store the no-policy answer read.
+    :returns: The response body, e.g.
+        ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
+    """
+    body: dict[str, object] = {"result": "POLICY_ACTION_ALLOW"}
+    resolver = caps.native_hook_allow_cache_seconds
+    if resolver is None:
+        return body
+    try:
+        seconds = float(resolver())
+    except Exception:  # A broken resolver must not fail the gate.
+        _logger.warning("native hook allow-cache resolver failed; not caching", exc_info=True)
+        return body
+    if not math.isfinite(seconds):
+        _logger.warning("native hook allow-cache window %r is not finite; not caching", seconds)
+        return body
+    seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS)
+    seconds -= policy_specs_cache_age(session_id, policy_store)
+    if seconds > 0:
+        body[ALLOW_CACHE_FIELD] = seconds
+    return body
 
 
 def _create_route_decision_id(
@@ -207,7 +250,7 @@ def register_hooks_routes(
 
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -299,17 +342,32 @@ def register_hooks_routes(
         # permission card with the gated tool name and distinguish
         # simultaneous prompts from different tools.
         extras: dict[str, Any] = {"tool_name": tool_name}
+        permission_directories = (
+            _claude_native_permission_directories(payload.get("permission_suggestions"))
+            if is_claude
+            else None
+        )
+        if permission_directories:
+            extras["permission_directories"] = permission_directories
         if cwd is not None:
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        if is_claude and _allow_auto_mode_eligible(tool_name, permission_mode):
+        if (
+            is_claude
+            and not permission_directories
+            and _allow_auto_mode_eligible(tool_name, permission_mode)
+        ):
             extras["allow_auto_mode"] = True
         # Edit tools → "Accept & allow all edits" (switches the session to
         # acceptEdits via setMode). Stamped only for edit-tool prompts
         # under a still-prompting mode — see _allow_all_edits_eligible.
         # The verdict site re-checks the same predicate before honoring it.
-        if is_claude and _allow_all_edits_eligible(tool_name, permission_mode):
+        if (
+            is_claude
+            and not permission_directories
+            and _allow_all_edits_eligible(tool_name, permission_mode)
+        ):
             extras["allow_all_edits"] = True
         # Non-edit eligible tools → "don't ask again" (installs a
         # session-scoped allow rule via addRules). Stamped only when the
@@ -318,7 +376,11 @@ def register_hooks_routes(
         # request host so the UI can label the button ("… for github.com"
         # vs "… for WebFetch"); the verdict site re-derives the same scope
         # before honoring the flag, never trusting a client-supplied rule.
-        if is_claude and _allow_remember_eligible(tool_name, permission_mode):
+        if (
+            is_claude
+            and not permission_directories
+            and _allow_remember_eligible(tool_name, permission_mode)
+        ):
             remember_scope: dict[str, Any] = {"tool": tool_name}
             remember_host = _claude_native_remember_host(tool_name, tool_input)
             if remember_host is not None:
@@ -440,7 +502,22 @@ def register_hooks_routes(
             and tool_input
         ):
             decision["updatedInput"] = tool_input
-        if (
+        if permission_directories:
+            # Only the explicit directory action grants the scope offered by Claude.
+            # Browser-supplied paths and generic permission-mode flags cannot widen it.
+            if (
+                behavior == "allow"
+                and isinstance(result.content, dict)
+                and result.content.get("allow_directories") is True
+            ):
+                decision["updatedPermissions"] = [
+                    {
+                        "type": "addDirectories",
+                        "directories": permission_directories,
+                        "destination": "session",
+                    }
+                ]
+        elif (
             behavior == "allow"
             and isinstance(result.content, dict)
             and result.content.get("allow_auto_mode") is True
@@ -658,7 +735,24 @@ def register_hooks_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        is_read_only = access.level is not None and access.level < LEVEL_EDIT
+        is_read_only = permission_store is not None and (
+            access.level is None or access.level < LEVEL_EDIT
+        )
+        if (
+            permission_store is not None
+            and access.conversation is not None
+            and access.conversation.parent_conversation_id is not None
+        ):
+            # Child display levels do not describe the parent's mutation authority.
+            is_read_only = not await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                access.conversation,
+            )
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -820,7 +914,7 @@ def register_hooks_routes(
             )
 
         loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
 
         _caps = _sf.get_caps()
@@ -830,13 +924,15 @@ def register_hooks_routes(
         # entirely. This avoids conversation-store reads for labels/state/usage
         # on every tool call for the common no-policy case. Session policies are
         # LRU-cached so this check is cheap after the first call per session.
-        # Users can add policies mid-session — the cache is invalidated on
-        # mutation, so newly added policies are visible on the very next call.
+        # Mutations invalidate that cache, so a newly added policy applies on
+        # the next call, or once a native hook's allow window (see
+        # _no_policy_allow_body) expires.
+        policy_store = get_policy_store()
         if not any_policies_apply(
             spec=loaded.spec,
             conversation_id=session_id,
             default_policies=_caps.default_policies,
-            policy_store=get_policy_store(),
+            policy_store=policy_store,
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
             # A sub-agent conversation's own guardrails live on the CHILD
@@ -845,7 +941,7 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                content=json.dumps(_no_policy_allow_body(_caps, session_id, policy_store)),
                 media_type="application/json",
             )
 
@@ -1123,7 +1219,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1214,7 +1310,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1313,7 +1409,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1430,7 +1526,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1466,6 +1562,23 @@ def register_hooks_routes(
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
         extras: dict[str, Any] = {}
+        native_delivery = payload.get("native_delivery")
+        if native_delivery is not None:
+            if (
+                policy_name != "kiro_native_permission"
+                or not isinstance(native_delivery, dict)
+                or native_delivery.get("state") not in ("ready", "unconfirmed")
+                or not isinstance(native_delivery.get("attempt"), str)
+                or not native_delivery["attempt"]
+                or (
+                    native_delivery["state"] == "unconfirmed"
+                    and native_delivery.get("action") not in ("accept", "decline", "cancel")
+                )
+            ):
+                raise OmnigentError(
+                    "Invalid native delivery attempt.", code=ErrorCode.INVALID_INPUT
+                )
+            extras["native_delivery"] = native_delivery
         ask_user_question = payload.get("ask_user_question")
         if isinstance(ask_user_question, dict) and isinstance(
             ask_user_question.get("questions"), list
@@ -1494,7 +1607,7 @@ def register_hooks_routes(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
-        if result.action == "decline":
+        if result.action == "decline" and native_delivery is None:
             # Explicit user decline: interrupt the native harness before
             # returning the decline so the abort signal arrives first.
             await _forward_session_change_to_runner(
@@ -1502,8 +1615,81 @@ def register_hooks_routes(
                 get_server_runner_router(),
                 {"type": "interrupt"},
             )
+        result_payload = result.model_dump(exclude_none=True)
+        if native_delivery is not None:
+            result_payload["native_delivery_attempt"] = native_delivery["attempt"]
         return Response(
-            content=json.dumps(result.model_dump(exclude_none=True)),
+            content=json.dumps(result_payload),
+            media_type="application/json",
+        )
+
+    # ── POST /sessions/{session_id}/hooks/pi-extension-ui ─
+
+    @router.post(
+        "/sessions/{session_id}/hooks/pi-extension-ui",
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def pi_extension_ui_hook(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """Pi-native extension UI hook (TUI wrap → web elicitation)."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                f"Invalid JSON in Pi extension UI hook body: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Pi extension UI hook body must be a JSON object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = payload.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id.startswith("elicit_pi_"):
+            raise OmnigentError(
+                "Pi extension UI hook 'elicitation_id' must start with 'elicit_pi_'.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        elicitation_id = _client_supplied_hook_elicitation_id(
+            {"_omnigent_elicitation_id": elicitation_id}, session_id
+        )
+        raw_request = payload.get("request")
+        if not isinstance(raw_request, dict):
+            raise OmnigentError(
+                "Pi extension UI hook body must include a 'request' object.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            params = to_elicitation_params(raw_request)
+        except ValueError as exc:
+            raise OmnigentError(
+                str(exc),
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        from omnigent.server.routes import sessions as _sf
+
+        result = await _publish_and_wait_for_harness_elicitation(
+            request,
+            session_id=session_id,
+            params=params,
+            timeout_s=min(
+                timeout_seconds(raw_request) or _sf._PI_EXTENSION_UI_HOOK_TIMEOUT_S,
+                _sf._PI_EXTENSION_UI_HOOK_TIMEOUT_S,
+            ),
+            conversation_store=conversation_store,
+            elicitation_id=elicitation_id,
+            tool_name="Pi(extension_ui)",
+        )
+        return Response(
+            content=json.dumps(to_ui_response(raw_request, result)),
             media_type="application/json",
         )
 
@@ -1640,7 +1826,7 @@ def register_hooks_routes(
         # Claude Code session never gets a Codex suggestion.
         cross_harness = auto_harness_session(conv, parent)
         # Which families the spawn may land on decides which router can serve it:
-        # off the AI Gateway the built-in judge answers, from the live catalog
+        # off the Unity Gateway the built-in judge answers, from the live catalog
         # alone (the static table's databricks-* ids are unreachable there).
         gateway_backed = await _spawn_gateway_backed(
             request,
@@ -1758,7 +1944,7 @@ def register_hooks_routes(
                 )
 
         # This pane's own family decides which router can serve its first turn.
-        # A create off the AI Gateway now succeeds (the built-in judge answers),
+        # A create off the Unity Gateway now succeeds (the built-in judge answers),
         # so this hook must make the same choice the composer path does.
         turn_gateway_backed = (
             await _spawn_gateway_backed(request, conv, (route_request.harness,))

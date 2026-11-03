@@ -26,7 +26,7 @@ import re
 from typing import Any
 
 
-def _redact_url(url: str | None) -> str | None:
+def redact_url(url: str | None) -> str | None:
     """Strip userinfo and query/fragment from a URL so it's safe to print.
 
     A ``--server`` value could carry embedded basic-auth (``https://user:pass@h``)
@@ -167,7 +167,7 @@ def collect_snapshot(*, server_url: str | None = None, timeout: float = 5.0) -> 
     return {
         "cli_version": _local_version(),
         "server_version": server_version,
-        "server_url": _redact_url(server_url),
+        "server_url": redact_url(server_url),
         "auth_source": auth_source,
         "auth_source_origin": auth_source_origin,
         "os": platform.platform(),

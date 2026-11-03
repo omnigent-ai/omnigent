@@ -24,15 +24,13 @@ async body runs in its own thread via :func:`asyncio.run`.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
-from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Stubbed host the composer auto-selects (the tunneled runner registers no
@@ -47,33 +45,6 @@ _TOGGLE_KEY = "omnigent:hide-unconfigured-harnesses"
 # picker's "Harnesses" group — the surface the filter acts on.
 _CLAUDE_AGENT_ID = "ag_claude_e2e"
 _GOOSE_AGENT_ID = "ag_goose_e2e"
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    The e2e_ui suite runs many pytest-playwright **sync** tests in the same
-    session; once one has run, pytest-asyncio can't start a loop on the main
-    thread. Running the coroutine from a fresh thread via :func:`asyncio.run`
-    sidesteps that. Any exception (including assertion failures) is captured and
-    re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _hosts_body() -> str:
@@ -180,6 +151,7 @@ async def _register_routes(page, hosts_body=_hosts_body) -> None:
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
 
 async def _open_picker(page) -> None:

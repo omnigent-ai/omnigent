@@ -5,20 +5,28 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import (
     _BlockingHarnessClient,
     _build_lifecycle_app,
@@ -31,6 +39,125 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", [None, "0", "1"])
+@pytest.mark.parametrize("stream", [False, True], ids=["background", "stream"])
+async def test_native_shell_authorization_requires_server_transport(
+    header: str | None, stream: bool
+) -> None:
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    app, _pm, harness = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/shell-authorization/events",
+            params={"stream": stream},
+            headers={CODEX_SHELL_AUTHORIZED_HEADER: header} if header is not None else {},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "shell-agent",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "!printf trusted"}],
+                "authorized_native_shell_command": "printf forged",
+            },
+        )
+        assert response.status_code == (200 if stream else 202), response.text
+        await poll_until_async(
+            lambda: bool(harness.posted_bodies) and not app.state.active_turns,
+            timeout_s=budget(5),
+        )
+    [body] = harness.posted_bodies
+    request = MessageEvent.model_validate(body).to_create_request()
+    assert request.authorized_native_shell_command == ("printf trusted" if header == "1" else None)
+
+
+@pytest.mark.asyncio
+async def test_native_shell_authorization_stays_with_each_buffered_message() -> None:
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    gate = asyncio.Event()
+    app, _pm, harness = _build_native_app(gate)
+    session_id = "shell-buffer-authorization"
+
+    async def post(client: httpx.AsyncClient, text: str, authorized: bool) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session_id}/events",
+            headers={CODEX_SHELL_AUTHORIZED_HEADER: "1"} if authorized else {},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "shell-agent",
+                "content": [{"type": "input_text", "text": text}],
+                "authorized_native_shell_command": "printf forged",
+            },
+        )
+
+    async with _runner_client(app) as client:
+        try:
+            assert (await post(client, "!printf first", True)).status_code == 202
+            await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=budget(5))
+            for text, authorized in [("!printf second", True), ("!printf legacy", False)]:
+                response = await post(client, text, authorized)
+                assert response.status_code == 202, response.text
+                assert response.json()["status"] == "buffered"
+        finally:
+            gate.set()
+        await poll_until_async(
+            lambda: len(harness.posted_bodies) == 3 and not app.state.active_turns,
+            timeout_s=budget(5),
+        )
+    assert harness.turn_latest_texts == ["!printf first", "!printf second", "!printf legacy"]
+    assert [
+        MessageEvent.model_validate(body).to_create_request().authorized_native_shell_command
+        for body in harness.posted_bodies
+    ] == ["printf first", "printf second", None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_native_input_identity_reaches_the_harness_request(harness: str) -> None:
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    identity = {
+        "input_stable_id": "a" * 32,
+        "pending_id": "pending_" + "b" * 32,
+        "delivery_attempt_id": "c" * 32,
+        "input_enqueued_at_ms": 12345,
+    }
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "private prompt"}],
+                "harness": harness,
+                "stable_id": "a" * 32,
+                **identity,
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+    assert len(hc.posted_bodies) == 1
+    request = MessageEvent.model_validate(hc.posted_bodies[0]).to_create_request()
+    assert request.model_dump(include=set(identity)) == identity
 
 
 def _build_blocking_app(
@@ -368,11 +495,12 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
     harness once it drains the injection into the running turn.
     """
 
-    def __init__(self, gate: asyncio.Event) -> None:
-        """Initialize with the gate that unblocks the turn-1 stream."""
+    def __init__(self, gate: asyncio.Event, completion_gate: asyncio.Event | None = None) -> None:
+        """Initialize with gates for consumption and optional turn completion."""
         super().__init__([])
         self._gate = gate
         self._consumed_ids: list[str] = []
+        self._completion_gate = completion_gate
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Turn-1 stream: created → (gate) → consumed markers → completed."""
@@ -380,6 +508,7 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
         self.posted_bodies.append(json)
         gate = self._gate
         consumed_ids = self._consumed_ids
+        completion_gate = self._completion_gate
 
         class _Ctx:
             status_code = 200
@@ -400,6 +529,8 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
                 # into the running turn, echo each correlation id back.
                 for inj_id in list(consumed_ids):
                     yield _sse({"type": "injection.consumed", "injection_id": inj_id})
+                if completion_gate is not None:
+                    await completion_gate.wait()
                 yield _sse({"type": "response.completed", "response": {"id": "resp_1"}})
 
         return _Ctx()
@@ -425,15 +556,17 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
 
 def _build_handshake_app(
     gate: asyncio.Event,
+    completion_gate: asyncio.Event | None = None,
 ) -> tuple[FastAPI, _FakeProcessManager, _HandshakeHarnessClient]:
     """Build a runner app whose harness emits the consumed-handshake.
 
     :param gate: Event that unblocks the turn-1 stream (after which the
         ``injection.consumed`` markers and ``response.completed`` flow).
+    :param completion_gate: Optional hold after consumption, before completion.
     :returns: ``(app, process_manager, harness_client)``.
     """
     spec = AgentSpec(spec_version=1, name="t")
-    harness_client = _HandshakeHarnessClient(gate)
+    harness_client = _HandshakeHarnessClient(gate, completion_gate)
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -449,101 +582,175 @@ def _build_handshake_app(
 
 
 @pytest.mark.asyncio
-async def test_midturn_message_not_double_delivered_to_harness() -> None:
-    """A message sent during an active turn must reach the harness once.
+@pytest.mark.parametrize("runs", [(None, None), ("A", "A"), ("A", "B"), ("A", None), (None, "A")])
+@pytest.mark.parametrize("stream_response", [False, True], ids=["background", "stream"])
+async def test_midturn_message_not_double_delivered_to_harness(
+    monkeypatch, runs, stream_response
+) -> None:
+    """Live steering is consumed once and retains the initiating turn context."""
+    gate = asyncio.Event()
+    completion_gate = asyncio.Event()
+    app, _pm, hc = _build_handshake_app(gate, completion_gate)
+    sid = "ede98a0180773a70b1e81cc854ff7d8a"
+    stream = hc.stream
 
-    Covers the web→TUI / claude-native duplication fix. When a user
-    message arrives while a turn is in flight, ``post_session_events``
-    forwards it as a live mid-turn injection (recorded in
-    ``patched_events``) AND buffers it. With the consumed-handshake
-    (RUNNER_MESSAGE_INGEST.md Part B), the harness echoes an
-    ``injection.consumed`` marker once it consumes the injection, and the
-    runner drops the buffered copy — so the message is NOT re-delivered in
-    a continuation turn. Exactly-once: forwarded once, no continuation.
+    def record_turn(*args, **kwargs):
+        logging.getLogger("omnigent.runner.test").info("steering turn dispatched")
+        return stream(*args, **kwargs)
 
-    The handshake harness here emits that marker on the turn-1 stream,
-    mirroring the real executor adapter. Without the runner's dedup (the
-    bug), the buffered "second" would still drain into a continuation
-    turn — ``posted_bodies`` would grow to 2 and the assertions fail.
+    monkeypatch.setattr(hc, "stream", record_turn)
+
+    def headers(run):
+        if run is None:
+            return {}
+        context = ScheduledRunLogContext(
+            task_id="task-" + run,
+            run_id=run,
+            task_workspace_id=7,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        )
+        return {SCHEDULED_RUN_HEADER: context.model_dump_json()}
+
+    def message(text):
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": text}],
+            "pending_id": "pending_" + text,
+            "harness": "openai-agents",
+        }
+
+    with capture_debug_rows("runner") as rows:
+        async with _runner_client(app) as client:
+            await client.post("/v1/sessions", json={"session_id": sid, "agent_id": "a" * 32})
+            first = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{sid}/events",
+                    json=message("first"),
+                    headers=headers(runs[0]),
+                    params={"stream": stream_response},
+                )
+            )
+            try:
+                if not stream_response:
+                    assert (await first).status_code == 202
+                # A live response proves steering is possible, beyond opening the stream.
+                await poll_until_async(
+                    lambda: sid in app.state.live_response_id, timeout_s=budget(5)
+                )
+                second = await client.post(
+                    f"/v1/sessions/{sid}/events", json=message("second"), headers=headers(runs[1])
+                )
+                assert second.status_code == 202
+                assert second.json()["status"] == "buffered"
+                assert len(hc.patched_events) == 1
+                gate.set()
+                await poll_until_async(
+                    lambda: not app.state.session_message_buffers.get(sid), timeout_s=budget(5)
+                )
+                assert _body_contains_text(hc.patched_events[0], "second")
+                # Consumed and queued inputs both retain their IDs until delivery completes.
+                assert app.state.active_turns
+                repeated = await client.post(
+                    f"/v1/sessions/{sid}/events", json=message("second"), headers=headers(runs[1])
+                )
+                assert repeated.status_code == 202
+                assert repeated.json()["status"] == "duplicate"
+            finally:
+                gate.set()
+                completion_gate.set()
+                response = await asyncio.wait_for(first, timeout=budget(5))
+            assert response.status_code == (200 if stream_response else 202)
+            await poll_until_async(
+                lambda: (
+                    not app.state.active_turns and not app.state.session_message_buffers.get(sid)
+                ),
+                timeout_s=budget(5),
+            )
+    assert len(hc.posted_bodies) == 1
+    assert len(hc.patched_events) == 1
+    assert _body_contains_text(hc.patched_events[0], "second")
+    probes = [row for row in rows if row["message"] == "steering turn dispatched"]
+    expected = [runs[0]]
+    assert [row["attributes"].get("run_id") for row in probes] == expected
+    assert [row["attributes"].get("task_id") for row in probes] == [
+        "task-" + run if run else None for run in expected
+    ]
+    assert all(row["session_id"] == sid for row in probes)
+
+
+class _RefusingSteerHarnessClient(_HandshakeHarnessClient):
+    """Harness fake whose turn ended before the runner's steer forward landed.
+
+    Mirrors the scaffold: a steer (``injection_id`` set) with no live turn to
+    inject into is refused with 409, so the runner keeps it buffered.
     """
-    import asyncio as _aio
 
-    gate = _aio.Event()
-    app, _pm, hc = _build_handshake_app(gate)
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        """Record the forwarded steer and refuse it."""
+        del url, timeout
+        self.patched_events.append(json)
 
+        class _Response:
+            status_code = 409
+            headers: dict[str, str] = {}
+            content = b'{"error": "no active turn to inject into"}'
+            text = content.decode()
+
+        return _Response()
+
+
+@pytest.mark.asyncio
+async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
+    """A steer the harness refused is not lost: it runs as the continuation turn.
+
+    The harness refuses a steer whose turn already ended, so the buffered copy
+    is the only delivery. The continuation body must not carry the steer's
+    ``injection_id``, or the harness would refuse to start that turn too.
+    """
+    gate = asyncio.Event()
+    spec = AgentSpec(spec_version=1, name="t")
+    hc = _RefusingSteerHarnessClient(gate)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    sid = "5c0b6f1e2d3a4b5c6d7e8f9a0b1c2d3e"
+    message = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "harness": "openai-agents",
+    }
     async with _runner_client(app) as client:
-        await client.post(
-            "/v1/sessions",
-            json={
-                "session_id": "ede98a0180773a70b1e81cc854ff7d8a",
-                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
-            },
-        )
-
-        # Turn 1 starts fire-and-forget (202) and its background task
-        # blocks inside the harness stream on `gate`. The 0.05s yield lets
-        # the runner mark the turn active before the second message lands.
-        resp1 = await client.post(
-            "/v1/sessions/ede98a0180773a70b1e81cc854ff7d8a/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "model": "test-agent",
-                "content": [{"type": "input_text", "text": "first"}],
-                "harness": "openai-agents",
-            },
-        )
-        assert resp1.status_code == 202
-        await _aio.sleep(0.05)
-
-        # "second" arrives while turn 1 is provably still active (blocked
-        # on the gate) → the runner buffers it AND forwards it as a live
-        # mid-turn injection with a correlation id.
-        resp2 = await client.post(
-            "/v1/sessions/ede98a0180773a70b1e81cc854ff7d8a/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "model": "test-agent",
-                "content": [{"type": "input_text", "text": "second"}],
-                "harness": "openai-agents",
-            },
-        )
-        # 202 "buffered" confirms turn 1 was still active — the precondition
-        # for the handshake path. A 200/stream here would mean the race
-        # window never opened and the test below would be vacuous.
-        assert resp2.status_code == 202, (
-            f"Expected 'second' to be buffered against the active turn, "
-            f"got {resp2.status_code}: {resp2.text}"
-        )
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": "a" * 32})
+        first = {**message, "content": [{"type": "input_text", "text": "first"}]}
+        assert (await client.post(f"/v1/sessions/{sid}/events", json=first)).status_code == 202
+        await asyncio.sleep(0.05)
+        second = {**message, "content": [{"type": "input_text", "text": "second"}]}
+        resp2 = await client.post(f"/v1/sessions/{sid}/events", json=second)
         assert resp2.json()["status"] == "buffered"
-
-        # Release turn 1; the stream then emits injection.consumed (for
-        # "second") and response.completed. The runner drops the buffered
-        # copy, so no continuation turn starts. Poll a bounded window: if a
-        # continuation were (incorrectly) going to start, posted_bodies
-        # would reach 2 within it.
         gate.set()
-        for _ in range(100):
+        for _ in range(200):
             if len(hc.posted_bodies) >= 2:
                 break
-            await _aio.sleep(0.01)
+            await asyncio.sleep(0.01)
 
-    # "second" was forwarded as a live injection (channel 1)...
-    midturn_injections = [b for b in hc.patched_events if _body_contains_text(b, "second")]
-    assert len(midturn_injections) == 1, (
-        f"'second' should be forwarded as exactly one mid-turn injection; "
-        f"got {len(midturn_injections)} ({hc.patched_events})"
-    )
-    # ...and must NOT also be re-sent in a continuation turn (channel 2).
-    # Exactly one harness turn stream means no continuation was started.
-    assert len(hc.posted_bodies) == 1, (
-        f"'second' was double-delivered: a continuation turn started after "
-        f"the injection was consumed. The runner must drop the buffered "
-        f"copy on injection.consumed.\nposted_bodies={hc.posted_bodies}"
-    )
-    continuation_has_second = any(_body_contains_text(b, "second") for b in hc.posted_bodies[1:])
-    assert not continuation_has_second
+    assert len(hc.patched_events) == 1
+    assert hc.patched_events[0].get("injection_id"), "the steer forward carries its id"
+    assert len(hc.posted_bodies) == 2, f"expected a continuation turn: {hc.posted_bodies}"
+    continuation = hc.posted_bodies[1]
+    assert _body_contains_text(continuation, "second")
+    assert "injection_id" not in continuation, continuation
 
 
 @pytest.mark.asyncio
@@ -643,6 +850,105 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
         f"means intermediate messages were dropped from the terminal.\n"
         f"turn_latest_texts={hc.turn_latest_texts}"
     )
+
+
+@pytest.mark.asyncio
+async def test_repeated_forward_of_a_queued_or_running_message_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-forward under the same pending id reaches the terminal once, not twice.
+
+    The server forwards a message again under its pending id after its own wait
+    for the first forward gives up, while the runner may still hold that first
+    forward. A repeat of the running message, or of one queued behind it, is
+    dropped; the same id after its turn has ended is a new send.
+    """
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *_a, **_k: None)
+    gate = asyncio.Event()
+    app, _pm, harness = _build_native_app(gate)
+    running_id = "pending_" + "a" * 32
+    queued_id = "pending_" + "b" * 32
+
+    async def post(client: httpx.AsyncClient, text: str, pending_id: str) -> str:
+        response = await client.post(
+            "/v1/sessions/11b4a5755857531509b492c3f9a7a1a6/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "agent_id": "0c5de81a62eeb73d54466214cf37e5db",
+                "content": [{"type": "input_text", "text": text}],
+                "pending_id": pending_id,
+            },
+        )
+        assert response.status_code == 202, response.text
+        return response.json()["status"]
+
+    def settled(turns: int) -> bool:
+        return len(harness.turn_latest_texts) == turns and not app.state.active_turns
+
+    async with _runner_client(app) as client:
+        assert await post(client, "1", running_id) == "accepted"
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=budget(5))
+        assert await post(client, "1", running_id) == "duplicate"
+        assert await post(client, "2", queued_id) == "buffered"
+        assert await post(client, "2", queued_id) == "duplicate"
+
+        gate.set()
+        await poll_until_async(lambda: settled(2), timeout_s=budget(5))
+        assert harness.turn_latest_texts == ["1", "2"]
+
+        assert await post(client, "1", running_id) == "accepted"
+        await poll_until_async(lambda: settled(3), timeout_s=budget(5))
+
+    assert harness.turn_latest_texts == ["1", "2", "1"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_forward_of_each_coalesced_message_is_dropped() -> None:
+    """All messages drained into one SDK turn remain owned until it finishes."""
+    first_gate = asyncio.Event()
+    coalesced_gate = asyncio.Event()
+    app, _pm, harness = _build_blocking_app(first_gate)
+    session_id = "2bb972bd50434200b2f543b79a581086"
+
+    async def post(client: httpx.AsyncClient, text: str) -> str:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "agent_id": "0c5de81a62eeb73d54466214cf37e5db",
+                "content": [{"type": "input_text", "text": text}],
+                "pending_id": f"pending_{text}",
+                "harness": "openai-agents",
+            },
+        )
+        assert response.status_code == 202, response.text
+        return response.json()["status"]
+
+    async with _runner_client(app) as client:
+        assert await post(client, "first") == "accepted"
+        await poll_until_async(lambda: len(harness.posted_bodies) == 1, timeout_s=budget(5))
+        assert await post(client, "second") == "buffered"
+        assert await post(client, "third") == "buffered"
+        # The first stream already captured first_gate; hold its continuation separately.
+        harness._gate = coalesced_gate
+        first_gate.set()
+        await poll_until_async(lambda: len(harness.posted_bodies) == 2, timeout_s=budget(5))
+        assert _body_contains_text(harness.posted_bodies[1], "second")
+        assert _body_contains_text(harness.posted_bodies[1], "third")
+        assert await post(client, "second") == "duplicate"
+        assert await post(client, "third") == "duplicate"
+        coalesced_gate.set()
+        await poll_until_async(lambda: not app.state.active_turns, timeout_s=budget(5))
+        assert len(harness.posted_bodies) == 2
+        assert await post(client, "second") == "accepted"
+        await poll_until_async(
+            lambda: len(harness.posted_bodies) == 3 and not app.state.active_turns,
+            timeout_s=budget(5),
+        )
 
 
 class _GatedFileServerClient:
@@ -1003,6 +1309,72 @@ async def test_forwarded_reasoning_effort_keeps_codex_native_full_ladder(
 
     assert hc.posted_bodies, "harness never received a turn"
     assert hc.posted_bodies[0].get("reasoning") == {"effort": "ultra"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_on_refusal", [False, True])
+async def test_refused_codex_startup_effort_follows_the_server_rollback_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rollback_on_refusal: bool,
+) -> None:
+    """An older server keeps a refused startup effort for the next turn; a newer one rolls back."""
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    monkeypatch.setattr(
+        claude_native_bridge, "post_tools_changed", lambda _bridge_dir, **kwargs: None
+    )
+    # No published bridge, so the live update is refused as it is while Codex starts.
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    spec = AgentSpec(spec_version=1, name="t", executor=ExecutorSpec(type="codex-native"))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session = "ee1f2b3c4d5e6f708192a3b4c5d6e7fa"
+    message = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "agent",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "hi"}],
+        "harness": "codex-native",
+    }
+    effort_change: dict[str, Any] = {"type": "effort_change", "effort": "high"}
+    if rollback_on_refusal:
+        effort_change["rollback_on_refusal"] = True
+
+    async with _runner_client(app) as client:
+        for turn in (1, 2):
+            if turn == 2:
+                refused = await client.post(f"/v1/sessions/{session}/events", json=effort_change)
+                assert refused.status_code == 503, refused.text
+                assert refused.json().get("rollback_on_refusal") is (
+                    True if rollback_on_refusal else None
+                )
+                hc.posted_bodies.clear()
+            resp = await client.post(f"/v1/sessions/{session}/events", json=message)
+            assert resp.status_code == 202
+            for _ in range(200):
+                if hc.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+            assert hc.posted_bodies, f"harness never received turn {turn}"
+
+    expected = None if rollback_on_refusal else {"effort": "high"}
+    assert hc.posted_bodies[0].get("reasoning") == expected
 
 
 @pytest.mark.asyncio

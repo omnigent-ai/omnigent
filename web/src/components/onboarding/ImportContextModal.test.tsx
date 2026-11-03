@@ -1,9 +1,13 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, useLocation } from "react-router-dom";
 
-import { ImportContextModal } from "./ImportContextModal";
+import {
+  ImportContextModal,
+  type ImportContext,
+  type ImportContextModalProps,
+} from "./ImportContextModal";
 import { MOCK_IMPORT_CONTEXT } from "./importContextMock";
-import type { ImportContext, ImportSelection } from "./ImportContextModal";
 
 // DialogContent reads isIOSShell to size modals for the iOS keyboard; keep it
 // false so all tests run the standard browser path.
@@ -18,16 +22,24 @@ afterEach(() => {
 
 function renderModal(
   context: ImportContext = MOCK_IMPORT_CONTEXT,
-  props: { onConfirm?: (s: ImportSelection) => void; onOpenChange?: (o: boolean) => void } = {},
+  props: Partial<Omit<ImportContextModalProps, "context">> = {},
 ) {
   return render(
-    <ImportContextModal
-      open={true}
-      onOpenChange={props.onOpenChange ?? vi.fn()}
-      context={context}
-      onConfirm={props.onConfirm ?? vi.fn()}
-    />,
+    <MemoryRouter>
+      <ImportContextModal
+        open={true}
+        onOpenChange={vi.fn()}
+        onConfirm={vi.fn()}
+        {...props}
+        context={context}
+      />
+      <LocationProbe />
+    </MemoryRouter>,
   );
+}
+
+function LocationProbe() {
+  return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
 function selectTab(tab: HTMLElement) {
@@ -59,8 +71,11 @@ function switchAsset(label: string) {
   selectTab(within(list).getByRole("tab", { name: new RegExp(`^${label}`) }));
 }
 
-function checkbox(name: string) {
-  return screen.getByRole("checkbox", { name });
+/** Row names in the visible asset list. */
+function rowNames(list: string) {
+  return within(screen.getByRole("list", { name: list }))
+    .getAllByRole("listitem")
+    .map((row) => row.firstChild?.textContent);
 }
 
 describe("ImportContextModal – harness tabs", () => {
@@ -72,26 +87,26 @@ describe("ImportContextModal – harness tabs", () => {
     expect(screen.getByRole("tab", { name: "Claude Code" })).toBe(tabs[0]);
     expect(screen.getByRole("tab", { name: "Codex" })).toBe(tabs[1]);
     expect(screen.getByRole("tab", { name: "Cursor" })).toBe(tabs[2]);
-    expect(screen.getByText("Your imports are ready")).toBeTruthy();
+    expect(screen.getByText("Your setup is ready")).toBeTruthy();
+    expect(screen.getByText(/These carry over automatically\./)).toBeTruthy();
   });
 
-  it("shows the credential line and asset-type tabs with counts", () => {
+  it("shows the credential line and read-only asset lists with details", () => {
     renderModal();
 
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
-    expect(screen.getAllByText("Imported")).toHaveLength(1);
-    expect(assetTabNames()).toEqual(["MCPs 4", "Skills 10", "Plugins 2"]);
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
+    expect(screen.getAllByText("Detected")).toHaveLength(1);
+    expect(assetTabNames()).toEqual(["MCPs 5", "Skills 10", "Plugins 3"]);
 
-    // MCPs is selected first and lists only Claude's servers.
-    expect(checkbox("databricks-v2")).toHaveAttribute("data-state", "checked");
-    expect(screen.getByText("18 tools")).toBeTruthy();
-    expect(screen.getByText("1 tool")).toBeTruthy();
-    expect(screen.queryByRole("checkbox", { name: "confluence" })).toBeNull();
-    expect(screen.queryByRole("checkbox", { name: "$create-system" })).toBeNull();
+    expect(rowNames("MCPs")).toEqual(["databricks-v2", "jira", "safe", "web-search", "figma"]);
+    expect(screen.getByText("figma plugin · mcp.figma.com")).toBeTruthy();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByText("Select all")).toBeNull();
 
     switchAsset("Plugins");
-    expect(checkbox("frontend-toolkit")).toHaveAttribute("data-state", "checked");
+    expect(rowNames("Plugins")).toEqual(["frontend-toolkit", "dev-productivity", "figma"]);
     expect(screen.getByText("12 skills")).toBeTruthy();
+    expect(screen.getByText("1 skill")).toBeTruthy();
   });
 
   it("switches to Codex and omits the empty Plugins type", () => {
@@ -100,65 +115,70 @@ describe("ImportContextModal – harness tabs", () => {
 
     expect(screen.getByText("Databricks (dbc-a5d4177a-49dc)")).toBeTruthy();
     expect(assetTabNames()).toEqual(["MCPs 2", "Skills 3"]);
-    expect(checkbox("github")).toBeTruthy();
-    expect(screen.queryByRole("checkbox", { name: "databricks-v2" })).toBeNull();
+    expect(rowNames("MCPs")).toEqual(["github", "web_search"]);
   });
-});
 
-describe("ImportContextModal – select all", () => {
-  it("reflects partial selection and toggles the whole list", () => {
+  it("prefixes Claude skills with / and Codex skills with $", () => {
     renderModal();
     switchAsset("Skills");
+    expect(rowNames("Skills")[0]).toBe("/create-kafka-topic");
 
-    const all = checkbox("Select all");
-    expect(all).toHaveAttribute("data-state", "checked");
-    expect(screen.getByText("10 of 10 selected")).toBeTruthy();
-
-    fireEvent.click(checkbox("$create-kafka-topic"));
-    expect(all).toHaveAttribute("data-state", "indeterminate");
-    expect(screen.getByText("9 of 10 selected")).toBeTruthy();
-
-    // Clicking an indeterminate select-all selects everything again.
-    fireEvent.click(all);
-    expect(all).toHaveAttribute("data-state", "checked");
-    expect(checkbox("$create-kafka-topic")).toHaveAttribute("data-state", "checked");
-
-    fireEvent.click(all);
-    expect(all).toHaveAttribute("data-state", "unchecked");
-    expect(screen.getByText("0 of 10 selected")).toBeTruthy();
+    switchHarness("Codex");
+    switchAsset("Skills");
+    expect(rowNames("Skills")[0]).toBe("$code-review");
   });
 });
 
-describe("ImportContextModal – confirm with partial selection", () => {
-  it("keeps selections across tabs and returns the remaining ids", () => {
-    const onConfirm = vi.fn();
-    const onOpenChange = vi.fn();
-    renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
-
-    switchAsset("Skills");
-    fireEvent.click(checkbox("$create-kafka-topic"));
-    switchAsset("Plugins");
-    fireEvent.click(checkbox("dev-productivity"));
-
-    switchHarness("Cursor");
-    fireEvent.click(checkbox("confluence"));
-
-    // Returning to a harness and type shows the earlier choice.
-    switchHarness("Claude Code");
-    switchAsset("Plugins");
-    expect(checkbox("dev-productivity")).toHaveAttribute("data-state", "unchecked");
-
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-
-    expect(onConfirm).toHaveBeenCalledOnce();
-    const { mcps, skills, plugins } = onConfirm.mock.calls[0][0] as ImportSelection;
-    expect(mcps).not.toContain("cursor:confluence");
-    expect(mcps).toHaveLength(MOCK_IMPORT_CONTEXT.mcps.length - 1);
-    expect(skills).not.toContain("claude:create-kafka-topic");
-    expect(skills).toContain("codex:ship");
-    expect(plugins).toEqual(["claude:frontend-toolkit", "cursor:figma"]);
-    expect(onOpenChange).toHaveBeenCalledWith(false);
+describe("ImportContextModal – host and status", () => {
+  it("names the host when given one", () => {
+    renderModal(MOCK_IMPORT_CONTEXT, { hostName: "dev-laptop" });
+    expect(screen.getByText(/Found in your harnesses on dev-laptop\./)).toBeTruthy();
   });
+
+  it("shows a loading state instead of tabs", () => {
+    renderModal(MOCK_IMPORT_CONTEXT, { status: "loading" });
+    expect(screen.getByText("Checking your harnesses…")).toBeTruthy();
+    expect(screen.queryAllByRole("tab")).toHaveLength(0);
+  });
+
+  it("explains an offline host", () => {
+    renderModal(MOCK_IMPORT_CONTEXT, { status: "offline", hostName: "dev-laptop" });
+    expect(
+      screen.getByText("dev-laptop is offline. Reconnect it to review its imports."),
+    ).toBeTruthy();
+    expect(screen.queryAllByRole("tab")).toHaveLength(0);
+  });
+
+  it.each([false, true])(
+    "keeps loaded assets and explains MCP errors (unsupported: %s)",
+    (mcpUnsupported) => {
+      renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [] }, { unavailable: ["mcps"], mcpUnsupported });
+
+      expect(assetTabNames()).toEqual(["Skills 10", "Plugins 3"]);
+      expect(screen.getByRole("status").textContent).toBe(
+        mcpUnsupported
+          ? "Please update this host to list MCP servers."
+          : "Couldn't read MCP servers from this machine.",
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "explains all failures when nothing loaded (unsupported MCPs: %s)",
+    (mcpUnsupported) => {
+      renderModal(
+        { credentials: [], mcps: [], skills: [], plugins: [] },
+        { unavailable: ["mcps", "skills"], mcpUnsupported },
+      );
+      expect(
+        screen.getByText(
+          mcpUnsupported
+            ? "Please update this host to list MCP servers. Couldn't read skills and plugins from this machine."
+            : "Couldn't read MCP servers or skills and plugins from this machine.",
+        ),
+      ).toBeTruthy();
+    },
+  );
 });
 
 describe("ImportContextModal – empty states", () => {
@@ -166,87 +186,54 @@ describe("ImportContextModal – empty states", () => {
     renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [], skills: [], plugins: [] });
 
     expect(harnessTabs()).toHaveLength(3);
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
     expect(screen.getByText("No MCPs, skills, or plugins detected")).toBeTruthy();
     expect(assetTabNames()).toEqual([]);
   });
 
   it("shows a single message and no tabs when nothing was detected", () => {
-    const onConfirm = vi.fn();
-    renderModal({ credentials: [], mcps: [], skills: [], plugins: [] }, { onConfirm });
+    renderModal({ credentials: [], mcps: [], skills: [], plugins: [] });
 
     expect(screen.queryAllByRole("tab")).toHaveLength(0);
     expect(screen.getByText("Nothing to import from your harnesses")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    expect(onConfirm).toHaveBeenCalledWith({ mcps: [], skills: [], plugins: [] });
   });
 });
 
-describe("ImportContextModal – selection reset on reopen", () => {
-  it("resets all checkboxes to checked after close then reopen", () => {
-    const { rerender } = renderModal();
-
-    switchHarness("Cursor");
-    fireEvent.click(checkbox("confluence"));
-    expect(checkbox("confluence")).toHaveAttribute("data-state", "unchecked");
-
-    // Close the modal (Radix unmounts ImportContextBody, discarding state).
-    rerender(
-      <ImportContextModal
-        open={false}
-        onOpenChange={vi.fn()}
-        context={MOCK_IMPORT_CONTEXT}
-        onConfirm={vi.fn()}
-      />,
-    );
-    rerender(
-      <ImportContextModal
-        open={true}
-        onOpenChange={vi.fn()}
-        context={MOCK_IMPORT_CONTEXT}
-        onConfirm={vi.fn()}
-      />,
-    );
-
-    switchHarness("Cursor");
-    expect(checkbox("confluence")).toHaveAttribute("data-state", "checked");
-  });
-});
-
-describe("ImportContextModal – close button", () => {
-  it("calls onOpenChange(false) when the X button is clicked", () => {
+describe("ImportContextModal – closing", () => {
+  it("opens Harnesses and dismisses without confirming on See more", () => {
+    const onConfirm = vi.fn();
     const onOpenChange = vi.fn();
-    renderModal(MOCK_IMPORT_CONTEXT, { onOpenChange });
+    renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
+
+    const seeMore = screen.getByRole("link", { name: "See more" });
+    expect(seeMore.getAttribute("href")).toBe("/settings/harnesses");
+    expect(seeMore.nextElementSibling).toBe(screen.getByRole("button", { name: "Confirm" }));
+    fireEvent.click(seeMore);
+
+    expect(screen.getByTestId("location").textContent).toBe("/settings/harnesses");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it("confirms and closes on Confirm", () => {
+    const onConfirm = vi.fn();
+    const onOpenChange = vi.fn();
+    renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    expect(onConfirm).toHaveBeenCalledWith();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("closes without confirming from the X button", () => {
+    const onConfirm = vi.fn();
+    const onOpenChange = vi.fn();
+    renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
-  });
-});
-
-describe("ImportContextModal – checkbox identity", () => {
-  it("toggles only the clicked row when item ids differ only by punctuation", () => {
-    const context: ImportContext = {
-      credentials: [],
-      mcps: [
-        { id: "cursor:plugin-foo", name: "plugin-foo", harness: "cursor" },
-        { id: "cursor:plugin:foo", name: "plugin:foo", harness: "cursor" },
-      ],
-      skills: [],
-      plugins: [],
-    };
-    const onConfirm = vi.fn();
-    renderModal(context, { onConfirm });
-
-    fireEvent.click(screen.getByText("plugin:foo"));
-
-    expect(checkbox("plugin-foo")).toHaveAttribute("data-state", "checked");
-    expect(checkbox("plugin:foo")).toHaveAttribute("data-state", "unchecked");
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    expect(onConfirm).toHaveBeenCalledWith({
-      mcps: ["cursor:plugin-foo"],
-      skills: [],
-      plugins: [],
-    });
+    expect(onConfirm).not.toHaveBeenCalled();
   });
 });

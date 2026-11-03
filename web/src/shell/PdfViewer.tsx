@@ -12,6 +12,7 @@
 // top of the rendered pages — nothing is written into the PDF bytes.
 
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
@@ -50,6 +51,7 @@ import "./pdfViewer.css";
 // lifetime. It bypasses pdf.js's fake-worker fallback, so a restrictive worker
 // CSP or a non-Worker environment (jsdom) throws on import — importing tests
 // must mock this module (CodeViewer.test.tsx already mocks ./PdfViewer).
+// The app's pdfjs-dist must match react-pdf's; Dependabot skips it (.github/dependabot.yml).
 pdfjs.GlobalWorkerOptions.workerPort = new Worker(
   new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url),
   { type: "module" },
@@ -390,7 +392,7 @@ export function PdfViewer({
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className={`fixed z-50 ${ADD_COMMENT_BUTTON_CLASS_NAME}`}
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {

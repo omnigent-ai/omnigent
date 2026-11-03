@@ -43,6 +43,7 @@ import yaml
 from playwright.sync_api import Locator, Page, Response, Route, expect
 
 from omnigent.inner.kimi_executor import _resolve_kimi_binary
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
@@ -154,20 +155,10 @@ def _create_kimi_session(base_url: str, runner_id: str) -> str:
     """
     name = f"kimi-usage-{uuid.uuid4().hex[:8]}"
     bundle = _build_kimi_bundle(name)
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create_resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 

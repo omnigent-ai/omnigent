@@ -172,20 +172,24 @@ describe("useSessionHostOnline (host tunnel, tri-state)", () => {
     expect(screen.getByTestId("host-probe").textContent).toBe("undefined");
   });
 
-  it("surfaces host_online from the fallback poll for the open session", () => {
-    // Off-sidebar open child: not in the conversations cache, so its
-    // liveness comes from the /health fallback poll.
-    useSessionMock.mockReturnValue({
-      session: { id: "conv_child" },
-      isLoading: false,
-      error: null,
-    } as unknown as ReturnType<typeof useSession>);
-    useRunnerHealthMock.mockReturnValue(
-      new Map<string, SessionLiveness>([["conv_child", liveness(false, true)]]),
-    );
-    renderInProvider(<HostProbe sessionId="conv_child" />, ["/c/conv_child"]);
-    expect(screen.getByTestId("host-probe").textContent).toBe("true");
-  });
+  it.each(["/c/conv_child", "/canvas/c/conv_child?canvas=project"])(
+    "surfaces host_online from the fallback poll at %s",
+    (route) => {
+      // Off-sidebar open child: not in the conversations cache, so its
+      // liveness comes from the /health fallback poll.
+      useSessionMock.mockReturnValue({
+        session: { id: "conv_child" },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      useRunnerHealthMock.mockReturnValue(
+        new Map<string, SessionLiveness>([["conv_child", liveness(false, true)]]),
+      );
+      renderInProvider(<HostProbe sessionId="conv_child" />, [route]);
+      expect(useSessionMock).toHaveBeenCalledWith("conv_child");
+      expect(screen.getByTestId("host-probe").textContent).toBe("true");
+    },
+  );
 
   it("surfaces the host version from the fallback poll for the open session", () => {
     // The info-popover footer reads the bound host's version; it rides the
@@ -220,25 +224,37 @@ describe("RunnerHealthProvider deduplication", () => {
 });
 
 describe("RunnerHealthProvider open-session-scoped fallback poll", () => {
-  it("polls the open session but NOT the sidebar list (stream covers it)", () => {
-    // Sidebar carries its own rows; those are stream-sourced, never polled.
-    // Only the open session (off-sidebar child here) goes through /health.
-    useConvMock.mockReturnValue({
-      data: { pages: [{ data: [{ id: "conv_parent", runner_online: true }] }] },
-    } as unknown as ReturnType<typeof useConversations>);
-    useSessionMock.mockReturnValue({
-      session: { id: "conv_child" },
-      isLoading: false,
-      error: null,
-    } as unknown as ReturnType<typeof useSession>);
+  it.each(["/c/temp%3A123", "/canvas/c/temp%3A123?canvas=project"])(
+    "does not fetch or poll an encoded temporary session at %s",
+    (route) => {
+      renderInProvider(<MapKeysProbe />, [route]);
+      expect(useSessionMock).toHaveBeenCalledWith(undefined);
+      expect(useRunnerHealthMock.mock.calls.at(-1)?.[0]).toEqual([]);
+    },
+  );
 
-    renderInProvider(<MapKeysProbe />, ["/c/conv_child"]);
+  it.each(["/c/conv_child", "/canvas/c/conv_child?canvas=project"])(
+    "polls the open session outside the sidebar at %s",
+    (route) => {
+      // Sidebar carries its own rows; those are stream-sourced, never polled.
+      // Only the open session (off-sidebar child here) goes through /health.
+      useConvMock.mockReturnValue({
+        data: { pages: [{ data: [{ id: "conv_parent", runner_online: true }] }] },
+      } as unknown as ReturnType<typeof useConversations>);
+      useSessionMock.mockReturnValue({
+        session: { id: "conv_child" },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
 
-    const polled = useRunnerHealthMock.mock.calls.at(-1)?.[0];
-    // The narrowed fallback set is the open session only — the sidebar
-    // parent is no longer polled fleet-wide.
-    expect(polled?.map((s) => s.id)).toEqual(["conv_child"]);
-  });
+      renderInProvider(<MapKeysProbe />, [route]);
+
+      const polled = useRunnerHealthMock.mock.calls.at(-1)?.[0];
+      // The narrowed fallback set is the open session only — the sidebar
+      // parent is no longer polled fleet-wide.
+      expect(polled?.map((s) => s.id)).toEqual(["conv_child"]);
+    },
+  );
 
   it("polls nothing when no session is open", () => {
     useConvMock.mockReturnValue({
