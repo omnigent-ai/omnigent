@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Automation templates](./automation-templates.md) covers the gallery tabs,
+  empty-state preview, and direct template setup.
+
 - [Automations introduction](./automations-introduction.md) covers the first-visit
   walkthrough, capability-dependent content, and browser-local dismissal.
 
