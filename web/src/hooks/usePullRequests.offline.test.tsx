@@ -15,7 +15,7 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo } from "./usePullRequests";
+import { usePullRequestInfo, usePullRequestInfos } from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -31,8 +31,9 @@ function runnerUnavailableResponse(): Response {
   } as unknown as Response;
 }
 
-function Probe({ id }: { id: string }) {
+function Probe({ id, batch = false }: { id: string; batch?: boolean }) {
   usePullRequestInfo(id);
+  usePullRequestInfos(id, batch ? ["https://github.com/org/repo/pull/1"] : []);
   return null;
 }
 
@@ -58,30 +59,46 @@ afterEach(() => {
 });
 
 describe("usePullRequestInfo runner-offline retry", () => {
-  it("stops retrying once the health poll shows nothing can serve the session", async () => {
+  it.each([false, true])(
+    "stops retrying once nothing can serve the session (batch=%s)",
+    async (batch) => {
+      vi.useFakeTimers();
+      // Page load: liveness hasn't answered when the first 503 lands.
+      onlineMock.mockReturnValue(undefined);
+      hostOnlineMock.mockReturnValue(undefined);
+      const qc = new QueryClient();
+      const tree = () => (
+        <QueryClientProvider client={qc}>
+          <Probe id="conv_asleep" batch={batch} />
+        </QueryClientProvider>
+      );
+
+      const view = render(tree());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(batch ? 2 : 1);
+
+      // An idle-stopped sandbox: runner and host both down.
+      onlineMock.mockReturnValue(false);
+      hostOnlineMock.mockReturnValue(false);
+      view.rerender(tree());
+      await vi.advanceTimersByTimeAsync(130_000);
+
+      // The retry already scheduled at the first failure still runs; none after it.
+      expect(fetchMock).toHaveBeenCalledTimes(batch ? 4 : 2);
+    },
+  );
+
+  it("does not fetch linked PRs while the session is already asleep", async () => {
     vi.useFakeTimers();
-    // Page load: liveness hasn't answered when the first 503 lands.
-    onlineMock.mockReturnValue(undefined);
-    hostOnlineMock.mockReturnValue(undefined);
-    const qc = new QueryClient();
-    const tree = () => (
-      <QueryClientProvider client={qc}>
-        <Probe id="conv_asleep" />
-      </QueryClientProvider>
-    );
-
-    const view = render(tree());
-    await vi.advanceTimersByTimeAsync(0);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    // An idle-stopped sandbox: runner and host both down.
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(false);
-    view.rerender(tree());
-    await vi.advanceTimersByTimeAsync(130_000);
-
-    // The retry already scheduled at the first failure still runs; none after it.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Probe id="conv_asleep" batch />
+      </QueryClientProvider>,
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("keeps retrying while the host is up and the runner is still connecting", async () => {

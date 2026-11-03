@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
@@ -151,7 +152,8 @@ export function useHostModelOptions(
 ) {
   const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
-  const pollerKey = JSON.stringify([hostId, harness]);
+  const server = getOmnigentServerIdentity();
+  const pollerKey = JSON.stringify([hostId, harness, server]);
   // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
     if (!canRefresh) return;
@@ -169,7 +171,7 @@ export function useHostModelOptions(
     };
   }, [queryClient, pollerKey, canRefresh]);
   const query = useQuery({
-    queryKey: ["host-model-options", hostId, harness],
+    queryKey: ["host-model-options", hostId, harness, server],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can

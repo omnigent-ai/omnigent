@@ -32,6 +32,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   ALT_KEY,
   ARIA_MOD_KEY,
@@ -63,14 +64,18 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
+import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import {
@@ -791,6 +796,10 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
+  /** Reports whether a sub-agent tab is open, so a phone can reach the drawer. */
+  onHasSubagentTabsChange?: (hasSubagentTabs: boolean) => void;
+  /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
+  subagentPanelOpener?: SubagentPanelOpener;
 }
 
 /**
@@ -861,6 +870,8 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
+  onHasSubagentTabsChange,
+  subagentPanelOpener,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
@@ -888,6 +899,11 @@ function WorkspacePanelImpl({
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
+  const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
+  useEffect(() => {
+    onHasSubagentTabsChange?.(hasSubagentTabs);
+    return () => onHasSubagentTabsChange?.(false);
+  }, [hasSubagentTabs, onHasSubagentTabsChange]);
   const activeHarness = useChatStore((s) => s.sessionHarness);
   const sideChatHarness = sessionHarness === undefined ? activeHarness : sessionHarness;
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
@@ -913,9 +929,13 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    if (childId.startsWith("pending:")) {
-      // "Ask in side chat": a not-yet-forked tab, so it must not take a slot in
-      // the Codex awaiting queue. Its first send creates the fork.
+    const subagentId = subagentSessionIdFromTab(childId);
+    if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
+      // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
+      sideChats.select(subagentId);
+    } else if (childId.startsWith("pending:") || subagentId !== null) {
+      // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
+      // existing session) must not take a slot in the Codex awaiting queue.
       sideChats.open(childId);
     } else {
       // Started this session → live (not a dead restored Codex fork).
@@ -983,7 +1003,10 @@ function WorkspacePanelImpl({
           if (sendFailed) throw new Error("side chat send failed");
         });
     }
-    return createSideChat(conversationId).then(
+    return createSideChat(
+      conversationId,
+      useChatStore.getState().sideChatComposers[pendingId]?.settings,
+    ).then(
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
         // shared queue, so overlapping launches can't cross-assign. Seeding the
@@ -1060,9 +1083,29 @@ function WorkspacePanelImpl({
     selectedFilePath,
     terminalShown,
   ]);
+  const subagentTabLabels = useSubagentTabLabels(sideChats.tabs);
+  // Number only side chats so their labels stay put as sub-agent tabs open and close.
+  const chatTabLabels: Record<string, string> = {};
+  let sideChatNumber = 0;
+  for (const tabId of sideChats.tabs) {
+    chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${++sideChatNumber}`;
+  }
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
   const selectedSideChat = sideChats.selected;
-  const selectedSideChatPane =
-    selectedSideChat === null ? null : (
+  const selectedSubagentId =
+    selectedSideChat === null ? null : subagentSessionIdFromTab(selectedSideChat);
+  const renderSelectedSideChatPane = () => {
+    if (selectedSideChat === null) return null;
+    if (selectedSubagentId !== null) {
+      return (
+        <SubagentTabPane
+          key={selectedSideChat}
+          sessionId={selectedSubagentId}
+          label={chatTabLabels[selectedSideChat] ?? SUBAGENT_TAB_FALLBACK_LABEL}
+        />
+      );
+    }
+    return (
       <SideChatPane
         key={selectedSideChat}
         childId={selectedSideChat}
@@ -1080,7 +1123,14 @@ function WorkspacePanelImpl({
         }
       />
     );
+  };
+  const selectedSideChatPane = renderSelectedSideChatPane();
   const closeSideChat = async (childId: string) => {
+    // Closing a sub-agent tab only hides it; the sub-agent keeps running.
+    if (subagentSessionIdFromTab(childId) !== null) {
+      sideChats.close(childId);
+      return;
+    }
     // Take the queue first so the stop's idle status can't send it to the closing chat.
     const queued = useChatStore.getState().clearQueuedMessages(childId);
     if (!childId.startsWith("pending:")) {
@@ -1256,9 +1306,9 @@ function WorkspacePanelImpl({
       },
       disabled: false,
     })),
-    ...sideChats.tabs.map((childId, index) => ({
+    ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
-      label: `Side chat ${index + 1}`,
+      label: chatTabLabels[childId] ?? childId,
       active: sideChatSelected && sideChats.selected === childId,
       select: () => {
         sideChats.select(childId);
@@ -1362,11 +1412,29 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
+  // The selected tab's view, beneath any open file or shell tab.
+  const scopeView =
+    sideChatSelected && !isMobile
+      ? "sidechat"
+      : browserSelected && showBrowserTab
+        ? "browser"
+        : rightRailTab === "github" && showGithubTab
+          ? "github"
+          : rightRailTab === "subagents" && rootSessionId
+            ? "subagents"
+            : rightRailTab === null
+              ? "empty"
+              : rightRailTab === "content-search" && showContentSearch
+                ? "content-search"
+                : "files";
+  // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
+  const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
+  const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
   const rail = (
     <aside
       aria-label="Workspace"
+      ref={railInertRef}
       aria-hidden={!open}
-      inert={inert}
       // The resize hook can starve the rail to width 0 while it stays mounted;
       // marking it collapsed keeps index.css's safe-area padding off it so a
       // zero-width rail can't paint a ghost bg-card strip on native shells.
@@ -1572,9 +1640,11 @@ function WorkspacePanelImpl({
                       </button>
                     </div>
                   ))}
-                {sideChats.tabs.map((childId, index) => {
+                {sideChats.tabs.map((childId) => {
                   const active = sideChatSelected && sideChats.selected === childId;
-                  const label = `Side chat ${index + 1}`;
+                  const label = chatTabLabels[childId] ?? childId;
+                  const TabIcon =
+                    subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon;
                   return (
                     <div
                       key={childId}
@@ -1602,8 +1672,8 @@ function WorkspacePanelImpl({
                           onRightRailTabChange("sidechat");
                         }}
                       >
-                        <MessagesSquareIcon className="size-4" />
-                        {label}
+                        <TabIcon className="size-4 shrink-0" />
+                        <span className="max-w-[16ch] truncate">{label}</span>
                       </button>
                       <button
                         type="button"
@@ -1697,11 +1767,11 @@ function WorkspacePanelImpl({
             </WorkspaceTabTooltip>
           </div>
         </div>
-        {/* Tab content — single slot. An open shell tab holds its xterm; a
-          file tab holds FileViewer; the Files/Changes tabs show FilesPanel
-          (tree vs changed-only list); Subagents lists the root's children +
-          a "main" link back to the parent. */}
-        <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
+        <div
+          data-workspace-panel-content
+          className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+        >
           {showContentSearch && showFilesPanel && !pending && (
             <div
               className={cn(
@@ -1716,6 +1786,27 @@ function WorkspacePanelImpl({
                 key={conversationId}
                 conversationId={conversationId}
                 onFileSelect={openFileViewer}
+              />
+            </div>
+          )}
+          {filesPanelMounted && (
+            <div
+              className={cn(
+                "flex min-h-0 flex-1 flex-col",
+                // Not display:none: hidden rows would measure 0px and collapse
+                // the virtualized tree's height, losing its scroll position.
+                !filesPanelActive && "invisible absolute inset-0",
+              )}
+            >
+              <FilesPanel
+                conversationId={contained ? conversationId : undefined}
+                frameless
+                onFileSelect={openFileViewer}
+                flatView={rightRailTab === "changes"}
+                showHidden={filesPanelShowHidden}
+                onShowHiddenChange={onShowHiddenChange}
+                sort={filesPanelSort}
+                onSortChange={onSortChange}
               />
             </div>
           )}
@@ -1755,12 +1846,12 @@ function WorkspacePanelImpl({
                 sort={filesPanelSort}
               />
             </ResponsiveViewerSlot>
-          ) : sideChatSelected && !isMobile ? (
+          ) : scopeView === "sidechat" ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it
             // in the side-chats drawer instead, so it never mounts twice.
             selectedSideChatPane
-          ) : browserSelected && showBrowserTab ? (
+          ) : scopeView === "browser" ? (
             // Browser soft tab — BrowserPane self-gates and measures this rail
             // slot to position the native view over it.
             <BrowserPane
@@ -1770,29 +1861,20 @@ function WorkspacePanelImpl({
               active={open}
               className="min-h-0 flex-1"
             />
-          ) : rightRailTab === "github" && showGithubTab ? (
-            <PullRequestPanel conversationId={conversationId} />
-          ) : rightRailTab === "subagents" && rootSessionId ? (
-            <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-          ) : rightRailTab === null ? (
+          ) : scopeView === "github" ? (
+            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+            </RenderErrorBoundary>
+          ) : scopeView === "subagents" && rootSessionId ? (
+            <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
+              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+            </SubagentPanelOpenerContext.Provider>
+          ) : scopeView === "empty" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
               <PlusIcon className="size-6" />
               <p className="text-sm">Open a Workspace tab from the + menu.</p>
             </div>
-          ) : rightRailTab === "content-search" && showContentSearch ? null : (
-            showFilesPanel && (
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
-            )
-          )}
+          ) : null}
         </div>
       </div>
     </aside>
@@ -1816,9 +1898,9 @@ function WorkspacePanelImpl({
             aria-label="Side chats"
             className="flex shrink-0 items-center gap-1 overflow-x-auto border-border border-b px-2 py-1.5"
           >
-            {sideChats.tabs.map((childId, index) => {
+            {sideChats.tabs.map((childId) => {
               const active = sideChats.selected === childId;
-              const label = `Side chat ${index + 1}`;
+              const label = chatTabLabels[childId] ?? childId;
               return (
                 <div
                   key={childId}
@@ -1831,9 +1913,13 @@ function WorkspacePanelImpl({
                     type="button"
                     role="tab"
                     aria-selected={active}
+                    className="flex items-center gap-1"
                     onClick={() => sideChats.select(childId)}
                   >
-                    {label}
+                    {subagentSessionIdFromTab(childId) !== null && (
+                      <BotIcon className="size-4 shrink-0" />
+                    )}
+                    <span className="max-w-[16ch] truncate">{label}</span>
                   </button>
                   <button
                     type="button"

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  contentEnvelopeText,
   humanizeKey,
+  isProseText,
   isoTimestampMs,
   parseToolOutput,
   pickTitleField,
   statusLabel,
   statusTone,
+  editErrorMessage,
   toolErrorMessage,
 } from "./toolValue";
 
@@ -97,6 +100,11 @@ describe("toolErrorMessage", () => {
     ['{"error": true}', "The tool reported an error."],
     ['{"error": {"code": 500}}', "The tool reported an error."],
     ["<tool_use_error></tool_use_error>", "The tool reported an error."],
+    [
+      '{"content": [{"type": "text", "text": "Could not find the text in a.py."}], "details": {}, "isError": true}',
+      "Could not find the text in a.py.",
+    ],
+    ['{"content": [], "isError": true}', "The tool reported an error."],
   ])("reports %s as a failure", (output, message) => {
     expect(toolErrorMessage(parseToolOutput(output))).toBe(message);
   });
@@ -105,8 +113,60 @@ describe("toolErrorMessage", () => {
     "Error handling in the parser works as expected.",
     '{"errors": []}',
     '{"error": null}',
+    '{"content": [{"type": "text", "text": "Done."}], "isError": false}',
     "Task plan updated (2 tasks).",
   ])("treats %s as a success", (output) => {
+    expect(toolErrorMessage(parseToolOutput(output))).toBeNull();
+  });
+});
+
+describe("contentEnvelopeText", () => {
+  it("joins the text blocks of a content envelope", () => {
+    const value = {
+      content: [
+        { type: "text", text: "Successfully replaced text in a.py." },
+        { type: "text", text: "Lines 3-4 changed." },
+      ],
+      details: { diff: "+x" },
+    };
+    expect(contentEnvelopeText(value)).toBe(
+      "Successfully replaced text in a.py.\n\nLines 3-4 changed.",
+    );
+  });
+
+  it.each([
+    [{ content: [{ type: "text", text: "Failed." }], isError: true }],
+    [{ content: "Done." }],
+    [[{ type: "text", text: "Done." }]],
+  ])("returns null for %j", (value) => {
+    expect(contentEnvelopeText(value)).toBeNull();
+  });
+});
+
+describe("editErrorMessage", () => {
+  it.each([
+    ["[error] Error: oldString not found in content", "Error: oldString not found in content"],
+    ["[error]", "The tool reported an error."],
+    [
+      "<tool_use_error>String to replace not found.</tool_use_error>",
+      "String to replace not found.",
+    ],
+  ])("reports %s as a failure", (output, message) => {
+    expect(editErrorMessage(output)).toBe(message);
+  });
+
+  it.each([
+    "[errors] none",
+    "[ERROR] plugin missing; continuing.",
+    "Edit applied.",
+    '{"content": [{"type": "text", "text": "Successfully replaced text in a.py."}]}',
+  ])("treats %s as a success", (output) => {
+    expect(editErrorMessage(output)).toBeNull();
+  });
+
+  it('matches "[error]" only on the edit path, not in toolErrorMessage', () => {
+    const output = "[error] recovered cache entry";
+    expect(editErrorMessage(output)).toBe("recovered cache entry");
     expect(toolErrorMessage(parseToolOutput(output))).toBeNull();
   });
 });
@@ -146,5 +206,34 @@ describe("isoTimestampMs", () => {
     expect(isoTimestampMs("2026-02-30T10:00:00Z")).toBeNull();
     expect(isoTimestampMs("2026-13-01T10:00:00Z")).toBeNull();
     expect(isoTimestampMs("tomorrow at 9")).toBeNull();
+  });
+});
+
+describe("isProseText", () => {
+  it("renders text under a prose field name as markdown", () => {
+    for (const key of ["description", "pr_body", "comments", "releaseNote", "summary"]) {
+      expect(isProseText("## Summary\n\n- Fix it", key)).toBe(true);
+    }
+    expect(isProseText("[1] See the RFC.\n\nMore notes", "summary")).toBe(true);
+  });
+
+  it("keeps text under any other field name literal", () => {
+    // WHY: markdown-looking text is often code or output; only a prose field name marks prose.
+    const markdown = "## Setup\n\n- Run **the app**\n";
+    expect(isProseText(markdown)).toBe(false);
+    for (const key of ["text", "prompt", "message", "content", "oldText", "output", "body_html"]) {
+      expect(isProseText(markdown, key)).toBe(false);
+    }
+  });
+
+  it("keeps data under a prose field name literal", () => {
+    for (const data of [
+      '{\n  "error": "bad"\n}',
+      "[\n  true,\n  false\n]",
+      '<?xml version="1.0"?>\n<a/>',
+      "<!DOCTYPE html>\n<p>Hi</p>",
+    ]) {
+      expect(isProseText(data, "body")).toBe(false);
+    }
   });
 });
