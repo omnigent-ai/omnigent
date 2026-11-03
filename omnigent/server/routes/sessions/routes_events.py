@@ -1798,7 +1798,7 @@ def register_events_routes(
             if require_interrupt_delivery:
                 source_status = _session_status_cache.get(session_id, conv.live_status)
                 if not _session_active_response_cache.get(session_id) and (
-                    source_status == "idle"
+                    source_status in ("idle", "failed")
                     or (source_status is None and conv.runner_id is None and conv.host_id is None)
                 ):
                     return {"queued": False}

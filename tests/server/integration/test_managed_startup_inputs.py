@@ -1476,8 +1476,9 @@ async def test_read_only_user_cannot_edit_or_interrupt_source(
 
 
 @pytest.mark.parametrize("failure", ["offline", "refused", "disconnected"])
+@pytest.mark.parametrize("source_status", ["running", "idle", "failed"])
 async def test_edited_fork_requires_active_source_interrupt_acknowledgment(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, failure: str
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, failure: str, source_status: str
 ) -> None:
     env = startup_env
     source_id = await _create(env, initial_input=None)
@@ -1493,8 +1494,10 @@ async def test_edited_fork_requires_active_source_interrupt_acknowledgment(
             )
         ],
     )
-    env.conv_store.set_session_live_status(source_id, "running")
-    runner = _stub_runner(monkeypatch, status=503)
+    env.conv_store.set_host_id(source_id, uuid4().hex, "/tmp/source-workspace")
+    env.conv_store.set_session_live_status(source_id, source_status)
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded, status=503)
 
     async def unavailable(*_: Any, **__: Any):
         if failure == "disconnected":
@@ -1517,10 +1520,15 @@ async def test_edited_fork_requires_active_source_interrupt_acknowledgment(
         )
     finally:
         await runner.aclose()
-    assert response.status_code == 503, response.text
-    assert "interrupt" in response.text
-    assert await _session_count(env) == before
-    assert env.conv_store.get_conversation(source_id).live_status == "running"
+    if source_status == "running":
+        assert response.status_code == 503, response.text
+        assert "interrupt" in response.text
+        assert await _session_count(env) == before
+    else:
+        assert response.status_code == 201, response.text
+        assert await _session_count(env) == before + 1
+        assert not forwarded
+    assert env.conv_store.get_conversation(source_id).live_status == source_status
 
 
 @pytest.mark.parametrize("resume", ["retry", "followup"])
@@ -1668,3 +1676,22 @@ async def test_managed_host_recovers_saved_input_without_startup_label(
     finally:
         await env.app.state.startup_inputs.shutdown()
         await runner.aclose()
+
+
+@pytest.mark.parametrize("before_item_id", ["not-an-id", "f" * 32])
+async def test_edited_fork_rejects_malformed_or_missing_item_on_real_store(
+    startup_env: _Env, before_item_id: str
+) -> None:
+    env = startup_env
+    source_id = await _create(env, initial_input=None)
+    before = await _session_count(env)
+    response = await env.client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={
+            "before_item_id": before_item_id,
+            "edited_text": "revised",
+            "interrupt_source": True,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert await _session_count(env) == before
