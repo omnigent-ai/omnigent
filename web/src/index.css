@@ -32,9 +32,12 @@
     min-width: 44px;
     min-height: 44px;
   }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
   @media (pointer: coarse) and (hover: none) {
-    min-width: 44px;
-    min-height: 44px;
+    &:is(:root, :root *) {
+      min-width: 44px;
+      min-height: 44px;
+    }
   }
 }
 
