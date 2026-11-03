@@ -470,6 +470,8 @@ export interface ErrorBlock {
    * native terminal, whose mirrored message carries no stable id.
    */
   unansweredSend?: { stableId: string; text?: string };
+  /** A client-only card for a failure carried only by a `failed` session status. */
+  fromSessionStatus?: true;
 }
 
 /**

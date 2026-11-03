@@ -13,8 +13,11 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -208,6 +211,38 @@ def test_build_claude_native_base_args(
                 "b.json",
             ),
         ),
+        (
+            None,
+            None,
+            ["--session-id", "11111111-2222-3333-4444-555555555555", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--session-id=11111111-2222-3333-4444-555555555555", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--fork-session", "--session-id", "new-id"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "--fork-session", "--session-id", "new-id"),
+        ),
+        (
+            None,
+            None,
+            ["--session-id", "11111111-2222-3333-4444-555555555555"],
+            None,
+            False,
+            ("--session-id", "11111111-2222-3333-4444-555555555555"),
+        ),
     ],
     ids=[
         "resume-only",
@@ -218,6 +253,10 @@ def test_build_claude_native_base_args(
         "unconsumed-legacy-prompt-kept-on-resume",
         "legacy-prompt-omitted-without-transcript",
         "flag-values-preserved",
+        "resume-drops-session-id",
+        "resume-drops-joined-session-id",
+        "fork-session-keeps-session-id",
+        "fresh-launch-keeps-session-id",
     ],
 )
 def test_build_claude_native_base_args_resume_prefix(
@@ -496,6 +535,70 @@ def test_build_native_claude_terminal_env_rejects_credentials_on_helper_path(
     )
     with pytest.raises(RuntimeError, match=credential):
         build_native_claude_terminal_env(leaking)
+
+
+@pytest.mark.parametrize(
+    ("configured", "managed", "ambient", "disabled"),
+    [
+        ("https://gateway.example/anthropic", None, None, True),
+        ("https://api.anthropic.com", None, None, False),
+        (None, "https://gateway.example/anthropic", None, True),
+        ("https://api.anthropic.com", "https://gateway.example/anthropic", None, True),
+        ("https://gateway.example/anthropic", "https://api.anthropic.com", None, False),
+        ("", None, "https://gateway.example/anthropic", True),
+        (None, None, "https://gateway.example/anthropic", True),
+        ("https://api.anthropic.com", None, "https://gateway.example/anthropic", False),
+        ("https://gateway.example/anthropic", None, "https://api.anthropic.com", True),
+        (None, None, None, False),
+    ],
+)
+def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
+    configured: str | None,
+    managed: str | None,
+    ambient: str | None,
+    disabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The effective Anthropic endpoint decides whether canonical fallback is safe."""
+    from omnigent.harnesses.claude_native import main as claude_native
+
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": managed} if managed else {}})
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    if ambient is None:
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", ambient)
+    config = (
+        ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": configured} if configured else {})
+        if configured is not None
+        else None
+    )
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert (terminal_env.get("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK") == "1") is disabled
+
+
+@pytest.mark.parametrize(
+    ("base_url", "configured_flag", "expected_flag"),
+    [
+        ("https://gateway.example/anthropic", "0", "1"),
+        ("https://api.anthropic.com", "0", "0"),
+        ("https://api.anthropic.com", "1", "1"),
+    ],
+)
+def test_claude_terminal_env_refusal_fallback_provider_override(
+    base_url: str, configured_flag: str, expected_flag: str
+) -> None:
+    """Gateway launches force the guard; direct Anthropic keeps explicit preferences."""
+    flag = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
+    config = ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": base_url, flag: configured_flag})
+
+    assert build_native_claude_terminal_env(config)[flag] == expected_flag
 
 
 def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
@@ -864,6 +967,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     session_id = "conv_launch_cancelled_during_drain"
     original_error = httpx.ConnectError("original launch transport failure")
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = original_error
     session_init = _claude_auto_create_session_init(session_id, bridge_dir)
     loop = asyncio.get_running_loop()
@@ -1292,6 +1396,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
@@ -1381,6 +1486,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(ValueError, match="config is not a JSON object"):
         await _auto_create_claude_terminal_for_test(
@@ -1455,6 +1561,7 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(propagated):
         await _auto_create_claude_terminal_for_test(
@@ -1513,6 +1620,7 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     with pytest.raises(RuntimeError, match="stop after seeding"):
@@ -1569,6 +1677,7 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(OmnigentError) as excinfo:
         await _auto_create_claude_terminal_for_test(
@@ -1579,3 +1688,44 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
     assert sorted(path.name for path in workspace.iterdir()) == []
     assert not (Path.cwd() / config_dir).exists()
     registry.launch_required_terminal.assert_not_called()
+
+
+def test_claude_terminal_env_unsets_tmux_for_bash_tool_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's Bash commands must not reach the private tmux server running Claude."""
+    monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+    env_file = build_native_claude_terminal_env(None)["CLAUDE_ENV_FILE"]
+
+    # Claude Code sources the env file before each Bash command it runs.
+    result = subprocess.run(
+        ["bash", "-c", f'. {shlex.quote(env_file)}; echo "${{TMUX-unset}} ${{TMUX_PANE-unset}}"'],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "TMUX_PANE": "%0",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "unset unset"
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_claude_env_file(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own CLAUDE_ENV_FILE is left in place instead of the tmux scrub."""
+    user_file = "/home/user/claude-env.sh"
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("CLAUDE_ENV_FILE", user_file)
+    else:
+        monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": user_file})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert terminal_env.get("CLAUDE_ENV_FILE", user_file) == user_file

@@ -2,9 +2,11 @@ import { BotIcon } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import { readSubagentActivity } from "@/lib/subagentActivity";
+import { useOpenSubagentInPanel } from "@/shell/subagentPanelOpener";
 
 export function SubagentActivityMessage({ data }: { data: Record<string, unknown> }) {
   const { search } = useLocation();
+  const openInPanel = useOpenSubagentInPanel();
   const activity = readSubagentActivity(data);
   if (!activity) return null;
   const params = new URLSearchParams(sessionNavigationSearch(search));
@@ -32,6 +34,9 @@ export function SubagentActivityMessage({ data }: { data: Record<string, unknown
           {label}{" "}
           <Link
             to={to}
+            onClick={(event) => {
+              openInPanel(activity.sessionId, event);
+            }}
             className="rounded-sm font-semibold text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {activity.title}
