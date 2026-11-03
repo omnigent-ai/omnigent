@@ -17,6 +17,7 @@ from omnigent.harness_availability import HARNESS_BINARY_MISSING, HARNESS_VERSIO
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
     _binary_availability_reason,
+    _databricks_credential_source,
     configured_harness_map,
     harness_is_configured,
 )
@@ -116,11 +117,11 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # tripped up by an unexpected subprocess probe.
     def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's declared range is [1.17.7, 1.18.0); Cursor uses calendar
+            # OpenCode's declared range is [2.0.0, 3.0.0); Cursor uses calendar
             # versions and needs a build after 2026-06-01; everything else is
             # fine with a generous semver placeholder.
             if argv[0].endswith("opencode"):
-                version = "1.17.7\n"
+                version = "opencode v2.0.18\n"
             elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
                 version = "2026.07.01\n"
             else:
@@ -302,7 +303,13 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
     )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
-    # opencode: no stored/env provider.
+    result = configured_harness_map()
+    assert result["claude-native"] == "needs-auth"
+
+
+def test_opencode_ready_without_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed OpenCode is launchable with no credential: its free models need none."""
+    _all_clis_installed(monkeypatch)
     import omnigent.onboarding.opencode_auth as oc
 
     monkeypatch.setattr(
@@ -310,9 +317,7 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
         "opencode_auth_summary",
         lambda: oc.OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
     )
-    result = configured_harness_map()
-    assert result["claude-native"] == "needs-auth"
-    assert result["opencode-native"] == "needs-auth"
+    assert configured_harness_map()["opencode-native"] is True
 
 
 def test_opencode_ready_via_bedrock_profile_without_stored_login(
@@ -1128,6 +1133,27 @@ def test_sdk_harness_ready_via_databricks_workspace(
     result = configured_harness_map()
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
+
+
+def test_databricks_credential_source_names_the_actual_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detection distinguishes env auth from the profile that actually matched."""
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-test-token")
+    assert _databricks_credential_source() == "Databricks environment variables"
+
+    monkeypatch.delenv("DATABRICKS_HOST")
+    monkeypatch.delenv("DATABRICKS_TOKEN")
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "not-the-match")
+    config_file = tmp_path / "databrickscfg-source"
+    config_file.write_text(
+        "[actual-profile]\nhost = https://example.cloud.databricks.com\ntoken = dapi-test-token\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
+
+    assert _databricks_credential_source() == "Databricks profile actual-profile"
 
 
 def test_databricks_workspace_url_alone_is_not_a_credential(

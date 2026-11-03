@@ -22,7 +22,7 @@ import {
   createBubbleCache,
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
-import { useChatStore } from "@/store/chatStore";
+import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
@@ -31,6 +31,7 @@ import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
@@ -228,7 +229,14 @@ function TranscriptImpl({
       flushSync(() => setNativeFindConversationId(display.conversationId));
     };
     window.addEventListener("keydown", handleFind);
-    return () => window.removeEventListener("keydown", handleFind);
+    // The desktop Edit > Find… menu opens its find bar without a keydown.
+    const unsubscribeFindOpened = onFindOpened(() => {
+      if (display.conversationId) setNativeFindConversationId(display.conversationId);
+    });
+    return () => {
+      window.removeEventListener("keydown", handleFind);
+      unsubscribeFindOpened();
+    };
   }, [display.conversationId]);
   const disableVirtualization = nativeFindConversationId === display.conversationId;
   const [searchParams] = useSearchParams();
@@ -594,7 +602,32 @@ export function VirtualBubbleList({
   };
   const ctxRef = useRef(ctx);
   ctxRef.current = ctx;
+  // A commit can transiently shorten the transcript and clamp a following reader to that height.
+  // Re-pin only a reader the commit moved up from the end (the library pins 1px short of it);
+  // a user scroll lands in its own task.
+  const followingScrollTopRef = useRef<number | null>(null);
+  followingScrollTopRef.current =
+    scrollEl &&
+    ctx.state.isAtBottom &&
+    !ctx.state.escapedFromLock &&
+    scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 2
+      ? scrollEl.scrollTop
+      : null;
+  useLayoutEffect(() => {
+    const recorded = followingScrollTopRef.current;
+    const { isAtBottom, escapedFromLock } = ctxRef.current.state;
+    if (!scrollEl || recorded === null || !isAtBottom || escapedFromLock) return;
+    if (scrollEl.scrollTop >= recorded) return;
+    const bottom = scrollEl.scrollHeight - scrollEl.clientHeight;
+    if (bottom - scrollEl.scrollTop > 1) ctxRef.current.state.scrollTop = bottom;
+  });
   const storeConvId = useChatStore((s) => s.conversationId);
+  // A queued follow-up is sent as soon as the turn ends, so the reply's actions would
+  // only show for a frame.
+  const followUpQueued = useChatStore(
+    (s) => sendableQueuedHead(s.queuedMessages, conversationId) !== null,
+  );
+  const actionsPersist = sessionIdle && !followUpQueued;
   const restoringRef = useRef<string | null>(null);
   const latestSnapshotRef = useRef<{
     conversationId: string;
@@ -670,7 +703,16 @@ export function VirtualBubbleList({
     };
     measure(false);
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure(true));
+    let viewportHeight = scrollEl.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const nextViewportHeight = scrollEl.clientHeight;
+      if (viewportHeight === 0 && nextViewportHeight > 0) {
+        // The browser can restore scrollTop without firing scroll when a hidden view returns.
+        scrollEl.dispatchEvent(new Event("scroll"));
+      }
+      viewportHeight = nextViewportHeight;
+      measure(true);
+    });
     observer.observe(scrollEl); // viewport height changes
     if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
     return () => observer.disconnect();
@@ -746,6 +788,25 @@ export function VirtualBubbleList({
         : element.getBoundingClientRect().height;
     },
   });
+
+  // A row mounted mid-scroll is only measured by its ResizeObserver, after the layout
+  // has recorded its shift. Measuring it right after the commit corrects the scroll first.
+  const measureRow = useCallback(
+    (node: HTMLDivElement | null) => {
+      virtualizer.measureElement(node);
+      if (node === null) return;
+      queueMicrotask(() => {
+        const key = node.dataset.bubbleKey;
+        if (!node.isConnected || key === undefined || virtualizer.itemSizeCache.has(key)) return;
+        // The cached offset lags scroll writes until the next scroll event, and the
+        // correction below writes an absolute position built from it.
+        const scroller = virtualizer.scrollElement;
+        if (scroller) virtualizer.scrollOffset = scroller.scrollTop;
+        virtualizer.resizeItem(Number(node.dataset.index), node.getBoundingClientRect().height);
+      });
+    },
+    [virtualizer],
+  );
 
   // An assistant bubble is keyed by its first item, so a history page that
   // continues the top turn renames it. Keep rendering it under the key its row
@@ -1038,7 +1099,7 @@ export function VirtualBubbleList({
             isLastAssistant={index === lastAssistantIndex}
             showsWorking={showsWorking && index === lastAssistantIndex}
             actionsPersistent={
-              index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+              index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
             }
           />
         ))}
@@ -1069,7 +1130,7 @@ export function VirtualBubbleList({
             key={rowKey(bubble)}
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
-            ref={virtualizer.measureElement}
+            ref={measureRow}
             className="relative"
           >
             <BubbleView
@@ -1077,7 +1138,7 @@ export function VirtualBubbleList({
               isLastAssistant={item.index === lastAssistantIndex}
               showsWorking={showsWorking && item.index === lastAssistantIndex}
               actionsPersistent={
-                item.index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+                item.index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
               }
             />
           </div>

@@ -93,6 +93,30 @@ async def test_list_sessions_search_query_filters_by_title(client: httpx.AsyncCl
     assert ids == [conv_a], f"Expected only {conv_a!r} matching 'alpha', got {ids!r}"
 
 
+async def test_list_sessions_search_scope_selects_match_group(client: httpx.AsyncClient) -> None:
+    """``search_scope`` reaches the store and rejects unknown scopes.
+
+    :param client: HTTP client wired to the test app.
+    """
+    conv_id = await _create_session(client, name="scope-agent", title="Gamma Launch Plan")
+
+    title_resp = await client.get(
+        "/v1/sessions", params={"search_query": "gamma", "search_scope": "title"}
+    )
+    assert title_resp.status_code == 200
+    assert [c["id"] for c in title_resp.json()["data"]] == [conv_id]
+    # The content group leaves out sessions whose title already matches.
+    content_resp = await client.get(
+        "/v1/sessions", params={"search_query": "gamma", "search_scope": "content"}
+    )
+    assert content_resp.status_code == 200
+    assert content_resp.json()["data"] == []
+    invalid_resp = await client.get(
+        "/v1/sessions", params={"search_query": "gamma", "search_scope": "body"}
+    )
+    assert invalid_resp.status_code == 422
+
+
 async def test_list_sessions_search_query_empty_is_noop(client: httpx.AsyncClient) -> None:
     """An empty ``search_query=`` returns the unfiltered list.
 

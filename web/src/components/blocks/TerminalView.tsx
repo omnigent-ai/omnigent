@@ -8,7 +8,7 @@
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -31,12 +31,6 @@ import {
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
-import {
-  readTerminalThemeMode,
-  resolveTerminalIsDark,
-  subscribeTerminalTheme,
-  type TerminalThemeMode,
-} from "@/lib/terminalThemePreferences";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   TerminalClipboardPrompt,
@@ -135,6 +129,8 @@ interface TerminalViewProps {
   resumeTarget?: "session" | "sandbox";
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
+  /** When provided, the parent increments this after successful recovery to redial a closed bridge. */
+  resumeGeneration?: number;
   /**
    * False while the surface is mounted but hidden (a pre-warmed attach
    * kept alive behind the chat view). The session stays connected either
@@ -173,6 +169,7 @@ export function TerminalView({
   onResume,
   resumeTarget = "session",
   resumePending = false,
+  resumeGeneration,
   active = true,
   focusOnConnect = active,
   directAttachUrl,
@@ -275,16 +272,8 @@ export function TerminalView({
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
-  const resolvedMode = useResolvedThemeMode();
-  // Terminal theme is independent of the app theme: "auto" follows the app's
-  // resolved appearance, while "light"/"dark" pin the terminal. Reading the
-  // pref as state (seeded at mount, updated via the pub/sub) lets a Settings
-  // change re-theme a live terminal through the existing setTheme effect below.
-  const [terminalMode, setTerminalMode] = useState<TerminalThemeMode>(() =>
-    readTerminalThemeMode(),
-  );
-  useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
-  const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
+  // A Settings change re-themes a live terminal through the setTheme effect below.
+  const isDark = useTerminalIsDark();
   const terminalBackground = terminalTheme(isDark).background;
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
@@ -525,12 +514,14 @@ export function TerminalView({
     setResumeError(null);
     try {
       await onResume();
-      disposeActiveSession();
-      setConnectAttempt((attempt) => attempt + 1);
+      if (resumeGeneration === undefined) {
+        disposeActiveSession();
+        setConnectAttempt((attempt) => attempt + 1);
+      }
     } catch (error) {
       setResumeError(resumeErrorText(error, resumeTarget));
     }
-  }, [onResume, disposeActiveSession, resumeTarget]);
+  }, [onResume, disposeActiveSession, resumeTarget, resumeGeneration]);
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
@@ -651,6 +642,21 @@ export function TerminalView({
     sessionRef.current?.setClipboardEnabled(!readOnly && active);
   }, [readOnly, active]);
 
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const previousResumeGeneration = useRef(resumeGeneration);
+  useEffect(() => {
+    if (previousResumeGeneration.current === resumeGeneration) return;
+    previousResumeGeneration.current = resumeGeneration;
+    if (resumeGeneration === undefined) return;
+    setResumeError(null);
+    const current = stateRef.current;
+    if (current.kind === "connected") return;
+    reconnectAttemptsRef.current = 0;
+    disposeActiveSession();
+    setConnectAttempt((attempt) => attempt + 1);
+  }, [resumeGeneration, disposeActiveSession]);
+
   // On the hidden→visible edge of a pre-warmed surface: focus the
   // terminal (the session's WS-open focus is a no-op while the element is
   // hidden — visibility:hidden elements aren't focusable), and if the
@@ -659,8 +665,6 @@ export function TerminalView({
   // immediately with a fresh budget. Reveal is a user signal, exactly
   // like the visibilitychange redial for frozen tabs. Deliberate closes
   // (4xxx) keep the dead-end overlay as ever.
-  const stateRef = useRef(state);
-  stateRef.current = state;
   const wasActiveRef = useRef(active);
   useEffect(() => {
     if (active && !wasActiveRef.current) {

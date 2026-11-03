@@ -124,10 +124,25 @@ class CompressedText(TypeDecorator[str]):
     impl = LargeBinary
     cache_ok = True
 
+    def __init__(self, max_stored_bytes: int | None = None) -> None:
+        """
+        :param max_stored_bytes: Largest framed (compressed) value to write, e.g.
+            ``65_535`` for a MySQL ``BLOB``; ``None`` leaves writes unbounded.
+        """
+        super().__init__()
+        self.max_stored_bytes = max_stored_bytes
+
     def process_bind_param(self, value: str | None, dialect: object) -> bytes | None:
-        """Compress on the way into the database."""
+        """Compress on the way into the database, enforcing ``max_stored_bytes``."""
         del dialect
-        return encode(value)
+        encoded = encode(value)
+        if (
+            encoded is not None
+            and self.max_stored_bytes is not None
+            and len(encoded) > self.max_stored_bytes
+        ):
+            raise ValueError("Compressed text exceeds size limit")
+        return encoded
 
     def process_result_value(
         self, value: bytes | str | memoryview | None, dialect: object
