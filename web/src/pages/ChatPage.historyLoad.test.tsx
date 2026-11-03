@@ -1739,6 +1739,8 @@ describe("JumpToTopButton", () => {
       fireEvent.mouseMove(container, { clientY: 10 });
     });
     expect(pill().className).toContain("pointer-events-auto");
+    expect(pill()).toHaveClass("size-7", "p-0");
+    expect(pill()).not.toHaveTextContent("Jump to top");
 
     // Leaving the conversation hides it again.
     act(() => {

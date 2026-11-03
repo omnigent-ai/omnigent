@@ -36,7 +36,8 @@ local; automatic client sync and shared/machine scope controls remain deferred.
 `harness=<harness>` saves a user default. Omit `--global` to save in the current
 project. Use `omnigent config list` to inspect the files and
 `omnigent config unset [--global] model` to remove a value. Startup commands
-and argument lists are configured in the user file's per-harness mappings;
+and argument lists are configured in the user file's per-harness mappings, as is
+`harness.codex-native.app_server`, a wrapper for Codex's session app-servers;
 `config list` names any project-file entries it ignores.
 
 **Launch:** run `omnigent run` with an agent/default agent and optional model
@@ -228,7 +229,8 @@ observed results, any mocked services, and remaining entry-point gaps.
 - Server-stored project defaults used by the new-session composer are separate
   from local `.omnigent/config.yaml`. The stubbed browser requests in
   `tests/e2e_ui/start_session/test_project_config_prefill.py` exercise the former,
-  not reading host YAML or syncing workspace preferences.
+  not reading host YAML or syncing workspace preferences. The model and effort
+  defaults are `project-session-defaults` in [the composer map](./composer.md).
 - A missing setting, an explicit project clear, an empty argument list, and a
   disabled plugin have different meanings. A project harness, scalar or
   `default`, only selects the default; per-harness fields stay user-owned.

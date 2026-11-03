@@ -22,6 +22,7 @@ import {
   MOD_KEY,
   newSessionShortcutKeys,
   SHIFT_KEY,
+  SPLIT_TERMINAL_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
 import {
@@ -92,6 +93,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
       { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
+      { label: "Cycle model", keys: [CTRL_KEY, ALT_KEY, "M"] },
+      { label: "Cycle reasoning effort", keys: [CTRL_KEY, ALT_KEY, "E"] },
       { label: "Cycle permission mode (in session)", keys: [SHIFT_KEY, "Tab"] },
       { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
@@ -119,6 +122,14 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       },
       { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
       { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
+    ],
+  },
+  {
+    title: "Panes",
+    note: "in grids and split terminals",
+    items: [
+      { label: "Focus previous pane", keys: [MOD_KEY, ALT_KEY, SHIFT_KEY, BRACKET_LEFT] },
+      { label: "Focus next pane", keys: [MOD_KEY, ALT_KEY, SHIFT_KEY, BRACKET_RIGHT] },
     ],
   },
   {
@@ -151,8 +162,10 @@ function shortcutGroupsFor(
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
   contentSearch: boolean,
+  grids: boolean,
+  splitTerminal: boolean,
 ): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) => {
+  const groups = SHORTCUT_GROUPS.map((group) => {
     if (group.title === "General") {
       return {
         ...group,
@@ -207,8 +220,23 @@ function shortcutGroupsFor(
           ),
       };
     }
+    if (group.title === "Panes") {
+      return {
+        ...group,
+        items: [
+          ...(grids || splitTerminal ? group.items : []),
+          ...(splitTerminal
+            ? [
+                { label: "Split terminal right", keys: SPLIT_TERMINAL_KEYS.columns },
+                { label: "Split terminal down", keys: SPLIT_TERMINAL_KEYS.rows },
+              ]
+            : []),
+        ],
+      };
+    }
     return group;
   });
+  return groups.filter((group) => group.items.length > 0);
 }
 
 /**
@@ -233,10 +261,12 @@ export function KeyboardShortcutsList({
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
     !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
+    !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
+    !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
   );
   const settings = variant === "settings";
   return (
-    <div className={settings ? "flex flex-col gap-6" : undefined}>
+    <div className={settings ? "flex flex-col gap-10" : undefined}>
       {groups.map((group) => (
         <section key={group.title} className={settings ? "" : "mb-4 last:mb-0"}>
           <h3

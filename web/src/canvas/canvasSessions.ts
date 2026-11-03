@@ -17,7 +17,8 @@ import {
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
-import { dedupeConversationsById } from "@/shell/sidebarNav";
+import { sessionVisibility } from "@/lib/sessionVisibility";
+import { dedupeConversationsById, isOwnedByViewer } from "@/shell/sidebarNav";
 
 /** First page when nothing is cached: small, so the first paint is quick. */
 export const INITIAL_SESSION_PAGE_LIMIT = 25;
@@ -117,7 +118,9 @@ function readStoredSessions(
     ) {
       return undefined;
     }
-    return dedupeConversationsById(stored.sessions.filter(isTopLevelActive));
+    return dedupeConversationsById(
+      stored.sessions.filter((session) => isCanvasSession(session, viewerId)),
+    );
   } catch {
     return undefined;
   }
@@ -197,8 +200,16 @@ function rememberCompleteSessions(
   }
 }
 
-export function isTopLevelActive(session: Conversation): boolean {
-  return !session.archived && session.parent_session_id == null;
+function isCanvasSession(
+  session: Conversation,
+  viewerId: string | null = getCurrentUserId(),
+): boolean {
+  return (
+    !session.archived &&
+    session.parent_session_id == null &&
+    isOwnedByViewer(session, viewerId) &&
+    sessionVisibility(session, viewerId) === "mine"
+  );
 }
 
 export function sessionListQuery(after: string | null, limit: number): string {
@@ -207,13 +218,13 @@ export function sessionListQuery(after: string | null, limit: number): string {
   query.set("sort_by", "updated_at");
   query.set("order", "desc");
   query.set("kind", "default");
-  query.set("visibility", "all");
+  query.set("visibility", "mine");
   query.set("include_archived", "false");
   if (after) query.set("after", after);
   return query.toString();
 }
 
-/** Top-level, non-archived rows already in the sidebar's list cache, newest first. */
+/** The viewer's active, top-level rows from the sidebar cache, newest first. */
 export function cachedSessionPreview(
   queryClient: QueryClient,
   limit: number = INITIAL_SESSION_PAGE_LIMIT,
@@ -223,7 +234,7 @@ export function cachedSessionPreview(
       queryKey: ["conversations"],
     })
     .flatMap(([, data]) => data?.pages.flatMap((page) => page.data) ?? []);
-  return dedupeConversationsById(rows.filter(isTopLevelActive))
+  return dedupeConversationsById(rows.filter((session) => isCanvasSession(session)))
     .sort((left, right) => right.updated_at - left.updated_at || left.id.localeCompare(right.id))
     .slice(0, limit);
 }
@@ -241,7 +252,7 @@ async function fetchSessionPage(
 }
 
 /**
- * Load every top-level session, newest first. The first page is a quick 25
+ * Load the viewer's top-level sessions, newest first. The first page is a quick 25
  * rows unless a preview already covers the first paint; later pages take the
  * server maximum. `onProgress` fires after each page; while more pages are
  * pending the preview stays merged in so cards never vanish mid-load. Only the
@@ -252,7 +263,12 @@ export async function loadAllSessions(
   onProgress: (progress: SessionLoadProgress) => void,
   signal?: AbortSignal,
 ): Promise<Conversation[]> {
-  const previewById = new Map(preview.map((session) => [session.id, session]));
+  const viewerId = await resolveIdentity();
+  const previewById = new Map(
+    preview
+      .filter((session) => isCanvasSession(session, viewerId))
+      .map((session) => [session.id, session]),
+  );
   const loaded = new Map<string, Conversation>();
   const seenCursors = new Set<string>();
   let after: string | null = null;
@@ -262,8 +278,12 @@ export async function loadAllSessions(
     // Each page's cursor comes from the previous response, so pages are sequential.
     // oxlint-disable-next-line no-await-in-loop
     const page = await fetchSessionPage(after, limit, signal);
+    // An unresolved identity must not confirm an empty board and erase saved layouts.
+    if (viewerId === null && page.data.some((session) => session.owner)) {
+      throw new Error("Could not determine session ownership. Try again.");
+    }
     for (const session of page.data) {
-      if (isTopLevelActive(session)) loaded.set(session.id, session);
+      if (isCanvasSession(session, viewerId)) loaded.set(session.id, session);
     }
     if (loaded.size > MAX_SESSIONS) {
       throw new Error(`Canvas session load exceeded ${MAX_SESSIONS} sessions`);
@@ -298,6 +318,9 @@ function sameCard(left: Conversation, right: Conversation): boolean {
     (left.project_id ?? null) === (right.project_id ?? null) &&
     (left.workspace ?? null) === (right.workspace ?? null) &&
     (left.archived ?? false) === (right.archived ?? false) &&
+    left.parent_session_id === right.parent_session_id &&
+    left.owner === right.owner &&
+    left.permission_level === right.permission_level &&
     left.labels?.omni_project === right.labels?.omni_project
   );
 }
@@ -322,7 +345,7 @@ function liveRows(queryClient: QueryClient): Map<string, Conversation> {
 /**
  * Overlay the sidebar's live rows onto the canvas rows: a cached row that is
  * at least as recent and renders differently replaces the canvas copy. Rows
- * that became archived drop off. Returns the input when nothing changed.
+ * that became archived, shared, or child sessions drop off.
  */
 export function applyLiveRows(
   sessions: readonly Conversation[],
@@ -332,12 +355,16 @@ export function applyLiveRows(
   const next: Conversation[] = [];
   for (const row of sessions) {
     const fresh = live.get(row.id);
+    if (!isCanvasSession(fresh && fresh.updated_at >= row.updated_at ? fresh : row)) {
+      changed = true;
+      continue;
+    }
     if (!fresh || fresh.updated_at < row.updated_at || sameCard(fresh, row)) {
       next.push(row);
       continue;
     }
     changed = true;
-    if (isTopLevelActive(fresh)) next.push(fresh);
+    next.push(fresh);
   }
   return changed ? next : [...sessions];
 }
