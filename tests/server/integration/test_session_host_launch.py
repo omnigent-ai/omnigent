@@ -1212,6 +1212,51 @@ async def test_offline_host_gets_real_grace_before_native_failure(
     assert wait_event.attributes["outcome"] == "host_offline"
 
 
+async def test_side_chat_send_names_its_source_host_offline(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side chat whose source's host is offline fails with the host-offline cause.
+
+    The side chat has no host of its own; it runs on its source's runner, so
+    the source's offline host is why no runner could start.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    source_id = await _offline_native_host_session(client, app)
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.get_conversation(source_id)
+    assert source is not None and source.runner_id is not None
+    side_chat = store.create_conversation(
+        agent_id=source.agent_id,
+        runner_id=source.runner_id,
+        labels={
+            **(source.labels or {}),
+            "omnigent.side_chat": "1",
+            "omnigent.side_chat.source_id": source_id,
+        },
+    )
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+
+    response = await client.post(
+        f"/v1/sessions/{side_chat.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{side_chat.id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _host_offline_message()
+
+
 async def test_offline_host_send_held_by_client_records_nothing(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -4107,11 +4152,15 @@ async def test_relaunch_stops_the_superseded_runner(
     )
 
 
+@pytest.mark.parametrize(
+    "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
+)
 async def test_concurrent_relaunches_are_single_flight(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_after_rotation: bool,
 ) -> None:
     """Two racing messages to an offline-runner session launch ONE runner.
 
@@ -4143,11 +4192,11 @@ async def test_concurrent_relaunches_are_single_flight(
         observed_bindings.append(args[0].runner_id)
         if len(observed_bindings) == 2:
             both_callers_ready.set()
-        await both_callers_ready.wait()
+        if not snapshot_after_rotation:
+            await both_callers_ready.wait()
         return await launch_runner(*args, **kwargs)
 
-    # Both requests must snapshot the offline binding before either rotates it.
-    # With startup grace disabled, a later snapshot would request another launch.
+    # Race both old snapshots, or let the second caller read the in-flight binding.
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
 
     def _post() -> Any:
@@ -4162,11 +4211,14 @@ async def test_concurrent_relaunches_are_single_flight(
             },
         )
 
-    tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
+    tasks = [asyncio.create_task(_post())]
+    if not snapshot_after_rotation:
+        tasks.append(asyncio.create_task(_post()))
     launches: list[HostLaunchRunnerFrame] = []
     try:
-        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
-        assert observed_bindings == [session["runner_id"], session["runner_id"]]
+        if not snapshot_after_rotation:
+            await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+            assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
@@ -4179,6 +4231,13 @@ async def test_concurrent_relaunches_are_single_flight(
                 frame = decode_host_frame(output["text"])
                 if isinstance(frame, HostLaunchRunnerFrame):
                     launches.append(frame)
+                    if snapshot_after_rotation and len(launches) == 1:
+                        tasks.append(asyncio.create_task(_post()))
+                        await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+                        assert observed_bindings == [
+                            session["runner_id"],
+                            token_bound_runner_id(frame.binding_token),
+                        ]
                     # Answer "launched" so the first flight's result wait
                     # returns and releases the relaunch lock — the second
                     # flight must then SHORT-CIRCUIT on the rotated binding
