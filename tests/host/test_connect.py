@@ -8839,6 +8839,82 @@ async def test_slow_frame_does_not_head_of_line_block(
     assert any('"req_slow"' in frame for frame in ws.sent)
 
 
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
+@pytest.mark.parametrize("succeeds", [True, False], ids=["success", "refusal"])
+async def test_slow_filesystem_frame_keeps_host_control_responsive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str, succeeds: bool
+) -> None:
+    """A stalled filesystem must not delay keepalive or runner liveness replies."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+
+    host = _make_host_process()
+    ws = _CollectingWs()
+    target = tmp_path / "folder"
+    if (operation == "stat") == succeeds:
+        target.mkdir()
+    frame_type = HostStatFrame if operation == "stat" else HostCreateDirFrame
+    frame = frame_type(request_id="filesystem", path=str(target))
+    real_handler = getattr(host, f"_handle_{operation}")
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def _slow_filesystem(frame: HostStatFrame | HostCreateDirFrame) -> object:
+        loop.call_soon_threadsafe(started.set)
+        try:
+            release.wait(5.0)
+            return real_handler(frame)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(host, f"_handle_{operation}", _slow_filesystem)
+    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc.poll.return_value = None
+    host._runners["runner_live"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    host._start_frame_task(ws, encode_host_frame(frame))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(started.wait(), 5.0)
+        assert not finished.is_set(), "filesystem blocked the host event loop"
+        await asyncio.wait_for(
+            host._handle_raw_message(ws, encode_frame(PingFrame(ts=123))),  # type: ignore[arg-type]
+            1.0,
+        )
+        await asyncio.wait_for(
+            host._dispatch_host_frame(  # type: ignore[arg-type]
+                ws, HostRunnerStatusFrame(request_id="status", runner_id="runner_live")
+            ),
+            1.0,
+        )
+        assert not finished.is_set()
+        assert len(ws.sent) == 2
+        assert decode_frame(ws.sent[0]) == PongFrame(ts=123)
+        assert decode_host_frame(ws.sent[1]) == HostRunnerStatusResultFrame(
+            request_id="status", status="alive"
+        )
+    finally:
+        release.set()
+        await asyncio.wait_for(_drain_frame_tasks(host), 5.0)
+
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, (HostStatResultFrame, HostCreateDirResultFrame))
+    assert result.request_id == "filesystem"
+    assert result.status == "ok"
+    if operation == "stat":
+        assert isinstance(result, HostStatResultFrame)
+        assert result.exists is succeeds
+        assert result.type == ("directory" if succeeds else None)
+    else:
+        assert isinstance(result, HostCreateDirResultFrame)
+        assert result.error == (None if succeeds else "directory already exists")
+        assert target.is_dir()
+
+
 @pytest.mark.parametrize("stage", ["queued", "preflight", "spawn"])
 async def test_runner_status_waits_for_pending_launch(
     stage: str,
