@@ -435,17 +435,15 @@ linux_pkg_install_cmd() {
 }
 
 tmux_version_supported() {
-  tmux_version_output=$(tmux -V 2>/dev/null) || return 1
-  case "$tmux_version_output" in
-    "tmux "*.*) ;;
+  tmux_version_output=$(tmux -V 2>/dev/null) || { tmux_version_output=; return 1; }
+  # Mirror omnigent.util.tmux_compat: the first "N.N" in the output, so release
+  # suffixes (3.3a) and build names (next-3.4) parse the same as in the runtime.
+  tmux_release=${tmux_version_output#"${tmux_version_output%%[0-9]*}"}
+  tmux_major=${tmux_release%%[!0-9]*}
+  tmux_minor=${tmux_release#"$tmux_major"}
+  case "$tmux_minor" in
+    .[0-9]*) tmux_minor=${tmux_minor#.}; tmux_minor=${tmux_minor%%[!0-9]*} ;;
     *) return 1 ;;
-  esac
-  tmux_release=${tmux_version_output#tmux }
-  tmux_major=${tmux_release%%.*}
-  tmux_minor=${tmux_release#*.}
-  tmux_minor=${tmux_minor%%[!0-9]*}
-  case "$tmux_major:$tmux_minor" in
-    *[!0-9:]*|:*|*:) return 1 ;;
   esac
   [ "$tmux_major" -gt "${TMUX_MIN_VERSION%%.*}" ] || {
     [ "$tmux_major" -eq "${TMUX_MIN_VERSION%%.*}" ] &&

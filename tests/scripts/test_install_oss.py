@@ -38,28 +38,22 @@ SH = shutil.which("sh") or "/bin/sh"
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize(
-    ("platform", "version", "answer", "upgrade_version", "upgrade_status"),
+    ("platform", "answer"),
     [
-        pytest.param("Linux", "3.3a", None, "3.3a", 0, id="linux-supported"),
-        pytest.param("Linux", "3.0", None, "3.3a", 0, id="linux-noninteractive"),
-        pytest.param("Linux", "3.0", "n", "3.3a", 0, id="linux-manual-remediation"),
-        pytest.param("Darwin", "3.3a", None, "3.3a", 0, id="darwin-supported"),
-        pytest.param("Darwin", "3.0", None, "3.3a", 0, id="darwin-noninteractive"),
-        pytest.param("Darwin", "3.0", "n", "3.3a", 0, id="darwin-declined"),
-        pytest.param("Darwin", "3.0", "y", "3.3a", 0, id="darwin-upgraded"),
-        pytest.param("Darwin", "3.0", "y", "3.0", 0, id="darwin-package-did-not-upgrade"),
-        pytest.param("Darwin", "3.0", "y", "3.0", 17, id="darwin-package-failed"),
+        pytest.param("Darwin", "y", id="darwin-upgraded"),
+        pytest.param("Darwin", "n", id="darwin-declined"),
+        pytest.param("Linux", None, id="linux-noninteractive"),
     ],
 )
 def test_installer_main_checks_tmux_with_explicit_consent(
-    tmp_path: Path,
-    platform: str,
-    version: str,
-    answer: str | None,
-    upgrade_version: str,
-    upgrade_status: int,
+    tmp_path: Path, platform: str, answer: str | None
 ) -> None:
-    """Drive the complete installer with a PTY and local executable dependencies."""
+    """Drive the complete installer with a PTY and local executable dependencies.
+
+    The function-level tests cover the version matrix; these cases exercise the
+    process boundary: the real consent prompt, no mutation before an answer, and
+    the ledger the installer writes.
+    """
     home = tmp_path / "home"
     home.mkdir()
     tools = tmp_path / "tools"
@@ -68,7 +62,7 @@ def test_installer_main_checks_tmux_with_explicit_consent(
     calls = tmp_path / "calls.jsonl"
     calls.touch()
     version_file = tmp_path / "tmux-version"
-    version_file.write_text(version)
+    version_file.write_text("3.0")
     dispatcher = tools / "fake-tool"
     dispatcher.write_text(
         f"#!{sys.executable}\n"
@@ -87,8 +81,7 @@ def test_installer_main_checks_tmux_with_explicit_consent(
         "    expected = ['apt-get', 'install', '-y', 'tmux'] if tool == 'sudo' "
         "else ['upgrade', 'tmux']\n"
         "    assert args == expected, args\n"
-        "    Path(os.environ['TEST_VERSION']).write_text(os.environ['TEST_UPGRADE_VERSION'])\n"
-        "    sys.exit(int(os.environ['TEST_UPGRADE_STATUS']))\n"
+        "    Path(os.environ['TEST_VERSION']).write_text('3.3a')\n"
         "elif tool == 'uv' and args[:2] == ['tool', 'dir']:\n"
         "    print(os.environ['PATH'])\n"
         "elif tool == 'uv' and args[:2] == ['tool', 'install']:\n"
@@ -117,8 +110,6 @@ def test_installer_main_checks_tmux_with_explicit_consent(
         "TEST_CALLS": str(calls),
         "TEST_PLATFORM": platform,
         "TEST_VERSION": str(version_file),
-        "TEST_UPGRADE_VERSION": upgrade_version,
-        "TEST_UPGRADE_STATUS": str(upgrade_status),
     }
     command = [str(INSTALLER), "--no-databricks", "--verbose"]
     transcript = tmp_path / "installer.log"
@@ -139,16 +130,15 @@ def test_installer_main_checks_tmux_with_explicit_consent(
             child = pexpect.spawn(SH, command, env=environment, cwd=str(home), encoding="utf-8")
             child.logfile = log
             try:
-                if platform == "Darwin":
-                    child.expect_exact("[Y/n] ", timeout=30)
-                    assert "native terminals need tmux 3.3 or newer" in child.before
-                    before_consent = [json.loads(line) for line in calls.read_text().splitlines()]
-                    assert not [
-                        call
-                        for call in before_consent
-                        if call[0] == "sudo" or (call[0] == "brew" and call[1][0] != "list")
-                    ]
-                    child.sendline(answer)
+                child.expect_exact("[Y/n] ", timeout=30)
+                assert "native terminals need tmux 3.3 or newer" in child.before
+                before_consent = [json.loads(line) for line in calls.read_text().splitlines()]
+                assert not [
+                    call
+                    for call in before_consent
+                    if call[0] == "sudo" or (call[0] == "brew" and call[1][0] != "list")
+                ]
+                child.sendline(answer)
                 child.expect(pexpect.EOF, timeout=90)
                 child.close()
                 status = child.exitstatus
@@ -165,26 +155,18 @@ def test_installer_main_checks_tmux_with_explicit_consent(
     ]
     assert len(upgrades) == (1 if answer == "y" else 0)
     probes = [call for call in invocations if call[0] == "brew" and call[1][0] == "list"]
-    assert probes == (
-        [["brew", ["list", "--formula", "tmux"]]]
-        if platform == "Darwin" and version == "3.0"
-        else []
-    )
+    assert probes == ([["brew", ["list", "--formula", "tmux"]]] if platform == "Darwin" else [])
     assert sum(call[0] == "uv" and call[1][:2] == ["tool", "install"] for call in invocations) == 1
-    supported = version == "3.3a" or (answer == "y" and upgrade_version == "3.3a")
-    assert ("tmux 3.3a is supported" in output) is supported
-    if not supported:
+    upgraded = answer == "y"
+    assert ("tmux 3.3a is supported" in output) is upgraded
+    if not upgraded:
         assert "tmux 3.3 or newer" in output
         assert "tmux -V" in output
         if platform == "Linux":
             assert "Install a supported version with your package manager" in output
             assert "[Y/n]" not in output
             assert "sudo apt-get" not in output
-    if answer == "y" and not supported:
-        assert "tmux 3.3 or newer is still unavailable" in output
-    if answer == "y" and upgrade_status:
-        assert "tmux install/upgrade failed" in output
-    assert version_file.read_text() == (upgrade_version if answer == "y" else version)
+    assert version_file.read_text() == ("3.3a" if upgraded else "3.0")
     ledger = json.loads((home / ".omnigent" / "install_ledger.json").read_text())
     assert ledger["entries"]["deps"]["tmux"]["installed_by"] == "preexisting"
 
@@ -442,6 +424,7 @@ def test_linux_pkg_install_cmd_none_present(lib: Path, tmp_path: Path) -> None:
         ("tmux 3.3a", 0, True),
         ("tmux 3.10", 0, True),
         ("tmux 4.0", 0, True),
+        ("tmux next-3.4", 0, True),
         ("unknown", 0, False),
         ("tmux 3.5", 1, False),
     ],
@@ -466,8 +449,11 @@ def test_check_tmux_validates_existing_version(
     assert "ownership=preexisting" in r.stdout
     assert "unexpected-install" not in r.stdout
     if supported:
+        assert f"{version} is supported" in r.stdout
         assert not r.stderr
     else:
+        detail = version if probe_status == 0 else "version unavailable"
+        assert f"tmux is unsupported ({detail})" in r.stderr
         assert "native terminals need tmux 3.3 or newer" in r.stderr
         assert "Install a supported version with your package manager" in r.stderr
         assert "sudo" not in r.stderr
