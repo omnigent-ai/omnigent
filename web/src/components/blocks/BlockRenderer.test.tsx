@@ -1595,23 +1595,6 @@ describe("BlockRenderer dispatch", () => {
     });
 
     it("keeps persistent dispatch cards visible outside the fold", () => {
-      const dispatch: RenderItem = {
-        kind: "tool",
-        itemId: "fc_send",
-        execution: {
-          name: "sys_session_send",
-          arguments: { agent: "deep_thought", title: "q1" },
-          argsSummary: "",
-          callId: "c_send",
-          agentName: "nessie",
-          executedBy: "server",
-          output: "ok",
-        },
-        output: "ok",
-        state: "output-available",
-        startedAt: null,
-        duration: undefined,
-      };
       const items: RenderItem[] = [
         { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
         dispatch,
