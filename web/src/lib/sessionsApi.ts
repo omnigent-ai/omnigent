@@ -986,26 +986,36 @@ export interface RewindPrompt {
   createdAt?: number;
 }
 
-/** Message pages `/rewind` reads before giving up on older prompts. */
+/** Message pages `/rewind` reads per request for prompts. */
 const REWIND_PROMPT_PAGES = 5;
 const REWIND_PROMPT_PAGE_SIZE = 200;
+
+/** A batch of `/rewind` prompts, newest first. */
+export interface RewindPromptsPage {
+  prompts: RewindPrompt[];
+  /** Pass back as `after` to read older prompts; `null` once none remain. */
+  olderCursor: string | null;
+}
 
 /**
  * List a session's user prompts, newest first, for the `/rewind` picker.
  *
  * Reads message items only (`GET /v1/sessions/{id}/items?type=message`, which
  * servers advertising `session_rewind` support) and skips hidden context
- * messages. Stops after the newest {@link REWIND_PROMPT_PAGES} pages.
+ * messages. Reads at most {@link REWIND_PROMPT_PAGES} pages per call; the
+ * returned cursor continues with older ones.
  *
  * @param sessionId - Session to read, e.g. "conv_abc".
  * @param signal - Aborts the requests when the picker closes.
+ * @param after - An `olderCursor` from the previous batch; omit for the newest.
  */
 export async function fetchRewindPrompts(
   sessionId: string,
   signal?: AbortSignal,
-): Promise<RewindPrompt[]> {
+  after: string | null = null,
+): Promise<RewindPromptsPage> {
   const prompts: RewindPrompt[] = [];
-  let after: string | null = null;
+  let cursor = after;
   // Each page needs the previous page's cursor.
   /* oxlint-disable no-await-in-loop */
   for (let page = 0; page < REWIND_PROMPT_PAGES; page++) {
@@ -1014,7 +1024,7 @@ export async function fetchRewindPrompts(
       order: "desc",
       type: "message",
     });
-    if (after) params.set("after", after);
+    if (cursor) params.set("after", cursor);
     const res = await authenticatedFetch(
       `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
       { signal },
@@ -1027,11 +1037,11 @@ export async function fetchRewindPrompts(
         .join("\n");
       prompts.push({ itemId: item.id, text, createdAt: item.created_at });
     }
-    if (!body.has_more || body.last_id == null) break;
-    after = body.last_id;
+    if (!body.has_more || body.last_id == null) return { prompts, olderCursor: null };
+    cursor = body.last_id;
   }
   /* oxlint-enable no-await-in-loop */
-  return prompts;
+  return { prompts, olderCursor: cursor };
 }
 
 /** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */

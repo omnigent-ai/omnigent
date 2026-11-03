@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Command,
   CommandEmpty,
@@ -12,8 +12,17 @@ import { fetchRewindPrompts, type RewindPrompt } from "@/lib/sessionsApi";
 
 type PromptsState =
   | { status: "loading" }
-  | { status: "ready"; prompts: RewindPrompt[] }
+  | {
+      status: "ready";
+      prompts: RewindPrompt[];
+      olderCursor: string | null;
+      /** Loading the next older batch, or why it failed. */
+      older: "idle" | "loading" | { error: string };
+    }
   | { status: "error"; message: string };
+
+const loadErrorMessage = (err: unknown) =>
+  err instanceof Error ? err.message : "Could not load prompts";
 
 interface RewindPickerProps {
   /** Session whose prompts are listed, e.g. "conv_abc". */
@@ -30,23 +39,52 @@ interface RewindPickerProps {
  */
 export function RewindPicker({ sessionId, open, onOpenChange, onPick }: RewindPickerProps) {
   const [state, setState] = useState<PromptsState>({ status: "loading" });
+  // Aborts the open picker's requests, older batches included, when it closes.
+  const controllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!open) return;
     const controller = new AbortController();
+    controllerRef.current = controller;
     setState({ status: "loading" });
     fetchRewindPrompts(sessionId, controller.signal).then(
-      (prompts) => setState({ status: "ready", prompts }),
+      ({ prompts, olderCursor }) =>
+        setState({ status: "ready", prompts, olderCursor, older: "idle" }),
       (err: unknown) => {
         if (controller.signal.aborted) return;
-        setState({
-          status: "error",
-          message: err instanceof Error ? err.message : "Could not load prompts",
-        });
+        setState({ status: "error", message: loadErrorMessage(err) });
       },
     );
     return () => controller.abort();
   }, [open, sessionId]);
+
+  const loadOlder = () => {
+    const controller = controllerRef.current;
+    if (state.status !== "ready" || state.olderCursor === null || state.older === "loading") return;
+    if (controller === null) return;
+    setState({ ...state, older: "loading" });
+    fetchRewindPrompts(sessionId, controller.signal, state.olderCursor).then(
+      (page) =>
+        setState((current) =>
+          current.status === "ready"
+            ? {
+                status: "ready",
+                prompts: [...current.prompts, ...page.prompts],
+                olderCursor: page.olderCursor,
+                older: "idle",
+              }
+            : current,
+        ),
+      (err: unknown) => {
+        if (controller.signal.aborted) return;
+        setState((current) =>
+          current.status === "ready"
+            ? { ...current, older: { error: loadErrorMessage(err) } }
+            : current,
+        );
+      },
+    );
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -90,6 +128,23 @@ export function RewindPicker({ sessionId, open, onOpenChange, onPick }: RewindPi
                     </CommandItem>
                   ))}
                 </CommandGroup>
+                {state.olderCursor !== null && (
+                  // Shown whatever the search, so an older prompt stays reachable.
+                  <CommandItem
+                    forceMount
+                    value="load older prompts"
+                    disabled={state.older === "loading"}
+                    onSelect={loadOlder}
+                    data-testid="rewind-load-older"
+                    className="text-muted-foreground"
+                  >
+                    {state.older === "loading"
+                      ? "Loading older prompts…"
+                      : typeof state.older === "object"
+                        ? `${state.older.error} — try again`
+                        : "Load older prompts"}
+                  </CommandItem>
+                )}
               </>
             )}
           </CommandList>

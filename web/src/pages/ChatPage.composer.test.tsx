@@ -1196,10 +1196,13 @@ describe("Composer slash-command menu", () => {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     useChatStore.setState({ sessionHarness: harness });
-    const prompts = vi.spyOn(sessionsApi, "fetchRewindPrompts").mockResolvedValue([
-      { itemId: "msg_second", text: "Add parser tests" },
-      { itemId: "msg_first", text: "Write the parser" },
-    ]);
+    const prompts = vi.spyOn(sessionsApi, "fetchRewindPrompts").mockResolvedValue({
+      prompts: [
+        { itemId: "msg_second", text: "Add parser tests" },
+        { itemId: "msg_first", text: "Write the parser" },
+      ],
+      olderCursor: null,
+    });
     const rewindToPrompt = vi.spyOn(useChatStore.getState(), "rewindToPrompt");
     const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
     render(
@@ -1232,6 +1235,36 @@ describe("Composer slash-command menu", () => {
       expect(onSend).not.toHaveBeenCalled();
     },
   );
+
+  it("/rewind loads older prompts on request, whatever the search", async () => {
+    const { prompts, rewindToPrompt } = renderRewindComposer("claude-sdk", {
+      session_rewind: true,
+    });
+    rewindToPrompt.mockResolvedValue();
+    prompts
+      .mockResolvedValueOnce({
+        prompts: [{ itemId: "msg_recent", text: "Add parser tests" }],
+        olderCursor: "msg_cursor",
+      })
+      .mockResolvedValueOnce({
+        prompts: [{ itemId: "msg_oldest", text: "Set up the repo" }],
+        olderCursor: null,
+      });
+    fireEvent.change(textarea(), { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const picker = await screen.findByTestId("rewind-picker");
+    await within(picker).findAllByTestId("rewind-prompt");
+
+    fireEvent.change(within(picker).getByRole("combobox"), { target: { value: "repo" } });
+    expect(within(picker).queryAllByTestId("rewind-prompt")).toEqual([]);
+    fireEvent.click(within(picker).getByTestId("rewind-load-older"));
+
+    const older = await within(picker).findByText("Set up the repo");
+    expect(prompts).toHaveBeenLastCalledWith("conv_test", expect.any(AbortSignal), "msg_cursor");
+    expect(within(picker).queryByTestId("rewind-load-older")).toBeNull();
+    fireEvent.click(older);
+    expect(rewindToPrompt).toHaveBeenCalledExactlyOnceWith("msg_oldest");
+  });
 
   it("/rewind shows a failed rewind under the composer", async () => {
     const { rewindToPrompt } = renderRewindComposer("claude-sdk", { session_rewind: true });

@@ -1567,17 +1567,53 @@ describe("fetchRewindPrompts", () => {
       }),
     );
 
-    const prompts = await fetchRewindPrompts("sess_1");
+    const { prompts, olderCursor } = await fetchRewindPrompts("sess_1");
 
     expect(prompts.map((prompt) => [prompt.itemId, prompt.text])).toEqual([
       ["msg_q2", "Add parser tests"],
       ["msg_q1", "Write the parser"],
     ]);
+    expect(olderCursor).toBeNull();
     expect(fetchMock.mock.calls[0]![0]).toBe(
       "/v1/sessions/sess_1/items?limit=200&order=desc&type=message",
     );
     expect(fetchMock.mock.calls[1]![0]).toBe(
       "/v1/sessions/sess_1/items?limit=200&order=desc&type=message&after=msg_skill",
+    );
+  });
+
+  it("stops after five pages and continues from the cursor it returns", async () => {
+    const page = (id: string, hasMore: boolean) =>
+      mockJsonResponse({
+        object: "list",
+        data: [{ id, type: "message", role: "user", content: [{ type: "input_text", text: id }] }],
+        last_id: id,
+        has_more: hasMore,
+      });
+    for (const id of ["msg_p1", "msg_p2", "msg_p3", "msg_p4", "msg_p5"])
+      fetchMock.mockResolvedValueOnce(page(id, true));
+    fetchMock.mockResolvedValueOnce(page("msg_oldest", false));
+
+    const newest = await fetchRewindPrompts("sess_1");
+
+    expect(newest.prompts.map((prompt) => prompt.itemId)).toEqual([
+      "msg_p1",
+      "msg_p2",
+      "msg_p3",
+      "msg_p4",
+      "msg_p5",
+    ]);
+    expect(newest.olderCursor).toBe("msg_p5");
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+
+    const older = await fetchRewindPrompts("sess_1", undefined, newest.olderCursor);
+
+    expect(older).toEqual({
+      prompts: [{ itemId: "msg_oldest", text: "msg_oldest", createdAt: undefined }],
+      olderCursor: null,
+    });
+    expect(fetchMock.mock.calls[5]![0]).toBe(
+      "/v1/sessions/sess_1/items?limit=200&order=desc&type=message&after=msg_p5",
     );
   });
 });
