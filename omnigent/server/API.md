@@ -447,6 +447,11 @@ Fields:
     Current lifecycle state: `"idle"`, `"running"`, `"waiting"`, or
     `"failed"`.
 
+  blocked_on (string or null)
+    What a `"running"` session is parked on as of its last
+    `session.status` edge, e.g. `"permission prompt"` or
+    `"dialog open"`. `null` when the session is not parked.
+
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.
 

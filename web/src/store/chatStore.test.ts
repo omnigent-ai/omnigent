@@ -14983,6 +14983,54 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await pump.stop();
   });
 
+  it("recovers a missed parked-dialog reason from the status snapshot", async () => {
+    seedSession("conv_blocked_gap", []);
+    const sink = pushableStream();
+    let blockedOnSnapshot: string | null = "permission prompt";
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_blocked_gap/stream") {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith("/v1/sessions/conv_blocked_gap?") && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id: "conv_blocked_gap",
+          agent_id: "agent_xyz",
+          status: "running",
+          blocked_on: blockedOnSnapshot,
+          created_at: 0,
+          items: [],
+          labels: {},
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_blocked_gap", {
+      abortController: controller,
+      sessionStatus: "running",
+      blockedOn: null,
+    });
+    const loop = startStreamPump("conv_blocked_gap", controller, bound.set, bound.get);
+    await drainAsync();
+
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(bound.get().blockedOn).toBe("permission prompt");
+
+    blockedOnSnapshot = null;
+    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(bound.get().blockedOn).toBeNull();
+
+    controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a live status event that arrives during snapshot reconciliation", async () => {
     seedSession("conv_status_race", []);
     const sink = pushableStream();

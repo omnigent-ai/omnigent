@@ -328,6 +328,11 @@ export interface Session {
    * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * What a running session is parked on as of the last status edge, e.g.
+   * `"permission prompt"`, so a reload keeps the terminal-routing label.
+   */
+  blockedOn?: string;
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a

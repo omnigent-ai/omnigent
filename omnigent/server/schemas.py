@@ -2194,6 +2194,10 @@ class SessionResponse(BaseModel):
     :param background_tasks: Per-shell detail for the running tally above,
         so a reload can restore each shell's description/command. ``None`` when
         none are tracked (or when an older runner reported only the count).
+    :param blocked_on: What a ``"running"`` session is parked on as of the
+        last status edge, e.g. ``"permission prompt"`` (see
+        :class:`SessionStatusEvent`), so a reload can still route the user to
+        the waiting terminal dialog. ``None`` when the session is not parked.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -2430,6 +2434,7 @@ class SessionResponse(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
+    blocked_on: str | None = None
     created_at: int
     updated_at: int | None = None
     title: str | None = None

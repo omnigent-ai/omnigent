@@ -5141,7 +5141,7 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
-        blockedOn: null,
+        blockedOn: session.blockedOn ?? null,
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
@@ -5386,10 +5386,11 @@ function reconnectStatusPatch(
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
   };
-  // Recover the background-shell tally across the gap too, so the spinner
-  // returns to "N background tasks still running" rather than vanishing on reconnect.
+  // Recover the background-shell tally and parked-dialog reason across the gap too,
+  // so the spinner keeps saying what it waits on rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
+  patch.blockedOn = session.blockedOn ?? null;
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -5512,6 +5513,7 @@ async function reconcileActiveSessionStatus(
     current.activeResponse !== stateBeforeFetch.activeResponse ||
     current.backgroundTaskCount !== stateBeforeFetch.backgroundTaskCount ||
     current.backgroundTasks !== stateBeforeFetch.backgroundTasks ||
+    current.blockedOn !== stateBeforeFetch.blockedOn ||
     current.mcpStartup !== stateBeforeFetch.mcpStartup ||
     current.contextWindow !== stateBeforeFetch.contextWindow ||
     current.tokensUsed !== stateBeforeFetch.tokensUsed ||

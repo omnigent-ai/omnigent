@@ -147,6 +147,11 @@ interface SessionResponseWire {
    * it. Absent when none are tracked.
    */
   background_tasks?: BackgroundTaskInfo[] | null;
+  /**
+   * What a ``"running"`` session is parked on as of the last status edge,
+   * e.g. ``"permission prompt"``. Absent when the session is not parked.
+   */
+  blocked_on?: string | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -336,6 +341,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
+    blockedOn: wire.blocked_on ?? undefined,
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,

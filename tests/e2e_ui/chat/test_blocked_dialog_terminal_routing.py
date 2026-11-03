@@ -13,6 +13,7 @@ Journey modeled:
 2. A slash command opens an interactive dialog in the terminal TUI.
 3. Chat parks on a muted blocked-on-a-dialog working indicator.
 4. The dialog waits for input in the terminal view only.
+5. The user reloads the chat while the dialog is still open.
 
 The regression contract: while the session is blocked on a terminal dialog,
 the chat surface must route the user to where the input is needed — either
@@ -119,3 +120,9 @@ def test_chat_blocked_on_terminal_dialog_routes_user_to_terminal(
         "inline elicitation card is shown. A user staying in chat mode has no "
         "way to know the session is waiting for them and will conclude it hung."
     )
+
+    # Step 5 — a reload loses the live status edge; the session snapshot must
+    # keep chat parked on the dialog instead of a bare working spinner.
+    page.reload()
+    expect(working).to_contain_text(_BLOCKED_ON_DIALOG, timeout=15_000)
+    expect(working).to_contain_text(re.compile(r"terminal", re.IGNORECASE))

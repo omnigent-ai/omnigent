@@ -139,6 +139,36 @@ async def test_get_session(
     assert body["id"] == session_id
 
 
+async def test_get_session_reports_what_a_running_session_is_blocked_on(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """A reload still learns the session is parked on a terminal prompt.
+
+    The live ``session.status`` edge that carried ``blocked_on`` is gone by the
+    time a reloaded chat reads the snapshot, so the snapshot must carry it.
+    """
+
+    async def status_and_blocked_on() -> tuple[str, object]:
+        resp = await client.get(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        return body["status"], body.get("blocked_on")
+
+    try:
+        sessions_module._publish_status(session_id, "running", blocked_on="permission prompt")
+        assert await status_and_blocked_on() == ("running", "permission prompt")
+
+        sessions_module._publish_status(session_id, "running")
+        assert await status_and_blocked_on() == ("running", None)
+
+        sessions_module._publish_status(session_id, "running", blocked_on="dialog open")
+        sessions_module._publish_status(session_id, "idle")
+        assert await status_and_blocked_on() == ("idle", None)
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
     """Getting a nonexistent session returns 404."""
     resp = await client.get("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")

@@ -668,6 +668,11 @@ _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskIn
 )
 
 
+# What a ``running`` session's last status edge said it is parked on (e.g. a
+# terminal permission prompt), so a reload can still say why nothing is moving.
+_session_blocked_on_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
 _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
 
 
@@ -1286,6 +1291,7 @@ __all__ = [
     "_session_active_response_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
+    "_session_blocked_on_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

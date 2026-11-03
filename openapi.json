@@ -8494,6 +8494,18 @@
             "description": "Per-shell detail for the running tally above, so a reload can restore each shell's description/command. `None` when none are tracked (or when an older runner reported only the count).",
             "title": "Background Tasks"
           },
+          "blocked_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What a `\"running\"` session is parked on as of the last status edge, e.g. `\"permission prompt\"` (see `SessionStatusEvent`), so a reload can still route the user to the waiting terminal dialog. `None` when the session is not parked.",
+            "title": "Blocked On"
+          },
           "context_window": {
             "anyOf": [
               {
