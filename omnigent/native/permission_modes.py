@@ -1,12 +1,34 @@
-"""Native launch permission vocabulary shared with the web UI."""
+"""Native permission modes accepted by automations and their launch arguments."""
 
-import json
-from importlib.resources import files
-
-# Keep CLI spellings, labels, and launch arguments together in the shared catalog.
+# Keep these mappings aligned with the web permission constants in
+# claudePermissionMode.ts and nativeHarnessModes.ts.
 PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
-    harness: {mode["value"]: mode["args"] for mode in modes}
-    for harness, modes in json.loads(
-        files("omnigent.native").joinpath("permission_modes.json").read_text(encoding="utf-8")
-    ).items()
+    "claude-native": {
+        "default": ["--permission-mode", "default"],
+        "auto": ["--permission-mode", "auto"],
+        "acceptEdits": ["--permission-mode", "acceptEdits"],
+        "plan": ["--permission-mode", "plan"],
+        "dontAsk": ["--permission-mode", "dontAsk"],
+        "bypassPermissions": ["--permission-mode", "bypassPermissions"],
+    },
+    "codex-native": {
+        "default": [],
+        "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+        "read-only": ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+        "bypass": [],
+    },
+    "cursor-native": {
+        "default": [],
+        "auto-review": ["--auto-review"],
+        "plan": ["--mode", "plan"],
+        "ask": ["--mode", "ask"],
+        "yolo": ["--yolo"],
+    },
+    "antigravity-native": {"default": [], "skip": ["--dangerously-skip-permissions"]},
+    "devin-native": {
+        "normal": [],
+        "accept-edits": ["--permission-mode", "accept-edits"],
+        "smart": ["--permission-mode", "smart"],
+        "dangerous": ["--permission-mode", "dangerous"],
+    },
 }

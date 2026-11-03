@@ -96,7 +96,6 @@ RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
 COPY web/ ./web/
-COPY omnigent/native/permission_modes.json ./omnigent/native/
 ARG VITE_OMNIGENT_HOST_ROUTING=false
 RUN pnpm --filter web run build
 

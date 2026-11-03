@@ -9,7 +9,6 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "web/**"
-      - "omnigent/native/permission_modes.json"
       - "editors/vscode/**"
       - "sdks/web-extension/**"
       - "examples/extensions/hello-page/web/**"
@@ -26,7 +25,6 @@ on:
       - main
     paths:
       - "web/**"
-      - "omnigent/native/permission_modes.json"
       - "editors/vscode/**"
       - "sdks/web-extension/**"
       - "examples/extensions/hello-page/web/**"

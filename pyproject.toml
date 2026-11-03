@@ -460,7 +460,6 @@ where = ["."]
 include = ["omnigent*"]
 
 [tool.setuptools.package-data]
-"omnigent.native" = ["permission_modes.json"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
