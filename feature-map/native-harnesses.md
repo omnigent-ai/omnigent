@@ -70,7 +70,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
-  the answer reaches the harness.
+  the answer reaches the harness. Shared relay calls exclude their own human
+  approval waits from the five-minute execution budget. A pending approval
+  stays pending past five minutes; rejection or expiry does not run the tool.
+  Cancellation or a disconnected caller releases that call's pending approval.
 - `devin-questions`: Devin's native question picker appears in Chat and Inbox;
   selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -1109,7 +1112,42 @@ local files are reused unchanged. For Gemini, fork tool-containing history and
 send a follow-up; expect no empty `function_response.name` error. These automated
 checks do not prove live providers, browser rendering or thought-signature parity.
 
+For the shared native tool relay's approval deadline, run
+`tests/harnesses/claude_native/test_claude_native_bridge.py::test_relay_approval_outlives_execution_and_http_timeouts`
+and `::test_relay_mcp_cancellation_releases_pending_approval`. These use the real
+HTTP relay and stdio helper with a harmless callback and short test deadlines;
+they do not launch a vendor CLI. The same module checks concurrent calls,
+approval expiry, and uncertain completion after a write. Execution-budget
+accounting is covered by `tests/runtime/test_tool_call_deadline.py`.
+
+For a human check in an isolated instance, use a native session in Chat to ask
+for an automation named "Approval deadline check" with harmless instructions
+and a first run well after the test. Leave its create approval pending for
+more than five minutes:
+the agent must not report a tool failure or claim creation, and the automation
+must not exist yet. Approve and confirm exactly one automation appears.
+Repeat with Reject and with cancelling the turn: no automation should appear,
+and cancelled approvals must no longer be actionable. Repeat the request from
+the native terminal and answer the same approval in Chat or Inbox. Remove the
+throwaway automation afterward. The 30-second save-request timeout is unchanged.
+
+The native client's own deadline must exceed the wait being tested. Codex 0.166.0
+has a separate 300-second MCP deadline that does not extend with relay progress.
+For a bounded before/after demo, set the isolated instance's
+`harness.codex-native.app_server` command to `codex` and its args to
+`["-c", "mcp_servers.omnigent.tool_timeout_sec=600"]`, then leave approval pending
+for 345 seconds. A TUI-only launch argument does not configure the separate
+app-server's MCP client. This isolates the relay's unchanged 300-second execution
+budget; it does not prove the default client can wait for a full approval day.
+With the default client deadline, cancellation must clear the approval without
+creating the automation. Record the client configuration with the evidence.
+
 ## Gotchas
+
+- Relay approval waits retain one pending request slot. Vendor clients that do not
+  honor MCP progress notifications can still impose their own shorter deadline;
+  the relay cancels its pending approval when the client disconnects. A timeout
+  after execution starts has an unknown outcome and cannot undo a committed write.
 
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup
