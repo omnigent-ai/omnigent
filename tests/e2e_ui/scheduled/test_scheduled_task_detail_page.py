@@ -55,6 +55,9 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
         builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
         "Detail run-now test",
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="acceptEdits",
     )
 
     _open_automations_page(page, base_url)
@@ -71,7 +74,20 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
         "Every day at 9:00 AM", timeout=15_000
     )
     expect(page.get_by_test_id("task-detail-host")).to_contain_text("Most recently active host")
+    expect(page.get_by_test_id("task-detail-model")).to_have_text("Opus")
+    expect(page.get_by_test_id("task-detail-effort")).to_have_text("High")
+    expect(page.get_by_test_id("task-detail-permission")).to_have_text("Accept edits")
+    expect(page.get_by_test_id("task-detail-timezone")).to_have_text("UTC")
     expect(page.get_by_test_id("task-detail-runs-empty")).to_be_visible()
+
+    configuration = page.get_by_role("button", name="Configuration", exact=True)
+    configuration.click()
+    expect(configuration).to_have_attribute("aria-expanded", "false")
+    expect(page.get_by_test_id("task-detail-model")).not_to_be_visible()
+    expect(page.get_by_test_id("task-detail-runs-empty")).to_be_visible()
+    configuration.press("Enter")
+    expect(configuration).to_have_attribute("aria-expanded", "true")
+    expect(page.get_by_test_id("task-detail-model")).to_have_text("Opus")
 
     # Run now returns 202; the page polls its run history until the run lands.
     page.get_by_test_id("task-detail-run-now").click()

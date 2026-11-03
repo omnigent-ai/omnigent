@@ -320,14 +320,17 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+@pytest.mark.parametrize("cost", [None, 0.0, 1.234])
 def test_get_session_activity(
     conversation_store: SqlAlchemyConversationStore,
+    cost: float | None,
 ) -> None:
     """Each known id maps to its update time and live status; unknown ids are omitted."""
     a = conversation_store.create_conversation(title="alpha")
     b = conversation_store.create_conversation(title="beta")
     conversation_store.set_session_live_status(a.id, "waiting")
     conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+    conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
 
     result = conversation_store.get_session_activity(
         [a.id, b.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
@@ -336,8 +339,10 @@ def test_get_session_activity(
     assert set(result) == {a.id, b.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
     assert result[a.id].live_status == "waiting"
+    assert result[a.id].total_cost_usd == cost
     # A session that never reported a status has none recorded.
     assert result[b.id].live_status is None
+    assert result[b.id].total_cost_usd is None
     assert conversation_store.get_session_activity([]) == {}
 
 
