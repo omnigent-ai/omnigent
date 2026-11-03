@@ -525,6 +525,44 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     assert live_runner.superseded == []
 
 
+async def test_claude_sdk_clear_removes_a_session_its_runner_will_not_initialize(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered runner that rejects the new session leaves nothing behind.
+
+    The source's saved inference configuration must be accepted, so the
+    unconfirmed initialization fails the clear; the new session is deleted
+    and the source gets no notice or redirect.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    source = store.create_conversation(
+        agent_id=agent["id"],
+        inference_snapshot={"runtime_config": {}, "harness": "claude-sdk", "owner_id": "local"},
+    )
+    store.set_host_id(source.id, _HOST_ID, "/work/repo")
+    store.replace_runner_id(source.id, _RUNNER_ID)
+    before = len((await client.get("/v1/sessions")).json()["data"])
+
+    resp = await client.post(
+        f"/v1/sessions/{source.id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert "did not accept this session's saved inference configuration" in resp.text
+    initialized = [
+        body["session_id"] for path, body in live_runner.posts if path == "/v1/sessions"
+    ]
+    assert [session_id for session_id in initialized if session_id != source.id]
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before
+    assert message_texts(store, source.id) == []
+    assert live_runner.superseded == []
+
+
 @pytest.mark.parametrize(
     ("clear_status", "placement", "status", "message"),
     [
