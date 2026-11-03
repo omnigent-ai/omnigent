@@ -256,10 +256,13 @@ describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
   "scheduled_task_sandbox_workspaces",
+  "scheduled_task_inbox",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
+    [false, false],
     [undefined, false],
+    ["true", false],
     ["yes", false],
   ])("reads %j as %j", async (advertised, expected) => {
     const payload = advertised === undefined ? {} : { [capability]: advertised };

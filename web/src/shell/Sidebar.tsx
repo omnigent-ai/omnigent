@@ -703,6 +703,12 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
+function inboxBadgeLabel(count: number, incomplete: boolean): string {
+  const label = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
+  if (incomplete) return `${label}; more automations not yet checked`;
+  return label;
+}
+
 function SidebarImpl({
   open,
   onClose,
@@ -808,6 +814,7 @@ function SidebarImpl({
           ? sidebarData.shared
           : sidebarData.all;
   const inboxCount = sidebarData.inboxCount;
+  const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -1306,13 +1313,12 @@ function SidebarImpl({
                     )}
                   />
                   Inbox
-                  {inboxCount > 0 && (
+                  {(inboxCount > 0 || inboxCountIncomplete) && (
                     <span
-                      aria-label={
-                        inboxCount === 1
-                          ? "1 inbox item waiting"
-                          : `${inboxCount} inbox items waiting`
+                      title={
+                        inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
                       }
+                      aria-label={inboxBadgeLabel(inboxCount, inboxCountIncomplete)}
                       className={cn(
                         "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
                         // The active Inbox row already paints the translucent
@@ -1321,7 +1327,8 @@ function SidebarImpl({
                         isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
                       )}
                     >
-                      {inboxCount}
+                      {inboxCount > 0 ? inboxCount : ""}
+                      {inboxCountIncomplete ? "+" : ""}
                     </span>
                   )}
                 </Link>
