@@ -21,6 +21,7 @@ def test_isolates_inherited_native_state(tmp_path):
             "OMNIGENT_CONFIG_HOME": "/parent",
             "CLAUDE_CONFIG_DIR": "/parent-claude",
             "OPENAI_API_KEY": "parent-key",
+            "OMNIGENT_PROCESS_LOG_FILE": "/parent/logs/runner/runner.log",
             "NO_PROXY": "example.test",
         },
         tmp_path,
@@ -28,6 +29,7 @@ def test_isolates_inherited_native_state(tmp_path):
     assert "LLM_API_KEY" not in env
     assert "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD" not in env
     assert "OPENAI_API_KEY" not in env
+    assert "OMNIGENT_PROCESS_LOG_FILE" not in env
     assert env["OMNIGENT_CONFIG_HOME"] == str(tmp_path / "config")
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
     assert "127.0.0.1" in env["NO_PROXY"]

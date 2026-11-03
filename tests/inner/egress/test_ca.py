@@ -31,7 +31,7 @@ def test_ensure_ca_generates_new_ca(tmp_path: Path) -> None:
     assert bc.value.ca is True
 
     # Not expired
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     assert now < cert.not_valid_after_utc
 
 
@@ -80,7 +80,7 @@ def _make_ca_pem(common_name: str) -> bytes:
     """Return the PEM bytes of a throwaway self-signed CA cert."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)

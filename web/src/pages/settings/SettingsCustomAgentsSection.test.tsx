@@ -349,7 +349,11 @@ const editableConfig: AgentConfig = {
   mcp_servers: {},
 };
 
-function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: boolean } = {}) {
+function configResponses({
+  fail = 0,
+  etag = true,
+  patchEtag = etag,
+}: { fail?: number; etag?: boolean; patchEtag?: boolean } = {}) {
   const previous = vi.mocked(authenticatedFetch).getMockImplementation()!;
   let current = { ...editableConfig };
   let patchStatus = fail;
@@ -363,7 +367,7 @@ function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: bool
       const patch = JSON.parse(init.body as string);
       current = { ...current, ...patch, version: current.version + 1 };
       users[0] = { ...users[0], description: current.description, version: current.version };
-      return new Response(JSON.stringify(current), { headers: { ETag: '"new"' } });
+      return new Response(JSON.stringify(current), { headers: patchEtag ? { ETag: '"new"' } : {} });
     }
     if (String(url).endsWith("/config"))
       return new Response(JSON.stringify(current), { headers: etag ? { ETag: '"original"' } : {} });
@@ -404,8 +408,12 @@ describe("editing custom agents", () => {
       expect.anything(),
     );
   });
-  it("saves only changed fields, updates the summary, and never builds a replacement bundle", async () => {
-    configResponses();
+  it.each([
+    [true, true],
+    [false, false],
+    [true, false],
+  ])("saves only changed fields twice with GET ETag=%s, PATCH ETag=%s", async (etag, patchEtag) => {
+    configResponses({ etag, patchEtag });
     await openEditor();
     expect(screen.queryByRole("dialog")).toBeNull();
     const description = screen.getByLabelText("Description");
@@ -426,7 +434,10 @@ describe("editing custom agents", () => {
       "/v1/agents/a1",
       expect.objectContaining({
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "If-Match": '"new"' },
+        headers: {
+          "Content-Type": "application/json",
+          ...(patchEtag ? { "If-Match": '"new"' } : {}),
+        },
         body: '{"description":"Updated again"}',
       }),
     );
@@ -434,7 +445,10 @@ describe("editing custom agents", () => {
       "/v1/agents/a1",
       expect.objectContaining({
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "If-Match": '"original"' },
+        headers: {
+          "Content-Type": "application/json",
+          ...(etag ? { "If-Match": '"original"' } : {}),
+        },
         body: '{"description":"Updated"}',
       }),
     );
@@ -521,11 +535,21 @@ describe("editing custom agents", () => {
     expect(await screen.findByDisplayValue("Concurrent winner")).toBeVisible();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
-  it("never saves without a revision", async () => {
-    configResponses({ etag: false });
+  it("preserves the draft on 428 and allows retrying after the server updates", async () => {
+    const server = configResponses({ etag: false, fail: 428 });
     await openEditor();
     fireEvent.change(screen.getByLabelText("Description"), { target: { value: "New" } });
-    expect(screen.getByRole("alert")).toHaveTextContent("did not provide");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("This server needs an update");
+    expect(screen.getByRole("alert")).toHaveTextContent("Your draft is still here");
+    expect(screen.getByLabelText("Description")).toHaveValue("New");
+    expect(screen.queryByRole("button", { name: "Reload latest" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    server.recover();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByLabelText("Description")).toHaveValue("New");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
 });

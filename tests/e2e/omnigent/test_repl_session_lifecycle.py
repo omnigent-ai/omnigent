@@ -380,7 +380,7 @@ def _drive_turn(
     # Local flow: parse the lifecycle markers rendered during the turn.
     lifecycle_branch = child.expect(
         [
-            r"POST /v1/sessions multipart bundle",
+            r"POST /v1/sessions json agent_id",
             r"resuming existing session id='([^']+)'",
         ],
         timeout=60,

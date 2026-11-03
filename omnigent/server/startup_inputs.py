@@ -27,6 +27,14 @@ from omnigent.entities.conversation import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.scheduled.telemetry import (
+    current_fire_stage,
+    current_scheduled_run,
+    log_delivery,
+    log_prompt_sent,
+    scheduled_run_scope,
+    start_fire_stage,
+)
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
@@ -94,6 +102,7 @@ class StartupInputContext:
     async def claim(self, store: ConversationStore, session_id: str) -> bool:
         # Leave the row queued throughout launch, authorization and policy checks.
         # A submitted native input is never replayed without its transcript receipt.
+        start_fire_stage("input_claim", session_id=session_id)
         self.submitted = await asyncio.to_thread(
             store.transition_pending_input,
             session_id,
@@ -101,6 +110,8 @@ class StartupInputContext:
             expected="in_progress",
             status="incomplete",
         )
+        if self.submitted:
+            start_fire_stage("prompt_send", session_id=session_id)
         return self.submitted
 
 
@@ -176,6 +187,7 @@ class ManagedStartupInputs:
                     model_override=event.model_override,
                     tools=event.tools,
                     background_titles_enabled=background_session_titles_enabled(headers),
+                    scheduled_run=current_scheduled_run(),
                 )
             }
         )
@@ -377,6 +389,18 @@ class ManagedStartupInputs:
             )
 
     async def _deliver(self, app: Any, session_id: str, item: ConversationItem) -> None:
+        options = (
+            item.data.startup_options
+            if isinstance(item.data, (MessageData, SlashCommandData))
+            else None
+        )
+        with scheduled_run_scope(
+            options.scheduled_run if options else None, session_id=session_id
+        ):
+            start_fire_stage("input_validation", session_id=session_id)
+            await self._deliver_scoped(app, session_id, item)
+
+    async def _deliver_scoped(self, app: Any, session_id: str, item: ConversationItem) -> None:
         if self.dispatch is None:
             return
         key = (current_workspace_id(), session_id)
@@ -386,6 +410,8 @@ class ManagedStartupInputs:
             return
         self._deliveries[key] = task
         context: StartupInputContext | None = None
+        sent = False
+        dispatch_id = uuid4().hex
         try:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
             current = await asyncio.to_thread(self.conversations.get_item, session_id, item.id)
@@ -420,10 +446,19 @@ class ManagedStartupInputs:
                 model_override=options.model_override if options else None,
                 tools=options.tools if options else None,
             )
+            log_delivery(
+                "scheduled_run_prompt_dispatch_started",
+                session_id=session_id,
+                input_id=item.id,
+                dispatch_id=dispatch_id,
+            )
             response = await self.dispatch(context, session_id, event)
             if response.get("denied"):
                 raise ValueError(str(response.get("reason", "Input denied by policy")))
             if context.submitted:
+                sent = True
+                log_prompt_sent(session_id, input_id=item.id, dispatch_id=dispatch_id)
+                start_fire_stage("post_delivery", session_id=session_id)
                 if not response.get("pending_id") and not response.get("item_id"):
                     # Native overlays such as /btw have no transcript echo.
                     from omnigent.server.routes.sessions import (
@@ -446,8 +481,33 @@ class ManagedStartupInputs:
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
         except asyncio.CancelledError:
+            log_delivery(
+                "scheduled_run_prompt_dispatch_interrupted",
+                session_id=session_id,
+                failure_stage=current_fire_stage(),
+                input_id=item.id,
+                dispatch_id=dispatch_id,
+                outcome="sent"
+                if sent
+                else "uncertain"
+                if context and context.submitted
+                else "not_sent",
+            )
             raise
         except Exception as exc:
+            log_delivery(
+                "scheduled_run_stage_failed",
+                session_id=session_id,
+                input_id=item.id,
+                failure_stage="post_delivery" if sent else current_fire_stage(),
+                dispatch_id=dispatch_id,
+                outcome="sent"
+                if sent
+                else "uncertain"
+                if context and context.submitted
+                else "not_sent",
+                exception_type=type(exc).__name__,
+            )
             _logger.exception("Unable to deliver saved message for session %s", session_id)
             if context is None or not context.submitted:
                 await asyncio.to_thread(
