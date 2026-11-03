@@ -164,9 +164,10 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "running in another background process."
             ),
             remediation=(
-                "On the host, use `claude attach <session-id>` with the ID in the "
-                "terminal output to inspect the existing session. To resume it here, "
-                "stop that session with `claude stop <session-id>`, then retry."
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
             ),
         ),
     ),
