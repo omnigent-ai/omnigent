@@ -1057,8 +1057,9 @@ function SidebarImpl({
           tabIndex={effectiveOpen ? 0 : -1}
           aria-hidden={!effectiveOpen}
           className={cn(
-            "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
-            effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
+            "fixed inset-0 z-[45] bg-black/25 transition-[opacity,visibility] duration-200 ease-out md:hidden",
+            // invisible: the macOS shell makes any rendered button a no-drag title-bar region.
+            effectiveOpen ? "opacity-100" : "pointer-events-none invisible opacity-0",
           )}
           style={dragging ? { opacity: liveDragProgress, transition: "none" } : undefined}
         />
