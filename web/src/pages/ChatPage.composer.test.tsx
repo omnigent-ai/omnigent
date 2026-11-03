@@ -5500,7 +5500,7 @@ describe("Composer reply quotes", () => {
       act(() =>
         handleSessionEvent({
           type: "session_input_consumed",
-          itemId: "f".repeat(32),
+          itemId: (edited ? "f" : "9").repeat(32),
           itemType: "message",
           data: { role: "user", content: [{ type: "input_text", text: "file a single PR" }] },
         }),

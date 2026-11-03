@@ -3,26 +3,19 @@
 // it, and the queue lives in memory, so a reload would otherwise lose the text.
 import { readComposerDraft, type StoredReplyDraft } from "./replyDraft";
 
-/**
- * Where a native terminal's transcript stood when a message POST was
- * dispatched. Its mirror carries no stable id, so only a user message after
- * `afterItemId` (`null`: an empty transcript) can prove the send, and only
- * once the `sameTextAhead` messages queued before it saying the same thing
- * have claimed theirs.
- */
-export interface NativeSendAnchor {
-  afterItemId: string | null;
-  sameTextAhead: number;
-}
-
 export interface UnsentSend {
   stableId: string;
   text: string;
   replyDraft?: StoredReplyDraft;
   /** The sender (`getCurrentUserId`), so another account in this tab can't recover it. */
   authorId: string;
-  /** Set once the message POST is dispatched on a native terminal. */
-  nativeAnchor?: NativeSendAnchor;
+  /**
+   * A native terminal's newest committed item when the message POST went out
+   * (`null`: an empty transcript). Its mirror carries no stable id, so only a
+   * user message after this item can prove the send, and only when no other
+   * outstanding send said the same thing; otherwise this stays unset.
+   */
+  afterItemId?: string | null;
 }
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
@@ -43,27 +36,15 @@ if (typeof window !== "undefined") {
 function parseSend(entry: unknown): UnsentSend | null {
   const draft = readComposerDraft(entry);
   if (!draft?.text || typeof entry !== "object" || entry === null) return null;
-  const { stableId, authorId, nativeAnchor } = entry as {
+  const { stableId, authorId, afterItemId } = entry as {
     stableId?: unknown;
     authorId?: unknown;
-    nativeAnchor?: unknown;
+    afterItemId?: unknown;
   };
   // A record with no sender can't be matched to the viewer.
   if (typeof stableId !== "string" || typeof authorId !== "string") return null;
-  const anchor = parseNativeAnchor(nativeAnchor);
-  return { ...draft, stableId, authorId, ...(anchor ? { nativeAnchor: anchor } : {}) };
-}
-
-function parseNativeAnchor(entry: unknown): NativeSendAnchor | null {
-  if (typeof entry !== "object" || entry === null) return null;
-  const { afterItemId, sameTextAhead } = entry as {
-    afterItemId?: unknown;
-    sameTextAhead?: unknown;
-  };
-  if (typeof afterItemId !== "string" && afterItemId !== null) return null;
-  if (typeof sameTextAhead !== "number" || !Number.isInteger(sameTextAhead) || sameTextAhead < 0)
-    return null;
-  return { afterItemId, sameTextAhead };
+  const anchored = typeof afterItemId === "string" || afterItemId === null;
+  return { ...draft, stableId, authorId, ...(anchored ? { afterItemId } : {}) };
 }
 
 function parseQueue(entry: unknown): UnsentSend[] | null {
