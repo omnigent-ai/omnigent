@@ -34,6 +34,7 @@ from omnigent.runner.identity import (
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
+from omnigent.server.managed_hosts import parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -67,7 +68,7 @@ _logger = logging.getLogger(__name__)
 # sandbox per fire, using the server's normal sandbox lifecycle.
 _VALID_EXECUTION_TARGETS = frozenset({"connected_host", "managed_sandbox"})
 _MANAGED_SANDBOX_WITH_HOST_MSG = (
-    "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id or workspace"
+    "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
 # A continued session cannot follow a change to these, so the next run starts a new one.
@@ -103,7 +104,7 @@ class CreateScheduledTaskRequest(BaseModel):
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     # ``managed_sandbox`` runs the task in a fresh server-provisioned sandbox
-    # (no host_id/workspace); default keeps the connected-host behavior.
+    # (no host_id, optional repository URL); default keeps connected-host behavior.
     execution_target: str = "connected_host"
     # One of the caller's projects to file fired sessions into.
     project_id: str | None = None
@@ -112,9 +113,7 @@ class CreateScheduledTaskRequest(BaseModel):
     def _validate_create(self) -> CreateScheduledTaskRequest:
         if self.execution_target not in _VALID_EXECUTION_TARGETS:
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
-        if self.execution_target == "managed_sandbox" and (
-            self.host_id is not None or self.workspace is not None
-        ):
+        if self.execution_target == "managed_sandbox" and self.host_id is not None:
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if self.session_id is not None and self.session_mode != "continue":
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
@@ -160,9 +159,7 @@ class UpdateScheduledTaskRequest(BaseModel):
             _VALID_EXECUTION_TARGETS
         ):
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
-        if self.execution_target == "managed_sandbox" and (
-            "host_id" in self.model_fields_set or "workspace" in self.model_fields_set
-        ):
+        if self.execution_target == "managed_sandbox" and "host_id" in self.model_fields_set:
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
@@ -419,8 +416,8 @@ def create_scheduled_tasks_router(
         host and a workspace are supplied, the workspace is validated against the
         host boundary here so a bad pin fails fast at create.
 
-        A ``managed_sandbox`` target has no host/workspace to validate — the fire
-        provisions a fresh sandbox — but the server must be able to launch one, so
+        A ``managed_sandbox`` target accepts a repository URL instead of a host
+        directory. The server must be able to launch a sandbox, so
         an unconfigured server rejects the task at create instead of failing every
         fire.
         """
@@ -455,7 +452,12 @@ def create_scheduled_tasks_router(
                     "use a connected host or a default provider without profiles",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            return agent, None, validated_model, validated_effort
+            if workspace is not None:
+                try:
+                    parse_repo_workspace(workspace)
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            return agent, workspace, validated_model, validated_effort
         if host_id is not None:
             host_store = getattr(request.app.state, "host_store", None)
             if host_store is not None:
@@ -905,32 +907,31 @@ def create_scheduled_tasks_router(
                 )
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
-        # Reject pinning a host/workspace on a managed-sandbox task rather than
+        # Reject pinning a host on a managed-sandbox task rather than
         # silently dropping it. The request model already rejects this when
         # execution_target is explicitly in the PATCH; this also covers a PATCH
         # that pins a field on an ALREADY-managed task (no execution_target sent),
         # validating against the EFFECTIVE target.
-        if switching_to_managed and (
-            fields.get("host_id") is not None or fields.get("workspace") is not None
-        ):
+        if switching_to_managed and fields.get("host_id") is not None:
             raise OmnigentError(
                 _MANAGED_SANDBOX_WITH_HOST_MSG,
                 code=ErrorCode.INVALID_INPUT,
             )
+        target_changed = target_execution != existing.execution_target
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
             # On a switch this runs the full create-time gauntlet against the NEW
             # agent: existence + bindability, and the pinned workspace re-checked
             # against that agent's os_env boundary (the boundary is per-agent, so
             # a workspace valid for the old harness need not be valid here). A
-            # managed_sandbox target validates against no host/workspace (the fire
-            # provisions a fresh sandbox) and checks the server can launch one.
+            # managed_sandbox target validates its repository URL and checks
+            # that the server can launch a sandbox.
             agent, workspace, _, _ = await _validate_launch_inputs(
                 request,
                 owner=owner,
                 agent_id=target_agent_id,
                 host_id=None if switching_to_managed else fields.get("host_id", existing.host_id),
                 workspace=(
-                    None if switching_to_managed else fields.get("workspace", existing.workspace)
+                    fields.get("workspace", None if target_changed else existing.workspace)
                 ),
                 model_override=fields.get("model_override", existing.model_override),
                 reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
@@ -938,13 +939,9 @@ def create_scheduled_tasks_router(
                 execution_target=target_execution,
             )
             if switching_to_managed:
-                # A managed-sandbox task carries no pinned host or workspace. Clear
-                # BOTH (workspace via the store's explicit-null) so a later switch
-                # back to connected execution isn't rejected for "workspace without
-                # host", and the fire never binds a dead pin.
+                # A sandbox has no pinned host; its workspace is a repository URL.
                 fields["host_id"] = None
-                fields["workspace"] = None
-            elif "workspace" in fields:
+            if "workspace" in fields or target_changed:
                 fields["workspace"] = workspace
             # A picked session keeps the agent it runs, so the task takes no copy.
             if agent_changed and fields.get("session_id") is None:

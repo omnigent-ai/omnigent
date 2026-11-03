@@ -7,7 +7,7 @@
 // A scheduled task is a saved prompt that fires an agent session on a recurring
 // RFC-5545 RRULE schedule. `host_id` / `workspace` are optional (post-FU-3):
 // omit both and the server resolves the owner's connected host + its home dir
-// at fire time; supply them only as a validated pair.
+// at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
 import { authenticatedFetch } from "./identity";
 import { startTimedInteraction } from "./analyticsEmit";
@@ -18,7 +18,7 @@ export type ScheduledTaskState = "active" | "paused";
 /**
  * Where each firing runs. `connected_host` pins/resolves the owner's own
  * machine; `managed_sandbox` provisions a FRESH server-managed sandbox per
- * firing (no host/workspace), using the server's normal sandbox lifecycle.
+ * firing (no host, optional repository URL), using the server's normal sandbox lifecycle.
  */
 export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 
@@ -59,7 +59,7 @@ export interface ScheduledTask {
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
   sessionId: string | null;
-  /** Pinned absolute workspace, or `null` (server defaults to the host home). */
+  /** Host directory or sandbox repository URL; null uses the target default. */
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
   hostId: string | null;
@@ -145,14 +145,14 @@ export interface CreateScheduledTaskInput {
   permissionMode?: string | null;
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
-  /** Optional pinned workspace; only valid together with `hostId`. */
+  /** Host directory (requires hostId), or a repository URL for a sandbox. */
   workspace?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
   /**
    * Where firings run. Omit (or `connected_host`) for the connected-host
    * behavior; `managed_sandbox` provisions a fresh sandbox each fire and must
-   * NOT be combined with `hostId` / `workspace`.
+   * NOT be combined with `hostId`. Its workspace is an optional repository URL.
    */
   executionTarget?: ScheduledTaskExecutionTarget;
   /** File every fired session into this existing project. */
@@ -186,7 +186,8 @@ export interface UpdateScheduledTaskInput {
   hostId?: string;
   /**
    * Switch where firings run. `managed_sandbox` clears any pinned host; do not
-   * also set `hostId` / `workspace` in the same update.
+   * also set `hostId` in the same update. Changing targets clears the previous
+   * workspace unless a replacement is supplied.
    */
   executionTarget?: ScheduledTaskExecutionTarget;
   state?: ScheduledTaskState;

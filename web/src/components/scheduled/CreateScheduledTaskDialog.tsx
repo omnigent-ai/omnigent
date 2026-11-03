@@ -106,6 +106,11 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  const sandboxRepoCatalog =
+    info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
+      ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
+      : [];
+
   const {
     data: projects = [],
     isSuccess: projectsLoaded,
@@ -227,9 +232,13 @@ export function CreateScheduledTaskDialog({
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
-  // "managed_sandbox") instead of a connected host; hides the host/workspace
-  // pickers. Only offered when the server advertises managed sandboxes.
+  // "managed_sandbox") instead of a connected host. Catalog-backed providers
+  // offer repository selection instead of browsing a connected host.
   const [sandboxMode, setSandboxMode] = useState(false);
+  const sandboxWorkspace = sandboxMode
+    ? workspace ||
+      (editingTask?.executionTarget === "managed_sandbox" ? "" : sandboxRepoCatalog[0]?.url || "")
+    : "";
   // Project by name: null = unchanged; "" = no project.
   const [projectChoice, setProjectChoice] = useState<string | null>(null);
   // Id of the existing project picked, captured at pick time so a later rename
@@ -240,8 +249,8 @@ export function CreateScheduledTaskDialog({
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
-  // Agent, host, and execution-target changes clear the binding. Workspace-only
-  // edits stay locked: the server may resolve a symlink to the same directory.
+  // Agent, host, execution-target and repository changes clear the binding.
+  // Host directory edits stay locked: a symlink may resolve to the same directory.
   const reusesExistingSession =
     sessionMode === "continue" &&
     editingTask !== null &&
@@ -249,6 +258,7 @@ export function CreateScheduledTaskDialog({
     !startNewSession &&
     !agentChanged &&
     executionTarget === editingTask.executionTarget &&
+    (!sandboxMode || sandboxWorkspace === (editingTask.workspace ?? "")) &&
     (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
@@ -379,8 +389,13 @@ export function CreateScheduledTaskDialog({
     setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
     setSandboxMode(nextSandbox);
     setHostId(nextHostId);
-    // Preserve a connected-host path for server validation; sandboxes start without one.
-    if (nextSandbox) setWorkspace("");
+    // Host directories and sandbox repository URLs are different workspace inputs.
+    if (nextSandbox !== sandboxMode) {
+      const nextTarget = nextSandbox ? "managed_sandbox" : "connected_host";
+      setWorkspace(
+        editingTask?.executionTarget === nextTarget ? (editingTask.workspace ?? "") : "",
+      );
+    }
     setWorkspaceBrowserOpen(false);
   }
   function handleModelChange(model: string) {
@@ -474,8 +489,8 @@ export function CreateScheduledTaskDialog({
     setError(null);
     setSubmitting(true);
     try {
-      // A sandbox task runs hostless (fresh sandbox per fire), so host/workspace
-      // are omitted. Only send executionTarget when it's meaningful: on create
+      // A sandbox task runs hostless; its workspace can name a catalog repository.
+      // Only send executionTarget when it's meaningful: on create
       // when sandbox is chosen (connected_host is the server default), and on
       // edit only when it actually changed — mirroring how agentId is threaded.
       const executionTargetChanged = editingTask
@@ -488,6 +503,9 @@ export function CreateScheduledTaskDialog({
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
+        ...(sandboxMode && sandboxRepoCatalog.length > 0 && sandboxWorkspace !== ""
+          ? { workspace: sandboxWorkspace }
+          : {}),
         ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
           ? { workspace: workspace.trim() }
           : {}),
@@ -787,6 +805,35 @@ export function CreateScheduledTaskDialog({
               </div>
             )}
           </div>
+
+          {sandboxMode && sandboxRepoCatalog.length > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="task-sandbox-repository">Repository</Label>
+              <Select
+                value={sandboxWorkspace}
+                onValueChange={setWorkspace}
+                onOpenChange={handleSelectOpenChange}
+                componentId="tasks.scheduled.sandbox_repository"
+              >
+                <SelectTrigger id="task-sandbox-repository" className="w-full">
+                  <SelectValue placeholder="Provider default" />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {workspace && !sandboxRepoCatalog.some((repo) => repo.url === workspace) && (
+                    <SelectItem value={workspace}>{workspace}</SelectItem>
+                  )}
+                  {sandboxRepoCatalog.map((repo) => (
+                    <SelectItem key={repo.url} value={repo.url}>
+                      {repo.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                Runs in this repository inside the sandbox.
+              </p>
+            </div>
+          )}
 
           {!sandboxMode && hostId !== "" && (
             <div className="flex flex-col gap-1.5">

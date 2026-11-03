@@ -2026,8 +2026,9 @@ async def _drain_managed_launches() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("launch_outcome", ["bound", "tracker_failed", "raised"])
+@pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
-    monkeypatch: pytest.MonkeyPatch, launch_outcome: str
+    monkeypatch: pytest.MonkeyPatch, launch_outcome: str, repository: str | None
 ) -> None:
     """A managed fire saves its prompt before provisioning; a failed launch fails the run."""
     from omnigent.server.managed_hosts import ManagedLaunchTracker
@@ -2050,7 +2051,9 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     direct_dispatch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
     monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", direct_dispatch)
-    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(execution_target="managed_sandbox", workspace=repository)}
+    )
     on_fire = build_on_fire(
         _deps(
             store,
@@ -2077,7 +2080,7 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
         assert call.kwargs["sandbox_config"] is config
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
-        assert call.kwargs["repos"] == ()
+        assert [repo.url for repo in call.kwargs["repos"]] == ([repository] if repository else [])
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
     # The saved prompt is delivered by the host's replica, never directly here.
     direct_dispatch.assert_not_awaited()
@@ -2850,16 +2853,22 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,
+    repository: str | None,
 ) -> None:
     """After a reset, the next session runs on the same sandbox, woken like a user message."""
     from omnigent.server.routes import sessions
 
-    task = _sandbox_continue_task(last_run_conversation_id="conv_prev")
+    task = _sandbox_continue_task(last_run_conversation_id="conv_prev", workspace=repository)
     own = continued_sandbox_host_id(task.id, task.workspace_id)
     conv_store = _ExistingConversationStore(
-        _continued_session(host_id=own, workspace="/sandbox/ws")
+        _continued_session(
+            host_id=own,
+            workspace="/sandbox/ws",
+            labels=fire_mod.managed_repo_labels([repository] if repository else []),
+        )
     )
     managed_launch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
@@ -2880,6 +2889,29 @@ async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_work
     assert [conv.host_id for conv in launched] == [own]
     managed_launch.assert_not_awaited()
     assert [run["status"] for run in store.runs] == ["running"]
+
+    assert fire_mod.read_managed_repo_workspaces(created["labels"]) == (
+        [repository] if repository else []
+    )
+    if repository:
+        changed = replace(task, workspace="https://github.com/example/other")
+        deps = _deps(store, conversation_store=conv_store, host_store=hosts)
+        assert await fire_mod._continued_host_binding(deps, changed) is None
+        problem = await fire_mod.continued_session_problem(
+            task,
+            _continued_session(host_id=own, workspace="/sandbox/ws", labels=created["labels"]),
+            host_store=hosts,
+            permission_store=None,
+        )
+        assert problem is None
+        problem = await fire_mod.continued_session_problem(
+            changed,
+            _continued_session(host_id=own, workspace="/sandbox/ws", labels=created["labels"]),
+            host_store=hosts,
+            permission_store=None,
+        )
+        assert problem is not None
+        assert problem[1] == "continued_session_incompatible"
 
 
 @pytest.mark.asyncio

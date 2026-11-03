@@ -562,6 +562,56 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
         auth_app.state.sandbox_config = None
 
 
+@pytest.mark.parametrize("workspace", ["https://github.com/example/runtime", "/repo", "bad-url"])
+async def test_sandbox_repository_create_edit_and_target_switch(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, workspace: str
+) -> None:
+    _make_user(db_uri)
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    try:
+        response = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                execution_target="managed_sandbox", host_id=None, workspace=workspace
+            ),
+            headers=_headers(),
+        )
+        if not workspace.startswith("https://"):
+            assert response.status_code == 400, response.text
+            return
+        assert response.status_code == 200, response.text
+        task = response.json()
+        assert task["workspace"] == workspace
+        assert task["host_id"] is None
+        path = f"/v1/scheduled-tasks/{task['id']}"
+        renamed = await auth_client.patch(path, json={"name": "Renamed"}, headers=_headers())
+        assert renamed.json()["workspace"] == workspace
+        changed = await auth_client.patch(
+            path, json={"workspace": "https://github.com/example/universe"}, headers=_headers()
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["workspace"] == "https://github.com/example/universe"
+        invalid = await auth_client.patch(path, json={"workspace": "/repo"}, headers=_headers())
+        assert invalid.status_code == 400, invalid.text
+        back = await auth_client.patch(
+            path,
+            json={"execution_target": "connected_host", "host_id": _HOST_ID},
+            headers=_headers(),
+        )
+        assert back.status_code == 200, back.text
+        assert back.json()["workspace"] is None
+        sandbox = await auth_client.patch(
+            path,
+            json={"execution_target": "managed_sandbox", "workspace": workspace},
+            headers=_headers(),
+        )
+        assert sandbox.status_code == 200, sandbox.text
+        assert sandbox.json()["workspace"] == workspace
+        assert sandbox.json()["host_id"] is None
+    finally:
+        auth_app.state.sandbox_config = None
+
+
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.

@@ -640,6 +640,127 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
   });
 
+  it.each(["create", "edit", "edit-default"])(
+    "saves catalog selection without changing an implicit default (%s)",
+    async (mode) => {
+      const editing = mode !== "create";
+      const implicitDefault = mode === "edit-default";
+      const runtime = "https://github.com/example/runtime";
+      const universe = "https://github.com/example/universe";
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            scheduled_task_sandbox_workspaces: true,
+            sandbox_provider: "arclet",
+            sandbox_provider_capabilities: {
+              arclet: {
+                repo_catalog: [
+                  { name: "universe", url: universe },
+                  { name: "runtime", url: runtime },
+                ],
+              },
+            },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="Nightly"
+            initialPrompt="Do it"
+            editingTask={
+              editing
+                ? scheduledTask({
+                    executionTarget: "managed_sandbox",
+                    workspace: implicitDefault ? null : runtime,
+                    sessionMode: "continue",
+                    sessionId: "existing-session",
+                  })
+                : null
+            }
+          />
+        </CapabilitiesProvider>,
+      );
+      if (!editing) {
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+      } else {
+        openHostSelect();
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+      }
+      expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Repository")).toHaveTextContent(
+        implicitDefault ? "Provider default" : editing ? "runtime" : "universe",
+      );
+      if (!implicitDefault) {
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(
+          await screen.findByRole("option", { name: editing ? "universe" : "runtime" }),
+        );
+      }
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      const mutation = editing ? updateMutateAsync : mutateAsync;
+      await waitFor(() => expect(mutation).toHaveBeenCalledTimes(1));
+      const input = editing ? mutation.mock.calls[0][0].input : mutation.mock.calls[0][0];
+      if (implicitDefault) {
+        expect(input).not.toHaveProperty("workspace");
+        expect(input).not.toHaveProperty("sessionId");
+        expect(input).not.toHaveProperty("modelOverride");
+      } else {
+        expect(input.workspace).toBe(editing ? universe : runtime);
+      }
+      expect(input).not.toHaveProperty("hostId");
+    },
+  );
+
+  it.each([false, true])(
+    "gates catalog selection and clears it on a host switch (supported: %s)",
+    async (supported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            scheduled_task_sandbox_workspaces: supported,
+            sandbox_provider: "arclet",
+            sandbox_provider_capabilities: {
+              arclet: {
+                repo_catalog: [{ name: "runtime", url: "https://github.com/example/runtime" }],
+              },
+            },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="Nightly"
+            initialPrompt="Do it"
+          />
+        </CapabilitiesProvider>,
+      );
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+      if (supported) {
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "runtime" }));
+      } else {
+        expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
+      }
+      openHostSelect();
+      fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+      expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("Browse folders");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+      expect(mutateAsync.mock.calls[0][0]).toMatchObject({ hostId: "host_1" });
+      expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("workspace");
+    },
+  );
+
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],

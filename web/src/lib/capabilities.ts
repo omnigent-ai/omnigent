@@ -138,7 +138,12 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
+    {
+      multi_repo?: boolean;
+      inference_models?: boolean;
+      default_models?: boolean;
+      repo_catalog?: { name: string; url: string }[];
+    }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -232,6 +237,8 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /** Sandbox automations accept a repository URL as their workspace. */
+  scheduled_task_sandbox_workspaces?: boolean;
   /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
@@ -401,6 +408,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   archive_worktree_cleanup: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
   branding: null,
@@ -526,6 +534,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
           agent_install: data.agent_install === true,
