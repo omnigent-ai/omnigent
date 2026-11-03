@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import weakref
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -115,6 +116,34 @@ from omnigent.stores.policy_store import PolicyStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+# Per-session locks serializing evaluate_policy's engine builds. A build seeds declared
+# label initial values with a read-then-write that is not atomic on every store (the generic
+# SQL path overwrites an existing value). Builds used to run on the event loop with no
+# ``await``, so builds for one session never overlapped; now they run on worker threads, and
+# this lock restores that ordering. Different sessions still build concurrently.
+_policy_engine_build_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _policy_engine_build_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing policy-engine builds for one session.
+
+    Get-or-create is race-free because there is no ``await`` between the
+    lookup and the insert (single event loop). Entries disappear once no
+    caller holds the lock.
+
+    :param session_id: Omnigent conversation id being evaluated, e.g. ``"conv_abc123"``.
+    :returns: The :class:`asyncio.Lock` shared by concurrent builds for ``session_id``.
+    """
+    lock = _policy_engine_build_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _policy_engine_build_locks[session_id] = lock
+    return lock
 
 
 def _no_policy_allow_body(
@@ -987,7 +1016,8 @@ def register_hooks_routes(
             )
 
         # The build makes several synchronous store reads.
-        engine = await asyncio.to_thread(_build_engine, conv)
+        async with _policy_engine_build_lock(session_id):
+            engine = await asyncio.to_thread(_build_engine, conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -1041,7 +1071,9 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    engine = await asyncio.to_thread(_build_engine)
+                    # Taken after the gate lock and never held while waiting for it.
+                    async with _policy_engine_build_lock(session_id):
+                        engine = await asyncio.to_thread(_build_engine)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,
