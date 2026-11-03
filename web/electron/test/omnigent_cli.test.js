@@ -1,8 +1,8 @@
 // Tests for the pure helpers in src/omnigent_cli.js, run with `node --test`
-// (no extra deps). The spawning functions need a real binary and are covered by
+// (no extra deps). Most spawning functions need a real binary and are covered by
 // the manual verification flow; here we test path resolution order, server-URL
-// matching, and status parsing — the logic that decides "is this machine
-// connected to server X?" and "which omnigent binary do we run?".
+// matching, status parsing, and runCli's failure classification — the logic that
+// decides "is this machine connected to server X?" and "which omnigent binary do we run?".
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
@@ -10,7 +10,6 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
 
 const {
   normalizeServerUrl,
@@ -21,6 +20,7 @@ const {
   candidatePaths,
   resolveCliPath,
   cliCommandParts,
+  runCli,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
@@ -57,6 +57,51 @@ describe("cliCommandParts", () => {
     assert.throws(() => cliCommandParts(null));
     assert.throws(() => cliCommandParts({ executable: "", prefixArgs: ["omni"] }));
     assert.throws(() => cliCommandParts({ executable: "/bin/isaac", prefixArgs: "omni" }));
+  });
+});
+
+describe("runCli", () => {
+  const nodeScript = (source) => ({ executable: process.execPath, prefixArgs: ["-e", source] });
+
+  it("resolves a clean exit with its output and no failure", async () => {
+    assert.deepEqual(await runCli(nodeScript('process.stdout.write("hi")'), []), {
+      code: 0,
+      stdout: "hi",
+      stderr: "",
+    });
+  });
+
+  it("keeps the exit code and adds the process-level failure", async () => {
+    const res = await runCli(nodeScript('console.error("SECRET"); process.exit(4)'), []);
+    assert.equal(res.code, 4);
+    assert.deepEqual(res.failure, { kind: "exited", exitCode: 4 });
+  });
+
+  it(
+    "keeps the timeout diagnosis when the child answers the kill with an exit code",
+    { skip: process.platform === "win32" && "POSIX signals", timeout: 10000 },
+    async () => {
+      const trapsSigterm = path.join(__dirname, "fixtures", "traps-sigterm.sh");
+      const res = await runCli({ executable: "/bin/sh", prefixArgs: [trapsSigterm] }, [], {
+        timeoutMs: 1000,
+      });
+      assert.equal(res.code, 7);
+      assert.deepEqual(res.failure, { kind: "timed-out", exitCode: 7 });
+    },
+  );
+
+  it("does not mistake execFile's maxBuffer kill for a timeout", async () => {
+    // 2 MiB of stdout overflows execFile's default 1 MiB maxBuffer.
+    const res = await runCli(nodeScript('process.stdout.write("x".repeat(2 * 1024 * 1024))'), []);
+    assert.equal(res.code, 1);
+    assert.deepEqual(res.failure, { kind: "failed" });
+  });
+
+  it("still reports code 1 for a spawn failure, now classified", async () => {
+    const missing = path.join(os.tmpdir(), "omnigent-no-such-cli", "omnigent");
+    const res = await runCli(missing, ["--version"]);
+    assert.equal(res.code, 1);
+    assert.deepEqual(res.failure, { kind: "cli-not-found", errorCode: "ENOENT" });
   });
 });
 
@@ -145,11 +190,15 @@ describe("localServerHealthy", () => {
     assert.equal(await localServerHealthy(), null);
   });
 
-  it("is null for a stale pidfile (dead pid)", async () => {
-    // A just-exited child's pid is dead (reuse within the test is negligible).
-    const { pid } = spawnSync(process.execPath, ["-e", ""]);
+  it("is null for a stale pidfile (dead pid)", async (t) => {
+    const pid = 123456;
+    const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: true }));
+    t.mock.method(process, "kill", () => {
+      throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+    });
     withPidfile(`${pid}\n6767\n`);
     assert.equal(await localServerHealthy(), null);
+    assert.equal(fetch.mock.callCount(), 0);
   });
 
   it("is null when the pid is alive but nothing serves the port", async () => {
@@ -530,7 +579,12 @@ describe("liveDaemonRecordFor", () => {
   afterEach(() => mock.restoreAll());
 
   it("skips a dead matching record before a live record", async () => {
-    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    const dead = process.pid + 1;
+    mock.method(process, "kill", (pid) => {
+      if (pid === dead) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      assert.equal(pid, process.pid);
+      return true;
+    });
     const records = [dead, process.pid].map((pid) => ({
       pid,
       target: "https://server.example",
