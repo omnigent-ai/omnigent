@@ -4051,6 +4051,23 @@ def test_drop_startup_fatal_claude_args_drops_missing_mcp_config_files(tmp_path:
     ]
 
 
+def test_drop_startup_fatal_claude_args_keeps_an_mcp_config_it_cannot_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config path whose check fails is kept: only a file known to be missing is dropped."""
+
+    def _unreadable(_self: Path) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_file", _unreadable)
+
+    args = drop_startup_fatal_claude_args(
+        ["--mcp-config", "servers.json", "--model", "opus"], workspace=tmp_path
+    )
+
+    assert args == ["--mcp-config", "servers.json", "--model", "opus"]
+
+
 def test_generated_claude_subprocesses_pin_runner_tmpdir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
