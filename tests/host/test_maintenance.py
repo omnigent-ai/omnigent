@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import Mock, call
 
+import psutil
 import pytest
 
 from omnigent.host.maintenance import HostMaintenanceJanitor, prune_stale_process_logs
 
 
-def test_host_janitor_covers_global_runner_cleanup() -> None:
+async def test_host_janitor_covers_global_runner_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    prune = Mock(side_effect=[2, 3])
+    monkeypatch.setattr("omnigent.host.maintenance.prune_stale_process_logs", prune)
     janitor = HostMaintenanceJanitor.for_host()
 
     assert [name for name, _stage in janitor._stages] == [
@@ -24,44 +32,128 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
     assert janitor._stage_skip_reasons == {
         "native_bridge_orphans": frozenset({"runner_superseded"})
     }
+    assert await dict(janitor._stages)["process_log_retention"]() == 5
+    assert prune.call_args_list == [
+        call(tmp_path / "logs" / "runner", "runner-*.log"),
+        call(tmp_path / "logs" / "host", "host-*.log"),
+    ]
 
 
-def test_prune_stale_process_logs_removes_only_idle_unheld_matches(tmp_path: Path) -> None:
+def test_prune_stale_process_logs_removes_only_idle_unheld_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     now = 2_000_000_000.0
     day = 24 * 3600.0
+    retention = 30 * day
     log_dir = tmp_path / "runner"
     log_dir.mkdir()
+    process = psutil.Process()
+    monkeypatch.setattr(psutil, "process_iter", lambda *_args: iter([process]))
 
-    def make(name: str, age_days: float) -> Path:
+    def make(name: str, age_s: float) -> Path:
         path = log_dir / name
         path.write_text("log\n", encoding="utf-8")
-        os.utime(path, (now - age_days * day, now - age_days * day))
+        os.utime(path, (now - age_s, now - age_s))
         return path
 
-    stale = make("runner-conv_a-20260101-000000-000000.log", 30)
-    recent = make("runner-conv_b-20260920-000000-000000.log", 2)
-    foreign = make("host-conv_c-20260101-000000-000000.log", 30)
-    target = make("runner-conv_target.log", 1)
-    held_path = make("runner-conv_held-20260101-000000-000000.log", 30)
+    stale = make("runner-conv_a-20260101-000000-000000.log", retention + 1)
+    at_cutoff = make("runner-conv_cutoff.log", retention)
+    before_cutoff = make("runner-conv_before_cutoff.log", retention - 1)
+    recent = make("runner-conv_b-20260920-000000-000000.log", 2 * day)
+    foreign = make("host-conv_c-20260101-000000-000000.log", 31 * day)
+    target = make("runner-conv_target.log", day)
+    held_path = make("runner-conv_held-20260101-000000-000000.log", 31 * day)
     link = log_dir / "runner-conv_link-20260101-000000-000000.log"
     link.symlink_to(stale)
-    os.utime(link, (now - 30 * day, now - 30 * day), follow_symlinks=False)
+    os.utime(link, (now - 31 * day, now - 31 * day), follow_symlinks=False)
 
     with held_path.open("rb"):
-        removed = prune_stale_process_logs(log_dir, "runner-*.log", max_age_s=14 * day, now=now)
+        removed = prune_stale_process_logs(log_dir, "runner-*.log", now=now)
 
     assert removed == 1
     assert not stale.exists()
+    assert at_cutoff.exists()
+    assert before_cutoff.exists()
     assert recent.exists()
     assert foreign.exists()
     assert target.exists()
     assert held_path.exists(), "a log a live runner still holds open must survive"
     assert link.is_symlink()
 
+    assert prune_stale_process_logs(log_dir, "host-*.log", max_age_s=40 * day, now=now) == 0
+    assert foreign.exists()
     with held_path.open("rb"):
-        removed_host = prune_stale_process_logs(log_dir, "host-*.log", max_age_s=14 * day, now=now)
+        removed_host = prune_stale_process_logs(log_dir, "host-*.log", now=now)
     assert removed_host == 1
     assert not foreign.exists()
+
+
+@pytest.mark.parametrize(
+    "inspection_error",
+    [
+        pytest.param(psutil.AccessDenied(os.getpid()), id="access-denied"),
+        pytest.param(OSError("descriptor inspection failed"), id="os-error"),
+        pytest.param(psutil.Error("descriptor inspection failed"), id="psutil-error"),
+    ],
+)
+def test_prune_stale_process_logs_preserves_candidates_after_inspection_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inspection_error: Exception
+) -> None:
+    held_path = tmp_path / "runner-held.log"
+    unheld_path = tmp_path / "runner-unheld.log"
+    for path in (held_path, unheld_path):
+        path.write_text("log\n", encoding="utf-8")
+        os.utime(path, (0, 0))
+    inspected_process = Mock(spec=psutil.Process)
+    inspected_process.open_files.return_value = []
+    inaccessible_process = Mock(spec=psutil.Process, pid=os.getpid())
+    inaccessible_process.open_files.side_effect = inspection_error
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        lambda *_args: iter([inspected_process, inaccessible_process]),
+    )
+
+    with held_path.open("rb"):
+        assert prune_stale_process_logs(tmp_path, "runner-*.log", now=2_000_000_000) == 0
+
+    assert held_path.exists(), "an uninspectable live process may still hold the log open"
+    assert unheld_path.exists(), "an incomplete scan cannot prove any candidate is unheld"
+
+
+def test_prune_stale_process_logs_preserves_candidates_after_enumeration_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = tmp_path / "runner-stale.log"
+    stale.write_text("log\n", encoding="utf-8")
+    os.utime(stale, (0, 0))
+
+    def failing_process_iter(*_args: object) -> Iterator[psutil.Process]:
+        yield psutil.Process()
+        raise OSError("process enumeration failed")
+
+    monkeypatch.setattr(psutil, "process_iter", failing_process_iter)
+
+    assert prune_stale_process_logs(tmp_path, "runner-*.log", now=2_000_000_000) == 0
+    assert stale.exists()
+
+
+@pytest.mark.parametrize("process_error", [psutil.NoSuchProcess, psutil.ZombieProcess])
+def test_prune_stale_process_logs_ignores_exited_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_error: type[psutil.NoSuchProcess],
+) -> None:
+    stale = tmp_path / "runner-stale.log"
+    stale.write_text("log\n", encoding="utf-8")
+    os.utime(stale, (0, 0))
+    exited_process = Mock(spec=psutil.Process)
+    exited_process.open_files.side_effect = process_error(999_999_999)
+    process = psutil.Process()
+    monkeypatch.setattr(psutil, "process_iter", lambda *_args: iter([exited_process, process]))
+
+    assert prune_stale_process_logs(tmp_path, "runner-*.log", now=2_000_000_000) == 1
+    assert not stale.exists()
 
 
 def test_prune_stale_process_logs_handles_missing_directory(tmp_path: Path) -> None:

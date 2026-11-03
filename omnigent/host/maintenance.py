@@ -24,7 +24,7 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_STARTUP_DELAY_S = 3.0
 _DEFAULT_LOCK_RETRY_S = 0.5
 # Process logs are never rotated; one file per runner or host start accumulates.
-_PROCESS_LOG_RETENTION_S = 14 * 24 * 3600.0
+_PROCESS_LOG_RETENTION_S = 30 * 24 * 3600.0
 
 MaintenanceStage = tuple[str, Callable[[], Awaitable[object]]]
 _LockOutcome = Literal["acquired", "busy", "failed"]
@@ -75,17 +75,22 @@ def _maintenance_lock(path: Path) -> Iterator[_LockOutcome]:
                 os.close(fd)
 
 
-def _paths_held_open() -> set[Path]:
-    """Return every file path held open by a process this user can inspect."""
+def _paths_held_open() -> set[Path] | None:
+    """Return open file paths, or ``None`` when inspection is incomplete."""
     import psutil
 
     held: set[Path] = set()
-    for process in psutil.process_iter(["pid"]):
-        try:
-            for handle in process.open_files():
+    try:
+        for process in psutil.process_iter(["pid"]):
+            try:
+                handles = process.open_files()
+            except psutil.NoSuchProcess:
+                continue
+            for handle in handles:
                 held.add(Path(handle.path))
-        except (psutil.Error, OSError):
-            continue
+    except (psutil.Error, OSError):
+        _logger.debug("process log cleanup deferred: open-file inspection failed", exc_info=True)
+        return None
     return held
 
 
@@ -99,7 +104,8 @@ def prune_stale_process_logs(
     """Delete files matching *pattern* that are untouched for *max_age_s* and not held open.
 
     A live runner writes its log through an inherited descriptor, so an open
-    file is always kept even when its mtime is old.
+    file is always kept even when its mtime is old. If a process cannot be
+    inspected, all candidates are kept until a later maintenance pass.
 
     :param log_dir: Process-log directory, e.g. ``~/.omnigent/logs/runner``.
     :param pattern: Glob for the logs to consider, e.g. ``"runner-*.log"``.
@@ -118,6 +124,8 @@ def prune_stale_process_logs(
     if not candidates:
         return 0
     held = _paths_held_open()
+    if held is None:
+        return 0
     removed = 0
     for path in candidates:
         if path in held or path.resolve() in held:
