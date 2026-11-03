@@ -2305,6 +2305,15 @@ def _codex_rollout_records_from_session_items(
                                 **message,
                                 "arguments": _codex_replayed_arguments(message["arguments"]),
                             }
+                        elif (
+                            message.get("type")
+                            in ("function_call_output", "custom_tool_call_output")
+                            and "output" in message
+                        ):
+                            message = {
+                                **message,
+                                "output": sanitize_replayed_image_blocks(message["output"]),
+                            }
                     replacement_history.append(message)
                 replacement_history = _codex_history_without_orphan_outputs(replacement_history)
                 replacement_call_ids = {

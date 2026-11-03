@@ -717,7 +717,7 @@ def register_resources_routes(
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
-        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+        from omnigent.inner.sandbox import declared_filesystem_reach
 
         if not conversation.workspace:
             return None
@@ -730,10 +730,10 @@ def register_resources_routes(
         if spec_os_env is None:
             return None
         root = Path(conversation.workspace)
-        policy = resolve_sandbox(spec_os_env, root)
+        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
         return (
-            reachable_roots(root, policy),
-            is_unconfined(policy),
+            roots,
+            unconfined,
             conversation.workspace,
         )
 

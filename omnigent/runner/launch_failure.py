@@ -114,14 +114,23 @@ _AUTH_MARKERS = (
 )
 
 # --- dbcert client certificate missing ----------------------------------------
-# A launcher that authenticates with the user's dbcert client certificate exits
-# before the agent starts when the files are absent, carry no team memberships,
-# or are about to expire.
+# dbcert launchers require certificate files, team membership and sufficient validity.
 _DBCERT_MARKERS = (
     "noteamsfoundinyourcertificate",
     "missingrequiredcredentialfiles",
     "certificateexpirestoosoon",
 )
+
+# --- Claude Code install failed or left broken -------------------------------
+# A launcher that installs Claude Code before starting it reports npm's
+# ENOENT text, which also reads like a missing binary.
+_BROKEN_CLAUDE_INSTALL_MARKERS = (
+    "failedtoinstallclaudecode",
+    "claudenativebinarynotinstalled",
+)
+# The launcher's exec of a half-written binary, "Exec format error: '<path>/claude'";
+# matched on compacted text, so only the quoted path may name claude.
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror:'[^']*claude'")
 # Pane captures wrap long lines and draw borders, which can split a marker.
 _PANE_WRAP = re.compile(r"[\s│┃]+")
 
@@ -145,9 +154,14 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
+)
 
-# Ordered most-specific first: the root and dbcert cases also read like
-# permission / auth problems, so they must win over the broader rules below.
+
+# Specific root, certificate and install diagnoses precede the broader
+# auth and missing-binary rules.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -174,6 +188,38 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "machine has no usable dbcert client certificate."
             ),
             remediation="Run `dbcert` on this machine, then retry.",
+        ),
+    ),
+    _TerminalMatcher(
+        "claude_install_broken",
+        lambda s: _claude_install_is_broken(s.output),
+        FailureDiagnosis(
+            title="Claude Code's install is broken",
+            cause=(
+                "Claude Code could not start because its install failed or is incomplete. "
+                "Launches that update Claude Code at the same time can leave it this way."
+            ),
+            remediation=(
+                "Send your message again. If it fails again, reinstall Claude Code on the "
+                "host with the installer you used, then retry."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
+        FailureDiagnosis(
+            title="Claude session is already running in the background",
+            cause=(
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
+            ),
+            remediation=(
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
@@ -236,6 +282,13 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
 )
+
+
+def _claude_install_is_broken(output: str) -> bool:
+    compact = _PANE_WRAP.sub("", output)
+    return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
+        _EXEC_FORMAT_ERROR.search(compact)
+    )
 
 
 # A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
@@ -304,6 +357,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
