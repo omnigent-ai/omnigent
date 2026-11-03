@@ -619,6 +619,32 @@ mod tests {
     }
 
     #[test]
+    fn ansi_log_colors_and_reset_survive_rendering() {
+        let (app, _rx) = app();
+        app.shared
+            .lock()
+            .unwrap()
+            .all
+            .push("\x1b[31mred\x1b[0m plain");
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..9)
+            .map(|column| buffer.cell((column, 4)).unwrap().symbol())
+            .collect();
+        assert_eq!(text, "red plain");
+        for column in 0..9 {
+            let foreground = buffer.cell((column, 4)).unwrap().fg;
+            let expected = if column < 3 {
+                ratatui::style::Color::Red
+            } else {
+                ratatui::style::Color::Reset
+            };
+            assert_eq!(foreground, expected, "column {column}");
+        }
+    }
+
+    #[test]
     fn paging_and_ends_move_the_window() {
         let (mut app, _rx) = app();
         seed(&app, 100);

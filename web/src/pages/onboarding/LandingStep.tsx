@@ -1,14 +1,16 @@
 // Onboarding step 1: the hero landing. Without MDM presets: "Get started
 // locally" / "Join your team". With presets: one "Join your team (<name>)" split
-// button; its dropdown lists other presets, recents, and a server URL field.
+// button; its dropdown selects from presets, recents, and a server URL field.
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { ArrowRight, ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -18,12 +20,10 @@ import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 import { ConnectStatus } from "@/pages/onboarding/primitives";
 import { ownServerName } from "@/lib/serverNames";
 
-/** Team name for a preset server URL: the host's first label, capitalized
- *  ("https://team.example.com/x" → "Team"). */
+/** Team name for a preset server URL: the host's first label. */
 function teamName(url: string): string {
   const host = url.replace(/^https?:\/\//i, "").replace(/[/?#].*$/, "");
-  const label = host.split(".")[0] || host;
-  return label.charAt(0).toUpperCase() + label.slice(1);
+  return host.split(".")[0] || host;
 }
 
 function displayUrl(url: string): string {
@@ -57,13 +57,12 @@ export function LandingStep({
   onCancelConnect?: () => void;
   onGetStarted: () => void;
   onJoinServer: () => void;
-  /** Join a preset server (the split button + its dropdown). */
+  /** Join the selected preset server. */
   onJoinManaged: (url: string) => void;
-  /** Join a recent or typed server URL (preset dropdown). */
+  /** Join the selected recent or typed server URL. */
   onJoinUrl: (url: string) => void;
 }) {
-  // Close the dropdown once a join starts: its field and items would otherwise
-  // stay usable (a second join) and cover the progress under the button.
+  // Close the dropdown during a join so it cannot change the selection or cover progress.
   const [menuOpen, setMenuOpen] = useState(false);
   // The menu spans the whole split button, not just its chevron trigger.
   const ctaRef = useRef<HTMLDivElement>(null);
@@ -73,14 +72,22 @@ export function LandingStep({
     if (connecting) setMenuOpen(false);
   }, [connecting]);
   const hasPresets = managedServers.length > 0;
+  const [selection, setSelection] = useState<string>();
+  const selectedUrl = selection ?? managedServers[0];
   const [typedUrl, setTypedUrl] = useState("");
   const [invalid, setInvalid] = useState(false);
-  const joinTyped = () => {
+  const selectTyped = () => {
     const url = normalizeServerUrl(typedUrl);
     if (url === null) setInvalid(true);
-    else onJoinUrl(url);
+    else {
+      setSelection(url);
+      setMenuOpen(false);
+    }
   };
-  const otherServers = [...managedServers.slice(1), ...recentServers];
+  const servers = [
+    ...new Set([...managedServers, ...recentServers, ...(selection ? [selection] : [])]),
+  ];
+  const firstRecent = servers.find((url) => !managedServers.includes(url));
   const nameOf = (url: string) =>
     managedServerNames && Object.hasOwn(managedServerNames, url) ? managedServerNames[url] : null;
   const listedName = (url: string) => {
@@ -89,7 +96,7 @@ export function LandingStep({
   };
 
   return (
-    <div className="flex flex-1 flex-col gap-2 px-2 pb-1">
+    <div className="flex min-w-0 flex-1 flex-col gap-2 px-2 pb-1">
       <div className="text-center flex-1 flex flex-col justify-center">
         <h1 className="text-2xl font-normal leading-9 tracking-[-0.03em] text-foreground">
           Meet Omnigent
@@ -107,18 +114,24 @@ export function LandingStep({
       )}
 
       {hasPresets ? (
-        // Only CTA: join the first preset, or pick another / type a URL.
+        // Only CTA: join the server selected in the dropdown.
         <div ref={ctaRef} className="flex gap-0">
           <Button
-            onClick={() => onJoinManaged(managedServers[0])}
+            onClick={() =>
+              managedServers.includes(selectedUrl)
+                ? onJoinManaged(selectedUrl)
+                : onJoinUrl(selectedUrl)
+            }
             loading={connecting}
-            className="flex-1 py-5 rounded-tr-none rounded-br-none border-none"
+            className="min-w-0 flex-1 py-5 rounded-tr-none rounded-br-none border-none"
           >
             <Users className="size-4" />
-            <span>
+            <span className="truncate" title={selectedUrl}>
               Join your team (
               <span className="opacity-80 font-normal">
-                {nameOf(managedServers[0]) ?? teamName(managedServers[0])}
+                {managedServers.includes(selectedUrl)
+                  ? (nameOf(selectedUrl) ?? teamName(selectedUrl))
+                  : listedName(selectedUrl)}
               </span>
               )
             </span>
@@ -140,19 +153,43 @@ export function LandingStep({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" style={{ width: menuWidth }}>
-              {otherServers.map((url) => (
-                <DropdownMenuItem
-                  key={url}
-                  onSelect={() =>
-                    managedServers.includes(url) ? onJoinManaged(url) : onJoinUrl(url)
-                  }
-                >
-                  <span className="truncate" title={url}>
-                    {listedName(url)}
-                  </span>
-                </DropdownMenuItem>
-              ))}
-              {otherServers.length > 0 && <DropdownMenuSeparator />}
+              <DropdownMenuRadioGroup value={selectedUrl} onValueChange={setSelection}>
+                {servers.map((url) => {
+                  const name =
+                    nameOf(url) ??
+                    ownServerName(serverNames, url) ??
+                    (managedServers.includes(url) ? teamName(url) : null);
+                  return (
+                    <Fragment key={url}>
+                      {url === firstRecent && (
+                        <DropdownMenuLabel className="text-muted-foreground">
+                          Recent servers
+                        </DropdownMenuLabel>
+                      )}
+                      <DropdownMenuRadioItem
+                        value={url}
+                        data-active={url === selectedUrl || undefined}
+                        className="px-1.5 data-[active=true]:bg-muted data-[active=true]:font-medium [&>[data-slot=dropdown-menu-radio-item-indicator]]:hidden"
+                      >
+                        <Users className="size-4" aria-hidden />
+                        <span className="truncate" title={url}>
+                          {name ? (
+                            <>
+                              {name}{" "}
+                              <span className="text-sm text-muted-foreground">
+                                ({getHostnameFromUrl(url)})
+                              </span>
+                            </>
+                          ) : (
+                            url
+                          )}
+                        </span>
+                      </DropdownMenuRadioItem>
+                    </Fragment>
+                  );
+                })}
+              </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
               {/* Typed in place; keys stay in the field instead of driving the menu. */}
               <div className="flex items-center gap-1 p-1" onKeyDown={(e) => e.stopPropagation()}>
                 <Input
@@ -162,7 +199,7 @@ export function LandingStep({
                     setInvalid(false);
                   }}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") joinTyped();
+                    if (e.key === "Enter") selectTyped();
                   }}
                   placeholder="Enter Omnigent server URL"
                   aria-label="Server URL"
@@ -172,8 +209,8 @@ export function LandingStep({
                   size="icon"
                   variant="ghost"
                   disabled={typedUrl.trim() === ""}
-                  onClick={joinTyped}
-                  aria-label="Join server"
+                  onClick={selectTyped}
+                  aria-label="Select server"
                 >
                   <ArrowRight className="size-4" />
                 </Button>
@@ -203,3 +240,8 @@ export function LandingStep({
     </div>
   );
 }
+
+const getHostnameFromUrl = (url: string) => {
+  const urlObject = new URL(url);
+  return urlObject.hostname;
+};

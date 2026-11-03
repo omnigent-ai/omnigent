@@ -48,6 +48,7 @@ import {
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
+  assistantMessagePhase,
   isCompactionItem,
   isErrorItem,
   isFunctionCallItem,
@@ -350,6 +351,7 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
 }
 
 function assistantMessageToBlock(item: MessageItem): TextDone {
+  const phase = assistantMessagePhase(item.phase);
   const text = item.content
     .filter((b): b is { type: "output_text"; text: string } => b.type === "output_text")
     .map((b) => b.text)
@@ -360,6 +362,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     fullText: text,
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
+    ...(phase !== undefined ? { phase } : {}),
   };
 }
 
