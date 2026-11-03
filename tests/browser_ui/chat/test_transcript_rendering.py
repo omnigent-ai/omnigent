@@ -611,6 +611,7 @@ def _open_and_assert_laid_out(page: Page, trigger: Locator, marker: str) -> None
     assert samples, f"{marker!r} never showed after opening"
     first = samples[0]
     assert first["diagram"], f"the diagram above {marker!r} rendered after opening"
+    assert first["tokens"] > 0, f"code below {marker!r} highlighted after opening"
     shift = max(abs(sample["offset"] - first["offset"]) for sample in samples)
     assert shift <= 24, f"{marker!r} moved {shift:.0f}px after opening"
     assert first["tokens"] == samples[-1]["tokens"], f"code below {marker!r} re-highlighted"

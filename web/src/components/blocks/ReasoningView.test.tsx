@@ -47,10 +47,8 @@ describe("ReasoningView — expandable gating", () => {
   });
 
   it("a settled section with content IS expandable and shows its text", () => {
-    // The normal completed-thought case: expandable header that, when
-    // clicked open, reveals the reasoning body. A settled section starts
-    // collapsed with its rendered body hidden, and expanding reveals that
-    // same body rather than rendering it again, so its markdown is ready.
+    // The normal completed-thought case: a collapsed header whose click
+    // reveals the same pre-rendered reasoning body.
     render(<ReasoningView text="Considered the options." isStreaming={false} duration={2.5} />);
     const trigger = screen.getByRole("button");
     expect(trigger).toBeTruthy();

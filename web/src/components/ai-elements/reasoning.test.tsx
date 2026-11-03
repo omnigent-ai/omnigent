@@ -62,6 +62,17 @@ describe("Reasoning — auto-expand", () => {
     const trigger = screen.getByRole("button");
     expect(trigger.getAttribute("data-state")).toBe("closed");
   });
+
+  it("shows the content when the caller passes open", () => {
+    render(
+      <Reasoning isStreaming={false} open>
+        <ReasoningTrigger />
+        <ReasoningContent>Some reasoning text</ReasoningContent>
+      </Reasoning>,
+    );
+    expect(screen.getByRole("button").getAttribute("data-state")).toBe("open");
+    expect(screen.getByText("Some reasoning text")).toBeVisible();
+  });
 });
 
 describe("Reasoning — non-expandable (nothing to show)", () => {

@@ -65,6 +65,7 @@ export const Reasoning = memo(
     isStreaming = false,
     duration,
     expandable = true,
+    open: openProp,
     children,
     ...props
   }: ReasoningProps) => {
@@ -74,7 +75,7 @@ export const Reasoning = memo(
     // doesn't inherit the user's choice from the previous one.
     const [userOverride, setUserOverride] = useState<boolean | null>(null);
     // A non-expandable section is always closed — there's nothing inside.
-    const isOpen = expandable ? (userOverride ?? isStreaming) : false;
+    const isOpen = expandable ? (openProp ?? userOverride ?? isStreaming) : false;
 
     useEffect(() => {
       if (isStreaming) setUserOverride(null);
