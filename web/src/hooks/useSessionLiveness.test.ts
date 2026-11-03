@@ -382,29 +382,105 @@ describe("useSessionLiveness — derivation truth table", () => {
 
 describe("useSessionHostConnecting", () => {
   const starting: SessionLiveness = { kind: "starting" };
+  const online: SessionLiveness = { kind: "online" };
+  interface Markers {
+    launchedAt?: number | null;
+    turnActive?: boolean;
+  }
 
   beforeEach(() => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    // `performance` is the monotonic clock; `setSystemTime` moves only the wall clock.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     vi.setSystemTime(new Date("2026-11-03T12:00:00Z"));
   });
   afterEach(() => vi.useRealTimers());
 
-  it("ends the window at the grace measured from an earlier known start", () => {
-    const createdAtMs = Date.now() - 30_000;
-    const { result } = renderHook(() =>
-      useSessionHostConnecting(SID, starting, null, [createdAtMs]),
+  function renderConnecting(initial: { liveness: SessionLiveness; markers: Markers }) {
+    return renderHook(
+      ({ liveness, markers }) => useSessionHostConnecting(SID, liveness, null, markers),
+      { initialProps: initial },
     );
+  }
+  const advance = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const GRACE_MS = STARTING_GRACE_S * 1000;
+
+  it("gives a second launch marker during continuous starting a fresh full window", () => {
+    const { result, rerender } = renderConnecting({
+      liveness: starting,
+      markers: { launchedAt: Date.now() },
+    });
+    advance(30_000);
+    const secondLaunch = { launchedAt: Date.now() };
+    rerender({ liveness: starting, markers: secondLaunch });
+    // Past the first launch's deadline, inside the second's.
+    advance(GRACE_MS - 1);
+    rerender({ liveness: starting, markers: { ...secondLaunch } });
     expect(result.current).toBe(true);
-    act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 30) * 1000 - 1));
-    expect(result.current).toBe(true);
-    act(() => vi.advanceTimersByTime(1));
+    advance(1);
     expect(result.current).toBe(false);
   });
 
-  it("never reports a failed launch as connecting", () => {
-    const { result } = renderHook(() =>
-      useSessionHostConnecting(SID, starting, { stage: "failed", error: "boom" }, []),
-    );
+  it("keeps the deadline across ordinary re-renders", () => {
+    const markers = { launchedAt: Date.now() };
+    const { result, rerender } = renderConnecting({ liveness: starting, markers });
+    advance(GRACE_MS - 1);
+    rerender({ liveness: starting, markers: { ...markers } });
+    expect(result.current).toBe(true);
+    advance(1);
+    rerender({ liveness: starting, markers: { ...markers } });
     expect(result.current).toBe(false);
+  });
+
+  it("opens a new window for a launch after the first one expired", () => {
+    const { result, rerender } = renderConnecting({ liveness: starting, markers: {} });
+    advance(GRACE_MS);
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { launchedAt: Date.now() } });
+    expect(result.current).toBe(true);
+    advance(GRACE_MS);
+    expect(result.current).toBe(false);
+  });
+
+  it("opens a window for a relaunch after an earlier turn completed", () => {
+    const { result, rerender } = renderConnecting({
+      liveness: starting,
+      markers: { turnActive: true },
+    });
+    advance(GRACE_MS);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { turnActive: true } });
+    expect(result.current).toBe(true);
+  });
+
+  it("starts over once the runner has been online", () => {
+    const { result, rerender } = renderConnecting({ liveness: starting, markers: {} });
+    advance(GRACE_MS);
+    rerender({ liveness: online, markers: {} });
+    rerender({ liveness: starting, markers: {} });
+    expect(result.current).toBe(true);
+  });
+
+  it("measures the window in elapsed time, not wall-clock time", () => {
+    const { result, rerender } = renderConnecting({ liveness: starting, markers: {} });
+    advance(10_000);
+    vi.setSystemTime(Date.now() - 10 * 60_000);
+    rerender({ liveness: starting, markers: {} });
+    expect(result.current).toBe(true);
+    advance(GRACE_MS - 10_000);
+    expect(result.current).toBe(false);
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    rerender({ liveness: starting, markers: {} });
+    expect(result.current).toBe(false);
+  });
+
+  it("never reports a stopped launch as connecting", () => {
+    for (const stage of ["failed", "action_required"] as const) {
+      const { result, unmount } = renderHook(() =>
+        useSessionHostConnecting(SID, starting, { stage }, {}),
+      );
+      expect(result.current).toBe(false);
+      unmount();
+    }
   });
 });

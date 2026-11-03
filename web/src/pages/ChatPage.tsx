@@ -850,15 +850,13 @@ export function ChatPage() {
   // Host-switch launch marker; see the store field. Keeps this surface's
   // liveness in step with AppShell's, which drives the startup spinner.
   const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
-  const liveness = useSessionLiveness(sessionConvId ?? undefined, livenessRow, {
-    turnActive: status === "streaming",
-    launchedAt: runnerLaunchedAt,
-  });
+  const launchMarkers = { turnActive: status === "streaming", launchedAt: runnerLaunchedAt };
+  const liveness = useSessionLiveness(sessionConvId ?? undefined, livenessRow, launchMarkers);
   const hostConnecting = useSessionHostConnecting(
     sessionConvId ?? undefined,
     liveness,
     sandboxStatus,
-    [livenessRow?.created_at ? livenessRow.created_at * 1000 : null, runnerLaunchedAt],
+    launchMarkers,
   );
 
   // Browser tab title mirrors the header; "● " flags main-session work in background tabs.

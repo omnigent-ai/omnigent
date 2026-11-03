@@ -228,53 +228,80 @@ export function useSessionLiveness(
   return raw;
 }
 
+/** Monotonic ms for connecting deadlines, so wall-clock jumps neither stretch nor cut them. */
+function monotonicNowMs(): number {
+  return performance.now();
+}
+
+interface HostConnectingAttempt {
+  sessionId: string | undefined;
+  launchedAt: number | null;
+  turnActive: boolean;
+  /** A new launch or turn began; the next visible attempt gets a fresh window. */
+  restartPending: boolean;
+  /** Monotonic ms when the current attempt ends; `null` when there is none. */
+  deadline: number | null;
+}
+
 /**
  * Whether the composer host chip should say the open session is connecting.
  *
- * Follows `starting` liveness or an in-flight sandbox launch, but never a
- * launch stopped on a failure or a user action, which keep their own status.
- * Each connecting attempt is bounded to {@link STARTING_GRACE_S}: a timer ends
- * it even if nothing else re-renders, so a host that never comes up falls
- * back to its offline status and Reconnect. A session switch starts over.
- *
- * @param attemptStartsMs Epoch ms when this attempt may have begun before the
- *   view saw it (the session's creation, a host-switch launch). The earliest
- *   one inside the grace anchors the window; otherwise it starts now.
+ * An attempt starts when this view first observes `starting` liveness or an
+ * in-flight sandbox launch, and again on each new client launch marker (a host
+ * switch's `launchedAt`, or a turn starting). It lasts {@link STARTING_GRACE_S}
+ * of monotonic time from that observation, ended by a timer even if nothing
+ * else re-renders, so a host that never comes up falls back to its offline
+ * status and Reconnect. The runner coming online, a launch stopped on a
+ * failure or user action, or a session switch ends it early; otherwise it
+ * holds to its bound, since liveness's own grace reads skewable server time.
  */
 export function useSessionHostConnecting(
   sessionId: string | undefined,
   liveness: SessionLiveness,
   sandboxStatus: SandboxStatus | null,
-  attemptStartsMs: readonly (number | null | undefined)[],
+  markers: { launchedAt?: number | null; turnActive?: boolean },
 ): boolean {
-  const starting =
-    !isSandboxLaunchStopped(sandboxStatus) &&
-    (sandboxStatus !== null || liveness.kind === "starting");
-  const graceMs = STARTING_GRACE_S * 1000;
-  const attemptRef = useRef<{ id: string | undefined; deadline: number | null }>({
-    id: sessionId,
-    deadline: null,
-  });
-  if (attemptRef.current.id !== sessionId) attemptRef.current = { id: sessionId, deadline: null };
-  if (!starting) {
-    attemptRef.current.deadline = null;
-  } else if (attemptRef.current.deadline === null) {
-    const now = Date.now();
-    const earlierStarts = attemptStartsMs.filter(
-      (start): start is number =>
-        typeof start === "number" && start <= now && now - start < graceMs,
-    );
-    attemptRef.current.deadline = Math.min(now, ...earlierStarts) + graceMs;
+  const launchedAt = markers.launchedAt ?? null;
+  const turnActive = markers.turnActive === true;
+  const stopped = isSandboxLaunchStopped(sandboxStatus);
+  const attemptVisible = !stopped && (sandboxStatus !== null || liveness.kind === "starting");
+  const attemptRef = useRef<HostConnectingAttempt | null>(null);
+  if (attemptRef.current === null || attemptRef.current.sessionId !== sessionId) {
+    attemptRef.current = {
+      sessionId,
+      launchedAt,
+      turnActive,
+      restartPending: false,
+      deadline: null,
+    };
   }
-  const deadline = attemptRef.current.deadline;
-  // Re-render at the deadline; re-arm if the timer fires early.
+  const attempt = attemptRef.current;
+  if (
+    (launchedAt !== null && launchedAt !== attempt.launchedAt) ||
+    (turnActive && !attempt.turnActive)
+  ) {
+    attempt.restartPending = true;
+  }
+  attempt.launchedAt = launchedAt;
+  attempt.turnActive = turnActive;
+  if (stopped || liveness.kind === "online") {
+    attempt.deadline = null;
+    attempt.restartPending = false;
+  } else if (attemptVisible && (attempt.deadline === null || attempt.restartPending)) {
+    attempt.deadline = monotonicNowMs() + STARTING_GRACE_S * 1000;
+    attempt.restartPending = false;
+  }
+  const deadline = attempt.deadline;
+  // Re-render at the deadline; an early fire re-arms only for the monotonic remainder.
   const [expiryCheck, setExpiryCheck] = useState(0);
   useEffect(() => {
-    if (deadline === null || Date.now() >= deadline) return;
-    const timer = setTimeout(() => setExpiryCheck((check) => check + 1), deadline - Date.now());
+    if (deadline === null) return;
+    const remainingMs = deadline - monotonicNowMs();
+    if (remainingMs <= 0) return;
+    const timer = setTimeout(() => setExpiryCheck((check) => check + 1), remainingMs);
     return () => clearTimeout(timer);
   }, [deadline, expiryCheck]);
-  return deadline !== null && Date.now() < deadline;
+  return deadline !== null && monotonicNowMs() < deadline;
 }
 
 /** Structural equality for the small `SessionLiveness` union. */

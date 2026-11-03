@@ -50,11 +50,13 @@ function OpenSession({
   sessionId,
   createdAtS,
   turnActive,
+  launchedAt = null,
   onReconnect,
 }: {
   sessionId: string;
   createdAtS: number;
   turnActive: boolean;
+  launchedAt?: number | null;
   onReconnect: () => void;
 }) {
   const row: LivenessRow = {
@@ -63,11 +65,10 @@ function OpenSession({
     created_at: createdAtS,
     host_resumable: false,
   };
-  const liveness = useSessionLiveness(sessionId, row, { turnActive });
+  const markers = { turnActive, launchedAt };
+  const liveness = useSessionLiveness(sessionId, row, markers);
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
-  const connecting = useSessionHostConnecting(sessionId, liveness, sandboxStatus, [
-    createdAtS * 1000,
-  ]);
+  const connecting = useSessionHostConnecting(sessionId, liveness, sandboxStatus, markers);
   return (
     <HostBadge
       sessionId={sessionId}
@@ -88,7 +89,8 @@ const closeHostMenu = () =>
   fireEvent.keyDown(screen.getByTestId("composer-host-menu"), { key: "Escape" });
 
 beforeEach(() => {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  // `performance` is the monotonic clock; `setSystemTime` moves only the wall clock.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
   vi.setSystemTime(new Date("2026-11-03T12:00:00Z"));
   runnerOnlineMock.mockReset().mockReturnValue(false);
   hostOnlineMock.mockReset().mockReturnValue(true);
@@ -181,6 +183,78 @@ describe("composer host chip while a session connects", () => {
     expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
 
     act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 10) * 1000));
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+  });
+  it.each([
+    ["44s behind", -44],
+    ["10 minutes ahead of", 600],
+  ])(
+    "bounds connecting to the grace from first sight when server time is %s the client",
+    (_skew, skewS) => {
+      hostOnlineMock.mockReturnValue(false);
+      const props = {
+        sessionId: "conv_1",
+        createdAtS: nowS() + skewS,
+        turnActive: true,
+        onReconnect: vi.fn(),
+      };
+      const { rerender } = render(<OpenSession {...props} />);
+      expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+      // A health poll re-renders mid-boot, after a skewed server grace would have lapsed.
+      act(() => vi.advanceTimersByTime(2_000));
+      rerender(<OpenSession {...props} />);
+      expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+      act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 2) * 1000 - 1));
+      expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+      act(() => vi.advanceTimersByTime(1));
+      expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+      openHostMenu();
+      expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+    },
+  );
+
+  it("ends connecting after the grace of elapsed time when the wall clock rolls back", () => {
+    hostOnlineMock.mockReturnValue(false);
+    const props = {
+      sessionId: "conv_1",
+      createdAtS: nowS(),
+      turnActive: true,
+      onReconnect: vi.fn(),
+    };
+    const { rerender } = render(<OpenSession {...props} />);
+
+    act(() => vi.advanceTimersByTime(10_000));
+    vi.setSystemTime(Date.now() - 10 * 60_000);
+    rerender(<OpenSession {...props} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+    act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 10) * 1000));
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+    act(() => vi.advanceTimersByTime(60_000));
+    rerender(<OpenSession {...props} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+    openHostMenu();
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+  });
+
+  it("gives a second host-switch launch its own full window", () => {
+    hostOnlineMock.mockReturnValue(false);
+    const base = { sessionId: "conv_1", createdAtS: nowS() - 3_600, turnActive: false };
+    const firstLaunch = { ...base, launchedAt: Date.now(), onReconnect: vi.fn() };
+    const { rerender } = render(<OpenSession {...firstLaunch} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+    act(() => vi.advanceTimersByTime(30_000));
+    const secondLaunch = { ...firstLaunch, launchedAt: Date.now() };
+    rerender(<OpenSession {...secondLaunch} />);
+
+    // Past the first launch's deadline, inside the second's.
+    act(() => vi.advanceTimersByTime(STARTING_GRACE_S * 1000 - 1));
+    rerender(<OpenSession {...secondLaunch} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+    act(() => vi.advanceTimersByTime(1));
     expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
   });
 });
