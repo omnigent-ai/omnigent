@@ -2238,9 +2238,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     if mode != "missing":
         executable = tmp_path / "rg"
         body = (
-            "import os, time\n"
-            f"open({str(tmp_path / 'pid')!r}, 'w').write(str(os.getpid()))\n"
-            "time.sleep(60)\n"
+            "import time\ntime.sleep(60)\n"
             if mode == "timeout"
             else "print('x' * (2 * 1024 * 1024))\n"
         )
@@ -2249,9 +2247,14 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
     )
+    # Record the owned child's PID before the shortened timer can kill it.
     timer = (
         "import threading\noriginal_timer = threading.Timer\n"
-        "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"
+        "def shortened_timer(seconds, callback):\n"
+        f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+        "        marker.write(str(process.pid))\n"
+        "    return original_timer(0.2, callback)\n"
+        "threading.Timer = shortened_timer\n"
     )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],

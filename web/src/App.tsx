@@ -19,8 +19,8 @@ import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 // kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
 // one view per destination under the same id.
 //
-// SettingsPage opts out (stays unwrapped): its id is param-derived
-// (`settings.<section>`), so it calls useOmnigentPageView itself.
+// SettingsPage and TasksPage own their page-view IDs because their section
+// depends on route/query parameters.
 function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
   return function WithPageView(props: P) {
     useOmnigentPageView(id);
@@ -57,10 +57,7 @@ const InboxPage = withPageView(
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
-const TasksPage = withPageView(
-  "tasks",
-  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
-);
+const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),

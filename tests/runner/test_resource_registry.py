@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -40,7 +41,7 @@ from omnigent.terminals import TerminalRegistry
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
 
-# Stands in for Claude's terminal: answers the OSC 7501 probe, then writes one report per key.
+# Stands in for Claude: completes OSC negotiation, reports working, then one report per key.
 _CLAUDE_OSC_PEER_SCRIPT = (
     "import os,sys,tty\n"
     "tty.setraw(0)\n"
@@ -68,8 +69,12 @@ _CLAUDE_OSC_PEER_SCRIPT = (
 )
 
 
-def _claude_osc_peer(path: Path) -> Path:
-    path.write_text(_CLAUDE_OSC_PEER_SCRIPT)
+def _claude_osc_peer(path: Path, *, error_detail: str | None = None) -> Path:
+    script = _CLAUDE_OSC_PEER_SCRIPT
+    if error_detail is not None:
+        report = b"state=error:msg=" + base64.b64encode(error_detail.encode())
+        script = script.replace("b'e':b'state=error'", f"b'e':{report!r}")
+    path.write_text(script)
     return path
 
 
@@ -250,8 +255,9 @@ async def test_claude_program_status_real_launch_and_fallback(
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_detail", [None, "API Error: 499"])
 async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_detail: str | None
 ) -> None:
     """A turn whose StopFailure hook never reaches the runner still ends, failed once."""
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
@@ -262,7 +268,17 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
     registry.set_session_status_publisher(
         lambda _, state, reason: statuses.append((state, reason))
     )
-    spec = _claude_osc_spec(tmp_path, _claude_osc_peer(tmp_path / "peer.py"), "osc", "none")
+    failures: list[tuple[str, str]] = []
+    if error_detail is not None:
+
+        def publish_failure(session_id: str, detail: str) -> None:
+            failures.append((session_id, detail))
+            statuses.append(("failed", None))
+
+        registry.set_session_failure_publisher(publish_failure)
+    spec = _claude_osc_spec(
+        tmp_path, _claude_osc_peer(tmp_path / "peer.py", error_detail=error_detail), "osc", "none"
+    )
     try:
         await registry.launch_required_terminal(
             "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
@@ -275,14 +291,14 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
-        await instance.send(keys="w")
         await _wait_for_status_edge(statuses, ("running", None))
         await instance.send(keys="e")
         # No hook edge arrives, so the runner's grace period is what ends the turn.
         await _wait_for_status_edge(statuses, ("failed", None), timeout=15)
         await asyncio.sleep(0.5)
         assert statuses.count(("failed", None)) == 1
-        assert raw_status.call_args_list.count(call("failed", None)) == 1
+        assert raw_status.call_args_list.count(call("failed", None)) == int(error_detail is None)
+        assert failures == ([("osc-test", error_detail)] if error_detail is not None else [])
     finally:
         await terminals.shutdown()
 
@@ -314,7 +330,6 @@ async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
-        await instance.send(keys="w")
         await _wait_for_status_edge(statuses, ("running", None))
         await instance.send(keys="e")
         async with asyncio.timeout(5):
@@ -868,8 +883,9 @@ class _FakeStatusPoller:
     ``sessions/<pid>.json``.
     """
 
-    def __init__(self, on_status: object) -> None:
+    def __init__(self, on_status: object, on_failure: Callable[[str], None] | None = None) -> None:
         self._on_status = on_status
+        self._on_failure = on_failure
         self.active = False
         self.blocked_on: str | None = None
         self.ticks = 0
@@ -890,11 +906,17 @@ class _FakeStatusPoller:
         """Simulate the file reporting a new status."""
         self._on_status(status, blocked_on)
 
+    def emit_failure(self, detail: str) -> None:
+        assert self._on_failure is not None
+        self._on_failure(detail)
+
 
 async def _observe_native_with_fake_poller(
     tmp_path: Path,
     session_id: str,
     activity_publisher: Callable[[str, str], None] | None = None,
+    *,
+    failure_publisher: Callable[[str, str], None] | None = None,
 ) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller], SessionResourceRegistry]:
     """Observe a claude-native terminal with an injected fake poller.
 
@@ -915,10 +937,14 @@ async def _observe_native_with_fake_poller(
     )
     if activity_publisher is not None:
         registry.set_terminal_activity_publisher(activity_publisher)
+    if failure_publisher is not None:
+        registry.set_session_failure_publisher(failure_publisher)
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+    def _fake_build(
+        *, session_id: str, instance: object, on_status: object, on_failure: Callable[[str], None]
+    ) -> _FakeStatusPoller:
         del session_id, instance
-        poller = _FakeStatusPoller(on_status)
+        poller = _FakeStatusPoller(on_status, on_failure)
         pollers.append(poller)
         return poller
 
@@ -1102,16 +1128,23 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("intervening_event", ["none", "failed-hook", "idle-hook", "new-turn"])
+@pytest.mark.parametrize("with_detail", [False, True])
 async def test_queued_fallback_failure_preserves_newer_turn_state(
-    tmp_path: Path, intervening_event: str
+    tmp_path: Path, intervening_event: str, with_detail: bool
 ) -> None:
     """A pending watcher failure must not replace a hook or end a newer turn."""
     session_id = "conv_queued_failure"
-    _, statuses, pollers, registry = await _observe_native_with_fake_poller(tmp_path, session_id)
+    failures: list[tuple[str, str]] = []
+    _, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, failure_publisher=lambda sid, detail: failures.append((sid, detail))
+    )
     poller = pollers[0]
     poller.emit("running")
     await asyncio.sleep(0)
-    poller.emit("failed")
+    if with_detail:
+        poller.emit_failure("API Error: 499")
+    else:
+        poller.emit("failed")
     if intervening_event != "none":
         registry.note_external_session_status(
             session_id, "idle" if intervening_event == "idle-hook" else "failed"
@@ -1119,14 +1152,25 @@ async def test_queued_fallback_failure_preserves_newer_turn_state(
     if intervening_event == "new-turn":
         registry.note_session_turn_started(session_id)
     await asyncio.sleep(0)
-    assert statuses == (["running", "failed"] if intervening_event == "none" else ["running"])
+    assert statuses == (
+        ["running", "failed"] if intervening_event == "none" and not with_detail else ["running"]
+    )
+    assert failures == (
+        [(session_id, "API Error: 499")] if intervening_event == "none" and with_detail else []
+    )
     assert registry.session_turn_is_active(session_id) == (intervening_event == "new-turn")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "reason"),
-    [("running", None), ("running", "permission prompt"), ("idle", None), ("failed", None)],
+    ("status", "reason", "with_detail"),
+    [
+        ("running", None, False),
+        ("running", "permission prompt", False),
+        ("idle", None, False),
+        ("failed", None, False),
+        ("failed", None, True),
+    ],
 )
 @pytest.mark.parametrize("replacement", [False, True], ids=["removed", "replaced"])
 @pytest.mark.parametrize("queued_first", [False, True], ids=["late-read", "queued-read"])
@@ -1134,17 +1178,28 @@ async def test_old_terminal_status_cannot_change_its_successor(
     tmp_path: Path,
     status: str,
     reason: str | None,
+    with_detail: bool,
     replacement: bool,
     queued_first: bool,
 ) -> None:
     """A stale watcher must not publish or change activity after its terminal leaves."""
     session_id = "conv_terminal_replaced"
-    _, statuses, pollers, registry = await _observe_native_with_fake_poller(tmp_path, session_id)
+    failures: list[tuple[str, str]] = []
+    _, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, session_id, failure_publisher=lambda sid, detail: failures.append((sid, detail))
+    )
     poller = pollers[0]
     poller.emit("running")
     await asyncio.sleep(0)
+
+    def emit() -> None:
+        if with_detail:
+            poller.emit_failure("API Error: 499")
+        else:
+            poller.emit(status, reason)
+
     if queued_first:
-        poller.emit(status, reason)
+        emit()
     terminals = registry._terminal_registry
     assert terminals is not None
     if replacement:
@@ -1157,9 +1212,10 @@ async def test_old_terminal_status_cannot_change_its_successor(
         registry.note_external_session_status(session_id, "idle")
     current_epoch = registry.session_activity_epoch(session_id)
     if not queued_first:
-        poller.emit(status, reason)
+        emit()
     await asyncio.sleep(0)
     assert statuses == ["running"]
+    assert failures == []
     assert registry.session_turn_is_active(session_id) is replacement
     assert registry.session_activity_epoch(session_id) == current_epoch
 
@@ -2383,9 +2439,11 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         lambda _sid, status, reason=None: edges.append((status, reason))
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+    def _fake_build(
+        *, session_id: str, instance: object, on_status: object, on_failure: Callable[[str], None]
+    ) -> _FakeStatusPoller:
         del session_id, instance
-        poller = _FakeStatusPoller(on_status)
+        poller = _FakeStatusPoller(on_status, on_failure)
         pollers.append(poller)
         return poller
 

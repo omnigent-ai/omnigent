@@ -170,6 +170,9 @@ class _CapturingResourceRegistry:
         """
         self._session_status_publisher = publisher
 
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        self._session_failure_publisher = publisher
+
     def set_terminal_exit_publisher(
         self,
         publisher: Callable[[Any], None],

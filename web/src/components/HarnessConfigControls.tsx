@@ -173,8 +173,8 @@ export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
 ];
 
 /**
- * Create-time effort ladder for a native harness (`null` = none). Codex uses
- * `model` or the catalog default; Devin is omitted (no project model default).
+ * Create-time effort ladder for a native harness (`null` = none). Codex and Devin use
+ * `model` or the catalog default to resolve their model-specific efforts.
  */
 export function nativeEffortOptions(
   harness: string | null | undefined,
@@ -183,7 +183,7 @@ export function nativeEffortOptions(
 ): { value: string; label: string }[] | null {
   if (harness === "claude-native") return CLAUDE_NATIVE_EFFORTS;
   if (harness === "pi-native") return PI_NATIVE_EFFORTS;
-  if (harness !== "codex-native") return null;
+  if (harness !== "codex-native" && harness !== "devin-native") return null;
   const effortModel = model || modelOptions.find((option) => option.isDefault)?.id;
   return codexEffortLevelsForModel(modelOptions, effortModel).map((value) => ({
     value,
