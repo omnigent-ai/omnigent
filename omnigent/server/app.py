@@ -273,6 +273,7 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_session_modes: bool = True
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    scheduled_task_sandbox_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -4381,21 +4382,12 @@ def create_app(
             runner_id, generation=connection.generation
         )
         await asyncio.gather(*cancelled, return_exceptions=True)
-        # Newest-wins guard: a superseded tunnel's teardown fires this
-        # hook after a fresh tunnel for the same ``runner_id`` already
-        # registered (``TunnelRegistry.register`` retires the old
-        # session, whose helper tasks then error out and run this
-        # teardown). Marking the runner's sessions ``failed`` here would
-        # clobber the live tunnel's recovery: reconnect-recovery
-        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
-        # may have just cleared a stale ``runner_disconnected`` failure,
-        # and this stale disconnect would silently re-fail the session.
-        # If a live tunnel is registered for this runner, the runner is
-        # NOT offline, so skip. Mirrors the registry's own
-        # generation-guarded ``deregister``.
-        if tunnel_registry.get(runner_id) is not None:
+        # Replaced tunnels still release their own initializers, but cannot
+        # cancel a newer outage or apply an old idle attestation to new work.
+        # The replacement may itself be gone before this cleanup finishes.
+        if connection.superseded or tunnel_registry.get(runner_id) is not None:
             _logger.info(
-                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                "Runner %s disconnect superseded by a newer tunnel; skipping offline-marking",
                 runner_id,
             )
             return

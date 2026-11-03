@@ -39,11 +39,11 @@ class SysScheduledTaskCreateTool(Tool):
         return (
             "Create a scheduled task: a saved prompt that runs an agent session "
             "on a recurring schedule (RRULE). Provide the agent to run, the "
-            "prompt to send it, and the recurrence rule. The workspace is always "
-            "optional and defaults to the launch host's home directory (fine for "
-            "MCP-only / chat tasks that touch no code directory). Optionally PIN "
-            "a connected host and/or a workspace on it; with no pinned host it "
-            "runs on your live host at fire time (the owner must have an online "
+            "prompt to send it, and the recurrence rule. The workspace is optional: "
+            "a connected-host directory (defaulting to its home), or a repository URL "
+            "for managed_sandbox (defaulting to the provider's repository). With "
+            "connected_host, optionally pin a host and/or a workspace on it; with no "
+            "pinned host it runs on your live host at fire time (the owner must have an online "
             "host then, else the run is recorded as failed). The task fires "
             "automatically on its schedule until deleted."
         )
@@ -138,9 +138,10 @@ class SysScheduledTaskCreateTool(Tool):
                         "workspace": {
                             "type": "string",
                             "description": (
-                                "Optional existing absolute path where the run's runner "
-                                "starts. Omit to default to the launch host's home "
-                                "directory (whether the host is pinned or resolved)."
+                                "For connected_host: an optional existing absolute runner "
+                                "start path; omit for the host's home directory. For "
+                                "managed_sandbox: an optional repository URL, optionally "
+                                "with #branch; omit for the provider default."
                             ),
                         },
                         "host_id": {
@@ -159,8 +160,9 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Where each firing runs. 'connected_host' (default) uses a "
                                 "pinned/resolved connected host. 'managed_sandbox' provisions "
                                 "a fresh server-managed sandbox per firing, using the server's "
-                                "sandbox lifecycle settings. Do not set host_id or workspace "
-                                "with it. Requires managed sandboxes configured on the server."
+                                "sandbox lifecycle settings. Do not set host_id with it; "
+                                "workspace may name a repository URL. Requires managed "
+                                "sandboxes configured on the server."
                             ),
                         },
                         "project_name": {
@@ -311,8 +313,13 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "workspace": {
-                            "type": "string",
-                            "description": "New existing absolute runner start path.",
+                            "type": ["string", "null"],
+                            "description": (
+                                "For connected_host: a new existing absolute runner start "
+                                "path. For managed_sandbox: a repository URL, optionally "
+                                "with #branch, or null to restore the provider default. "
+                                "Omit to keep the current selection."
+                            ),
                         },
                         "host_id": {
                             "type": "string",
@@ -324,7 +331,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": (
                                 "Switch where firings run. 'managed_sandbox' provisions a "
                                 "fresh server-managed sandbox per firing (clears any pinned "
-                                "host; do not also set host_id or workspace)."
+                                "host; do not also set host_id). workspace may name a "
+                                "repository URL, or be null for the provider default."
                             ),
                         },
                         "state": {
