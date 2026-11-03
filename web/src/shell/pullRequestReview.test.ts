@@ -228,6 +228,25 @@ describe("match positions after a refresh or a reseed", () => {
     expect(firstMatchAtOrBelow(matches, ["a.ts", "b.ts", "c.ts"], null)).toBe(0);
   });
 
+  it("prefers the same side when falling back to the nearest line", () => {
+    const deletion: Match = {
+      target: { path: "a.ts", kind: "line", side: "deletions", line: 19, text: "x" },
+      start: 0,
+      end: 1,
+    };
+    const addition: Match = {
+      target: { path: "a.ts", kind: "line", side: "additions", line: 40, text: "x" },
+      start: 0,
+      end: 1,
+    };
+    const previous: Match = {
+      target: { path: "a.ts", kind: "line", side: "additions", line: 20, text: "gone" },
+      start: 0,
+      end: 1,
+    };
+    expect(refreshedMatchIndex([deletion, addition], previous)).toBe(1);
+  });
+
   it("tells the current and previous path of a rename apart", () => {
     const corpus: PatchMatchTarget[] = [
       { path: "y.ts", kind: "path", text: "y.ts" },

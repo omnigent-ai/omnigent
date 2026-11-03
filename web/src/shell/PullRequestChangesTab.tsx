@@ -682,8 +682,15 @@ export function PullRequestChangesTab({
   const stepMatch = (direction: 1 | -1) => {
     // Matches for a query still being searched would navigate the previous results.
     if (!matches.length || deferredQuery !== query) return;
+    // With no active match yet, the first step lands on the first or last match by direction.
     const next =
-      matches[activeIndex < 0 ? 0 : (activeIndex + direction + matches.length) % matches.length];
+      matches[
+        activeIndex < 0
+          ? direction > 0
+            ? 0
+            : matches.length - 1
+          : (activeIndex + direction + matches.length) % matches.length
+      ];
     // A fresh object, so stepping to the sole match again is a new reveal request.
     setFindTarget({ ...next });
     if (next.target.kind === "path") setPendingReveal({ path: next.target.path });

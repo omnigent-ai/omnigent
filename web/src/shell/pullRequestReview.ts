@@ -153,15 +153,20 @@ export function refreshedMatchIndex(matches: readonly Match[], previous: Match):
       match.target.text === target.text,
   );
   if (same >= 0) return same;
+  // Line numbers only compare within a side: old and new numbering drift apart.
+  const sameFile = (match: Match) => match.target.path === target.path;
+  const sameSide = (match: Match) =>
+    match.target.kind === target.kind && match.target.side === target.side;
+  const candidates = matches.flatMap((match, index) => (sameFile(match) ? [{ index, match }] : []));
+  const preferred = candidates.filter(({ match }) => sameSide(match));
   let nearest = 0;
   let nearestDistance = Infinity;
-  matches.forEach((match, index) => {
-    if (match.target.path !== target.path) return;
+  for (const { index, match } of preferred.length ? preferred : candidates) {
     const distance = Math.abs((match.target.line ?? 0) - (target.line ?? 0));
     if (distance < nearestDistance) {
       nearest = index;
       nearestDistance = distance;
     }
-  });
+  }
   return nearest;
 }
