@@ -8515,7 +8515,8 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 _MID_TURN_STATUSES = ("running", "waiting")
 # A laptop that sleeps or loses its network takes its runner with it and often
 # resumes the turn hours later, so a turn interrupted that way waits this long.
-HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
+# Three days covers a laptop closed over a weekend.
+HOST_OFFLINE_HOLD_S: float = 72 * 3600.0
 # How often a host-offline hold re-checks whether the host came back.
 HOST_OFFLINE_RECHECK_S: float = 60.0
 
