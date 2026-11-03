@@ -7309,22 +7309,27 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
 
 
 @pytest.mark.parametrize(
-    ("payload", "reason"),
+    ("payload", "heartbeat", "reason"),
     [
-        (b"", "closed before delivering its result"),
-        (b"\n \n", "closed before delivering its result"),
-        (b'{"content":', "malformed JSON"),
-        (b"[]", "non-object JSON"),
+        (b"", True, "closed before delivering its result"),
+        (b"\n \n", True, "closed before delivering its result"),
+        (b'{"content":', True, "malformed JSON"),
+        (b"[]", True, "non-object JSON"),
+        (b'{"content":[{"type":"text","text":"created"}]}', False, None),
     ],
 )
-def test_call_relay_tool_reports_unknown_completion_for_incomplete_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes, reason: str
+def test_call_relay_tool_decodes_complete_or_uncertain_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    heartbeat: bool,
+    reason: str | None,
 ) -> None:
-    """An HTTP success without a final result cannot establish mutation failure."""
+    """Legacy success is preserved; missing or invalid results stay uncertain."""
 
     class Response(io.BytesIO):
         status = 200
-        headers = {"X-Omnigent-Relay-Heartbeat": "1"}
+        headers = {"X-Omnigent-Relay-Heartbeat": "1"} if heartbeat else {}
 
     claude_native_bridge._write_json_file(
         tmp_path / claude_native_bridge._TOOL_RELAY_FILE,
@@ -7334,6 +7339,9 @@ def test_call_relay_tool_reports_unknown_completion_for_incomplete_response(
         claude_native_bridge.request, "urlopen", lambda *_args, **_kwargs: Response(payload)
     )
     result = claude_native_bridge._call_relay_tool(tmp_path, "sys_scheduled_task_create", {})
+    if reason is None:
+        assert result == {"content": [{"type": "text", "text": "created"}]}
+        return
     assert result["isError"]
     message = json.loads(result["content"][0]["text"])["error"]
     assert "Completion is unknown" in message
@@ -16665,6 +16673,14 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         assert events[-1]["reason"] == "unanswered"
         assert not pending_approvals.has_pending("conv_cancel_relay")
         assert not pending_approvals.resolve("elicit_cancel_relay", True)
+        if stop == "notification":
+            assert proc.stdout is not None
+            cancelled_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            assert cancelled_result["id"] == 51
+            assert cancelled_result["result"]["isError"]
+            _write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
+            ping_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            assert ping_result == {"jsonrpc": "2.0", "id": 52, "result": {}}
     finally:
         pending_approvals.resolve("elicit_cancel_relay", False)
         if stop != "relay_close":
