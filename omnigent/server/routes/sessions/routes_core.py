@@ -199,6 +199,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
+    _list_status_with_starting,
     _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
@@ -4617,7 +4618,9 @@ def register_core_routes(
                 f"{command} is only available in a top-level session.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if _session_status_from_cache(source.id, source.live_status) == "running":
+        # A message still waiting on its runner counts as a running turn.
+        status = _session_status_from_cache(source.id, source.live_status)
+        if _list_status_with_starting(status, source.id) == "running":
             raise OmnigentError(
                 f"Stop the current turn before running {command}.",
                 code=ErrorCode.INVALID_INPUT,

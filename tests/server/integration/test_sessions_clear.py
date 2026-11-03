@@ -11,6 +11,7 @@ SDK client.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -531,6 +532,7 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
         (503, "runner", 500, "Clear failed: runner returned 503"),
         (None, "runner", 503, "Couldn't reach this session's runner"),
         (200, "running", 400, "Stop the current turn"),
+        (200, "starting", 400, "Stop the current turn"),
         (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
         (200, "sub_agent", 400, "only available in a top-level session"),
@@ -548,9 +550,10 @@ async def test_claude_sdk_clear_refusals_create_no_session(
 ) -> None:
     """A refused ``clear`` creates, initializes and supersedes nothing.
 
-    A busy, failing or unreachable runner, a running turn, no placement, a non-owner or a
-    sub-agent refuses it. The caller and session checks run before the runner
-    frees the client, so only a runner refusal reaches the runner.
+    A busy, failing or unreachable runner, a running turn or one still
+    reaching its runner, no placement, a non-owner or a sub-agent refuses it.
+    The caller and session checks run before the runner frees the client, so
+    only a runner refusal reaches the runner.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     auth_live_runner.clear_status = clear_status
@@ -558,12 +561,37 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     source_id, _items = await create_placed_session(
         auth_client,
         store,
-        runner_id=None if placement == "none" else _RUNNER_ID,
+        runner_id={"none": None, "starting": "runner_gone"}.get(placement, _RUNNER_ID),
         host=placement != "none",
         user=_OWNER,
     )
     caller = _OWNER
-    if placement == "running":
+    message_task: asyncio.Task[httpx.Response] | None = None
+    release_message = asyncio.Event()
+    if placement == "starting":
+        # A message to the offline runner waits on runner recovery.
+        recovering = asyncio.Event()
+        resolve_runner = sessions_module._get_runner_client
+
+        async def recover_runner(*args: Any, **kwargs: Any) -> Any:
+            if not recovering.is_set():
+                recovering.set()
+                await release_message.wait()
+            return await resolve_runner(*args, **kwargs)
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", recover_runner)
+        message_task = asyncio.create_task(
+            auth_client.post(
+                f"/v1/sessions/{source_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
+                },
+                headers={"X-Forwarded-Email": _OWNER},
+            )
+        )
+        await asyncio.wait_for(recovering.wait(), timeout=10)
+    elif placement == "running":
         monkeypatch.setitem(sessions_module._session_status_cache, source_id, "running")
     elif placement == "editor":
         granted = await auth_client.put(
@@ -587,11 +615,16 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
     posts_before = len(auth_live_runner.posts)
 
-    resp = await auth_client.post(
-        f"/v1/sessions/{source_id}/events",
-        json={"type": "clear", "data": {}},
-        headers=headers,
-    )
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{source_id}/events",
+            json={"type": "clear", "data": {}},
+            headers=headers,
+        )
+    finally:
+        release_message.set()
+        if message_task is not None:
+            await message_task
 
     assert resp.status_code == status, resp.text
     assert message in resp.text
