@@ -1041,6 +1041,8 @@ function SidebarImpl({
       a11y tree via tabIndex/aria-hidden rather than the `inert` the drawer
       uses: React 18 doesn't know `inert` as a boolean attribute and drops it,
       so a focusable control relying on it would stay tabbable while closed.
+      Parked, it is also `invisible`: the macOS desktop shell treats any rendered
+      button as a no-drag region, transparent or not, blocking title-bar drags.
 
       z-45, not z-40: chat chrome also sits at z-40 (ChatPage's jump-to-top
       pill) and renders after the sidebar, so a same-z peer that ever takes
@@ -1056,8 +1058,8 @@ function SidebarImpl({
           tabIndex={effectiveOpen ? 0 : -1}
           aria-hidden={!effectiveOpen}
           className={cn(
-            "fixed inset-0 z-[45] bg-black/25 transition-opacity duration-200 ease-out md:hidden",
-            effectiveOpen ? "opacity-100" : "pointer-events-none opacity-0",
+            "fixed inset-0 z-[45] bg-black/25 transition-[opacity,visibility] duration-200 ease-out md:hidden",
+            effectiveOpen ? "opacity-100" : "pointer-events-none invisible opacity-0",
           )}
           style={dragging ? { opacity: liveDragProgress, transition: "none" } : undefined}
         />

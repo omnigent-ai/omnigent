@@ -33,6 +33,37 @@ _NARROW_VIEWPORT = {"width": 740, "height": 860}
 # macOS paints the traffic lights outside the DOM; index.css reserves this strip for them.
 _WINDOW_CONTROLS_STRIP = {"x": 0, "y": 0, "width": 88, "height": 48}
 
+# Electron applies app-region rects in document order, ignoring stacking, opacity
+# and pointer-events, so the last rendered region over a point decides dragging.
+_UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT = """
+(stripHeight) => {
+  const appRegion = (element) => getComputedStyle(element).getPropertyValue("-webkit-app-region");
+  const regions = [...document.querySelectorAll("*")].flatMap((element) => {
+    const region = appRegion(element);
+    const rect = element.getBoundingClientRect();
+    const rendered =
+      getComputedStyle(element).visibility === "visible" && rect.width && rect.height;
+    const hasRegion = region === "drag" || region === "no-drag";
+    return hasRegion && rendered ? [{ element, region, rect }] : [];
+  });
+  const undraggable = [];
+  for (let x = 4; x < window.innerWidth; x += 16) {
+    for (const y of [8, 24, stripHeight - 4]) {
+      const isEmpty = document.elementsFromPoint(x, y).every((el) => appRegion(el) !== "no-drag");
+      const covering = regions.filter(
+        ({ rect }) => x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom,
+      ).at(-1);
+      if (isEmpty && covering?.region !== "drag") {
+        const element = covering?.element;
+        const coveredBy = element ? element.dataset.testid || element.tagName : null;
+        undraggable.push({ x, y, coveredBy });
+      }
+    }
+  }
+  return undraggable;
+}
+"""
+
 
 def _intersects_window_controls(box: dict[str, float] | None) -> bool:
     assert box is not None and box["width"] > 0 and box["height"] > 0, f"no rendered box: {box}"
@@ -162,3 +193,31 @@ def test_narrowing_window_collapses_open_sidebar(
     composer = page.get_by_role("textbox", name="Message the agent")
     composer.click(timeout=5_000)
     expect(composer).to_be_focused()
+
+
+def test_narrow_window_title_bar_stays_draggable(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    base_url, session_id = seeded_session
+    page = _open_session_in_mac_shell(request, base_url, session_id)
+    strip_height = _WINDOW_CONTROLS_STRIP["height"]
+    wide_points = page.evaluate(_UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT, strip_height)
+    assert wide_points == [], (
+        f"empty title-bar points not draggable at {_WIDE_VIEWPORT['width']}px: {wide_points}"
+    )
+
+    page.set_viewport_size(_NARROW_VIEWPORT)
+    expect(page.locator('aside[aria-label="Conversations"]')).to_have_attribute(
+        "data-collapsed", "true"
+    )
+    page.wait_for_function(
+        "() => document.querySelector('aside[aria-label=\"Conversations\"]')"
+        ".getBoundingClientRect().right <= 0"
+    )
+    expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+    _hold_for_recording(page)
+
+    narrow_points = page.evaluate(_UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT, strip_height)
+    assert narrow_points == [], (
+        f"empty title-bar points not draggable at {_NARROW_VIEWPORT['width']}px: {narrow_points}"
+    )
