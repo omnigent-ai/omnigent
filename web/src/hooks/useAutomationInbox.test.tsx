@@ -4,6 +4,8 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { setOmnigentHostConfig } from "@/lib/host";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { listAutomationFailures } from "@/lib/scheduledTasksApi";
 import { useAutomationInbox } from "./useAutomationInbox";
 
@@ -12,6 +14,7 @@ let viewer: string | null = "alice";
 vi.mock("./useViewerId", () => ({ useViewerId: () => viewer }));
 let client: QueryClient;
 let supported = true;
+let mountPath = "/mount-a";
 const failure = {
   taskId: "task",
   taskName: "Report",
@@ -23,7 +26,7 @@ const failure = {
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
     <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, scheduled_task_inbox: supported }}>
-      {children}
+      <RoutingProvider value={basenamedRouting(mountPath)}>{children}</RoutingProvider>
     </CapabilitiesProvider>
   </QueryClientProvider>
 );
@@ -32,11 +35,14 @@ beforeEach(() => {
   localStorage.clear();
   viewer = "alice";
   supported = true;
+  mountPath = "/mount-a";
+  setOmnigentHostConfig({ serverIdentity: "server-a" });
   vi.mocked(listAutomationFailures).mockReset().mockResolvedValue({ data: [], nextCursor: null });
 });
 afterEach(() => {
   cleanup();
   client.clear();
+  setOmnigentHostConfig({});
 });
 
 it("continues across empty task pages and hides only the read occurrence", async () => {
@@ -71,14 +77,19 @@ it.each([
   expect(listAutomationFailures).not.toHaveBeenCalled();
 });
 
-it("does not display the previous viewer's cached failures", async () => {
-  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [failure], nextCursor: null });
-  const { result, rerender } = renderHook(() => useAutomationInbox(true), { wrapper });
-  await waitFor(() => expect(result.current.items).toHaveLength(1));
-  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [], nextCursor: null });
-  viewer = "bob";
-  rerender();
-  expect(result.current.items).toEqual([]);
-  await waitFor(() => expect(result.current.isSuccess).toBe(true));
-  expect(result.current.items).toEqual([]);
-});
+it.each(["viewer", "backend", "mount"])(
+  "does not display cached failures after a %s change",
+  async (changedScope) => {
+    vi.mocked(listAutomationFailures).mockResolvedValue({ data: [failure], nextCursor: null });
+    const { result, rerender } = renderHook(() => useAutomationInbox(true), { wrapper });
+    await waitFor(() => expect(result.current.items).toHaveLength(1));
+    vi.mocked(listAutomationFailures).mockResolvedValue({ data: [], nextCursor: null });
+    if (changedScope === "viewer") viewer = "bob";
+    else if (changedScope === "backend") setOmnigentHostConfig({ serverIdentity: "server-b" });
+    else mountPath = "/mount-b";
+    rerender();
+    expect(result.current.items).toEqual([]);
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.items).toEqual([]);
+  },
+);

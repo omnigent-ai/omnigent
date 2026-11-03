@@ -2304,7 +2304,12 @@ def test_an_executor_records_succeeded_for_a_prompt_delivered_into_a_session(
 
 
 @pytest.mark.parametrize("state", ["active", "paused"])
-def test_inbox_failures_latest_run_and_session_dedup(store, state):
+@pytest.mark.parametrize(
+    "latest_status, conversation_id",
+    [("failed", _uid("session")), ("starting", None), ("running", None), ("succeeded", None)],
+    ids=["linked-failure", "starting", "running", "succeeded"],
+)
+def test_inbox_failures_latest_run_and_session_dedup(store, state, latest_status, conversation_id):
     task = _session_task(store, "inbox", state=state)
     run_id = _uid("inbox-failure")
     store.create_run(
@@ -2323,21 +2328,13 @@ def test_inbox_failures_latest_run_and_session_dedup(store, state):
     assert not hasattr(failures[0], "error")
     assert not hasattr(failures[0], "prompt")
 
-    # A linked failure stays on the session Inbox even if it is read or not loaded.
+    # Each newer state independently replaces the visible sessionless failure.
     store.create_run(
-        run_id=_uid("linked"),
+        run_id=_uid("latest"),
         scheduled_task_id=task.id,
-        status="failed",
+        status=latest_status,
         scheduled_at=200,
-        conversation_id=_uid("session"),
-        error_code="launch_failed",
-    )
-    assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
-    store.create_run(
-        run_id=_uid("recovered"),
-        scheduled_task_id=task.id,
-        status="succeeded",
-        scheduled_at=300,
+        conversation_id=conversation_id,
     )
     assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
 
