@@ -73,7 +73,9 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
 # A continued session cannot follow a change to these, so the next run starts a new one.
-_SESSION_BOUND_FIELDS = frozenset({"agent_id", "host_id", "workspace", "execution_target"})
+_SESSION_BOUND_FIELDS = frozenset(
+    {"agent_id", "host_id", "workspace", "base_branch", "execution_target"}
+)
 
 
 class AutomationFailurePage(BaseModel):
@@ -105,6 +107,7 @@ class CreateScheduledTaskRequest(BaseModel):
     # Unpinned connected-host tasks resolve an online host and its home at fire time.
     # Omission or null selects the default; empty strings are invalid.
     workspace: str | None = Field(default=None, min_length=1)
+    base_branch: str | None = Field(default=None, min_length=1, max_length=255)
     host_id: str | None = Field(default=None, min_length=1)
     # ``managed_sandbox`` runs the task in a fresh server-provisioned sandbox
     # (no host_id, optional repository URL); default keeps connected-host behavior.
@@ -120,6 +123,9 @@ class CreateScheduledTaskRequest(BaseModel):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if self.session_id is not None and self.session_mode != "continue":
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
+        _validate_worktree_target(
+            self.base_branch, self.execution_target, self.host_id, self.workspace
+        )
         return self
 
 
@@ -144,6 +150,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     # Null makes a continue-mode task's next run start a new session.
     session_id: str | None = Field(default=None, min_length=1)
     workspace: str | None = Field(default=None, min_length=1)
+    base_branch: str | None = Field(default=None, min_length=1, max_length=255)
     host_id: str | None = Field(default=None, min_length=1)
     execution_target: str | None = Field(default=None, min_length=1)
     state: str | None = None
@@ -165,6 +172,15 @@ class UpdateScheduledTaskRequest(BaseModel):
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
         return self
+
+
+def _validate_worktree_target(
+    base_branch: str | None, execution_target: str, host_id: str | None, workspace: str | None
+) -> None:
+    if base_branch is not None and (
+        execution_target != "connected_host" or host_id is None or workspace is None
+    ):
+        raise ValueError("random worktree requires a connected host and repository workspace")
 
 
 def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
@@ -214,6 +230,7 @@ def _to_response(
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "workspace": task.workspace,
+        "base_branch": task.base_branch,
         "host_id": task.host_id,
         "execution_target": task.execution_target,
         "project_id": task.project_id,
@@ -611,6 +628,7 @@ def create_scheduled_tasks_router(
                     timezone=body.timezone,
                     created_at=0,
                     workspace=workspace,
+                    base_branch=body.base_branch,
                     host_id=body.host_id,
                     execution_target=body.execution_target,
                     session_mode=body.session_mode,
@@ -641,6 +659,7 @@ def create_scheduled_tasks_router(
                 session_mode=body.session_mode,
                 session_id=body.session_id,
                 workspace=workspace,
+                base_branch=body.base_branch,
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
@@ -973,6 +992,17 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.INVALID_INPUT,
             )
         target_changed = target_execution != existing.execution_target
+        if switching_to_managed and fields.get("base_branch") is None:
+            fields["base_branch"] = None
+        try:
+            _validate_worktree_target(
+                fields.get("base_branch", existing.base_branch),
+                target_execution,
+                fields.get("host_id", existing.host_id),
+                fields.get("workspace", existing.workspace),
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
             # Revalidate placement against the selected agent and execution target.
             agent, workspace, _, _ = await _validate_launch_inputs(
@@ -1016,6 +1046,7 @@ def create_scheduled_tasks_router(
                             "agent_id",
                             "host_id",
                             "workspace",
+                            "base_branch",
                             "execution_target",
                             "session_mode",
                             "session_id",

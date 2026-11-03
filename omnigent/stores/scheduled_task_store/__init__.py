@@ -72,6 +72,7 @@ class ScheduledTaskStore(ABC):
         session_mode: str = "new",
         session_id: str | None = None,
         workspace: str | None = None,
+        base_branch: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
         execution_target: str = "connected_host",
@@ -192,6 +193,7 @@ class ScheduledTaskStore(ABC):
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
+        base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
         project_id: str | None = _UNSET,
         execution_target: str | None = None,
@@ -204,9 +206,9 @@ class ScheduledTaskStore(ABC):
 
         Most parameters use ``None`` to mean "leave unchanged". For the per-task
         overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``permission_mode``), ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
+        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
+        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (e.g.
         turning a set ``bypassPermissions`` back off), and clearing a host
         binding or nulling out a deleted last-run conversation.

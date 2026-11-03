@@ -21,6 +21,10 @@ the creation modal with its integration settings ready to customize.
   sandbox setup shows Repository instead of a folder picker. Provider default
   leaves the repository unpinned; choosing it on edit clears an existing pin.
   Switching between a connected host and a sandbox clears incompatible selections.
+  Selecting a Git repository shows the optional Random worktree checkbox. Other
+  directories hide the checkbox and its help text. It defaults off;
+  when on, each new session starts in a fresh worktree from HEAD, and continuing
+  runs reuse that session's worktree. Editing can turn it off again.
 - `harness-settings`: model, effort, and permission controls follow the selected
   harness. Codex and Devin efforts follow the selected model; Pi exposes thinking
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
@@ -70,11 +74,16 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   workspace browsing in create/edit setup, disconnect/reconnect, preserving a
   saved workspace, and sandbox creation with offline connected hosts. It also
   covers repository/default selections, legacy edits, target switching, and
-  continued-session setting locks.
+  continued-session setting locks, plus Random worktree on/off in the shared modal.
 - `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
   uses its own built-SPA browser contract, with a synthetic provider catalog,
   to cover repository creation, replacement, clearing, and reopening on desktop
   and mobile. It does not verify actual sandbox execution.
+- In the creation modal, choose a connected host and Git repository, enable
+  Random worktree, save, and reopen Edit to confirm it stayed enabled. Run twice
+  with New session each run and check that the sessions have distinct worktree
+  paths. Disable the option and run again: the new session uses the selected
+  directory. With Continue in the same session, later runs reuse its worktree.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the

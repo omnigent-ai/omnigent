@@ -48,6 +48,7 @@ import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
 import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -234,6 +235,7 @@ export function CreateScheduledTaskDialog({
   // when it fires.
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
+  const [baseBranch, setBaseBranch] = useState<string | null>(null);
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
   // "managed_sandbox") instead of a connected host. Catalog-backed providers
   // offer repository selection instead of browsing a connected host.
@@ -268,6 +270,7 @@ export function CreateScheduledTaskDialog({
     !agentChanged &&
     executionTarget === editingTask.executionTarget &&
     (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
+    baseBranch === (editingTask.baseBranch ?? null) &&
     (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
@@ -306,6 +309,7 @@ export function CreateScheduledTaskDialog({
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
         setWorkspace(savedWorkspace);
+        setBaseBranch(editingTask.baseBranch ?? null);
         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
         setProjectChoice(null);
         setPickedProjectId(null);
@@ -328,6 +332,7 @@ export function CreateScheduledTaskDialog({
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
+        setBaseBranch(null);
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
@@ -404,6 +409,7 @@ export function CreateScheduledTaskDialog({
     const restore = isEdit && effectiveAgentId === editingTask?.agentId && originalTarget;
     setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
     setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
+    setBaseBranch(restore && !nextSandbox ? (editingTask?.baseBranch ?? null) : null);
     setSandboxMode(nextSandbox);
     setHostId(nextHostId);
     // Host directories and sandbox repository URLs are different workspace inputs.
@@ -424,6 +430,11 @@ export function CreateScheduledTaskDialog({
   }
 
   const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
+  const { data: worktrees } = useHostWorktrees(
+    open && !sandboxMode && !workspaceHostOffline && hostId !== "" ? hostId : null,
+    workspace || null,
+  );
+  const isGitWorkspace = (worktrees?.length ?? 0) > 0;
   useEffect(() => {
     if (workspaceHostOffline) setWorkspaceBrowserOpen(false);
   }, [workspaceHostOffline]);
@@ -525,6 +536,7 @@ export function CreateScheduledTaskDialog({
         rrule: buildRRule(schedule),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
+        ...(baseBranch !== (editingTask?.baseBranch ?? null) ? { baseBranch } : {}),
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
@@ -880,10 +892,37 @@ export function CreateScheduledTaskDialog({
                 onOpenChange={setWorkspaceBrowserOpen}
                 hostId={hostId}
                 initialPath={workspace}
-                onConfirm={setWorkspace}
+                onConfirm={(path) => {
+                  if (path !== workspace) setBaseBranch(null);
+                  setWorkspace(path);
+                }}
               />
               {workspace && (
-                <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
+                <>
+                  <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
+                  {isGitWorkspace && (
+                    <>
+                      <div className="mt-2 flex items-center gap-2">
+                        <Checkbox
+                          id="task-random-worktree"
+                          checked={baseBranch !== null}
+                          onCheckedChange={(checked) =>
+                            setBaseBranch(checked === true ? "HEAD" : null)
+                          }
+                          componentId="tasks.scheduled.random_worktree"
+                        />
+                        <label htmlFor="task-random-worktree" className="cursor-pointer text-sm">
+                          Random worktree
+                        </label>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        {sessionMode === "continue"
+                          ? "Creates a randomly named worktree from the repository’s current HEAD when starting a session. Later runs reuse it."
+                          : "Creates a fresh randomly named worktree from the repository’s current HEAD for each run."}
+                      </p>
+                    </>
+                  )}
+                </>
               )}
             </div>
           )}

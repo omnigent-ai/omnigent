@@ -2571,10 +2571,26 @@ async def _fire_once(deps: FireDeps) -> list[Any]:
 
 
 @pytest.mark.asyncio
-async def test_continue_sends_the_prompt_into_the_session() -> None:
-    conv_store = _ExistingConversationStore(_continued_session())
+@pytest.mark.parametrize("worktree", [False, True])
+async def test_continue_sends_the_prompt_into_the_session(worktree: bool) -> None:
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    session = _continued_session()
+    if worktree:
+        session.workspace = "/repo-worktrees/previous"
+        session.git_branch = "previous"
+        session.labels = {
+            fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(session.workspace),
+        }
+    conv_store = _ExistingConversationStore(session)
     perm = FakePermissionStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _continuing_task(base_branch="HEAD" if worktree else None)}
+    )
 
     launched = await _fire_once(_deps(store, conversation_store=conv_store, permission_store=perm))
 
@@ -3267,3 +3283,97 @@ async def test_continue_dispatch_failure_records_a_failed_run() -> None:
     assert [(run["status"], run["error_code"], run["conversation_id"]) for run in store.runs] == [
         ("failed", "launch_failed", "conv_prev")
     ]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_random_worktree_is_created_per_new_session(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    from omnigent.server.routes import _host_worktree
+
+    task = _task(base_branch="HEAD" if enabled else None)
+    deps = _deps(FakeScheduledTaskStore(), host_registry=FakeHostRegistry({"host_1"}))
+    create = AsyncMock(
+        side_effect=[
+            _host_worktree.CreatedWorktree(
+                f"/repo-worktrees/run-{i}", f"run-{i}", f"/repo-worktrees/run-{i}/src"
+            )
+            for i in range(2)
+        ]
+    )
+    monkeypatch.setattr(_host_worktree, "create_worktree_on_host", create)
+    for i in range(2):
+        conv = await fire_mod._create_session(deps, task)
+        saved = deps.conversation_store.created[-1]
+        assert saved["workspace"] == (f"/repo-worktrees/run-{i}/src" if enabled else "/repo")
+        assert saved["git_branch"] == (f"run-{i}" if enabled else None)
+        if enabled:
+            assert saved["labels"][
+                _host_worktree.WORKTREE_ROOT_LABEL_KEY
+            ] == _host_worktree.worktree_root_fingerprint(f"/repo-worktrees/run-{i}")
+            # The next firing accepts the relocated directory and bypasses creation.
+            conv.labels = saved["labels"]
+            continuing = replace(task, session_mode="continue", session_id=conv.id)
+            assert (
+                await fire_mod.continued_session_problem(
+                    continuing, conv, host_store=None, permission_store=None
+                )
+                is None
+            )
+    assert create.await_count == (2 if enabled else 0)
+    if enabled:
+        calls = [call.kwargs for call in create.await_args_list]
+        assert calls[0]["branch_name"] != calls[1]["branch_name"]
+        assert all(
+            call["repo_path"] == "/repo" and call["base_branch"] == "HEAD" for call in calls
+        )
+    assert task.workspace == "/repo"
+
+
+async def test_random_worktree_rolls_back_when_session_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_worktree
+    from omnigent.server.routes._sessions import helpers
+
+    deps = _deps(
+        FakeScheduledTaskStore(),
+        host_registry=FakeHostRegistry({"host_1"}),
+        conversation_store=FakeConversationStore(fail_create=True),
+    )
+    monkeypatch.setattr(
+        _host_worktree,
+        "create_worktree_on_host",
+        AsyncMock(return_value=_host_worktree.CreatedWorktree("/repo-worktrees/new", "new")),
+    )
+    remove = AsyncMock()
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    with pytest.raises(RuntimeError, match="create failed"):
+        await fire_mod._create_session(deps, _task(base_branch="HEAD"))
+    assert remove.await_count == 1
+    assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/new"
+    assert remove.call_args.kwargs["delete_branch"] is True
+
+
+async def test_unused_session_discards_its_random_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+    from omnigent.server.routes._sessions import helpers
+
+    conv = _continued_session(
+        workspace="/repo-worktrees/unused/src",
+        git_branch="unused",
+        labels={WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/unused")},
+    )
+    deps = _deps(FakeScheduledTaskStore())
+    remove = AsyncMock()
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    await fire_mod._discard_session(deps, conv)
+    assert remove.await_count == 1
+    assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/unused"
+    assert remove.call_args.kwargs["branch"] == "unused"
+    assert deps.conversation_store.deleted == [conv.id]

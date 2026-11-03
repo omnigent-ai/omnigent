@@ -34,6 +34,12 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
+const gitWorkspace = vi.hoisted(() => ({ available: true }));
+vi.mock("@/hooks/useHostWorktrees", () => ({
+  useHostWorktrees: () => ({
+    data: gitWorkspace.available ? [{ path: "/home/me/repo", branch: "main", is_main: true }] : [],
+  }),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
 // dropdown source). Returning no data makes it fall back to the static Claude
@@ -168,6 +174,7 @@ const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
+  gitWorkspace.available = true;
   vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
     typeof hostsHook.useHostModelOptions
   >);
@@ -2959,4 +2966,97 @@ describe("automation harness settings", () => {
       }
     },
   );
+});
+
+describe("automation random worktree", () => {
+  it("clears a saved worktree choice when switching hosts", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        { host_id: "host_1", name: "laptop", status: "online" },
+        { host_id: "host_2", name: "desktop", status: "online" },
+      ],
+    } as ReturnType<typeof hostsHook.useHosts>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          hostId: "host_1",
+          workspace: "/home/me/repo",
+          baseBranch: "HEAD",
+        })}
+      />,
+    );
+    fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+    gitWorkspace.available = false;
+    fireEvent.click(screen.getByRole("option", { name: "desktop" }));
+    expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      hostId: "host_2",
+      baseBranch: null,
+    });
+  });
+
+  it("defaults off and enables a fresh worktree on create", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Review" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Review code" } });
+    fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    fireEvent.click(screen.getByTestId("task-workspace-browse"));
+    fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+    const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalled());
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      baseBranch: "HEAD",
+      workspace: "/home/me/repo",
+      hostId: "host_1",
+    });
+  });
+
+  it.each([null, "HEAD"])("only shows the option for a Git repository (saved %s)", (baseBranch) => {
+    gitWorkspace.available = false;
+    const dialog = () => (
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          hostId: "host_1",
+          workspace: "/home/me/repo",
+          baseBranch,
+        })}
+      />
+    );
+    const { rerender } = render(dialog());
+    expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Creates a fresh randomly named worktree/)).not.toBeInTheDocument();
+    gitWorkspace.available = true;
+    rerender(dialog());
+    const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
+    expect(checkbox).toBeEnabled();
+    expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
+  });
+
+  it.each([null, "HEAD"])("saves toggling the saved option from %s", async (baseBranch) => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ hostId: "host_1", workspace: "/home/me/repo", baseBranch })}
+      />,
+    );
+    const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
+    expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
+    expect(updateMutateAsync.mock.calls[0][0].input.baseBranch).toBe(
+      baseBranch === null ? "HEAD" : null,
+    );
+  });
 });

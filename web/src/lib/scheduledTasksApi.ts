@@ -61,6 +61,8 @@ export interface ScheduledTask {
   sessionId: string | null;
   /** Host directory or sandbox repository URL; null uses the target default. */
   workspace: string | null;
+  /** Base ref for a fresh random worktree; null/absent uses the selected directory. */
+  baseBranch?: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
   hostId: string | null;
   /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
@@ -149,6 +151,7 @@ export interface CreateScheduledTaskInput {
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
   workspace?: string | null;
+  baseBranch?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
   /**
@@ -186,6 +189,7 @@ export interface UpdateScheduledTaskInput {
   sessionId?: string | null;
   /** Host directory or sandbox repository; null restores a sandbox provider's default. */
   workspace?: string | null;
+  baseBranch?: string | null;
   hostId?: string;
   /**
    * Switch where firings run. `managed_sandbox` clears any pinned host; do not
@@ -215,6 +219,7 @@ interface ScheduledTaskWire {
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
+  base_branch?: string | null;
   host_id: string | null;
   execution_target: ScheduledTaskExecutionTarget;
   // Absent on servers that predate task projects.
@@ -300,6 +305,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
+    baseBranch: wire.base_branch ?? null,
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
     projectId: wire.project_id ?? null,
@@ -367,6 +373,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
+  if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
@@ -411,6 +418,7 @@ export async function updateScheduledTask(
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
+  if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;

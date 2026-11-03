@@ -276,9 +276,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
-    assert "base_branch" not in created
-    # execution_target is now surfaced (defaults to connected_host); base_branch
-    # stays an internal legacy column.
+    assert created["base_branch"] is None
     assert created["execution_target"] == "connected_host"
     task_id = created["id"]
 
@@ -539,7 +537,9 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
     auth_app.state.sandbox_config = _sandbox_deployment()
     try:
         created = (
-            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+            await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(base_branch="HEAD"), headers=_headers()
+            )
         ).json()
         tid = created["id"]
         assert created["host_id"] is not None and created["workspace"] is not None
@@ -553,6 +553,7 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
         b = to_managed.json()
         assert b["execution_target"] == "managed_sandbox"
         assert b["host_id"] is None and b["workspace"] is None
+        assert b["base_branch"] is None
 
         back = await auth_client.patch(
             f"/v1/scheduled-tasks/{tid}",
@@ -3071,3 +3072,44 @@ async def test_automation_inbox_does_not_duplicate_a_deleted_session(auth_client
             assert await SqlAlchemyConversationStore(db_uri).delete_conversation(session_id)
         response = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers())
         assert response.status_code == 200 and response.json()["data"] == []
+
+
+async def test_random_worktree_can_be_enabled_preserved_and_disabled(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(base_branch="HEAD", session_mode="continue"),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()
+    assert task["base_branch"] == "HEAD"
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.update(task["id"], session_id=_owned_session(db_uri))
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    for patch, expected in [
+        ({"name": "renamed"}, "HEAD"),
+        ({"base_branch": None}, None),
+        ({"base_branch": "HEAD"}, "HEAD"),
+    ]:
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == 200, response.text
+        assert response.json()["base_branch"] == expected
+        if "base_branch" in patch:
+            assert response.json()["session_id"] is None
+        stored = SqlAlchemyScheduledTaskStore(db_uri).get(task["id"])
+        assert stored is not None and stored.base_branch == expected
+
+
+@pytest.mark.parametrize("missing", ["host_id", "workspace"])
+async def test_random_worktree_requires_pinned_repository(
+    auth_client: httpx.AsyncClient, missing: str
+) -> None:
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(base_branch="HEAD", **{missing: None}),
+        headers=_headers(),
+    )
+    assert response.status_code == 422, response.text
+    assert "random worktree requires" in response.text
