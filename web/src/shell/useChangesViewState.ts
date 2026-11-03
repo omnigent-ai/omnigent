@@ -46,14 +46,15 @@ function withRevealed(view: ChangesView, path: string, revealed: boolean) {
 export function useChangesViewState(conversationId: string, prUrl: string): ChangesViewState {
   const key = JSON.stringify([conversationId, prUrl]);
   const view = useSyncExternalStore(subscribe, () => views.get(key) ?? EMPTY_VIEW);
-  return useMemo<ChangesViewState>(
+  // Actions depend only on the key, so callbacks built on them stay stable.
+  const actions = useMemo<Omit<ChangesViewState, keyof ChangesView>>(
     () => ({
-      ...view,
       setPathFilter: (pathFilter) => update(key, () => ({ pathFilter })),
       setHideViewed: (hideViewed) => update(key, () => ({ hideViewed })),
       reveal: (path) => update(key, (current) => withRevealed(current, path, true)),
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
     }),
-    [key, view],
+    [key],
   );
+  return useMemo(() => ({ ...view, ...actions }), [view, actions]);
 }

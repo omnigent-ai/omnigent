@@ -187,6 +187,11 @@ export function PullRequestFileSection({
   // Restore the committed range when a pointer gesture is canceled.
   const [selectionPreview, setSelectionPreview] = useState<typeof selection>();
   const selectedLines = selection?.revision === revision ? selection.range : null;
+  const readerLines =
+    selectionPreview?.revision === revision ? selectionPreview.range : selectedLines;
+  const shownLines = highlight
+    ? { start: highlight.line, end: highlight.line, side: highlight.side }
+    : readerLines;
   const previewSelection = useCallback(
     (range: SelectedLineRange | null) => setSelectionPreview({ revision, range }),
     [revision],
@@ -409,13 +414,7 @@ export function PullRequestFileSection({
                 onLineSelectionChange: previewSelection,
                 onLineSelectionEnd: commitSelection,
               }}
-              selectedLines={
-                highlight
-                  ? { start: highlight.line, end: highlight.line, side: highlight.side }
-                  : selectionPreview?.revision === revision
-                    ? selectionPreview.range
-                    : selectedLines
-              }
+              selectedLines={shownLines}
               disableWorkerPool
               renderGutterUtility={
                 showGutterUtility

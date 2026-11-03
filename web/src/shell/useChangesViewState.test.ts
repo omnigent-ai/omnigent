@@ -26,9 +26,11 @@ describe("useChangesViewState", () => {
     }
   });
 
-  it("clears a reveal", () => {
+  it("clears a reveal with stable actions", () => {
     const { result } = renderHook(() => useChangesViewState("view-state-c", "pr"));
+    const { reveal } = result.current;
     act(() => result.current.reveal("a.ts"));
+    expect(result.current.reveal).toBe(reveal);
     act(() => result.current.clearReveal("a.ts"));
     expect(result.current.revealedPaths.has("a.ts")).toBe(false);
   });

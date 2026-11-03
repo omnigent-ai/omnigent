@@ -396,7 +396,7 @@ export function PullRequestChangesTab({
   }, []);
 
   const files = useMemo<PullRequestChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
-  // Computed once: the tree, the stacked list and expand/collapse all follow it.
+  // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
   const visibleFiles = useMemo(
     () => selectVisibleFiles(files, { pathFilter: view.pathFilter, hiddenPaths: NO_HIDDEN_PATHS }),
     [files, view.pathFilter],
@@ -554,9 +554,9 @@ export function PullRequestChangesTab({
 
   useEffect(() => {
     setActivePath((prev) =>
-      prev && files.some((f) => f.path === prev) ? prev : (files[0]?.path ?? null),
+      prev && visibleFiles.some((f) => f.path === prev) ? prev : (visibleFiles[0]?.path ?? null),
     );
-  }, [files]);
+  }, [visibleFiles]);
 
   // Jumping to a collapsed file also expands it, so the click lands on its diff.
   const jumpTo = useCallback(
@@ -624,7 +624,7 @@ export function PullRequestChangesTab({
   for (const thread of threads) {
     const file =
       canShowFiles &&
-      files.find(
+      visibleFiles.find(
         (entry) =>
           entry.path === thread.path || filesByPath.get(entry.path)?.prevName === thread.path,
       );
