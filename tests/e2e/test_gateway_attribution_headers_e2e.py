@@ -156,6 +156,9 @@ def test_gateway_headers_reach_real_cli_requests(
     state_path.write_text(json.dumps({"workspaces": {_ORIGIN: {"workspace": _ORIGIN}}}))
     monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # CI workflows opt into request tags, which would add a third generated header.
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", client_surface)
     env = {
         "PATH": os.environ["PATH"],
