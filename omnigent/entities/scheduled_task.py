@@ -74,8 +74,8 @@ class ScheduledTask:
     :param session_id: The session a ``"continue"`` task sends its prompt to.
         ``None`` until its first firing creates one, unless the owner picked an
         existing session.
-    :param workspace: Absolute existing path where a fired session's connected
-        host runner should start. ``None`` only for legacy or invalid rows.
+    :param workspace: Connected-host directory or managed-sandbox repository URL.
+        ``None`` uses the execution target's default workspace.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
         not create git worktrees at fire time.
     :param execution_target: ``"connected_host"`` for a pinned host, or
