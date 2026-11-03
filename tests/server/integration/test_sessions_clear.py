@@ -12,6 +12,7 @@ SDK client.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -33,6 +34,7 @@ from omnigent.server.managed_hosts import (
     read_managed_repo_workspaces,
 )
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
@@ -161,7 +163,8 @@ class LiveRunner:
     clear_status: int | None = 200
     posts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     superseded: list[tuple[str, str, str]] = field(default_factory=list)
-    on_clear: Callable[[], None] | None = None
+    # Runs while the runner handles ``clear``; awaited when it returns a coroutine.
+    on_clear: Callable[[], object] | None = None
 
 
 @asynccontextmanager
@@ -171,12 +174,14 @@ async def install_live_runner(
     """Register a live runner on *app* and record what the server sends it."""
     state = LiveRunner()
 
-    def handle(request: httpx.Request) -> httpx.Response:
+    async def handle(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
         state.posts.append((request.url.path, body))
         if body.get("type") == "clear":
             if state.on_clear is not None:
-                state.on_clear()
+                during_release = state.on_clear()
+                if inspect.isawaitable(during_release):
+                    await during_release
             if state.clear_status is None:
                 raise httpx.ReadTimeout("runner did not answer", request=request)
             return httpx.Response(state.clear_status, json={"error": "busy"})
@@ -401,6 +406,58 @@ async def test_claude_sdk_clear_copies_no_item_written_while_it_runs(
     assert resp.status_code == 202, resp.text
     assert message_texts(store, source_id)[0] == "Earlier clear notice"
     assert store.list_items(resp.json()["session_id"]).data == []
+
+
+async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message sent after the release but before the redirect is refused.
+
+    It would otherwise run in the original chat while viewers follow the new,
+    empty one. The clear itself still completes.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(client, store)
+    sent: list[httpx.Response] = []
+
+    async def send_from_another_tab() -> None:
+        sent.append(
+            await client.post(
+                f"/v1/sessions/{source_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "Q3"}]},
+                },
+            )
+        )
+
+    live_runner.on_clear = send_from_another_tab
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    new_id = resp.json()["session_id"]
+    assert [response.status_code for response in sent] == [409], sent[0].text
+    assert "moving to a new session" in sent[0].text
+    source_messages = [body for path, body in live_runner.posts if body.get("type") == "message"]
+    assert source_messages == []
+    assert "Q3" not in message_texts(store, source_id)
+    assert live_runner.superseded == [(source_id, new_id, "clear")]
+    # The guard ends with the move: the original chat takes messages again.
+    resumed = await client.post(
+        f"/v1/sessions/{source_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "Q4"}]},
+        },
+    )
+    assert resumed.status_code < 300, resumed.text
 
 
 async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
@@ -673,3 +730,5 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     assert "/v1/sessions" not in [path for path, _body in auth_live_runner.posts[posts_before:]]
     if placement != "runner":
         assert clear_requests(auth_live_runner) == []
+    # A refused clear leaves the session open to messages.
+    assert not orchestration._session_is_moving(source_id)

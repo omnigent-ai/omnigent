@@ -200,10 +200,12 @@ from omnigent.server.routes._sessions.orchestration import (
     _is_native_terminal_session,
     _labels_for_viewer,
     _list_status_with_starting,
+    _mark_session_moving,
     _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _session_is_moving,
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
@@ -4590,7 +4592,8 @@ def register_core_routes(
         *before_item_id*. It is bound to the source's host and workspace and
         to its live runner, and the source gets a notice linking to it plus a
         ``session.superseded`` redirect for live viewers. A fork that cannot
-        be placed is deleted again.
+        be placed is deleted again. Messages to *source* are refused until
+        the redirect is published.
 
         :param request: The incoming request, whose caller must own *source*.
         :param source: Session to supersede.
@@ -4618,6 +4621,11 @@ def register_core_routes(
                 f"{command} is only available in a top-level session.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if _session_is_moving(source.id):
+            raise OmnigentError(
+                f"This chat is already moving to a new session; wait before running {command}.",
+                code=ErrorCode.CONFLICT,
+            )
         # A message still waiting on its runner counts as a running turn.
         status = _session_status_from_cache(source.id, source.live_status)
         if _list_status_with_starting(status, source.id) == "running":
@@ -4625,114 +4633,117 @@ def register_core_routes(
                 f"Stop the current turn before running {command}.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        runner_online = (
-            source.runner_id is not None
-            and runner_router is not None
-            and runner_router.runner_is_online(source.runner_id)
-        )
-        if not runner_online and source.runner_id is not None:
-            from omnigent.server.routes.sessions.routes_events import (
-                _raise_if_runner_on_another_replica,
+        # Held, with no await since the checks above, until viewers are
+        # redirected: messages arriving meanwhile are refused, not run here.
+        with _mark_session_moving(source.id):
+            runner_online = (
+                source.runner_id is not None
+                and runner_router is not None
+                and runner_router.runner_is_online(source.runner_id)
             )
-
-            # A runner live on another replica is not offline: re-address there
-            # rather than continue without it.
-            await _raise_if_runner_on_another_replica(
-                source, request.app.state, conversation_store
-            )
-        host_bound = source.host_id is not None and source.workspace is not None
-        runner_offline = OmnigentError(
-            f"Can't run {command} while this session's runner is offline. "
-            "Reconnect the session (send a message to wake it), then try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-        if not runner_online and not host_bound:
-            raise runner_offline
-        if prepare is not None:
-            await prepare()
-
-        fork = await _fork_session(
-            request,
-            source.id,
-            SessionForkRequest(title=title),
-            before_item_id=before_item_id,
-            keep_sandbox_labels=True,
-            copy_history=copy_history,
-        )
-        runner_bound = runner_online
-        try:
-            if host_bound:
-                assert source.host_id is not None and source.workspace is not None
-                await asyncio.to_thread(
-                    conversation_store.set_host_id,
-                    fork.id,
-                    source.host_id,
-                    source.workspace,
-                    source.git_branch,
+            if not runner_online and source.runner_id is not None:
+                from omnigent.server.routes.sessions.routes_events import (
+                    _raise_if_runner_on_another_replica,
                 )
-            if runner_online:
-                assert source.runner_id is not None and runner_router is not None
-                try:
-                    await _update_session(
-                        request,
-                        fork.id,
-                        UpdateSessionRequest(runner_id=source.runner_id),
-                        include_usage=False,
-                    )
-                except Exception:
-                    if runner_router.runner_is_online(source.runner_id):
-                        raise
-                    # The runner left after the check: a host-bound fork
-                    # relaunches on its host, as with an offline runner.
-                    if not host_bound:
-                        raise runner_offline from None
-                    runner_bound = False
-        except Exception:
-            # Leave no announced fork for a retry to duplicate.
-            await _delete_unreturned_session(fork.id)
-            raise
 
-        # Best-effort, as for native supersession: the fork already holds the
-        # work, so a lost notice must not strand it unreturned.
-        try:
-            await _persist_external_conversation_item(
+                # A runner live on another replica is not offline: re-address there
+                # rather than continue without it.
+                await _raise_if_runner_on_another_replica(
+                    source, request.app.state, conversation_store
+                )
+            host_bound = source.host_id is not None and source.workspace is not None
+            runner_offline = OmnigentError(
+                f"Can't run {command} while this session's runner is offline. "
+                "Reconnect the session (send a message to wake it), then try again.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+            if not runner_online and not host_bound:
+                raise runner_offline
+            if prepare is not None:
+                await prepare()
+
+            fork = await _fork_session(
+                request,
                 source.id,
-                source,
-                SessionEventInput(
-                    type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
-                    data={
-                        "item_type": "message",
-                        "item_data": {
-                            "role": "assistant",
-                            "agent": fork.agent_name or "assistant",
-                            "content": [{"type": "output_text", "text": notice(fork.id)}],
+                SessionForkRequest(title=title),
+                before_item_id=before_item_id,
+                keep_sandbox_labels=True,
+                copy_history=copy_history,
+            )
+            runner_bound = runner_online
+            try:
+                if host_bound:
+                    assert source.host_id is not None and source.workspace is not None
+                    await asyncio.to_thread(
+                        conversation_store.set_host_id,
+                        fork.id,
+                        source.host_id,
+                        source.workspace,
+                        source.git_branch,
+                    )
+                if runner_online:
+                    assert source.runner_id is not None and runner_router is not None
+                    try:
+                        await _update_session(
+                            request,
+                            fork.id,
+                            UpdateSessionRequest(runner_id=source.runner_id),
+                            include_usage=False,
+                        )
+                    except Exception:
+                        if runner_router.runner_is_online(source.runner_id):
+                            raise
+                        # The runner left after the check: a host-bound fork
+                        # relaunches on its host, as with an offline runner.
+                        if not host_bound:
+                            raise runner_offline from None
+                        runner_bound = False
+            except Exception:
+                # Leave no announced fork for a retry to duplicate.
+                await _delete_unreturned_session(fork.id)
+                raise
+
+            # Best-effort, as for native supersession: the fork already holds the
+            # work, so a lost notice must not strand it unreturned.
+            try:
+                await _persist_external_conversation_item(
+                    source.id,
+                    source,
+                    SessionEventInput(
+                        type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
+                        data={
+                            "item_type": "message",
+                            "item_data": {
+                                "role": "assistant",
+                                "agent": fork.agent_name or "assistant",
+                                "content": [{"type": "output_text", "text": notice(fork.id)}],
+                            },
                         },
-                    },
-                ),
-                conversation_store,
-            )
-        except Exception:
-            _logger.warning(
-                "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                    ),
+                    conversation_store,
+                )
+            except Exception:
+                _logger.warning(
+                    "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                    command,
+                    source.id,
+                    fork.id,
+                    exc_info=True,
+                    extra={"session_id": source.id},
+                )
+            _publish_session_superseded(source.id, fork.id, reason=reason)
+            _logger.info(
+                "Session superseded by %s",
                 command,
-                source.id,
-                fork.id,
-                exc_info=True,
-                extra={"session_id": source.id},
+                extra=debug_event(
+                    "session_superseded",
+                    session_id=source.id,
+                    target_session_id=fork.id,
+                    command=command,
+                    runner_bound=runner_bound,
+                ),
             )
-        _publish_session_superseded(source.id, fork.id, reason=reason)
-        _logger.info(
-            "Session superseded by %s",
-            command,
-            extra=debug_event(
-                "session_superseded",
-                session_id=source.id,
-                target_session_id=fork.id,
-                command=command,
-                runner_bound=runner_bound,
-            ),
-        )
-        return fork.id
+            return fork.id
 
     async def clear_session_into_fresh_session(
         request: Request,
