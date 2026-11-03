@@ -1376,7 +1376,9 @@ Content-Type: application/json
 
 {"item_id": "msg_abc123"}
 
-200 OK — {"session_id": "conv_new", "prompt": "<the prompt's text>"}
+200 OK — {"session_id": "conv_new", "prompt": "<the prompt's text>",
+  "attachments": [{"type": "input_image", "file_id": "file_new",
+  "filename": "diagram.png"}]}
 
 400 Bad Request — the session's harness is not claude-sdk or
   claude-native, item_id is not one of its user prompts, it is a
@@ -1395,7 +1397,10 @@ source's title, labels, model, effort and launch arguments. A
 claude-native fork rebuilds Claude's transcript from the kept items.
 The source keeps its full history and gets a notice linking to the fork;
 live viewers follow via `session.superseded` with `reason: "rewind"`.
-Clients put `prompt` back in the composer. `GET /v1/info` reports
+Clients put `prompt` back in the composer, with `attachments`: the
+prompt's files as the fork's own copies (a fork copies every source
+file), readable from the fork's `resources/files/{file_id}/content`.
+Rewinding never rolls back files on disk. `GET /v1/info` reports
 `session_rewind: true`, which also means
 `GET /v1/sessions/{id}/items?type=message` filters items by type.
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.integration.test_sessions_clear import (
@@ -86,6 +87,67 @@ async def test_rewind_to_the_first_prompt_starts_empty(
     assert resp.status_code == 200, resp.text
     assert resp.json()["prompt"] == "Q1"
     assert message_texts(store, resp.json()["session_id"]) == []
+
+
+async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attachment-only prompt comes back as the fork's copies of its files."""
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    uploads = {}
+    for filename, data, content_type in (
+        ("notes.txt", b"parser notes", "text/plain"),
+        ("diagram.png", b"\x89PNG fake", "image/png"),
+        ("deleted.txt", b"gone", "text/plain"),
+    ):
+        upload = await client.post(
+            f"/v1/sessions/{source_id}/resources/files",
+            files={"file": (filename, data, content_type)},
+        )
+        assert upload.status_code == 201, upload.text
+        uploads[filename] = upload.json()["id"]
+    deleted = await client.delete(
+        f"/v1/sessions/{source_id}/resources/files/{uploads.pop('deleted.txt')}"
+    )
+    assert deleted.status_code == 200, deleted.text
+    [prompt] = store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_3",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_image", "file_id": uploads["diagram.png"]},
+                        {"type": "input_file", "file_id": uploads["notes.txt"]},
+                        {"type": "input_file", "file_id": deleted.json()["id"]},
+                    ],
+                ),
+            )
+        ],
+    )
+
+    resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
+
+    assert resp.status_code == 200, resp.text
+    new_id, attachments = resp.json()["session_id"], resp.json()["attachments"]
+    assert resp.json()["prompt"] == ""
+    assert [(a["type"], a["filename"]) for a in attachments] == [
+        ("input_image", "diagram.png"),
+        ("input_file", "notes.txt"),
+    ]
+    assert not {a["file_id"] for a in attachments} & set(uploads.values())
+    contents = [
+        (await client.get(f"/v1/sessions/{new_id}/resources/files/{a['file_id']}/content")).content
+        for a in attachments
+    ]
+    assert contents == [b"\x89PNG fake", b"parser notes"]
 
 
 @pytest.mark.parametrize(

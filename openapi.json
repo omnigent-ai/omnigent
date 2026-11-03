@@ -9223,6 +9223,37 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRewindAttachment": {
+        "description": "A file the chosen `/rewind` prompt attached, as the rewound session holds it.",
+        "properties": {
+          "file_id": {
+            "description": "The rewound session's copy of the file, e.g. `\"file_abc\"`; read it from `/v1/sessions/{session_id}/resources/files/{file_id}`.",
+            "title": "File Id",
+            "type": "string"
+          },
+          "filename": {
+            "description": "The attachment's name, e.g. `\"diagram.png\"`.",
+            "title": "Filename",
+            "type": "string"
+          },
+          "type": {
+            "description": "The prompt's content block type, `\"input_file\"` or `\"input_image\"`.",
+            "enum": [
+              "input_file",
+              "input_image"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "file_id",
+          "filename"
+        ],
+        "title": "SessionRewindAttachment",
+        "type": "object"
+      },
       "SessionRewindRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/sessions/{session_id}/rewind`.",
@@ -9244,6 +9275,14 @@
       "SessionRewindResponse": {
         "description": "Result of `POST /v1/sessions/{session_id}/rewind`.",
         "properties": {
+          "attachments": {
+            "description": "The prompt's attachments, in prompt order, for the client to put back in the composer; empty when it had none.",
+            "items": {
+              "$ref": "#/components/schemas/SessionRewindAttachment"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
           "prompt": {
             "description": "Text of the chosen prompt, for the client to put back in the composer, e.g. `\"Add a test for the parser\"`.",
             "title": "Prompt",

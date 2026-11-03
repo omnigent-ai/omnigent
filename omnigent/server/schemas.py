@@ -2990,6 +2990,22 @@ class SessionRewindRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionRewindAttachment(BaseModel):
+    """
+    A file the chosen ``/rewind`` prompt attached, as the rewound session holds it.
+
+    :param type: The prompt's content block type, ``"input_file"`` or
+        ``"input_image"``.
+    :param file_id: The rewound session's copy of the file, e.g. ``"file_abc"``;
+        read it from ``/v1/sessions/{session_id}/resources/files/{file_id}``.
+    :param filename: The attachment's name, e.g. ``"diagram.png"``.
+    """
+
+    type: Literal["input_file", "input_image"]
+    file_id: str
+    filename: str
+
+
 class SessionRewindResponse(BaseModel):
     """
     Result of ``POST /v1/sessions/{session_id}/rewind``.
@@ -2998,10 +3014,13 @@ class SessionRewindResponse(BaseModel):
         ``"conv_new"``. The source session gets a notice linking to it.
     :param prompt: Text of the chosen prompt, for the client to put back in
         the composer, e.g. ``"Add a test for the parser"``.
+    :param attachments: The prompt's attachments, in prompt order, for the
+        client to put back in the composer; empty when it had none.
     """
 
     session_id: str
     prompt: str
+    attachments: list[SessionRewindAttachment] = Field(default_factory=list)
 
 
 class ReadStatePutRequest(BaseModel):

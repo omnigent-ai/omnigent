@@ -234,6 +234,7 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionPullRequestSummary,
     SessionResponse,
+    SessionRewindAttachment,
     SessionRewindRequest,
     SessionRewindResponse,
     SupersessionReason,
@@ -5112,7 +5113,7 @@ def register_core_routes(
                 "/rewind is not available for this session type.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        prompt = await asyncio.to_thread(_rewind_prompt_text, conv.id, body.item_id)
+        prompt = await asyncio.to_thread(_rewind_prompt, conv.id, body.item_id)
         new_session_id = await _continue_session_in_fork(
             request,
             conv,
@@ -5127,11 +5128,22 @@ def register_core_routes(
             ),
             reason="rewind",
         )
-        return SessionRewindResponse(session_id=new_session_id, prompt=prompt)
+        attachments = await asyncio.to_thread(
+            _rewind_attachments, conv.id, new_session_id, prompt.content
+        )
+        return SessionRewindResponse(
+            session_id=new_session_id,
+            prompt="\n".join(
+                part["text"]
+                for part in prompt.content
+                if part.get("type") == "input_text" and isinstance(part.get("text"), str)
+            ),
+            attachments=attachments,
+        )
 
-    def _rewind_prompt_text(session_id: str, item_id: str) -> str:
+    def _rewind_prompt(session_id: str, item_id: str) -> MessageData:
         """
-        Return the text of *session_id*'s user prompt *item_id*.
+        Return *session_id*'s user prompt *item_id*.
 
         :raises OmnigentError: 400 when the item is not a user prompt there.
         """
@@ -5146,10 +5158,49 @@ def register_core_routes(
         item = conversation_store.get_item(session_id, item_id)
         if item is None or not isinstance(item.data, MessageData) or item.data.role != "user":
             raise not_a_prompt
-        return "\n".join(
-            part["text"]
-            for part in item.data.content
-            if part.get("type") == "input_text" and isinstance(part.get("text"), str)
-        )
+        return item.data
+
+    def _rewind_attachments(
+        source_id: str, fork_id: str, content: list[dict[str, Any]]
+    ) -> list[SessionRewindAttachment]:
+        """
+        Return the files *content* attached, as the fork's copies of them.
+
+        A fork copies every source file as a row sharing the source's blob, so
+        each attachment is matched to the fork row holding the same blob.
+        Attachments whose file is gone are left out.
+
+        :param source_id: The rewound session, which holds the prompt's files.
+        :param fork_id: The fork continuing it.
+        :param content: The prompt's content blocks.
+        """
+        if file_store is None:
+            return []
+        fork_file_ids: dict[str, str] = {}
+        after: str | None = None
+        while True:
+            page = file_store.list(fork_id, limit=1000, after=after, order="asc")
+            for fork_file in page.data:
+                fork_file_ids.setdefault(fork_file.blob_key or fork_file.id, fork_file.id)
+            if not page.has_more or not page.data:
+                break
+            after = page.last_id
+        attachments: list[SessionRewindAttachment] = []
+        for part in content:
+            block_type, file_id = part.get("type"), part.get("file_id")
+            if block_type not in ("input_file", "input_image") or not isinstance(file_id, str):
+                continue
+            stored = file_store.get(file_id, session_id=source_id)
+            fork_file_id = (
+                fork_file_ids.get(stored.blob_key or stored.id) if stored is not None else None
+            )
+            if stored is None or fork_file_id is None:
+                continue
+            attachments.append(
+                SessionRewindAttachment(
+                    type=block_type, file_id=fork_file_id, filename=stored.filename
+                )
+            )
+        return attachments
 
     return clear_session_into_fresh_session
