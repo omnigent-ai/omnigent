@@ -947,7 +947,7 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
-/** Opt-in: fold a finished turn's earlier messages so only the last shows. */
+/** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
   const labelId = useId();
@@ -956,7 +956,7 @@ function FoldAssistantNarrationControl() {
       <SettingsLabel
         label="Show only the final answer"
         labelId={labelId}
-        description="Once a turn finishes, fold its progress messages into the Worked row. Codex's marked answers stay visible; for other agents, the last message does."
+        description="Codex marks its final answer, so a finished Codex turn folds its progress messages into the Worked row. Turn this on to fold other agents' progress messages too, keeping each turn's last message visible."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1625,7 +1625,7 @@ function DatabricksIntegrationControl() {
 }
 
 /**
- * Opt-in dispatch for messages sent while the agent is working.
+ * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());

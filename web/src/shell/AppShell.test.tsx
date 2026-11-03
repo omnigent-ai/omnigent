@@ -5744,7 +5744,7 @@ describe("AppShell design-mode submission", () => {
   }
 
   it.each([
-    { preference: null, busy: true, backlog: false, queued: true },
+    { preference: null, busy: true, backlog: false, queued: false },
     { preference: "false", busy: true, backlog: false, queued: true },
     { preference: "true", busy: true, backlog: false, queued: false },
     { preference: "true", busy: true, backlog: true, queued: true },
@@ -5815,6 +5815,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("preserves queued instructions when always-steer is enabled mid-session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("First change");
     localStorage.setItem("omnigent:always-steer", "true");
@@ -5829,6 +5830,7 @@ describe("AppShell design-mode submission", () => {
 
   // User-opened tabs submit with their `browser-tab:` view ID, not the session ID.
   it("sends a submission from a user-opened tab in the current session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
     expect(send).not.toHaveBeenCalled();
@@ -5869,6 +5871,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("rejects a late pointer submission after switching to another session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     chat.conversationId = "conv_other";
     submitInstruction();

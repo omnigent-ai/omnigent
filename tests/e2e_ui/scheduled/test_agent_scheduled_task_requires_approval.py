@@ -18,6 +18,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests.e2e_ui.conftest import (
     _create_bundled_session,
     _ensure_runner_online,
@@ -30,7 +31,7 @@ from tests.e2e_ui.scheduled.test_scheduled_tasks_page import _open_automations_p
 _APPROVAL_CARD = '[data-testid="approval-card"][data-state="pending"]'
 _TASK_ROW = '[data-testid="scheduled-task-row"]'
 _RRULE = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
-_PROMPT = "Summarize yesterday's activity."
+_PROMPT = "Summarize yesterday's activity.\n" * 80 + "END OF AUTOMATION INSTRUCTIONS"
 _CREATE_REPLY = "Created the daily automation."
 _UPDATE_REPLY = "Paused the automation."
 _TURN_TIMEOUT_MS = 90_000
@@ -52,10 +53,10 @@ executor:
 
 
 def _schedulable_agent_id(base_url: str) -> str:
-    """An agent a task can be scheduled against (``hello_world`` when registered)."""
+    """Prefer Claude Code so task permission overrides are supported."""
     agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
     by_name = {agent["name"]: agent["id"] for agent in agents}
-    for name in ("hello_world", "polly"):
+    for name in (CLAUDE_NATIVE_AGENT_NAME, "hello_world", "polly"):
         if name in by_name:
             return by_name[name]
     assert agents, "no agents registered to schedule a task against"
@@ -129,9 +130,15 @@ def _await_gate_or_reply(page: Page, reply: str) -> str:
     raise AssertionError(f"neither an approval card nor the reply {reply!r} appeared")
 
 
-def _approve(page: Page, reply: str) -> None:
-    page.locator(_APPROVAL_CARD).first.get_by_role("button", name="Approve").click()
-    expect(page.get_by_text(reply, exact=True).first).to_be_visible(timeout=_TURN_TIMEOUT_MS)
+def _resolve_approval(page: Page, reply: str, *, approve: bool) -> None:
+    page.locator(_APPROVAL_CARD).first.get_by_role(
+        "button", name="Approve" if approve else "Reject", exact=True
+    ).click()
+    if approve:
+        expect(page.get_by_text(reply, exact=True).first).to_be_visible(timeout=_TURN_TIMEOUT_MS)
+    else:
+        responded = page.locator('[data-testid="approval-card"][data-state="responded"]').first
+        expect(responded.get_by_text("Rejected", exact=False).first).to_be_visible()
 
 
 def _hold(page: Page) -> None:
@@ -141,19 +148,19 @@ def _hold(page: Page) -> None:
 
 
 def _drive_gated_turn(
-    page: Page, message: str, reply: str, before_approval: Callable[[], None]
+    page: Page, message: str, reply: str, before_approval: Callable[[], None], *, approve: bool
 ) -> str:
     """Send ``message``; return whether the approval card or the reply came first.
 
     When the call parks, ``before_approval`` checks nothing has changed yet, then
-    the card is approved and the reply awaited.
+    the card is resolved and the verdict or reply awaited.
     """
     _send(page, message)
     outcome = _await_gate_or_reply(page, reply)
     if outcome == "approval":
         before_approval()
         _hold(page)
-        _approve(page, reply)
+        _resolve_approval(page, reply, approve=approve)
     _hold(page)
     return outcome
 
@@ -198,10 +205,12 @@ def scheduling_session(
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("approve", [True, False], ids=["accept", "reject"])
 def test_agent_scheduled_task_create_requires_approval(
     request: pytest.FixtureRequest,
     mock_llm_server_url: str,
     scheduling_session: tuple[str, str, str, str],
+    approve: bool,
 ) -> None:
     """The agent's create call parks on an approval card before the task exists."""
     base_url, session_id, model, task_name = scheduling_session
@@ -212,6 +221,7 @@ def test_agent_scheduled_task_create_requires_approval(
         {
             "name": task_name,
             "prompt": _PROMPT,
+            "permission_mode": None,
             "rrule": _RRULE,
             "agent_id": _schedulable_agent_id(base_url),
             "timezone": "UTC",
@@ -227,6 +237,10 @@ def test_agent_scheduled_task_create_requires_approval(
         expect(card).to_contain_text(task_name)
         expect(card).to_contain_text(f"rrule={_RRULE}")
         expect(card).to_contain_text("timezone=UTC")
+        expect(card).to_contain_text(_PROMPT)
+        expect(card).to_contain_text(
+            "Effective task permission mode: agent default (no task override)"
+        )
         assert not _tasks_named(base_url, task_name), "task was created before approval"
 
     outcome = _drive_gated_turn(
@@ -235,20 +249,27 @@ def test_agent_scheduled_task_create_requires_approval(
         "activity every day at 09:00 UTC.",
         _CREATE_REPLY,
         no_task_yet,
+        approve=approve,
     )
     pending = _pending_elicitations(base_url, session_id)
     assert outcome == "approval", (
         f"agent created automation {task_name!r} with no approval prompt: the reply "
         f"{_CREATE_REPLY!r} arrived with pending_elicitations={pending}"
     )
-    _open_task_row(page, base_url, task_name)
+    if approve:
+        _open_task_row(page, base_url, task_name)
+        assert _tasks_named(base_url, task_name)[0]["prompt"] == _PROMPT
+    else:
+        assert not _tasks_named(base_url, task_name), "rejected create changed automations"
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("approve", [True, False], ids=["accept", "reject"])
 def test_agent_scheduled_task_update_requires_approval(
     request: pytest.FixtureRequest,
     mock_llm_server_url: str,
     scheduling_session: tuple[str, str, str, str],
+    approve: bool,
 ) -> None:
     """The agent's update call parks on an approval card before the task changes."""
     base_url, session_id, model, task_name = scheduling_session
@@ -258,19 +279,27 @@ def test_agent_scheduled_task_update_requires_approval(
         mock_llm_server_url,
         model,
         "sys_scheduled_task_update",
-        {"scheduled_task_id": task_id, "state": "paused"},
+        {
+            "scheduled_task_id": task_id,
+            "state": "paused",
+            "prompt": _PROMPT,
+            "permission_mode": "auto",
+        },
         _UPDATE_REPLY,
     )
     page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{session_id}")
 
     def still_active() -> None:
+        card = page.locator(_APPROVAL_CARD).first
+        expect(card).to_contain_text(_PROMPT)
+        expect(card).to_contain_text("Effective task permission mode: auto")
         tasks = _tasks_named(base_url, task_name)
         assert tasks, f"seeded task {task_name!r} disappeared"
         assert tasks[0]["state"] == "active", "task was paused before approval"
 
     outcome = _drive_gated_turn(
-        page, f"Pause the automation '{task_name}'.", _UPDATE_REPLY, still_active
+        page, f"Pause the automation '{task_name}'.", _UPDATE_REPLY, still_active, approve=approve
     )
     pending = _pending_elicitations(base_url, session_id)
     assert outcome == "approval", (
@@ -278,4 +307,10 @@ def test_agent_scheduled_task_update_requires_approval(
         f"{_UPDATE_REPLY!r} arrived with pending_elicitations={pending}"
     )
     row = _open_task_row(page, base_url, task_name)
-    expect(row.get_by_test_id("task-paused-pill")).to_be_visible()
+    if approve:
+        expect(row.get_by_test_id("task-paused-pill")).to_be_visible()
+        assert _tasks_named(base_url, task_name)[0]["permission_mode"] == "auto"
+    else:
+        expect(row.get_by_test_id("task-paused-pill")).not_to_be_visible()
+        assert _tasks_named(base_url, task_name)[0]["state"] == "active"
+        assert _tasks_named(base_url, task_name)[0]["permission_mode"] is None
