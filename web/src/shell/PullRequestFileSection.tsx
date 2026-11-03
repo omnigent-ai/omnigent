@@ -137,8 +137,10 @@ const FIND_HIGHLIGHT = "pr-find-active";
 const ROW_RETRY_FRAMES = 30;
 
 /** The diff's rows live in its open shadow root once @pierre/diffs has rendered. */
+// Scoped to the main diff: thread snippets render their own diffs in the same section.
 function diffRoot(section: HTMLElement): ParentNode {
-  return section.querySelector("diffs-container")?.shadowRoot ?? section;
+  const main = section.querySelector<HTMLElement>("[data-main-diff]") ?? section;
+  return main.querySelector(":scope > diffs-container")?.shadowRoot ?? main;
 }
 
 function findDiffRow({ side, line }: FindHighlight, section: HTMLElement): HTMLElement | null {
@@ -504,6 +506,7 @@ export function PullRequestFileSection({
       ) : fileDiff ? (
         <div className="overflow-x-auto" onPointerCancel={() => setSelectionPreview(undefined)}>
           <div
+            data-main-diff
             style={{
               minWidth: annotations.length && options?.diffStyle === "split" ? 720 : undefined,
             }}

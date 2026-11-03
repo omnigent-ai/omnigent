@@ -797,8 +797,12 @@ export function PullRequestChangesTab({
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
     if (file) {
-      // A thread on a filtered-out file has no mounted section, so show it first.
-      if (!visibleFiles.includes(file)) view.setPathFilter("");
+      // A thread on a filtered-out file has no mounted section, so show it first. Clearing
+      // hide-viewed too keeps a pending reveal from waiting on a filter that stays on.
+      if (!visibleFiles.includes(file)) {
+        view.setPathFilter("");
+        view.setHideViewed(false);
+      }
       jumpTo(file.path);
     }
     setFocusedThread({ id: next.id });
