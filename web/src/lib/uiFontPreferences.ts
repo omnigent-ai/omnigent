@@ -28,7 +28,9 @@ export const UI_FONT_SIZE_MOBILE_DEFAULT = 14;
 export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
-export const UI_FONT_SIZE_MOBILE_QUERY = "(max-width: 767.98px)";
+// Legacy syntax keeps matchMedia compatible with the SPA's Safari 15 target.
+export const UI_FONT_SIZE_MOBILE_QUERY = "not all and (min-width: 48rem)";
+export const MESSAGE_FONT_SIZE_MOBILE_QUERY = `${UI_FONT_SIZE_MOBILE_QUERY}, (pointer: coarse)`;
 
 /** Clamp an arbitrary number into the supported px range. */
 export function clampUiFontSizePx(px: number): number {
@@ -73,6 +75,33 @@ export function readUiFontSizePx(): number {
   return readStoredUiFontSizePx() ?? defaultUiFontSizePx();
 }
 
+function readUiFontSizeOverridePx(): number | null {
+  const applied = Number.parseFloat(
+    getStyleRoot()?.style.getPropertyValue("--desktop-ui-font-size") ?? "",
+  );
+  return isValidPx(applied) ? clampUiFontSizePx(applied) : readStoredUiFontSizePx();
+}
+
+/** An applied choice can be newer than storage when a write fails. */
+export function readAppliedUiFontSizePx(): number {
+  return readUiFontSizeOverridePx() ?? defaultUiFontSizePx();
+}
+
+/** Read conversation size, or preview a choice before storage succeeds. */
+export function readMessageFontSizePx(
+  selected: number | null = readUiFontSizeOverridePx(),
+): number {
+  const size = selected === null ? null : clampUiFontSizePx(selected);
+  if (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(MESSAGE_FONT_SIZE_MOBILE_QUERY).matches
+  ) {
+    return (size ?? UI_FONT_SIZE_MOBILE_DEFAULT) + 2;
+  }
+  return size ?? defaultUiFontSizePx();
+}
+
 /**
  * Persist the UI font size (px). The value is clamped to the supported range
  * before writing. Swallows quota/access errors so a failed write can't break
@@ -93,7 +122,9 @@ export function writeUiFontSizePx(px: number): void {
 export function applyDesktopUiFontSize(px: number): void {
   const root = getStyleRoot();
   if (!root) return;
-  root.style.setProperty("--desktop-ui-font-size", `${clampUiFontSizePx(px)}px`);
+  const size = clampUiFontSizePx(px);
+  root.style.setProperty("--desktop-ui-font-size", `${size}px`);
+  root.style.setProperty("--mobile-message-font-size", `${size + 2}px`);
 }
 
 /** Apply a saved choice, or let CSS use the 14px default. */
@@ -103,8 +134,9 @@ export function applyStoredUiFontSize(): void {
   const stored = readStoredUiFontSizePx();
   if (stored === null) {
     root.style.removeProperty("--desktop-ui-font-size");
+    root.style.removeProperty("--mobile-message-font-size");
   } else {
-    root.style.setProperty("--desktop-ui-font-size", `${stored}px`);
+    applyDesktopUiFontSize(stored);
   }
 }
 

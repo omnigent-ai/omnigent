@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -20,6 +21,18 @@ _UNSET: Any = object()
 # How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
 # the session, another session got there first, or the task changed under the run.
 AdoptOutcome = Literal["adopted", "taken", "stale"]
+
+
+@dataclass(frozen=True)
+class AutomationFailure:
+    """Latest sessionless failure, without prompts or raw error details."""
+
+    task_id: str
+    task_name: str
+    run_id: str
+    scheduled_at: int
+    finished_at: int | None
+    error_code: str | None
 
 
 class ScheduledTaskStore(ABC):
@@ -59,6 +72,7 @@ class ScheduledTaskStore(ABC):
         session_mode: str = "new",
         session_id: str | None = None,
         workspace: str | None = None,
+        base_branch: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
         execution_target: str = "connected_host",
@@ -122,6 +136,23 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def list_inbox_failures(
+        self,
+        *,
+        owner_user_id: str | None,
+        generation: str | None = None,
+        check_generation: bool = False,
+        after: tuple[int, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
+        """Page owned tasks and return their latest failures without a session.
+
+        The cursor advances over examined tasks, including healthy/deleted tasks,
+        so an empty page can still have a continuation. Legacy stores return empty.
+        """
+        del owner_user_id, generation, check_generation, after, limit
+        return [], None
+
     @abstractmethod
     def list_active(self) -> builtins.list[ScheduledTask]:
         """
@@ -162,6 +193,7 @@ class ScheduledTaskStore(ABC):
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
+        base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
         project_id: str | None = _UNSET,
         execution_target: str | None = None,
@@ -174,9 +206,9 @@ class ScheduledTaskStore(ABC):
 
         Most parameters use ``None`` to mean "leave unchanged". For the per-task
         overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``permission_mode``), ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
+        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
+        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (e.g.
         turning a set ``bypassPermissions`` back off), and clearing a host
         binding or nulling out a deleted last-run conversation.

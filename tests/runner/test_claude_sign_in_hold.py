@@ -17,13 +17,16 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.diagnostics import sign_in_next_step
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app, sign_in_watch, subagent_work
 from omnigent.runtime import pending_inputs
+from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -313,62 +316,108 @@ def _quiet_pane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 )
 async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in(
     refusal_message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The refused message is neither failed nor lost; it goes out once the sign-in is done."""
     refused = [
         _sse({"type": "response.created", "response": {"id": "resp_1"}}),
         _sign_in_refusal(message=refusal_message),
     ]
-    app, harness, server = _build_app([refused, _DELIVERED])
     sid = uuid.uuid4().hex
-    async with _runner_client(app) as client:
-        await _create_session(client, sid)
-        first = await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
-        assert first.status_code == 202
-        await _until(
-            lambda: (
-                sid in app.state.sign_in_holds
-                and bool(server.notices("databricks_sign_in_pending"))
+    ready = False
+    pane_reads = 0
+
+    async def read_pane(**kwargs):
+        nonlocal pane_reads
+        pane_reads += 1
+        logging.getLogger("omnigent.runner.test").info("sign-in watcher read")
+        return {"screen": _READY_SCREEN if ready else _SIGN_IN_SCREEN}
+
+    registry = _claude_pane(sid, tmp_path, read_pane)
+    app, harness, server = _build_app([refused, _DELIVERED], terminal_registry=registry)
+    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
+    stream = harness.stream
+
+    def record_turn(*args, **kwargs):
+        logging.getLogger("omnigent.runner.test").info("sign-in turn dispatched")
+        return stream(*args, **kwargs)
+
+    monkeypatch.setattr(harness, "stream", record_turn)
+    context = ScheduledRunLogContext(
+        task_id="task-A",
+        run_id="A",
+        task_workspace_id=7,
+        scheduled_at=1000,
+        target="connected_host",
+        session_mode="continue",
+    )
+    with capture_debug_rows("runner") as rows:
+        async with _runner_client(app) as client:
+            await _create_session(client, sid)
+            first = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json=_message("first"),
+                headers={SCHEDULED_RUN_HEADER: context.model_dump_json()},
             )
-        )
-
-        published = _published(app, sid)
-        assert not [e for e in published if e.get("type") == "response.failed"]
-        assert not [
-            e for e in published if e.get("type") == "session.status" and e["status"] == "failed"
-        ]
-        assert len(harness.posted_bodies) == 1
-        assert [m["content"][0]["text"] for m in app.state.session_message_buffers[sid]] == [
-            "first"
-        ]
-        (notice,) = server.notices("databricks_sign_in_pending")
-        assert notice["level"] == "info"
-        assert notice["remediation"] == _HELD_SIGN_IN_STEP
-        assert "will be sent once you sign in" in notice["title"]
-
-        # A message sent meanwhile queues behind the held one.
-        second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
-        assert second.status_code == 202
-        assert (
-            second.json()["detail"] == "Message buffered until the Databricks sign-in completes."
-        )
-        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- no send in window
-        assert len(harness.posted_bodies) == 1
-
-        # The sign-in watcher saw the agent ready.
-        hold = app.state.sign_in_holds[sid]
-        hold.waiting = False
-        await _until(
-            lambda: (
-                len(harness.posted_bodies) == 3 and not app.state.session_message_buffers.get(sid)
+            assert first.status_code == 202
+            await _until(
+                lambda: (
+                    sid in app.state.sign_in_holds
+                    and bool(server.notices("databricks_sign_in_pending"))
+                )
             )
-        )
+
+            published = _published(app, sid)
+            assert not [e for e in published if e.get("type") == "response.failed"]
+            assert not [
+                e
+                for e in published
+                if e.get("type") == "session.status" and e["status"] == "failed"
+            ]
+            assert len(harness.posted_bodies) == 1
+            assert [m["content"][0]["text"] for m in app.state.session_message_buffers[sid]] == [
+                "first"
+            ]
+            (notice,) = server.notices("databricks_sign_in_pending")
+            assert notice["level"] == "info"
+            assert notice["remediation"] == _HELD_SIGN_IN_STEP
+            assert "will be sent once you sign in" in notice["title"]
+
+            # A message sent meanwhile queues behind the held one.
+            second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
+            assert second.status_code == 202
+            assert (
+                second.json()["detail"]
+                == "Message buffered until the Databricks sign-in completes."
+            )
+            reads_before = pane_reads
+            await _until(lambda: pane_reads > reads_before)
+            assert len(harness.posted_bodies) == 1
+
+            ready = True
+            await _until(
+                lambda: (
+                    len(harness.posted_bodies) == 3
+                    and not app.state.session_message_buffers.get(sid)
+                )
+            )
 
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first", "second"]
     # The resent message is recorded once in the turn history.
     resent_history = [item for item in harness.posted_bodies[1]["content"] if "content" in item]
     assert [item["content"][0]["text"] for item in resent_history].count("first") == 1
     assert sid not in app.state.sign_in_holds
+
+    turns = [row for row in rows if row["message"] == "sign-in turn dispatched"]
+    assert [row["attributes"].get("run_id") for row in turns] == ["A", "A", None]
+    assert [row["attributes"].get("task_id") for row in turns] == ["task-A", "task-A", None]
+    watchers = [row for row in rows if row["message"] == "sign-in watcher read"]
+    assert watchers
+    assert all(
+        "run_id" not in row["attributes"] and "task_id" not in row["attributes"]
+        for row in watchers
+    )
 
 
 @pytest.mark.asyncio
