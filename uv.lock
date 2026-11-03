@@ -1074,7 +1074,7 @@ wheels = [
 
 [[package]]
 name = "databricks-mcp"
-version = "0.9.0"
+version = "0.9.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "databricks-ai-bridge" },
@@ -1082,9 +1082,9 @@ dependencies = [
     { name = "mcp" },
     { name = "mlflow" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f0/6b/fe9c6291bbbbccd14267bd05ade1f4522b59fc3380d16253476b9984d1a1/databricks_mcp-0.9.0.tar.gz", hash = "sha256:e311c70221306116af7fc9adb2bfedf0fb2f181d7cf12ff1e46682334150a98a", size = 10898, upload-time = "2026-02-20T23:41:39.857Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/93/6f9e5feaa7023cf637266d2271e6ee80c06db31a923cd2d61ad2d2333cc7/databricks_mcp-0.9.2.tar.gz", hash = "sha256:a7bb1f437d39bb02acfca5861c73c94787a3d6f4d48798319d12ace8cd8e8aa2", size = 11641, upload-time = "2026-07-31T02:26:51.18Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/37/98/710dccd35deedcb5a03a3d191e3e6c2bd99547de865a0d200f6cf52ca434/databricks_mcp-0.9.0-py3-none-any.whl", hash = "sha256:09407d60ecc5ee0ccd5f200b33426b148bf88b0fdc0975bc4f1d55f17f884ec9", size = 12413, upload-time = "2026-02-20T23:41:38.791Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/b6/7b0b7caac2f12bd4ec574c131b7d001d9fe387e943b7dd254b3f73a65694/databricks_mcp-0.9.2-py3-none-any.whl", hash = "sha256:da5ff3b0219e80c366a7208511e404cce7824fea22907706582e5196f054084d", size = 13177, upload-time = "2026-07-31T02:26:50.304Z" },
 ]
 
 [[package]]
