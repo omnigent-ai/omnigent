@@ -25,7 +25,7 @@
 
 import { escapeHtmlAttr } from "@/lib/html";
 import bridgeRuntime from "./htmlCommentBridgeRuntime.js?raw";
-import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
+import { prepareHtmlPreviewDoc, startTagEnd } from "./codeViewerHelpers";
 import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
@@ -313,6 +313,19 @@ const BRIDGE_HIGHLIGHT_STYLE =
   "</style>";
 
 /**
+ * Hides the page while a scroll restore is pending, so clamped offsets never paint. The
+ * runtime removes it once the restore settles; as an animation it also ends by itself after
+ * the budget, so the page still shows if the runtime never runs.
+ */
+function restoreHideStyle(nonce: string): string {
+  return (
+    `<style data-omni-restore-hide="${escapeHtmlAttr(nonce)}">` +
+    `html{animation:omni-restore-hide ${SCROLL_RESTORE_BUDGET_MS}ms!important}` +
+    "@keyframes omni-restore-hide{from,to{opacity:0}}</style>"
+  );
+}
+
+/**
  * Prepare HTML artifact content for the comment-enabled preview iframe: first
  * run {@link prepareHtmlPreviewDoc} (so links still open in a new tab), then
  * append the highlight `<style>` and the bridge `<script>` so the script runs
@@ -326,7 +339,8 @@ const BRIDGE_HIGHLIGHT_STYLE =
  * @param nonce Per-mount nonce shared with the parent for message validation.
  * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
  * @param restoreScrollTop Saved vertical offset the runtime returns to as the document
- *   lays out, so a remounted preview reopens where the reader was; 0 keeps the top.
+ *   lays out, so a remounted preview reopens where the reader was; 0 keeps the top. The
+ *   page stays hidden until it gets there, via a style placed first in the head.
  */
 export function injectCommentBridge(
   html: string,
@@ -334,16 +348,20 @@ export function injectCommentBridge(
   runtimeUrl?: string,
   restoreScrollTop = 0,
 ): string {
-  const prepared = prepareHtmlPreviewDoc(html);
+  let prepared = prepareHtmlPreviewDoc(html);
+  const restoring = Number.isFinite(restoreScrollTop) && restoreScrollTop > 0;
+  if (restoring) {
+    const headStart = Math.max(startTagEnd(prepared, "head"), 0);
+    prepared = prepared.slice(0, headStart) + restoreHideStyle(nonce) + prepared.slice(headStart);
+  }
   const src = runtimeUrl ? ` src="${escapeHtmlAttr(runtimeUrl)}"` : "";
   const body = runtimeUrl ? "" : HTML_COMMENT_BRIDGE_RUNTIME;
   const protocol = escapeHtmlAttr(JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }));
-  const restore =
-    Number.isFinite(restoreScrollTop) && restoreScrollTop > 0
-      ? ` data-omni-restore-scroll="${escapeHtmlAttr(
-          JSON.stringify({ top: restoreScrollTop, budgetMs: SCROLL_RESTORE_BUDGET_MS }),
-        )}"`
-      : "";
+  const restore = restoring
+    ? ` data-omni-restore-scroll="${escapeHtmlAttr(
+        JSON.stringify({ top: restoreScrollTop, budgetMs: SCROLL_RESTORE_BUDGET_MS }),
+      )}"`
+    : "";
   const inject =
     BRIDGE_HIGHLIGHT_STYLE +
     `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}" data-omni-protocol="${protocol}"${restore}>${body}</script>`;

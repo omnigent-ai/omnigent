@@ -178,12 +178,21 @@ def _plan_steps(first: int, last: int) -> str:
     )
 
 
+# Records each frame's opacity and offset from the first frame on, so a test can tell
+# whether the preview was ever shown away from the offset it restores.
+_FRAME_SAMPLER = (
+    "<script>window.sampledFrames=[];requestAnimationFrame(function sample(){"
+    "sampledFrames.push([getComputedStyle(document.documentElement).opacity,scrollY]);"
+    "requestAnimationFrame(sample)})</script>"
+)
+
 # A long HTML artifact whose later steps arrive after load, so the browser clamps
 # the restored offset until the page grows tall enough to reach it.
 _HTML_ARTIFACT = (
     "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Plan</title>"
     "<style>body{font-family:sans-serif;margin:24px}section{min-height:220px}</style>"
-    "</head><body><h1>Migration plan</h1>"
+    + _FRAME_SAMPLER
+    + "</head><body><h1>Migration plan</h1>"
     + _plan_steps(1, 8)
     + "<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', "
     + json.dumps(_plan_steps(9, 40))
@@ -246,7 +255,7 @@ def _settled_html_scroll(page: Page) -> int:
 
 
 def _expect_html_scroll(page: Page, expected: int) -> None:
-    """The remounted preview returns to ``expected`` and shows step 25."""
+    """The remounted preview reopens at ``expected`` on step 25 and is never shown elsewhere."""
     preview = page.frame_locator(_HTML_PREVIEW)
     expect(preview.get_by_role("heading", name="Step 25", exact=True)).to_be_in_viewport(
         timeout=15_000
@@ -256,6 +265,15 @@ def _expect_html_scroll(page: Page, expected: int) -> None:
     frame.wait_for_function(
         "expected => Math.round(window.scrollY) === expected", arg=expected, timeout=10_000
     )
+    frame.wait_for_function(
+        "() => getComputedStyle(document.documentElement).opacity === '1'", timeout=5_000
+    )
+    samples = frame.evaluate("() => window.sampledFrames")
+    shown_elsewhere = [
+        round(top) for opacity, top in samples if float(opacity) > 0 and abs(top - expected) > 1
+    ]
+    assert samples, "the preview painted no frames"
+    assert not shown_elsewhere, f"preview shown at {shown_elsewhere}, away from {expected}"
 
 
 def test_html_preview_scroll_survives_tab_switch(

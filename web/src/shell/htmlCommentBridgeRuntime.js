@@ -220,8 +220,15 @@
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
   let scrollRestore = null; // { top, deadline, y, height } while restoring
   let scrollRestoreFrame = 0;
+  let restoreHide = null; // the injected style hiding the page until the restore ends
+
+  function revealPage() {
+    if (restoreHide) restoreHide.remove();
+    restoreHide = null;
+  }
 
   function settleScrollRestore() {
+    revealPage();
     if (!scrollRestore) return;
     scrollRestore = null;
     cancelAnimationFrame(scrollRestoreFrame);
@@ -250,19 +257,32 @@
     // "instant" overrides an artifact's `scroll-behavior: smooth`.
     window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
     scrollRestore.y = window.scrollY;
+    if (Math.abs(scrollRestore.y - scrollRestore.top) <= 1) revealPage();
     scrollRestore.height = document.documentElement.scrollHeight;
     scrollRestoreFrame = requestAnimationFrame(applyScrollRestore);
   }
 
   function startScrollRestore() {
-    let saved;
+    const styles = document.querySelectorAll("style[data-omni-restore-hide]");
+    for (let i = 0; i < styles.length; i++) {
+      if (styles[i].getAttribute("data-omni-restore-hide") === NONCE) restoreHide = styles[i];
+    }
+    let saved = null;
     try {
       saved = JSON.parse(script.getAttribute("data-omni-restore-scroll") || "null");
     } catch {
+      // A malformed request restores nothing.
+    }
+    const valid =
+      saved &&
+      typeof saved.top === "number" &&
+      saved.top > 0 &&
+      typeof saved.budgetMs === "number" &&
+      saved.budgetMs > 0;
+    if (!valid) {
+      revealPage();
       return;
     }
-    if (!saved || typeof saved.top !== "number" || !(saved.top > 0)) return;
-    if (typeof saved.budgetMs !== "number" || !(saved.budgetMs > 0)) return;
     scrollRestore = {
       top: saved.top,
       deadline: performance.now() + saved.budgetMs,

@@ -117,8 +117,24 @@ describe("injectCommentBridge", () => {
     (top) => {
       const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL, top);
       expect(out).not.toContain("data-omni-restore-scroll");
+      expect(out).not.toContain("data-omni-restore-hide");
     },
   );
+
+  it.each([
+    ["a document with a head", "<!DOCTYPE html><html><head><title>Plan</title></head><body>"],
+    ["a document without a head", "<!DOCTYPE html><html><body><p>Plan</p></body></html>"],
+    ["a bare fragment", "<p>Plan</p>"],
+  ])("hides %s from the start of its head while restoring", (_label, html) => {
+    const out = injectCommentBridge(html, NONCE, LOADER_URL, 640);
+    if (html.startsWith("<!DOCTYPE html>")) expect(out.startsWith("<!DOCTYPE html>")).toBe(true);
+    const hide = new DOMParser().parseFromString(out, "text/html").head.firstElementChild;
+    expect(hide?.getAttribute("data-omni-restore-hide")).toBe(NONCE);
+    expect(hide?.textContent).toBe(
+      `html{animation:omni-restore-hide ${SCROLL_RESTORE_BUDGET_MS}ms!important}` +
+        "@keyframes omni-restore-hide{from,to{opacity:0}}",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -299,7 +315,16 @@ describe("bridge runtime scroll position", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    document.head.querySelectorAll("style[data-omni-restore-hide]").forEach((el) => el.remove());
   });
+
+  /** The style injected with a saved offset to hide the page, as the runtime finds it. */
+  function addRestoreHide(nonce = RUNTIME_NONCE) {
+    const style = document.createElement("style");
+    style.setAttribute("data-omni-restore-hide", nonce);
+    document.head.append(style);
+    return style;
+  }
 
   /**
    * Fake frames and the clock, and give jsdom a scrollable page whose offset
@@ -395,15 +420,18 @@ describe("bridge runtime scroll position", () => {
     const { scrollTo, userScrollTo, setPageHeight } = fakeScrolling({
       pageHeight: CLAMPING_PAGE_HEIGHT,
     });
+    const hide = addRestoreHide();
     const port = startRuntime({ restoreScroll: restoreTo(640) });
     expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));
     expect(window.scrollY).toBe(232);
+    expect(hide.isConnected).toBe(true);
 
-    // Late content grows the page; the next frame reaches the saved offset.
+    // Late content grows the page; the next frame reaches the saved offset and shows it.
     setPageHeight(2_000);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(2);
     expect(window.scrollY).toBe(640);
+    expect(hide.isConnected).toBe(false);
     // The clamped offset is not reported, so it can't overwrite the saved one.
     expect(sentScrollOffsets(port)).toEqual([]);
 
@@ -416,6 +444,17 @@ describe("bridge runtime scroll position", () => {
     userScrollTo(700);
     vi.advanceTimersToNextFrame();
     expect(sentScrollOffsets(port)).toEqual([700]);
+  });
+
+  it("shows the page short of the saved offset once the budget runs out", () => {
+    fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    const hide = addRestoreHide();
+    startRuntime({ restoreScroll: restoreTo(640) });
+    vi.advanceTimersByTime(BUDGET_MS - 20);
+    expect(hide.isConnected).toBe(true);
+    vi.advanceTimersByTime(40);
+    expect(hide.isConnected).toBe(false);
+    expect(window.scrollY).toBe(232);
   });
 
   it("keeps restoring when content growing above the reader moves the offset", () => {
@@ -438,18 +477,20 @@ describe("bridge runtime scroll position", () => {
       "a scroll key",
       () => dispatchToPage(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true })),
     ],
-    ["the scrollbar", (userScrollTo) => userScrollTo(300)],
+    ["the scrollbar", (userScrollTo) => userScrollTo(100)],
   ])("stops restoring when the reader takes over with %s", (_label, takeOver) => {
-    const { scrollTo, userScrollTo } = fakeScrolling();
+    const { scrollTo, userScrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    const hide = addRestoreHide();
     const port = startRuntime({ restoreScroll: restoreTo(640) });
     takeOver(userScrollTo);
+    expect(hide.isConnected).toBe(false);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(1);
 
-    userScrollTo(360);
+    userScrollTo(200);
     vi.advanceTimersToNextFrame();
-    expect(window.scrollY).toBe(360);
-    expect(sentScrollOffsets(port).at(-1)).toBe(360);
+    expect(window.scrollY).toBe(200);
+    expect(sentScrollOffsets(port).at(-1)).toBe(200);
   });
 
   it.each<[string, Event]>([
@@ -460,12 +501,14 @@ describe("bridge runtime scroll position", () => {
       new KeyboardEvent("keydown", { key: "=", ctrlKey: true, bubbles: true }),
     ],
   ])("keeps restoring through %s", (_label, event) => {
-    const { scrollTo } = fakeScrolling();
+    const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    const hide = addRestoreHide();
     startRuntime({ restoreScroll: restoreTo(640) });
     dispatchToPage(event);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(2);
     expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));
+    expect(hide.isConnected).toBe(true);
   });
 
   interface RuntimePort {
@@ -473,7 +516,10 @@ describe("bridge runtime scroll position", () => {
   }
 
   /** Restore to 640 in a page whose one comment's highlight starts `highlightTop` px down. */
-  function restoreWithComment(highlightTop: number, run: (port: RuntimePort) => void) {
+  function restoreWithComment(
+    highlightTop: number,
+    run: (port: RuntimePort, hide: HTMLStyleElement) => void,
+  ) {
     const rect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
     try {
       document.body.innerHTML = "<p>Quarterly revenue</p>";
@@ -488,6 +534,7 @@ describe("bridge runtime scroll position", () => {
           return { top, bottom: top + 20, width: 60, height: 20 };
         },
       });
+      const hide = addRestoreHide();
       const port = startRuntime({ restoreScroll: restoreTo(640) }) as unknown as RuntimePort;
       port.onmessage?.({
         data: {
@@ -495,7 +542,7 @@ describe("bridge runtime scroll position", () => {
           comments: [{ id: "c1", anchor_content: "revenue", occ: 0 }],
         },
       });
-      run(port);
+      run(port, hide);
     } finally {
       if (rect) Object.defineProperty(Range.prototype, "getBoundingClientRect", rect);
       else delete (Range.prototype as Partial<Range>).getBoundingClientRect;
@@ -517,10 +564,12 @@ describe("bridge runtime scroll position", () => {
     ["an offscreen comment, scrolling to it", 4_640, true],
     ["an already visible comment, leaving the page still", 740, false],
   ])("stops restoring when the reader picks %s", (_label, highlightTop, scrollsToComment) => {
-    const { scrollTo } = fakeScrolling();
-    restoreWithComment(highlightTop, (port) => {
+    const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    restoreWithComment(highlightTop, (port, hide) => {
       activate(port, null); // the parent's initial sync on connect
+      expect(hide.isConnected).toBe(true);
       activate(port, "c1");
+      expect(hide.isConnected).toBe(false);
       if (scrollsToComment) expect(scrollTo).toHaveBeenLastCalledWith(smoothScroll);
       else expect(scrollTo).not.toHaveBeenCalledWith(smoothScroll);
 
@@ -531,30 +580,32 @@ describe("bridge runtime scroll position", () => {
   });
 
   it.each([
-    ["", undefined],
-    [" while late content clamps the page", CLAMPING_PAGE_HEIGHT],
+    ["", undefined, false],
+    [" while late content clamps the page", CLAMPING_PAGE_HEIGHT, true],
   ])(
     "keeps restoring when the initial sync restates a comment visible at the saved offset%s",
-    (_label, pageHeight) => {
+    (_label, pageHeight, stillHidden) => {
       const { scrollTo } = fakeScrolling({ pageHeight });
       // Clamped to 232, this highlight is below the viewport; at 640 it is in view.
-      restoreWithComment(1_300, (port) => {
+      restoreWithComment(1_300, (port, hide) => {
         activate(port, "c1");
         expect(scrollTo).not.toHaveBeenCalledWith(smoothScroll);
         const writes = scrollTo.mock.calls.length;
         vi.advanceTimersToNextFrame();
         expect(scrollTo).toHaveBeenCalledTimes(writes + 1);
         expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));
+        expect(hide.isConnected).toBe(stillHidden);
       });
     },
   );
 
   // A linked comment reaches the frame in this same first sync, so it must win.
   it("scrolls to an active comment outside the saved view on the initial sync", () => {
-    const { scrollTo } = fakeScrolling();
-    restoreWithComment(4_640, (port) => {
+    const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
+    restoreWithComment(4_640, (port, hide) => {
       activate(port, "c1");
       expect(scrollTo).toHaveBeenLastCalledWith(smoothScroll);
+      expect(hide.isConnected).toBe(false);
       const writes = scrollTo.mock.calls.length;
       vi.advanceTimersToNextFrame();
       expect(scrollTo).toHaveBeenCalledTimes(writes);
@@ -571,7 +622,11 @@ describe("bridge runtime scroll position", () => {
     ["a zero budget", JSON.stringify({ top: 640, budgetMs: 0 })],
   ])("starts without restoring given %s", (_label, restoreScroll) => {
     const { scrollTo } = fakeScrolling();
+    const hide = addRestoreHide();
+    const artifactStyle = addRestoreHide("another-nonce");
     startRuntime({ restoreScroll });
+    expect(hide.isConnected).toBe(false);
+    expect(artifactStyle.isConnected).toBe(true);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).not.toHaveBeenCalled();
     expect(runtimeListeners.some(([, type]) => type === "wheel")).toBe(false);
