@@ -1622,22 +1622,32 @@ describe("automation failures", () => {
     },
   );
 
-  it("offers continuation for an empty task page and retries feed failures", () => {
+  it.each(["loading", "error", "continuation"])("renders an independent %s feed state", (state) => {
     const fetchNextPage = vi.fn();
     const refetch = vi.fn();
     vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
       automationInboxStub({
-        hasNextPage: true,
+        hasNextPage: state === "continuation",
         fetchNextPage,
-        isError: true,
+        isLoading: state === "loading",
+        isError: state === "error",
         refetch,
       }),
     );
     renderPage();
-    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load automation failures.");
-    fireEvent.click(screen.getByRole("button", { name: "Retry automations" }));
-    expect(refetch).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("button", { name: "Check more automations" }));
-    expect(fetchNextPage).toHaveBeenCalledOnce();
+    if (state === "loading") {
+      expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).toBeNull();
+    } else if (state === "error") {
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load automation failures.");
+      fireEvent.click(screen.getByRole("button", { name: "Retry automations" }));
+      expect(refetch).toHaveBeenCalledOnce();
+    } else {
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByText("Nothing waiting in the loaded items")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Check more automations" }));
+      expect(fetchNextPage).toHaveBeenCalledOnce();
+    }
+    if (state !== "continuation") expect(screen.queryByText(/Nothing waiting/)).toBeNull();
   });
 });

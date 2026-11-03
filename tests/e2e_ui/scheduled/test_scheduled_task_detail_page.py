@@ -98,7 +98,9 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
     assert response.ok
     [failure] = [item for item in response.json()["data"] if item["task_id"] == task_id]
     assert failure["task_id"] == task_id and failure["error_code"] == "no_online_host"
-    page.goto(f"{base_url}/inbox")
+    page.keyboard.press("ControlOrMeta+k")
+    page.get_by_role("dialog").get_by_text("Go to Inbox", exact=True).click()
+    expect(page).to_have_url(f"{base_url}/inbox")
     entry = page.get_by_test_id("inbox-automation-item").filter(has_text=task_name)
     expect(entry).to_have_count(1)
     entry.get_by_role("button", name=f"Automation failed: {task_name}").click()
@@ -115,7 +117,9 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
     page.reload()
     expect(page.get_by_role("heading", name="Inbox", exact=True)).to_be_visible()
     expect(entry).to_have_count(0)
-    page.goto(f"{base_url}/tasks")
+    page.keyboard.press("ControlOrMeta+k")
+    page.get_by_role("dialog").get_by_text("Go to Automations", exact=True).click()
+    expect(page).to_have_url(f"{base_url}/tasks")
     expect(
         _row_by_name(page, task_name).get_by_role("img", name="Last run failed")
     ).to_be_visible()

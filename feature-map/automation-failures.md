@@ -23,6 +23,8 @@ session, while session-linked failures keep their existing session Inbox entry.
 - **Inbox:** open Inbox from the sidebar or visit `/inbox`. Expand an Automation
   failed item, then choose Open automation or Mark as read. These items appear in
   All and Unread, and do not appear in Awaiting response.
+- **Command palette:** open Search or press Cmd+K (Mac) / Ctrl+K (Linux/Windows),
+  then choose Go to Inbox or Go to Automations.
 - **Narrow screens / embedded UI:** the same Automations and Inbox pages are
   reachable through the app navigation; links respect the embedding mount path.
 
@@ -34,9 +36,13 @@ no connected host so Run now fails naturally without touching a real host.
 - **Automations and Inbox, detail page enabled — own environment:**
   `tests/e2e_ui/scheduled/test_scheduled_task_detail_page.py` opens a task,
   runs it without a host in desktop and narrow viewports, verifies the failed history, active and paused warnings,
-  follows the Inbox entry, and checks dismissal across reload. Run directly with
+  opens Inbox through the command palette, follows the failure entry, checks
+  dismissal across reload, then returns via Go to Automations to confirm the warning remains. Run directly with
   `--ui-skip-build --video=on --screenshot=on` and an evidence directory outside
   the repository.
+- **Command palette:** in the same browser journey, choose Go to Inbox and verify
+  the failed automation appears. After marking it read and reloading, choose
+  Go to Automations and verify the card still warns. Repeat at a narrow width.
 - **Legacy detail-disabled cards and navigation:** component checks in
   `web/src/components/scheduled/ScheduledTaskRow.test.tsx` and
   `web/src/pages/InboxPage.test.tsx` verify the warning and Open automation fallback.

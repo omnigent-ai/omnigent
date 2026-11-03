@@ -256,10 +256,13 @@ describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
   "scheduled_task_sandbox_workspaces",
+  "scheduled_task_inbox",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
+    [false, false],
     [undefined, false],
+    ["true", false],
     ["yes", false],
   ])("reads %j as %j", async (advertised, expected) => {
     const payload = advertised === undefined ? {} : { [capability]: advertised };
@@ -473,11 +476,3 @@ describe("picker curation", () => {
     expect(pickerCuration(info({})).defaultAgentName).toBeNull();
   });
 });
-
-it.each([true, false, undefined, "true"])(
-  "parses automation Inbox support strictly: %s",
-  async (value) => {
-    const parsed = await probe({ scheduled_task_inbox: value });
-    expect(parsed.scheduled_task_inbox).toBe(value === true);
-  },
-);

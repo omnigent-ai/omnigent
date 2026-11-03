@@ -1055,31 +1055,45 @@ describe("Sidebar session list", () => {
     expect(badge.className).not.toContain("brand-accent");
   });
 
-  it.each([0, 2])(
-    "marks an incomplete Inbox count of %s until all task pages are checked",
-    (count) => {
+  it.each([
+    { approvals: 0, automations: 0, label: "0 inbox items waiting", badge: "+" },
+    { approvals: 0, automations: 1, label: "1 inbox item waiting", badge: "1+" },
+    { approvals: 2, automations: 1, label: "3 inbox items waiting", badge: "3+" },
+  ])(
+    "combines $approvals approvals and $automations failures until all task pages are checked",
+    ({ approvals, automations, label, badge }) => {
       const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
-      const state = { items: [], hasNextPage: true } as unknown as ReturnType<
-        typeof automationInboxHook.useAutomationInbox
-      >;
+      const failure = {
+        taskId: "task",
+        taskName: "Report",
+        runId: "run",
+        scheduledAt: 100,
+        finishedAt: 101,
+        errorCode: "host_offline",
+      };
+      const state = {
+        items: automations ? [failure] : [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
       automationInbox.mockReturnValue(state);
       try {
         mockConversations([
-          conv("conv_awaiting", "Claude Code", { pending_elicitations_count: count }),
+          conv("conv_awaiting", "Claude Code", { pending_elicitations_count: approvals }),
         ]);
         const first = renderSidebar();
         expect(
           within(screen.getByTestId("inbox-button")).getByLabelText(
-            `${count} inbox items waiting; more automations not yet checked`,
+            `${label}; more automations not yet checked`,
           ),
-        ).toHaveTextContent(count ? `${count}+` : "+");
+        ).toHaveTextContent(badge);
         first.unmount();
         automationInbox.mockReturnValue({ ...state, hasNextPage: false });
         renderSidebar();
         const inbox = within(screen.getByTestId("inbox-button"));
         expect(inbox.queryByLabelText(/more automations/)).toBeNull();
-        if (count) expect(inbox.getByLabelText("2 inbox items waiting")).toHaveTextContent("2");
-        else expect(inbox.queryByText("+")).toBeNull();
+        if (approvals + automations) {
+          expect(inbox.getByLabelText(label)).toHaveTextContent(String(approvals + automations));
+        } else expect(inbox.queryByText("+")).toBeNull();
       } finally {
         automationInbox.mockRestore();
       }
