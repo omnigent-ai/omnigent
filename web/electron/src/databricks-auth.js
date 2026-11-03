@@ -169,7 +169,11 @@ function createDatabricksAuth({
   ) {
     if (!current(ctx)) return Promise.resolve();
     if (reload) ctx.reloadVersion = ctx.navigationVersion;
-    if (ctx.pending) return ctx.pending;
+    if (ctx.pending) {
+      ctx.supersededChecks.push(superseded);
+      return ctx.pending;
+    }
+    ctx.supersededChecks = [superseded];
     clearTimeoutFn(ctx.timer);
     console.log("[omnigent] databricks auth: silent renewal", {
       origin: ctx.origin,
@@ -201,14 +205,16 @@ function createDatabricksAuth({
         }
       })
       .catch(async (error) => {
-        if (!superseded()) return fail(ctx, error);
-        if (!current(ctx)) return;
-        // A newer page loaded meanwhile: retry on the usual schedule instead of replacing it.
-        console.warn("[omnigent] databricks auth: renewal failed after a newer page load", {
-          origin: ctx.origin,
-          code: error?.errorCode,
-        });
-        await schedule(ctx).catch((scheduleError) => fail(ctx, scheduleError));
+        const replaced = () => ctx.supersededChecks.every((check) => check());
+        if (replaced() && current(ctx)) {
+          // Newer page loads replaced every waiting check: retry on the usual schedule instead.
+          console.warn("[omnigent] databricks auth: renewal failed after a newer page load", {
+            origin: ctx.origin,
+            code: error?.errorCode,
+          });
+          await schedule(ctx).catch((scheduleError) => fail(ctx, scheduleError));
+        }
+        if (!replaced()) fail(ctx, error);
       })
       .finally(() => {
         if (renewals.get(ctx.origin) === pending) renewals.delete(ctx.origin);
@@ -221,8 +227,8 @@ function createDatabricksAuth({
   /**
    * Renew `win`'s session without reloading. Resolves whether the window is still
    * connected afterwards, or returns null when the window has no live connection.
-   * A failed renewal goes to `onAuthRequired` unless `superseded()` reports that a
-   * newer page has replaced the one being checked.
+   * A failed renewal goes to `onAuthRequired` unless `superseded()`, and that of every
+   * other caller sharing the renewal, reports that a newer page replaced theirs.
    */
   function checkSession(win, reason, superseded) {
     const ctx = connections.get(win);
@@ -258,6 +264,7 @@ function createDatabricksAuth({
       returnUrl: loadUrl,
       timer: null,
       pending: null,
+      supersededChecks: [],
       scheduleGeneration: 0,
       navigationVersion: 0,
       reloadVersion: null,

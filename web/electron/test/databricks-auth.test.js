@@ -283,6 +283,55 @@ describe("Databricks browser session lifecycle", () => {
       [[`${ORIGIN}/omnigent`, IP_ACL_BLOCKED]],
     );
   });
+  it("reports a refused renewal that a blocked login joined after a superseded check", async (t) => {
+    let refuse;
+    const h = harness({
+      ensureSession: () =>
+        new Promise((_resolve, reject) => {
+          refuse = () =>
+            reject(Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED }));
+        }),
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    const checked = h.auth.checkSession(win, "test", () => true);
+    h.request(win, `${ORIGIN}/login`);
+    await drain();
+    refuse();
+    assert.equal(await checked, false);
+    assert.equal(h.calls.renew.length, 1);
+    assert.deepEqual(
+      h.calls.errors.map(({ error }) => error.errorCode),
+      [IP_ACL_BLOCKED],
+    );
+  });
+  it("reports a refused renewal that a blocked login joined while a superseded check rescheduled", async (t) => {
+    const h = harness({
+      ensureSession: async () => {
+        throw Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED });
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    const readCookies = h.session.cookies.get;
+    let releaseCookies;
+    h.session.cookies.get = (...args) =>
+      new Promise((resolve) => {
+        releaseCookies = () => resolve(readCookies(...args));
+      });
+    const checked = h.auth.checkSession(win, "test", () => true);
+    await drain();
+    h.request(win, `${ORIGIN}/login`);
+    releaseCookies();
+    assert.equal(await checked, false);
+    assert.equal(h.calls.renew.length, 1);
+    assert.deepEqual(
+      h.calls.errors.map(({ error }) => error.errorCode),
+      [IP_ACL_BLOCKED],
+    );
+  });
   it("keeps a rejected window blocked after unpinning until a new connection begins", async (t) => {
     const h = harness({
       ensureSession: async () => {
