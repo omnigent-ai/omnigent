@@ -9,7 +9,7 @@
 //      but its rows could not be clicked (Radix's modal layer) or
 //      were clipped by the scrollable form body.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { splitTypedPath, WorkspacePathField } from "./WorkspacePathField";
@@ -379,6 +379,34 @@ describe("WorkspacePathField", () => {
     expect(onOpenChange).not.toHaveBeenCalled();
 
     fireEvent.keyDown(input, { key: "Escape" });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("leaves Escape to the surrounding dialog when focus is outside the field", () => {
+    mockListing(ENTRIES);
+    const onOpenChange = vi.fn();
+    render(
+      <Dialog open onOpenChange={onOpenChange}>
+        <DialogContent>
+          <DialogTitle>Switch host</DialogTitle>
+          <DialogDescription>Pick a directory.</DialogDescription>
+          <WorkspacePathField
+            hostId="host_1"
+            value={VALUE}
+            onChange={vi.fn()}
+            onBrowse={vi.fn()}
+            recent={[]}
+          />
+          <button type="button">Switch</button>
+        </DialogContent>
+      </Dialog>,
+    );
+    fireEvent.focus(screen.getByTestId("workspace-path-input"));
+    const sibling = screen.getByRole("button", { name: "Switch" });
+    act(() => sibling.focus());
+    expect(screen.getByTestId("workspace-path-dropdown")).toBeTruthy();
+
+    fireEvent.keyDown(sibling, { key: "Escape" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });
