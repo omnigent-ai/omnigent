@@ -63,7 +63,7 @@ window.arcaConnect.onStarted(({ login, command }) => {
   confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
   statusEl.dataset.kind = "";
   statusEl.textContent = login
-    ? "Complete sign-in in your browser. Credentials stay on the Arca instance."
+    ? "Complete sign-in in your browser. If no browser opened, check that Arca Companion is running. Credentials stay on the Arca instance."
     : "A cold instance can take a few minutes to start.";
 });
 
@@ -96,17 +96,11 @@ window.arcaConnect.onOutput((text) => {
   ensureTerminal().write(text);
 });
 
-window.arcaConnect.onDone(({ ok, error, authRequired, command }) => {
+window.arcaConnect.onDone(({ ok, error }) => {
   statusEl.dataset.kind = ok ? "ok" : "error";
   statusEl.textContent = ok ? "Connected. The Arca host should appear online shortly." : error;
   confirmBtn.classList.remove("loading");
-  confirmBtn.hidden = !authRequired;
-  confirmBtn.disabled = false;
-  if (authRequired) {
-    commandEl.textContent = command;
-    confirmBtn.textContent = "Sign in and retry";
-    confirmBtn.focus();
-  }
-  cancelBtn.textContent = authRequired ? "Cancel" : "Close";
+  confirmBtn.hidden = true;
+  cancelBtn.textContent = "Close";
   resizeToContent();
 });

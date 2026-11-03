@@ -7,6 +7,7 @@ Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,55 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
         fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, "access denied")
         == auth
     )
+
+
+def test_classify_codex_error_ip_access_list_refusal_not_auth() -> None:
+    """A workspace IP access list refusal (HTTP 403) is not a sign-in failure.
+
+    Signing in again cannot clear a network policy, so the re-auth status and
+    hint would point the user at the wrong fix.
+    """
+    generic = fwd._CODEX_ERROR_KIND_GENERIC
+    # Synthetic address, workspace and request id; the wording is the gateway's.
+    acl_message = (
+        "unexpected status 403 Forbidden: Source IP address: 203.0.113.7 is blocked by "
+        "Databricks IP ACL for workspace: 1234567890123456 "
+        "[ReqId: 00000000-0000-4000-8000-000000000000]"
+    )
+    structured_403 = {"codexErrorInfo": {"httpStatusCode": 403}}
+    assert fwd._classify_codex_error(structured_403, acl_message) == generic
+    assert fwd._classify_codex_error({}, acl_message) == generic
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "0000a401-0000-4000-8000-000000000000",
+        "00000000-4030-4000-8000-000000000000",
+        "00000000-0000-4000-8000-0000000c4013",
+    ],
+)
+def test_classify_codex_error_rate_limit_request_id_not_auth(request_id: str) -> None:
+    """A 429 whose request id happens to contain "401"/"403" is not auth.
+
+    The message fallback must match the status only as a standalone token,
+    and an explicit rate limit never asks the user to sign in again.
+    """
+    message = f"exceeded retry limit, last status: 429 Too Many Requests, request id: {request_id}"
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unexpected status 401 Unauthorized: token expired",
+        "unexpected status 403 Forbidden: missing scope",
+        "stream error: status 401, request id: 00000000-0000-4000-8000-000000000000",
+    ],
+)
+def test_classify_codex_error_standalone_auth_status_is_auth(message: str) -> None:
+    """A real 401/403 status in the message still classifies as auth."""
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_AUTH
 
 
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
@@ -928,7 +978,7 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
         }
     ]
 
-    edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
+    edge = fwd._resume_turn_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
 
     assert edge is not None
     assert edge.status == "failed"
@@ -997,6 +1047,37 @@ async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_token_command_failure_posts_without_codex_login_hint(
+    tmp_path: Path,
+) -> None:
+    """A failed model provider token command is not a Codex login problem."""
+    _seed_active_turn(tmp_path, "turn_123")
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+        "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+        "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools "
+        "access token. Run `isaac` to log in and try again."
+    )
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": message, "codexErrorInfo": "other"},
+        }
+    }
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+    assert edge is not None
+    client = _RecordingClient()
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    data = client.posts[0][1]["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == message
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
 async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()
@@ -1016,6 +1097,48 @@ _CERTIFICATE_LINE = (
     "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
     "ssl/tls alert certificate expired (_ssl.c:2580)"
 )
+
+
+@pytest.mark.parametrize(
+    ("message", "turn_id", "reason"),
+    [
+        ("Failed to shutdown thread persistence", None, "thread_persistence_shutdown"),
+        ("private-error-detail", "child-turn", "unclassified"),
+        ("x" * 5000 + "Failed to shutdown thread persistence", "child-turn", "unclassified"),
+    ],
+)
+async def test_status_audit_correlates_child_errors_without_copying_error_text(
+    caplog: pytest.LogCaptureFixture,
+    message: str,
+    turn_id: str | None,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    client = _RecordingClient()
+    await fwd._post_turn_status_edge(
+        client,
+        "child-session",
+        fwd._CodexTurnStatusEdge(
+            status="failed",
+            turn_id=turn_id,
+            source="error",
+            error=fwd._CodexTerminalError(message=message, kind=fwd._CODEX_ERROR_KIND_GENERIC),
+        ),
+    )
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status"
+    ]
+    assert record.session_id == "child-session"
+    assert record.attributes["has_turn_id"] is (turn_id is not None)
+    assert record.attributes["has_error"] is True
+    assert record.attributes["native_error_kind"] == "generic"
+    assert record.attributes["native_error_reason"] == reason
+    assert record.attributes["protocol_source"] == "error"
+    assert "private-error-detail" not in json.dumps(record.attributes)
+    assert message not in record.getMessage()
+    assert client.posts[0][1]["data"]["output"] == message
 
 
 def _connection_retry_params(*, http_status: int | None = None) -> dict:
@@ -1128,6 +1251,44 @@ async def test_handle_event_fails_retrying_turn_on_launcher_certificate_failure(
         if body["type"] == "external_session_status"
     ]
     assert status_posts == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_handle_event_retry_after_mcp_certificate_line_is_left_to_codex(
+    tmp_path: Path,
+) -> None:
+    """An MCP server's expired certificate on stderr does not kill a reconnecting turn."""
+    client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    mcp_line = (
+        "2026-10-16T12:00:00.000000Z  WARN codex_mcp::rmcp_client: failed to connect MCP "
+        "server `docs`: error sending request: invalid peer certificate: Expired"
+    )
+    failure = detect_certificate_failure(mcp_line)
+    if failure is not None:
+        record_certificate_failure(tmp_path, failure)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": _connection_retry_params()},
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+        forwarder_state=fwd._CodexForwarderState(
+            parent_session_id="conv_x",
+            codex_client=codex_client,  # type: ignore[arg-type]
+            model="gpt-5",
+        ),
+    )
+
+    assert codex_client.requests == []
+    assert all(body["data"].get("status") != "failed" for _url, body in client.posts)
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
 
 
 @pytest.mark.asyncio

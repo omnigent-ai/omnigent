@@ -818,7 +818,7 @@ async def test_inflight_replay_via_pre_ready_snapshot_does_not_duplicate_window_
         for _ in range(8):
             try:
                 ev = await asyncio.wait_for(gen.__anext__(), timeout=0.3)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
             if ev.get("type") == "response.created":
                 created_replays += 1

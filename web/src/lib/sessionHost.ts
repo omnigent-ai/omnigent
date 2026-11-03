@@ -65,6 +65,15 @@ export function sessionRoutingHostId(
 // host-bound ancestor instead of going keyless to the default replica.
 const _sessionParents = new Map<string, string>();
 
+/** Routing parent a child's labels encode (side chat or fork), or null if independent. */
+export function parentIdFromLabels(labels: Record<string, string> | undefined): string | null {
+  return (
+    labels?.["omnigent.side_chat.source_id"] ??
+    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null) ??
+    null
+  );
+}
+
 /**
  * Record (or clear) a session's parent so a hostless child resolves its host
  * through the ancestor chain. Called wherever a session object is parsed.
@@ -74,11 +83,7 @@ export function setSessionParent(
   parentId: string | null | undefined,
   labels?: Record<string, string>,
 ): void {
-  // The fork-source fallback supports side chats created by older servers.
-  const routingParent =
-    parentId ??
-    labels?.["omnigent.side_chat.source_id"] ??
-    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null);
+  const routingParent = parentId ?? parentIdFromLabels(labels);
   const nextParent = routingParent && routingParent !== sessionId ? routingParent : null;
   if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
   if (nextParent) {
