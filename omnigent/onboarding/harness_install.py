@@ -45,7 +45,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from packaging.version import InvalidVersion, Version
 
@@ -824,6 +824,10 @@ READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 # Distinct from a parseable-but-too-old version, which needs an upgrade.
 PROBE_UNANSWERED = "probe-unanswered"
 
+# Return type of :func:`harness_cli_probe_outcome`: a normal tri-state where
+# the sentinel is distinguishable from plain ``False``.
+HarnessProbeOutcome = bool | Literal["probe-unanswered"]
+
 # Cache successful probes to limit subprocess churn during readiness checks.
 # Launchers can delegate to an updated executable without changing themselves.
 _VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
@@ -1004,7 +1008,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
 def harness_cli_probe_outcome(
     key: str,
     timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
-) -> bool:
+) -> HarnessProbeOutcome:
     """Return whether the CLI is ready, distinguishing a probe that never answered.
 
     Mirrors :func:`harness_cli_installed` but returns :data:`PROBE_UNANSWERED`
@@ -1094,15 +1098,16 @@ def _harness_cli_version_string(
             cached = _VERSION_PROBE_CACHE.get(sig)
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
-    flags: dict[str, object] = {}
+    creationflags = 0
+    start_new_session = False
     if IS_WINDOWS:
         # DETACHED_PROCESS detaches the probe from the daemon's console, so a
         # launcher shim that opens its own TTY has nothing to bind to.
-        flags["creationflags"] = 0x00000008  # DETACHED_PROCESS
+        creationflags = 0x00000008  # DETACHED_PROCESS
     else:
         # start_new_session detaches the probe from the controlling terminal
         # (POSIX setsid), so an interactive first-run shim cannot open /dev/tty.
-        flags["start_new_session"] = True
+        start_new_session = True
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -1112,7 +1117,10 @@ def _harness_cli_version_string(
             timeout=timeout,
             check=False,
             cwd=probe_cwd,
-            **flags,
+            # Detach the probe from the daemon's console/TTY: an interactive
+            # first-run launcher shim must not capture it.
+            creationflags=creationflags,
+            start_new_session=start_new_session,
         )
     except subprocess.TimeoutExpired:
         # The probe never got an answer (e.g. a launcher shim dropped into its
