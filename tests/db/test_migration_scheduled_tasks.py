@@ -925,3 +925,45 @@ def test_session_mode_migration_defaults_existing_tasks_and_round_trips(
             "id",
         ],
     }
+
+
+def test_mutation_receipt_schema_and_rollback(db_engine: Engine) -> None:
+    """Receipts enforce a scoped unique key and survive a refused rollback."""
+    inspector = sa.inspect(db_engine)
+    assert inspector.get_pk_constraint("scheduled_task_requests")["constrained_columns"] == [
+        "workspace_id",
+        "owner_key",
+        "request_id",
+    ]
+    assert inspector.get_foreign_keys("scheduled_task_requests") == []
+    table = sa.Table("scheduled_task_requests", sa.MetaData(), autoload_with=db_engine)
+    receipt = {
+        "workspace_id": 0,
+        "owner_key": uuid4().bytes,
+        "request_id": uuid4().bytes,
+        "request_hash": b"a" * 32,
+        "scheduled_task_id": uuid4().bytes,
+        "created_at": 1,
+    }
+    with db_engine.begin() as connection:
+        connection.execute(table.insert().values(**receipt))
+    with pytest.raises(IntegrityError), db_engine.begin() as connection:
+        connection.execute(table.insert().values(**receipt))
+    with db_engine.begin() as connection:
+        connection.execute(table.insert().values(**{**receipt, "workspace_id": 1}))
+        connection.execute(table.insert().values(**{**receipt, "owner_key": uuid4().bytes}))
+    with pytest.raises(IntegrityError), db_engine.begin() as connection:
+        connection.execute(
+            table.insert().values(
+                **{**receipt, "request_id": uuid4().bytes, "request_hash": b"short"}
+            )
+        )
+    config = _build_alembic_config(str(db_engine.url))
+    with pytest.raises(RuntimeError, match="Cannot drop"):
+        command.downgrade(config, "d0a1f879a01d")
+    with db_engine.begin() as connection:
+        assert connection.scalar(sa.select(sa.func.count()).select_from(table)) == 3
+        connection.execute(table.delete())
+    command.downgrade(config, "d0a1f879a01d")
+    assert "scheduled_task_requests" not in sa.inspect(db_engine).get_table_names()
+    command.upgrade(config, "head")
