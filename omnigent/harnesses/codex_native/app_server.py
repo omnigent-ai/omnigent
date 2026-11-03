@@ -107,7 +107,7 @@ from omnigent.inner.databricks_executor import (
     _databricks_gateway_host,
     _read_databrickscfg_host,
 )
-from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.process_logging import (
     DATA_DIR_ENV_VAR,
@@ -1923,7 +1923,6 @@ async def probe_codex_model_options(
             _databricks_launch_materialization,
             model=launch.model,
             profile=launch.profile,
-            codex_path=resolved_codex,
         )
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
@@ -2184,6 +2183,52 @@ async def codex_launch_catalog_is_stale(
     return model_catalog_store.catalog_is_stale(
         "codex-native", codex_catalog_fingerprint(launch, codex_path=codex_path)
     )
+
+
+@dataclass(frozen=True)
+class CodexLaunchModels:
+    """
+    The model list one Codex launch shape validates a pick against.
+
+    :param rows: ``model/list``-shaped rows with one default marked, e.g.
+        ``[{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]``.
+    :param stale: Whether the rows came from a stored catalog past its TTL.
+    """
+
+    rows: list[_JsonObject]
+    stale: bool
+
+
+async def codex_launch_models(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch, reload: bool = False
+) -> CodexLaunchModels | None:
+    """
+    Resolve the models one launch shape can run.
+
+    A Databricks profile launch runs what its workspace serves, so the
+    workspace listing (then ucode's cached copy) decides, default first.
+    Every other shape uses Codex's own ``model/list`` from the shared store.
+
+    :param codex_path: Optional Codex executable override.
+    :param launch: An already-resolved ``model=None`` launch shape.
+    :param reload: Await a fresh Codex catalog instead of reading the store.
+    :returns: The shape's models, or ``None`` when the list is unknown
+        (it failed or came back empty).
+    """
+    if launch.profile is not None:
+        servable = await asyncio.to_thread(databricks_profile_codex_models, launch.profile)
+        if not servable:
+            return None
+        rows: list[_JsonObject] = [{"id": model, "model": model} for model in servable]
+        rows[0]["isDefault"] = True
+        return CodexLaunchModels(rows=rows, stale=False)
+    if reload:
+        fresh = await codex_reprobed_launch_catalog(codex_path=codex_path, launch=launch)
+        return CodexLaunchModels(rows=fresh, stale=False) if fresh else None
+    # Read staleness before the fetch can start a background probe.
+    stale = await codex_launch_catalog_is_stale(codex_path=codex_path, launch=launch)
+    stored = await codex_launch_catalog(codex_path=codex_path, launch=launch)
+    return CodexLaunchModels(rows=stored, stale=stale) if stored else None
 
 
 def _backfill_lease_is_running(db_path: Path) -> bool:
@@ -3754,7 +3799,7 @@ class CodexDatabricksProfileMissingError(OmnigentError, OSError):
 
 
 def _databricks_launch_materialization(
-    *, model: str | None, profile: str, codex_path: str | None = None
+    *, model: str | None, profile: str
 ) -> _DatabricksLaunchMaterialization:
     """
     Resolve the Databricks-profile routing pieces of a Codex launch.
@@ -3769,7 +3814,6 @@ def _databricks_launch_materialization(
     :param model: Optional explicit model pin; ``None`` resolves the
         catalog default.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
-    :param codex_path: Executable whose shared catalog may resolve the model.
     :returns: The materialized overrides, pinned model, and host.
     :raises CodexDatabricksProfileMissingError: When the profile resolves no
         workspace host.
@@ -3778,7 +3822,7 @@ def _databricks_launch_materialization(
     if not host:
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
-    resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
+    resolved_model = _resolve_databricks_codex_model(host, profile, model)
     base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
         host, profile
     )
@@ -3833,9 +3877,7 @@ def _databricks_codex_gateway(
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
-def _resolve_databricks_codex_model(
-    host: str, profile: str, requested: str | None, *, codex_path: str | None = None
-) -> str:
+def _resolve_databricks_codex_model(host: str, profile: str, requested: str | None) -> str:
     """Resolve the codex launch model against what the workspace serves.
 
     Codex used to take its model from the bundled MLflow catalog — a
@@ -3847,8 +3889,6 @@ def _resolve_databricks_codex_model(
     then ucode's cached copy of it, then the bundled catalog as the documented
     last resort.
 
-    An explicit model first reuses its fresh shared Codex catalog row's model
-    for the same profile, workspace and executable. A miss keeps discovery.
     The explicit model is matched against the servable ids, so a legacy
     ``model_override`` persisted before this change still launches; one the
     workspace does not serve passes through untouched, because the gateway's
@@ -3858,24 +3898,9 @@ def _resolve_databricks_codex_model(
     :param profile: Databricks CLI profile backing the launch.
     :param requested: Explicit model id, or ``None`` to take the newest
         servable one.
-    :param codex_path: Executable whose shared catalog may resolve the model.
     :returns: The model id to pin on the codex launch.
     """
-    from omnigent.models import model_catalog_store
     from omnigent.models.databricks_model_discovery import select_servable_model
-
-    if requested:
-        profile_host = _read_databrickscfg_host(profile)
-        if profile_host and profile_host.rstrip("/") == host.rstrip("/"):
-            fingerprint = codex_catalog_fingerprint(
-                NativeCodexLaunch([], None, profile), codex_path=codex_path
-            )
-            rows = model_catalog_store.read_catalog("codex-native", fingerprint)
-            if rows and not model_catalog_store.catalog_is_stale("codex-native", fingerprint):
-                slug = codex_reachable_model_slug(requested, rows)
-                model = next((row.get("model") for row in rows if row.get("id") == slug), None)
-                if isinstance(model, str) and model.strip():
-                    return model.strip()
 
     servable = _databricks_servable_codex_models(host, profile)
     if requested:
@@ -3885,34 +3910,30 @@ def _resolve_databricks_codex_model(
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 
-def databricks_profile_serves_codex_model(profile: str, model: str) -> bool:
+def databricks_profile_codex_models(profile: str) -> tuple[str, ...]:
     """
-    Report whether a Databricks profile's workspace serves *model* to Codex.
+    List the codex-servable ids a Databricks profile's workspace serves.
 
-    Uses the same listing a profile launch resolves its model from, so a
-    ``True`` answer means the launch will pin that workspace's served id.
+    Reads the same listing a profile launch resolves its model from.
 
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
-    :param model: Model id in any spelling, e.g. ``"gpt-6.1-sol"``.
-    :returns: ``True`` when the workspace lists the model on the codex route;
-        ``False`` when it does not, or no listing could be read.
+    :returns: Servable ids, launch default first, e.g.
+        ``("system.ai.gpt-5-6-sol",)``; empty when the profile resolves no
+        host or no listing could be read.
     """
-    from omnigent.models.databricks_model_discovery import select_servable_model
-
     try:
         host = _databricks_gateway_host(profile)
-    except Exception as exc:  # an unresolvable profile cannot confirm the pick
+    except Exception as exc:  # an unresolvable profile has no listing
         _logger.warning(
             "native-codex: could not resolve the workspace host for profile %r (%s)",
             profile,
             exc,
             exc_info=_logger.isEnabledFor(logging.DEBUG),
         )
-        return False
+        return ()
     if not host:
-        return False
-    servable = _databricks_servable_codex_models(host.rstrip("/"), profile)
-    return select_servable_model(model, servable) is not None
+        return ()
+    return _databricks_servable_codex_models(host.rstrip("/"), profile)
 
 
 def _databricks_servable_codex_models(host: str, profile: str) -> tuple[str, ...]:
@@ -4053,9 +4074,7 @@ def build_codex_native_server(
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
-        databricks = _databricks_launch_materialization(
-            model=model, profile=profile, codex_path=resolved_codex
-        )
+        databricks = _databricks_launch_materialization(model=model, profile=profile)
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         # A launch that names no model still routes through the profile's

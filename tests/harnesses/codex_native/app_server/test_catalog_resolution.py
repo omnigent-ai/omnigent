@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -17,6 +16,7 @@ from omnigent.harnesses.codex_native.app_server import (
 
 @pytest.fixture
 def _databricks_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Seed a fresh Codex catalog for the ``prof`` shape that a profile launch must ignore."""
     from omnigent.harnesses.codex_native import app_server
     from omnigent.models import model_catalog_store
 
@@ -24,8 +24,6 @@ def _databricks_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     cfg_path.write_text("[prof]\nhost = https://h.example.com/\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    # The launch's explicit executable, not PATH's default, must key the lookup.
-    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: "/other/codex")
     fingerprint = app_server.codex_catalog_fingerprint(
         NativeCodexLaunch([], None, "prof"), codex_path=sys.executable
     )
@@ -43,23 +41,24 @@ def _databricks_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 @pytest.mark.parametrize(
     ("requested", "expected"),
     [
-        ("system.ai.gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("gpt-1-2-test", "system.ai.gpt-1-2-test"),
         ("gpt-1.2-test", "system.ai.gpt-1-2-test"),
-        ("custom-picker", "custom_catalog.schema.model"),
-        ("custom_catalog.schema.model", "custom_catalog.schema.model"),
+        ("databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
+        ("custom-picker", "custom-picker"),
+        (None, "system.ai.gpt-1-2-test"),
     ],
 )
-def test_build_codex_native_server_reuses_catalog_model(
+def test_build_codex_native_server_resolves_the_model_from_the_workspace(
     _databricks_catalog: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    requested: str,
+    requested: str | None,
     expected: str,
 ) -> None:
-    credentials = Mock(side_effect=RuntimeError("credentials unavailable"))
-    discovery = Mock(side_effect=RuntimeError("discovery unavailable"))
+    """A profile launch pins the workspace's served id; a stored Codex row never stands in."""
+    from types import SimpleNamespace
+
+    credentials = Mock(return_value=SimpleNamespace(token="tok"))
+    discovery = Mock(return_value=("system.ai.gpt-1-2-test",))
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
     )
@@ -78,8 +77,7 @@ def test_build_codex_native_server_reuses_catalog_model(
         codex_path=sys.executable,
     )
 
-    credentials.assert_not_called()
-    discovery.assert_not_called()
+    discovery.assert_called_once_with("https://h.example.com", "tok")
     assert f'model="{expected}"' in server.config_overrides
     assert server.env["DATABRICKS_HOST"] == "https://h.example.com"
     overrides = "\n".join(server.config_overrides)
@@ -88,100 +86,42 @@ def test_build_codex_native_server_reuses_catalog_model(
 
 
 @pytest.mark.parametrize(
-    ("catalog_state", "requested", "expected"),
+    ("servable", "expected"),
     [
-        ("missing", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("damaged", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("stale", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("missing-model", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("blank-model", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("invalid-model", "databricks-gpt-1-2-test", "system.ai.gpt-1-2-test"),
-        ("missing", "gpt-1.2-test", "system.ai.gpt-1-2-test"),
-        ("fresh", "unknown-model", "unknown-model"),
-        ("fresh", None, "system.ai.gpt-1-2-test"),
+        (
+            ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5"),
+            [
+                {
+                    "id": "system.ai.gpt-5-6-sol",
+                    "model": "system.ai.gpt-5-6-sol",
+                    "isDefault": True,
+                },
+                {"id": "system.ai.gpt-5-5", "model": "system.ai.gpt-5-5"},
+            ],
+        ),
+        ((), None),
     ],
 )
-def test_resolve_databricks_codex_model_catalog_miss_keeps_discovery(
-    _databricks_catalog: str,
+async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
     monkeypatch: pytest.MonkeyPatch,
-    catalog_state: str,
-    requested: str | None,
-    expected: str,
+    servable: tuple[str, ...],
+    expected: list[dict[str, object]] | None,
 ) -> None:
-    from types import SimpleNamespace
+    """A profile shape lists the workspace's models, default first; an empty listing is unknown."""
+    from omnigent.harnesses.codex_native import app_server
 
-    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
-    from omnigent.models import model_catalog_store
+    listing = Mock(return_value=servable)
+    monkeypatch.setattr(app_server, "databricks_profile_codex_models", listing)
+    codex_catalog = AsyncMock(side_effect=AssertionError("profile shapes skip Codex rows"))
+    monkeypatch.setattr(app_server, "codex_launch_catalog", codex_catalog)
 
-    path = model_catalog_store.catalog_path("codex-native", _databricks_catalog)
-    if catalog_state == "missing":
-        path.unlink()
-    elif catalog_state == "damaged":
-        path.write_text("not json")
-    elif catalog_state == "stale":
-        old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
-        os.utime(path, (old, old))
-    elif catalog_state.endswith("-model"):
-        row: dict[str, object] = {"id": "gpt-1.2-test"}
-        if catalog_state != "missing-model":
-            row["model"] = " " if catalog_state == "blank-model" else 123
-        model_catalog_store.write_catalog("codex-native", _databricks_catalog, [row])
-
-    credentials = Mock(return_value=SimpleNamespace(token="tok"))
-    discovery = Mock(return_value=("system.ai.gpt-1-2-test",))
-    monkeypatch.setattr(
-        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
-    )
-    monkeypatch.setattr(
-        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discovery
+    models = await app_server.codex_launch_models(
+        codex_path=sys.executable, launch=NativeCodexLaunch([], None, "prof")
     )
 
-    assert (
-        _resolve_databricks_codex_model(
-            "https://h.example.com", "prof", requested, codex_path=sys.executable
-        )
-        == expected
-    )
-    credentials.assert_called_once_with("prof")
-    discovery.assert_called_once_with("https://h.example.com", "tok")
-
-
-@pytest.mark.parametrize("changed", ["profile", "workspace", "host", "binary"])
-def test_resolve_databricks_codex_model_does_not_reuse_other_catalog(
-    _databricks_catalog: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    changed: str,
-) -> None:
-    from types import SimpleNamespace
-
-    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
-
-    profile = "other" if changed == "profile" else "prof"
-    host = (
-        "https://other.example.com"
-        if changed in {"workspace", "host"}
-        else "https://h.example.com"
-    )
-    profile_host = host if changed != "host" else "https://h.example.com"
-    (tmp_path / "databrickscfg").write_text(f"[{profile}]\nhost = {profile_host}\n")
-    codex_path = "/other/codex" if changed == "binary" else sys.executable
-    discovery = Mock(return_value=("system.ai.gpt-1-2-test",))
-    monkeypatch.setattr(
-        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
-        lambda profile: SimpleNamespace(token="tok"),
-    )
-    monkeypatch.setattr(
-        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discovery
-    )
-
-    assert (
-        _resolve_databricks_codex_model(
-            host, profile, "databricks-gpt-1-2-test", codex_path=codex_path
-        )
-        == "system.ai.gpt-1-2-test"
-    )
-    discovery.assert_called_once_with(host, "tok")
+    assert (models.rows if models is not None else None) == expected
+    assert models is None or models.stale is False
+    listing.assert_called_once_with("prof")
 
 
 def test_resolve_databricks_codex_model_matches_servable_ids(
