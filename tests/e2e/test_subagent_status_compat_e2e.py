@@ -278,6 +278,7 @@ async def test_subagent_idle_reporting_with_old_server(
                             "message": {
                                 "role": "assistant",
                                 "content": [{"type": "text", "text": text}],
+                                "stop_reason": "end_turn",
                             },
                         }
                     )

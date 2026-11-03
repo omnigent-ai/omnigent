@@ -1052,6 +1052,9 @@ Request body matches `SessionEventInput`:
                                   Optional fields: `response_id`,
                                   `background_task_count`, `background_tasks`,
                                   `blocked_on`, as for external_session_status.
+                                  `turn_completed: false` (the child is waiting
+                                  on a tool call) publishes nothing until the
+                                  parent has recorded the child's result.
                                   Returns `{queued: false}`. Activity resumes
                                   through external_session_status running.
                                   On an older server's explicit unknown-event

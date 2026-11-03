@@ -23,6 +23,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
+    _BACKGROUND_TASK_FORWARD_LIMIT,
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
@@ -32,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     HookReadResult,
     TranscriptReadResult,
     _display_text,
+    _normalize_background_task,
     _transcript_items_from_entry,
     _transcript_timestamp,
     compute_transcript_cumulative_cost,
@@ -649,6 +651,9 @@ class SubagentEntry:
         means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
+    :param turn_completed: Whether the child's latest transcript message ended
+        its turn, sent with idle observations so the server can keep a child
+        that is waiting on a tool call working. ``None`` until a message is read.
     """
 
     subagent_id: str
@@ -659,6 +664,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    turn_completed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -702,18 +708,29 @@ class _SubagentStatusCapability:
 
     supported: bool = True
 
-    async def post_idle(self, client: httpx.AsyncClient, *, session_id: str) -> None:
+    async def post_idle(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        turn_completed: bool | None = None,
+    ) -> None:
         """Post an idle observation, or skip it once an old server rejects the type.
 
         :param client: Omnigent HTTP client.
         :param session_id: Child session receiving the observation.
+        :param turn_completed: Whether the child's transcript shows its turn
+            ended; ``None`` omits the field.
         :raises httpx.HTTPError: For failures other than an unknown event type.
         """
         if not self.supported:
             return
+        data: dict[str, bool] = {"idle": True}
+        if turn_completed is not None:
+            data["turn_completed"] = turn_completed
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": "subagent.status", "data": {"idle": True}},
+            json={"type": "subagent.status", "data": data},
         )
         if resp.status_code == 400:
             try:
@@ -954,6 +971,17 @@ class _ForwardDedupeState:
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
+    # Background shells since the last ``Stop``: its count and detail, adjusted
+    # by transcript launches and finishes. Posted when an interrupt ends a turn,
+    # since Claude fires no ``Stop`` hook to carry its own count then.
+    background_task_count: int = 0
+    background_tasks: tuple[dict[str, object], ...] = ()
+    # Ids of counted shells, including ones the detail limit leaves out.
+    background_task_ids: frozenset[str] = frozenset()
+    background_tally_changed: bool = False
+    interrupted_turn_pending: bool = False
+    # Recent Bash call inputs by call id, naming the shell its launch result starts.
+    background_bash_calls: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1342,6 +1370,9 @@ async def forward_claude_transcript_to_session(
     session_event_batch_capability = _SessionEventBatchCapability()
     delta_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
+    # Children owed an idle after /clear or a fork; kept across rotation resets.
+    rotation_settles: dict[str, None] = {}
+    rotation_settle_retries = _PostRetryTracker()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1428,6 +1459,17 @@ async def forward_claude_transcript_to_session(
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
                         subagent_task = None
+                        rotation_settles.update(
+                            dict.fromkeys(
+                                await asyncio.to_thread(_rotated_subagents_to_settle, bridge_dir)
+                            )
+                        )
+                        await _settle_rotated_subagents(
+                            client,
+                            rotation_settles,
+                            subagent_status_capability,
+                            rotation_settle_retries,
+                        )
                         # Tell the superseded (old) conversation it was cleared:
                         # persist a notice linking to the rotated-to session and
                         # emit a live redirect event. Use the loop's ``session_id``
@@ -1486,6 +1528,17 @@ async def forward_claude_transcript_to_session(
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
                         subagent_task = None
+                        rotation_settles.update(
+                            dict.fromkeys(
+                                await asyncio.to_thread(_rotated_subagents_to_settle, bridge_dir)
+                            )
+                        )
+                        await _settle_rotated_subagents(
+                            client,
+                            rotation_settles,
+                            subagent_status_capability,
+                            rotation_settle_retries,
+                        )
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -1519,6 +1572,13 @@ async def forward_claude_transcript_to_session(
                         cost_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
+                    if rotation_settles:
+                        await _settle_rotated_subagents(
+                            client,
+                            rotation_settles,
+                            subagent_status_capability,
+                            rotation_settle_retries,
+                        )
                     if not external_session_id_mirrored:
                         external_session_id_mirrored = await _maybe_mirror_external_session_id(
                             client=client,
@@ -1571,6 +1631,14 @@ async def forward_claude_transcript_to_session(
                             compaction_retry_tracker=compaction_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
+                        )
+                        # Before the hook phase, so a ``Stop`` landing in this poll
+                        # still has the final word on the count.
+                        await _forward_interrupted_turn_tally(
+                            client,
+                            session_id=current_session_id,
+                            dedupe=dedupe,
+                            retry_tracker=status_retries,
                         )
                         hook_state = await _forward_available_status_events(
                             client=client,
@@ -1807,6 +1875,9 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            turn_completed=(
+                row.get("turn_completed") if isinstance(row.get("turn_completed"), bool) else None
+            ),
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1830,6 +1901,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "turn_completed": entry.turn_completed,
             }
             for entry in state.subagents.values()
         },
@@ -2316,9 +2388,16 @@ async def _forward_one_subagent(
     seen_source_ids = list(entry.seen_source_ids)
     seen = set(seen_source_ids)
     pending, safe_offset = _pending_items_from_records(result, seen, entry.byte_offset)
-    new_entry = entry
-    if safe_offset != entry.byte_offset:
-        new_entry = replace(entry, byte_offset=safe_offset)
+    new_entry = replace(
+        entry,
+        byte_offset=safe_offset,
+        turn_completed=(
+            entry.turn_completed
+            if result.latest_turn_completed is None
+            else result.latest_turn_completed
+        ),
+    )
+    if new_entry != entry:
         await checkpoint.put(new_entry)
 
     batches = await asyncio.to_thread(_partition_subagent_batches, pending)
@@ -2545,7 +2624,11 @@ async def _forward_one_subagent(
         return
     try:
         if desired_status == "idle":
-            await status_capability.post_idle(client, session_id=entry.child_conversation_id)
+            await status_capability.post_idle(
+                client,
+                session_id=entry.child_conversation_id,
+                turn_completed=new_entry.turn_completed,
+            )
         else:
             await post_external_session_status(
                 client,
@@ -4737,6 +4820,12 @@ async def _forward_available_status_events(
             )
             return durable
         retry_tracker.clear(retry_key)
+        _reset_background_tally(
+            dedupe,
+            count=0 if status == "failed" else record.background_task_count,
+            tasks=None if status == "failed" else record.background_tasks,
+            task_ids=() if status == "failed" else record.background_task_ids,
+        )
         if response_id is not None:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
@@ -4863,6 +4952,49 @@ async def _cancel_subagent_forward_task(
         return
     except Exception:
         _logger.exception("Claude child-history worker failed during cleanup")
+
+
+def _rotated_subagents_to_settle(bridge_dir: Path) -> list[str]:
+    """Return children of the rotated-away session that may still show as working."""
+    state = _read_subagent_forward_state(bridge_dir)
+    return [
+        entry.child_conversation_id
+        for entry in state.subagents.values()
+        if entry.child_conversation_id
+        and entry.last_status != "failed"
+        and not (entry.last_status == "idle" and entry.turn_completed is not False)
+    ]
+
+
+async def _settle_rotated_subagents(
+    client: httpx.AsyncClient,
+    pending: dict[str, None],
+    status_capability: _SubagentStatusCapability,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """Settle children of rotated-away sessions; their transcripts are no longer read."""
+    for child_id in list(pending):
+        retry_key = f"rotation-settle:{child_id}"
+        if retry_tracker.retry_delay_s(retry_key) is not None:
+            continue
+        try:
+            await status_capability.post_idle(client, session_id=child_id)
+        except httpx.HTTPError as exc:
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=child_id)
+            if decision.exhausted:
+                pending.pop(child_id, None)
+            _logger.warning(
+                "Could not settle claude-native sub-agent after session rotation; "
+                "child=%s attempt=%s exhausted=%s http_status=%s",
+                child_id,
+                decision.attempts,
+                decision.exhausted,
+                _http_status_for_log(exc),
+                extra={"session_id": child_id},
+            )
+            continue
+        retry_tracker.clear(retry_key)
+        pending.pop(child_id, None)
 
 
 def _promote_pending_settle(
@@ -5116,6 +5248,132 @@ async def _handle_compact_summary_item(
     # again as a spurious standalone boundary.
     await _mark_compaction_persisted(bridge_dir, seq, expect_completion_ack=True)
     return True
+
+
+_BACKGROUND_BASH_CALL_LIMIT = 16
+
+
+def _note_background_shell_signals(
+    item: ClaudeTranscriptItem,
+    dedupe: _ForwardDedupeState,
+    *,
+    ended_response_ids: tuple[str | None, ...],
+) -> None:
+    """
+    Fold one forwarded transcript item into the background-shell tally.
+
+    :param item: Transcript item the server accepted.
+    :param dedupe: Forwarder state holding the tally; mutated in place.
+    :param ended_response_ids: Turns whose ``Stop`` edge already posted. Their
+        launches are in Claude's own count, so they are not added again.
+    """
+    if item.item_type == "function_call":
+        call_id = item.data.get("call_id")
+        if item.data.get("name") != "Bash" or not isinstance(call_id, str):
+            return
+        try:
+            arguments = json.loads(str(item.data.get("arguments")))
+        except ValueError:
+            arguments = None
+        dedupe.background_bash_calls[call_id] = arguments if isinstance(arguments, dict) else {}
+        while len(dedupe.background_bash_calls) > _BACKGROUND_BASH_CALL_LIMIT:
+            dedupe.background_bash_calls.pop(next(iter(dedupe.background_bash_calls)))
+        return
+    if item.item_type == "function_call_output":
+        arguments = dedupe.background_bash_calls.pop(str(item.data.get("call_id")), {})
+        task_id = item.background_task_id
+        if (
+            task_id is None
+            or item.response_id in ended_response_ids
+            or task_id in dedupe.background_task_ids
+        ):
+            return
+        dedupe.background_task_count += 1
+        dedupe.background_task_ids |= {task_id}
+        detail = _normalize_background_task(
+            {**arguments, "id": task_id, "type": "shell", "status": "running"}
+        )
+        if detail is not None and len(dedupe.background_tasks) < _BACKGROUND_TASK_FORWARD_LIMIT:
+            dedupe.background_tasks = (*dedupe.background_tasks, detail)
+        dedupe.background_tally_changed = True
+        return
+    if item.item_type != "message" or item.data.get("role") != "user":
+        return
+    # Sub-agents also send task notifications; only counted shells lower the tally.
+    for task_id in set(item.finished_task_ids) & dedupe.background_task_ids:
+        dedupe.background_task_ids -= {task_id}
+        dedupe.background_tasks = tuple(
+            task for task in dedupe.background_tasks if task.get("id") != task_id
+        )
+        dedupe.background_task_count = max(0, dedupe.background_task_count - 1)
+        dedupe.background_tally_changed = True
+    # Any other user record opens a turn that settles the tally itself.
+    dedupe.interrupted_turn_pending = item.interrupts_turn
+
+
+def _reset_background_tally(
+    dedupe: _ForwardDedupeState,
+    *,
+    count: int,
+    tasks: Sequence[dict[str, object]] | None,
+    task_ids: Sequence[str],
+) -> None:
+    """Adopt the count, detail and shell ids a turn-end hook edge delivered."""
+    dedupe.background_task_count = count
+    dedupe.background_tasks = tuple(tasks or ())
+    dedupe.background_task_ids = frozenset(task_ids)
+    dedupe.background_tally_changed = False
+    dedupe.interrupted_turn_pending = False
+
+
+async def _forward_interrupted_turn_tally(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """
+    Post the background-shell tally on the ``idle`` edge of an interrupted turn.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param dedupe: Forwarder state holding the tally; cleared once delivered.
+    :param retry_tracker: Retry/backoff tracker for status posts.
+    """
+    if not dedupe.interrupted_turn_pending:
+        return
+    if not dedupe.background_tally_changed:
+        dedupe.interrupted_turn_pending = False
+        return
+    retry_key = "interrupted-turn-tally"
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return
+    try:
+        await post_external_session_status(
+            client,
+            session_id=session_id,
+            status="idle",
+            background_task_count=dedupe.background_task_count,
+            background_tasks=list(dedupe.background_tasks) or None,
+        )
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
+        _logger.warning(
+            "Failed to forward Claude background-shell tally; session=%s attempt=%s "
+            "exhausted=%s http_status=%s",
+            session_id,
+            decision.attempts,
+            decision.exhausted,
+            _http_status_for_log(exc),
+            extra={"session_id": session_id},
+        )
+        if not decision.exhausted:
+            return
+    else:
+        retry_tracker.clear(retry_key)
+    dedupe.background_tally_changed = False
+    dedupe.interrupted_turn_pending = False
 
 
 async def _forward_available_items(
@@ -5405,6 +5663,7 @@ async def _forward_available_items(
             return updated
         retry_tracker.clear(retry_key)
         await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
+        _note_background_shell_signals(item, dedupe, ended_response_ids=ended_response_ids)
         seen.add(item.source_id)
         seen_source_ids.append(item.source_id)
         updated = replace(
