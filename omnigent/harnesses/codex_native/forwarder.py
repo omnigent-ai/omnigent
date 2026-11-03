@@ -6304,13 +6304,13 @@ async def _apply_child_resume(
         if isinstance(turns, list) and turns and isinstance(turns[-1], dict):
             turn = turns[-1]
             status = _omnigent_status_from_resume_turn(turn)
-            if status is not None:
-                forwarder_state.child_activity.note(
-                    child_thread_id, active=False, turn_id=_turn_id_from_payload(turn)
-                )
-            elif _turn_status_from_params({"turn": turn}) == "inProgress":
+            if status == "running":
                 forwarder_state.child_activity.note(
                     child_thread_id, active=True, turn_id=_turn_id_from_payload(turn)
+                )
+            elif status is not None:
+                forwarder_state.child_activity.note(
+                    child_thread_id, active=False, turn_id=_turn_id_from_payload(turn)
                 )
     forwarder_state.note_child_thread_subscribed(child_thread_id)
 
