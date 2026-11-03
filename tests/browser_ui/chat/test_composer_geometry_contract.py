@@ -316,6 +316,7 @@ def test_live_primary_actions_and_stop_remain_reachable(
     """Touch/native target growth preserves hit areas and Stop through active-turn reflow."""
     chat = chat_session_contract
     enlarged = bool(native_kind) or touch
+    compact_size = 32 if viewport["width"] < 768 else 28
     if native_kind:
         page.add_init_script(f"window.omnigentNative = {{kind: '{native_kind}'}};")
     chat.set_catalog(
@@ -363,14 +364,11 @@ def test_live_primary_actions_and_stop_remain_reachable(
     model = page.get_by_test_id("composer-config-gear")
     send = page.get_by_role("button", name="Send", exact=True)
     if not enlarged:
-        for control in (add, send):
+        for control in (add, permission, model, send):
             bounds = box(control)
-            assert bounds["width"] == pytest.approx(
-                32 if viewport["width"] < 768 else 28, abs=TOLERANCE
-            )
-            assert bounds["height"] == pytest.approx(
-                32 if viewport["width"] < 768 else 28, abs=TOLERANCE
-            )
+            assert bounds["height"] == pytest.approx(compact_size, abs=TOLERANCE)
+            if control is add or control is send:
+                assert bounds["width"] == pytest.approx(compact_size, abs=TOLERANCE)
     for control in (add, permission, model, send):
         assert_action(control)
     if touch:
@@ -390,6 +388,18 @@ def test_live_primary_actions_and_stop_remain_reachable(
     menu.press("Escape")
     expect(menu).not_to_be_visible()
     expect(add).to_be_focused()
+    if not touch:
+        for trigger, menu_id in (
+            (permission, "composer-permission-menu"),
+            (model, "composer-agent-menu"),
+        ):
+            trigger.focus()
+            trigger.press("Enter")
+            popup = page.get_by_test_id(menu_id)
+            expect(popup).to_be_visible()
+            popup.press("Escape")
+            expect(popup).not_to_be_visible()
+            expect(trigger).to_be_focused()
 
     page.get_by_label("Message the agent").fill("")
     chat.emit_busy("touch-target-turn")
@@ -397,13 +407,22 @@ def test_live_primary_actions_and_stop_remain_reachable(
     expect(stop).to_be_visible()
     for control in (add, permission, model, stop):
         assert_action(control)
+        if not enlarged:
+            assert box(control)["height"] == pytest.approx(compact_size, abs=TOLERANCE)
+    if not enlarged:
+        assert box(stop)["width"] == pytest.approx(compact_size, abs=TOLERANCE)
     for other in (add, permission, model):
         assert_no_overlap(box(other), box(stop))
     with page.expect_response(
-        lambda response: response.url.endswith(f"/{chat.session_id}/events")
+        lambda response: (
+            response.url.endswith(f"/{chat.session_id}/events")
+            and response.request.method == "POST"
+        )
     ):
         if touch:
             stop.tap(position={"x": box(stop)["width"] / 2, "y": box(stop)["height"] - 3})
+        elif viewport == DESKTOP:
+            stop.press("Enter")
         else:
             stop.click()
     assert len(chat.event_posts) == 1
