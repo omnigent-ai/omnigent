@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -179,6 +179,10 @@ describe("full skill descriptions", () => {
   const commands = { "/help": "Show help", "/triage": triage, "/review": "Review code" };
   const description = (name: string) => screen.getByTestId(`slash-menu-description-${name}`);
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   /** Make a row's one-line description report overflow, as layout would when it is cut off. */
   function overflowDescription(name: string, scrollWidth: number) {
     const element = description(name);
@@ -201,16 +205,20 @@ describe("full skill descriptions", () => {
     expect(description("review")).not.toHaveClass("truncate");
   });
 
-  it("shows a cut-off description in full in a hover tooltip after a short delay", async () => {
+  it("shows a cut-off description in full in a hover tooltip after a short delay", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
     overflowDescription("triage", 900);
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
     // A pointer passing over rows shouldn't flash tooltips; the menu waits 400 ms.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 200);
+    act(() => {
+      vi.advanceTimersByTime(399);
     });
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
-    const tooltip = await screen.findByTestId("slash-menu-tooltip-triage", {}, { timeout: 2000 });
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    const tooltip = screen.getByTestId("slash-menu-tooltip-triage");
     expect(tooltip).toHaveTextContent(triage);
     expect(tooltip).toHaveClass("max-h-64", "overflow-y-auto", "items-start");
   });
