@@ -223,6 +223,15 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
     stage: "Settings",
     reason: "The agent, model or workspace is invalid. Edit the automation to fix it.",
   },
+  permission_harness_unresolved: {
+    stage: "Permissions",
+    reason: "Couldn't load the agent's permission settings. Restore access to the agent and retry.",
+  },
+  permission_mode_unsupported: {
+    stage: "Permissions",
+    reason:
+      "The saved permission isn't supported by this agent. Edit the automation to change or clear it.",
+  },
   not_found: {
     stage: "Settings",
     reason: "The agent or workspace no longer exists. Edit the automation to fix it.",
