@@ -203,7 +203,11 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
-import { DEFAULT_FILE_VIEW_PREFERENCES, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import {
+  DEFAULT_FILE_VIEW_PREFERENCES,
+  readFileViewPreferences,
+  writeFileViewPreferences,
+} from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
@@ -254,6 +258,8 @@ interface RenderProps {
   initialSearch?: string;
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
+  onCloseTab?: () => void;
+  closeTabRef?: { current: (() => void) | null };
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
@@ -279,6 +285,8 @@ function viewerTree({
   path = "file1.py",
   initialSearch = "",
   onClose = vi.fn(),
+  onCloseTab,
+  closeTabRef,
   sort,
   onNavigateTo,
 }: RenderProps = {}) {
@@ -299,6 +307,8 @@ function viewerTree({
           conversationId="conv_1"
           path={path}
           onClose={onClose}
+          onCloseTab={onCloseTab}
+          closeTabRef={closeTabRef}
           sort={sort}
           onNavigateTo={onNavigateTo}
         />
@@ -604,6 +614,36 @@ describe("FileViewer prev/next navigation order", () => {
     { path: "c.py", bytes: 1, modified_at: 200, name: "c.py", status: "modified" as const },
   ];
 
+  it("navigates in repository order, sorts within each repo, and puts other files last", async () => {
+    const files = [
+      { ...changedFiles[0], path: "web/a.py", repository_root: "web" },
+      { ...changedFiles[1], path: "api/b.py", repository_root: "api" },
+      { ...changedFiles[0], path: "api/a.py", repository_root: "api" },
+      changedFiles[2],
+    ];
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () =>
+        ({ data: { available: true, data: files } }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+        const onNavigateTo = vi.fn();
+        renderViewer({ open: true, path: "api/a.py", sort: "recent", onNavigateTo });
+        const prev = screen.getByRole("button", { name: "Previous file" });
+        expect(prev.parentElement?.querySelector("span.tabular-nums")?.textContent).toBe("2/4");
+        fireEvent.click(prev);
+        expect(onNavigateTo).toHaveBeenLastCalledWith("api/b.py");
+        fireEvent.click(screen.getByRole("button", { name: "Next file" }));
+        expect(onNavigateTo).toHaveBeenLastCalledWith("web/a.py");
+        expect(files.map((file) => file.path)).toEqual([
+          "web/a.py",
+          "api/b.py",
+          "api/a.py",
+          "c.py",
+        ]);
+      },
+    );
+  });
+
   // alpha: [a, b, c] → b is 2nd → "2/3". recent: [b, c, a] → b is 1st → "1/3".
   it.each([
     { sort: "alpha" as const, expected: "2/3" },
@@ -836,6 +876,31 @@ describe("FileViewer URL sync — diff param", () => {
       expect(screen.getByText("Loading diff…")).toBeInTheDocument();
     } finally {
       // Restore the default (payload present) so later tests render the diff.
+      vi.mocked(useFileDiff).mockReturnValue({
+        data: { before: "old", after: "new" },
+      } as ReturnType<typeof useFileDiff>);
+    }
+  });
+
+  it.each([
+    { baseline_state: "unknown", after: "current" },
+    { baseline_state: "unknown", after: null },
+    { baseline_state: undefined, after: "new file" },
+  ] as const)("handles a missing original with $baseline_state and $after", async (payload) => {
+    vi.mocked(useFileDiff).mockReturnValue({
+      data: { before: null, ...payload },
+    } as ReturnType<typeof useFileDiff>);
+    try {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+      if (payload.baseline_state === "unknown") {
+        expect(screen.getByText("Original content unavailable")).toBeInTheDocument();
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      } else {
+        expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+        expect(screen.queryByText("Original content unavailable")).toBeNull();
+      }
+    } finally {
       vi.mocked(useFileDiff).mockReturnValue({
         data: { before: "old", after: "new" },
       } as ReturnType<typeof useFileDiff>);
@@ -1770,24 +1835,35 @@ describe("FileViewer view-settings menu", () => {
     },
   );
 
-  it("offers Wrap lines for a deleted file only in the diff view", async () => {
+  it("shows deleted files in diff without changing the global preference or fetching missing content", async () => {
     const changed = vi.mocked(useWorkspaceChangedFiles);
     const original = changed.getMockImplementation();
     const entry = { path: "file1.py", name: "file1.py", bytes: 0, modified_at: null };
     changed.mockReturnValue({
-      data: { available: true, data: [{ ...entry, status: "deleted" }] },
+      data: {
+        available: true,
+        data: [
+          { ...entry, status: "modified" },
+          { ...entry, path: "deleted.py", name: "deleted.py", status: "deleted" },
+        ],
+      },
     } as ReturnType<typeof useWorkspaceChangedFiles>);
     try {
-      const first = render(viewerTree({ open: true }));
+      const { rerender } = render(viewerTree({ open: true }));
+      expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+      rerender(viewerTree({ open: true, path: "deleted.py" }));
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(useFileContent).toHaveBeenLastCalledWith("conv_1", null, { visible: true });
+      expect(screen.queryByRole("button", { name: /Exit diff view|Show diff/ })).toBeNull();
+      expect(readFileViewPreferences().diffActive).toBe(false);
       openSettingsMenu();
       expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
-      expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
-      first.unmount();
-
-      render(viewerTree({ open: true, initialSearch: "diff=1" }));
-      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
-      openSettingsMenu();
       expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+      rerender(viewerTree({ open: true }));
+      expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(readFileViewPreferences().diffActive).toBe(false);
     } finally {
       changed.mockImplementation(original!);
     }
@@ -2611,4 +2687,39 @@ it("keeps grid file viewers independent of shared URL parameters and copies a se
   expect(copied.pathname).toBe("/c/conv_1");
   expect(copied.searchParams.get("file")).toBe("file1.py");
   expect(copied.searchParams.has("comment")).toBe(false);
+});
+
+describe("FileViewer Close Tab", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  it("retains an unsaved buffer when closing is cancelled, and closes only after confirmation", () => {
+    const closeTabRef: { current: (() => void) | null } = { current: null };
+    const onCloseTab = vi.fn();
+    const { unmount } = renderViewer({ open: true, path: "file1.md", closeTabRef, onCloseTab });
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    act(() => closeTabRef.current?.());
+    expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
+    expect(onCloseTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(onCloseTab).not.toHaveBeenCalled();
+    expect(draft).toHaveValue("Unsaved draft");
+
+    act(() => closeTabRef.current?.());
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onCloseTab).toHaveBeenCalledOnce();
+    unmount();
+    expect(closeTabRef.current).toBeNull();
+  });
+
+  it("closes a clean file without confirmation", () => {
+    const closeTabRef: { current: (() => void) | null } = { current: null };
+    const onCloseTab = vi.fn();
+    renderViewer({ open: true, closeTabRef, onCloseTab });
+    act(() => closeTabRef.current?.());
+    expect(onCloseTab).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
 });

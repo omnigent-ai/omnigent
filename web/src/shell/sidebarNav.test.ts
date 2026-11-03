@@ -11,12 +11,15 @@ import {
   getConversationIconKind,
   groupConversations,
   getConversationAgentType,
+  customSortOrder,
   migratePinnedConversationIds,
+  moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
   sessionsListAcceptsDrop,
   sortConversations,
+  startCustomOrder,
   STATUS_BUCKETS,
   statusBucket,
   dateBucket,
@@ -790,4 +793,93 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   // With the pointer outside, arrival order still must not show through.
   expect(first).toEqual(["c", "b", "a"]);
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
+});
+
+describe("Custom order", () => {
+  // Whole-second server timestamps, as the API returns them.
+  const row = (id: string, createdAt: number, updatedAt = createdAt): Conversation => ({
+    ...conversation(id, id, new Date(0)),
+    created_at: createdAt,
+    updated_at: updatedAt,
+  });
+  const ids = (rows: Conversation[]) => rows.map((c) => c.id);
+
+  it("starts from the automatic order on screen at the newest server time", () => {
+    const rows = [row("a", 10, 300), row("b", 20, 100), row("c", 30, 200)];
+    expect(startCustomOrder("updated", rows, null, null)).toEqual({
+      base: "updated",
+      since: 300,
+      ids: ["a", "c", "b"],
+    });
+    expect(startCustomOrder("created", rows, null, null).ids).toEqual(["c", "b", "a"]);
+    // A hover-frozen key is what the viewer sees, so it is what Custom keeps.
+    expect(startCustomOrder("updated", rows, null, new Map([["b", 400]])).ids).toEqual([
+      "b",
+      "a",
+      "c",
+    ]);
+    expect(startCustomOrder("created", [], null, null)).toEqual({
+      base: "created",
+      since: 0,
+      ids: [],
+    });
+  });
+
+  it("fixes saved rows, puts new sessions above them and history below", () => {
+    const order = customSortOrder({ base: "updated", since: 100, ids: ["s1", "s2"] });
+    const rows = [
+      row("history-tie", 100),
+      row("s2", 1, 900),
+      row("history", 50, 80),
+      row("new-older", 101, 999),
+      row("s1", 2, 3),
+      row("new-newer", 150),
+      row("history-active", 40, 999),
+    ];
+    expect(ids(sortConversations(rows, null, null, "updated_at", order))).toEqual([
+      "new-newer",
+      "new-older",
+      "s1",
+      "s2",
+      "history-active",
+      "history-tie",
+      "history",
+    ]);
+  });
+
+  it("moves within a list and saves only through the deepest row it touches", () => {
+    const order = { base: "updated" as const, since: 100, ids: ["s1", "s2", "s3"] };
+    // s2 is saved but not loaded; h1..h3 are history loaded after Custom started.
+    const rows = [
+      row("n1", 200),
+      row("s1", 1),
+      row("s3", 3),
+      ...["h1", "h2", "h3"].map((id, index) => row(id, 50 - index, 90 - index)),
+    ];
+    expect(moveCustomOrder(order, rows, "s1", "s3", null, null)?.ids).toEqual([
+      "n1",
+      "s2",
+      "s3",
+      "s1",
+    ]);
+    expect(moveCustomOrder(order, rows, "s3", "n1", null, null)?.ids).toEqual([
+      "s3",
+      "n1",
+      "s1",
+      "s2",
+    ]);
+    const deep = moveCustomOrder(order, rows, "h2", "s1", null, null)!;
+    expect(deep.ids).toEqual(["n1", "h2", "s1", "s2", "s3", "h1"]);
+    // The saved order renders exactly as moved; unsaved h3 keeps following Updated.
+    expect(ids(sortConversations(rows, null, null, "updated_at", customSortOrder(deep)))).toEqual([
+      "n1",
+      "h2",
+      "s1",
+      "s3",
+      "h1",
+      "h3",
+    ]);
+    expect(moveCustomOrder(order, rows, "s1", "s1", null, null)).toBeNull();
+    expect(moveCustomOrder(order, rows, "s1", "deleted", null, null)).toBeNull();
+  });
 });
