@@ -172,6 +172,7 @@ import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
+  parseSystemMessage,
   taskNotificationMarkerContent,
   withoutAttachedMarkers,
 } from "@/lib/systemMessage";
@@ -2720,6 +2721,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
+    // A reply already streaming belongs to an earlier input, not this send.
+    const sentWhileIdle =
+      !alreadyStreaming && !sentMidTurn && !targetState?.blocks.some(isLiveProvisionalBlock);
     if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
@@ -2773,7 +2777,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
                 ...(sentMidTurn ? { sentMidTurn } : {}),
-                ...(!alreadyStreaming && !sentMidTurn ? { sentWhileIdle: true } : {}),
+                ...(sentWhileIdle ? { sentWhileIdle } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -6599,6 +6603,30 @@ function makeLiveTextBlock(
   };
 }
 
+const TURN_NEUTRAL_BLOCK_TYPES: ReadonlySet<AnyBlock["type"]> = new Set([
+  "response_start",
+  "response_end",
+  "routing_decision",
+  "compaction_loading",
+  "file",
+]);
+
+/** Whether the newest committed input is one this client did not send, still without a reply. */
+function foreignInputAwaitsReply(blocks: AnyBlock[]): boolean {
+  for (let at = blocks.length - 1; at >= 0; at -= 1) {
+    const block = blocks[at]!;
+    if (block.type === "user_message") {
+      // A promoted local send keeps its temp id; an interrupt record closes its turn.
+      return (
+        block.stableKey === undefined &&
+        parseSystemMessage(messageContentText(block.content))?.kind !== "interrupted"
+      );
+    }
+    if (!TURN_NEUTRAL_BLOCK_TYPES.has(block.type)) return false;
+  }
+  return false;
+}
+
 /**
  * Fold one streamed chunk into its in-flight preview block in `blocks`.
  *
@@ -6631,10 +6659,20 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: n
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
       // Deltas outrun the transcript, so the send that started this turn may
       // still be pending; the preview must render below it.
-      const startingSend = s.pendingUserMessages.find((p) => p.sentWhileIdle && !p.initialDraft);
+      const idleSend = s.pendingUserMessages.find((p) => p.sentWhileIdle && !p.initialDraft);
+      // Another client's or the terminal's input still owed a reply owns this turn instead.
+      const turnOwnedByCommittedInput = idleSend !== undefined && foreignInputAwaitsReply(s.blocks);
+      const startingSend = turnOwnedByCommittedInput ? undefined : idleSend;
       const preview = makeLiveTextBlock(itemId, delta, responseId, index);
       return {
         ...startupPatch,
+        ...(turnOwnedByCommittedInput
+          ? {
+              pendingUserMessages: s.pendingUserMessages.map((p) =>
+                p.sentWhileIdle ? { ...p, sentWhileIdle: false } : p,
+              ),
+            }
+          : {}),
         blocks: [
           ...s.blocks,
           startingSend ? { ...preview, answersPendingSend: startingSend.tempId } : preview,

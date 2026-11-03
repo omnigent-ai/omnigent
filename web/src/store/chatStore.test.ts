@@ -17394,6 +17394,133 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
+  /** A `session.input.consumed` frame committing one user-role text item. */
+  function inputConsumed(itemId: string, text: string): string {
+    return sse("session.input.consumed", {
+      data: {
+        item_id: itemId,
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text }] },
+      },
+    });
+  }
+
+  it.each([
+    ["before its reply streams", false],
+    ["while its reply streams", true],
+  ])(
+    "keeps another client's unanswered message and its reply above a send made %s",
+    async (_label, replyStartedBeforeSend) => {
+      useChatStore.setState({
+        conversationId: "conv_live_order_owner",
+        blocks: [],
+        isNativeTerminalSession: true,
+        abortController: new AbortController(),
+      });
+      const { sink, controller } = startPump("conv_live_order_owner");
+      sink.push(inputConsumed("item_other_user", "other question"));
+      if (replyStartedBeforeSend) sink.push(nativeDelta("m_other_1", 0, "other answer", true));
+      await tick();
+      await useChatStore.getState().send("my question", "agent_xyz");
+
+      sink.push(
+        sse("session.status", {
+          conversation_id: "conv_live_order_owner",
+          status: "running",
+          response_id: null,
+        }),
+      );
+      if (!replyStartedBeforeSend) sink.push(nativeDelta("m_other_1", 0, "other answer", true));
+      await tick();
+      expect(renderedTranscript()).toEqual([
+        { role: "user", text: "other question" },
+        { role: "assistant", text: "other answer" },
+        { role: "user", text: "my question" },
+      ]);
+
+      sink.push(messageDone("ci_other_1", "resp_other", "other answer", "m_other_1"));
+      sink.push(nativeDelta("m_other_2", 0, " continued", true));
+      await tick();
+      const expected = [
+        { role: "user", text: "other question" },
+        { role: "assistant", text: "other answer continued" },
+        { role: "user", text: "my question" },
+      ];
+      expect(renderedTranscript()).toEqual(expected);
+
+      sink.push(inputConsumed("item_my_user", "my question"));
+      await tick();
+      expect(renderedTranscript()).toEqual(expected);
+
+      controller.abort();
+    },
+  );
+
+  it("keeps the next question above its early reply when the previous reply landed before its ack", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_order_late_ack",
+      blocks: [],
+      isNativeTerminalSession: true,
+      abortController: new AbortController(),
+    });
+    const { sink, controller } = startPump("conv_live_order_late_ack");
+    const status = (value: "running" | "idle") =>
+      sse("session.status", {
+        conversation_id: "conv_live_order_late_ack",
+        status: value,
+        response_id: null,
+      });
+    await useChatStore.getState().send("first question", "agent_xyz");
+    sink.push(status("running"));
+    sink.push(nativeDelta("m_1", 0, "first answer", true));
+    sink.push(messageDone("ci_1", "resp_1", "first answer", "m_1"));
+    sink.push(inputConsumed("item_first_user", "first question"));
+    sink.push(status("idle"));
+    await tick();
+
+    await useChatStore.getState().send("second question", "agent_xyz");
+    sink.push(status("running"));
+    sink.push(nativeDelta("m_2", 0, "second answer", true));
+    await tick();
+    expect(renderedTranscript().slice(-2)).toEqual([
+      { role: "user", text: "second question" },
+      { role: "assistant", text: "second answer" },
+    ]);
+
+    controller.abort();
+  });
+
+  it("keeps a background-task wake's reply above a send made just before the wake", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_order_wake",
+      blocks: itemsToBlocks([
+        userMessage("resp_prev", "earlier question"),
+        assistantMessage("resp_prev", "earlier answer"),
+      ]),
+      isNativeTerminalSession: true,
+      abortController: new AbortController(),
+    });
+    const { sink, controller } = startPump("conv_live_order_wake");
+    await useChatStore.getState().send("my question", "agent_xyz");
+    sink.push(inputConsumed("item_wake", "[System: background task bt_1 completed]"));
+    sink.push(nativeDelta("m_wake", 0, "wake answer", true));
+    await tick();
+    const expected = [
+      { role: "user", text: "earlier question" },
+      { role: "assistant", text: "earlier answer" },
+      { role: "user", text: "[System: background task bt_1 completed]" },
+      { role: "assistant", text: "wake answer" },
+      { role: "user", text: "my question" },
+    ];
+    expect(renderedTranscript()).toEqual(expected);
+
+    sink.push(inputConsumed("item_my_user", "my question"));
+    await tick();
+    expect(renderedTranscript()).toEqual(expected);
+
+    controller.abort();
+  });
+
   it("drops an unfinalized provisional on response_end (interrupt / drop)", async () => {
     useChatStore.setState({
       conversationId: "conv_live5",
