@@ -917,10 +917,10 @@ describe("BlockRenderer dispatch", () => {
     });
 
     it("checks a long blank run for a backward reference in linear time", () => {
-      const blankRun = "\n".repeat(50_000);
+      const blankRun = "\n".repeat(100_000);
       const start = performance.now();
       expect(pointsBackward(`Report:${blankRun}x`)).toBe(false);
-      expect(pointsBackward(`Report:${" \n".repeat(25_000)}x`)).toBe(false);
+      expect(pointsBackward(`Report:${" \n".repeat(50_000)}x`)).toBe(false);
       expect(pointsBackward(`Report:${blankRun}Above is the full log.`)).toBe(true);
       expect(performance.now() - start).toBeLessThan(1000);
     });
@@ -959,6 +959,24 @@ describe("BlockRenderer dispatch", () => {
       expect(within(foldBody).getByText("second output")).toBeVisible();
       expect(foldBody.contains(pinned)).toBe(false);
       expect(pinned).toBeVisible();
+    });
+
+    it("shows the output an answer points back to once in a fold that starts open", () => {
+      const items: RenderItem[] = [
+        tool(1, "Bash", "the report"),
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" defaultExpanded />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      expect(screen.getAllByText("the report")).toHaveLength(1);
+      expect(screen.getByText("the report")).toBeVisible();
     });
 
     it("finds the output an answer points back to past a visible dispatch card", () => {
@@ -1035,6 +1053,53 @@ describe("BlockRenderer dispatch", () => {
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
     });
+
+    it.each([
+      ["commentary", true],
+      ["final_answer", false],
+    ] as const)(
+      "with a %s message before an outputless run, shows the earlier output: %s",
+      (phase, revealed) => {
+        const items: RenderItem[] = [
+          tool(1, "shell", "REPORT"),
+          { kind: "text", itemId: "m0", text: "Checking the services.", final: true, phase },
+          tool(2, "shell", "  \n"),
+          {
+            kind: "text",
+            itemId: "m1",
+            text: "The output is above.",
+            final: true,
+            phase: "final_answer",
+          },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        const folds = screen.getAllByRole("button", { name: "Worked" });
+        expect(folds).toHaveLength(2);
+        for (const fold of folds) expect(fold).toHaveAttribute("aria-expanded", "false");
+        if (!revealed) {
+          expect(screen.queryByText("REPORT")).toBeNull();
+          return;
+        }
+        const pinned = screen.getByText("REPORT");
+        expect(
+          folds[1]!.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(
+          pinned.compareDocumentPosition(screen.getByText("The output is above.")) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+
+        fireEvent.click(folds[0]!);
+        const firstRun = screen.getAllByTestId("turn-worked-fold")[0]!;
+        fireEvent.click(within(firstRun).getByText("Ran 1 shell command"));
+        fireEvent.click(within(firstRun).getByRole("button", { name: "Shell" }));
+        expect(within(firstRun).getByText("REPORT")).toBeVisible();
+      },
+    );
 
     describe("with foldNarration", () => {
       it("folds narration and work behind one row, leaving the last message", () => {

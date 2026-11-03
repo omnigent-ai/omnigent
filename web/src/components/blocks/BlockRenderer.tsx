@@ -619,19 +619,29 @@ export function pointsBackward(text: string): boolean {
 
 type ToolItem = Extract<RenderItem, { kind: "tool" }>;
 
-/** The latest output in the work run before a message that points back to it. */
+/** The latest output since the previous answer, before a message that points back to it. */
 function referencedOutputTool(segments: TurnSegment[], index: number): ToolItem | undefined {
   const segment = segments[index];
-  // Exempt cards stay visible, so the hidden output can sit above them.
-  const previous = segments.slice(0, index).findLast((earlier) => earlier.kind !== "exempt");
-  if (previous?.kind !== "work" || segment?.kind !== "text") return undefined;
+  if (segment?.kind !== "text") return undefined;
   if (!segment.items.some((item) => item.kind === "text" && pointsBackward(item.text))) {
     return undefined;
   }
-  return previous.items.findLast(
-    (item): item is ToolItem =>
-      item.kind === "tool" && !isTrailingWrapup(item) && !!item.output?.trim(),
-  );
+  // Visible cards, commentary, and outputless runs can sit between the output and the answer.
+  for (const earlier of segments.slice(0, index).reverse()) {
+    if (earlier.kind === "exempt") continue;
+    if (earlier.kind === "text") {
+      if (earlier.items.every((item) => hasMessagePhase(item) && item.phase === "commentary")) {
+        continue;
+      }
+      return undefined;
+    }
+    const output = earlier.items.findLast(
+      (item): item is ToolItem =>
+        item.kind === "tool" && !isTrailingWrapup(item) && !!item.output?.trim(),
+    );
+    if (output) return output;
+  }
+  return undefined;
 }
 
 function hasMessagePhase(item: RenderItem): item is Extract<RenderItem, { kind: "text" }> {
