@@ -15086,6 +15086,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
     expect(pump.bound.get().status).toBe("idle");
+    expect(pump.bound.get().sendLatchedAt).toBeNull();
     expect(pump.bound.get().sessionStatus).toBe("idle");
     expect(pump.sinks).toHaveLength(2);
 
@@ -15094,7 +15095,12 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   it("keeps a fresh send latch when the snapshot predates its turn", async () => {
     const pump = await startMissedEventPump("conv_fresh_latch", "idle");
-    pump.bound.set({ pendingUserMessages: [], activeResponse: null, sessionStatus: "idle" });
+    pump.bound.set({
+      pendingUserMessages: [],
+      activeResponse: null,
+      sessionStatus: "idle",
+      sendLatchedAt: Date.now(),
+    });
 
     await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
@@ -15108,7 +15114,12 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   it("keeps a fresh send latch after the previous turn's idle edge was missed", async () => {
     const id = "conv_fresh_latch_after_missed_idle";
     const pump = await startMissedEventPump(id, "idle");
-    pump.bound.set({ pendingUserMessages: [] });
+    const previousLatch = Date.now() - 1_000;
+    pump.bound.set({
+      pendingUserMessages: [],
+      sendLatchedAt: previousLatch,
+      sendLatchSeenRunning: previousLatch,
+    });
     pump.sinks[0]!.push(
       sse("response.completed", { id: "resp_live", status: "completed", output: [] }),
     );
@@ -15130,6 +15141,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     const latchedAt = pump.bound.get().sendLatchedAt;
     expect(latchedAt).not.toBeNull();
+    expect(pump.bound.get().sendLatchSeenRunning).toBe(previousLatch);
     await advanceWithHeartbeats(
       () => pump.sinks.at(-1)!,
       2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,

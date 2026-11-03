@@ -5421,6 +5421,8 @@ function reconnectStatusPatch(
     patch.status = "idle";
   } else if (snapshotEnded && latchedTurnSeenBefore(latchBeforeFetch, s)) {
     patch.status = "idle";
+    patch.sendLatchedAt = null;
+    patch.sendLatchSeenRunning = null;
   } else if (session.status === "waiting") {
     // Turn ended, background work remains. Finalize a still-streaming response
     // and free the local send lifecycle so the composer dispatches a new turn.
@@ -5582,7 +5584,7 @@ async function reconcileActiveSessionStatus(
       ? current.activeResponse.responseId
       : `latch:${current.sendLatchedAt}`;
   const recycleForTurn = turnEnded && !recovery.recycledTurnKeys.has(turnKey);
-  // The reconnect reconciles status too; its in-flight drop needs the turn still streaming.
+  // Skip the patch: the reconnect drops in-flight blocks, then its backfill settles status.
   if ((recycleForTurn || consumedPendingIds.length > 0) && recovery.recycleStream()) {
     if (recycleForTurn) recovery.recycledTurnKeys.add(turnKey);
     for (const pendingId of consumedPendingIds) recovery.revealedPendingIds.add(pendingId);
