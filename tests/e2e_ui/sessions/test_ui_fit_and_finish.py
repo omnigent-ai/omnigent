@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from playwright.sync_api import Page, expect
 
 
@@ -15,7 +17,11 @@ def test_keyboard_shortcuts_use_grouped_settings_cards(page: Page, live_server: 
     expect(general).to_be_visible()
     card = general.locator("xpath=..").locator("ul")
     expect(card).to_be_visible()
-    expect(card.get_by_text("Start a new session", exact=True)).to_be_visible()
+    new_session = card.get_by_text("Start a new session", exact=True)
+    expect(new_session).to_be_visible()
+    expect(new_session.locator("xpath=..").locator("kbd")).to_have_text(
+        ["⌘", "⇧", "O"] if sys.platform == "darwin" else ["Ctrl", "Shift", "O"]
+    )
     expect(card.get_by_text("Show keyboard shortcuts", exact=True)).to_be_visible()
 
     geometry = card.evaluate(

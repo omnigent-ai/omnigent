@@ -1,18 +1,19 @@
-// Tests for the Scheduled tasks page (`/tasks`): list rendering, the
-// Active/Paused filter + search, the Paused badge/dimming, the New automation
-// manual create action, and the pause/delete row actions dispatching the
-// mutation hooks.
-//
-// The scheduled-tasks hooks are mocked at their seam; the create dialog is
-// stubbed to a marker so we assert the page opens it without exercising its
-// internals (covered by its own tests).
+// Tests for /tasks: lists, filters, gallery tabs, and row actions.
+// Scheduled-task hooks are mocked; the creation dialog exposes its seed props and close action.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { TasksPage } from "./TasksPage";
+import { useViewerId } from "@/hooks/useViewerId";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
@@ -23,17 +24,25 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 
 // Stub the create dialog — its internals are covered separately; here we only
 // need to know it opened and WHICH prefill (initialName/initialPrompt) TasksPage
-// passed, so we can assert chip-click seeds it and manual open does not.
+// passed, so we can assert card selection seeds it and manual open does not.
 vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: ({
     open,
+    onOpenChange,
     initialName,
     initialPrompt,
+    initialTrigger,
+    initialTemplateId,
+    sessionLink,
     editingTask,
   }: {
     open: boolean;
+    onOpenChange: (open: boolean) => void;
     initialName?: string;
     initialPrompt?: string;
+    initialTrigger?: string | null;
+    initialTemplateId?: string;
+    sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
     open ? (
@@ -41,9 +50,16 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-initial-trigger={initialTrigger ?? ""}
+        data-initial-template={initialTemplateId ?? ""}
+        data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
-      />
+      >
+        <button type="button" onClick={() => onOpenChange(false)}>
+          Close setup
+        </button>
+      </div>
     ) : null,
 }));
 
@@ -61,9 +77,12 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -77,7 +96,10 @@ const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
 
-function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?: boolean } = {}) {
+function setTasks(
+  tasks: ScheduledTask[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean } = {},
+) {
   vi.mocked(hooks.useScheduledTasks).mockReturnValue({
     data: tasks,
     isLoading: state.isLoading ?? false,
@@ -86,7 +108,12 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
 }
 
+const analytics = vi.fn();
 beforeEach(() => {
+  analytics.mockReset();
+  setOmnigentHostConfig({ analytics });
+  localStorage.clear();
+  vi.mocked(useViewerId).mockReturnValue(null);
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -107,17 +134,98 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  setOmnigentHostConfig({});
+});
 
-function renderPage() {
+const TRIGGER_INFO = {
+  ...SERVER_INFO_OFFLINE_FALLBACK,
+  scheduled_task_session_modes: true,
+  features: { session_orchestration: true },
+};
+
+function renderPage(
+  path = "/tasks",
+  basename = "",
+  info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
+) {
   return render(
-    <MemoryRouter>
-      <TasksPage />
-    </MemoryRouter>,
+    <CapabilitiesProvider info={info}>
+      <MemoryRouter initialEntries={[`${basename}${path}`]}>
+        <RoutingProvider value={basenamedRouting(basename)}>
+          <Routes>
+            <Route path={`${basename}/tasks`} element={<TasksPage />} />
+            <Route
+              path={`${basename}/tasks/templates`}
+              element={<TasksPage key="templates" templatesOnly />}
+            />
+          </Routes>
+        </RoutingProvider>
+      </MemoryRouter>
+    </CapabilitiesProvider>,
   );
 }
 
+function selectView(name: "Your automations" | "Templates") {
+  fireEvent.mouseDown(screen.getByRole("tab", { name }), { button: 0, ctrlKey: false });
+}
+
 describe("TasksPage list", () => {
+  it("reopens the guide from the info button beside the heading", async () => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    setTasks([]);
+    render(
+      <MemoryRouter>
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <TasksPage />
+        </CapabilitiesProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    await waitFor(() => expect(screen.getByTestId("new-task-button")).toHaveFocus());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "About automations" }));
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "See examples" }));
+    expect(screen.getByRole("dialog", { name: "Example automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "About automations" })).toHaveFocus(),
+    );
+  });
+
+  it("waits for the first task load and keeps the guide's step through a failed refetch", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    const content = () => (
+      <MemoryRouter>
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <TasksPage />
+        </CapabilitiesProvider>
+      </MemoryRouter>
+    );
+    setTasks(undefined, { isLoading: true });
+    const view = render(content());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    setTasks(undefined, { isError: true });
+    view.rerender(content());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    setTasks([]);
+    view.rerender(content());
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    const step = screen.getByText(/of .* · Make it yours/).textContent;
+    setTasks([], { isError: true });
+    view.rerender(content());
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(screen.getByText(step!)).toBeVisible();
+    setTasks([]);
+    view.rerender(content());
+    expect(screen.getByText(step!)).toBeVisible();
+  });
+
   it("renders the title, subtitle and task rows with schedule text", () => {
     setTasks([task()]);
     renderPage();
@@ -176,44 +284,55 @@ describe("TasksPage list", () => {
     expect(screen.queryAllByTestId("new-task-button")).toHaveLength(1);
   });
 
-  it("shows compact suggestion chips in the true empty state", () => {
+  it("shows descriptive template cards in the true empty state", () => {
     setTasks([]);
     renderPage();
     const suggestions = screen.getByTestId("tasks-suggestions");
-    expect(within(suggestions).queryByText("Suggestions")).toBeNull();
-    const chips = within(suggestions).getAllByTestId(/^suggestion-/);
-    expect(chips).toHaveLength(3);
-    expect(chips.map((r) => r.getAttribute("data-testid"))).toEqual([
-      "suggestion-follow-up-monitor",
-      "suggestion-pr-sweep",
-      "suggestion-news-digest",
+    expect(within(suggestions).getByText("Suggested Automations")).toBeInTheDocument();
+    const cards = within(suggestions).getAllByTestId(/^suggestion-/);
+    expect(cards).toHaveLength(3);
+    expect(cards.map((r) => r.getAttribute("data-testid"))).toEqual([
+      "suggestion-trigger-jira",
+      "suggestion-trigger-slack",
+      "suggestion-trigger-github",
     ]);
-    expect(within(suggestions).getByText("Follow-up monitor")).toBeInTheDocument();
-    expect(within(suggestions).getByText("PR sweep")).toBeInTheDocument();
-    expect(within(suggestions).getByText("News digest")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Jira tickets")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Slack messages")).toBeInTheDocument();
+    expect(within(suggestions).getByText("GitHub issues")).toBeInTheDocument();
   });
 
-  it("shows compact suggestion chips below populated lists", () => {
+  it("shows the gallery on Templates instead of below populated lists", () => {
     setTasks([task()]);
     renderPage();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    selectView("Templates");
+    expect(screen.queryByTestId("tasks-list")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-search")).not.toBeInTheDocument();
     const suggestions = screen.getByTestId("tasks-suggestions");
-    expect(within(suggestions).getByText("Suggestions")).toBeInTheDocument();
-    const chips = within(suggestions).getAllByTestId(/^suggestion-/);
-    expect(chips).toHaveLength(3);
-    expect(chips.map((c) => c.getAttribute("data-testid"))).toEqual([
-      "suggestion-follow-up-monitor",
-      "suggestion-pr-sweep",
-      "suggestion-news-digest",
+    expect(screen.getByRole("tab", { name: "Templates" })).toHaveAttribute("aria-selected", "true");
+    const cards = within(suggestions).getAllByTestId(/^suggestion-/);
+    expect(cards).toHaveLength(3);
+    expect(cards.map((c) => c.getAttribute("data-testid"))).toEqual([
+      "suggestion-trigger-jira",
+      "suggestion-trigger-slack",
+      "suggestion-trigger-github",
     ]);
-    const followUp = within(suggestions).getByTestId("suggestion-follow-up-monitor");
-    expect(followUp).toHaveTextContent("Follow-up monitor");
+    const jiraCard = within(suggestions).getByTestId("suggestion-trigger-jira");
+    expect(jiraCard).toHaveTextContent("Jira tickets");
+    expect(jiraCard).toHaveTextContent("Watch for matching tickets");
+    expect(jiraCard).toHaveTextContent("Requires a Jira MCP server.");
+    expect(jiraCard).toHaveTextContent("Checks every hour");
+    expect(screen.queryByRole("button", { name: /Show all/ })).not.toBeInTheDocument();
+    expect(jiraCard).toHaveAccessibleDescription(
+      "Watch for matching tickets and start a session to investigate or work on each one. Checks every hour Requires a Jira MCP server.",
+    );
   });
 
-  it("hides Suggestions in filtered-empty states after tasks exist", () => {
+  it("keeps templates out of populated and filtered-empty lists", () => {
     setTasks([task({ state: "active" })]);
     renderPage();
     expect(screen.getByTestId("tasks-filter-all")).toBeInTheDocument();
-    expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
     expect(screen.getByText("No automations found")).toBeInTheDocument();
@@ -225,7 +344,7 @@ describe("TasksPage list", () => {
     expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
 
     fireEvent.click(screen.getByTestId("tasks-filter-all"));
-    expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
   });
 });
 
@@ -288,67 +407,147 @@ describe("filtering + search", () => {
   });
 });
 
-describe("New automation button", () => {
-  it("reads 'New automation' and opens the manual create dialog directly (no dropdown)", () => {
+describe("New automation entry", () => {
+  it("opens the setup form directly", () => {
     setTasks([]);
     renderPage();
-    const button = screen.getByTestId("new-task-button");
-    expect(button).toHaveTextContent("New automation");
-    fireEvent.click(button);
-    expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-prompt", "");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
   });
 
-  it("does not offer a 'Create with Omnigent' entry point", () => {
-    setTasks([]);
+  it.each(["", "/mount"])("redirects old template links to the gallery under '%s'", (basename) => {
+    setTasks([task()]);
+    renderPage("/tasks/templates", basename);
+    expect(screen.getByRole("heading", { name: "Automations" })).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-list")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Automation templates" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Templates" })).toHaveAttribute("aria-selected", "true");
+    selectView("Your automations");
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
+  });
+
+  it("opens setup even when the task list failed to load", () => {
+    setTasks([], { isError: true });
     renderPage();
-    // No dropdown and no deferred create option: the manual dialog is the only
-    // create path on this page.
-    fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
-    expect(screen.queryByTestId("new-task-omnigent")).toBeNull();
-    expect(screen.queryByTestId("new-task-manual")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
   });
 });
 
-describe("suggestion prefill", () => {
-  it("seeds the dialog with the picked suggestion's name + prompt", () => {
+describe("automation view navigation", () => {
+  it("reports one analytics event per tab change, including pointer focus activation", () => {
     setTasks([]);
     renderPage();
-    fireEvent.click(screen.getByTestId("suggestion-follow-up-monitor"));
-    const dialog = screen.getByTestId("manual-dialog-open");
-    // The fuller prefill.name/prompt are passed (NOT the short chip label).
-    expect(dialog.getAttribute("data-initial-name")).toBe("Follow-up monitor");
-    expect(dialog.getAttribute("data-initial-prompt")).toContain("Review recent email");
+    expect(analytics).toHaveBeenCalledWith({ type: "page_view", pageId: "tasks" });
+    selectView("Templates");
+    expect(analytics).toHaveBeenCalledWith({ type: "page_view", pageId: "tasks.templates" });
+    expect(analytics).toHaveBeenCalledWith({
+      type: "value_change",
+      componentId: "tasks.view",
+      componentKind: "tabs",
+      value: "templates",
+    });
+    selectView("Templates");
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(1);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+    ]);
+    selectView("Your automations");
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+      [{ type: "page_view", pageId: "tasks" }],
+    ]);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(2);
+    expect(analytics).toHaveBeenCalledWith({
+      type: "value_change",
+      componentId: "tasks.view",
+      componentKind: "tabs",
+      value: "yours",
+    });
   });
 
-  it("opens EMPTY from the plain 'New automation' button (no prefill)", () => {
-    setTasks([]);
+  it("keeps search and filter selections when switching views", () => {
+    setTasks([
+      task({ name: "Daily review", state: "paused" }),
+      task({ id: "other", name: "Other task" }),
+    ]);
     renderPage();
+    fireEvent.change(screen.getByTestId("tasks-search"), { target: { value: "Daily" } });
+    fireEvent.click(screen.getByTestId("tasks-filter-paused"));
+    selectView("Templates");
+    expect(screen.getByRole("region", { name: "Automation templates" })).toBeInTheDocument();
+    selectView("Your automations");
+    expect(screen.getByTestId("tasks-search")).toHaveValue("Daily");
+    expect(screen.getByTestId("tasks-filter-paused")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByTestId("scheduled-task-row")).toHaveLength(1);
+  });
+
+  it("opens both creation paths from a directly linked Templates tab even when tasks fail to load", () => {
+    setTasks(undefined, { isError: true });
+    renderPage("/tasks?view=templates");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-github"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-trigger",
+      "github",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
+  });
+});
+
+describe("template prefill", () => {
+  it("opens the integration builder with the selected template name", () => {
+    setTasks([]);
+    renderPage();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
     const dialog = screen.getByTestId("manual-dialog-open");
-    expect(dialog.getAttribute("data-initial-name")).toBe("");
+    expect(dialog.getAttribute("data-initial-name")).toBe("Jira tickets");
+    expect(dialog.getAttribute("data-initial-trigger")).toBe("jira");
     expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+    expect(dialog).toHaveAttribute("data-initial-template", "jira");
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "tasks.template.jira",
+      componentKind: "button",
+    });
   });
 
-  it("reseeds when switching chips, and does not leak a stale prefill into a manual open", () => {
+  it("reseeds from another card after closing, and starts manual creation empty", () => {
     setTasks([]);
     renderPage();
 
-    // Open from one chip → seeded.
-    fireEvent.click(screen.getByTestId("suggestion-follow-up-monitor"));
+    // Each card seeds a fresh form.
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
-      "Follow-up monitor",
+      "Jira tickets",
+    );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "jira",
     );
 
-    // The stub dialog reports open via the `open` prop; simulate a close by
-    // clicking a different chip (reseed) — the new suggestion's values win.
-    fireEvent.click(screen.getByTestId("suggestion-pr-sweep"));
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    expect(screen.queryByTestId("manual-dialog-open")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-slack"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
-      "PR sweep",
+      "Slack messages",
+    );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "slack",
     );
 
-    // Now the plain manual open must be EMPTY — no stale prefill from the chips.
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    // Manual creation must not inherit the previous template.
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe("");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-template", "");
   });
 });
 
@@ -380,5 +579,68 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+});
+
+describe("trigger templates", () => {
+  it("opens the dialog on the picked template with an absolute session link", () => {
+    setTasks([]);
+    renderPage();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-slack"));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog.getAttribute("data-initial-trigger")).toBe("slack");
+    expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+    expect(dialog.getAttribute("data-session-link")).toBe(
+      `${window.location.origin}/c/CONVERSATION_ID`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    // A later plain open drops the template.
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-trigger")).toBe("");
+  });
+
+  it.each(["jira", "slack", "github"])("opens the %s builder from its gallery card", (source) => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    setTasks([]);
+    renderPage("/tasks?view=templates");
+    expect(
+      screen.queryByRole("dialog", { name: "Introducing Automations" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-trigger",
+      source,
+    );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      source,
+    );
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: `tasks.template.${source}`,
+      componentKind: "button",
+    });
+  });
+
+  it.each([
+    ["can't keep one session per automation", { scheduled_task_session_modes: false }],
+    ["has session orchestration turned off", { features: { session_orchestration: false } }],
+    // Older servers don't report the feature at all.
+    ["doesn't report session orchestration", { features: {} }],
+  ])("hides the templates when the server %s", (_name, overrides) => {
+    setTasks([]);
+    renderPage("/tasks?view=templates", "", { ...TRIGGER_INFO, ...overrides });
+    expect(screen.getByText(/Automation templates are not available on this server/)).toBeVisible();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog).toHaveAttribute("data-initial-name", "");
+    expect(dialog).toHaveAttribute("data-initial-prompt", "");
+    expect(dialog).toHaveAttribute("data-initial-trigger", "");
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    selectView("Your automations");
+    expect(screen.getByText("No automations yet")).toBeVisible();
+    expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
   });
 });

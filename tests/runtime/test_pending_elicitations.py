@@ -634,7 +634,8 @@ def test_lookup_returns_none_after_resolve() -> None:
     assert pending_elicitations.lookup("elicit_gone") is None
 
 
-def test_lookup_returns_deep_copy() -> None:
+@pytest.mark.parametrize("conversation_id", [None, "conv_a"])
+def test_lookup_returns_deep_copy(conversation_id: str | None) -> None:
     """
     :func:`lookup` returns a deep copy of the stored event so callers
     cannot mutate the index.
@@ -645,14 +646,28 @@ def test_lookup_returns_deep_copy() -> None:
         "params": {"message": "original"},
     }
     pending_elicitations.record_publish("conv_a", event)
-    result = pending_elicitations.lookup("elicit_copy")
+    result = pending_elicitations.lookup("elicit_copy", conversation_id=conversation_id)
     assert result is not None
     _, payload = result
     payload["params"]["message"] = "tampered"
     # Re-lookup must still see the original.
-    result2 = pending_elicitations.lookup("elicit_copy")
+    result2 = pending_elicitations.lookup("elicit_copy", conversation_id=conversation_id)
     assert result2 is not None
     assert result2[1]["params"]["message"] == "original"
+
+
+def test_scoped_lookup_does_not_fall_back_to_another_session() -> None:
+    event = _elicit_event("elicit_child")
+    pending_elicitations.record_publish("conv_parent", event)
+    pending_elicitations.record_publish("conv_child", event)
+    assert pending_elicitations.lookup("elicit_child", conversation_id="conv_child") == (
+        "conv_child",
+        event,
+    )
+    pending_elicitations.resolve("conv_child", "elicit_child")
+    assert pending_elicitations.lookup("elicit_child", conversation_id="conv_child") is None
+    assert pending_elicitations.lookup("elicit_child", conversation_id="conv_unknown") is None
+    assert pending_elicitations.lookup("elicit_unknown", conversation_id="conv_parent") is None
 
 
 def test_snapshot_for_returns_independent_copies() -> None:
@@ -686,3 +701,56 @@ def test_snapshot_for_returns_independent_copies() -> None:
     # the index; if "tampered-top-level", the top-level copy is
     # there but nested values are still shared.
     assert snap2[0]["params"]["message"] == "original"
+
+
+def test_native_resolution_evidence_is_scoped_and_repark_clears_it() -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    request = _elicit_event("shared")
+    request["params"] = {"native_delivery": {"state": "sending", "attempt": "first"}}
+    expired = {
+        "type": "response.elicitation_resolved",
+        "elicitation_id": "shared",
+        "reason": "unanswered",
+    }
+    confirmed = {"type": "response.elicitation_resolved", "elicitation_id": "shared"}
+    with workspace_scope(1):
+        pending_elicitations.record_publish("session", request)
+        pending_elicitations.record_publish("session", expired)
+        assert pending_elicitations.native_resolution_for("session", "shared") == "unanswered"
+        assert pending_elicitations.native_resolution_for("other", "shared") is None
+    with workspace_scope(2):
+        assert pending_elicitations.native_resolution_for("session", "shared") is None
+    with workspace_scope(1):
+        pending_elicitations.record_publish("session", confirmed)
+        assert pending_elicitations.native_resolution_for("session", "shared") == "confirmed"
+        pending_elicitations.record_publish("session", request)
+        assert pending_elicitations.native_resolution_for("session", "shared") is None
+        pending_elicitations.resolve("session", "shared")
+        assert pending_elicitations.native_resolution_for("session", "shared") is None
+        pending_elicitations.record_publish("session", _elicit_event("generic"))
+        pending_elicitations.record_publish("session", {**expired, "elicitation_id": "generic"})
+        assert pending_elicitations.native_resolution_for("session", "generic") is None
+
+
+def test_native_resolution_evidence_is_bounded_and_eviction_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cachetools import LRUCache
+
+    from omnigent.db.workspace_cache import WorkspaceScopedCache
+
+    monkeypatch.setattr(
+        pending_elicitations,
+        "_native_resolutions",
+        WorkspaceScopedCache(lambda: LRUCache(maxsize=1)),
+    )
+    for eid in ("old", "new"):
+        request = _elicit_event(eid)
+        request["params"] = {"native_delivery": {"state": "sending", "attempt": "first"}}
+        pending_elicitations.record_publish("session", request)
+        pending_elicitations.record_publish(
+            "session", {"type": "response.elicitation_resolved", "elicitation_id": eid}
+        )
+    assert pending_elicitations.native_resolution_for("session", "old") is None
+    assert pending_elicitations.native_resolution_for("session", "new") == "confirmed"

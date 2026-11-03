@@ -17,7 +17,6 @@ import json
 import os
 import secrets
 import signal
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -27,6 +26,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _BOOT_TIMEOUT = 30.0
@@ -46,16 +46,6 @@ os_env:
   sandbox:
     type: none
 """
-
-
-def _find_free_port() -> int:
-    """Return a free TCP port on localhost.
-
-    :returns: An ephemeral port number.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _clean_env() -> dict[str, str]:
@@ -273,7 +263,7 @@ def test_session_resources_e2e(
 
     python = omnigent_python
     repo_root = omnigent_repo_root
-    port = _find_free_port()
+    port = find_free_port()
 
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
@@ -500,7 +490,7 @@ def test_direct_attach_e2e(
 
     python = omnigent_python
     repo_root = omnigent_repo_root
-    port = _find_free_port()
+    port = find_free_port()
 
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
