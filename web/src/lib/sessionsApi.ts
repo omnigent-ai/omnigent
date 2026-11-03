@@ -959,7 +959,13 @@ export async function createSideChat(
     config: settings,
   });
   if (runnerId) {
-    await updateSession(fork.id, { runnerId });
+    try {
+      await updateSession(fork.id, { runnerId });
+    } catch (error) {
+      // Otherwise the abandoned fork would still open on the user's other devices.
+      await removeListedSideChat(sourceId, fork.id).catch(() => {});
+      throw error;
+    }
   }
   return { childSessionId: fork.id };
 }

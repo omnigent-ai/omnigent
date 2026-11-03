@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_OPEN_SIDE_CHATS,
   readSessionWorkspaceState,
   SESSION_WORKSPACE_STATE_KEY,
   writeSessionWorkspaceState,
@@ -220,6 +221,22 @@ describe("side chats the server lists", () => {
 
     expect(result.current.tabs).toEqual(["conv_new"]);
     expect(result.current.selected).toBe("conv_new");
+  });
+
+  it("reopen once a tab closes if the tab limit dropped them", () => {
+    const listed = Array.from({ length: MAX_OPEN_SIDE_CHATS + 1 }, (_, index) => `conv_${index}`);
+    const first = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.sync(listed));
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(listed.slice(1));
+    first.unmount();
+
+    const reloaded = renderHook(() => useSideChats("session-a"));
+    act(() => reloaded.result.current.close("conv_5"));
+    act(() => reloaded.result.current.sync(listed.filter((id) => id !== "conv_5")));
+
+    const reopened = [...listed.slice(1).filter((id) => id !== "conv_5"), "conv_0"];
+    expect(reloaded.result.current.tabs).toEqual(reopened);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(reopened);
   });
 
   it("leave storage untouched when the list is unchanged", () => {

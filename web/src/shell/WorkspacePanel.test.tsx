@@ -1351,9 +1351,14 @@ describe("WorkspacePanel mobile side chats", () => {
       selectedSideChatId: "conv_side_b",
     });
 
-  it.each([false, true])(
-    "keeps a side chat, draft, and queue when close fails (mobile=%s)",
-    async (mobile) => {
+  it.each([
+    ["stopping", false],
+    ["stopping", true],
+    ["unlisting", false],
+    ["unlisting", true],
+  ])(
+    "keeps a side chat, draft, and queue when %s it fails on close (mobile=%s)",
+    async (failingStep, mobile) => {
       isMobileMock.mockReturnValue(mobile);
       openTabs();
       const followUp = {
@@ -1367,8 +1372,11 @@ describe("WorkspacePanel mobile side chats", () => {
       const queuedAtStop: unknown[] = [];
       const stop = vi.spyOn(sessionsApi, "stopSession").mockImplementationOnce(async () => {
         queuedAtStop.push(sideQueue());
-        throw new Error("offline");
+        if (failingStep === "stopping") throw new Error("offline");
+        return { queued: false };
       });
+      const remove = vi.mocked(sessionsApi.removeListedSideChat);
+      if (failingStep === "unlisting") remove.mockRejectedValueOnce(new Error("offline"));
       useChatStore.setState({
         sideChatDrafts: { conv_side_b: "Keep this question" },
         queuedMessages: [followUp, otherChat],
@@ -1397,6 +1405,8 @@ describe("WorkspacePanel mobile side chats", () => {
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
       expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
+      expect(remove).toHaveBeenCalledTimes(failingStep === "unlisting" ? 2 : 1);
+      expect(remove).toHaveBeenLastCalledWith("conv_ws", "conv_side_b");
       expect(queuedAtStop).toEqual([[], []]);
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
       expect(useChatStore.getState().queuedMessages).toEqual([otherChat]);
@@ -1517,33 +1527,6 @@ describe("WorkspacePanel side chats from the user's other devices", () => {
 
     expect(screen.getByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
     expect(readSessionWorkspaceState("conv_ws")?.openSideChats).toEqual(["conv_remote"]);
-  });
-
-  it("stops listing a side chat closed here, and keeps it open if that fails", async () => {
-    writeSessionWorkspaceState("conv_ws", {
-      openSideChats: ["conv_side_a", "conv_side_b"],
-      selectedSideChatId: "conv_side_b",
-    });
-    vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
-    const remove = vi
-      .mocked(sessionsApi.removeListedSideChat)
-      .mockRejectedValueOnce(new Error("offline"));
-    renderWorkspace({ rightRailTab: "sidechat" });
-
-    fireEvent.click(screen.getByRole("button", { name: "Close Side chat 2" }));
-    await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
-    );
-    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
-
-    fireEvent.click(screen.getByRole("button", { name: "Close Side chat 2" }));
-    await waitFor(() =>
-      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
-    );
-    expect(remove.mock.calls).toEqual([
-      ["conv_ws", "conv_side_b"],
-      ["conv_ws", "conv_side_b"],
-    ]);
   });
 
   it("keeps a side chat closed when a list fetched before the close still names it", async () => {

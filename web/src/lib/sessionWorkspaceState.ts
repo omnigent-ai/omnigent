@@ -67,6 +67,8 @@ const MAX_SESSIONS = 100;
 // through many files can't bloat the store. Tabs are appended in open order, so
 // the most-recent (tail) entries are kept.
 const MAX_OPEN_FILES = 20;
+/** Side-chat tabs persisted per session; opening more drops the oldest. */
+export const MAX_OPEN_SIDE_CHATS = MAX_OPEN_FILES;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -212,14 +214,14 @@ export function saveSessionWorkspaceState(
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
   }
   // Same bound for side-chat tabs (also appended in open order).
-  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
-    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
+  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_SIDE_CHATS) {
+    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_SIDE_CHATS);
   }
   if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_FILES) {
     next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_FILES);
   }
-  if (next.closedSideChats && next.closedSideChats.length > MAX_OPEN_FILES) {
-    next.closedSideChats = next.closedSideChats.slice(-MAX_OPEN_FILES);
+  if (next.closedSideChats && next.closedSideChats.length > MAX_OPEN_SIDE_CHATS) {
+    next.closedSideChats = next.closedSideChats.slice(-MAX_OPEN_SIDE_CHATS);
   }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).

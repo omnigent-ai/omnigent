@@ -747,6 +747,26 @@ describe("createSideChat", () => {
     },
   );
 
+  it.each([
+    { ok: true, status: 204 },
+    { ok: false, status: 500 },
+  ])("unlists the fork when its runner can't be bound (unlisting $status)", async (unlisted) => {
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse(source))
+      .mockResolvedValueOnce(mockJsonResponse(fork))
+      .mockResolvedValueOnce(
+        mockJsonResponse({ detail: "runner gone" }, { ok: false, status: 409 }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse({ detail: "boom" }, unlisted));
+
+    await expect(createSideChat(source.id)).rejects.toThrow("runner gone");
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const [url, init] = fetchMock.mock.calls[3] as [string, RequestInit];
+    expect(url).toBe(`/v1/sessions/${source.id}/side_chats/${fork.id}`);
+    expect(init.method).toBe("DELETE");
+  });
+
   it("allows an in-process session to use normal dispatch without a host or runner id", async () => {
     fetchMock
       .mockResolvedValueOnce(

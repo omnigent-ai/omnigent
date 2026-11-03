@@ -94,6 +94,7 @@ async def test_closed_side_chat_is_no_longer_listed(
     store = SqlAlchemyConversationStore(db_uri)
     source_id = _session(store, db_uri)
     fork = await client.post(f"/v1/sessions/{source_id}/fork", json={"side_chat": True})
+    assert fork.status_code == 201, fork.text
     side_chat_id = fork.json()["id"]
 
     for _ in range(2):
@@ -160,6 +161,7 @@ async def test_normal_fork_drops_side_chat_bookkeeping(
     store = SqlAlchemyConversationStore(db_uri)
     source_id = _session(store, db_uri, messages=1)
     side = await client.post(f"/v1/sessions/{source_id}/fork", json={"side_chat": True})
+    assert side.status_code == 201, side.text
     side_chat_id = side.json()["id"]
 
     for forked_from in (source_id, side_chat_id):

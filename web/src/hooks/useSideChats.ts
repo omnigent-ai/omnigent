@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { readSessionWorkspaceState, saveSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  MAX_OPEN_SIDE_CHATS,
+  readSessionWorkspaceState,
+  saveSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import { newPendingSideChatId } from "@/lib/sideChat";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 
@@ -175,9 +179,10 @@ export function useSideChats(conversationId: string) {
   );
 
   /** Reconcile with the server's side-chat list (oldest first): open tabs for
-   *  side chats new to the list without changing the selection, and close
-   *  those another device removed from it. Tabs the list never named (Codex
-   *  forks, pending tabs, older side chats) are left alone. */
+   *  listed side chats this browser hasn't closed (the newest that fit the tab
+   *  limit) without changing the selection, and close those another device
+   *  removed from it. Tabs the list never named (Codex forks, pending tabs,
+   *  older side chats) are left alone. */
   const sync = useCallback(
     (listed: string[]) =>
       update((current) => {
@@ -188,9 +193,9 @@ export function useSideChats(conversationId: string) {
           if (!listedSet.has(id)) next = withTabClosed(next, id);
         }
         const closed = new Set(next.closed);
-        const added = listed.filter(
-          (id) => !synced.has(id) && !next.tabs.includes(id) && !closed.has(id),
-        );
+        const unopened = listed.filter((id) => !next.tabs.includes(id) && !closed.has(id));
+        const room = Math.max(0, MAX_OPEN_SIDE_CHATS - next.tabs.length);
+        const added = room > 0 ? unopened.slice(-room) : [];
         const sameList =
           listed.length === current.synced.length && listed.every((id) => synced.has(id));
         if (next === current && added.length === 0 && sameList) return current;
