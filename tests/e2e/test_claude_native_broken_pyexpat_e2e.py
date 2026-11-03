@@ -39,9 +39,13 @@ _DLOPEN_ERROR = (
     f"Symbol not found: {_DLOPEN_SYMBOL}"
 )
 
-# Loaded automatically at interpreter startup when its directory is first on
-# PYTHONPATH; it makes ``import pyexpat`` fail the same way on any platform.
+_SERVER_ADDRESS = ("127.0.0.1", 59999)
+
+# The spawned interpreter loads both faults before the CLI starts: a broken
+# XML import and a refused connection to the declared test endpoint.
 _SITECUSTOMIZE = f"""\
+import errno
+import socket
 import sys
 
 
@@ -53,11 +57,21 @@ class _BrokenPyexpatFinder:
 
 
 sys.meta_path.insert(0, _BrokenPyexpatFinder())
+
+_original_connect = socket.socket.connect
+
+
+def _refuse_test_server(self, address):
+    if address == {_SERVER_ADDRESS!r}:
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "Test server connection refused")
+    return _original_connect(self, address)
+
+
+socket.socket.connect = _refuse_test_server
 """
 
-# Almost certainly closed, so the connect step fails fast with its actionable
-# "Could not reach the omnigent server" error rather than hanging.
-_UNREACHABLE_SERVER = "http://127.0.0.1:59999"
+# The process-local shim refuses this endpoint even if another test binds it.
+_UNREACHABLE_SERVER = f"http://{_SERVER_ADDRESS[0]}:{_SERVER_ADDRESS[1]}"
 
 
 def _run_claude_with_broken_pyexpat(tmp_path: Path) -> subprocess.CompletedProcess[str]:
