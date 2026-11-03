@@ -83,6 +83,7 @@ import {
   openSessionStream,
   postEvent,
   rewindSession,
+  type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
   type SessionItemsPage,
   updateSession,
@@ -124,7 +125,12 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  hasSessionDraft,
+  setSessionDraft,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -160,7 +166,7 @@ import type {
   Session,
   SessionStatus,
 } from "@/lib/types";
-import { uploadFile } from "@/lib/filesApi";
+import { downloadSessionFile, uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
@@ -1200,6 +1206,12 @@ export interface AppChatState {
    */
   redirectToConversationId: string | null;
   /**
+   * The prompt `/rewind` returned for its new session's composer. The
+   * composer can open before the rewind responds (the stream redirect may win),
+   * so an open, untouched composer for that session takes it, then clears it.
+   */
+  rewindPrefill: (SessionDraft & { conversationId: string }) | null;
+  /**
    * Side-chat child to open as a soft tab in the Workspace rail, or null.
    * `AppShell` observes it, opens/selects that child's side-chat tab on the
    * (still-active) main chat, and clears it — the user stays in the main
@@ -1947,6 +1959,35 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
   return block;
 }
 
+/**
+ * Download a rewound prompt's attachments from the new session as composer
+ * files. Each is remembered as already uploaded there, so sending reuses the
+ * session's copy. An attachment that fails to download is left out.
+ */
+async function rewindAttachmentFiles(
+  sessionId: string,
+  attachments: readonly RewindAttachment[],
+): Promise<File[]> {
+  const files = await Promise.all(
+    attachments.map(async (attachment) => {
+      try {
+        const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
+        const block: ContentBlock = {
+          type: attachment.type,
+          file_id: attachment.fileId,
+          filename: attachment.filename,
+        };
+        uploadedFileBlockCache.set(file, new Map([[sessionId, block]]));
+        return file;
+      } catch (err) {
+        console.warn("Couldn't restore a rewound prompt's attachment", err);
+        return null;
+      }
+    }),
+  );
+  return files.filter((file): file is File => file !== null);
+}
+
 async function uploadFileBlocks(
   sessionId: string,
   files: readonly File[],
@@ -2211,6 +2252,7 @@ function cachedEffortFamilyForSession(
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
+  rewindPrefill: null,
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
@@ -3696,10 +3738,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     const rewound = await rewindSession(conversationId, itemId);
-    setSessionDraft(rewound.sessionId, { text: rewound.prompt, files: [] });
-    useChatStore.setState((s) =>
-      s.conversationId === conversationId ? { redirectToConversationId: rewound.sessionId } : {},
-    );
+    const files = await rewindAttachmentFiles(rewound.sessionId, rewound.attachments);
+    const draft: SessionDraft = { text: rewound.prompt, files };
+    // Text typed in the new session since it opened wins over the prompt.
+    if (!hasSessionDraft(rewound.sessionId)) setSessionDraft(rewound.sessionId, draft);
+    useChatStore.setState((s) => ({
+      rewindPrefill: { ...draft, conversationId: rewound.sessionId },
+      ...(s.conversationId === conversationId
+        ? { redirectToConversationId: rewound.sessionId }
+        : {}),
+    }));
   },
 
   refreshSessionState: async (conversationId) => {
