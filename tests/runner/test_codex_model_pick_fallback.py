@@ -286,6 +286,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     assert harness.builds[0]["session_id"] == _SESSION_ID
     assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
+    assert harness.notices == []
     harness.probe.assert_not_awaited()
     harness.workspace_models.assert_not_called()
 
