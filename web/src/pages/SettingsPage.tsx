@@ -142,8 +142,10 @@ import {
   applyStoredUiFontSize,
   applyUiFontFamily,
   clampUiFontSizePx,
+  MESSAGE_FONT_SIZE_MOBILE_QUERY,
+  readAppliedUiFontSizePx,
+  readMessageFontSizePx,
   readUiFontFamily,
-  readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
@@ -1972,29 +1974,34 @@ function DefaultBaseBranchControl() {
 /**
  * UI font size stepper. Maps one of the supported discrete px values into
  * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
- * without resizing layout or icons. The chosen value applies directly on
- * every viewport; only the unset default differs between desktop and mobile.
+ * without resizing layout or icons. Mobile conversation prose adds 2px;
+ * the remaining interface uses the chosen value directly.
  */
 function UiFontSizeControl() {
+  const sizeDescriptionId = useId();
   // `px` is the committed value: clamped, persisted, and applied to the UI.
   // `draft` is the raw text in the box, kept separate so mid-edit states the
   // committed value can't hold — a transient out-of-range number (e.g. "1" on
   // the way to "18") or an empty field while retyping — don't get clamped on
   // every keystroke. We only commit while typing when the draft is already a
   // valid in-range size; blur/Enter clamps and re-syncs the text.
-  const [px, setPx] = useState(() => readUiFontSizePx());
+  const [px, setPx] = useState(() => readAppliedUiFontSizePx());
   const [draft, setDraft] = useState(() => String(px));
+  const [messagePx, setMessagePx] = useState(() => readMessageFontSizePx());
 
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
-    const media = window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY);
+    const media = [UI_FONT_SIZE_MOBILE_QUERY, MESSAGE_FONT_SIZE_MOBILE_QUERY].map((query) =>
+      window.matchMedia(query),
+    );
     const syncViewportDefault = () => {
-      const next = readUiFontSizePx();
+      const next = readAppliedUiFontSizePx();
       setPx(next);
       setDraft(String(next));
+      setMessagePx(readMessageFontSizePx());
     };
-    media.addEventListener("change", syncViewportDefault);
-    return () => media.removeEventListener("change", syncViewportDefault);
+    media.forEach((query) => query.addEventListener("change", syncViewportDefault));
+    return () => media.forEach((query) => query.removeEventListener("change", syncViewportDefault));
   }, []);
 
   const commit = useCallback((next: number) => {
@@ -2003,6 +2010,7 @@ function UiFontSizeControl() {
     setDraft(String(clamped));
     writeUiFontSizePx(clamped);
     applyDesktopUiFontSize(clamped);
+    setMessagePx(readMessageFontSizePx(clamped));
   }, []);
 
   const onDraftChange = useCallback((text: string) => {
@@ -2015,6 +2023,7 @@ function UiFontSizeControl() {
         setPx(value);
         writeUiFontSizePx(value);
         applyDesktopUiFontSize(value);
+        setMessagePx(readMessageFontSizePx(value));
       }
     }
   }, []);
@@ -2023,7 +2032,9 @@ function UiFontSizeControl() {
   // draft reverts to the last committed size rather than a bogus one.
   const commitDraft = useCallback(() => {
     const value = Number(draft);
-    commit(Number.isFinite(value) && draft.trim() !== "" ? value : px);
+    const next = Number.isFinite(value) && draft.trim() !== "" ? clampUiFontSizePx(value) : px;
+    if (next !== px) commit(next);
+    else setDraft(String(px));
   }, [commit, draft, px]);
 
   const atMin = px <= UI_FONT_SIZE_MIN;
@@ -2031,15 +2042,26 @@ function UiFontSizeControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <SettingsLabel
-        label="Interface font size"
-        description="Set text across the interface. Icons and spacing stay fixed."
-      />
+      <div className="min-w-0">
+        <SettingsLabel
+          label="Interface font size"
+          description="Sets interface text. Conversation text is larger on touch devices and narrow screens. Icons and spacing stay fixed."
+        />
+        <p
+          id={sizeDescriptionId}
+          role="status"
+          aria-atomic="true"
+          className="mt-1 text-sm text-muted-foreground"
+        >
+          Interface {px}px · Messages {messagePx}px
+        </p>
+      </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
         role="group"
         aria-label="Interface font size"
+        aria-describedby={sizeDescriptionId}
         className={cn(
           "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
@@ -2062,6 +2084,7 @@ function UiFontSizeControl() {
             max={UI_FONT_SIZE_MAX}
             step={UI_FONT_SIZE_STEP}
             aria-label="Interface font size in pixels"
+            aria-describedby={sizeDescriptionId}
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}

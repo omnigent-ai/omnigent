@@ -170,6 +170,7 @@ function loadNavigationHarness({
   deepLinks = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
   clipboardWriteText = async () => {},
+  localHostNow = Date.now,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -281,6 +282,9 @@ function loadNavigationHarness({
       // away watch, workspace bounce): keep them all, like a real emitter.
       if (!listeners.has(eventName)) listeners.set(eventName, []);
       listeners.get(eventName).push(listener);
+    },
+    prependListener(eventName, listener) {
+      listeners.set(eventName, [listener, ...(listeners.get(eventName) ?? [])]);
     },
     emit(eventName, ...args) {
       for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
@@ -628,6 +632,7 @@ function loadNavigationHarness({
             return {
               closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+              setRecentSessionSwitchSupported: () => {},
             };
           },
         },
@@ -649,8 +654,11 @@ function loadNavigationHarness({
     },
     "./hostIdentity": {
       ...require("../src/hostIdentity"),
-      isHostThisMachine: (context) =>
-        require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
+      createHostThisMachineChecker: () =>
+        require("../src/hostIdentity").createHostThisMachineChecker({
+          cli: localHostCli,
+          now: localHostNow,
+        }),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -692,7 +700,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -3882,6 +3890,26 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
   });
 
+  it("reconnects behind the overlay when the workspace never responds", async (t) => {
+    let loads = 0;
+    const h = browserHarness(t, [25], {
+      loadURL: () => (loads++ === 0 ? new Promise(() => {}) : Promise.resolve()),
+    });
+    h.api.setServerResponseTimeoutMs(20);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, undefined, { loadUrl: page }), {
+      code: "ERR_TIMED_OUT",
+    });
+    assert.equal(h.overlay.hint, "Check your network connection.");
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+    await until(
+      () => h.calls.loadURL.length === 2 && h.api.windows.get(h.win).origin === origin,
+      "the reopened page",
+    );
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.overlay.hint, null);
+  });
+
   it("keeps the overlay up when a background session retry fails", async (t) => {
     const h = browserHarness(t, [20, 20], {
       ensureSession: async () => {
@@ -5096,10 +5124,134 @@ it("dismisses native loading feedback when the server document fails", async (t)
     },
   });
   t.after(h.cleanup);
+  let stops = 0;
+  h.webContents.stop = () => {
+    stops++;
+  };
+  h.api.setServerResponseTimeoutMs(20);
   await assert.rejects(h.api.loadServerUrl(h.win, "https://example.com/"), /connection lost/);
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+  await wait(40);
+  assert.equal(stops, 0);
+  assert.deepEqual(h.calls.loadFile, []);
+});
+
+describe("server response deadline (src/main.js)", () => {
+  const server = "http://127.0.0.1:6767";
+
+  function stalledHarness(t, loadServer) {
+    const h = loadNavigationHarness({ serverUrl: server, loadServer });
+    t.after(h.cleanup);
+    h.stops = 0;
+    h.webContents.stop = () => {
+      h.stops++;
+    };
+    h.api.setServerResponseTimeoutMs(20);
+    return h;
+  }
+
+  it("gives the server 30s to respond", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    assert.equal(h.api.serverResponseTimeoutMs(), 30_000);
+  });
+
+  it("returns to setup with a timeout when the server accepts but never responds", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const h = stalledHarness(t, () => new Promise(() => {}));
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_TIMED_OUT" });
+    await wait(0);
+    assert.equal(h.stops, 1);
+    assert.equal(h.calls.loadFile.length, 1);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.deepEqual(
+      [params.get("error"), params.get("url")],
+      ["ERR_TIMED_OUT (-7)", `${server}/`],
+    );
+    const shown = h.calls.loading.find((call) => call.action === "show");
+    assert.equal(shown.label, "Opening Omnigent…");
+    assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+    const recorded = (name) =>
+      events.filter(([event]) => event === name).map(([, fields]) => fields);
+    assert.deepEqual(
+      recorded("navigation_failed").map(({ origin, code }) => [origin, code]),
+      [[server, "net_7"]],
+    );
+    assert.deepEqual(
+      recorded("connection_result").map(({ outcome, code }) => [outcome, code]),
+      [["failed", "ERR_TIMED_OUT"]],
+    );
+  });
+
+  it("keeps loading a server document that responded before the deadline", async (t) => {
+    let finishLoad;
+    const h = stalledHarness(t, (url) => {
+      h.emit("did-navigate", url, 200, "OK");
+      return new Promise((resolve) => {
+        finishLoad = resolve;
+      });
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await wait(60);
+    assert.equal(h.stops, 0);
+    assert.deepEqual(h.calls.loadFile, []);
+    finishLoad();
+    assert.equal(await pending, server);
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+  });
+
+  it("stops a superseded load at once without returning to setup", async (t) => {
+    let stalled;
+    const reachedLoad = new Promise((resolve) => {
+      stalled = resolve;
+    });
+    const h = stalledHarness(t, () => {
+      stalled();
+      return new Promise(() => {});
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await reachedLoad;
+    // A newer attempt that has not navigated yet, e.g. still signing in.
+    h.api.pinWindow(h.win, "https://other.example");
+    assert.equal(h.stops, 1);
+    await assert.rejects(pending, { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 1);
+    assert.deepEqual(h.calls.loadFile, []);
+  });
+
+  const setupError = (h) => new URLSearchParams(h.calls.loadFile[0][1].search).get("error");
+
+  it("keeps a failed load's own error and setup fallback", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-fail-load", -102, "ERR_CONNECTION_REFUSED", url, true);
+      await wait(0);
+      throw Object.assign(new Error("ERR_CONNECTION_REFUSED (-102)"), {
+        code: "ERR_CONNECTION_REFUSED",
+      });
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_CONNECTION_REFUSED" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "ERR_CONNECTION_REFUSED (-102)");
+  });
+
+  it("leaves an HTTP error page to the setup fallback without stopping it", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-navigate", url, 500, "Internal Server Error");
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "500 Internal Server Error");
+  });
 });
 
 describe("OIDC system-browser sign-in wiring", () => {
@@ -5718,9 +5870,11 @@ describe("main-owned local host eligibility", () => {
 
   it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
     let live = true;
+    let now = 0;
     const serverUrl = "https://server.example";
     const h = loadNavigationHarness({
       serverUrl,
+      localHostNow: () => now,
       localHostCli: {
         readLocalHostId: () => "local",
         liveDaemonRecordFor: (target) => {
@@ -5753,10 +5907,131 @@ describe("main-owned local host eligibility", () => {
       false,
     );
     live = false;
+    now = 1000;
     assert.equal(
       context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
         .hostIsThisMachine,
       false,
     );
+  });
+});
+
+describe("Close Tab menu item", () => {
+  const server = "https://host.example";
+
+  function loadCloseTabHarness(t, options = {}) {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server, ...options });
+    t.after(h.cleanup);
+    let closes = 0;
+    h.win.close = () => {
+      closes++;
+    };
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.registerIpc();
+    h.api.buildMenu();
+    h.setUrl(server);
+    return {
+      h,
+      pageEvent: { sender: h.webContents, senderFrame: { url: server } },
+      closes: () => closes,
+      closeTabRequests: () =>
+        h.calls.progress.filter((message) => message.channel === "omnigent:close-tab").length,
+      clickMenuItem: (id) => h.calls.appMenu.getMenuItemById(id).click(),
+    };
+  }
+
+  it("binds CmdOrCtrl+W to Close Tab and CmdOrCtrl+Shift+W to Close Window", (t) => {
+    const { h, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    assert.equal(h.calls.appMenu.getMenuItemById("close_tab").accelerator, "CmdOrCtrl+W");
+    assert.equal(h.calls.appMenu.getMenuItemById("close_window").accelerator, "CmdOrCtrl+Shift+W");
+    clickMenuItem("close_window");
+    assert.equal(closes(), 1);
+    assert.equal(closeTabRequests(), 0);
+  });
+
+  it("closes the window when the page never opted in", (t) => {
+    const { closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    clickMenuItem("close_tab");
+    assert.equal(closes(), 1);
+    assert.equal(closeTabRequests(), 0);
+  });
+
+  it("forwards Close Tab to an opted-in page until it opts out", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 0);
+
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, false);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 1);
+  });
+
+  it("ignores opt-in and close requests from a page off the pinned server", (t) => {
+    const { h, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.setUrl("https://evil.example");
+    const foreignEvent = { sender: h.webContents, senderFrame: { url: "https://evil.example" } };
+    h.ipc.get("omnigent:set-close-tab-supported")(foreignEvent, true);
+    h.ipc.get("omnigent:close-window")(foreignEvent);
+    assert.equal(closes(), 0);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 0);
+    assert.equal(closes(), 1);
+  });
+
+  it("closes the window after its renderer exits", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.api.createWindow();
+    h.setUrl(server);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+    h.emit("render-process-gone", { reason: "crashed" });
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 0);
+    assert.equal(closes(), 1);
+  });
+
+  it("falls back while unresponsive and resumes tab closing after recovery", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.api.createWindow();
+    h.setUrl(server);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+    h.emit("unresponsive");
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 0);
+    assert.equal(closes(), 1);
+
+    h.emit("responsive");
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 1);
+  });
+
+  it("lets the page close its own window", (t) => {
+    const { h, pageEvent, closes } = loadCloseTabHarness(t);
+    h.ipc.get("omnigent:close-window")(pageEvent);
+    assert.equal(closes(), 1);
+  });
+
+  it("keeps the opt-in until a new main-frame document commits", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.api.createWindow();
+    h.setUrl(server);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+
+    h.emit("did-start-navigation", `${server}/c/other`, true, true);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+
+    h.emit("did-start-navigation", `${server}/download`, false, true);
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 2);
+    assert.equal(closes(), 0);
+
+    h.emit("did-navigate", `${server}/`, 200, "OK");
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 2);
+    assert.equal(closes(), 1);
   });
 });
