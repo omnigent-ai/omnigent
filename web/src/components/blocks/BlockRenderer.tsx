@@ -970,7 +970,7 @@ function renderItem(
           className={cn("min-w-0", followsText && "mt-2")}
         >
           <FilePathAwareMessageResponse
-            className="chat-markdown"
+            className="chat-markdown text-message"
             mode={isTextStreaming ? "streaming" : "static"}
           >
             {item.text}
