@@ -11,6 +11,7 @@ from pathlib import Path
 
 import psutil
 
+from tests._helpers.polling import poll_until
 from tests.e2e.resilience.lab.events import EventLog
 
 
@@ -178,7 +179,7 @@ def processes_with_home(home: Path) -> list[psutil.Process]:
 
 @contextlib.contextmanager
 def frozen(processes: Sequence[psutil.Process], events: EventLog) -> Iterator[None]:
-    """SIGSTOP *processes* for the duration of the block, then SIGCONT them.
+    """Confirm SIGSTOP before entering the block and SIGCONT before returning.
 
     :param processes: Processes to freeze.
     :param events: Lab event log.
@@ -189,10 +190,25 @@ def frozen(processes: Sequence[psutil.Process], events: EventLog) -> Iterator[No
             with contextlib.suppress(psutil.NoSuchProcess):
                 proc.send_signal(signal.SIGSTOP)
                 stopped.append(proc)
+        poll_until(lambda: _have_stopped_state(stopped, stopped=True), interval_s=0.01)
         events.emit("lab", "freeze", pids=[p.pid for p in stopped])
         yield
     finally:
         for proc in reversed(stopped):
             with contextlib.suppress(psutil.NoSuchProcess):
                 proc.send_signal(signal.SIGCONT)
+        poll_until(lambda: _have_stopped_state(stopped, stopped=False), interval_s=0.01)
         events.emit("lab", "thaw", pids=[p.pid for p in stopped])
+
+
+def _have_stopped_state(processes: Sequence[psutil.Process], *, stopped: bool) -> bool:
+    for proc in processes:
+        try:
+            status = proc.status()
+        except psutil.NoSuchProcess:
+            continue
+        if status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+            continue
+        if (status == psutil.STATUS_STOPPED) != stopped:
+            return False
+    return True
