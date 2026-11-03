@@ -8655,10 +8655,10 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
             (swap_dir / "sub").symlink_to(outside, target_is_directory=True)
         return result
 
-    monkeypatch.setattr(os, "stat", stat_then_replace_sub)
-    with pytest.raises(OSError):
-        tool_dispatch._bundle_local_agent_source(root, swap_dir)
-    monkeypatch.undo()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "stat", stat_then_replace_sub)
+        with pytest.raises(OSError):
+            tool_dispatch._bundle_local_agent_source(root, swap_dir)
     assert swapped
 
     link_agent = root / "link_agent"
@@ -8678,11 +8678,11 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
             target.symlink_to(outside / "config.yaml")
         return result
 
-    monkeypatch.setattr(os, "stat", stat_then_link_to_secret)
-    for source in (link_agent, prebuilt):
-        with pytest.raises(OSError):
-            tool_dispatch._bundle_local_agent_source(root, source)
-    monkeypatch.undo()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "stat", stat_then_link_to_secret)
+        for source in (link_agent, prebuilt):
+            with pytest.raises(OSError):
+                tool_dispatch._bundle_local_agent_source(root, source)
     assert not to_swap
 
     agent_dir = root / "fifo_agent"
@@ -8711,16 +8711,16 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
         except BaseException as exc:
             errors.append(exc)
 
-    monkeypatch.setattr(os, "stat", stat_then_replace_notes)
-    worker = threading.Thread(target=bundle_agent_dir, daemon=True)
-    worker.start()
-    worker.join(timeout=10)
-    if worker.is_alive():
-        # Opening the write end releases a reader blocked on the FIFO.
-        os.close(os.open(notes, os.O_WRONLY | os.O_NONBLOCK))
+    with monkeypatch.context() as patcher:
+        patcher.setattr(os, "stat", stat_then_replace_notes)
+        worker = threading.Thread(target=bundle_agent_dir, daemon=True)
+        worker.start()
         worker.join(timeout=10)
-        pytest.fail("opening a FIFO swapped in after inspection blocked")
-    monkeypatch.undo()
+        if worker.is_alive():
+            # Opening the write end releases a reader blocked on the FIFO.
+            os.close(os.open(notes, os.O_WRONLY | os.O_NONBLOCK))
+            worker.join(timeout=10)
+            pytest.fail("opening a FIFO swapped in after inspection blocked")
     assert len(errors) == 1
     assert isinstance(errors[0], OSError)
     assert "unsupported file type" in str(errors[0])
