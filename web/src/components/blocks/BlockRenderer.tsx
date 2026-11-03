@@ -617,22 +617,25 @@ export function pointsBackward(text: string): boolean {
   return BACKWARD_REFERENCE.test(text);
 }
 
+function refersBack(item: RenderItem): boolean {
+  return item.kind === "text" && pointsBackward(item.text);
+}
+
 type ToolItem = Extract<RenderItem, { kind: "tool" }>;
 
 /** The latest output since the previous answer, before a message that points back to it. */
 function referencedOutputTool(segments: TurnSegment[], index: number): ToolItem | undefined {
   const segment = segments[index];
   if (segment?.kind !== "text") return undefined;
-  if (!segment.items.some((item) => item.kind === "text" && pointsBackward(item.text))) {
-    return undefined;
-  }
+  if (!segment.items.some(refersBack)) return undefined;
   // Visible cards, commentary, and outputless runs can sit between the output and the answer.
+  // A message that points back already carries the copy, so the walk stops there.
   for (const earlier of segments.slice(0, index).reverse()) {
     if (earlier.kind === "exempt") continue;
     if (earlier.kind === "text") {
-      if (earlier.items.every((item) => hasMessagePhase(item) && item.phase === "commentary")) {
-        continue;
-      }
+      const passable = (item: RenderItem) =>
+        hasMessagePhase(item) && item.phase === "commentary" && !refersBack(item);
+      if (earlier.items.every(passable)) continue;
       return undefined;
     }
     const output = earlier.items.findLast(

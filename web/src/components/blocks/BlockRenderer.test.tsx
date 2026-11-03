@@ -899,13 +899,13 @@ describe("BlockRenderer dispatch", () => {
       "Latency is above the threshold.",
       "Latency was above-average today.",
       "Above all, the build is green.",
-      // Points within the answer itself, not to earlier output.
-      "The table above lists each step.",
       "Error logs above 1GB were rotated.",
       "Results above the baseline were flagged.",
       "The results are above expectations.",
       "Results above average were flagged.",
       "Logs above threshold were rotated.",
+      // Points within the answer itself, not to earlier output.
+      "The table above lists each step.",
     ])("keeps narration and output folded when no earlier output is meant: %s", (answer) => {
       render(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
@@ -980,24 +980,25 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("the report")).toBeVisible();
     });
 
-    it("finds the output an answer points back to past a visible dispatch card", () => {
-      const dispatch: RenderItem = {
-        kind: "tool",
-        itemId: "fc_send",
-        execution: {
-          name: "sys_session_send",
-          arguments: { agent: "deep_thought", title: "q1" },
-          argsSummary: "",
-          callId: "c_send",
-          agentName: "nessie",
-          executedBy: "server",
-          output: "ok",
-        },
+    const dispatch: RenderItem = {
+      kind: "tool",
+      itemId: "fc_send",
+      execution: {
+        name: "sys_session_send",
+        arguments: { agent: "deep_thought", title: "q1" },
+        argsSummary: "",
+        callId: "c_send",
+        agentName: "nessie",
+        executedBy: "server",
         output: "ok",
-        state: "output-available",
-        startedAt: null,
-        duration: undefined,
-      };
+      },
+      output: "ok",
+      state: "output-available",
+      startedAt: null,
+      duration: undefined,
+    };
+
+    it("finds the output an answer points back to past a visible dispatch card", () => {
       const items: RenderItem[] = [
         tool(1, "Bash", "the report"),
         dispatch,
@@ -1018,6 +1019,63 @@ describe("BlockRenderer dispatch", () => {
         screen.getByText(/Start child session/).compareDocumentPosition(pinned) &
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
+    });
+
+    it.each([
+      ["a visible dispatch card", dispatch],
+      ["an outputless run", tool(2, "Bash", "  \n")],
+    ])(
+      "copies the output once when commentary and the answer both point back past %s",
+      (_, between) => {
+        const items: RenderItem[] = [
+          tool(1, "Bash", "the report"),
+          { kind: "text", itemId: "m0", text: "See above.", final: true, phase: "commentary" },
+          between,
+          {
+            kind: "text",
+            itemId: "m1",
+            text: "The output is above.",
+            final: true,
+            phase: "final_answer",
+          },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        const folds = screen.getAllByRole("button", { name: "Worked" });
+        for (const fold of folds) expect(fold).toHaveAttribute("aria-expanded", "false");
+        expect(screen.getAllByText("the report")).toHaveLength(1);
+        const pinned = screen.getByText("the report");
+        expect(
+          pinned.compareDocumentPosition(screen.getByText("See above.")) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+
+        fireEvent.click(folds[0]!);
+        const firstRun = screen.getAllByTestId("turn-worked-fold")[0]!;
+        fireEvent.click(within(firstRun).getByText("Ran 1 shell command"));
+        fireEvent.click(within(firstRun).getByRole("button", { name: "Bash" }));
+        expect(within(firstRun).getByText("the report")).toBeVisible();
+      },
+    );
+
+    it("opens no card when nothing before the answer printed output", () => {
+      const items: RenderItem[] = [
+        tool(1, "Bash", "  \n"),
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(screen.queryByRole("button", { name: "Bash" })).toBeNull();
     });
 
     it("splits interleaved commentary into runs when the answer points back", () => {
