@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -18,6 +19,7 @@ from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
     SqlScheduledTask,
+    SqlScheduledTaskRequest,
     SqlScheduledTaskRun,
     current_workspace_id,
     workspace_scope,
@@ -54,6 +56,11 @@ from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
     TaskCursor,
+)
+from omnigent.stores.scheduled_task_store.requests import (
+    MutationAlreadyApplied,
+    MutationReceipt,
+    MutationRequest,
 )
 
 _logger = logging.getLogger(__name__)
@@ -216,6 +223,63 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             immediate=True,
         )
 
+    @staticmethod
+    def _request_receipt(row: SqlScheduledTaskRequest) -> MutationReceipt:
+        return MutationReceipt(
+            row.request_id, row.request_hash, row.scheduled_task_id, row.created_at
+        )
+
+    def get_request(self, owner_key: str, request_id: str) -> MutationReceipt | None:
+        """Read the committed receipt; absence does not rule out an in-flight write."""
+        with self._session("reconcile_mutation_request") as session:
+            row = session.get(
+                SqlScheduledTaskRequest, (current_workspace_id(), owner_key, request_id)
+            )
+            return self._request_receipt(row) if row is not None else None
+
+    def _record_request(
+        self, session: Session, request: MutationRequest | None, task_id: str
+    ) -> None:
+        if request is None:
+            return
+        if len(request.request_hash) != 32:
+            raise ValueError("Request digest must contain 32 bytes")
+        key = (current_workspace_id(), request.owner_key, request.request_id)
+        existing = session.get(SqlScheduledTaskRequest, key, with_for_update=True)
+        if existing is not None:
+            receipt = self._request_receipt(existing)
+            receipt.require_match(request)
+            raise MutationAlreadyApplied(receipt)
+        session.add(
+            SqlScheduledTaskRequest(
+                workspace_id=current_workspace_id(),
+                owner_key=request.owner_key,
+                request_id=request.request_id,
+                request_hash=request.request_hash,
+                scheduled_task_id=task_id,
+                created_at=now_epoch(),
+            )
+        )
+        # Claim the unique request key before writing the task in this transaction.
+        session.flush()
+
+    def _write_mutation(
+        self,
+        operation: str,
+        write: Callable[[Session], ScheduledTask | None],
+        request: MutationRequest | None,
+    ) -> ScheduledTask | None:
+        try:
+            return run_write_transaction(self._session_immediate, operation, write)
+        except IntegrityError:
+            # A concurrent transaction can win the request key after our read.
+            if request is not None:
+                receipt = self.get_request(request.owner_key, request.request_id)
+                if receipt is not None:
+                    receipt.require_match(request)
+                    raise MutationAlreadyApplied(receipt) from None
+            raise
+
     # ── Scheduled tasks ──────────────────────────────────────────
 
     def create(
@@ -240,12 +304,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        mutation_request: MutationRequest | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
+            self._record_request(session, mutation_request, scheduled_task_id)
             row = SqlScheduledTask(
                 account_generation=generation,
                 id=scheduled_task_id,
@@ -278,7 +344,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "insert_task", write)
+        result = self._write_mutation("create_task", write, mutation_request)
+        assert result is not None
+        return result
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         """Return a scheduled task by id, or ``None`` if not found."""
@@ -382,6 +450,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        mutation_request: MutationRequest | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -408,6 +477,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             if state is not None and state != "deleted":
                 require_active_account(session, row.user_id, generation=row.account_generation)
+            self._record_request(session, mutation_request, scheduled_task_id)
             schedule_before = (row.rrule, row.timezone, row.state)
             changed = False
             if name is not None and row.name != name:
@@ -479,7 +549,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "update_task", write)
+        return self._write_mutation("update_task", write, mutation_request)
 
     def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
         """Clear the task's project only while it is still *project_id*."""

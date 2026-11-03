@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.stores.scheduled_task_store.requests import MutationReceipt, MutationRequest
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
@@ -39,6 +40,11 @@ class ScheduledTaskStore(ABC):
         """
         self.storage_location = storage_location
 
+    @abstractmethod
+    def get_request(self, owner_key: str, request_id: str) -> MutationReceipt | None:
+        """Look up a committed receipt in the current workspace and owner scope."""
+        ...
+
     # ── Scheduled tasks ──────────────────────────────────────────
 
     @abstractmethod
@@ -64,6 +70,7 @@ class ScheduledTaskStore(ABC):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        mutation_request: MutationRequest | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -168,6 +175,7 @@ class ScheduledTaskStore(ABC):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        mutation_request: MutationRequest | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.

@@ -8241,13 +8241,33 @@ def _run_relay_tool(
     :param arguments: Decoded tool arguments.
     :returns: MCP tool-call response.
     """
+    from omnigent.tools.scheduled_task_requests import mutation_arguments
+
+    try:
+        arguments = mutation_arguments(name, arguments)
+    except ValueError as exc:
+        return _relay_dispatch_error(name, arguments, str(exc), outcome="not_applied")
     future = asyncio.run_coroutine_threadsafe(
         _await_tool_result(tool_executor(name, arguments)), loop
     )
     try:
         result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
+    except TimeoutError as exc:
+        if future.done() and not future.cancelled() and future.exception() is exc:
+            return _relay_dispatch_error(
+                name, arguments, f"Omnigent tool dispatch failed: TimeoutError: {exc}"
+            )
+        future.cancel()
+        return _relay_dispatch_error(
+            name,
+            arguments,
+            f"Omnigent tool dispatch timed out after {_TOOL_CALL_TIMEOUT_S:g}s. "
+            "Cancellation requested; the outcome is unknown. Committed writes cannot be undone.",
+        )
     except Exception as exc:  # noqa: BLE001 - relay converts callback failures to MCP errors.
-        return _mcp_error(f"Omnigent tool dispatch failed: {exc}")
+        return _relay_dispatch_error(
+            name, arguments, f"Omnigent tool dispatch failed: {type(exc).__name__}: {exc}"
+        )
     return _mcp_response_from_tool_result(result)
 
 
@@ -8719,6 +8739,12 @@ def _call_relay_tool(
     :param arguments: Decoded tool arguments.
     :returns: MCP tool-call result.
     """
+    from omnigent.tools.scheduled_task_requests import mutation_arguments
+
+    try:
+        arguments = mutation_arguments(name, arguments)
+    except ValueError as exc:
+        return _relay_dispatch_error(name, arguments, str(exc), outcome="not_applied")
     relay = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
     token = relay.get("token")
     url = relay.get("url")
@@ -8738,7 +8764,9 @@ def _call_relay_tool(
         with request.urlopen(req, timeout=_TOOL_RELAY_POST_TIMEOUT_S) as resp:
             raw = resp.read().decode("utf-8")
             if resp.status >= 400:
-                return _mcp_error(f"tool relay POST failed with HTTP {resp.status}")
+                return _relay_dispatch_error(
+                    name, arguments, f"tool relay POST failed with HTTP {resp.status}"
+                )
     # ``OSError`` (the base of ``error.URLError``) also covers the bare
     # timeout / reset errors that ``urlopen`` raises mid-read —
     # ``TimeoutError``, ``socket.timeout``, ``ConnectionResetError`` — which
@@ -8747,14 +8775,34 @@ def _call_relay_tool(
     # through ``_call_mcp_tool`` → ``_stdio_jsonrpc_loop`` and kill the MCP
     # server.
     except OSError as exc:
-        return _mcp_error(f"failed to call Omnigent tool relay: {exc}")
+        return _relay_dispatch_error(
+            name, arguments, f"failed to call Omnigent tool relay: {type(exc).__name__}: {exc}"
+        )
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:
-        return _mcp_error("Omnigent tool relay returned malformed JSON")
+        return _relay_dispatch_error(
+            name, arguments, "Omnigent tool relay returned malformed JSON"
+        )
     if not isinstance(decoded, dict):
-        return _mcp_error("Omnigent tool relay returned non-object JSON")
+        return _relay_dispatch_error(
+            name, arguments, "Omnigent tool relay returned non-object JSON"
+        )
     return decoded
+
+
+def _relay_dispatch_error(
+    name: str,
+    arguments: _JsonObject,
+    message: str,
+    *,
+    outcome: str = "unknown",
+) -> _JsonObject:
+    """Carry mutation identity across relay errors, including empty timeout exceptions."""
+    from omnigent.tools.scheduled_task_requests import mutation_failure
+
+    payload = mutation_failure(name, arguments, message, outcome=outcome)
+    return {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": True}
 
 
 def _mcp_error(message: str) -> _JsonObject:

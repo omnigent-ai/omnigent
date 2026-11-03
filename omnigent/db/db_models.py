@@ -1422,6 +1422,23 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlScheduledTaskRequest(OmnigentBase):
+    """A receipt committed atomically with a task mutation, retained after deletion."""
+
+    __tablename__ = "scheduled_task_requests"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    owner_key: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    request_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    request_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("length(request_hash) = 32", name="ck_scheduled_task_requests_hash"),
+    )
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

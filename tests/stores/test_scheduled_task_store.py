@@ -2301,3 +2301,114 @@ def test_an_executor_records_succeeded_for_a_prompt_delivered_into_a_session(
     assert (delivered.status, delivered.conversation_id) == ("succeeded", _uid("c1"))
     assert delivered.finished_at == now + 30
     assert delivered.lease_expires_at is None
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_mutation_receipt_is_atomic_and_survives_concurrent_retry(
+    store: SqlAlchemyScheduledTaskStore,
+    operation: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from omnigent.stores.scheduled_task_store.requests import (
+        MutationAlreadyApplied,
+        MutationRequest,
+    )
+
+    owner = "alice@example.com"
+    initial_id = _uid("initial-mutation")
+    fields = {
+        "name": "initial",
+        "prompt": "p",
+        "rrule": "FREQ=DAILY",
+        "user_id": owner,
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+    }
+    if operation == "update":
+        store.create(scheduled_task_id=initial_id, **fields)
+    request = MutationRequest.create(
+        owner,
+        _uid("request"),
+        operation,
+        initial_id if operation == "update" else None,
+        {"name": "edited"},
+    )
+    barrier = Barrier(4)
+
+    def mutate(index: int) -> str:
+        barrier.wait(timeout=10)
+        try:
+            if operation == "create":
+                task = store.create(
+                    scheduled_task_id=_uid(f"candidate-{index}"),
+                    mutation_request=request,
+                    **fields,
+                )
+            else:
+                task = store.update(initial_id, name="edited", mutation_request=request)
+            assert task is not None
+            return task.id
+        except MutationAlreadyApplied as exc:
+            return exc.receipt.scheduled_task_id
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        ids = list(executor.map(mutate, range(4)))
+    assert len(set(ids)) == 1
+    assert len(store.list(owner_user_id=owner)) == 1
+    restarted = SqlAlchemyScheduledTaskStore(store.storage_location)
+    receipt = restarted.get_request(request.owner_key, request.request_id)
+    assert receipt is not None and receipt.scheduled_task_id == ids[0]
+    with pytest.raises(MutationAlreadyApplied):
+        if operation == "create":
+            restarted.create(
+                scheduled_task_id=_uid("later-retry"), mutation_request=request, **fields
+            )
+        else:
+            restarted.update(initial_id, name="edited", mutation_request=request)
+    with workspace_scope(current_workspace_id() + 1):
+        assert restarted.get_request(request.owner_key, request.request_id) is None
+
+
+def test_failed_mutation_does_not_commit_receipt(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.stores.scheduled_task_store.requests import MutationRequest
+
+    request = MutationRequest.create("alice@example.com", _uid("rollback"), "create", None, {})
+
+    def fail_schedule(*args: object) -> None:
+        raise ValueError("schedule failed after receipt insert")
+
+    monkeypatch.setattr(store, "_refresh_schedule", fail_schedule)
+    with pytest.raises(ValueError, match="schedule failed"):
+        store.create(
+            scheduled_task_id=_uid("rollback-task"),
+            name="n",
+            prompt="p",
+            rrule="FREQ=DAILY",
+            user_id="alice@example.com",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+            mutation_request=request,
+        )
+    assert store.get_request(request.owner_key, request.request_id) is None
+    assert store.get(_uid("rollback-task")) is None
+
+
+def test_request_identity_separates_account_generations() -> None:
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.stores.scheduled_task_store.requests import MutationRequest
+
+    with account_authority_scope("alice@example.com", _uid("old-account")):
+        original = MutationRequest.create(
+            "alice@example.com", _uid("request"), "create", None, {"name": "n"}
+        )
+    with account_authority_scope("alice@example.com", _uid("new-account")):
+        recreated = MutationRequest.create(
+            "alice@example.com", _uid("request"), "create", None, {"name": "n"}
+        )
+    assert original.owner_key != recreated.owner_key
+    assert original.request_id == recreated.request_id

@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
@@ -59,6 +59,12 @@ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.stores.scheduled_task_store.requests import (
+    MutationAlreadyApplied,
+    MutationReceipt,
+    MutationRequest,
+    request_owner_key,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -72,6 +78,10 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset({"agent_id", "host_id", "workspace", "execution_target"})
+_IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Optional UUID for this mutation. Reuse the same UUID and inputs on retry. "
+    "Reconcile uncertainty at GET /v1/scheduled-task-requests/{request_id}."
+)
 
 
 class CreateScheduledTaskRequest(BaseModel):
@@ -555,10 +565,91 @@ def create_scheduled_tasks_router(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
 
+    def _mutation_request(
+        key: str | None,
+        owner: str,
+        body: BaseModel,
+        action: str,
+        target: str | None = None,
+    ) -> MutationRequest | None:
+        if key is None:
+            return None
+        return MutationRequest.create(
+            owner, key, action, target, body.model_dump(exclude_unset=action == "update")
+        )
+
+    def _replayed(receipt: MutationReceipt, owner: str, request: Request) -> dict[str, Any]:
+        task = store.get(receipt.scheduled_task_id)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        if task is not None and task.user_id != owner_id:
+            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+        scheduler = _scheduler(request)
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
+            # A lost response may follow a commit but precede timer synchronization.
+            if task is None:
+                scheduler.remove(receipt.scheduled_task_id)
+            else:
+                scheduler.update(task)
+        latest_status = store.list_latest_run_status_for_tasks([receipt.scheduled_task_id])
+        response = (
+            _to_response(
+                task,
+                last_run_status=latest_status.get(task.id),
+                next_run_at=_next_run_at(task, request),
+            )
+            if task is not None and task.state != "deleted"
+            else {"id": receipt.scheduled_task_id, "deleted": True}
+        )
+        return {
+            **response,
+            "request_id": receipt.request_id,
+            "outcome": "applied",
+            "replayed": True,
+            "warning": "This request already applied; no additional mutation was made. "
+            "Task fields show current state and may include later edits.",
+        }
+
+    def _existing_request(mutation: MutationRequest | None) -> MutationReceipt | None:
+        if mutation is None:
+            return None
+        receipt = store.get_request(mutation.owner_key, mutation.request_id)
+        if receipt is not None:
+            receipt.require_match(mutation)
+        return receipt
+
+    @router.get("/scheduled-task-requests/{request_id}")
+    async def get_scheduled_task_request(
+        request: Request, request_id: uuid.UUID
+    ) -> dict[str, Any]:
+        """Reconcile a request without mistaking an absent receipt for a failed write."""
+        receipt = store.get_request(request_owner_key(_owner(request)), request_id.hex)
+        if receipt is None:
+            return {
+                "request_id": request_id.hex,
+                "outcome": "unknown",
+                "message": "No committed receipt is visible. The request may still be waiting "
+                "for approval or processing. Retry only with the same request ID and inputs.",
+            }
+        return {
+            "request_id": receipt.request_id,
+            "outcome": "applied",
+            "scheduled_task_id": receipt.scheduled_task_id,
+            "applied_at": receipt.created_at,
+            "message": "The mutation committed. Read the task for its current state; "
+            "it may have been edited or deleted since this request.",
+        }
+
     @router.post("/scheduled-tasks")
     async def create_scheduled_task(
         request: Request,
         body: CreateScheduledTaskRequest,
+        idempotency_key: str | None = Header(
+            default=None,
+            alias="Idempotency-Key",
+            description=_IDEMPOTENCY_KEY_DESCRIPTION,
+        ),
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
@@ -569,6 +660,10 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        mutation = _mutation_request(idempotency_key, owner, body, "create")
+        receipt = _existing_request(mutation)
+        if receipt is not None:
+            return _replayed(receipt, owner, request)
         await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
@@ -637,10 +732,13 @@ def create_scheduled_tasks_router(
                 host_id=host_id,
                 project_id=project_id,
                 execution_target=body.execution_target,
+                mutation_request=mutation,
             )
         except Exception as exc:
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+            if isinstance(exc, MutationAlreadyApplied):
+                return _replayed(exc.receipt, owner, request)
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
                     "Could not calculate the next run time for this schedule. "
@@ -661,10 +759,10 @@ def create_scheduled_tasks_router(
             scheduler.add(task)
         # A freshly created task has no runs (last_run_status is None); its
         # next_run_at comes from the legacy timer or the persisted schedule.
-        return _to_response(
-            task,
-            next_run_at=_next_run_at(task, request),
-        )
+        response = _to_response(task, next_run_at=_next_run_at(task, request))
+        if mutation is not None:
+            response.update(request_id=mutation.request_id, outcome="applied", replayed=False)
+        return response
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
@@ -842,6 +940,11 @@ def create_scheduled_tasks_router(
         request: Request,
         scheduled_task_id: str,
         body: UpdateScheduledTaskRequest,
+        idempotency_key: str | None = Header(
+            default=None,
+            alias="Idempotency-Key",
+            description=_IDEMPOTENCY_KEY_DESCRIPTION,
+        ),
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
@@ -853,6 +956,10 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        mutation = _mutation_request(idempotency_key, owner, body, "update", scheduled_task_id)
+        receipt = _existing_request(mutation)
+        if receipt is not None:
+            return _replayed(receipt, owner, request)
         existing = _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:
             await _validate_rrule_or_400(body.rrule)
@@ -985,13 +1092,15 @@ def create_scheduled_tasks_router(
         try:
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(scheduled_task_id, **fields)
+            updated = store.update(scheduled_task_id, mutation_request=mutation, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:
             # The task never bound the copy, so nothing else uses it.
             if new_copy is not None:
                 agent_store.delete(new_copy.id)
+            if isinstance(exc, MutationAlreadyApplied):
+                return _replayed(exc.receipt, owner, request)
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
                     "Could not calculate the next run time for this schedule. "
@@ -1005,11 +1114,14 @@ def create_scheduled_tasks_router(
         ):
             scheduler.update(updated)
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
-        return _to_response(
+        response = _to_response(
             updated,
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )
+        if mutation is not None:
+            response.update(request_id=mutation.request_id, outcome="applied", replayed=False)
+        return response
 
     @router.delete("/scheduled-tasks/{scheduled_task_id}")
     async def delete_scheduled_task(

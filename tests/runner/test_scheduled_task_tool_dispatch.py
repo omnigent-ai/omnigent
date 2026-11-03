@@ -63,7 +63,11 @@ class _RecordingClient:
         self.headers: list[dict[str, str] | None] = []
         self._response = response or _Resp(body={"id": "t1"})
         self._info = info or _Resp(
-            body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
+            body={
+                "scheduled_task_projects": True,
+                "scheduled_task_session_modes": True,
+                "scheduled_task_request_ids": True,
+            }
         )
 
     async def get(self, url: str, *, timeout: object = None) -> _Resp:
@@ -138,7 +142,9 @@ async def test_create_posts_payload() -> None:
         "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
+    assert len(client.headers[-1]["Idempotency-Key"]) == 32
     assert client.headers[-1] == {
+        "Idempotency-Key": client.headers[-1]["Idempotency-Key"],
         ORCHESTRATION_SOURCE_HEADER: "conv_source",
         "x-omnigent-automation-source": "agent",
     }
@@ -191,9 +197,9 @@ async def test_create_without_session_args_sends_no_session_fields() -> None:
         json.dumps({**_REVIEW_FIELDS, "name": "n", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
         server_client=client,
     )
-    _, _, body = client.calls[0]
+    _, _, body = client.calls[-1]
     assert not {"session_mode", "session_id"} & set(body)
-    assert "/v1/info" not in [url for _, url, _ in client.calls]
+    assert [url for _, url, _ in client.calls].count("/v1/info") == 1
 
 
 @pytest.mark.asyncio
@@ -256,7 +262,7 @@ async def test_update_patches_by_id() -> None:
         server_client=client,
         conversation_id="conv_source",
     )
-    verb, url, body = client.calls[0]
+    verb, url, body = client.calls[-1]
     assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
     assert body == {
         **_REVIEW_FIELDS,
@@ -264,7 +270,8 @@ async def test_update_patches_by_id() -> None:
         "workspace": "/repo2",
         "host_id": "fedcba9876543210fedcba9876543210",
     }
-    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
+    assert client.headers[-1][ORCHESTRATION_SOURCE_HEADER] == "conv_source"
+    assert len(client.headers[-1]["Idempotency-Key"]) == 32
 
 
 @pytest.mark.asyncio
@@ -438,14 +445,14 @@ async def test_update_by_name_on_an_unknown_task_creates_no_project() -> None:
 
 
 @pytest.mark.asyncio
-async def test_calls_without_project_args_skip_the_capability_check() -> None:
+async def test_calls_without_project_args_still_require_request_id_support() -> None:
     client = _RecordingClient(info=_Resp(body={}))
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
         json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "name": "renamed"}),
         server_client=client,
     )
-    assert [url for _, url, _ in client.calls] == [f"/v1/scheduled-tasks/{_TASK_ID}"]
+    assert [url for _, url, _ in client.calls] == ["/v1/info"]
 
 
 @pytest.mark.parametrize("project_id", ["0123456789abcdef0123456789abcdef", None])
@@ -589,3 +596,52 @@ async def test_update_forwards_session_fields() -> None:
     )
     _, _, body = client.calls[-1]
     assert body == {**_REVIEW_FIELDS, "session_mode": "continue", "session_id": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_request_id_is_preserved_across_retries_and_excluded_from_payload(
+    tool_name: str,
+) -> None:
+    request_id = "ca" * 16
+    client = _RecordingClient()
+    arguments = {**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "request_id": request_id}
+    for _ in range(2):
+        await _execute_scheduled_task_tool(tool_name, json.dumps(arguments), server_client=client)
+    assert [headers["Idempotency-Key"] for headers in client.headers] == [request_id, request_id]
+    assert all(
+        "request_id" not in payload
+        for method, _, payload in client.calls
+        if method in {"POST", "PATCH"}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", ["not-a-uuid", "", None, 42, {}])
+async def test_invalid_mutation_request_ids_never_dispatch(request_id: object) -> None:
+    client = _RecordingClient()
+    output = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({**_REVIEW_FIELDS, "request_id": request_id}),
+        server_client=client,
+    )
+    assert json.loads(output)["outcome"] == "not_applied"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, outcome", [(400, "not_applied"), (409, "not_applied"), (503, "unknown")]
+)
+async def test_mutation_http_errors_report_outcome_and_identity(status: int, outcome: str) -> None:
+    client = _RecordingClient(_Resp(status_code=status))
+    output = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_scheduled_task_create",
+            json.dumps(_REVIEW_FIELDS),
+            server_client=client,
+        )
+    )
+    assert output["outcome"] == outcome
+    assert output["request_id"] == client.headers[-1]["Idempotency-Key"]
+    assert output["reconciliation"]["request_id"] == output["request_id"]

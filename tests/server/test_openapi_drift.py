@@ -190,6 +190,16 @@ def test_openapi_json_matches_generator_output() -> None:
 
     dump_module = _load_dump_openapi_module()
     generated_spec = dump_module.generate_spec()
+    paths = generated_spec["paths"]
+    assert "/v1/scheduled-task-requests/{request_id}" in paths
+    for path, method in (
+        ("/v1/scheduled-tasks", "post"),
+        ("/v1/scheduled-tasks/{scheduled_task_id}", "patch"),
+    ):
+        assert any(
+            parameter["in"] == "header" and parameter["name"] == "Idempotency-Key"
+            for parameter in paths[path][method]["parameters"]
+        )
     # Match dump_openapi.py's serialization exactly so the comparison
     # is byte-for-byte against what the script would write.
     generated_text = json.dumps(generated_spec, indent=2, sort_keys=True) + "\n"

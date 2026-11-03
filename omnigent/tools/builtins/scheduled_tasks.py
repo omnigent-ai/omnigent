@@ -18,6 +18,14 @@ from typing import Any
 
 from omnigent.tools.base import Tool
 
+_REQUEST_ID_SCHEMA = {
+    "type": "string",
+    "description": "UUID identifying this mutation. Choose once before calling and reuse with "
+    "identical inputs on every retry. If omitted, a UUID is allocated and returned. "
+    "After a timeout, reconcile using sys_scheduled_task_list(request_id=...). "
+    "A fresh UUID is a new operation and may create a duplicate task.",
+}
+
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
@@ -58,6 +66,7 @@ class SysScheduledTaskCreateTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "request_id": _REQUEST_ID_SCHEMA,
                         "name": {
                             "type": "string",
                             "description": "Human-readable task name, e.g. 'nightly triage'.",
@@ -203,7 +212,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks with schedules and state. Pass request_id to reconcile "
+            "a create/update after timeout: applied means committed; unknown means no receipt "
+            "is visible and the original request may still be pending."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""
@@ -214,7 +227,12 @@ class SysScheduledTaskListTool(Tool):
                 "description": self.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "request_id": {
+                            "type": "string",
+                            "description": "Mutation UUID to reconcile instead of listing tasks.",
+                        },
+                    },
                     "required": [],
                     "additionalProperties": False,
                 },
@@ -253,6 +271,7 @@ class SysScheduledTaskUpdateTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "request_id": _REQUEST_ID_SCHEMA,
                         "scheduled_task_id": {
                             "type": "string",
                             "description": "The task to update (from sys_scheduled_task_list).",

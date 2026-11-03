@@ -2854,3 +2854,197 @@ async def test_changing_where_a_task_runs_starts_a_new_session(
 
     assert moved.status_code == 200, moved.text
     assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)
+
+
+async def test_create_retries_same_request_without_duplicate_task(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    headers = {**_headers(), "Idempotency-Key": "ab" * 16}
+    first = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    second = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    tasks = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert len(tasks.json()["scheduled_tasks"]) == 1
+
+
+async def test_mutation_receipts_reconcile_retries_and_preserve_later_edits(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    headers = {**_headers(), "Idempotency-Key": "ac" * 16}
+    first = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    task_id = first.json()["id"]
+    url = f"/v1/scheduled-tasks/{task_id}"
+    update_headers = {**_headers(), "Idempotency-Key": "ad" * 16}
+    update = {"name": "first edit"}
+    applied = await auth_client.patch(url, json=update, headers=update_headers)
+    assert applied.status_code == 200
+    later = await auth_client.patch(url, json={"name": "later edit"}, headers=_headers())
+    assert later.status_code == 200
+    replay = await auth_client.patch(url, json=update, headers=update_headers)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert replay.json()["name"] == "later edit"
+    assert "no additional mutation" in replay.json()["warning"]
+    conflict = await auth_client.patch(url, json={"name": "different"}, headers=update_headers)
+    assert conflict.status_code == 409
+    method_conflict = await auth_client.patch(url, json=update, headers=headers)
+    assert method_conflict.status_code == 409
+    current = await auth_client.get(url, headers=_headers())
+    assert current.json()["name"] == "later edit"
+    for request_id in ("ac" * 16, "ad" * 16):
+        status = await auth_client.get(
+            f"/v1/scheduled-task-requests/{request_id}", headers=_headers()
+        )
+        assert status.json()["outcome"] == "applied"
+        assert status.json()["scheduled_task_id"] == task_id
+    await auth_client.delete(url, headers=_headers())
+    replay_deleted = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=headers
+    )
+    assert replay_deleted.status_code == 200
+    assert replay_deleted.json()["deleted"] is True
+    assert replay_deleted.json()["replayed"] is True
+    tasks = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert tasks.json()["scheduled_tasks"] == []
+
+
+async def test_mutation_request_scope_conflicts_and_unknown_receipts(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    request_id = "ae" * 16
+    status_url = f"/v1/scheduled-task-requests/{request_id}"
+    unknown = await auth_client.get(status_url, headers=_headers())
+    assert unknown.json()["outcome"] == "unknown"
+    body = _create_body(workspace=None, host_id=None)
+    alice = await auth_client.post(
+        "/v1/scheduled-tasks", json=body, headers={**_headers(), "Idempotency-Key": request_id}
+    )
+    assert alice.status_code == 200
+    hidden = await auth_client.get(status_url, headers=_headers("bob@example.com"))
+    assert hidden.json()["outcome"] == "unknown"
+    bob = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=body,
+        headers={**_headers("bob@example.com"), "Idempotency-Key": request_id},
+    )
+    assert bob.status_code == 200
+    assert bob.json()["id"] != alice.json()["id"]
+    conflict = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={**body, "prompt": "changed"},
+        headers={**_headers(), "Idempotency-Key": request_id},
+    )
+    assert conflict.status_code == 409
+    # A new ID expresses a new intent; similar requests are not silently merged.
+    distinct = await auth_client.post(
+        "/v1/scheduled-tasks", json=body, headers={**_headers(), "Idempotency-Key": "af" * 16}
+    )
+    assert distinct.status_code == 200
+    assert distinct.json()["id"] != alice.json()["id"]
+
+
+async def test_concurrent_request_replays_create_only_one_task(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    import asyncio
+
+    headers = {**_headers(), "Idempotency-Key": "ba" * 16}
+    responses = await asyncio.gather(
+        *(
+            auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+            for _ in range(6)
+        )
+    )
+    assert all(response.status_code == 200 for response in responses)
+    assert len({response.json()["id"] for response in responses}) == 1
+    assert sum(not response.json()["replayed"] for response in responses) == 1
+    tasks = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert len(tasks.json()["scheduled_tasks"]) == 1
+
+
+@pytest.mark.parametrize("committed", [False, True])
+async def test_runner_reconciles_lost_mutation_response(
+    auth_client: httpx.AsyncClient,
+    committed: bool,
+) -> None:
+    from omnigent.runner.tool_dispatch import _execute_scheduled_task_tool
+
+    request_id = "bb" * 16
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and not committed:
+            raise httpx.ReadTimeout("")
+        response = await auth_client.request(
+            request.method,
+            request.url.path,
+            content=request.content,
+            headers={**_headers(), "Content-Type": "application/json", **dict(request.headers)},
+        )
+        if request.method == "POST":
+            assert response.status_code == 200, response.text
+            raise httpx.ReadTimeout("")
+        return response
+
+    arguments = {**_create_body(), "permission_mode": None, "request_id": request_id}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        result = json.loads(
+            await _execute_scheduled_task_tool(
+                "sys_scheduled_task_create",
+                json.dumps(arguments),
+                server_client=client,
+            )
+        )
+        assert result["outcome"] == "unknown"
+        assert "ReadTimeout" in result["error"]
+        assert result["request_id"] == request_id
+        status = json.loads(
+            await _execute_scheduled_task_tool(
+                "sys_scheduled_task_list",
+                json.dumps({"request_id": request_id}),
+                server_client=client,
+            )
+        )
+        assert status["outcome"] == ("applied" if committed else "unknown")
+    retry = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={**_create_body(), "permission_mode": None},
+        headers={**_headers(), "Idempotency-Key": request_id},
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is committed
+    tasks = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert len(tasks.json()["scheduled_tasks"]) == 1
+
+
+async def test_replay_restores_legacy_timer_after_postcommit_error(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = auth_app.state.scheduled_task_scheduler
+    headers = {**_headers(), "Idempotency-Key": "cb" * 16}
+    with monkeypatch.context() as patch:
+        patch.setattr(scheduler, "add", Mock(side_effect=RuntimeError("timer interrupted")))
+        with pytest.raises(RuntimeError, match="timer interrupted"):
+            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    assert scheduler.job_count == 0
+    response = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=headers)
+    assert response.status_code == 200
+    assert response.json()["replayed"] is True
+    assert scheduler.job_count == 1
+
+
+async def test_invalid_request_key_cannot_create_a_task(auth_client: httpx.AsyncClient) -> None:
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(),
+        headers={**_headers(), "Idempotency-Key": "invalid"},
+    )
+    assert response.status_code == 400
+    tasks = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert tasks.json()["scheduled_tasks"] == []

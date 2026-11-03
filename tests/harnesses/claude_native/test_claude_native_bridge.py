@@ -7182,9 +7182,13 @@ async def test_channel_server_relays_active_omnigent_tools(
             proc.wait(timeout=5.0)
 
 
+@pytest.mark.parametrize(
+    "tool_name", ["sys_os_shell", "sys_scheduled_task_create", "sys_scheduled_task_update"]
+)
 def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
     """
     A relay POST that times out mid-read returns an MCP error, not a raise.
@@ -7198,6 +7202,7 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     asserts the call instead yields an ``isError`` MCP result so the stdio
     loop can keep serving.
     """
+    received = []
     started = threading.Event()
     release = threading.Event()
 
@@ -7221,7 +7226,7 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
             :returns: None.
             """
             length = int(self.headers.get("Content-Length", "0"))
-            self.rfile.read(length)
+            received.append(json.loads(self.rfile.read(length)))
             started.set()
             # Hold the connection open with no response so the client's read
             # times out. Released in the test's finally so the thread exits.
@@ -7245,7 +7250,7 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
 
     try:
         result = claude_native_bridge._call_relay_tool(
-            bridge_dir, "sys_os_shell", {"command": "echo hi"}
+            bridge_dir, tool_name, {"command": "echo hi"}
         )
     finally:
         release.set()
@@ -7258,6 +7263,12 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     assert result["isError"] is True
     error_text = json.loads(result["content"][0]["text"])["error"]
     assert "failed to call Omnigent tool relay" in error_text
+
+    if tool_name.startswith("sys_scheduled_task_"):
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["outcome"] == "unknown"
+        assert payload["request_id"] == received[0]["arguments"]["request_id"]
+        assert len(payload["request_id"]) == 32
 
 
 @pytest.mark.asyncio
@@ -16330,3 +16341,25 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
             pytest.fail("delivery continued after a failed resize")
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
+
+
+@pytest.mark.asyncio
+async def test_relay_callback_timeout_is_not_reported_as_wait_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def executor(name, arguments):
+        raise TimeoutError()
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 10)
+    response = await asyncio.to_thread(
+        claude_native_bridge._run_relay_tool,
+        executor,
+        asyncio.get_running_loop(),
+        "sys_scheduled_task_create",
+        {"request_id": "cd" * 16},
+    )
+    result = json.loads(response["content"][0]["text"])
+    assert "TimeoutError" in result["error"]
+    assert "after 10s" not in result["error"]
+    assert result["outcome"] == "unknown"
+    assert result["request_id"] == "cd" * 16

@@ -117,3 +117,58 @@ def test_no_policy_fast_path_skips_ungated_scheduled_task_tools(
         tool_name=tool_name,
         conversation=conv,
     )
+
+
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_relay_timeout_cancels_pending_approval_without_dispatch(
+    tmp_path: Path,
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    import asyncio
+    import json
+
+    from omnigent.harnesses.claude_native import bridge
+
+    spec, conv = _no_guardrails_spec(tmp_path, conversation_store)
+    engine = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    approval = asyncio.Event()
+    cancelled = asyncio.Event()
+    decisions = []
+    dispatched = []
+
+    async def executor(name, arguments):
+        decision = await engine.evaluate(
+            EvaluationContext(
+                phase=Phase.TOOL_CALL,
+                content={"name": name, "arguments": arguments},
+                tool_name=name,
+            )
+        )
+        decisions.append(decision.action)
+        assert decision.action == PolicyAction.ASK
+        try:
+            await approval.wait()
+            dispatched.append(arguments)
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(bridge, "_TOOL_CALL_TIMEOUT_S", 0.1)
+    arguments = {**_CREATE_ARGS, "request_id": "bc" * 16}
+    if tool_name.endswith("update"):
+        arguments["scheduled_task_id"] = _TASK_ID
+    response = await asyncio.to_thread(
+        bridge._run_relay_tool, executor, asyncio.get_running_loop(), tool_name, arguments
+    )
+    await asyncio.wait_for(cancelled.wait(), 2)
+    approval.set()
+    result = json.loads(response["content"][0]["text"])
+    assert response["isError"] is True
+    assert result["outcome"] == "unknown"
+    assert result["request_id"] == arguments["request_id"]
+    assert "timed out" in result["error"]
+    assert decisions == [PolicyAction.ASK]
+    assert dispatched == []

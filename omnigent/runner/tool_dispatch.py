@@ -119,6 +119,11 @@ from omnigent.tools.builtins.timer import (
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.tools.scheduled_task_requests import (
+    MUTATION_TOOLS,
+    mutation_arguments,
+    mutation_failure,
+)
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -4815,26 +4820,34 @@ _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _SCHEDULED_TASK_SESSION_FIELDS = ("session_mode", "session_id")
 
 
-async def _scheduled_task_session_fields_refusal(
-    server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
+async def _scheduled_task_capabilities_refusal(
+    server_client: httpx.AsyncClient, tool_name: str, arguments: _JsonObject
 ) -> str | None:
-    """An error for session fields this server would reject, or ``None`` to send them.
-
-    An older server forbids unknown fields, so the payload would fail with a 422
-    that does not say why. Asked only when the call carries one of the fields; an
-    unreadable ``/v1/info`` counts as unsupported, as for task projects.
-    """
-    if not any(field in payload for field in _SCHEDULED_TASK_SESSION_FIELDS):
-        return None
+    """Refuse unsupported mutation fields before any request can change server state."""
     info = await server_client.get("/v1/info", timeout=30.0)
-    if info.status_code < 400 and info.json().get("scheduled_task_session_modes") is True:
-        return None
-    return json.dumps(
-        {
-            "error": f"{tool_name}: this Omnigent server does not support session_mode or "
+    capabilities = info.json() if info.status_code < 400 else {}
+    if (
+        any(field in arguments for field in ("project_name", "project_id"))
+        and capabilities.get("scheduled_task_projects") is not True
+    ):
+        return (
+            f"{tool_name}: this server does not support automation projects; "
+            "retry without project_name or project_id"
+        )
+    if (
+        any(field in arguments for field in _SCHEDULED_TASK_SESSION_FIELDS)
+        and capabilities.get("scheduled_task_session_modes") is not True
+    ):
+        return (
+            f"{tool_name}: this Omnigent server does not support session_mode or "
             "session_id; omit them to start a new session on every run"
-        }
-    )
+        )
+    if capabilities.get("scheduled_task_request_ids") is not True:
+        return (
+            "This server does not support scheduled-task request IDs; "
+            "upgrade the server before retrying this mutation."
+        )
+    return None
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
@@ -4911,6 +4924,10 @@ async def _execute_scheduled_task_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
     if not isinstance(args, dict):
         return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    try:
+        args = mutation_arguments(tool_name, args)
+    except ValueError as exc:
+        return json.dumps(mutation_failure(tool_name, args, str(exc), outcome="not_applied"))
     if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
         action = "create" if tool_name == "sys_scheduled_task_create" else "update"
         error = scheduled_task_review_error(args, action=action)
@@ -4924,35 +4941,45 @@ async def _execute_scheduled_task_tool(
             {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
         )
     project_name = raw_project_name if isinstance(raw_project_name, str) else None
-    wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
-        "project_name" in args or "project_id" in args
-    )
+    task_url = None
+    if tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
+        task_id = args.get("scheduled_task_id")
+        if not task_id:
+            return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
+        task_url = _scheduled_task_url(task_id)
+        if task_url is None:
+            return json.dumps(
+                {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+            )
     mutation_headers = (
         {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
     )
 
+    dispatched = False
     try:
-        if wants_project:
-            # Older servers reject the field; refuse before creating a project for it.
-            info = await server_client.get("/v1/info", timeout=30.0)
-            if info.status_code >= 400 or info.json().get("scheduled_task_projects") is not True:
+        if tool_name in MUTATION_TOOLS:
+            refusal = await _scheduled_task_capabilities_refusal(server_client, tool_name, args)
+            if refusal is not None:
                 return json.dumps(
-                    {
-                        "error": f"{tool_name}: this server does not support automation "
-                        "projects; retry without project_name or project_id"
-                    }
+                    mutation_failure(tool_name, args, refusal, outcome="not_applied")
                 )
+            mutation_headers = {
+                **(mutation_headers or {}),
+                "Idempotency-Key": str(args["request_id"]),
+            }
         if tool_name == "sys_scheduled_task_list":
-            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+            request_id = args.get("request_id")
+            if request_id is None:
+                url = "/v1/scheduled-tasks"
+            else:
+                request_id = uuid.UUID(str(request_id)).hex
+                url = f"/v1/scheduled-task-requests/{request_id}"
+            resp = await server_client.get(url, timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
-            refusal = await _scheduled_task_session_fields_refusal(
-                server_client, tool_name, payload
-            )
-            if refusal is not None:
-                return refusal
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
+            dispatched = True
             resp = await server_client.post(
                 "/v1/scheduled-tasks",
                 json=payload,
@@ -4960,23 +4987,11 @@ async def _execute_scheduled_task_tool(
                 headers={**(mutation_headers or {}), "x-omnigent-automation-source": "agent"},
             )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
-            task_id = args.get("scheduled_task_id")
-            if not task_id:
-                return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
-            task_url = _scheduled_task_url(task_id)
-            if task_url is None:
-                return json.dumps(
-                    {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
-                )
+            assert task_url is not None
             if tool_name == "sys_scheduled_task_delete":
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
-                refusal = await _scheduled_task_session_fields_refusal(
-                    server_client, tool_name, payload
-                )
-                if refusal is not None:
-                    return refusal
                 resp = None
                 if project_name is not None:
                     # Confirm the task first so a bad id doesn't leave a new project behind.
@@ -4988,19 +5003,42 @@ async def _execute_scheduled_task_tool(
                             server_client, project_name
                         )
                 if resp is None:
+                    dispatched = True
                     resp = await server_client.patch(
                         task_url, json=payload, headers=mutation_headers, timeout=30.0
                     )
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+        return json.dumps(
+            mutation_failure(
+                tool_name,
+                args,
+                f"{tool_name} failed: {type(exc).__name__}: {exc}",
+                outcome="unknown" if dispatched else "not_applied",
+            )
+        )
 
     if resp.status_code >= 400:
-        return json.dumps(
-            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        result = mutation_failure(
+            tool_name,
+            args,
+            f"server returned {resp.status_code}",
+            outcome="unknown" if dispatched and resp.status_code >= 500 else "not_applied",
         )
-    return json.dumps(resp.json())
+        result["details"] = resp.text[:500]
+        return json.dumps(result)
+    try:
+        return json.dumps(resp.json())
+    except ValueError as exc:
+        return json.dumps(
+            mutation_failure(
+                tool_name,
+                args,
+                f"Invalid server response: {type(exc).__name__}: {exc}",
+                outcome="unknown" if dispatched else "not_applied",
+            )
+        )
 
 
 @dataclass

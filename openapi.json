@@ -1841,6 +1841,148 @@
         "title": "CreateProjectRequest",
         "type": "object"
       },
+      "CreateScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/scheduled-tasks`.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "execution_target": {
+            "default": "connected_host",
+            "title": "Execution Target",
+            "type": "string"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "max_cost_usd": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Cost Usd"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "rrule": {
+            "title": "Rrule",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "session_mode": {
+            "default": "new",
+            "enum": [
+              "new",
+              "continue"
+            ],
+            "title": "Session Mode",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "UTC",
+            "title": "Timezone",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "name",
+          "prompt",
+          "rrule",
+          "agent_id"
+        ],
+        "title": "CreateScheduledTaskRequest",
+        "type": "object"
+      },
       "CreateSessionPolicyRequest": {
         "description": "Request body for `POST /v1/sessions/{session_id}/policies`.",
         "properties": {
@@ -6180,6 +6322,11 @@
             "title": "Scheduled Task Projects",
             "type": "boolean"
           },
+          "scheduled_task_request_ids": {
+            "default": true,
+            "title": "Scheduled Task Request Ids",
+            "type": "boolean"
+          },
           "scheduled_task_session_modes": {
             "default": true,
             "title": "Scheduled Task Session Modes",
@@ -10402,6 +10549,201 @@
         "title": "UpdateProjectRequest",
         "type": "object"
       },
+      "UpdateScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PATCH /v1/scheduled-tasks/{id}`. Unset fields are unchanged.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "execution_target": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Target"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          },
+          "max_cost_usd": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Cost Usd"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "permission_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Permission Mode"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Effort"
+          },
+          "rrule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rrule"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "session_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "new",
+                  "continue"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Mode"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "title": "UpdateScheduledTaskRequest",
+        "type": "object"
+      },
       "UpdateSessionPolicyRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{session_id}/policies/{policy_id}`.\n\nAll fields are optional; `None` fields are left unchanged.\nUnknown fields (including `type`, which is immutable) are\nrejected with `422`.",
@@ -14121,6 +14463,421 @@
         "summary": "Model Options",
         "tags": [
           "sandbox inference"
+        ]
+      }
+    },
+    "/v1/scheduled-task-requests/{request_id}": {
+      "get": {
+        "description": "Reconcile a request without mistaking an absent receipt for a failed write.",
+        "operationId": "get_scheduled_task_request_v1_scheduled_task_requests__request_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Scheduled Task Request V1 Scheduled Task Requests  Request Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Scheduled Task Request",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks": {
+      "get": {
+        "description": "List the caller's scheduled tasks.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Scheduled Tasks V1 Scheduled Tasks Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Scheduled Tasks",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "post": {
+        "description": "Create a scheduled task and arm it on the live scheduler.",
+        "operationId": "create_scheduled_task_v1_scheduled_tasks_post",
+        "parameters": [
+          {
+            "description": "Optional UUID for this mutation. Reuse the same UUID and inputs on retry. Reconcile uncertainty at GET /v1/scheduled-task-requests/{request_id}.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional UUID for this mutation. Reuse the same UUID and inputs on retry. Reconcile uncertainty at GET /v1/scheduled-task-requests/{request_id}.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScheduledTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Scheduled Task V1 Scheduled Tasks Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}": {
+      "delete": {
+        "description": "Check ownership, then delete the task and history in a worker thread.\n\nThe ownership lookup remains synchronous; remove the timer after deletion.",
+        "operationId": "delete_scheduled_task_v1_scheduled_tasks__scheduled_task_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "get": {
+        "description": "Fetch one of the caller's scheduled tasks.",
+        "operationId": "get_scheduled_task_v1_scheduled_tasks__scheduled_task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "patch": {
+        "description": "Update mutable fields of a task and re-sync the scheduler.",
+        "operationId": "update_scheduled_task_v1_scheduled_tasks__scheduled_task_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional UUID for this mutation. Reuse the same UUID and inputs on retry. Reconcile uncertainty at GET /v1/scheduled-task-requests/{request_id}.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional UUID for this mutation. Reuse the same UUID and inputs on retry. Reconcile uncertainty at GET /v1/scheduled-task-requests/{request_id}.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateScheduledTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run": {
+      "post": {
+        "description": "Trigger an immediate fire of one of the caller's scheduled tasks.\n\nA manual override that reuses the SHARED scheduled-fire path (the same\n`on_fire` machinery \u2014 session create, owner grant, runner launch,\nprompt dispatch, run recording). Legacy timers fire through\n`app.state.scheduled_task_run_now` and share its process-local overlap\nguard. With `automations_v2`, the request is recorded as a pending run\nthat the host's owning replica claims and starts like any occurrence, so\nRun now gets the same lease, recovery, and host routing. Each request is\nits own run; it may overlap a scheduled one.\n\nPaused tasks ARE runnable here \u2014 run-now is an explicit manual override,\nso it does not require the `active` state the scheduler enforces.\n\nFire-and-forget: like the scheduler, the session create + launch runs in\nthe background, so this returns `202 Accepted` with the task id rather\nthan the finished run. The new run row appears in the task's `/runs`\nhistory and in the LIST endpoint's `last_run_status`. Legacy timers\nreturn `409` when a fire for this task is already in flight. Both return\n`503` when the scheduler subsystem is not running.",
+        "operationId": "run_scheduled_task_now_v1_scheduled_tasks__scheduled_task_id__run_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Run Scheduled Task Now V1 Scheduled Tasks  Scheduled Task Id  Run Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Scheduled Task Now",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/runs": {
+      "get": {
+        "description": "List the run history for one of the caller's scheduled tasks.\n\nOwner-scoped: a task owned by someone else (or absent) 404s via\n`_require_owned`, so runs aren't enumerable across users. Runs come\nback most-recent-first (`scheduled_at DESC`); an empty history is an\nempty list.\n\nCursor-paginated so history is never silently truncated: pass `limit`\n(1-1000, default 100) and `after` (a prior page's `next_cursor`).\nThe response is `{\"runs\": [...], \"next_cursor\": <id or null>}`; a\n`null` cursor marks the last page.\n\nLazy-on-read backstop: before listing, force-fail any of this task's\nruns still `running` past the 6h max age (`incomplete`). Completion\nitself is event-driven (the `_publish_status` hook); this only\ncatches a genuine orphan \u2014 a run whose terminal event never fired (host\ndied mid-turn) \u2014 so the \"every run eventually terminal\" invariant holds\nwithout a background poll or startup sweep. Pure age check (no\nconversation I/O); a young in-flight run is untouched, and the\nconditional `update_run` never clobbers an already-terminal row.",
+        "operationId": "list_scheduled_task_runs_v1_scheduled_tasks__scheduled_task_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Scheduled Task Runs V1 Scheduled Tasks  Scheduled Task Id  Runs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Runs",
+        "tags": [
+          "scheduled_tasks"
         ]
       }
     },
@@ -19675,6 +20432,11 @@
       "description": "First-class, owner-private containers that group sessions \u2014 create, list, rename, and delete.",
       "name": "projects",
       "x-displayName": "Projects"
+    },
+    {
+      "description": "Create, update and reconcile recurring agent tasks.",
+      "name": "scheduled_tasks",
+      "x-displayName": "Scheduled Tasks"
     },
     {
       "description": "Health, version, and identity endpoints for the running server.",
