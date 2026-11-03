@@ -33,7 +33,6 @@ def test_delete_revokes_cookie_and_refresh_on_another_server(tmp_path: Path) -> 
             "OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD": "admin-pw-12345",
             "OMNIGENT_ACCOUNTS_AUTO_OPEN": "0",
             "OMNIGENT_ADMIN_CREDENTIALS_PATH": str(tmp_path / "admin-creds"),
-            "OMNIGENT_LOG_LEVEL": "INFO",
             "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
             "XDG_DATA_HOME": str(tmp_path / "xdg-data"),
         }
@@ -71,16 +70,16 @@ def test_delete_revokes_cookie_and_refresh_on_another_server(tmp_path: Path) -> 
                 )
                 processes.append(process)
                 deadline = time.monotonic() + 30
-                # Discover the kernel-assigned listener after Uvicorn owns its port.
+                # The CLI reports the kernel-assigned port once it has bound it.
                 while time.monotonic() < deadline:
                     logs = log_path.read_text() + process_log_path.read_text()
                     assert process.poll() is None, logs
                     listening = re.search(
-                        r"Uvicorn running on (http://127\.0\.0\.1:[1-9]\d*)",
+                        r"Starting omnigent server on (127\.0\.0\.1:[1-9]\d*)",
                         logs,
                     )
                     if listening is not None:
-                        base = listening.group(1)
+                        base = f"http://{listening.group(1)}"
                         break
                     time.sleep(0.1)
                 else:
