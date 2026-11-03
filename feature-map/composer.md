@@ -120,8 +120,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
-  Rows show a one-line description; the highlighted row wraps it to up to four
-  lines, and hovering a cut-off row shows the full text in a scrollable tooltip.
+  Rows show a one-line description. When the pointer or keyboard highlight rests
+  on a cut-off row for 400 ms, a scrollable tooltip shows the full text.
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
@@ -607,6 +607,7 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:

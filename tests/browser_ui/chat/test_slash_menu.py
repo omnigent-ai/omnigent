@@ -360,44 +360,67 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
 
     triage = page.get_by_test_id("slash-menu-item-triage")
     description = page.get_by_test_id("slash-menu-description-triage")
-    expect(triage).to_be_visible()
-    assert description.evaluate(_IS_CUT_OFF), "an unhighlighted row keeps one line"
-    one_line_box = description.bounding_box()
-    assert one_line_box is not None
-    one_line_height = one_line_box["height"]
     review_pr = page.get_by_test_id("slash-menu-item-review-pr")
-    rows_before_hover = [review_pr.bounding_box(), triage.bounding_box()]
+    expect(triage).to_be_visible()
+    assert description.evaluate(_IS_CUT_OFF)
+    rows_before = [review_pr.bounding_box(), triage.bounding_box()]
 
-    # Hovering the cut-off row shows its whole description in a tooltip.
-    triage.hover()
-    tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
-    expect(tooltip).to_be_visible()
-    expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
-    # The tooltip floats over the menu, so hovering neither resizes nor moves rows.
-    assert [review_pr.bounding_box(), triage.bounding_box()] == rows_before_hover
-    page.mouse.move(0, 0, steps=5)
-    expect(tooltip).to_have_count(0)
-
-    # Highlighting the row from the keyboard wraps the full description in place.
+    # A description that fits never gets a tooltip, hovered or highlighted.
+    review_pr.hover()
     composer.press("ArrowUp")
-    expect(triage).to_have_attribute("data-active", "true")
-    expect(description).to_have_text(_LONG_SKILL_DESCRIPTION)
-    assert not description.evaluate(_IS_CUT_OFF)
-    wrapped_box = description.bounding_box()
-    assert wrapped_box is not None
-    assert wrapped_box["height"] > one_line_height * 1.5
-    assert not page.get_by_test_id("slash-menu-description-review-pr").evaluate(_IS_CUT_OFF)
-
-    # The highlighted row needs no tooltip; moving on collapses it again.
-    triage.hover()
-    page.wait_for_timeout(800)
-    expect(tooltip).to_have_count(0)
     composer.press("ArrowUp")
     expect(review_pr).to_have_attribute("data-active", "true")
-    assert description.evaluate(_IS_CUT_OFF)
+    page.wait_for_timeout(800)
+    expect(page.get_by_test_id("slash-menu-tooltip-review-pr")).to_have_count(0)
+
+    # Resting the highlight on the cut-off row shows its full text over a one-line row.
+    composer.press("ArrowDown")
+    expect(triage).to_have_attribute("data-active", "true")
+    tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
+    expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
+    assert description.evaluate(_IS_CUT_OFF), "the highlighted row keeps one line"
+    assert [review_pr.bounding_box(), triage.bounding_box()] == rows_before
+
+    # The pointer leaving the highlighted row closes its tooltip; hovering the row reopens it.
+    triage.hover()
+    page.mouse.move(0, 0, steps=5)
+    expect(tooltip).to_have_count(0)
+    triage.hover()
+    expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
+
+    # Moving the highlight closes the tooltip, even under the pointer.
+    composer.press("ArrowUp")
+    expect(review_pr).to_have_attribute("data-active", "true")
+    expect(tooltip).to_have_count(0)
     composer.press("ArrowDown")
     composer.press("Enter")
     expect(composer).to_have_value("/triage ")
+
+
+def test_slash_menu_shows_a_long_single_match_from_the_keyboard(
+    page: Page, chat_session_contract
+) -> None:
+    chat_session_contract.set_skills(
+        [
+            {"name": "review-pr", "description": "Review a pull request"},
+            {"name": "triage", "description": _LONG_SKILL_DESCRIPTION},
+        ]
+    )
+    page.goto(chat_session_contract.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.press_sequentially("/tri")
+
+    expect(page.locator(_ROWS)).to_have_count(1)
+    expect(page.get_by_test_id("slash-menu-item-triage")).to_have_attribute("data-active", "true")
+    tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
+    expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
+
+    # One Escape still dismisses the menu while its tooltip is open.
+    composer.press("Escape")
+    expect(page.get_by_test_id("slash-command-menu")).to_have_count(0)
+    expect(tooltip).to_have_count(0)
+    expect(composer).to_have_value("")
 
 
 _SPRAWLING_SKILL_DESCRIPTION = " ".join(
@@ -427,7 +450,7 @@ def test_slash_menu_bounds_a_very_long_skill_description(
     expect(composer).to_be_visible()
     composer.fill("/")
 
-    # The highlighted row wraps to four lines and hides the rest.
+    # The highlighted row keeps one line.
     composer.press("ArrowUp")
     sprawl = page.get_by_test_id("slash-menu-item-sprawl")
     expect(sprawl).to_have_attribute("data-active", "true")
@@ -435,15 +458,8 @@ def test_slash_menu_bounds_a_very_long_skill_description(
     line_height = description.evaluate(_LINE_HEIGHT)
     description_box = description.bounding_box()
     assert description_box is not None
-    assert description_box["height"] == pytest.approx(4 * line_height, abs=1)
-    assert description.evaluate(_OVERFLOWS_VERTICALLY)
-
-    # Off the highlight, the hover tooltip stops at its height cap and scrolls from the top.
-    composer.press("ArrowUp")
-    expect(page.get_by_test_id("slash-menu-item-review-pr")).to_have_attribute(
-        "data-active", "true"
-    )
-    sprawl.hover()
+    assert description_box["height"] == pytest.approx(line_height, abs=1)
+    # Its tooltip stops at the height cap and scrolls from the first line.
     tooltip = page.get_by_test_id("slash-menu-tooltip-sprawl")
     expect(tooltip).to_be_visible()
     tooltip_box = tooltip.bounding_box()

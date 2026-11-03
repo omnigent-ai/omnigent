@@ -199,19 +199,11 @@ describe("full skill descriptions", () => {
     Object.defineProperty(element, "scrollWidth", { configurable: true, value: scrollWidth });
   }
 
-  it("wraps the highlighted row's description to up to four lines and keeps other rows to one line", () => {
-    const { rerender } = render(
-      <SlashCommandMenu {...props} commands={commands} activeIndex={1} />,
-    );
+  it("keeps every row's description to one line, highlighted or not", () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
     expect(description("triage")).toHaveTextContent(triage);
-    expect(description("triage")).toHaveClass("line-clamp-4", "break-words");
-    expect(description("triage")).not.toHaveClass("truncate");
-    expect(description("review")).toHaveClass("truncate");
-
-    // Moving the highlight collapses the previous row back to one line.
-    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
     expect(description("triage")).toHaveClass("truncate");
-    expect(description("review")).not.toHaveClass("truncate");
+    expect(description("review")).toHaveClass("truncate");
   });
 
   it("shows a cut-off description in full in a hover tooltip after a short delay", () => {
@@ -227,21 +219,32 @@ describe("full skill descriptions", () => {
     expect(tooltip).toHaveClass("max-h-64", "overflow-y-auto", "items-start");
   });
 
-  it("shows no tooltip when the description already fits or the row is highlighted", () => {
+  it("shows a cut-off description once the keyboard highlight rests on its row", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
-    overflowDescription("review", 200);
-    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-review"));
-    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
     overflowDescription("triage", 900);
-    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
-    advanceTimers(500);
-    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    advanceTimers(399);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    advanceTimers(1);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 
-  it("closes an open tooltip when its row becomes highlighted", () => {
+  it("drops a pending tooltip when the highlight moves on before the delay ends", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={1} />,
+    );
+    overflowDescription("triage", 900);
+    advanceTimers(200);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    advanceTimers(500);
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("closes a hover tooltip when the highlight moves between other rows", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
@@ -249,25 +252,22 @@ describe("full skill descriptions", () => {
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
     advanceTimers(400);
     expect(screen.getByTestId("slash-menu-tooltip-triage")).toBeInTheDocument();
-    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
-    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
-    // Arrowing away again does not bring back a tooltip the pointer has left.
-    fireEvent.pointerLeave(screen.getByTestId("slash-menu-item-triage"));
+    // The pointer stays on the row, so only the highlight change can close it.
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
-    advanceTimers(500);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 
-  it("drops a pending tooltip when its row is highlighted before the delay ends", () => {
+  it("shows no tooltip for a description that already fits", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
-    overflowDescription("triage", 900);
-    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
-    // The pointer stays on the row, so only the highlight can keep the tooltip closed.
-    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    overflowDescription("review", 200);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-review"));
     advanceTimers(500);
-    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    advanceTimers(500);
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
   });
 });
 

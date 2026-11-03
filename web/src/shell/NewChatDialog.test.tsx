@@ -9315,7 +9315,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByTestId("slash-menu-item-cross-review")).not.toBeInTheDocument();
   });
 
-  it("wraps the highlighted skill's description to up to four lines as the user arrows through the menu", () => {
+  it("shows a cut-off skill description in a tooltip once the user arrows onto it", () => {
     const triage =
       "Given the current conversation's context (a bug, error, crash, regression, or test " +
       "failure), file a ticket with reproduction steps and the owning team.";
@@ -9328,13 +9328,20 @@ describe("NewChatLandingScreen skills menu", () => {
     renderLanding();
     typeMessage("/");
     const description = screen.getByTestId("slash-menu-description-triage");
+    // jsdom has no layout, so report the overflow of a cut-off line.
+    Object.defineProperty(description, "scrollWidth", { configurable: true, value: 900 });
     expect(screen.getByTestId("slash-menu-item-review-pr")).toHaveAttribute("data-active", "true");
-    expect(description).toHaveClass("truncate");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
     expect(screen.getByTestId("slash-menu-item-triage")).toHaveAttribute("data-active", "true");
-    expect(description).toHaveTextContent(triage);
-    expect(description).toHaveClass("line-clamp-4");
-    expect(description).not.toHaveClass("truncate");
+    expect(description).toHaveClass("truncate");
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toHaveTextContent(triage);
   });
 
   it("shows Retry for discovery failures and an empty state after successful retry", () => {

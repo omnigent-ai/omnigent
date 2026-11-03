@@ -409,7 +409,7 @@ function McpServerMenu({
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
-  /** Description shown beside the name; wrapped to up to four lines when highlighted. */
+  /** One-line description shown beside the name; a cut-off one also opens in a tooltip. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
   flatIndex: number;
@@ -429,58 +429,68 @@ function RetrySkillsButton({ onClick }: { onClick: () => void }) {
   );
 }
 
+/** How long the pointer or keyboard highlight rests on a cut-off row before its tooltip opens. */
+const DESCRIPTION_TOOLTIP_DELAY_MS = 400;
+
+function isCutOff(element: HTMLElement | null): boolean {
+  return element !== null && element.scrollWidth > element.clientWidth;
+}
+
 /** A row inside a section list ("Commands" or "Skills"). */
 function MenuRowButton({
   row,
   active,
+  activeIndex,
   onSelect,
 }: {
   /** The row to render. */
   row: MenuRow;
   /** Whether this row is the keyboard-highlighted one. */
   active: boolean;
+  /** The menu's highlighted index; moving it closes this row's tooltip. */
+  activeIndex: number;
   /** Selection callback, called with the slash-prefixed name. */
   onSelect: (cmd: string) => void;
 }) {
   const isBuiltin = row.isBuiltin;
   const descriptionRef = useRef<HTMLSpanElement>(null);
   const [tooltipOpen, setTooltipOpen] = useState(false);
-  // Radix reports no close while the tooltip is suppressed, so drop it here.
-  if (active && tooltipOpen) setTooltipOpen(false);
+  // A highlight resting on a cut-off row opens its tooltip; moving the highlight closes them all.
+  useEffect(() => {
+    const timer = active
+      ? window.setTimeout(
+          () => setTooltipOpen(isCutOff(descriptionRef.current)),
+          DESCRIPTION_TOOLTIP_DELAY_MS,
+        )
+      : undefined;
+    return () => {
+      window.clearTimeout(timer);
+      setTooltipOpen(false);
+    };
+  }, [active, activeIndex]);
   // Wand in pink for skills (per design feedback — distinct from the
   // info-blue slash-command tint, and from plain Sparkles which marks
   // thinking/reasoning blocks), the ⌘ glyph in slate for built-ins.
   const Icon = isBuiltin ? CommandIcon : WandSparklesIcon;
-  // The highlighted row already wraps its description, so the hover
-  // tooltip is only for other rows whose one-line description is cut off.
-  const openTooltip = (open: boolean) => {
-    const description = descriptionRef.current;
-    setTooltipOpen(
-      open && !active && description !== null && description.scrollWidth > description.clientWidth,
-    );
-  };
   return (
-    <Tooltip open={tooltipOpen} onOpenChange={openTooltip}>
+    <Tooltip
+      open={tooltipOpen}
+      onOpenChange={(open) => setTooltipOpen(open && isCutOff(descriptionRef.current))}
+    >
       <TooltipTrigger asChild>
         <button
           type="button"
           data-testid={`slash-menu-item-${row.name.slice(1)}`}
           data-active={active ? "true" : undefined}
           className={cn(
-            "flex w-full gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
-            // Baseline alignment keeps a wrapped description's first line level with the name.
-            active ? "items-baseline bg-muted dark:bg-muted/50" : "items-center",
+            "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
+            active && "bg-muted dark:bg-muted/50",
           )}
           // preventDefault keeps the textarea focused while the user clicks.
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => onSelect(row.name)}
         >
-          <span
-            className={cn(
-              "flex w-4 shrink-0 items-center justify-center",
-              active ? "h-[1lh] self-start" : "h-4",
-            )}
-          >
+          <span className="flex size-4 shrink-0 items-center justify-center">
             <Icon
               className={cn(
                 "size-3.5",
@@ -497,11 +507,7 @@ function MenuRowButton({
             <span
               ref={descriptionRef}
               data-testid={`slash-menu-description-${row.name.slice(1)}`}
-              className={cn(
-                "min-w-0 text-xs text-muted-foreground",
-                // Clamped so one long description can't fill the capped list.
-                active ? "line-clamp-4 break-words leading-4" : "truncate leading-4",
-              )}
+              className="truncate text-xs leading-4 text-muted-foreground"
             >
               {row.description}
             </span>
@@ -528,8 +534,8 @@ function MenuRowButton({
  * starts a slash command, shared by the in-session composer (ChatPage)
  * and the new-chat landing composer (NewChatDialog). Cursor-style
  * layout: a panel with "Commands" / "Skills" section headers and icon +
- * name + one-line description rows. The highlighted row wraps its
- * description to up to four lines, and hovering a cut-off row shows it in a tooltip.
+ * name + one-line description rows. Resting the pointer or keyboard
+ * highlight on a cut-off row shows its full description in a tooltip.
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
@@ -598,7 +604,7 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <TooltipProvider delayDuration={400}>
+    <TooltipProvider delayDuration={DESCRIPTION_TOOLTIP_DELAY_MS}>
       <div
         data-testid="slash-command-menu"
         className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
@@ -610,6 +616,7 @@ export function SlashCommandMenu({
               key={row.name}
               row={row}
               active={row.flatIndex === activeIndex}
+              activeIndex={activeIndex}
               onSelect={onSelect}
             />
           ))}
@@ -656,6 +663,7 @@ export function SlashCommandMenu({
               key={row.name}
               row={row}
               active={row.flatIndex === activeIndex}
+              activeIndex={activeIndex}
               onSelect={onSelect}
             />
           ))}
