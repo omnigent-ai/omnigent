@@ -100,6 +100,10 @@ async def test_quiet_codex_discovered_child_holds_its_parent_pane(
                 }
             }
 
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            """Report an unsubscribed connection so the child's history is replayed."""
+            return False
+
         async def iter_events(self):
             while True:
                 event, handled = await self.events.get()
