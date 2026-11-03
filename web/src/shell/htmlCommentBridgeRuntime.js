@@ -21,6 +21,7 @@
     "commentClick",
     "selectionCleared",
     "zoom",
+    "scroll",
   ];
   if (requiredTypes.some((name) => typeof T[name] !== "string")) return;
   let port = null;
@@ -211,6 +212,63 @@
     }
   }
 
+  // Restore the saved offset after a remount. Late-loading content can clamp it,
+  // so re-assert it each frame until the budget ends or the reader scrolls;
+  // scroll reports stay off meanwhile so clamps can't overwrite the saved value.
+  const USER_SCROLL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"];
+  let scrollRestore = null; // { top, deadline } while restoring
+  let scrollRestoreFrame = 0;
+
+  function settleScrollRestore() {
+    if (!scrollRestore) return;
+    scrollRestore = null;
+    cancelAnimationFrame(scrollRestoreFrame);
+    for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
+      window.removeEventListener(USER_SCROLL_EVENTS[i], settleScrollRestore, true);
+    }
+  }
+
+  function applyScrollRestore() {
+    if (!scrollRestore) return;
+    if (performance.now() >= scrollRestore.deadline) {
+      settleScrollRestore();
+      return;
+    }
+    // "instant" overrides an artifact's `scroll-behavior: smooth`.
+    window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
+    scrollRestoreFrame = requestAnimationFrame(applyScrollRestore);
+  }
+
+  function startScrollRestore() {
+    let saved;
+    try {
+      saved = JSON.parse(script.getAttribute("data-omni-restore-scroll") || "null");
+    } catch {
+      return;
+    }
+    if (!saved || typeof saved.top !== "number" || !(saved.top > 0)) return;
+    const budget = typeof saved.budgetMs === "number" ? saved.budgetMs : 0;
+    scrollRestore = { top: saved.top, deadline: performance.now() + budget };
+    for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
+      window.addEventListener(USER_SCROLL_EVENTS[i], settleScrollRestore, {
+        capture: true,
+        passive: true,
+      });
+    }
+    applyScrollRestore();
+  }
+
+  // Report the reader's offset, at most once per frame, so the parent can
+  // restore it on the next mount.
+  let scrollReportFrame = 0;
+  function onScroll() {
+    if (scrollRestore || scrollReportFrame) return;
+    scrollReportFrame = requestAnimationFrame(function () {
+      scrollReportFrame = 0;
+      if (!scrollRestore) send({ type: T.scroll, top: window.scrollY });
+    });
+  }
+
   // Scroll the first active-comment range into view. Uses the range's client
   // rect (Ranges have no scrollIntoView) to center it in the viewport, but only
   // when off-screen so an already-visible highlight doesn't jump.
@@ -222,6 +280,7 @@
     const vh = window.innerHeight || document.documentElement.clientHeight;
     if (rect.top >= 0 && rect.bottom <= vh) return; // already fully visible
     const target = window.pageYOffset + rect.top - vh / 2 + rect.height / 2;
+    settleScrollRestore();
     window.scrollTo({ top: target < 0 ? 0 : target, behavior: "smooth" });
   }
 
@@ -383,4 +442,6 @@
   });
 
   document.addEventListener("mouseup", onMouseUp, true);
+  window.addEventListener("scroll", onScroll, { passive: true });
+  startScrollRestore();
 })();

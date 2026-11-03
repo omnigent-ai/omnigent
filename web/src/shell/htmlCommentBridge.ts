@@ -27,6 +27,7 @@ import { escapeHtmlAttr } from "@/lib/html";
 import bridgeRuntime from "./htmlCommentBridgeRuntime.js?raw";
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
 import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -52,6 +53,8 @@ export const BRIDGE_MSG = {
   selectionCleared: "omni:selectionCleared",
   /** iframe → parent: the user pressed a zoom shortcut inside the preview. */
   zoom: "omni:zoom",
+  /** iframe → parent: the document's vertical scroll offset after it scrolled. */
+  scroll: "omni:scroll",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -93,9 +96,20 @@ export interface BridgeZoom {
   action: HtmlPreviewZoomAction;
 }
 
+export interface BridgeScroll {
+  type: typeof BRIDGE_MSG.scroll;
+  /** The document's vertical scroll offset, in the frame's CSS pixels. */
+  top: number;
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
-  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared | BridgeZoom;
+  | BridgeReady
+  | BridgeSelection
+  | BridgeCommentClick
+  | BridgeSelectionCleared
+  | BridgeZoom
+  | BridgeScroll;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -151,6 +165,10 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return { type: BRIDGE_MSG.selectionCleared };
     case BRIDGE_MSG.zoom:
       return isHtmlPreviewZoomAction(d.action) ? { type: BRIDGE_MSG.zoom, action: d.action } : null;
+    case BRIDGE_MSG.scroll:
+      return typeof d.top === "number" && Number.isFinite(d.top) && d.top >= 0
+        ? { type: BRIDGE_MSG.scroll, top: d.top }
+        : null;
     default:
       return null;
   }
@@ -304,18 +322,33 @@ const BRIDGE_HIGHLIGHT_STYLE =
  * (NOT a full HTML parse, which could subtly change how the artifact renders):
  * inject before `</body>` when present, else before `</html>`, else append.
  *
+ * A positive `restoreScrollTop` tells the runtime to scroll the document back to
+ * that offset as it lays out, so a remounted preview reopens where the reader was.
+ *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
  * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
+ * @param restoreScrollTop Saved vertical scroll offset to return to, or 0 for the top.
  */
-export function injectCommentBridge(html: string, nonce: string, runtimeUrl?: string): string {
+export function injectCommentBridge(
+  html: string,
+  nonce: string,
+  runtimeUrl?: string,
+  restoreScrollTop = 0,
+): string {
   const prepared = prepareHtmlPreviewDoc(html);
   const src = runtimeUrl ? ` src="${escapeHtmlAttr(runtimeUrl)}"` : "";
   const body = runtimeUrl ? "" : HTML_COMMENT_BRIDGE_RUNTIME;
   const protocol = escapeHtmlAttr(JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }));
+  const restore =
+    Number.isFinite(restoreScrollTop) && restoreScrollTop > 0
+      ? ` data-omni-restore-scroll="${escapeHtmlAttr(
+          JSON.stringify({ top: restoreScrollTop, budgetMs: SCROLL_RESTORE_BUDGET_MS }),
+        )}"`
+      : "";
   const inject =
     BRIDGE_HIGHLIGHT_STYLE +
-    `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}" data-omni-protocol="${protocol}">${body}</script>`;
+    `<script${src} data-omni-nonce="${escapeHtmlAttr(nonce)}" data-omni-protocol="${protocol}"${restore}>${body}</script>`;
 
   const bodyClose = prepared.search(/<\/body\s*>/i);
   if (bodyClose !== -1) {

@@ -8,6 +8,7 @@ import {
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 // ---------------------------------------------------------------------------
 // injectCommentBridge — script/style placement (mirrors prepareHtmlPreviewDoc)
@@ -100,60 +101,89 @@ describe("injectCommentBridge", () => {
   it("ships a syntactically valid classic script", () => {
     expect(() => new Function(HTML_COMMENT_BRIDGE_RUNTIME)).not.toThrow();
   });
+
+  it("hands a saved scroll offset and the restore budget to the runtime", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL, 640);
+    const doc = new DOMParser().parseFromString(out, "text/html");
+    const script = doc.querySelector(`script[data-omni-nonce="${NONCE}"]`);
+    expect(JSON.parse(script?.getAttribute("data-omni-restore-scroll") ?? "")).toEqual({
+      top: 640,
+      budgetMs: SCROLL_RESTORE_BUDGET_MS,
+    });
+  });
+
+  it.each([0, -5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "asks for no restore when the saved offset is %s",
+    (top) => {
+      const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL, top);
+      expect(out).not.toContain("data-omni-restore-scroll");
+    },
+  );
 });
+
+// ---------------------------------------------------------------------------
+// Bridge runtime harness
+// ---------------------------------------------------------------------------
+
+const RUNTIME_NONCE = "runtime-nonce";
+const runtimeListeners: [EventTarget, string, EventListenerOrEventListenerObject, unknown][] = [];
+
+afterEach(() => {
+  for (const [target, type, listener, options] of runtimeListeners.splice(0)) {
+    target.removeEventListener(type, listener, options as EventListenerOptions);
+  }
+  vi.restoreAllMocks();
+});
+
+/** Run the runtime in this document, as the injected script would, and connect a port. */
+function startRuntime({
+  connect = true,
+  beforeConnect,
+  restoreScroll,
+}: {
+  connect?: boolean;
+  beforeConnect?: () => void;
+  /** Value of the script's `data-omni-restore-scroll` attribute. */
+  restoreScroll?: string;
+} = {}) {
+  for (const target of [window, document]) {
+    const original = target.addEventListener.bind(target);
+    vi.spyOn(target, "addEventListener").mockImplementation((type, listener, options) => {
+      if (listener) runtimeListeners.push([target, type, listener, options]);
+      original(type, listener, options);
+    });
+  }
+  const script = document.createElement("script");
+  script.setAttribute("data-omni-nonce", RUNTIME_NONCE);
+  script.setAttribute(
+    "data-omni-protocol",
+    JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }),
+  );
+  if (restoreScroll !== undefined) script.setAttribute("data-omni-restore-scroll", restoreScroll);
+  vi.spyOn(document, "currentScript", "get").mockReturnValue(script);
+  new Function(HTML_COMMENT_BRIDGE_RUNTIME)();
+  beforeConnect?.();
+
+  const port = { postMessage: vi.fn(), onmessage: null };
+  if (connect) {
+    const init = new Event("message");
+    Object.defineProperties(init, {
+      data: { value: { source: BRIDGE_SOURCE, nonce: RUNTIME_NONCE, type: BRIDGE_MSG.init } },
+      ports: { value: [port] },
+    });
+    window.dispatchEvent(init);
+    port.postMessage.mockClear(); // drop the ready message
+  }
+  vi.mocked(window.addEventListener).mockRestore();
+  vi.mocked(document.addEventListener).mockRestore();
+  return port;
+}
 
 // ---------------------------------------------------------------------------
 // Bridge runtime — zoom shortcuts inside the preview
 // ---------------------------------------------------------------------------
 
 describe("bridge runtime zoom shortcuts", () => {
-  const NONCE = "zoom-nonce";
-  const added: [EventTarget, string, EventListenerOrEventListenerObject, unknown][] = [];
-
-  afterEach(() => {
-    for (const [target, type, listener, options] of added.splice(0)) {
-      target.removeEventListener(type, listener, options as EventListenerOptions);
-    }
-    vi.restoreAllMocks();
-  });
-
-  /** Run the runtime in this document, as the injected script would, and connect a port. */
-  function startRuntime({
-    connect = true,
-    beforeConnect,
-  }: { connect?: boolean; beforeConnect?: () => void } = {}) {
-    for (const target of [window, document]) {
-      const original = target.addEventListener.bind(target);
-      vi.spyOn(target, "addEventListener").mockImplementation((type, listener, options) => {
-        if (listener) added.push([target, type, listener, options]);
-        original(type, listener, options);
-      });
-    }
-    const script = document.createElement("script");
-    script.setAttribute("data-omni-nonce", NONCE);
-    script.setAttribute(
-      "data-omni-protocol",
-      JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }),
-    );
-    vi.spyOn(document, "currentScript", "get").mockReturnValue(script);
-    new Function(HTML_COMMENT_BRIDGE_RUNTIME)();
-    beforeConnect?.();
-
-    const port = { postMessage: vi.fn(), onmessage: null };
-    if (connect) {
-      const init = new Event("message");
-      Object.defineProperties(init, {
-        data: { value: { source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.init } },
-        ports: { value: [port] },
-      });
-      window.dispatchEvent(init);
-      port.postMessage.mockClear(); // drop the ready message
-    }
-    vi.mocked(window.addEventListener).mockRestore();
-    vi.mocked(document.addEventListener).mockRestore();
-    return port;
-  }
-
   function press(init: KeyboardEventInit): boolean {
     const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
     document.body.dispatchEvent(event);
@@ -162,7 +192,11 @@ describe("bridge runtime zoom shortcuts", () => {
 
   function sentZoomActions(port: { postMessage: ReturnType<typeof vi.fn> }) {
     return port.postMessage.mock.calls.map(([msg]) => {
-      expect(msg).toMatchObject({ source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.zoom });
+      expect(msg).toMatchObject({
+        source: BRIDGE_SOURCE,
+        nonce: RUNTIME_NONCE,
+        type: BRIDGE_MSG.zoom,
+      });
       return (msg as { action: string }).action;
     });
   }
@@ -257,6 +291,161 @@ describe("bridge runtime zoom shortcuts", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bridge runtime — scroll restore and scroll reports
+// ---------------------------------------------------------------------------
+
+describe("bridge runtime scroll position", () => {
+  const BUDGET_MS = 1_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Fake frames and the clock, stub jsdom's unimplemented scrollTo, and track scrollY. */
+  function fakeScrolling() {
+    vi.useFakeTimers({
+      toFake: ["requestAnimationFrame", "cancelAnimationFrame", "performance"],
+    });
+    let scrollY = 0;
+    vi.spyOn(window, "scrollY", "get").mockImplementation(() => scrollY);
+    const scrollTo = vi
+      .spyOn(window, "scrollTo")
+      .mockImplementation((options?: ScrollToOptions | number) => {
+        if (typeof options === "object" && typeof options.top === "number") scrollY = options.top;
+      });
+    const scrollBy = (top: number) => {
+      scrollY = top;
+      window.dispatchEvent(new Event("scroll"));
+    };
+    return { scrollTo, scrollBy };
+  }
+
+  function sentScrollOffsets(port: { postMessage: ReturnType<typeof vi.fn> }) {
+    return port.postMessage.mock.calls
+      .map(([msg]) => msg as { type: string; top: number; nonce: string })
+      .filter((msg) => msg.type === BRIDGE_MSG.scroll)
+      .map((msg) => {
+        expect(msg.nonce).toBe(RUNTIME_NONCE);
+        return msg.top;
+      });
+  }
+
+  const restoreTo = (top: number) => JSON.stringify({ top, budgetMs: BUDGET_MS });
+
+  it("reports the reader's offset once per frame", () => {
+    const { scrollBy } = fakeScrolling();
+    const port = startRuntime();
+
+    scrollBy(120);
+    scrollBy(180);
+    expect(sentScrollOffsets(port)).toEqual([]);
+    vi.advanceTimersToNextFrame();
+    expect(sentScrollOffsets(port)).toEqual([180]);
+
+    scrollBy(0);
+    vi.advanceTimersToNextFrame();
+    expect(sentScrollOffsets(port)).toEqual([180, 0]);
+  });
+
+  it("starts at the top without a saved offset", () => {
+    const { scrollTo } = fakeScrolling();
+    startRuntime();
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("re-asserts the saved offset each frame until the budget runs out", () => {
+    const { scrollTo, scrollBy } = fakeScrolling();
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
+    expect(scrollTo).toHaveBeenLastCalledWith({ left: 0, top: 640, behavior: "instant" });
+
+    // Content still loading clamps the document back; the next frame retries.
+    scrollBy(200);
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    expect(window.scrollY).toBe(640);
+    // The clamp is not reported, so it can't overwrite the saved offset.
+    expect(sentScrollOffsets(port)).toEqual([]);
+
+    vi.advanceTimersByTime(BUDGET_MS);
+    const writes = scrollTo.mock.calls.length;
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(writes);
+
+    // After the restore settles, the reader's own scrolling is reported again.
+    scrollBy(700);
+    vi.advanceTimersToNextFrame();
+    expect(sentScrollOffsets(port)).toEqual([700]);
+  });
+
+  it.each(["wheel", "touchstart", "pointerdown", "keydown"])(
+    "stops restoring when the reader takes over with %s",
+    (type) => {
+      const { scrollTo, scrollBy } = fakeScrolling();
+      const port = startRuntime({ restoreScroll: restoreTo(640) });
+      document.body.dispatchEvent(new Event(type, { bubbles: true }));
+
+      scrollBy(300);
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).toHaveBeenCalledTimes(1);
+      expect(window.scrollY).toBe(300);
+      expect(sentScrollOffsets(port)).toEqual([300]);
+    },
+  );
+
+  it("lets a newly active comment scroll the preview instead of the restore", () => {
+    const { scrollTo } = fakeScrolling();
+    const rect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
+    try {
+      document.body.innerHTML = "<p>Quarterly revenue</p>";
+      // jsdom lacks the Custom Highlight API the runtime tracks active ranges with.
+      vi.stubGlobal("CSS", { highlights: new Map() });
+      vi.stubGlobal("Highlight", Set);
+      // jsdom has no layout: place the commented text far below the viewport.
+      Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ top: 4_000, bottom: 4_020, width: 60, height: 20 }),
+      });
+      const port = startRuntime({ restoreScroll: restoreTo(640) }) as unknown as {
+        onmessage: ((event: { data: unknown }) => void) | null;
+      };
+      port.onmessage?.({
+        data: {
+          type: BRIDGE_MSG.setComments,
+          comments: [{ id: "c1", anchor_content: "revenue", occ: 0 }],
+        },
+      });
+      port.onmessage?.({
+        data: {
+          type: BRIDGE_MSG.setActive,
+          active: { comment_id: "c1", anchor_content: "revenue" },
+        },
+      });
+      expect(scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ behavior: "smooth" }));
+
+      const writes = scrollTo.mock.calls.length;
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).toHaveBeenCalledTimes(writes);
+    } finally {
+      if (rect) Object.defineProperty(Range.prototype, "getBoundingClientRect", rect);
+      else delete (Range.prototype as Partial<Range>).getBoundingClientRect;
+      vi.unstubAllGlobals();
+      document.body.innerHTML = "";
+    }
+  });
+
+  it.each(["null", "{", JSON.stringify({ top: -10, budgetMs: BUDGET_MS }), '{"top":"640"}'])(
+    "ignores a malformed restore request %s",
+    (restoreScroll) => {
+      const { scrollTo } = fakeScrolling();
+      startRuntime({ restoreScroll });
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).not.toHaveBeenCalled();
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // parseBridgeMessage — inbound validation (guards against spoofed postMessage)
 // ---------------------------------------------------------------------------
 
@@ -338,6 +527,20 @@ describe("parseBridgeMessage", () => {
     }
     expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.zoom, action: "2" }, NONCE)).toBeNull();
     expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.zoom }, NONCE)).toBeNull();
+  });
+
+  it("accepts a scroll report only with a finite, non-negative offset", () => {
+    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.scroll, top: 0 }, NONCE)).toEqual({
+      type: BRIDGE_MSG.scroll,
+      top: 0,
+    });
+    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.scroll, top: 812.5 }, NONCE)).toEqual({
+      type: BRIDGE_MSG.scroll,
+      top: 812.5,
+    });
+    for (const top of [-1, Number.NaN, Number.POSITIVE_INFINITY, "640", undefined]) {
+      expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.scroll, top }, NONCE)).toBeNull();
+    }
   });
 
   it("rejects a wrong nonce (spoof from artifact JS)", () => {

@@ -6,6 +6,7 @@ import type { Comment } from "@/hooks/useComments";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({
@@ -22,10 +23,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function renderViewer(content: string, truncated = false, embedded = false) {
+function renderViewer(
+  content: string,
+  truncated = false,
+  embedded = false,
+  scrollKey: string | null = null,
+) {
   const viewer = (
     <HtmlCommentViewer
       conversationId="conv_1"
+      scrollKey={scrollKey}
       content={content}
       truncated={truncated}
       comments={[]}
@@ -102,6 +109,7 @@ describe("HtmlCommentViewer", () => {
       <EmbeddedProvider>
         <HtmlCommentViewer
           conversationId="conv_1"
+          scrollKey={null}
           content="<p>Updated artifact</p>"
           truncated={false}
           comments={[]}
@@ -179,6 +187,7 @@ describe("HtmlCommentViewer", () => {
     rerender(
       <HtmlCommentViewer
         conversationId="conv_1"
+        scrollKey={null}
         content="<body>x</body>"
         truncated={true}
         comments={[]}
@@ -192,6 +201,60 @@ describe("HtmlCommentViewer", () => {
   it("does not show the floating Add-comment button before any selection", () => {
     renderViewer("<body><p>doc</p></body>");
     expect(document.querySelector("[data-add-comment-btn]")).toBeNull();
+  });
+});
+
+describe("HtmlCommentViewer scroll position", () => {
+  /** The saved offset the frame was asked to restore, or null for none. */
+  function requestedRestore(): { top: number } | null {
+    const srcDoc = screen.getByTitle<HTMLIFrameElement>("HTML preview").getAttribute("srcdoc");
+    const doc = new DOMParser().parseFromString(srcDoc ?? "", "text/html");
+    const value = doc
+      .querySelector("script[data-omni-nonce]")
+      ?.getAttribute("data-omni-restore-scroll");
+    return value ? (JSON.parse(value) as { top: number }) : null;
+  }
+
+  it("saves the frame's reported offset and restores it when the preview remounts", async () => {
+    const key = "html-preview:conv_1:plan.html";
+    const first = renderViewer("<body><p>plan</p></body>", false, false, key);
+    expect(requestedRestore()).toBeNull();
+    const { port, send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 760 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(760));
+    port.close();
+    first.unmount();
+
+    // Switching back to the tab or session mounts a fresh preview for the file.
+    renderViewer("<body><p>plan</p></body>", false, false, key);
+    expect(requestedRestore()).toMatchObject({ top: 760 });
+  });
+
+  it("keeps each file's offset to itself", () => {
+    saveScrollTop("html-preview:conv_1:a.html", 420);
+    renderViewer("<body><p>b</p></body>", false, false, "html-preview:conv_1:b.html");
+    expect(requestedRestore()).toBeNull();
+  });
+
+  it("returns to the saved offset when the agent rewrites the file", () => {
+    const key = "html-preview:conv_1:live.html";
+    saveScrollTop(key, 300);
+    const { rerender } = renderViewer("<body><p>v1</p></body>", false, false, key);
+    saveScrollTop(key, 512);
+    rerender(
+      <HtmlCommentViewer
+        conversationId="conv_1"
+        scrollKey={key}
+        content="<body><p>v2</p></body>"
+        truncated={false}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+      />,
+    );
+    expect(requestedRestore()).toMatchObject({ top: 512 });
   });
 });
 
@@ -255,6 +318,7 @@ describe("HtmlCommentViewer zoom", () => {
     rerender(
       <HtmlCommentViewer
         conversationId="conv_1"
+        scrollKey={null}
         content="<body><p>rewritten</p></body>"
         truncated={false}
         comments={[]}
@@ -336,6 +400,7 @@ describe("HtmlCommentViewer zoom", () => {
     render(
       <HtmlCommentViewer
         conversationId="conv_1"
+        scrollKey={null}
         content={content}
         truncated={false}
         comments={[draft]}

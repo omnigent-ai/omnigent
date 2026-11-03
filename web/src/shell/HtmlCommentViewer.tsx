@@ -33,6 +33,7 @@ import {
   nextHtmlPreviewZoom,
 } from "./htmlPreviewZoom";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
 const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
@@ -44,6 +45,8 @@ const ZOOM_BADGE_MS = 1_500;
 
 interface HtmlCommentViewerProps {
   conversationId: string;
+  /** Cache key for the preview's scroll offset (null disables persistence). */
+  scrollKey: string | null;
   /** Raw HTML source — rendered in the iframe and searched for comment anchors. */
   content: string;
   truncated: boolean;
@@ -91,6 +94,7 @@ function activePayload(content: string, sel: ActiveSelection | null) {
 
 export function HtmlCommentViewer({
   conversationId,
+  scrollKey,
   content,
   truncated,
   comments,
@@ -107,6 +111,7 @@ export function HtmlCommentViewer({
   // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
   // which re-runs the bridge and (via the new nonce) re-establishes
   // the channel — clearing any stale highlights from the previous content.
+  // The frame reopens at the reader's last offset for this file.
   const { nonce, srcDoc } = useMemo(() => {
     const n = genNonce();
     return {
@@ -115,9 +120,10 @@ export function HtmlCommentViewer({
         content,
         n,
         loadBridgeExternally ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+        scrollKey ? (getSavedScrollTop(scrollKey) ?? 0) : 0,
       ),
     };
-  }, [content, loadBridgeExternally]);
+  }, [content, loadBridgeExternally, scrollKey]);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
@@ -164,6 +170,8 @@ export function HtmlCommentViewer({
   onSetActiveSelectionRef.current = onSetActiveSelection;
   const activeSelectionRef = useRef(activeSelection);
   activeSelectionRef.current = activeSelection;
+  const scrollKeyRef = useRef(scrollKey);
+  scrollKeyRef.current = scrollKey;
 
   const postState = () => {
     const port = portRef.current;
@@ -252,6 +260,8 @@ export function HtmlCommentViewer({
       setZoomBadgeVisible(true);
       if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
       zoomBadgeTimerRef.current = setTimeout(() => setZoomBadgeVisible(false), ZOOM_BADGE_MS);
+    } else if (msg.type === BRIDGE_MSG.scroll) {
+      if (scrollKeyRef.current) saveScrollTop(scrollKeyRef.current, msg.top);
     }
   };
 
