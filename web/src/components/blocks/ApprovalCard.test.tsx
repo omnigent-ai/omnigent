@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -2345,4 +2346,72 @@ describe("Kiro approval delivery", () => {
       native_delivery_attempt: "reject-attempt",
     });
   });
+});
+
+describe("question custom selection and editing", () => {
+  it.each([false, true])(
+    "retains edited text and selections across navigation (multi=%s)",
+    async (multiSelect) => {
+      const user = userEvent.setup();
+      const submit = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ conversationId: "conv_custom", submitApproval: submit });
+      render(
+        <ApprovalCard
+          elicitationId="custom-focus"
+          message="Choose"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{
+            questions: [
+              { question: "First", options: [{ label: "Preset" }], multiSelect },
+              { question: "Second", options: [{ label: "Done" }], multiSelect: false },
+            ],
+          }}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "Prev" })).toBeDisabled();
+      await user.click(screen.getByLabelText("Preset"));
+      const toggle = screen.getByRole(multiSelect ? "checkbox" : "radio", {
+        name: "Select custom answer",
+      });
+      const editor = screen.getByRole("textbox", { name: "Custom answer" });
+      const selectionLabel = toggle.closest("label")!;
+      expect(selectionLabel).not.toContainElement(editor);
+      await user.click(editor);
+      expect(editor).toHaveFocus();
+      expect(toggle).not.toBeChecked();
+      await user.click(selectionLabel);
+      expect(toggle).toBeChecked();
+      expect(editor).not.toHaveFocus();
+      if (multiSelect) {
+        await user.click(selectionLabel);
+        expect(toggle).not.toBeChecked();
+        await user.click(selectionLabel);
+        expect(toggle).toBeChecked();
+      }
+      await user.click(editor);
+      expect(editor).toHaveFocus();
+      expect(toggle).toBeChecked();
+      await user.type(editor, "Custom text");
+      expect(submit).not.toHaveBeenCalled();
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByLabelText("Done")).toBeChecked();
+      expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+      await user.click(screen.getByLabelText("Done"));
+      await user.click(screen.getByRole("button", { name: "Prev" }));
+      expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("Custom text");
+      expect(screen.getByTestId("ask-user-question-custom-toggle")).toBeChecked();
+      expect(screen.getByLabelText("Preset").matches(":checked")).toBe(multiSelect);
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      await user.click(screen.getByRole("button", { name: "Submit" }));
+      expect(submit).toHaveBeenCalledExactlyOnceWith("custom-focus", "accept", {
+        First: multiSelect ? ["Preset", "Custom text"] : "Custom text",
+        Second: "Done",
+      });
+    },
+  );
 });

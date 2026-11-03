@@ -850,6 +850,22 @@ def build_native_controls(
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="approval mode change", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None and state.active_turn_id is not None:
+            # Codex disables /permissions while a turn runs, and the Escape that
+            # opens it would interrupt that turn and drop the message it carries.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "codex_native_approval_mode_busy",
+                    "detail": (
+                        "Codex is working on a turn. Change the approval mode after "
+                        "it finishes, or stop the turn first."
+                    ),
+                },
+            )
         try:
             offered = await asyncio.to_thread(
                 _inject_codex_permission_mode,
@@ -1345,6 +1361,7 @@ def build_native_controls(
             alias_pins,
             canonical_claude_id,
             claude_model_command_arg,
+            normalized_model_id,
             picker_command_values,
         )
 
@@ -1472,6 +1489,9 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+        # Claude Code's statusLine names a 1M model without its ``[1m]`` marker,
+        # so once the marker reached the pane, the unmarked name confirms it.
+        unmarked_expected: set[str] = set()
         if not bound_model:
             # A repeated alias pick keeps the same model; its launch pin proves
             # the exact generation even when the options cache is cold.
@@ -1480,12 +1500,19 @@ def build_native_controls(
                 for value in (selected_model, resolved_model or "", model_arg)
             )
             pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
+            # A translation that dropped the marker leaves the pane on the plain
+            # model, which must not confirm a 1M pick.
+            marker_sent = any(
+                value.lower().endswith("[1m]") for value in (model_arg, pinned or "")
+            )
             if pinned:
                 if long_context_requested and not pinned.lower().endswith("[1m]"):
                     pinned += "[1m]"
                 expected.add(pinned)
             if long_context_requested:
                 expected = {value for value in expected if value.lower().endswith("[1m]")}
+            if marker_sent:
+                unmarked_expected = {normalized_model_id(value) for value in expected}
             expected.update(
                 canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
             )
@@ -1497,6 +1524,10 @@ def build_native_controls(
                 and (
                     current in expected
                     or comparable in expected
+                    or (
+                        not current.lower().endswith("[1m]")
+                        and normalized_model_id(current) in unmarked_expected
+                    )
                     or (baseline and current != baseline)
                 )
             )

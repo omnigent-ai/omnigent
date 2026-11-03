@@ -54,7 +54,8 @@ export type OmnigentInteractionKind =
   | "list_sessions"
   | "get_session"
   | "create_session_sandbox"
-  | "create_session_computer";
+  | "create_session_computer"
+  | "create_scheduled_task";
 
 /** Terminal outcome of an interaction, set on the `complete` phase. */
 export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";

@@ -1000,7 +1000,12 @@ class TestProviderManagedProfiles:
         )
         _make_managed_sandbox_start(deps)(
             conversation,
-            SimpleNamespace(user_id=_OWNER, agent_id=env.agent_id),
+            SimpleNamespace(
+                user_id=_OWNER,
+                agent_id=env.agent_id,
+                execution_target="managed_sandbox",
+                workspace=None,
+            ),
             uuid.uuid4().hex,
             _STAGED_LAUNCH_ERRORS,
         )

@@ -310,6 +310,9 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     :param harness_fd: fd of this runner's own control socket back to the
         zygote, exported so the runner can request harness forks.
     """
+    # Wire stdio first so a failure in the setup below lands in the runner's
+    # own log, which the host's exit report reads, not in the zygote's.
+    _wire_child_stdio(request.get("log_path"))
     _apply_child_env(request)
     workspace = request.get("cwd")
     if not isinstance(workspace, str):
@@ -318,8 +321,6 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     # Tell the runner its harness-fork channel fd (set after the env replace so
     # it survives the clear).
     os.environ[ZYGOTE_HARNESS_FD_ENV_VAR] = str(harness_fd)
-
-    _wire_child_stdio(request.get("log_path"))
 
     # Test seam: exercise fork/reap/poll without booting a real runner. Honored
     # only when set in the fork payload's env (never in production launches).
