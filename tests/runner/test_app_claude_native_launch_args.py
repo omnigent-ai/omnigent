@@ -1687,3 +1687,20 @@ def test_claude_terminal_env_keeps_a_user_claude_env_file(
     terminal_env = build_native_claude_terminal_env(config)
 
     assert terminal_env.get("CLAUDE_ENV_FILE", user_file) == user_file
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider"])
+def test_claude_terminal_env_keeps_a_user_api_timeout(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """A user's own API_TIMEOUT_MS wins over the default request timeout."""
+    config = None
+    if source == "ambient":
+        monkeypatch.setenv("API_TIMEOUT_MS", "600000")
+    else:
+        monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
+        config = ClaudeNativeUcodeConfig(env={"API_TIMEOUT_MS": "600000"})
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert terminal_env.get("API_TIMEOUT_MS", "600000") == "600000"

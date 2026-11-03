@@ -117,6 +117,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     Channels flag is not snuck in.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     body = claude_native._claude_terminal_request(
         ("--resume", "claude-session", "-p", "hi"),
@@ -136,6 +137,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
     }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
@@ -296,6 +298,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         model="databricks-claude-opus-test",
     )
 
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     body = claude_native._claude_terminal_request(
         ("--print", "hi"),
         command="claude",
@@ -313,6 +316,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     args = spec["args"]

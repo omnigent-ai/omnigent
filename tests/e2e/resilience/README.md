@@ -61,8 +61,8 @@ They are built from four pieces:
   run, or of every run with `OMNIGENT_RESILIENCE_KEEP=1`.
 
 `scenarios/_contract.py` holds the shared phases (idle, tool running, tool
-ending during the outage, approval pending) and the checks every scenario
-records once its fault clears.
+ending during the outage, approval pending, model call unanswered) and the
+checks every scenario records once its fault clears.
 
 Rows that break the contract today are pinned to their finding in one of two
 ways. A row that breaks several checks is marked `xfail(strict=True)`. When a

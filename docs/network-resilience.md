@@ -61,6 +61,7 @@ a run happens to pass. Outages beyond the short default run only with
 | S3 flap (full mode only) | idle | 120 s | pass | pass, R8 intermittent |
 | S3 flap (full mode only) | tool running, approval pending | 120 s | gap: [R6](#r6-repeated-blips-add-up-to-a-disconnect-failure) | gap: R6 |
 | S4 | idle, tool running, approval pending | 10 s / 60 s / 300 s | pass | pass |
+| S4 | model call unanswered | 120 s | pass | not covered |
 | S5 | approve | 20 s | pass | pass |
 | S5 | approve | 150 s | gap: R2 | pass |
 | S5 | send | 20 s / 150 s | gap: [R3](#r3-a-message-sent-while-the-host-is-unreachable-is-lost) | gap: R3 |
