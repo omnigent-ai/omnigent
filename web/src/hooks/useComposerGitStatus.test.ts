@@ -8,6 +8,9 @@ import { useComposerGitStatus } from "./useComposerGitStatus";
 
 const useSessionWorktreesMock = vi.fn();
 const usePullRequestInfoMock = vi.fn();
+const usePullRequestInfosMock = vi.fn<(id: string | undefined, urls: string[]) => unknown[]>(
+  () => [],
+);
 const useSessionPullRequestsMock = vi.fn(() => ({ data: undefined as unknown }));
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
@@ -19,6 +22,8 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
 }));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
+  usePullRequestInfos: (id: string | undefined, urls: string[]) =>
+    usePullRequestInfosMock(id, urls),
 }));
 vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => ({
   storedListToShow: (await importOriginal<typeof UseSessionPullRequestsModule>()).storedListToShow,
@@ -48,8 +53,8 @@ function setWorktrees(
     ...extra,
   });
 }
-function setGithub(data: Record<string, unknown> | undefined) {
-  usePullRequestInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
+function setGithub(data: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}) {
+  usePullRequestInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn(), ...extra });
 }
 
 function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
@@ -67,6 +72,8 @@ function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
 afterEach(() => {
   useSessionWorktreesMock.mockReset();
   usePullRequestInfoMock.mockReset();
+  usePullRequestInfosMock.mockReset();
+  usePullRequestInfosMock.mockReturnValue([]);
   useSessionPullRequestsMock.mockReset();
   useSessionPullRequestsMock.mockReturnValue({ data: undefined });
 });
@@ -220,6 +227,242 @@ describe("useComposerGitStatus", () => {
     expect(result.current.prNumber).toBe(7);
   });
 
+  it("prioritizes every linked PR's live status instead of the selected or first PR", () => {
+    setWorktrees(undefined);
+    const prs = [
+      { url: "merged", number: 1, state: "MERGED" },
+      { url: "closed", number: 2, state: "CLOSED" },
+      {
+        url: "ready",
+        number: 3,
+        state: "OPEN",
+        provider: "example_forge",
+        provider_display: FORGE_DISPLAY,
+      },
+      { url: "pending", number: 4, state: "OPEN" },
+      { url: "conflict", number: 5, state: "OPEN" },
+    ];
+    setGithub({
+      tracking_available: true,
+      prs,
+      pr: { url: "ready", number: 3, state: "OPEN", merge_state_status: "CLEAN" },
+    });
+    usePullRequestInfosMock.mockReturnValue([
+      { data: { pr: { url: "closed", state: "CLOSED" } } },
+      { data: { pr: { url: "pending", state: "OPEN", checks: { pending: 1 } } } },
+      { data: { pr: { url: "conflict", state: "OPEN", merge_state_status: "DIRTY" } } },
+    ]);
+    const { result } = run();
+    expect(result.current.prs.map((pr) => pr.number)).toEqual([5, 3, 4, 1, 2]);
+    expect(result.current).toMatchObject({ prCount: 5, prNumber: 5, prStatus: "conflict" });
+    expect(usePullRequestInfosMock).toHaveBeenCalledWith("conv-1", [
+      "closed",
+      "pending",
+      "conflict",
+    ]);
+  });
+
+  it("refreshes a closed PR that has reopened while leaving merged PRs at rest", () => {
+    setWorktrees(undefined);
+    setGithub({ tracking_available: true });
+    useSessionPullRequestsMock.mockReturnValue({
+      data: {
+        synced: true,
+        prs: [
+          { url: "merged", number: 1, state: "merged" },
+          { url: "reopened", number: 2, state: "closed" },
+        ],
+      },
+    });
+    usePullRequestInfosMock.mockReturnValue([
+      { data: { pr: { url: "reopened", state: "OPEN", merge_state_status: "CLEAN" } } },
+    ]);
+    expect(run().result.current).toMatchObject({ prNumber: 2, prStatus: "ready" });
+    expect(usePullRequestInfosMock).toHaveBeenCalledWith("conv-1", ["reopened"]);
+  });
+
+  it("does not restore a removed selected PR when the stored list is empty", () => {
+    setWorktrees(undefined);
+    setGithub({
+      tracking_available: true,
+      prs: [{ url: "removed", number: 1, state: "OPEN" }],
+      pr: { url: "removed", number: 1, state: "OPEN", merge_state_status: "DIRTY" },
+    });
+    useSessionPullRequestsMock.mockReturnValue({ data: { prs: [], synced: true } });
+    expect(run().result.current).toMatchObject({
+      prs: [],
+      prCount: 0,
+      prNumber: null,
+      prStatus: null,
+    });
+    expect(usePullRequestInfosMock).toHaveBeenCalledWith("conv-1", []);
+  });
+
+  it.each([{ isError: true }, { isEnabled: false }])(
+    "drops stale readiness and conflicts after a failed refresh or offline transition: %j",
+    (queryState) => {
+      setWorktrees(undefined);
+      setGithub(
+        {
+          prs: [
+            { url: "ready", number: 1, state: "OPEN" },
+            { url: "conflict", number: 2, state: "OPEN" },
+          ],
+          pr: { url: "ready", state: "OPEN", merge_state_status: "CLEAN" },
+        },
+        queryState,
+      );
+      usePullRequestInfosMock.mockReturnValue([
+        {
+          ...queryState,
+          data: { pr: { url: "conflict", state: "OPEN", merge_state_status: "DIRTY" } },
+        },
+      ]);
+      expect(run().result.current).toMatchObject({ prStatus: "open", prNumber: 1 });
+    },
+  );
+
+  it("ignores a detail response for a different requested PR URL", () => {
+    setWorktrees(undefined);
+    setGithub({
+      prs: [
+        { url: "first", number: 1, state: "OPEN" },
+        { url: "second", number: 2, state: "OPEN" },
+      ],
+    });
+    usePullRequestInfosMock.mockReturnValue([
+      { data: { pr: { url: "second", number: 2, state: "OPEN", merge_state_status: "DIRTY" } } },
+      { data: { pr: null } },
+    ]);
+    expect(run().result.current).toMatchObject({ prStatus: "open", prNumber: 1 });
+  });
+
+  it("keeps known terminal states offline unless the stored lifecycle is newer", () => {
+    setWorktrees(undefined);
+    setGithub({ tracking_available: true });
+    useSessionPullRequestsMock.mockReturnValue({
+      data: {
+        synced: true,
+        prs: [{ url: "closed", number: 1, state: "OPEN", state_checked_at: 1 }],
+      },
+    });
+    usePullRequestInfosMock.mockReturnValue([
+      { isEnabled: false, dataUpdatedAt: 2000, data: { pr: { url: "closed", state: "CLOSED" } } },
+    ]);
+    const { result, rerender } = run();
+    expect(result.current.prStatus).toBe("closed");
+    useSessionPullRequestsMock.mockReturnValue({
+      data: {
+        synced: true,
+        prs: [{ url: "closed", number: 1, state: "OPEN", state_checked_at: 3 }],
+      },
+    });
+    rerender();
+    expect(result.current.prStatus).toBe("open");
+  });
+
+  it.each(["selected", "linked"])(
+    "uses newer stored lifecycle over an older successful %s PR response",
+    (source) => {
+      setWorktrees(undefined);
+      const pr = { url: "updated", state: "OPEN", merge_state_status: "CLEAN", title: "Old title" };
+      const info = { tracking_available: true, ...(source === "selected" ? { pr } : {}) };
+      setGithub(info, { dataUpdatedAt: 2000 });
+      if (source === "linked") {
+        usePullRequestInfosMock.mockReturnValue([{ data: { pr }, dataUpdatedAt: 2000 }]);
+      }
+      useSessionPullRequestsMock.mockReturnValue({
+        data: {
+          synced: true,
+          prs: [
+            {
+              url: "updated",
+              number: 1,
+              state: "CLOSED",
+              title: "Current title",
+              state_checked_at: 3,
+            },
+          ],
+        },
+      });
+      const { result, rerender } = run();
+      expect(result.current).toMatchObject({
+        prStatus: "closed",
+        prs: [{ title: "Current title" }],
+      });
+      expect(result.current.prs[0].merge_state_status).toBeUndefined();
+
+      setGithub(info, { dataUpdatedAt: 4000 });
+      if (source === "linked") {
+        usePullRequestInfosMock.mockReturnValue([{ data: { pr }, dataUpdatedAt: 4000 }]);
+      }
+      rerender();
+      expect(result.current.prStatus).toBe("ready");
+    },
+  );
+
+  it.each([
+    { live: { merge_state_status: "DIRTY" }, storedDraft: undefined, expected: "conflict" },
+    { live: { checks: { failing: 1, pending: 0 } }, storedDraft: undefined, expected: "failed" },
+    { live: { merge_state_status: "CLEAN" }, storedDraft: undefined, expected: "ready" },
+    {
+      live: { is_draft: true, merge_state_status: "CLEAN" },
+      storedDraft: undefined,
+      expected: "draft",
+    },
+    {
+      live: { is_draft: false, merge_state_status: "CLEAN" },
+      storedDraft: true,
+      expected: "draft",
+    },
+    { live: { is_draft: true, merge_state_status: "CLEAN" }, storedDraft: false, expected: "open" },
+  ])(
+    "retains rich status unless a newer summary changes draft lifecycle: $expected",
+    ({ live, storedDraft, expected }) => {
+      setWorktrees(undefined);
+      setGithub({ tracking_available: true });
+      useSessionPullRequestsMock.mockReturnValue({
+        data: {
+          synced: true,
+          prs: [
+            {
+              url: "updated",
+              number: 1,
+              state: "open",
+              is_draft: storedDraft,
+              state_checked_at: 3,
+            },
+          ],
+        },
+      });
+      usePullRequestInfosMock.mockReturnValue([
+        { dataUpdatedAt: 2000, data: { pr: { url: "updated", state: "OPEN", ...live } } },
+      ]);
+      expect(run().result.current.prStatus).toBe(expected);
+    },
+  );
+
+  it("preserves the legacy single PR's full status without another lookup", () => {
+    setWorktrees(undefined);
+    setGithub({
+      repo: { name_with_owner: "org/repo" },
+      pr: {
+        url: "https://github.com/org/repo/pull/6000",
+        number: 6000,
+        title: "Legacy host PR",
+        state: "OPEN",
+        merge_state_status: "CLEAN",
+      },
+    });
+    expect(run().result.current).toMatchObject({
+      prCount: 1,
+      prNumber: 6000,
+      prStatus: "ready",
+      prs: [{ number: 6000, repository: "org/repo", title: "Legacy host PR" }],
+    });
+    expect(usePullRequestInfosMock).toHaveBeenCalledWith("conv-1", []);
+  });
+
   it.each([
     { live: "the host is offline", query: { isError: true, isFetching: false } },
     { live: "live info still loads", query: { isError: false, isLoading: true, isFetching: true } },
@@ -228,11 +471,19 @@ describe("useComposerGitStatus", () => {
     usePullRequestInfoMock.mockReturnValue({ data: undefined, refetch: vi.fn(), ...query });
     useSessionPullRequestsMock.mockReturnValue({
       data: {
-        prs: [{ url: "https://github.com/o/r/pull/42", number: 42, provider: "github" }],
+        prs: [
+          { url: "merged", number: 1, state: "MERGED" },
+          { url: "https://github.com/o/r/pull/42", number: 42, provider: "github", state: "OPEN" },
+        ],
         synced: true,
       },
     });
-    expect(run().result.current).toMatchObject({ githubState: "ready", prCount: 1, prNumber: 42 });
+    expect(run().result.current).toMatchObject({
+      githubState: "ready",
+      prCount: 2,
+      prNumber: 42,
+      prStatus: "open",
+    });
   });
 
   it("keeps a live PR from a host without tracking over the empty stored list", () => {
@@ -292,6 +543,8 @@ describe("useComposerGitStatus", () => {
   it("refresh() refetches both sources and surfaces fetching", () => {
     const wtRefetch = vi.fn();
     const ghRefetch = vi.fn();
+    const detailRefetch = vi.fn();
+    usePullRequestInfosMock.mockReturnValue([{ refetch: detailRefetch, isFetching: true }]);
     setWorktrees(
       { status: "ok", worktrees: [wt({ branch: "main" })] },
       { isFetching: true, refetch: wtRefetch },
@@ -301,10 +554,17 @@ describe("useComposerGitStatus", () => {
       isFetching: false,
       refetch: ghRefetch,
     });
-    const { result } = run();
+    const { result, rerender } = run();
     expect(result.current.refreshing).toBe(true);
-    result.current.refresh();
+    const refresh = result.current.refresh;
+    const latestDetailRefetch = vi.fn();
+    usePullRequestInfosMock.mockReturnValue([{ refetch: latestDetailRefetch }]);
+    rerender();
+    expect(result.current.refresh).toBe(refresh);
+    refresh();
     expect(wtRefetch).toHaveBeenCalledTimes(1);
     expect(ghRefetch).toHaveBeenCalledTimes(1);
+    expect(detailRefetch).not.toHaveBeenCalled();
+    expect(latestDetailRefetch).toHaveBeenCalledTimes(1);
   });
 });
