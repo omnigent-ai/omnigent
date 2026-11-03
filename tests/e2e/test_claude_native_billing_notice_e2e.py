@@ -288,7 +288,12 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
                 "Create billing-notice-sentinel.txt containing confirmed using Python in Bash.",
                 keys="",
             ) == {"status": "sent"}
-            await asyncio.sleep(0.3)
+            # An Enter that lands before Claude draws the typed draft is swallowed.
+            await _wait_for_pane(
+                terminal,
+                lambda pane: "billing-notice-sentinel.txt" in pane,
+                description="the typed prompt in Claude's composer",
+            )
             assert await terminal.send(keys="Enter") == {"status": "sent"}
             notice = await _wait_for_pane(
                 terminal,

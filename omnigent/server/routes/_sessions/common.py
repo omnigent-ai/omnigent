@@ -56,7 +56,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
+)
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -152,6 +155,9 @@ _EXTERNAL_MCP_STARTUP_STATUS_VALUES: frozenset[str] = frozenset(
 
 _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 
+# PRs a runner discovered for its session, as ``{"prs": [...]}``; the server merges them.
+_EXTERNAL_PULL_REQUESTS_TYPE: str = "external_pull_requests"
+
 
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
 
@@ -222,7 +228,7 @@ _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nicknam
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
-_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 
 
 # Current approval/sandbox mode of a live codex-native session. ``terminal_launch_args``
@@ -588,6 +594,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_SESSION_STATUS_TYPE,
         _SUBAGENT_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_PULL_REQUESTS_TYPE,
         _EXTERNAL_COMPACTION_STATUS_TYPE,
         _EXTERNAL_MCP_STARTUP_TYPE,
         _EXTERNAL_MODEL_CHANGE_TYPE,
@@ -1170,6 +1177,7 @@ __all__ = [
     "_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE",
     "_EXTERNAL_OUTPUT_TEXT_DELTA_TYPE",
     "_EXTERNAL_PERMISSION_MODE_CHANGE_TYPE",
+    "_EXTERNAL_PULL_REQUESTS_TYPE",
     "_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE",
     "_EXTERNAL_SESSION_INTERRUPTED_TYPE",
     "_EXTERNAL_SESSION_STATUS_TYPE",
