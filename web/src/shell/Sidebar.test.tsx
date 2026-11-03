@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -2793,6 +2793,9 @@ describe("Sidebar project Show more", () => {
       thresholds = [];
     }
     vi.stubGlobal("IntersectionObserver", TestObserver);
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
     const fetchNextPage = vi.fn();

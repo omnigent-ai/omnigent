@@ -45,7 +45,7 @@ export function createStoredBooleanPreference(
         window.localStorage.setItem(storageKey, storedValue);
       }
     } catch {
-      // A storage failure must not break Settings.
+      // Ignore storage failures (quota, privacy mode); readers fall back to the default.
     }
     notifyChanged();
   };

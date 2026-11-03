@@ -1559,9 +1559,9 @@ function ProjectFolder({
     name,
     viewerId,
   ]);
-  // Each expansion starts at one page; the open session is never left hidden.
   const paginated = useProjectFolderPagination();
-  // Changing the listed sessions restarts both the page count and the auto-load budget.
+  // Each expansion, archive switch or re-sort restarts the page count and auto-load
+  // budget; when paginated, the open session is never left hidden.
   const listScope = JSON.stringify([expanded, archived, sortBy]);
   const display = useSidebarDisplayPagination(
     conversations,
@@ -1634,6 +1634,41 @@ function ProjectFolder({
     disabled: ordering.disabled,
   });
   const orderedMenuActions = { ...menuActions, ordering };
+
+  let footer: ReactNode = null;
+  if (loadingFirstPage) {
+    footer = (
+      <div className="pl-6">
+        <p
+          className={cn(
+            SIDEBAR_ROW,
+            "flex w-full flex-col justify-center text-left text-muted-foreground",
+          )}
+        >
+          Loading…
+        </p>
+      </div>
+    );
+  } else if (!paginated) {
+    footer = (
+      <InfiniteScrollSentinel
+        hasMore={query.hasNextPage}
+        isFetching={query.isFetchingNextPage}
+        fetchMore={query.fetchNextPage}
+        scrollRoot={scrollRoot}
+        scopeKey={listScope}
+        indent
+      />
+    );
+  } else if (display.hasMore) {
+    footer = (
+      <ProjectShowMoreRow
+        loading={query.isFetchingNextPage}
+        marker={hiddenMarker}
+        onShowMore={showMore}
+      />
+    );
+  }
 
   return (
     <div
@@ -1726,35 +1761,7 @@ function ProjectFolder({
             />
           </ContextMenuContent>
         }
-        footer={
-          loadingFirstPage ? (
-            <div className="pl-6">
-              <p
-                className={cn(
-                  SIDEBAR_ROW,
-                  "flex w-full flex-col justify-center text-left text-muted-foreground",
-                )}
-              >
-                Loading…
-              </p>
-            </div>
-          ) : !paginated ? (
-            <InfiniteScrollSentinel
-              hasMore={query.hasNextPage}
-              isFetching={query.isFetchingNextPage}
-              fetchMore={query.fetchNextPage}
-              scrollRoot={scrollRoot}
-              scopeKey={listScope}
-              indent
-            />
-          ) : display.hasMore ? (
-            <ProjectShowMoreRow
-              loading={query.isFetchingNextPage}
-              marker={hiddenMarker}
-              onShowMore={showMore}
-            />
-          ) : null
-        }
+        footer={footer}
       />
       {menuDialogs}
     </div>
