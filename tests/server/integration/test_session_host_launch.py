@@ -4152,11 +4152,15 @@ async def test_relaunch_stops_the_superseded_runner(
     )
 
 
+@pytest.mark.parametrize(
+    "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
+)
 async def test_concurrent_relaunches_are_single_flight(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_after_rotation: bool,
 ) -> None:
     """Two racing messages to an offline-runner session launch ONE runner.
 
@@ -4188,11 +4192,11 @@ async def test_concurrent_relaunches_are_single_flight(
         observed_bindings.append(args[0].runner_id)
         if len(observed_bindings) == 2:
             both_callers_ready.set()
-        await both_callers_ready.wait()
+        if not snapshot_after_rotation:
+            await both_callers_ready.wait()
         return await launch_runner(*args, **kwargs)
 
-    # Both requests must snapshot the offline binding before either rotates it.
-    # With startup grace disabled, a later snapshot would request another launch.
+    # Race both old snapshots, or let the second caller read the in-flight binding.
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
 
     def _post() -> Any:
@@ -4207,11 +4211,14 @@ async def test_concurrent_relaunches_are_single_flight(
             },
         )
 
-    tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
+    tasks = [asyncio.create_task(_post())]
+    if not snapshot_after_rotation:
+        tasks.append(asyncio.create_task(_post()))
     launches: list[HostLaunchRunnerFrame] = []
     try:
-        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
-        assert observed_bindings == [session["runner_id"], session["runner_id"]]
+        if not snapshot_after_rotation:
+            await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+            assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
@@ -4224,6 +4231,13 @@ async def test_concurrent_relaunches_are_single_flight(
                 frame = decode_host_frame(output["text"])
                 if isinstance(frame, HostLaunchRunnerFrame):
                     launches.append(frame)
+                    if snapshot_after_rotation and len(launches) == 1:
+                        tasks.append(asyncio.create_task(_post()))
+                        await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+                        assert observed_bindings == [
+                            session["runner_id"],
+                            token_bound_runner_id(frame.binding_token),
+                        ]
                     # Answer "launched" so the first flight's result wait
                     # returns and releases the relaunch lock — the second
                     # flight must then SHORT-CIRCUIT on the rotated binding

@@ -46,10 +46,7 @@ import {
   nativeModelTooltip,
   normalizeEffortLabel,
 } from "@/lib/composerModelLabel";
-import {
-  codexCreateApprovalOptions,
-  applyCodexApprovalSelection,
-} from "@/lib/codexApprovalOptions";
+import { applyCodexApprovalSelection } from "@/lib/codexApprovalOptions";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -158,6 +155,7 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  isNativeOpenCodeHarness,
   skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
@@ -282,6 +280,7 @@ import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
+  nativeAgentHasModelSettings,
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
@@ -294,6 +293,7 @@ import {
   AGY_NATIVE_SKIP_MODES,
   AGY_NATIVE_SKIP_VALUE,
   AUTO_PERMISSION_MODE,
+  nativePermissionOptions,
   CODEX_NATIVE_APPROVAL_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
@@ -885,6 +885,16 @@ function harnessWarningMessage(
       </>
     );
   }
+  // OpenCode 2.x ships as a new npm package; an in-place 1.x upgrade can't reach it.
+  if (reason === "version-too-low" && !!harness && isNativeOpenCodeHarness(harness)) {
+    return (
+      <>
+        {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
+        <code>npm i -g @opencode/cli@2.0.32</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
+        <code>omni setup</code> on that machine.
+      </>
+    );
+  }
   // ``version-too-low`` is a uniform state across all CLI harnesses now that
   // the server checks supported version ranges. Keep the message generic so
   // the user is nudged toward setup rather than being told the CLI is missing.
@@ -1112,15 +1122,6 @@ const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
 const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
 // How many rows the backfill promotes — matches the inline list's usual size.
 const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
-
-function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
-  return (
-    nativeAgentHasCapability(agent, "modelPicker") ||
-    // devinMode owns Devin's own Model + Effort rows (see nativeCodingAgents).
-    nativeAgentHasCapability(agent, "devinMode") ||
-    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
-  );
-}
 
 function agentHasAdvancedSettings(
   agent: AvailableAgent | undefined,
@@ -3432,7 +3433,7 @@ export function NewChatLandingScreen() {
   }, [brainHarnessLabelsAll, brainRoutable]);
   const isEntryConfigurable = (agent: AvailableAgent) =>
     (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
-    agentHasModelSettings(agent) ||
+    nativeAgentHasModelSettings(agent) ||
     agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   // Only an eligible harness can display active per-turn Smart Routing.
   const routingOn = smartRoutingEligible && costControlMode === "on";
@@ -3768,25 +3769,7 @@ export function NewChatLandingScreen() {
         value,
         label: normalizeEffortLabel(value),
       }))
-    : supportsPermissionMode
-      ? CLAUDE_NATIVE_EFFORTS
-      : selectedNativeHarness === "devin-native"
-        ? // Devin encodes effort as a model-variant suffix, and the rung set is
-          // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
-          // different Fusion model), so derive it from the selected model's catalog
-          // entry rather than offering a fixed ladder the model can't honor.
-          codexEffortLevelsForModel(
-            devinModelOptions,
-            pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
-          ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-        : selectedNativeHarness === "pi-native"
-          ? PI_NATIVE_EFFORTS
-          : selectedNativeHarness === "codex-native"
-            ? codexEffortLevelsForModel(
-                codexModelOptions,
-                pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-              ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-            : [];
+    : (nativeEffortOptions(selectedNativeHarness, pickerModelOptions, pickedModel) ?? []);
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
     for (const key of Object.keys(options)) picked.add(key);
@@ -4143,19 +4126,7 @@ export function NewChatLandingScreen() {
   );
   const directModeOptions = smartRoutingHarnessSelected
     ? []
-    : supportsPermissionMode
-      ? CLAUDE_NATIVE_PERMISSION_MODES
-      : supportsApprovalMode
-        ? selectedNativeHarness === "codex-native"
-          ? codexCreateApprovalOptions()
-          : CODEX_NATIVE_APPROVAL_MODES
-        : supportsCursorMode
-          ? CURSOR_NATIVE_EXEC_MODES
-          : supportsAgySkipPermissions
-            ? AGY_NATIVE_SKIP_MODES
-            : supportsDevinPermission
-              ? DEVIN_NATIVE_PERMISSION_MODES
-              : [];
+    : nativePermissionOptions(selectedNativeHarness);
   // Unsaved custom agents launch through the host runners route, which cannot
   // refuse a host too old to start Codex in Plan mode.
   const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
