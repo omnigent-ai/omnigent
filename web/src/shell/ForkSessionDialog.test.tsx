@@ -2244,6 +2244,38 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Modal Sandbox");
     });
 
+    it("keeps the same-provider default when the source host arrives after the picker's hosts", async () => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_1", labels: {} },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      const source = host({ sandbox_provider: "arclet" });
+      const laptop = host({ host_id: "host_2", name: "laptop" });
+      let sourceLoaded = false;
+      // The picker's connected hosts load first; the full list with the source sandbox later.
+      useHostsMock.mockImplementation(
+        (options) =>
+          (options?.includeSandbox
+            ? sourceLoaded
+              ? { data: [source, laptop], isLoading: false }
+              : { data: undefined, isLoading: true }
+            : { data: [laptop], isLoading: false }) as ReturnType<typeof useHosts>,
+      );
+      const { refresh } = renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      });
+
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-host-select")).not.toHaveTextContent("laptop");
+
+      sourceLoaded = true;
+      refresh();
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
+    });
+
     it("keeps the same-provider default when server capabilities arrive after hosts", async () => {
       useSessionMock.mockReturnValue({
         session: { hostId: "host_1", labels: {} },
