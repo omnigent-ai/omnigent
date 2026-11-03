@@ -233,7 +233,7 @@ async def test_schedule_validation_keeps_requests_responsive(
             return 0
         return 1
 
-    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", recurrence_clock)
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", recurrence_clock)
     pending = asyncio.create_task(auth_client.request(method, url, json=body, headers=_headers()))
     try:
         assert await asyncio.to_thread(entered.wait, 2)
