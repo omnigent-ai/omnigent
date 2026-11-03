@@ -138,7 +138,10 @@ async def test_create_posts_payload() -> None:
         "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
-    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
+    assert client.headers[-1] == {
+        ORCHESTRATION_SOURCE_HEADER: "conv_source",
+        "x-omnigent-automation-source": "agent",
+    }
 
 
 @pytest.mark.asyncio
