@@ -16,7 +16,11 @@ the creation modal with its integration settings ready to customize.
   New automation opens a blank form.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
-  browsing again; saved paths and sandbox setup are preserved.
+  browsing again; saved paths and sandbox setup are preserved. When the default
+  sandbox provider supplies a repository catalog and the server supports it,
+  sandbox setup shows Repository instead of a folder picker. Provider default
+  leaves the repository unpinned; choosing it on edit clears an existing pin.
+  Switching between a connected host and a sandbox clears incompatible selections.
 - `harness-settings`: model, effort, and permission controls follow the selected
   harness. Codex and Devin efforts follow the selected model; Pi exposes thinking
   levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
@@ -41,7 +45,11 @@ the creation modal with its integration settings ready to customize.
   a preview beneath the empty-state message.
 - **Creation modal:** click New automation on either tab to start from scratch.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
-  the same connected-host workspace availability applies.
+  the same workspace and sandbox Repository controls apply. Unrelated edits
+  preserve a continued session when the repository is unchanged or a legacy
+  directory pin is cleared. Selecting
+  another repository unlocks model/permission settings for a new session;
+  restoring the saved selection locks them again.
 - **Mobile web:** use the same tabs and creation paths after opening Automations.
 - **Managed embedded:** open Automations through the host navigation; tabs,
   gallery, and modal use the same components under the host's mount path.
@@ -60,7 +68,13 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   capability gating, and both creation buttons' paths.
 - `web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx` covers offline
   workspace browsing in create/edit setup, disconnect/reconnect, preserving a
-  saved workspace, and sandbox creation with offline connected hosts.
+  saved workspace, and sandbox creation with offline connected hosts. It also
+  covers repository/default selections, legacy edits, target switching, and
+  continued-session setting locks.
+- `tests/browser_ui/test_automation_sandbox_repository.py::test_automation_sandbox_repository`
+  uses its own built-SPA browser contract, with a synthetic provider catalog,
+  to cover repository creation, replacement, clearing, and reopening on desktop
+  and mobile. It does not verify actual sandbox execution.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
@@ -69,6 +83,10 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   harness such as Cursor. Check that only supported settings appear, model changes
   clear unsupported effort choices, and saved selections survive reopening. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.
+- With a provider catalog, create an automation from New automation or a template,
+  choose the sandbox and a repository, save, and reopen Edit. Change the repository,
+  then select Provider default and save again; reopen to confirm both persist.
+  Repeat through the row menu and detail page, including at a narrow viewport.
 - For managed, repeat in a deployment containing this UI version; local
   standalone evidence does not verify host styling or navigation integration.
 
