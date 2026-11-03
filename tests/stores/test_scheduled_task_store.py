@@ -59,6 +59,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
+        base_branch="HEAD",
         host_id=_uid("host_abc123"),
         project_id=_uid("proj_abc"),
         delegation_ref="workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner",
@@ -77,7 +78,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
-    assert task.base_branch is None
+    assert task.base_branch == "HEAD"
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
     assert task.project_id == _uid("proj_abc")
@@ -210,15 +211,18 @@ def test_update_workspace_explicit_null_clears_it(
         agent_id=_uid("ag"),
         timezone="UTC",
         workspace="/repo",
+        base_branch="HEAD",
         host_id=_uid("h"),
     )
     # Omitting workspace leaves it unchanged.
     unchanged = store.update(_uid("st_ws"), name="renamed")
     assert unchanged is not None and unchanged.workspace == "/repo"
+    assert unchanged.base_branch == "HEAD"
     # Explicit None clears both host and workspace (the managed-switch shape).
-    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None, base_branch=None)
     assert cleared is not None
     assert cleared.workspace is None
+    assert cleared.base_branch is None
     assert cleared.host_id is None
 
 
@@ -2268,6 +2272,7 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000)
     for name, value in (
         ("workspace", "/elsewhere"),
+        ("base_branch", "HEAD"),
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),

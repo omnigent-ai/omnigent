@@ -6247,6 +6247,11 @@
             "title": "Scheduled Task Session Modes",
             "type": "boolean"
           },
+          "scheduled_task_worktrees": {
+            "default": true,
+            "title": "Scheduled Task Worktrees",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"

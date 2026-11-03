@@ -264,6 +264,8 @@ class ServerInfoResponse(BaseModel):
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
     dictation_available: bool
+    # Scheduled tasks accept the optional random-worktree base ref.
+    scheduled_task_worktrees: bool = True
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
@@ -3627,6 +3629,7 @@ def create_app(
                 "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,

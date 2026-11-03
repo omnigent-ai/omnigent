@@ -476,3 +476,15 @@ describe("picker curation", () => {
     expect(pickerCuration(info({})).defaultAgentName).toBeNull();
   });
 });
+
+describe("resolveServerInfo scheduled_task_worktrees", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support (%s)", async (advertised, expected) => {
+    expect((await probe({ scheduled_task_worktrees: advertised })).scheduled_task_worktrees).toBe(
+      expected,
+    );
+  });
+});

@@ -152,6 +152,7 @@ _SESSION_CREATION_FIELDS = (
     "agent_id",
     "host_id",
     "workspace",
+    "base_branch",
     "execution_target",
     "model_override",
     "reasoning_effort",
@@ -240,6 +241,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         session_mode: str = "new",
         session_id: str | None = None,
         workspace: str | None = None,
+        base_branch: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
         execution_target: str = "connected_host",
@@ -267,7 +269,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 session_mode=encode_scheduled_task_session_mode(session_mode),
                 session_id=session_id,
                 workspace=workspace,
-                base_branch=None,
+                base_branch=base_branch,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
                 project_id=project_id,
@@ -381,6 +383,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
+        base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
         project_id: str | None = _UNSET,
         execution_target: str | None = None,
@@ -392,9 +395,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``workspace``, ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``workspace``, ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
+        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
+        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (a set
         ``bypassPermissions`` can be turned back off), and clearing both
         ``host_id`` and ``workspace`` unpins a task (e.g. switching it to
@@ -452,6 +455,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if workspace is not _UNSET and row.workspace != workspace:
                 row.workspace = workspace
+                changed = True
+            if base_branch is not _UNSET and row.base_branch != base_branch:
+                row.base_branch = base_branch
                 changed = True
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
