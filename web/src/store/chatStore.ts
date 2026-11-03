@@ -961,6 +961,12 @@ export interface ConversationState {
    */
   sendLatchedAt: number | null;
   /**
+   * The `sendLatchedAt` a `running` status edge last arrived under. When it
+   * matches the current latch, that send's turn was seen starting, so a
+   * turn-end snapshot may settle the latch.
+   */
+  sendLatchSeenRunning: number | null;
+  /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
    * the session snapshot on bind; ``null`` before bind or when the
@@ -2175,6 +2181,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   pendingRetryStableId: null,
   restoredSendDraft: null,
   sendLatchedAt: null,
+  sendLatchSeenRunning: null,
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
@@ -5377,6 +5384,7 @@ function reconnectStatusPatch(
   session: Session,
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  latchBeforeFetch: SendLatchEvidence,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
@@ -5411,9 +5419,7 @@ function reconnectStatusPatch(
       completedAt: Date.now(),
     };
     patch.status = "idle";
-  } else if (snapshotEnded && s.status === "streaming" && s.sessionStatus === "running") {
-    // A send latch whose turn was seen running has ended; a fresh send's latch
-    // (session not yet running) waits for its own turn.
+  } else if (snapshotEnded && latchedTurnSeenBefore(latchBeforeFetch, s)) {
     patch.status = "idle";
   } else if (session.status === "waiting") {
     // Turn ended, background work remains. Finalize a still-streaming response
@@ -5445,6 +5451,22 @@ function reconnectStatusPatch(
   return patch;
 }
 
+type SendLatchEvidence = Pick<ChatState, "status" | "sendLatchedAt" | "sendLatchSeenRunning">;
+
+/**
+ * Whether the send latch held when a snapshot read began had already seen its
+ * turn start and still holds, so the snapshot's turn end is that turn's end.
+ */
+function latchedTurnSeenBefore(before: SendLatchEvidence, s: SendLatchEvidence): boolean {
+  return (
+    before.status === "streaming" &&
+    before.sendLatchedAt !== null &&
+    before.sendLatchSeenRunning === before.sendLatchedAt &&
+    s.status === "streaming" &&
+    s.sendLatchedAt === before.sendLatchedAt
+  );
+}
+
 /**
  * Re-read only a launch's stage, on screen or not. Live events that leave the launch
  * alone can't void the read; a launch update that lands during it wins instead.
@@ -5469,8 +5491,10 @@ interface MissedEventRecovery {
   revealedPendingIds: Set<string>;
   /** Ended turns already recycled for; a later tick settles them from the snapshot. */
   recycledTurnKeys: Set<string>;
-  /** The last reconnect backfill failed, so status reconciles retry it. */
+  /** The latest reconnect backfill failed a read, so status reconciles retry it. */
   backfillOwed: boolean;
+  /** Run the reconnect backfill, with or without its status patch, recording `backfillOwed`. */
+  backfill: (settleStatus: boolean) => Promise<void>;
 }
 
 /**
@@ -5549,7 +5573,7 @@ async function reconcileActiveSessionStatus(
   );
   const turnSeenRunning =
     current.activeResponse?.state === "streaming" ||
-    (current.status === "streaming" && current.sessionStatus === "running");
+    latchedTurnSeenBefore(stateBeforeFetch, current);
   const turnEnded =
     turnSeenRunning &&
     (session.status === "idle" || session.status === "failed" || session.status === "waiting");
@@ -5565,22 +5589,26 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => {
-    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
+    const patch = reconnectStatusPatch(
+      session,
+      s,
+      stateBeforeFetch.mcpStartupLaunch,
+      stateBeforeFetch,
+    );
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     return blocks === null ? patch : { ...patch, blocks };
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
-  const ignored = nativePreviewTombstonesByController.get(controller);
   if (
-    ignored &&
-    (recovery.backfillOwed ||
-      get().blocks.some(
-        (block) =>
-          isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
-      ))
+    recovery.backfillOwed ||
+    get().blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
   ) {
-    // Retry a failed or missed final-item backfill on the existing status-reconcile cadence.
-    recovery.backfillOwed = !(await reconcileOnReconnect(id, set, get, ignored));
+    // Retry a failed or missed final-item backfill on the existing status-reconcile
+    // cadence. This guarded snapshot settled status; the retry's later read must not.
+    await recovery.backfill(false);
   }
 }
 
@@ -5803,17 +5831,17 @@ async function rehydrateWindowOnReconnect(
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
-  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
-): Promise<boolean> {
+  statusPatchFor: (s: ChatState) => Partial<ChatState>,
+): Promise<ReconnectBackfill> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
   let fresh: SessionItemsPage;
   try {
     fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS });
   } catch {
-    return false;
+    return "failed";
   }
-  if (isConversationDisposed(id) || get().historyGeneration !== generation) return false;
+  if (isConversationDisposed(id) || get().historyGeneration !== generation) return "skipped";
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -5844,7 +5872,7 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
-    const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const statusPatch = statusPatchFor(s);
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -5869,8 +5897,11 @@ async function rehydrateWindowOnReconnect(
     };
   });
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
-  return true;
+  return "applied";
 }
+
+/** A reconnect backfill's outcome; only a failed read leaves history owed. */
+type ReconnectBackfill = "applied" | "failed" | "skipped";
 
 /**
  * Reconcile committed state after a reconnect.
@@ -5895,18 +5926,20 @@ async function rehydrateWindowOnReconnect(
  * are not items, so the item backfill can't recover prompts that fired or
  * resolved while the socket was dead. The backfill path leaves history-window
  * state (`hasMoreHistory` / `oldestItemId`) untouched — a reconnect is not a
- * re-hydrate. Swallows fetch errors, resolving false so the caller can
- * retry; true once the snapshot was applied. All writes are
- * `historyGeneration`-guarded so a window reset mid-fetch voids them.
+ * re-hydrate. Swallows fetch errors, resolving "failed" so the caller can
+ * retry. All writes are `historyGeneration`-guarded so a window reset
+ * mid-fetch voids them. `settleStatus: false` skips the status patch.
  */
 async function reconcileOnReconnect(
   id: string,
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
-): Promise<boolean> {
-  if (queryClient === null) return false;
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  settleStatus = true,
+): Promise<ReconnectBackfill> {
+  if (queryClient === null) return "skipped";
+  const stateBeforeFetch = get();
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -5938,10 +5971,12 @@ async function reconcileOnReconnect(
       fetchSessionItemsPage(id),
     ]);
   } catch {
-    return false;
+    return "failed";
   }
-  if (stale()) return false;
+  if (stale()) return "skipped";
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  const statusPatchFor = (s: ChatState): Partial<ChatState> =>
+    settleStatus ? reconnectStatusPatch(session, s, launchBeforeFetch, stateBeforeFetch) : {};
 
   // Page backwards until the fetched window reaches the pre-gap transcript
   // or the conversation start. A single newest page is not enough: a gap
@@ -5963,9 +5998,9 @@ async function reconcileOnReconnect(
       // backfill with the gap still uncovered so the full rehydrate below
       // runs, instead of leaving items no path can fetch.
       if (isStaleCursorError(error)) break;
-      return false;
+      return "failed";
     }
-    if (stale()) return false;
+    if (stale()) return "skipped";
     items = [...older.items, ...items];
     hasMore = older.hasMore;
     covered = !hasMore || older.items.some((it) => preGapIds.has(it.id));
@@ -5983,7 +6018,7 @@ async function reconcileOnReconnect(
       set,
       get,
       ignoredNativeMessageIds,
-      launchBeforeFetch,
+      statusPatchFor,
     );
   }
 
@@ -6001,7 +6036,7 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...statusPatchFor(s),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
@@ -6064,7 +6099,7 @@ async function reconcileOnReconnect(
     return patch;
   });
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
-  return true;
+  return "applied";
 }
 
 // ── Presence idle reporting ─────────────────────────────────────────
@@ -6165,6 +6200,7 @@ export async function startStreamPump(
   let hasConnected = false;
   // The open currently live, so routing changes and missed events can recycle it.
   let liveAttempt: AbortController | null = null;
+  let backfillRuns = 0;
   const missedEventRecovery: MissedEventRecovery = {
     recycleStream: () => {
       if (liveAttempt === null || !hasConnected) return false;
@@ -6174,6 +6210,19 @@ export async function startStreamPump(
     revealedPendingIds: new Set<string>(),
     recycledTurnKeys: new Set<string>(),
     backfillOwed: false,
+    backfill: async (settleStatus) => {
+      backfillRuns += 1;
+      const run = backfillRuns;
+      const outcome = await reconcileOnReconnect(
+        id,
+        set,
+        get,
+        ignoredNativeMessageIds,
+        settleStatus,
+      );
+      // A slower earlier run must not overwrite the latest run's outcome.
+      if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
+    },
   };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
   // reconciliations stay serialized: a catch-up tick that straddles a slow
@@ -6403,12 +6452,7 @@ export async function startStreamPump(
           ignoredNativeMessageIds,
         );
         if (reconnecting) {
-          missedEventRecovery.backfillOwed = !(await reconcileOnReconnect(
-            id,
-            set,
-            get,
-            ignoredNativeMessageIds,
-          ));
+          await missedEventRecovery.backfill(true);
           // reconcileOnReconnect can read a stale "running" when the server
           // just restarted and hasn't reprocessed the turn's completion yet,
           // stranding the tab on "Working…" until the 60s periodic reconcile.
@@ -8442,6 +8486,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // so an absent one means "no longer parked".
           blockedOn: event.blockedOn ?? null,
         };
+        if (event.status === "running") patch.sendLatchSeenRunning = s.sendLatchedAt;
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its
         // `idle` to `waiting` and attaches `background_task_count`); the

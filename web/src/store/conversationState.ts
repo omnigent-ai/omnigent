@@ -66,6 +66,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   pendingRetryStableId: true,
   restoredSendDraft: true,
   sendLatchedAt: true,
+  sendLatchSeenRunning: true,
   historyGeneration: true,
   awaitingSideChatFor: true,
 };
@@ -136,6 +137,7 @@ export function createInitialConversationState(): ConversationState {
     pendingRetryStableId: null,
     restoredSendDraft: null,
     sendLatchedAt: null,
+    sendLatchSeenRunning: null,
     historyGeneration: 0,
     awaitingSideChatFor: null,
   };
