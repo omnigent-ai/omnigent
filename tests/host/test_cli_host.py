@@ -2345,6 +2345,15 @@ def test_start_hosts_on_explicit_server(
         ),
     ],
 )
+@pytest.mark.parametrize(
+    ("desktop_args", "desktop_env", "expected_desktop"),
+    [
+        pytest.param([], None, False, id="browser"),
+        pytest.param(["--open-in-desktop"], None, True, id="desktop-flag"),
+        pytest.param([], "1", True, id="desktop-env"),
+        pytest.param(["--open-in-desktop"], "0", True, id="desktop-flag-overrides-env"),
+    ],
+)
 def test_host_web_ui_open_gates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2353,6 +2362,9 @@ def test_host_web_ui_open_gates(
     no_open_env: str | None,
     config_content: str | None,
     expected_opened: list[str],
+    desktop_args: list[str],
+    desktop_env: str | None,
+    expected_desktop: bool,
 ) -> None:
     """Open the host web UI only when interactive and enabled."""
     if config_content is not None:
@@ -2360,7 +2372,7 @@ def test_host_web_ui_open_gates(
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: is_tty)
-    opened: list[str] = []
+    opened: list[tuple[str, bool]] = []
 
     with (
         patch(
@@ -2370,15 +2382,20 @@ def test_host_web_ui_open_gates(
         patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
         patch(
             "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
+            lambda url, *, desktop: opened.append((url, desktop)) or True,
         ),
     ):
         result = CliRunner().invoke(
-            cli, ["host", *extra_args], env={"OMNIGENT_HOST_NO_OPEN": no_open_env}
+            cli,
+            ["host", *extra_args, *desktop_args],
+            env={
+                "OMNIGENT_HOST_NO_OPEN": no_open_env,
+                "OMNIGENT_HOST_OPEN_IN_DESKTOP": desktop_env,
+            },
         )
 
     assert result.exit_code == 0, result.output
-    assert opened == expected_opened
+    assert opened == [(url, expected_desktop) for url in expected_opened]
 
 
 @pytest.mark.parametrize("no_open", [False, True])
@@ -2398,7 +2415,7 @@ def test_host_remote_web_ui_open_preference(
         patch("omnigent.host.connect.run_host_process", lambda server_url, **kwargs: None),
         patch(
             "omnigent.conversation_browser.open_conversation_url",
-            lambda url: opened.append(url) or True,
+            lambda url, **_: opened.append(url) or True,
         ),
     ):
         result = CliRunner().invoke(
@@ -2429,6 +2446,15 @@ def test_host_remote_web_ui_open_preference(
         pytest.param(["--no-open"], "0", [], id="flag-overrides-env"),
     ],
 )
+@pytest.mark.parametrize(
+    ("desktop_args", "desktop_env", "expected_desktop"),
+    [
+        pytest.param([], None, False, id="browser"),
+        pytest.param(["--open-in-desktop"], None, True, id="desktop-flag"),
+        pytest.param([], "1", True, id="desktop-env"),
+        pytest.param(["--open-in-desktop"], "0", True, id="desktop-flag-overrides-env"),
+    ],
+)
 def test_background_host_web_ui_open_preference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2436,19 +2462,27 @@ def test_background_host_web_ui_open_preference(
     extra_args: list[str],
     no_open_env: str | None,
     expected_opened: list[str],
+    desktop_args: list[str],
+    desktop_env: str | None,
+    expected_desktop: bool,
 ) -> None:
     """Both background entry points honor the flag and environment preference."""
     _patch_background_host_spawn(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
-    opened: list[str] = []
+    opened: list[tuple[str, bool]] = []
 
     with patch(
         "omnigent.conversation_browser.open_conversation_url",
-        lambda url: opened.append(url) or True,
+        lambda url, *, desktop: opened.append((url, desktop)) or True,
     ):
         result = CliRunner().invoke(
-            cli, [*command, *extra_args], env={"OMNIGENT_HOST_NO_OPEN": no_open_env}
+            cli,
+            [*command, *extra_args, *desktop_args],
+            env={
+                "OMNIGENT_HOST_NO_OPEN": no_open_env,
+                "OMNIGENT_HOST_OPEN_IN_DESKTOP": desktop_env,
+            },
         )
 
     assert result.exit_code == 0, result.output
-    assert opened == expected_opened
+    assert opened == [(url, expected_desktop) for url in expected_opened]
