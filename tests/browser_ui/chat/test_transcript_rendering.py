@@ -39,6 +39,18 @@ _INVALID_MERMAID = (
     "    Note over A,B: proceed once; do not call Save\n"
     "    A=>B: again\n```"
 )
+_POINTER_CONTEXTS = [
+    pytest.param(
+        True,
+        marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        id="touch",
+    ),
+    pytest.param(
+        False,
+        marks=pytest.mark.browser_context_args(has_touch=False, is_mobile=False),
+        id="mouse",
+    ),
+]
 
 
 def _seed_assistant_message(chat: ChatSessionContract, text: str) -> None:
@@ -52,6 +64,141 @@ def _seed_assistant_message(chat: ChatSessionContract, text: str) -> None:
             )
         ]
     )
+
+
+@pytest.mark.parametrize(
+    "saved_size", [None, 11, 13, 18], ids=["unset", "small", "saved-13", "large"]
+)
+@pytest.mark.parametrize("touch", _POINTER_CONTEXTS)
+def test_message_font_size_survives_rotation_and_reload(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    saved_size: int | None,
+    touch: bool,
+) -> None:
+    """Built message CSS keeps touch prose stable while interface defaults follow layout."""
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item(
+                "font-assistant",
+                "assistant",
+                "Assistant prose with `inline code`.\n\n- A list item\n\n"
+                "##### A small heading\n\n```text\ncode sample\n```",
+                response_id="font-turn",
+            ),
+            message_item("font-user", "user", "User prose.", response_id="font-turn"),
+        ]
+    )
+    viewports = (
+        [(390, 844), (844, 390), (390, 844)] if touch else [(767, 844), (768, 844), (1280, 844)]
+    )
+    page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
+    page.goto(chat.url)
+    if saved_size is not None:
+        # Seed once, so reload cannot repair an accidentally changed preference.
+        page.evaluate(
+            "size => localStorage.setItem('omnigent:ui-font-size', String(size))", saved_size
+        )
+        page.reload()
+
+    assistant = page.get_by_test_id("assistant-text-section")
+    prose = [page.locator('[data-role="user"] p'), assistant.locator("p").first]
+    prose.extend([assistant.locator("li"), assistant.locator('[data-streamdown="heading-5"]')])
+    for width, height in viewports:
+        page.set_viewport_size({"width": width, "height": height})
+        for reload in (False, True):
+            if reload:
+                page.reload()
+            assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
+            interface_px = saved_size if saved_size is not None else (14 if width < 768 else 13)
+            message_px = (
+                (saved_size if saved_size is not None else 14) + 2
+                if touch or width < 768
+                else interface_px
+            )
+            for element in prose:
+                expect(element).to_have_css("font-size", f"{message_px}px")
+            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.6:g}px")
+            for selector in ('[data-streamdown="inline-code"]', _CODE_BODY):
+                expect(assistant.locator(selector)).to_have_css(
+                    "font-size", f"{message_px * 0.875:g}px"
+                )
+            expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
+                "font-size", f"{interface_px}px"
+            )
+            assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") == (
+                None if saved_size is None else str(saved_size)
+            )
+
+
+@pytest.mark.parametrize("touch", _POINTER_CONTEXTS)
+def test_large_message_fallback_keeps_message_font_size(
+    page: Page, chat_session_contract: ChatSessionContract, touch: bool
+) -> None:
+    """Assistant and expanded user fallbacks retain touch sizing and desktop defaults."""
+    text = "Long prose. " * 5_000 + "VISIBLE_FALLBACK_TAIL"
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item("large-assistant", "assistant", text, response_id="large-turn"),
+            message_item("large-user", "user", text, response_id="large-turn"),
+        ]
+    )
+    viewports = [(390, 844), (844, 390)] if touch else [(1280, 844)]
+    page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
+    page.goto(chat.url)
+    page.get_by_role("button", name=re.compile(r"^Show full prompt")).click()
+    for width, height in viewports:
+        page.set_viewport_size({"width": width, "height": height})
+        assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
+        for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
+            fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
+            expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
+            expect(fallback).to_have_css("font-size", "16px" if touch else "11.7px")
+
+
+@pytest.mark.only_browser("chromium")
+@pytest.mark.browser_context_args(has_touch=False, is_mobile=False)
+def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A larger browser default moves the rem breakpoint for both CSS and Settings."""
+    initial_size = page.evaluate("parseInt(getComputedStyle(document.documentElement).fontSize)")
+    cdp = page.context.new_cdp_session(page)
+    try:
+        cdp.send("Page.setFontSizes", {"fontSizes": {"standard": 20}})
+        assert page.evaluate("getComputedStyle(document.documentElement).fontSize") == "20px"
+        chat = chat_session_contract
+        chat.set_items(
+            [
+                message_item(
+                    "custom-assistant", "assistant", "Assistant prose.", response_id="custom"
+                ),
+                message_item("custom-user", "user", "User prose.", response_id="custom"),
+            ]
+        )
+        page.set_viewport_size({"width": 800, "height": 844})
+        page.goto(chat.url)
+        assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
+        assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
+        for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
+            expect(page.locator(selector)).to_have_css("font-size", "16px")
+        expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
+            "font-size", "14px"
+        )
+        page.goto(f"{chat.contract.base_url}/settings/appearance")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("14")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "14px")
+        expect(
+            page.get_by_role("group", name="Interface font size", exact=True)
+        ).to_have_accessible_description("Interface 14px · Messages 16px")
+        assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") is None
+    finally:
+        try:
+            cdp.send("Page.setFontSizes", {"fontSizes": {"standard": initial_size}})
+        finally:
+            cdp.detach()
 
 
 def _position_code_block(block: Locator) -> None:

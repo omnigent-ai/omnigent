@@ -911,6 +911,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                     </pre>
                   ) : (
                     <FilePathAwareMessageResponse
+                      className="text-message"
                       breaks
                       mode="static"
                       remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
