@@ -114,6 +114,8 @@ def _pr_data() -> dict[str, object]:
         "headRefName": "reviewer-status",
         "headRefOid": "head-sha",
         "baseRefOid": "base-sha",
+        "headRepository": {"id": "R_1", "name": "widgets"},
+        "headRepositoryOwner": {"id": "U_1", "login": "acme"},
         "statusCheckRollup": [],
         "body": "description",
         "comments": [],
