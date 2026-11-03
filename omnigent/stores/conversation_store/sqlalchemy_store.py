@@ -5650,14 +5650,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # that combination reflects lost metadata, not a chat-only
             # session. Other workspace-less sources resume in-process like
             # a brand-new chat session.
-            # Per-user pin keys (``omnigent.pinned.<user>``), per-repo sandbox
-            # labels (``omnigent.sandbox.repo.<index>``) and the source's side-chat
-            # entries are dynamic-suffix, so they're never in the exact-match drop
-            # sets — drop them by prefix instead. A fork is a NEW conversation;
-            # inheriting the source's pins would show the clone as pinned for the
-            # forker AND carry every other user's pin key along as dead data, and
-            # inheriting the repo labels would re-clone the source's repos even
-            # into a fork asked for empty.
+            # Pin, sandbox-repo and side-chat entry labels have dynamic suffixes, so drop
+            # them by prefix: a fork is a new conversation and must not inherit the
+            # source's pins, repos or side chats.
             source_labels = _fetch_labels(session, source_conversation_id)
             source_workspace_missing = (
                 source_labels.get("omnigent.last_task_error_code") == ErrorCode.WORKSPACE_MISSING

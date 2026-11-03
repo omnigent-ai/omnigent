@@ -11336,11 +11336,9 @@ def _child_session_summary_from_conversation(
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
-    # Child sessions aren't pinnable (the pin affordance lives on top-level
-    # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
-    # defensively so a shared child's summary can never expose another viewer's
-    # pin key. No collapse-to-canonical here: there's no pin to surface. Side-chat
-    # entries are private to their creator for the same reason.
+    # Child sessions aren't pinnable, but strip per-user pin and side-chat entry keys so
+    # a shared child's summary never exposes another viewer's private labels. No
+    # collapse-to-canonical here: there's no pin to surface.
     raw_labels = {
         k: v
         for k, v in conv.labels.items()

@@ -191,18 +191,23 @@ export function useSideChats(conversationId: string) {
    *
    *  @param listed The listed side-chat ids, oldest first.
    *  @param requestedAt When the list's request started (ms since epoch).
+   *  @returns The ids of the open tabs this list closed.
    */
   const sync = useCallback(
-    (listed: string[], requestedAt: number) =>
+    (listed: string[], requestedAt: number): string[] => {
+      let removed: string[] = [];
       update((current) => {
+        removed = [];
         // A future syncedAt means the clock moved back, so it can't order lists.
         if (requestedAt < current.syncedAt && current.syncedAt <= Date.now()) return current;
         const synced = new Set(current.synced);
         const listedSet = new Set(listed);
         let next = current;
         for (const id of current.synced) {
+          if (listedSet.has(id) || !next.tabs.includes(id)) continue;
           // Not remembered as closed: a later list that names it again reopens it.
-          if (!listedSet.has(id)) next = withoutTab(next, id);
+          next = withoutTab(next, id);
+          removed.push(id);
         }
         const closed = new Set(next.closed);
         const unopened = listed.filter((id) => !next.tabs.includes(id) && !closed.has(id));
@@ -210,9 +215,12 @@ export function useSideChats(conversationId: string) {
         const added = room > 0 ? unopened.slice(-room) : [];
         const sameList =
           listed.length === current.synced.length && listed.every((id) => synced.has(id));
-        if (next === current && added.length === 0 && sameList) return current;
+        const unchanged = next === current && added.length === 0 && sameList;
+        if (unchanged && requestedAt <= current.syncedAt) return current;
         return { ...next, tabs: [...next.tabs, ...added], synced: listed, syncedAt: requestedAt };
-      }),
+      });
+      return removed;
+    },
     [update],
   );
 

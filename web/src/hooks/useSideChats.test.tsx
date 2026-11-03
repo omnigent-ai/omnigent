@@ -212,32 +212,48 @@ describe("side chats the server lists", () => {
     },
   );
 
-  it.each([
-    [
-      "a list another window requested before they were created arrives late",
-      (first: SideChatsHook, second: SideChatsHook) => {
-        first.open("conv_new");
-        first.sync(["conv_new"], 2);
-        second.sync([], 1);
-      },
-    ],
-    [
-      "a list requested later but answered earlier misses them",
-      (first: SideChatsHook, second: SideChatsHook) => {
-        first.sync(["conv_new"], 1);
-        second.sync([], 2);
-      },
-    ],
-  ])("stay open once listed when %s", (_when, missThem) => {
+  it("stay open once listed when a list another window requested before they were created arrives late", () => {
     const first = renderHook(() => useSideChats("session-a"));
     const second = renderHook(() => useSideChats("session-a"));
-    act(() => missThem(first.result.current, second.result.current));
+    act(() => first.result.current.open("conv_new"));
+    act(() => first.result.current.sync(["conv_new"], 2));
+
+    act(() => second.result.current.sync([], 1));
+
+    expect(second.result.current.tabs).toEqual(["conv_new"]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_new"]);
+  });
+
+  it("reopen when a list names them again after a later one missed them", () => {
+    const first = renderHook(() => useSideChats("session-a"));
+    const second = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.sync(["conv_new"], 1));
+    act(() => second.result.current.sync([], 2));
+    expect(second.result.current.tabs).toEqual([]);
 
     act(() => second.result.current.sync(["conv_new"], 3));
 
     expect(second.result.current.tabs).toEqual(["conv_new"]);
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_new"]);
   });
+
+  it.each([
+    ["naming a side chat", ["conv_a"], [], ["conv_a"]],
+    ["naming none", [], ["conv_a"], []],
+  ])(
+    "stay as a repeated list %s left them when an older list arrives",
+    (_what, repeated, older, expected) => {
+      const first = renderHook(() => useSideChats("session-a"));
+      const second = renderHook(() => useSideChats("session-a"));
+      act(() => first.result.current.sync(repeated, 1));
+      act(() => first.result.current.sync(repeated, 3));
+
+      act(() => second.result.current.sync(older, 2));
+
+      expect(second.result.current.tabs).toEqual(expected);
+      expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(expected);
+    },
+  );
 
   it("apply lists after the clock moves back", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
@@ -280,12 +296,17 @@ describe("side chats the server lists", () => {
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(reopened);
   });
 
-  it("leave storage untouched when the list is unchanged", () => {
+  it("report the open tabs a list closes", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.sync(["conv_a", "conv_b"], 1));
+    act(() => result.current.close("conv_b"));
 
-    act(() => result.current.sync([], 1));
+    let removed: string[] = [];
+    act(() => {
+      removed = result.current.sync([], 2);
+    });
 
-    expect(localStorage.getItem(SESSION_WORKSPACE_STATE_KEY)).toBeNull();
+    expect(removed).toEqual(["conv_a"]);
   });
 });
 

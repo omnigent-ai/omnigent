@@ -1303,7 +1303,8 @@ describe("history a generic side chat copied from its parent", () => {
     });
 
   it("stays hidden on a device that didn't create the side chat", async () => {
-    mockSession.labels = { "omnigent.side_chat.history_item_id": "item_parent_a" };
+    // The copied history can end with an item that renders no block.
+    mockSession.labels = { "omnigent.side_chat.history_item_id": "item_parent_event" };
     let resolveOlder: (page: sessionsApi.SessionItemsPage) => void = () => {};
     const fetchOlder = vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockReturnValue(
       new Promise((resolve) => {
@@ -1311,19 +1312,19 @@ describe("history a generic side chat copied from its parent", () => {
       }),
     );
     // History opened elsewhere already loaded more than the fetched page.
-    showChild([
+    const parentHistory = [
       message("item_parent_old", "user", "Older parent question"),
       message("item_parent_q", "user", "Parent question"),
       message("item_parent_a", "assistant", "Parent answer"),
-      ...sideChatTurn,
-    ]);
+    ];
+    showChild([...parentHistory, ...sideChatTurn]);
     renderPane(<SideChatPane childId={childId} />);
 
     expect(screen.queryByText("Parent question")).toBeNull();
     expect(screen.queryByText("Side question")).toBeNull();
     await act(async () =>
       resolveOlder({
-        items: [message("item_parent_q", "user", "Parent question")],
+        items: [message("item_parent_a", "assistant", "Parent answer")],
         hasMore: true,
       }),
     );
@@ -1334,14 +1335,24 @@ describe("history a generic side chat copied from its parent", () => {
     expect(screen.queryByText("Parent question")).toBeNull();
     expect(screen.queryByText("Parent answer")).toBeNull();
     expect(fetchOlder).toHaveBeenCalledWith(childId, {
-      olderThan: "item_parent_a",
+      olderThan: "item_parent_event",
       limit: sessionsApi.INITIAL_WINDOW_ITEMS,
     });
     expect(JSON.parse(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)!)).toEqual([
+      "item_parent_event",
       "item_parent_a",
-      "item_parent_q",
-      "item_parent_old",
     ]);
+
+    act(() =>
+      showChild([
+        message("item_parent_oldest", "user", "Oldest parent question"),
+        ...parentHistory,
+        ...sideChatTurn,
+      ]),
+    );
+
+    expect(screen.queryByText("Oldest parent question")).toBeNull();
+    expect(screen.getByText("Side question")).toBeInTheDocument();
   });
 
   it("is empty when the parent had no history, so the first question shows", () => {

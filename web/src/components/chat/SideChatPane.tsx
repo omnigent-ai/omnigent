@@ -223,8 +223,8 @@ export function SideChatPane({
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
   const needsBoundary = boundaryRef.current.ids === null && !pending && filterHistory;
-  // A filtered pane never pages older history, so one window-sized page covers
-  // every copied item it can show.
+  // One page of the copied history locates where it ends; the pane hides everything
+  // before that, including older pages another view of this child loaded.
   const copiedHistory = useQuery({
     queryKey: ["side_chat_history", childId, historyItemId],
     queryFn: async () => {
@@ -242,10 +242,6 @@ export function SideChatPane({
     const ids =
       historyItemId === "" ? new Set<string>() : copiedHistory.data && new Set(copiedHistory.data);
     if (ids) {
-      // History already loaded past the fetched page is copied too if it precedes the marker.
-      const loaded = blocks.map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId);
-      const markerIndex = loaded.findIndex((id) => id?.split(":")[0] === historyItemId);
-      for (const id of loaded.slice(0, Math.max(markerIndex, 0))) if (id) ids.add(id);
       boundaryRef.current.ids = ids;
       writeInheritedBoundary(childId, ids);
     }
@@ -276,11 +272,13 @@ export function SideChatPane({
   const visibleBlocks = useMemo(() => {
     if (awaitingBoundary) return [];
     if (inherited === null) return blocks;
-    return blocks.filter((b) => {
+    // The copied history precedes the side chat's own turns, so hide through its last block.
+    const lastCopied = blocks.findLastIndex((b) => {
       const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
       // Derived block ids (`<item id>:<suffix>`) belong to their item.
-      return !(typeof id === "string" && (inherited.has(id) || inherited.has(id.split(":")[0])));
+      return typeof id === "string" && (inherited.has(id) || inherited.has(id.split(":")[0]));
     });
+    return blocks.slice(lastCopied + 1);
   }, [blocks, inherited, awaitingBoundary]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());

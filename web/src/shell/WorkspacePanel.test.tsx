@@ -1491,6 +1491,16 @@ describe("WorkspacePanel side chats from the user's other devices", () => {
     vi.mocked(sessionsApi.listSideChats).mockResolvedValue([{ id: "conv_remote", createdAt: 1 }]);
     renderWorkspace({ rightRailTab: "sidechat", queryClient });
     expect(await screen.findByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
+    const followUp = {
+      queueId: "q_remote",
+      text: "Queued follow-up",
+      conversationId: "conv_remote",
+    };
+    const otherChat = { queueId: "q_other", text: "Other chat", conversationId: "conv_other" };
+    useChatStore.setState({
+      sideChatDrafts: { conv_remote: "Unsent question" },
+      queuedMessages: [followUp, otherChat],
+    });
     vi.mocked(sessionsApi.listSideChats).mockResolvedValue([]);
 
     try {
@@ -1502,6 +1512,10 @@ describe("WorkspacePanel side chats from the user's other devices", () => {
     } finally {
       focusManager.setFocused(undefined);
     }
+    // A queued follow-up would otherwise send once the closed chat goes idle.
+    expect(useChatStore.getState().queuedMessages).toEqual([otherChat]);
+    expect(useChatStore.getState().sideChatDrafts.conv_remote).toBeUndefined();
+    useChatStore.setState({ queuedMessages: [] });
   });
 
   it("keeps listed side chats open when the server stops listing them", async () => {

@@ -198,6 +198,16 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
   }
 }
 
+/** Drop a closed side chat's unsent text/attachments, queued follow-ups, and any
+ *  seeded question that never got to send: its tab is gone, so they'd have nowhere
+ *  to return to, and a queued follow-up would restart the closed chat. */
+function discardSideChatInput(childId: string) {
+  const store = useChatStore.getState();
+  store.clearQueuedMessages(childId);
+  store.clearSideChatComposer(childId);
+  store.clearSideChatDraft(childId);
+}
+
 function NewTabMenu({
   conversationId,
   panels,
@@ -905,7 +915,10 @@ function WorkspacePanelImpl({
   const listedSideChats = useListedSideChats(conversationId);
   const { sync: syncSideChats } = sideChats;
   useEffect(() => {
-    if (listedSideChats !== null) syncSideChats(listedSideChats.ids, listedSideChats.requestedAt);
+    if (listedSideChats === null) return;
+    for (const childId of syncSideChats(listedSideChats.ids, listedSideChats.requestedAt)) {
+      discardSideChatInput(childId);
+    }
   }, [listedSideChats, syncSideChats]);
   const refreshListedSideChats = useCallback(() => {
     const queryKey = listedSideChatsQueryKey(conversationId);
@@ -1166,11 +1179,7 @@ function WorkspacePanelImpl({
         return;
       }
     }
-    // The tab is gone, so its unsent text/attachments, follow-ups queued during the
-    // stop, and any seeded question that never got to send have nowhere to return to.
-    useChatStore.getState().clearQueuedMessages(childId);
-    useChatStore.getState().clearSideChatComposer(childId);
-    useChatStore.getState().clearSideChatDraft(childId);
+    discardSideChatInput(childId);
     sideChats.close(childId);
     if (!childId.startsWith("pending:")) refreshListedSideChats();
   };
