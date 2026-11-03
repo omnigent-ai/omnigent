@@ -121,6 +121,64 @@ def normalized_model_id(model: str) -> str:
     return prefix_folded_model_id(model).removesuffix("[1m]")
 
 
+#: Claude Code's client-side 1M-window marker: it reads 1M only when the model
+#: id carries this suffix (otherwise capping at 200K) and strips it before requests.
+LONG_CONTEXT_MARKER = "[1m]"
+
+#: Lowest version of each long-context family that Claude Code serves at 1M,
+#: tracking its baked-in catalog: Sonnet opts in at 4.0, Opus at 4.6.
+_MIN_LONG_CONTEXT_VERSION: dict[str, tuple[int, ...]] = {
+    "sonnet": (4,),
+    "opus": (4, 6),
+}
+
+
+def _supports_long_context(canonical: str) -> bool:
+    """Whether a canonical Claude id names a model Claude Code serves at 1M.
+
+    1M capability is per-model, not per-generation: Sonnet 3.7 and Opus 4.5 cap
+    at 200K while a later sibling serves 1M. Marking a 200K-only id ``[1m]``
+    would size the session past the model and overflow mid-session, so each
+    family opts in only from its own minimum version.
+    """
+    segments = _SEGMENT_RE.split(canonical)
+    for family, minimum in _MIN_LONG_CONTEXT_VERSION.items():
+        if family not in segments:
+            continue
+        # Collect the leading run of version digits, treating a 4+-digit run
+        # (a date like ``-20250514``) or a non-numeric vendor suffix (``-v1:0``)
+        # as the boundary — neither is a Claude version component.
+        version: list[int] = []
+        for segment in segments:
+            if segment.isdigit() and len(segment) < 4:
+                version.append(int(segment))
+            elif version:
+                break
+        return tuple(version) >= minimum
+    return False
+
+
+def model_id_with_1m_marker(model_id: str) -> str:
+    """Add the ``[1m]`` window marker to a 1M-capable Opus/Sonnet id, else return it unchanged.
+
+    Everything else passes through unchanged: non-Claude ids, bare family
+    aliases, Haiku and other families, 200K-only Opus/Sonnet versions (Opus
+    through 4.5, Sonnet through 3.7), and already-marked ids.
+    """
+    spelled = model_id.strip()
+    canonical = canonical_claude_id(spelled)
+    if (
+        canonical is None
+        or spelled.lower().endswith(LONG_CONTEXT_MARKER)
+        or not _supports_long_context(canonical)
+    ):
+        return spelled
+    # Append to the stripped id so the marker sits flush against it; Claude
+    # Code strips the marker before requesting, and a stray space would leave
+    # the gateway a trailing-space model name it cannot route.
+    return f"{spelled}{LONG_CONTEXT_MARKER}"
+
+
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Read the session's alias → model-id pinning.
 
