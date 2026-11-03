@@ -4681,22 +4681,34 @@ def register_core_routes(
             await _delete_unreturned_session(fork.id)
             raise
 
-        await _persist_external_conversation_item(
-            source.id,
-            source,
-            SessionEventInput(
-                type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
-                data={
-                    "item_type": "message",
-                    "item_data": {
-                        "role": "assistant",
-                        "agent": fork.agent_name or "assistant",
-                        "content": [{"type": "output_text", "text": notice(fork.id)}],
+        # Best-effort, as for native supersession: the fork already holds the
+        # work, so a lost notice must not strand it unreturned.
+        try:
+            await _persist_external_conversation_item(
+                source.id,
+                source,
+                SessionEventInput(
+                    type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
+                    data={
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "assistant",
+                            "agent": fork.agent_name or "assistant",
+                            "content": [{"type": "output_text", "text": notice(fork.id)}],
+                        },
                     },
-                },
-            ),
-            conversation_store,
-        )
+                ),
+                conversation_store,
+            )
+        except Exception:
+            _logger.warning(
+                "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                command,
+                source.id,
+                fork.id,
+                exc_info=True,
+                extra={"session_id": source.id},
+            )
         _publish_session_superseded(source.id, fork.id, reason=reason)
         _logger.info(
             "Session superseded by %s",

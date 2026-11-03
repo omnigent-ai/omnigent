@@ -349,6 +349,37 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert live_runner.superseded == [(source_id, new_id, "clear")]
 
 
+async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed notice write still returns and announces the new session.
+
+    The notice is best-effort, so the client follows the session that already
+    holds the work instead of a retry making a second one.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(client, store)
+    monkeypatch.setattr(
+        routes_core,
+        "_persist_external_conversation_item",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    new_id = resp.json()["session_id"]
+    assert store.get_conversation(new_id) is not None
+    assert live_runner.superseded == [(source_id, new_id, "clear")]
+    assert message_texts(store, source_id) == ["Q1", "A1", "Q2", "A2"]
+
+
 @pytest.mark.parametrize(
     ("runner_id", "host_live", "runner_reachable"),
     [
