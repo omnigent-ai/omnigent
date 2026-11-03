@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 import uuid
@@ -49,6 +50,15 @@ class Host:
             f"Host {self.host_id} never came online ({last}; exit={self.proc.poll()}).\n"
             f"{self.log_path.read_text(errors='replace')[-4000:]}"
         )
+
+    def runner_pid(self, runner_id: str) -> int:
+        """Return the pid this host logged when it launched *runner_id*."""
+        match = re.search(
+            rf"Launched runner {re.escape(runner_id)} for workspace .*? \(pid=(\d+)\)",
+            self.log_path.read_text(errors="replace"),
+        )
+        assert match is not None, f"host log has no launch of {runner_id}"
+        return int(match.group(1))
 
 
 @contextmanager

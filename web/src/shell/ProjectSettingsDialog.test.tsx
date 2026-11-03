@@ -138,6 +138,79 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true });
   });
 
+  it("round-trips env and worktree setup scripts, one entry per line", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { env_commands: ["conda activate proj"], setup_commands: ["npm ci"] },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-env-commands")).toHaveValue(
+        "conda activate proj",
+      ),
+    );
+    expect(screen.getByTestId("project-settings-setup-commands")).toHaveValue("npm ci");
+
+    // Blank lines are dropped; indentation inside the script (heredocs, if/fi) is kept.
+    fireEvent.change(screen.getByTestId("project-settings-setup-commands"), {
+      target: { value: "if [ -f x ]; then\n\n  npm ci\nfi\n  \n" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        env_commands: ["conda activate proj"],
+        setup_commands: ["if [ -f x ]; then", "  npm ci", "fi"],
+      }),
+    );
+  });
+
+  it("offers the parallel-setup switch only with setup commands, and saves it", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    expect(screen.queryByTestId("project-settings-parallel-setup")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("project-settings-setup-commands"), {
+      target: { value: "npm ci" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-parallel-setup"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        setup_commands: ["npm ci"],
+        parallel_setup: true,
+      }),
+    );
+  });
+
+  it("drops a command list cleared to blank", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { env_commands: ["conda activate proj"] },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-env-commands")).toHaveValue(
+        "conda activate proj",
+      ),
+    );
+
+    fireEvent.change(screen.getByTestId("project-settings-env-commands"), {
+      target: { value: "   \n" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
   it("preserves the project icon when saving settings", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",

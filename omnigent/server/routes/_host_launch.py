@@ -18,6 +18,7 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import os
@@ -26,14 +27,18 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 
-from omnigent.entities import Conversation
+from omnigent.debug_logging import debug_event
+from omnigent.entities import Conversation, Project
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.host.frames import CAP_PROJECT_SETUP
+from omnigent.project_setup import ProjectSetup
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 
 if TYPE_CHECKING:
     from omnigent.server.sandbox_profiles import SandboxProfileCatalog
@@ -167,6 +172,92 @@ def configure_host_sharding(enabled: bool) -> None:
     """
     global _host_sharded
     _host_sharded = enabled
+
+
+_project_store: ProjectStore | None = None
+
+
+def configure_project_setup_source(project_store: ProjectStore | None) -> None:
+    """Record the store that launches read project setup commands from.
+
+    :param project_store: The server's project store; ``None`` disables
+        project setup (e.g. a deployment without projects).
+    """
+    global _project_store
+    _project_store = project_store
+
+
+@dataclass(frozen=True)
+class LaunchProjectSetup:
+    """Project setup to send with one runner launch.
+
+    :param setup: ``HostLaunchRunnerFrame.project_setup``, or ``None``.
+    :param unsupported: The project has setup but the host lacks
+        :data:`CAP_PROJECT_SETUP`; the caller should tell the user.
+    """
+
+    setup: ProjectSetup | None = None
+    unsupported: bool = False
+
+    @property
+    def agent_waits(self) -> bool:
+        """Whether the agent's turns wait for the worktree setup to finish."""
+        return self.setup is None or not self.setup.parallel_setup
+
+
+def _owned_project(
+    project_store: ProjectStore, project_id: str, owner: str | None
+) -> Project | None:
+    """Load a project owned by a host's owner.
+
+    A single-user server records its one user as either ``None`` or the
+    reserved local user depending on the auth mode, so both name that user.
+    """
+    owners: tuple[str | None, ...] = (
+        (None, RESERVED_USER_LOCAL) if owner in (None, RESERVED_USER_LOCAL) else (owner,)
+    )
+    for candidate in owners:
+        project = project_store.get(project_id, user_id=candidate)
+        if project is not None:
+            return project
+    return None
+
+
+async def resolve_launch_project_setup(
+    conv: Conversation, host_conn: HostConnection
+) -> LaunchProjectSetup:
+    """Load the session's project setup for a launch on ``host_conn``.
+
+    The project is read as the host's owner, so only commands that user wrote
+    ever run on their machine. Read at launch time so edits apply to the next
+    launch. A lookup failure is logged and treated as "no setup".
+
+    :param conv: The session being launched.
+    :param host_conn: Live connection to the target host.
+    :returns: What to send, or an empty result.
+    """
+    # A managed sandbox is not the user's machine: their local env (conda envs,
+    # ~/.env files) does not exist there, so its commands would only fail.
+    project_store = _project_store
+    if conv.project_id is None or project_store is None or host_conn.registered_with_managed_token:
+        return LaunchProjectSetup()
+    try:
+        project = await asyncio.to_thread(
+            _owned_project, project_store, conv.project_id, host_conn.owner
+        )
+        setup = ProjectSetup.from_mapping(project.config) if project is not None else None
+    except Exception:
+        _logger.warning(
+            "Could not load project setup",
+            exc_info=True,
+            extra=debug_event("project_setup_failed", session_id=conv.id),
+        )
+        return LaunchProjectSetup()
+    if setup is None:
+        return LaunchProjectSetup()
+    if CAP_PROJECT_SETUP not in host_conn.hello.capabilities:
+        return LaunchProjectSetup(unsupported=True)
+    return LaunchProjectSetup(setup=setup)
 
 
 def _deployment_is_sharded() -> bool:

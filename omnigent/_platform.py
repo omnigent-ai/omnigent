@@ -14,6 +14,7 @@ or anything platform-specific at module top level.
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import hashlib
 import logging
@@ -310,6 +311,44 @@ def default_interactive_shell() -> str:
         if _resolve_interactive_shell(name):
             return name
     return "bash"
+
+
+#: Shells whose ``-c`` and script syntax accept POSIX shell code.
+_POSIX_SHELLS = frozenset({"bash", "zsh", "sh", "dash", "ksh"})
+
+
+def posix_login_shell() -> str | None:
+    """
+    Absolute path of a POSIX shell to run the user's setup code in.
+
+    The user's own login shell when it is POSIX: ``$SHELL``, or the account's
+    login shell when a daemon started by launchd or systemd has no ``$SHELL``.
+    A fish or nushell user gets zsh or bash instead, so profile-defined
+    ``PATH`` entries still load. ``None`` on Windows or when no POSIX shell
+    resolves.
+
+    :returns: e.g. ``"/bin/zsh"``.
+    """
+    if IS_WINDOWS:
+        return None
+    shell = os.environ.get("SHELL", "").strip()
+    if not shell:
+        with contextlib.suppress(KeyError, ImportError):
+            import pwd
+
+            shell = pwd.getpwuid(os.getuid()).pw_shell
+    name = os.path.basename(shell)
+    if name in _POSIX_SHELLS:
+        if os.path.isabs(shell) and os.access(shell, os.X_OK):
+            return shell
+        resolved = _resolve_interactive_shell(name)
+        if resolved:
+            return resolved
+    for fallback in ("zsh", "bash"):
+        resolved = _resolve_interactive_shell(fallback)
+        if resolved:
+            return resolved
+    return None
 
 
 def installed_interactive_shells() -> list[str]:

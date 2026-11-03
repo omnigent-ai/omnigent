@@ -21,11 +21,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
+import { cn } from "@/lib/utils";
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
@@ -56,20 +58,28 @@ function Field({
   label,
   hint,
   htmlFor,
+  stacked = false,
   children,
 }: {
   label: string;
   hint?: string;
   htmlFor?: string;
+  /** Put the control full width under its label, e.g. for a script editor. */
+  stacked?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+    <div
+      className={cn(
+        "flex flex-col gap-1.5",
+        !stacked && "sm:flex-row sm:items-start sm:justify-between sm:gap-4",
+      )}
+    >
       <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
         <span className="font-medium text-ui">{label}</span>
         {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
-      <div className="sm:w-64">{children}</div>
+      <div className={stacked ? undefined : "sm:w-64"}>{children}</div>
     </div>
   );
 }
@@ -79,6 +89,21 @@ function Field({
 function trimOrUndef(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed === "" ? undefined : trimmed;
+}
+
+/**
+ * Script lines as stored entries; the backend re-joins them into one script.
+ * Blank lines are dropped, but indentation inside a line is kept (heredocs).
+ */
+function commandsFromText(text: string): string[] {
+  return text.split("\n").filter((line) => line.trim() !== "");
+}
+
+/** The stored command list as editable text, ignoring a malformed value. */
+function commandsToText(commands: unknown): string {
+  return Array.isArray(commands)
+    ? commands.filter((command): command is string => typeof command === "string").join("\n")
+    : "";
 }
 
 export function ProjectSettingsDialog({
@@ -149,6 +174,9 @@ export function ProjectSettingsDialog({
   // effort ladder; NONE stores no default (unset key).
   const [effort, setEffort] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [envCommands, setEnvCommands] = useState("");
+  const [setupCommands, setSetupCommands] = useState("");
+  const [parallelSetup, setParallelSetup] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -191,16 +219,21 @@ export function ProjectSettingsDialog({
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
-    const c: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
-    setHostId(c.host_id ?? NONE);
-    setWorkspace(c.workspace ?? "");
-    setUseWorktree(c.use_worktree ?? readAlwaysUseWorktree());
-    setBaseBranch(c.base_branch ?? "");
-    setAgentId(c.agent_id ?? null);
-    setModel(c.model ?? NONE);
+    const storedConfig: ProjectConfig = projectConfigWithLaunch(stored ?? {}, launch);
+    setHostId(storedConfig.host_id ?? NONE);
+    setWorkspace(storedConfig.workspace ?? "");
+    setUseWorktree(storedConfig.use_worktree ?? readAlwaysUseWorktree());
+    setBaseBranch(storedConfig.base_branch ?? "");
+    setAgentId(storedConfig.agent_id ?? null);
+    setModel(storedConfig.model ?? NONE);
     // The server stores config untyped, so ignore a malformed effort.
-    setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
+    setEffort(
+      typeof storedConfig.effort === "string" && storedConfig.effort ? storedConfig.effort : NONE,
+    );
     setWorkspaceOpen(false);
+    setEnvCommands(commandsToText(storedConfig.env_commands));
+    setSetupCommands(commandsToText(storedConfig.setup_commands));
+    setParallelSetup(storedConfig.parallel_setup === true);
   }, [open, stored, loadFailed, launch]);
 
   const onSubmit = (e: FormEvent) => {
@@ -251,6 +284,15 @@ export function ProjectSettingsDialog({
     else if (!agentUnresolved) delete config.model;
     if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
     else if (!agentUnresolved) delete config.effort;
+    const envList = commandsFromText(envCommands);
+    if (envList.length > 0) config.env_commands = envList;
+    else delete config.env_commands;
+    const setupList = commandsFromText(setupCommands);
+    if (setupList.length > 0) config.setup_commands = setupList;
+    else delete config.setup_commands;
+    // Only meaningful with setup commands; unset keeps the default (agent waits).
+    if (setupList.length > 0 && parallelSetup) config.parallel_setup = true;
+    else delete config.parallel_setup;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -386,7 +428,8 @@ export function ProjectSettingsDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="sm:max-w-lg"
+        // Scrolls when tall (e.g. long scripts), so Save stays reachable.
+        className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
@@ -660,6 +703,58 @@ export function ProjectSettingsDialog({
                   )}
                 </SelectContent>
               </Select>
+            </Field>
+          )}
+
+          <Field
+            label="Environment commands"
+            hint="Shell script run before every session starts; the environment it sets reaches the agent (e.g. conda activate)."
+            htmlFor="project-settings-env-commands"
+            stacked
+          >
+            <Textarea
+              id="project-settings-env-commands"
+              data-testid="project-settings-env-commands"
+              className="max-h-64 font-mono whitespace-pre"
+              spellCheck={false}
+              placeholder="conda activate my-env"
+              value={envCommands}
+              onChange={(e) => setEnvCommands(e.target.value)}
+              disabled={isLoading}
+            />
+          </Field>
+
+          <Field
+            label="Worktree setup"
+            hint="Shell script run once per new git worktree (e.g. installs); stops at the first failing command. $OMNIGENT_ROOT_PATH is the main checkout."
+            htmlFor="project-settings-setup-commands"
+            stacked
+          >
+            <Textarea
+              id="project-settings-setup-commands"
+              data-testid="project-settings-setup-commands"
+              className="max-h-64 font-mono whitespace-pre"
+              spellCheck={false}
+              placeholder={'cp "$OMNIGENT_ROOT_PATH/.env" .env\nnpm ci'}
+              value={setupCommands}
+              onChange={(e) => setSetupCommands(e.target.value)}
+              disabled={isLoading}
+            />
+          </Field>
+
+          {commandsFromText(setupCommands).length > 0 && (
+            <Field
+              label="Start agent during setup"
+              hint="Let the agent start before worktree setup finishes, instead of waiting for it."
+            >
+              <div className="flex sm:justify-end">
+                <Switch
+                  data-testid="project-settings-parallel-setup"
+                  checked={parallelSetup}
+                  onCheckedChange={setParallelSetup}
+                  disabled={isLoading}
+                />
+              </div>
             </Field>
           )}
 

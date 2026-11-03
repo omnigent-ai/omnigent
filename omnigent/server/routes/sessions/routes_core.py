@@ -82,7 +82,12 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
-from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import (
+    HostConnection,
+    HostLaunchResult,
+    HostRegistry,
+    RunnerExitReports,
+)
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -206,6 +211,8 @@ from omnigent.server.schemas import (
     CreatedSessionResponse,
     PaginatedList,
     ProjectSessionCreateRequest,
+    ProjectSetupLogResponse,
+    ProjectSetupRerunResponse,
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
@@ -340,6 +347,8 @@ async def _wake_runner_for_model_change(
 # Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
 # mirroring/cleanup (6s) to finish before the server restores a selection.
 _CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
+#: How long the project setup log endpoint waits for the host.
+_PROJECT_SETUP_LOG_TIMEOUT_S = 15.0
 
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "
@@ -765,8 +774,10 @@ def register_core_routes(
         from omnigent.server.routes._host_launch import (
             LAUNCH_TIMEOUT_ENV_VAR,
             resolve_host_launch,
+            resolve_launch_project_setup,
             resolve_launch_timeout_s,
         )
+        from omnigent.server.routes._sessions.helpers import note_launch_project_setup
 
         with creation_stage("create_acl_ms"):
             target = await asyncio.to_thread(
@@ -820,6 +831,7 @@ def register_core_routes(
                 stage="runner_launch",
             ),
         )
+        project_setup = await resolve_launch_project_setup(target.conv, conn)
         request_id = secrets.token_hex(8)
         future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -846,6 +858,7 @@ def register_core_routes(
                 ),
                 # The session had no runner bound, so nothing is superseded.
                 superseded_runner_ids=(),
+                project_setup=project_setup.setup,
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
@@ -888,6 +901,10 @@ def register_core_routes(
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
+            )
+        else:
+            await note_launch_project_setup(
+                target.conv, conversation_store, project_setup, launch_result
             )
         return runner_id, launch_failed
 
@@ -4491,6 +4508,128 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+
+    async def _owner_session_host(
+        request: Request, session_id: str
+    ) -> tuple[Conversation, HostRegistry, HostConnection]:
+        """Resolve the caller's own host-bound session and its live host tunnel.
+
+        Project setup endpoints run code on, or read logs from, the owner's
+        machine, so they are owner-only.
+
+        :raises OmnigentError: 404 for an unknown session, 409 when it does not
+            run on a host, or the host-absent error (``WRONG_REPLICA`` when the
+            tunnel lives on another replica).
+        """
+        from omnigent.host.frames import CAP_PROJECT_SETUP
+        from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        registry = getattr(request.app.state, "host_registry", None)
+        host_store = getattr(request.app.state, "host_store", None)
+        if (
+            conv.host_id is None
+            or conv.workspace is None
+            or registry is None
+            or host_store is None
+        ):
+            raise OmnigentError("This session does not run on a host", code=ErrorCode.CONFLICT)
+        host = await asyncio.to_thread(
+            resolve_host_owner, user_id=user_id, host_id=conv.host_id, host_store=host_store
+        )
+        conn = registry.get(conv.host_id)
+        if conn is None:
+            raise host_absent_error(host)
+        if CAP_PROJECT_SETUP not in conn.hello.capabilities:
+            raise OmnigentError(
+                "The session's host is too old to run project setup", code=ErrorCode.CONFLICT
+            )
+        return conv, registry, conn
+
+    # ── POST /sessions/{session_id}/project-setup/rerun ──────────
+    @router.post(
+        "/sessions/{session_id}/project-setup/rerun",
+        status_code=202,
+        response_model=ProjectSetupRerunResponse,
+    )
+    async def rerun_project_setup(request: Request, session_id: str) -> ProjectSetupRerunResponse:
+        """Run the session's worktree setup again, without restarting its agent.
+
+        The outcome arrives as the usual project-setup notices.
+
+        :raises OmnigentError: As :func:`_owner_session_host`, or 409 when the
+            project has no setup commands.
+        """
+        from omnigent.host.frames import HostRerunProjectSetupFrame, encode_host_frame
+        from omnigent.server.routes._host_launch import resolve_launch_project_setup
+        from omnigent.server.routes._sessions.helpers import note_project_setup_running
+
+        conv, registry, conn = await _owner_session_host(request, session_id)
+        project_setup = await resolve_launch_project_setup(conv, conn)
+        if project_setup.setup is None or not project_setup.setup.setup_commands:
+            raise OmnigentError(
+                "The session's project has no setup commands", code=ErrorCode.CONFLICT
+            )
+        assert conv.workspace is not None
+        try:
+            registry.send_text(
+                conn,
+                encode_host_frame(
+                    HostRerunProjectSetupFrame(
+                        session_id=session_id,
+                        workspace=conv.workspace,
+                        project_setup=project_setup.setup,
+                    )
+                ),
+            )
+        except ConnectionError as exc:
+            raise OmnigentError(
+                "The session's host disconnected", code=ErrorCode.HOST_OFFLINE
+            ) from exc
+        await note_project_setup_running(
+            conv, conversation_store, message="Re-running project setup for this worktree."
+        )
+        return ProjectSetupRerunResponse(status="started")
+
+    # ── GET /sessions/{session_id}/project-setup/log ─────────────
+    @router.get("/sessions/{session_id}/project-setup/log", response_model=ProjectSetupLogResponse)
+    async def read_project_setup_log(request: Request, session_id: str) -> ProjectSetupLogResponse:
+        """Return the end of the session worktree's latest project setup log.
+
+        Owner-only: setup output can hold whatever the commands printed. The
+        host redacts credentials and reads only its own setup logs.
+
+        :raises OmnigentError: As :func:`_owner_session_host`, or 503 when the
+            host does not answer.
+        """
+        from omnigent.host.frames import HostReadProjectSetupLogFrame, encode_host_frame
+
+        conv, registry, conn = await _owner_session_host(request, session_id)
+        assert conv.workspace is not None
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        conn.pending_project_setup_logs[request_id] = future
+        try:
+            registry.send_text(
+                conn,
+                encode_host_frame(
+                    HostReadProjectSetupLogFrame(request_id=request_id, workspace=conv.workspace)
+                ),
+            )
+            content = await asyncio.wait_for(future, timeout=_PROJECT_SETUP_LOG_TIMEOUT_S)
+        except (ConnectionError, TimeoutError) as exc:
+            raise OmnigentError(
+                "The session's host did not return the setup log", code=ErrorCode.HOST_OFFLINE
+            ) from exc
+        finally:
+            conn.pending_project_setup_logs.pop(request_id, None)
+        return ProjectSetupLogResponse(content=content)
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a

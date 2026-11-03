@@ -33,6 +33,7 @@ from omnigent.entities import (
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
+from omnigent.project_setup import validate_project_setup_config
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -5421,6 +5422,27 @@ class SessionProjectSummary(BaseModel):
     icon: str | None = None
 
 
+class ProjectSetupRerunResponse(BaseModel):
+    """
+    Response for ``POST /v1/sessions/{id}/project-setup/rerun``.
+
+    :param status: ``"started"``; the outcome arrives as session notices.
+    """
+
+    status: Literal["started"]
+
+
+class ProjectSetupLogResponse(BaseModel):
+    """
+    Response for ``GET /v1/sessions/{id}/project-setup/log``.
+
+    :param content: The end of the worktree's latest setup log, credentials
+        redacted, or ``None`` when it has none.
+    """
+
+    content: str | None
+
+
 class CreateProjectRequest(BaseModel):
     """
     Request body for ``POST /v1/projects``.
@@ -5428,13 +5450,21 @@ class CreateProjectRequest(BaseModel):
     :param name: Human-readable project name. Trimmed; must be non-empty and
         at most 100 characters; unique among the caller's projects.
     :param config: Optional default session settings (opaque JSON object).
-        Omitted / empty stores no defaults.
+        Omitted / empty stores no defaults. Its ``env_commands`` and
+        ``setup_commands`` lists are validated (see :mod:`omnigent.project_setup`).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("config")
+    @classmethod
+    def _validate_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Reject malformed project setup command lists at save time."""
+        validate_project_setup_config(value)
+        return value
 
     @field_validator("name")
     @classmethod
@@ -5462,13 +5492,22 @@ class UpdateProjectRequest(BaseModel):
     :param name: New project name. ``None`` leaves it unchanged; otherwise
         trimmed, non-empty, at most 100 characters.
     :param config: New config object to replace the stored one. ``None`` leaves
-        it unchanged; an empty object ``{}`` clears the stored defaults.
+        it unchanged; an empty object ``{}`` clears the stored defaults. Its
+        ``env_commands`` and ``setup_commands`` lists are validated.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
     config: dict[str, Any] | None = None
+
+    @field_validator("config")
+    @classmethod
+    def _validate_config(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Reject malformed project setup command lists at save time."""
+        if value is not None:
+            validate_project_setup_config(value)
+        return value
 
     @field_validator("name")
     @classmethod

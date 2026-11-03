@@ -57,6 +57,19 @@ export interface ProjectConfig {
    * model's ladder. Unset = the harness's own configured effort.
    */
   effort?: string;
+  /**
+   * Script lines sourced as one shell script before every session in this
+   * project starts; the environment it sets (e.g. `conda activate`) reaches
+   * the agent. Validated and executed by the server and host.
+   */
+  env_commands?: string[];
+  /**
+   * Script lines run as one `set -e` shell script once per new git worktree
+   * (e.g. installs). The agent's turns wait for it unless `parallel_setup` is set.
+   */
+  setup_commands?: string[];
+  /** Let the agent start while `setup_commands` still run. Unset = wait. */
+  parallel_setup?: boolean;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

@@ -202,8 +202,9 @@ def _fail_pending_worktrees(conn: HostConnection) -> None:
 
 
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
-    """Wake account/login route waiters when their tunnel disappears."""
+    """Wake account, login and project-setup-log route waiters when their tunnel disappears."""
     for pending in (
+        conn.pending_project_setup_logs,
         conn.pending_harness_account_probes,
         conn.pending_harness_refreshes,
         conn.pending_harness_login_starts,
@@ -376,6 +377,8 @@ class HostLaunchResult(TypedDict, total=False):
     error: str | None
     error_code: str | None
     workspace_recreated: bool
+    project_setup_warnings: list[str]
+    project_setup_running: bool
 
 
 @dataclass
@@ -414,6 +417,9 @@ class HostConnection:
         host sends ``host.runner_status_result``. Values carry the
         single ``status`` field (``"alive"`` / ``"dead"`` /
         ``"unknown"``).
+    :param pending_project_setup_logs: Per-``request_id`` futures for
+        in-flight ``host.read_project_setup_log`` requests, resolved with the
+        log text or ``None``; failed when the host disconnects.
     :param pending_stats: Per-``request_id`` futures for in-flight
         ``host.stat`` requests. Resolved when the host sends
         ``host.stat_result``. The dict values carry the full
@@ -513,6 +519,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_stats: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_project_setup_logs: dict[str, asyncio.Future[str | None]] = field(
         default_factory=dict,
     )
     pending_list_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
