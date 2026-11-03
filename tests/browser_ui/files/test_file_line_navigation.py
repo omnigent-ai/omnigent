@@ -597,6 +597,17 @@ def test_content_search_opens_line_and_preserves_results(
     expect(drawer_search).to_have_value("changed")
     expect(drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 200")).to_be_visible()
 
+    # The same file opened from Changes goes back to Files instead.
+    drawer.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role("button", name="Conversation actions", exact=True).click()
+    page.get_by_role("menuitem", name=re.compile(r"^Changes")).click()
+    files_drawer = page.get_by_test_id("files-panel-drawer")
+    files_drawer.get_by_role("button", name=_FILE_PATH, exact=True).click()
+    page.get_by_role("button", name="Close file viewer", exact=True).click()
+    expect(files_drawer).to_have_attribute("data-state", "open")
+    expect(drawer).to_have_attribute("data-state", "closed")
+    files_drawer.get_by_role("button", name="Close files", exact=True).click()
+
     # Widening hands the same query and results to the desktop rail.
     page.set_viewport_size({"width": 1600, "height": 1000})
     rail.get_by_role("tab", name="Content search", exact=True).click()

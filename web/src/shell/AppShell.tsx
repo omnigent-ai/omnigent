@@ -1493,14 +1493,23 @@ function AppShellImpl() {
     },
     [],
   );
-  // Mobile Back returns to the Content search drawer for files opened from it.
-  const fileOpenedFromContentSearchRef = useRef(false);
+  // Mobile Back returns to Content search only for the conversation and file
+  // its result committed; any other file navigation clears it.
+  const contentSearchFileRef = useRef<string | null>(null);
   const openFileViewer = useCallback(
     (path: string, options?: OpenFileOptions) => {
-      fileOpenedFromContentSearchRef.current = false;
+      contentSearchFileRef.current = null;
       guardFileNavigation(path, options, () => commitFileNavigation(path, options));
     },
     [guardFileNavigation, commitFileNavigation],
+  );
+  const openContentSearchResult = useCallback(
+    (path: string, options?: OpenFileOptions) =>
+      guardFileNavigation(path, options, () => {
+        commitFileNavigation(path, options);
+        contentSearchFileRef.current = `${conversationId}\n${path}`;
+      }),
+    [guardFileNavigation, commitFileNavigation, conversationId],
   );
 
   useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
@@ -1821,9 +1830,12 @@ function AppShellImpl() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
-    if (fileOpenedFromContentSearchRef.current) setContentSearchPanelOpen(true);
-    else setFilesPanelOpen(true);
-    fileOpenedFromContentSearchRef.current = false;
+    if (contentSearchFileRef.current === `${conversationId}\n${selectedFilePath}`) {
+      setContentSearchPanelOpen(true);
+    } else {
+      setFilesPanelOpen(true);
+    }
+    contentSearchFileRef.current = null;
   }
 
   // Deselect the active file tab to reveal the scope view (Changed/All list
@@ -2921,10 +2933,7 @@ function AppShellImpl() {
                   <ContentSearchPanel
                     key={conversationId}
                     conversationId={conversationId}
-                    onFileSelect={(path, options) => {
-                      openFileViewer(path, options);
-                      fileOpenedFromContentSearchRef.current = true;
-                    }}
+                    onFileSelect={openContentSearchResult}
                   />
                 </MobilePanelDrawer>
               )}
