@@ -111,10 +111,14 @@ async def test_turn_after_hung_mcp_reconnect_is_not_held_by_the_cli(
     status_file = home / "mcp-auth-status.json"
     names = ["alpha", "beta"]
     monkeypatch.setenv("HOME", str(home))
+    # The CLI would read its config from an inherited directory instead of the seeded HOME.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
     monkeypatch.setenv("ANTHROPIC_BASE_URL", isolated_mock_llm_server_url)
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     monkeypatch.setenv("MCP_TIMEOUT", str(_CLI_MCP_TIMEOUT_MS))
+    # The CLI sandbox can't see an editable checkout outside the workspace; it isn't under test.
+    monkeypatch.setenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", "1")
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 2.0)
 
     with _HangsAfterSignIn() as alpha, _HangsAfterSignIn() as beta:

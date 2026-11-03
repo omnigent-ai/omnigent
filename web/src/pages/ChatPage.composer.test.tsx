@@ -4121,6 +4121,8 @@ describe("Composer MCP status command", () => {
     { loadsUserSettings: undefined, agentLoaded: false, agentFailed: false, userRowShown: false },
     // Its request failed: managed servers only, with a status saying why.
     { loadsUserSettings: undefined, agentLoaded: false, agentFailed: true, userRowShown: false },
+    // A failed refetch keeps the earlier agent's data: still managed only, with the status.
+    { loadsUserSettings: undefined, agentLoaded: true, agentFailed: true, userRowShown: false },
   ])(
     "lists the host's Claude servers in a claude-sdk session: %j",
     ({ loadsUserSettings, agentLoaded, agentFailed, userRowShown }) => {

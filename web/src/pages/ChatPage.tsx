@@ -2571,19 +2571,23 @@ function ComposerImpl(
     sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
   // claude-sdk runs the Claude Code CLI, so on a host its /mcp lists the host's Claude servers.
-  const hostMcpKey =
-    sessionHarness === "claude-sdk"
-      ? hostMcpRoutingId !== null
-        ? "claude"
-        : undefined
-      : nativeMcpHarness;
+  const sdkHostMcpKey = hostMcpRoutingId !== null ? "claude" : undefined;
+  const hostMcpKey = sessionHarness === "claude-sdk" ? sdkHostMcpKey : nativeMcpHarness;
   const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
   const { data: sessionAgent, isError: sessionAgentFailed } = useSessionAgent(composerSessionId);
   // A claude-sdk session run without setting sources (`skills: none`) loads only managed
-  // servers; until the session's agent arrives, list only those.
+  // servers; until the session's agent arrives, or if its request fails, list only those.
   const hostUserServersLoaded =
     sessionHarness !== "claude-sdk" ||
-    (sessionAgent !== undefined && sessionAgent.loads_user_settings !== false);
+    (!sessionAgentFailed &&
+      sessionAgent !== undefined &&
+      sessionAgent.loads_user_settings !== false);
+  let sdkAgentStatus: string | undefined;
+  if (sessionHarness === "claude-sdk" && sessionAgentFailed) {
+    sdkAgentStatus = "Couldn’t load this session’s agent, so only managed MCP servers are shown.";
+  } else if (sessionHarness === "claude-sdk" && sessionAgent === undefined) {
+    sdkAgentStatus = "Loading this session’s agent; only managed MCP servers are shown so far.";
+  }
   const isSessionHostServer = useCallback(
     (server: HostMcpServer) =>
       server.harness === hostMcpHarness && (server.managed === true || hostUserServersLoaded),
@@ -2612,11 +2616,7 @@ function ComposerImpl(
           ? "Loading MCP servers…"
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
-            : sessionHarness === "claude-sdk" && sessionAgent === undefined
-              ? sessionAgentFailed
-                ? "Couldn’t load this session’s agent, so only managed MCP servers are shown."
-                : "Loading this session’s agent; only managed MCP servers are shown so far."
-              : undefined;
+            : sdkAgentStatus;
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness
     : hostMcpHarness && INVENTORY_HARNESS_IDS[hostMcpHarness];
