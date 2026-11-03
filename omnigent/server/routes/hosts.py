@@ -1749,7 +1749,7 @@ def create_hosts_router(
             )
         # Expected filesystem error (already exists / permission denied /
         # parent is a file) → 409 Conflict with the host's message, so
-        # the picker can show "directory already exists" inline.
+        # the picker can show "directory already exists".
         if result.get("error"):
             raise HTTPException(
                 status_code=409,

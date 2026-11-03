@@ -14,6 +14,7 @@ import {
   SearchIcon,
 } from "lucide-react";
 import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -483,10 +484,11 @@ export function WorkspacePicker({
   // (e.g. home resolving) can't overwrite what they're typing.
   const userEditedRef = useRef(false);
   // "New folder" inline form: null when closed, otherwise the in-progress
-  // folder name. A separate error string holds the last create failure
-  // (e.g. "directory already exists") so it shows inline by the input.
+  // folder name.
   const [newFolderName, setNewFolderName] = useState<string | null>(null);
-  const [createError, setCreateError] = useState<string | null>(null);
+  // Path of a submitted folder the host hasn't created yet. It takes the form's
+  // place wherever the user browses, and is never listed or selectable.
+  const [creatingPath, setCreatingPath] = useState<string | null>(null);
   const [selectedWorktreePath, setSelectedWorktreePath] = useState<string | null>(null);
   const createDir = useCreateHostDirectory();
   const hasCommitActions = onSelect !== undefined || onClose !== undefined;
@@ -505,7 +507,6 @@ export function WorkspacePicker({
     setResolvedHome(null);
     userEditedRef.current = false;
     setNewFolderName(null);
-    setCreateError(null);
   }, [hostId]);
 
   const {
@@ -795,16 +796,26 @@ export function WorkspacePicker({
     : path === "" && !navigationPending
       ? "~"
       : null;
-  const canCreateFolder = hostId !== null && createBaseDir !== null && !navigationPending && !error;
+  const canCreateFolder =
+    hostId !== null &&
+    createBaseDir !== null &&
+    !navigationPending &&
+    !error &&
+    creatingPath === null;
+
+  // Counts changes to what a late create would overwrite by navigating, so a
+  // create that settles after the user has touched the picker leaves them be.
+  const viewChangesRef = useRef(0);
+  useEffect(() => {
+    viewChangesRef.current += 1;
+  }, [hostId, path, searchInput, pathEditing, activePath, selectedWorktreePath]);
 
   function openNewFolder() {
-    setCreateError(null);
     setNewFolderName("");
   }
 
   function cancelNewFolder() {
     setNewFolderName(null);
-    setCreateError(null);
   }
 
   async function commitNewFolder() {
@@ -813,16 +824,21 @@ export function WorkspacePicker({
       return;
     }
     const target = joinPath(createBaseDir, name);
+    const viewAtSubmit = viewChangesRef.current;
+    setNewFolderName(null);
+    setCreatingPath(target);
     try {
       const created = await createDir.mutateAsync({ hostId, path: target });
-      // Drop into the freshly created folder so the user can pick it
-      // straight away (the reason they made it). The listing refresh is
-      // handled by the mutation's onSuccess invalidation.
-      setNewFolderName(null);
-      setCreateError(null);
-      navigateTo(created);
+      // Drop into the new folder (by the host's canonical path) so the user can
+      // pick it straight away. The mutation's onSuccess refreshes the listing.
+      if (viewChangesRef.current === viewAtSubmit) navigateTo(created);
     } catch (err) {
-      setCreateError(err instanceof Error ? err.message : "Failed to create folder");
+      // A toast outlives the picker, so the failure shows even after it closes.
+      const message = err instanceof Error ? err.message : "Failed to create folder";
+      toast.error(`Couldn't create folder "${name}"`, { description: message });
+      if (viewChangesRef.current === viewAtSubmit) setNewFolderName(name);
+    } finally {
+      setCreatingPath(null);
     }
   }
 
@@ -1065,10 +1081,7 @@ export function WorkspacePicker({
                   // Focus belongs on the field the user just opened; the picker is already a focus trap.
                   autoFocus
                   value={newFolderName}
-                  onChange={(e) => {
-                    setNewFolderName(e.target.value);
-                    if (createError !== null) setCreateError(null);
-                  }}
+                  onChange={(e) => setNewFolderName(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") {
                       e.preventDefault();
@@ -1087,18 +1100,14 @@ export function WorkspacePicker({
                 />
                 <button
                   type="button"
-                  disabled={newFolderName.trim() === "" || createDir.isPending}
+                  disabled={newFolderName.trim() === ""}
                   onClick={() => void commitNewFolder()}
                   aria-label="Create folder"
                   title="Create folder"
                   className="mobile-touch-target shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
                   data-testid="workspace-picker-new-folder-create"
                 >
-                  {createDir.isPending ? (
-                    <Spinner className="size-4" />
-                  ) : (
-                    <CheckIcon className="size-4" />
-                  )}
+                  <CheckIcon className="size-4" />
                 </button>
                 <button
                   type="button"
@@ -1111,16 +1120,18 @@ export function WorkspacePicker({
                   <XIcon className="size-4" />
                 </button>
               </div>
-              {createError !== null && (
-                <span
-                  className="text-sm text-destructive"
-                  role="alert"
-                  aria-live="assertive"
-                  data-testid="workspace-picker-new-folder-error"
-                >
-                  {createError}
-                </span>
-              )}
+            </div>
+          )}
+          {creatingPath !== null && (
+            <div
+              role="status"
+              className="flex shrink-0 items-center gap-2 border-b bg-muted/30 px-4 py-2 text-sm text-muted-foreground"
+              data-testid="workspace-picker-new-folder-pending"
+            >
+              <Spinner className="size-4 shrink-0" />
+              <span className="min-w-0 truncate" title={creatingPath}>
+                Creating {creatingPath}…
+              </span>
             </div>
           )}
           {occupiedCount > 0 && (
