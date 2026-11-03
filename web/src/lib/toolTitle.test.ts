@@ -184,6 +184,21 @@ describe("formatToolTitle", () => {
       server: "github",
       toolName: "github__create_pull_request",
     });
+    // A list of fields to return shapes the result, so it is not counted as "5 items".
+    expect(
+      formatToolTitle("mcp__linear__get_issue", {
+        id: "OMNI-13632",
+        fields: ["id", "title", "description", "status", "labels"],
+      }).body,
+    ).toBe("OMNI-13632");
+    expect(formatToolTitle("search_records", { query: "x", selectColumns: ["a", "b"] }).body).toBe(
+      "x",
+    );
+    expect(formatToolTitle("get_issue", { issue: "OMNI-1", fields: "summary,status" }).body).toBe(
+      "OMNI-1",
+    );
+    // `include` names what the call is about (a path glob), not which fields come back.
+    expect(formatToolTitle("search_code", { include: ["src/**/*.ts"] }).body).toBe("src/**/*.ts");
     // A formatter for a built-in name does not apply to another server's tool.
     expect(formatToolTitle("mcp__search__web_search", { query: "x" }).verb).toBe("Web search");
   });

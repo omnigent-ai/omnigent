@@ -205,3 +205,15 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(chevron)).toMatch(/md:group-hover:opacity-100/);
   });
 });
+
+it("opens New project without toggling the Projects header", () => {
+  renderSidebar();
+  const projects = headerButton("Projects");
+  const expanded = projects.getAttribute("aria-expanded");
+  fireEvent.click(projects);
+  expect(projects.getAttribute("aria-expanded")).not.toBe(expanded);
+  const afterToggle = projects.getAttribute("aria-expanded");
+  fireEvent.click(screen.getByRole("button", { name: "New project" }));
+  expect(screen.getByRole("dialog", { name: "New project" })).toBeVisible();
+  expect(projects.getAttribute("aria-expanded")).toBe(afterToggle);
+});

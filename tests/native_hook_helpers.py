@@ -1,11 +1,13 @@
 """Shared test helpers for the native-harness policy hooks.
 
 Used by both ``tests/harnesses/claude_native/test_claude_native_hook.py`` and
-``tests/harnesses/codex_native/test_codex_native_hook.py`` so the fail-closed failure-mode stub
-lives in one place and can't drift if new modes are added.
+``tests/harnesses/codex_native/test_codex_native_hook.py`` so the policy-server stubs
+live in one place and can't drift if new modes are added.
 """
 
 from __future__ import annotations
+
+import json
 
 import httpx
 
@@ -42,3 +44,30 @@ def make_failing_client(mode: str) -> type:
             return httpx.Response(200, text="not json at all", request=req)
 
     return _FailingHttpxClient
+
+
+def make_verdict_client(verdict: dict[str, object]) -> type:
+    """
+    Build an ``httpx.Client`` stub that answers every policy POST with *verdict*.
+
+    :param verdict: ``EvaluationResponse`` body to return with status 200, e.g.
+        ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 60.0}``.
+    :returns: A class usable as a drop-in for :class:`httpx.Client`.
+    """
+    body = json.dumps(verdict)
+
+    class _VerdictHttpxClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _VerdictHttpxClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(200, text=body, request=httpx.Request("POST", url))
+
+    return _VerdictHttpxClient
