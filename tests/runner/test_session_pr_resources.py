@@ -96,7 +96,7 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
         B: "Second",
     }
     assert [call[-1] for call in calls] == [
-        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid",
+        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
         "title",
     ]
     registry = SessionPrRegistry("session")
@@ -451,7 +451,12 @@ def test_unassociated_selection_is_rejected(tracked: str) -> None:
 
 def test_auth_failure_preserves_pr_list(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github, "_gh", lambda *_args, **_kwargs: (1, "", "not authenticated"))
+    accounts = [{"login": "alice", "host": "github.com", "active": True}]
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, accounts))
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: "alice")
     info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert info["accounts"] == accounts
+    assert info["selected_account"] == "alice"
     assert info["authenticated"] is False
     assert info["selected_pr_url"] == B
     assert len(info["prs"]) == 2
@@ -494,6 +499,50 @@ def test_context_uses_fork_head_and_merge_base(
         github.github_file_diff(
             tracked, "main", "new.py", session_id="session", pr_url=B, head_sha="stale"
         )
+
+
+async def test_changes_route_pins_revision_and_reports_truncation(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, base = "a" * 40, "b" * 40
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": base}, "changed_files": 3001}
+            return 0, json.dumps(pr), ""
+        assert args[-1] == "repos/example/two/pulls/42/files?per_page=100"
+        page = [{"filename": f"f{index}.py", "status": "added"} for index in range(3000)]
+        return 0, json.dumps([page]), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head, "base_sha": base},
+        )
+        partial = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head},
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert len(result["data"]) == 3000
+    assert {key: result[key] for key in ("has_more", "total_count", "head_sha", "base_sha")} == {
+        "has_more": True,
+        "total_count": 3001,
+        "head_sha": head,
+        "base_sha": base,
+    }
+    assert result["warning"] == "The provider lists at most 3000 files; 1 files are not shown."
+    assert partial.status_code == 400
+    assert partial.json()["detail"] == "Expected full head and base commit SHAs"
 
 
 @pytest.fixture
@@ -820,5 +869,8 @@ def test_enterprise_without_auth_retains_selection(
     monkeypatch.setattr(github, "_gh", gh)
     info = github.github_info(tracked, session_id="session", pr_url=url)
     assert info["selected_pr_url"] == url
+    assert info["authenticated"] is False
+    assert info["accounts"] == []
+    assert info["selected_account"] is None
     assert info["pr"] is None
     assert len(info["prs"]) == 3

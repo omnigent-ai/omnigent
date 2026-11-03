@@ -51,6 +51,7 @@ from omnigent.debug_logging import (
     publish_origin_identity,
     runner_log_scope,
 )
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.errors import (
     ErrorCategory,
     ErrorImpact,
@@ -228,6 +229,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -1968,7 +1970,10 @@ class HostProcess:
         log_runner_id = (
             token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
         )
-        with runner_log_scope(frame.session_id, log_runner_id):
+        with (
+            runner_log_scope(frame.session_id, log_runner_id),
+            scheduled_run_scope(frame.scheduled_run, session_id=frame.session_id),
+        ):
             _logger.info(
                 "Runner launch requested",
                 extra=debug_event(
@@ -2220,7 +2225,11 @@ class HostProcess:
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
         )
-        watcher = asyncio.create_task(self._watch_runner(runner_id))
+        launch_context = current_scheduled_run()
+        with scheduled_run_scope(None, session_id=frame.session_id):
+            watcher = asyncio.create_task(
+                self._watch_runner(runner_id, launch_context=launch_context)
+            )
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
         connect_watchdog = asyncio.create_task(
@@ -2598,7 +2607,9 @@ class HostProcess:
             status=status,
         )
 
-    async def _watch_runner(self, runner_id: str) -> None:
+    async def _watch_runner(
+        self, runner_id: str, *, launch_context: ScheduledRunLogContext | None = None
+    ) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
         Polls the runner subprocess until it exits. An exit while the
@@ -2613,6 +2624,7 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
+        :param launch_context: Occurrence retained only for confirmed pre-connect failures.
         :returns: None. Returns silently for intentional stops and clean
             (exit-code-0) shutdowns.
         """
@@ -2637,50 +2649,56 @@ class HostProcess:
                 had_connected = await asyncio.to_thread(handle.connect_marker.exists)
             except OSError:
                 _logger.warning("Could not read connect marker for %s", runner_id, exc_info=True)
-        if handle.proc.returncode == 0:
-            if had_connected is not False:
-                # Post-connect code 0 includes graceful idle-reaper exits.
-                _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+        # Only a confirmed pre-connect exit belongs to the launching occurrence.
+        with scheduled_run_scope(
+            launch_context if had_connected is False else None, session_id=handle.session_id
+        ):
+            if handle.proc.returncode == 0:
+                if had_connected is not False:
+                    # Post-connect code 0 includes graceful idle-reaper exits.
+                    _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+                    return
+                # Pre-connect code 0 is a failed launch; send its cause to the server.
+                error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+                _logger.info(
+                    "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+                    runner_id,
+                )
+                await self._report_runner_exit(runner_id, error, had_connected=had_connected)
                 return
-            # Pre-connect code 0 is a failed launch; send its cause to the server.
             error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-            _logger.info(
-                "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+            # A credential refusal before connecting needs renewed sign-in.
+            # Other exits remain runner faults; the log tail carries the cause.
+            auth_rejected = (
+                handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE
+                and had_connected is not True
+            )
+            if auth_rejected:
+                error = (
+                    "The server rejected this host's credentials, so the runner could not "
+                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{self._login_hint_url()}` "
+                    f"on this host, then retry. Details: {error}"
+                )
+            _logger.warning(
+                "Runner %s died unexpectedly: %s",
                 runner_id,
+                error,
+                extra=debug_event(
+                    "runner_died",
+                    session_id=handle.session_id,
+                    stage="runner_process",
+                    runner_id=runner_id,
+                    error_category=(
+                        ErrorCategory.CONFIG if auth_rejected else ErrorCategory.RUNNER
+                    ).value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=(
+                        ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
+                    ).value,
+                ),
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
-            return
-        error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        # A credential refusal before connecting needs renewed sign-in.
-        # Other exits remain runner faults; the log tail carries the cause.
-        auth_rejected = (
-            handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
-        )
-        if auth_rejected:
-            error = (
-                "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-                f"on this host, then retry. Details: {error}"
-            )
-        _logger.warning(
-            "Runner %s died unexpectedly: %s",
-            runner_id,
-            error,
-            extra=debug_event(
-                "runner_died",
-                session_id=handle.session_id,
-                stage="runner_process",
-                runner_id=runner_id,
-                error_category=(
-                    ErrorCategory.CONFIG if auth_rejected else ErrorCategory.RUNNER
-                ).value,
-                error_impact=ErrorImpact.BLOCKING.value,
-                error_phase=(
-                    ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
-                ).value,
-            ),
-        )
-        await self._report_runner_exit(runner_id, error, had_connected=had_connected)
 
     async def _watch_runner_connect(
         self, runner_id: str, *, exit_watcher: asyncio.Task[None]
@@ -3696,7 +3714,11 @@ class HostProcess:
         from pathlib import Path
 
         from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+        from omnigent.workspace_fs import (
+            WorkspaceReader,
+            WorkspaceReaderError,
+            read_repository_branches,
+        )
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -3722,25 +3744,29 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
-        # Re-detect the repository every time: a workspace that gains or loses
-        # a .git after its first request needs a reader of the matching kind.
-        repo_root = detect_git_root(Path(expanded))
-        with self._fs_readers_lock:
-            cached = self._fs_readers.get(expanded)
-            if cached is None or cached[0] != repo_root:
-                cached = (repo_root, WorkspaceReader(Path(expanded)))
-                self._fs_readers[expanded] = cached
-                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
-                    self._fs_readers.popitem(last=False)
-            self._fs_readers.move_to_end(expanded)
-            reader = cached[1]
         from omnigent.runner import pr_resource
 
         try:
-            with pr_resource.server_tracking(
-                params.get("server_tracked"), params.get("default_pr_url")
-            ):
-                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            if frame.op == "repository_branches":
+                payload = read_repository_branches(
+                    Path(expanded), cast("list[dict[str, str]]", params["repositories"])
+                )
+            else:
+                # A workspace can gain or lose its .git while the host is running.
+                repo_root = detect_git_root(Path(expanded))
+                with self._fs_readers_lock:
+                    cached = self._fs_readers.get(expanded)
+                    if cached is None or cached[0] != repo_root:
+                        cached = (repo_root, WorkspaceReader(Path(expanded)))
+                        self._fs_readers[expanded] = cached
+                        while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                            self._fs_readers.popitem(last=False)
+                    self._fs_readers.move_to_end(expanded)
+                    reader = cached[1]
+                with pr_resource.server_tracking(
+                    params.get("server_tracked"), params.get("default_pr_url")
+                ):
+                    payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -4116,6 +4142,20 @@ class HostProcess:
                     status="failed",
                     error="failed to resolve Claude SDK model options",
                 )
+            if listing.source == "cli":
+                # A CLI-login listing replays the CLI-login catalog's wire ids; serve
+                # its rows (display names, aliases, default) from the same launch, which
+                # also refreshes a stale catalog in the background.
+                from omnigent.harnesses.claude_native.main import claude_launch_catalog
+
+                rows = await claude_launch_catalog(None)
+                if rows:
+                    return HostModelOptionsResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        models=with_source(rows),
+                        routable_models=[model.id for model in listing.models],
+                    )
             if not listing.models:
                 # Subscription / CLI-login providers list nothing endpoint-side.
                 # The SDK drives the claude CLI, so the CLI's own probed rows
@@ -4196,8 +4236,28 @@ class HostProcess:
             )
         if op == "github_info":
             return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+        if op == "github_review_threads":
+            return r.github_review_threads(
+                session_id,
+                str(params.get("pr_url", "")),
+                str(params.get("after", "")),
+                str(params.get("head_sha", "")),
+                str(params.get("base_sha", "")),
+            )
+        if op == "github_review_thread_comments":
+            return r.github_review_thread_comments(
+                session_id,
+                str(params.get("pr_url", "")),
+                str(params.get("thread_id", "")),
+                str(params.get("after", "")),
+            )
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),
@@ -4209,7 +4269,12 @@ class HostProcess:
                 base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_pr_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
@@ -4335,6 +4400,22 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 add=params.get("add", []),
                 remove=params.get("remove", []),
+            )
+        if op == "github_review_thread_create":
+            return pr_resource.create_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                body=params.get("body"),
+                anchor=params.get("anchor"),
+            )
+        if op == "github_review_thread_reply":
+            return pr_resource.reply_to_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                thread_id=str(params.get("thread_id", "")),
+                body=params.get("body"),
             )
         if op == "github_comment_create":
             return pr_resource.create_pr_comment(

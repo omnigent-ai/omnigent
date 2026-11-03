@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -1053,6 +1054,51 @@ describe("Sidebar session list", () => {
     );
     expect(badge.className).not.toContain("brand-accent");
   });
+
+  it.each([
+    { approvals: 0, automations: 0, label: "0 inbox items waiting", badge: "+" },
+    { approvals: 0, automations: 1, label: "1 inbox item waiting", badge: "1+" },
+    { approvals: 2, automations: 1, label: "3 inbox items waiting", badge: "3+" },
+  ])(
+    "combines $approvals approvals and $automations failures until all task pages are checked",
+    ({ approvals, automations, label, badge }) => {
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      const failure = {
+        taskId: "task",
+        taskName: "Report",
+        runId: "run",
+        scheduledAt: 100,
+        finishedAt: 101,
+        errorCode: "host_offline",
+      };
+      const state = {
+        items: automations ? [failure] : [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
+      automationInbox.mockReturnValue(state);
+      try {
+        mockConversations([
+          conv("conv_awaiting", "Claude Code", { pending_elicitations_count: approvals }),
+        ]);
+        const first = renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            `${label}; more automations not yet checked`,
+          ),
+        ).toHaveTextContent(badge);
+        first.unmount();
+        automationInbox.mockReturnValue({ ...state, hasNextPage: false });
+        renderSidebar();
+        const inbox = within(screen.getByTestId("inbox-button"));
+        expect(inbox.queryByLabelText(/more automations/)).toBeNull();
+        if (approvals + automations) {
+          expect(inbox.getByLabelText(label)).toHaveTextContent(String(approvals + automations));
+        } else expect(inbox.queryByText("+")).toBeNull();
+      } finally {
+        automationInbox.mockRestore();
+      }
+    },
+  );
 
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.
@@ -2673,6 +2719,28 @@ describe("Sidebar project Show more", () => {
     );
   }
 
+  it("keeps a folder's own members in Custom order across Show more", () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ ordering: "custom", custom: { base: "updated", since: 1000, ids: [] } }),
+    );
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    projectSessionsMock.current["Customer X"] = filedSessions(7);
+    renderGroupingSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+
+    // The keyboard path: the row menu opens with Enter.
+    const first = screen.getByRole("link", { name: "conv_filed_0" }).closest("li")!;
+    fireEvent.keyDown(within(first).getByTestId("conversation-actions"), { key: "Enter" });
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    const moved = ["conv_filed_1", "conv_filed_0", ...filedIds(7).slice(2)];
+    expect(folderRowIds()).toEqual(moved.slice(0, 5));
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(moved);
+  });
+
   it("lists five more sessions per click until none remain", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
@@ -3979,6 +4047,162 @@ describe("Sidebar view options", () => {
     });
     expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
   });
+
+  it.each([
+    {
+      merge_state_status: "DIRTY",
+      checks: { failing: 0, pending: 0 },
+      label: "Merge conflicts",
+      icon: "git-compare-arrows",
+    },
+    {
+      merge_state_status: "BLOCKED",
+      checks: { failing: 1, pending: 1 },
+      label: "Checks failing",
+      icon: "circle-x",
+    },
+    {
+      merge_state_status: "BLOCKED",
+      checks: { failing: 0, pending: 1 },
+      label: "Checks running",
+      icon: "circle-dot",
+    },
+    {
+      merge_state_status: "CLEAN",
+      checks: { failing: 0, pending: 0 },
+      label: "Ready to merge",
+      icon: "circle-check",
+    },
+  ])(
+    "keeps live PR status when a newer stored summary has the same lifecycle: $label",
+    async ({ label, icon, ...status }) => {
+      const url = "https://github.com/omnigent-ai/omnigent/pull/419";
+      const checkedAt = Date.now() / 1000 - 600;
+      usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: (checkedAt - 60) * 1000,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: { url, number: 419, state: "OPEN", is_draft: false, ...status },
+        },
+      });
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: 419,
+            state: "open",
+            state_checked_at: checkedAt,
+          },
+        }),
+      ]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      const row = await screen.findByTestId("session-tooltip-pr");
+      expect(row).toHaveTextContent(`PR#419 · ${label}`);
+      expect(row).not.toHaveTextContent("as of");
+      expect(row.querySelector(`.lucide-${icon}`)).toBeInTheDocument();
+    },
+  );
+
+  it.each([{ isError: true }, { isEnabled: false }])(
+    "keeps cached lifecycle without stale merge readiness when live info is unavailable: %j",
+    async (queryState) => {
+      usePullRequestInfoMock.mockReturnValue({
+        ...queryState,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: { number: 419, state: "OPEN", is_draft: false, merge_state_status: "CLEAN" },
+        },
+      });
+      mockConversations([conv("conv_gh", "Codex", { workspace: "/Users/me/omnigent" })]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("session-tooltip-pr")).toHaveTextContent(/^PR#419 · Open$/);
+    },
+  );
+
+  it.each([
+    {
+      storedNumber: 419,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Merged",
+    },
+    {
+      storedNumber: 420,
+      storedState: "MERGED",
+      storedDraft: false,
+      liveState: "OPEN",
+      expected: "Ready to merge",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: true,
+      liveState: "OPEN",
+      expected: "Draft",
+    },
+    {
+      storedNumber: 419,
+      storedState: "OPEN",
+      storedDraft: false,
+      liveState: "CLOSED",
+      expected: "Open",
+    },
+  ])(
+    "uses a newer stored lifecycle only for the same PR: $storedNumber",
+    async ({ storedNumber, storedState, storedDraft, liveState, expected }) => {
+      const now = Date.now();
+      usePullRequestInfoMock.mockReturnValue({
+        dataUpdatedAt: now - 10_000,
+        data: {
+          object: "session.github.info",
+          available: true,
+          pr: {
+            url: "https://github.com/omnigent-ai/omnigent/pull/419",
+            number: 419,
+            state: liveState,
+            is_draft: false,
+            merge_state_status: "CLEAN",
+          },
+        },
+      });
+      mockConversations([
+        conv("conv_gh", "Codex", {
+          workspace: "/Users/me/omnigent",
+          pull_request: {
+            url: `https://github.com/omnigent-ai/omnigent/pull/${storedNumber}`,
+            provider: "github",
+            repository: "omnigent-ai/omnigent",
+            number: storedNumber,
+            state: storedState,
+            is_draft: storedDraft,
+            state_checked_at: now / 1000,
+          },
+        }),
+      ]);
+      renderGroupingSidebar();
+
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_gh" }), {
+        pointerType: "mouse",
+      });
+      expect(await screen.findByTestId("session-tooltip-pr")).toHaveTextContent(
+        `PR#419 · ${expected}`,
+      );
+    },
+  );
 
   it("shows the tracked PR number when gh can't resolve its state", async () => {
     // gh unauthenticated: `pr` is null, but the association carries the number.
