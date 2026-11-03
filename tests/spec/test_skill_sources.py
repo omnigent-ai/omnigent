@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -321,7 +320,7 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
     repo = tmp_path / "repo"
     workspace = repo / "ws"
     workspace.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=10)
+    (repo / ".git").mkdir()
     _write_skill(workspace / ".agents" / "skills", "workspace-skill")
     _write_skill(repo / ".agents" / "skills", "repo-root-skill")
     ctx = _ctx(workspace, home)
