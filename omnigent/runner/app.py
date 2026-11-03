@@ -1842,14 +1842,14 @@ def create_runner_app(
                     claude_failure_context,
                 )
 
-                context = normalize_failure_context(
-                    {
-                        **claude_failure_context({}, error_text=failure_detail),
-                        "failure_source": "claude_program_status",
-                        "detail_source": "program_status_error",
-                        "native_error_message": failure_detail,
-                    }
-                )
+                raw_context: dict[str, object] = {
+                    **claude_failure_context({}, error_text=failure_detail),
+                    "failure_source": "claude_program_status",
+                    "detail_source": "program_status_error",
+                }
+                # An API error envelope decodes to its cause; the raw report is only the fallback.
+                raw_context.setdefault("native_error_message", failure_detail)
+                context = normalize_failure_context(raw_context)
                 detail = context.get("native_error_message")
                 if isinstance(detail, str):
                     event["error"] = {"code": "native_turn_error", "message": detail}

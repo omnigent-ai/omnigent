@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -494,8 +495,20 @@ async def test_terminal_only_native_work_idle_accounting(
             )
 
 
+_API_ERROR_CAUSE = "The request exceeded the model's context window."
+# Longer than the published message's 1,024-character clip, so the raw envelope cannot
+# stand in for the cause it carries.
+_LONG_API_ERROR_ENVELOPE = "API Error: 500 " + json.dumps(
+    {"error": {"type": "api_error", "message": _API_ERROR_CAUSE}, "details": "x" * 1200}
+)
+_PANE_FAILURE_DETAILS = {
+    "pane_detail": "API Error: 499 Authorization: Bearer synthetic-secret-token",
+    "pane_envelope": _LONG_API_ERROR_ENVELOPE,
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane", "pane_detail"])
+@pytest.mark.parametrize("status_source", ["forwarder", "pane", "pane_detail", "pane_envelope"])
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -513,12 +526,10 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
-            if status_source == "pane_detail":
+            if status_source in _PANE_FAILURE_DETAILS:
                 publish_failure = app.state.session_resource_registry._session_failure_publisher
                 assert publish_failure is not None
-                publish_failure(
-                    conv_id, "API Error: 499 Authorization: Bearer synthetic-secret-token"
-                )
+                publish_failure(conv_id, _PANE_FAILURE_DETAILS[status_source])
             else:
                 publish = app.state.session_resource_registry._session_status_publisher
                 assert publish is not None
@@ -537,6 +548,14 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
                 assert context["failure_source"] == "claude_program_status"
                 assert context["detail_source"] == "program_status_error"
                 assert "native_hook_event" not in context
+            elif status_source == "pane_envelope":
+                assert len(_LONG_API_ERROR_ENVELOPE) > 1024
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"] == _API_ERROR_CAUSE
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == _API_ERROR_CAUSE
+                assert context["http_status"] == 500
+                assert context["failure_source"] == "claude_program_status"
             else:
                 assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
                 assert "Open the terminal" in failures[0]["error"]["message"]
