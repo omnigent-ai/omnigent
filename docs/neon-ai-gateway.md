@@ -155,6 +155,7 @@ follow-up turn, and a resumed session prove the full agent flow.
 | `401` | The token lacks the `ai_gateway:invoke` scope, was revoked, or belongs to a branch outside this host's lineage. |
 | `429` mentioning the input or output token limit | The account's 200,000 tokens per minute limit (input and output are counted separately). Requests resume when the window resets. |
 | `429` with `REQUEST_LIMIT_EXCEEDED` | Neon's account-level daily spend cap. See Neon's [troubleshooting guide](https://neon.com/docs/ai-gateway/troubleshooting). |
+| Claude Code reports `There's an issue with the selected model`, and no Messages request reaches Neon | A managed Claude Code settings file (on macOS, `/Library/Application Support/ClaudeCode/managed-settings.json`) sets `ANTHROPIC_BASE_URL` or `apiKeyHelper`. Managed settings take precedence over the environment Omnigent passes, so Claude Code calls that endpoint instead of Neon. Use a machine without that policy, or route through the `openai` family. |
 | Claude Code falls back to its own login | The `anthropic` block is missing or its credential does not resolve, for example `NEON_AI_GATEWAY_TOKEN` is unset in the process running `omnigent host`. |
 
 Neon's [AI Gateway docs](https://neon.com/docs/ai-gateway/overview) are the
