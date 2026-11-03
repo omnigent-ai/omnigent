@@ -6,6 +6,7 @@ import contextlib
 import json
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -438,7 +439,7 @@ def relayed_terminal(
             yield socket_path, marker, bridge_dir
         finally:
             if tui is not None:
-                tui.kill()
+                tui.send_signal(signal.SIGHUP)
                 tui.wait(timeout=5)
             with contextlib.suppress(subprocess.SubprocessError):
                 subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)

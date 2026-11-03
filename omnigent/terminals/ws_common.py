@@ -42,6 +42,8 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
 
     The pane-dead flag, rather than bare session existence, handles terminals
     configured with ``remain-on-exit``. Probe errors fail closed.
+    Targets must be pane IDs or managed single-pane sessions; tmux may
+    reinterpret a removed window/pane index as a surviving pane.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -74,7 +76,7 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
 
 
 async def _check_pane_dead_definitive(socket_path: str, tmux_target: str) -> bool | None:
-    """Return pane liveness, or ``None`` when the probe is inconclusive."""
+    """Return pane death, or ``None`` if inconclusive; targets follow `_tmux_session_alive`."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "tmux",

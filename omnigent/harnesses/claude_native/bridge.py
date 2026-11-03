@@ -5978,9 +5978,9 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     dead pane's exit code comes from the same answer — a second probe at
     failure time can race the session's teardown and come back empty.
 
-    ``display-message`` resolves the exact pane; ``list-panes`` lists its
-    whole window. The explicit missing-target marker distinguishes an
-    unresolved pane from an unanswered probe.
+    Targets are pane IDs (``%123``) or managed single-pane sessions (``main``).
+    Indexed targets are unsupported: tmux may resolve a removed pane's index
+    to a surviving pane. The missing marker identifies unresolved pane IDs.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -6053,6 +6053,9 @@ def _request_claude_repaint(
     A launcher may also run Claude Code outside that tree: isaac's fast launch
     pumps the pane to a pre-started worker's terminal. Claude Code's session
     registry still names its process, so that process gets the signal too.
+
+    Targets follow :func:`_claude_pane_state`: a pane ID or a managed
+    single-pane session, never a window/pane index that tmux can reinterpret.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.

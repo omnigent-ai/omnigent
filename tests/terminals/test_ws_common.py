@@ -114,6 +114,7 @@ class _FakeProcess:
         (b"1\n", False, True),
         (b"\n", False, None),
         (b"unknown\n", False, None),
+        (b"0 1\n", False, None),
     ],
 )
 async def test_tmux_liveness_uses_pane_dead_flag(
