@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import psutil
 import pytest
 
@@ -111,10 +112,12 @@ def _server(name: str = "demo", harness: str = "claude", plugin: str | None = No
 
 
 async def _settled(logins: HostMcpLogins, login_id: str) -> dict:
-    async with asyncio.timeout(budget(10)):
-        while (status := logins.status(login_id))["state"] == "pending":
-            await asyncio.sleep(0.02)
-    return dict(status)
+    await poll_until_async(
+        lambda: logins.status(login_id)["state"] != "pending",
+        timeout_s=budget(10),
+        interval_s=0.02,
+    )
+    return dict(logins.status(login_id))
 
 
 def _exited(pid: int) -> bool:
@@ -275,6 +278,29 @@ async def test_redirect_written_to_a_busy_terminal_arrives_whole(
         assert failed.value.status == "failed"
     finally:
         os.close(write_fd)
+
+
+async def test_sign_in_that_ends_during_delivery_gets_no_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pipe stands in for a file that reused the closed terminal's number.
+    read_fd, reused_fd = os.pipe()
+    terminal = reused_fd
+
+    async def sign_in_ends_meanwhile(*_args: object, **_kwargs: object) -> None:
+        nonlocal terminal
+        terminal = -1
+        raise httpx.ConnectError("no listener")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", sign_in_ends_meanwhile)
+    try:
+        with pytest.raises(LoginError) as ended:
+            await mcp_login._deliver_callback(lambda: terminal, _CALLBACK)
+        assert ended.value.status == "invalid"
+        os.close(reused_fd)
+        assert os.read(read_fd, 100) == b""
+    finally:
+        os.close(read_fd)
 
 
 @pytest.mark.parametrize("slow_listener", [False, True])

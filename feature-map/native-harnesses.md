@@ -226,7 +226,8 @@ then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion.
 
 **MCP sign-in:** the same path to a needs-auth server → Sign in → Open sign-in
-page, approve, and return; or paste the redirect address and click Finish.
+page (or Copy sign-in link), approve, and return; or paste the redirect address
+and click Finish. A failed or expired attempt offers Try again.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
