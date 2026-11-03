@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -334,6 +335,8 @@ class OSEnvironment(ABC):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -360,6 +363,13 @@ class OSEnvironment(ABC):
         max_output: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
+
+    def run_git(
+        self, argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run Git read arguments from a worker thread in this environment."""
+        del argv, cwd, timeout
+        raise OSError("This environment does not support Git reads")
 
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         """Remove the entry *path* names, confined like ``write``.
@@ -447,6 +457,15 @@ class _HelperProcessClient:
         atexit.register(self.close)
 
     def request(self, payload: OpRequest) -> OpResult:
+        if payload.get("op") == "git":
+            timeout = max(0.0, float(payload["timeout"]))
+            payload = {**payload, "deadline": time.monotonic() + timeout}
+            if not self._lock.acquire(timeout=timeout):
+                return {"timed_out": True}
+            try:
+                return self._request_locked(payload, allow_retry=True)
+            finally:
+                self._lock.release()
         with self._lock:
             return self._request_locked(payload, allow_retry=True)
 
@@ -467,6 +486,11 @@ class _HelperProcessClient:
             return {"error": "OS environment helper is closed"}
 
         self._ensure_started_locked()
+        if payload.get("op") == "git":
+            remaining = payload["deadline"] - time.monotonic()
+            if remaining <= 0:
+                return {"timed_out": True}
+            payload = {**payload, "timeout": remaining}
         assert self._proc is not None
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
@@ -978,6 +1002,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -991,6 +1017,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "offset": offset,
                 "limit": limit,
                 "max_bytes": max_bytes,
+                "regular_only": regular_only,
             },
         )
         return cast(OpResult, result)
@@ -1046,6 +1073,24 @@ class CallerProcessOSEnvironment(OSEnvironment):
             request["max_output"] = max_output
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
+
+    def run_git(
+        self, argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Use the persistent sandbox helper; callers must use a worker thread."""
+        result = self._helper.request(
+            {"op": "git", "argv": argv, "cwd": str(cwd), "timeout": timeout}
+        )
+        if result.get("timed_out"):
+            raise subprocess.TimeoutExpired(["git", *argv], timeout)
+        if result.get("error"):
+            raise OSError(result["error"])
+        return subprocess.CompletedProcess(
+            ["git", *argv],
+            result["returncode"],
+            base64.b64decode(result["stdout"]),
+            base64.b64decode(result["stderr"]),
+        )
 
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         result = await run_sync_on_thread(
@@ -1137,6 +1182,67 @@ def _handle_helper_request(
     sandbox: SandboxPolicy,
 ) -> OpResult:
     op = request.get("op")
+    if op == "git":
+        from omnigent.runtime.filesystem_registry import _anchored_git_env
+
+        args, target, timeout = request.get("argv"), request.get("cwd"), request.get("timeout")
+        if (
+            not isinstance(args, list)
+            or not args
+            or not all(isinstance(arg, str) for arg in args)
+            or args[0] not in {"status", "diff", "show"}
+            or not isinstance(target, str)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            return {"error": "Invalid Git read request"}
+        try:
+            git_cwd = _resolve_path(cwd, target)
+            _assert_within_reach(cwd, sandbox, git_cwd, need_write=False)
+            _assert_read_allowed(sandbox, git_cwd, cwd)
+            options = ["--no-ext-diff", "--no-textconv"] if args[0] == "diff" else []
+            argv = [
+                "git",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "diff.autoRefreshIndex=false",
+                args[0],
+                *options,
+                *args[1:],
+            ]
+            git_env = _anchored_git_env()
+            if args[0] == "show":
+                # Baseline reads distinguish missing HEAD paths from other Git failures.
+                git_env["LC_ALL"] = "C"
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                completed = subprocess.run(
+                    argv,
+                    cwd=git_cwd,
+                    env=git_env,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=timeout,
+                )
+                stdout.seek(0)
+                stderr.seek(0)
+                output, errors = (
+                    stdout.read(10 * 1024 * 1024 + 1),
+                    stderr.read(10 * 1024 * 1024 + 1),
+                )
+            if max(len(output), len(errors)) > 10 * 1024 * 1024:
+                return {"error": "Git output exceeds the 10 MiB read limit"}
+            return {
+                "returncode": completed.returncode,
+                "stdout": base64.b64encode(output).decode("ascii"),
+                "stderr": base64.b64encode(errors).decode("ascii"),
+            }
+        except subprocess.TimeoutExpired:
+            return {"timed_out": True}
+        except OSError as exc:
+            return {"error": str(exc)}
+
     if op == "read":
         raw_path = request.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1151,6 +1257,20 @@ def _handle_helper_request(
         offset = offset_raw if isinstance(offset_raw, int) else 1
         max_bytes_raw = request.get("max_bytes")
         max_bytes = max_bytes_raw if isinstance(max_bytes_raw, int) else None
+        if request.get("regular_only"):
+            if not max_bytes or max_bytes < 0 or not hasattr(os, "O_NONBLOCK"):
+                return {"error": "A bounded regular-file read is unavailable"}
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                with os.fdopen(descriptor, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        return {"error": "Original content requires a regular file"}
+                    content = source.read(max_bytes + 1)
+                if len(content) > max_bytes or b"\0" in content:
+                    return {"error": "Original content exceeds the text read limit"}
+                return {"content": content.decode("utf-8"), "encoding": "utf-8"}
+            except (OSError, UnicodeError) as exc:
+                return {"error": str(exc)}
         return _read_impl(
             path,
             offset,
