@@ -200,6 +200,24 @@ describe("McpSignInDialog", () => {
     expect(calls("GET", `${BASE}/L1`)).toHaveLength(0);
   });
 
+  it("cancels a sign-in that starts after the dialog closed", async () => {
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
+    const view = await renderDialog();
+    view.rerender(<McpSignInDialog {...props} open={false} />);
+    await act(async () => respond(json(login())));
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
+    await tick();
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(0);
+    expect(props.onSignedIn).not.toHaveBeenCalled();
+  });
+
   it("does not cancel a sign-in that already succeeded", async () => {
     on("POST", BASE, () => json(login({ state: "succeeded", authorization_url: null })));
     const view = await renderDialog();

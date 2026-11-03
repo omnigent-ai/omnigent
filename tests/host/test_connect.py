@@ -11133,8 +11133,8 @@ async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch):
 
     started = []
 
-    async def start(self, configured):
-        started.append(configured)
+    async def start(self, configured, owner):
+        started.append((configured, owner))
         return {
             "login_id": "l1",
             "state": "pending",
@@ -11153,13 +11153,32 @@ async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch):
     host._start_frame_task(ws, encode_host_frame(HostMcpLoginFrame("n", "status", login_id="x")))
     await _drain_frame_tasks(host)
     results = {frame.request_id: frame for frame in map(decode_host_frame, ws.sent)}
-    assert started == [server]
+    assert started == [(server, ws)]
     assert (results["m"].status, results["m"].login_id, results["m"].state) == (
         "ok",
         "l1",
         "pending",
     )
     assert (results["n"].status, results["n"].error) == ("not_found", "Sign-in not found")
+
+
+async def test_host_pauses_orphan_reaping_during_mcp_status_checks(monkeypatch):
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+
+    host = _make_host_process()
+    seen = []
+
+    async def sign_in_state(server, timeout):
+        seen.append(host._owned_subprocess_ops)
+        return "available"
+
+    monkeypatch.setattr("omnigent.host.mcp_tools.harness_sign_in_state", sign_in_state)
+    server = ConfiguredMcpServer({"name": "docs", "harness": "claude", "transport": "http"}, {})
+    deadline = asyncio.get_running_loop().time() + 10
+    state = await host._mcp_tools._sign_in_state(server, ("claude", "docs"), deadline)
+    # A nonzero count is what stops _reap_orphans_once from taking the exit status.
+    assert (state, seen, host._owned_subprocess_ops) == ("available", [1], 0)
+    assert host._mcp_logins._subprocess_guard == host._host_subprocess_op
 
 
 async def test_host_mcp_login_failure_is_private(monkeypatch, caplog):

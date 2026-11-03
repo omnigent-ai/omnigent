@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
-import httpx
 import uvicorn
 from mcp.server.auth.provider import AccessToken, AuthorizationCode, construct_redirect_uri
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -82,12 +81,6 @@ class OAuthMcpServer:
     @property
     def tokens_issued(self) -> int:
         return len(self.provider.tokens)
-
-    def approve(self, authorization_url: str) -> str:
-        """Follow the consent page as a browser would and return the redirect address."""
-        with httpx.Client(follow_redirects=False, timeout=10, trust_env=False) as client:
-            consent = client.get(authorization_url).headers["location"]
-            return client.post(consent).headers["location"]
 
 
 @contextmanager

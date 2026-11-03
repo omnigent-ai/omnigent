@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from ipaddress import ip_address
@@ -111,7 +112,13 @@ def _login_target(server: ConfiguredMcpServer) -> tuple[str, str] | None:
     return executable, name
 
 
-async def _run_status_command(argv: list[str], harness: str) -> tuple[int, str] | None:
+# Pauses the host's orphan reaper while a subprocess's exit status is unclaimed.
+SubprocessGuard = Callable[[], contextlib.AbstractContextManager[None]]
+
+
+async def _run_status_command(
+    argv: list[str], harness: str, timeout: float
+) -> tuple[int, str] | None:
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.DEVNULL,
@@ -123,7 +130,7 @@ async def _run_status_command(argv: list[str], harness: str) -> tuple[int, str] 
     )
     remember_process_group(process)
     try:
-        async with asyncio.timeout(STATUS_TIMEOUT_SECONDS):
+        async with asyncio.timeout(timeout):
             stdout, _ = await process.communicate()
     except TimeoutError:
         return None
@@ -135,7 +142,9 @@ async def _run_status_command(argv: list[str], harness: str) -> tuple[int, str] 
     return process.returncode, stdout.decode(errors="replace")
 
 
-async def harness_sign_in_state(server: ConfiguredMcpServer) -> SignInState | None:
+async def harness_sign_in_state(
+    server: ConfiguredMcpServer, timeout: float = STATUS_TIMEOUT_SECONDS
+) -> SignInState | None:
     """Whether the harness holds a sign-in for *server* (``None``: it can't sign in).
 
     Only called for servers that answered Omnigent's probe with HTTP 401, so a
@@ -148,7 +157,7 @@ async def harness_sign_in_state(server: ConfiguredMcpServer) -> SignInState | No
     harness = server.summary["harness"]
     try:
         if harness == "claude":
-            ran = await _run_status_command([executable, "mcp", "get", name], harness)
+            ran = await _run_status_command([executable, "mcp", "get", name], harness, timeout)
             if ran is None:
                 return "available"
             code, output = ran
@@ -158,7 +167,7 @@ async def harness_sign_in_state(server: ConfiguredMcpServer) -> SignInState | No
                 (line for line in output.splitlines() if line.strip().startswith("Status:")), ""
             )
             return "signed_in" if "Connected" in status else "available"
-        ran = await _run_status_command([executable, "mcp", "list", "--json"], harness)
+        ran = await _run_status_command([executable, "mcp", "list", "--json"], harness, timeout)
         if ran is None:
             return "available"
         code, output = ran
@@ -269,9 +278,16 @@ class _Login:
 class HostMcpLogins:
     """Interactive ``mcp login`` processes the web UI is driving on this host."""
 
-    def __init__(self, on_success: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_success: Callable[[], None] | None = None,
+        subprocess_guard: SubprocessGuard = contextlib.nullcontext,
+    ) -> None:
         self._logins: dict[str, _Login] = {}
         self._on_success = on_success
+        self._subprocess_guard = subprocess_guard
+        # Tunnels that disconnected; their late start requests must not spawn.
+        self._closed_owners: weakref.WeakSet[object] = weakref.WeakSet()
         # Start requests arrive on separate frame tasks; one at a time keeps a
         # double-click from spawning two CLIs that race for the same redirect.
         self._start_lock = asyncio.Lock()
@@ -289,22 +305,35 @@ class HostMcpLogins:
             raise LoginError("not_found", "Sign-in not found")
         return login
 
-    async def start(self, server: ConfiguredMcpServer) -> LoginStatus:
-        """Start signing in to *server* and return once its authorization URL is known."""
+    async def start(self, server: ConfiguredMcpServer, owner: object | None = None) -> LoginStatus:
+        """Start signing in to *server* and return once its authorization URL is known.
+
+        *owner* identifies the tunnel asking; once it is closed, its starts fail.
+        """
         target = _login_target(server)
         if target is None:
             raise LoginError("invalid", "This harness can't sign in to this MCP server")
         executable, name = target
         key = (server.summary["harness"], name)
         async with self._start_lock:
+            if owner is not None and owner in self._closed_owners:
+                raise LoginError("failed", "The host disconnected")
             self._prune()
             for earlier in [login for login in self._logins.values() if login.key == key]:
                 await self._finish(earlier, "cancelled")
             pending = sum(login.state == "pending" for login in self._logins.values())
             if pending >= MAX_ACTIVE_LOGINS:
                 raise LoginError("busy", "Too many sign-ins in progress")
-            login = await self._spawn(executable, name, key)
-            self._logins[login.login_id] = login
+            with self._subprocess_guard():
+                spawning = asyncio.ensure_future(self._spawn(executable, name, key))
+                try:
+                    login = await asyncio.shield(spawning)
+                except asyncio.CancelledError:
+                    # The cancelled request still owns, and must stop, any CLI it spawned.
+                    with contextlib.suppress(Exception):
+                        await self._finish(await spawning, "cancelled")
+                    raise
+                self._logins[login.login_id] = login
         try:
             async with asyncio.timeout(URL_WAIT_SECONDS):
                 while login.url is None and login.state == "pending":
@@ -312,6 +341,10 @@ class HostMcpLogins:
                     await login.changed.wait()
         except TimeoutError:
             await self._finish(login, "failed", "The harness didn't offer a sign-in page")
+        except asyncio.CancelledError:
+            # Only this request knew the login id, so nothing else would stop it.
+            await self._finish(login, "cancelled")
+            raise
         return login.status()
 
     async def _spawn(self, executable: str, name: str, key: tuple[str, str]) -> _Login:
@@ -428,8 +461,12 @@ class HostMcpLogins:
         await self._finish(login, "cancelled")
         return login.status()
 
-    async def close(self) -> None:
-        """Stop every login; the web UI that drove them is gone."""
-        for login in list(self._logins.values()):
-            await self._finish(login, "cancelled")
-        self._logins.clear()
+    async def close(self, owner: object | None = None) -> None:
+        """Stop every login and refuse later starts from *owner*; its web UI is gone."""
+        # The lock lets an in-flight start register its CLI before it is stopped.
+        async with self._start_lock:
+            if owner is not None:
+                self._closed_owners.add(owner)
+            for login in list(self._logins.values()):
+                await self._finish(login, "cancelled")
+            self._logins.clear()

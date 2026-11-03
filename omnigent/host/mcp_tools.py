@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -17,7 +18,12 @@ from cachetools import TTLCache
 from mcp.client.stdio import get_default_environment
 
 from omnigent.host.mcp_inventory import ConfiguredMcpServer, configured_mcp_servers
-from omnigent.host.mcp_login import SignInState, harness_sign_in_state
+from omnigent.host.mcp_login import (
+    STATUS_TIMEOUT_SECONDS,
+    SignInState,
+    SubprocessGuard,
+    harness_sign_in_state,
+)
 from omnigent.inner._proc import remember_process_group, spawn_kwargs
 from omnigent.inner._subprocess_lifecycle import terminate_subprocess
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -27,6 +33,10 @@ PROBE_TIMEOUT_SECONDS = 10.0
 PROBE_CACHE_SECONDS = 300.0
 # Short, so a sign-in made outside Omnigent shows up on the next expansion.
 SIGN_IN_CACHE_SECONDS = 30
+# Older servers stop waiting for a probe reply after 15 seconds.
+RESPONSE_BUDGET_SECONDS = 13.0
+# Room for terminating a status command that outlives its timeout.
+_STATUS_CLEANUP_SECONDS = 1.0
 MAX_TOOLS = 500
 MAX_TOOL_NAME = 256
 MAX_TOOL_DESCRIPTION = 300
@@ -184,7 +194,8 @@ async def find_configured_server(
 
 
 class HostMcpTools:
-    def __init__(self) -> None:
+    def __init__(self, subprocess_guard: SubprocessGuard = contextlib.nullcontext) -> None:
+        self._subprocess_guard = subprocess_guard
         self._slots = asyncio.Semaphore(2)
         self._cache: TTLCache[str, McpProbeResult] = TTLCache(maxsize=128, ttl=PROBE_CACHE_SECONDS)
         self._sign_in_slots = asyncio.Semaphore(2)
@@ -200,6 +211,7 @@ class HostMcpTools:
     async def probe(
         self, harness: str, name: str, plugin: str | None = None, source_id: str | None = None
     ) -> McpProbeResult:
+        deadline = asyncio.get_running_loop().time() + RESPONSE_BUDGET_SECONDS
         server = await find_configured_server(harness, name, plugin, source_id)
         try:
             config, cwd, transport = _effective_config(server)
@@ -210,25 +222,43 @@ class HostMcpTools:
             return _result("unsupported")
         result = await self._probe(config, cwd, transport)
         if result["connection"] == "needs_auth":
-            sign_in = await self._sign_in_state(server, (harness, name, plugin, source_id))
+            key = (harness, name, plugin, source_id)
+            sign_in = await self._sign_in_state(server, key, deadline)
             if sign_in is not None:
                 return {**result, "harness_sign_in": sign_in}
         return result
 
     async def _sign_in_state(
-        self, server: ConfiguredMcpServer, key: tuple[str | None, ...]
+        self, server: ConfiguredMcpServer, key: tuple[str | None, ...], deadline: float
     ) -> SignInState | None:
+        """The harness's sign-in for *server*, or ``None`` if unknown by *deadline*."""
         missing = object()
         cached = self._sign_in_cache.get(key, missing)
         if cached is not missing:
             return cast("SignInState | None", cached)
-        async with self._sign_in_slots:
+        loop = asyncio.get_running_loop()
+        try:
+            async with asyncio.timeout_at(deadline - _STATUS_CLEANUP_SECONDS):
+                await self._sign_in_slots.acquire()
+        except TimeoutError:
+            return None
+        try:
             cached = self._sign_in_cache.get(key, missing)
             if cached is not missing:
                 return cast("SignInState | None", cached)
-            state = await harness_sign_in_state(server)
-            self._sign_in_cache[key] = state
+            budget = deadline - _STATUS_CLEANUP_SECONDS - loop.time()
+            if budget <= 0:
+                return None
+            with self._subprocess_guard():
+                state = await harness_sign_in_state(
+                    server, timeout=min(STATUS_TIMEOUT_SECONDS, budget)
+                )
+            # A shortened check may have guessed; let the next expansion ask again.
+            if budget >= STATUS_TIMEOUT_SECONDS:
+                self._sign_in_cache[key] = state
             return state
+        finally:
+            self._sign_in_slots.release()
 
     async def _probe(self, config: MCPServerConfig, cwd: Path, transport: str) -> McpProbeResult:
         payload = json.dumps(

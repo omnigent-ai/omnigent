@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -256,6 +257,98 @@ async def test_concurrent_sign_ins_are_bounded(
     states = sorted(racing.status(started["login_id"])["state"] for started in (first, second))
     assert states == ["cancelled", "pending"]
     await racing.close()
+
+
+class _Tunnel:
+    """Stands in for the tunnel connection that owns a start request."""
+
+
+async def test_disconnect_stops_an_in_flight_start(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawning = asyncio.Event()
+    release = asyncio.Event()
+    spawn = HostMcpLogins._spawn
+
+    pids = []
+
+    async def paused_spawn(self, *args):
+        spawning.set()
+        await release.wait()
+        login = await spawn(self, *args)
+        pids.append(login.process.pid)
+        return login
+
+    monkeypatch.setattr(HostMcpLogins, "_spawn", paused_spawn)
+    tunnel = _Tunnel()
+    logins = HostMcpLogins()
+    start = asyncio.create_task(logins.start(_server(), tunnel))
+    await spawning.wait()
+    close = asyncio.create_task(logins.close(tunnel))
+    await asyncio.sleep(0)
+    release.set()
+    started, _ = await asyncio.gather(start, close)
+    assert started["state"] == "cancelled"
+    await _assert_gone(pids[0])
+    assert not logins.pids()
+
+    with pytest.raises(LoginError) as refused:
+        await logins.start(_server(), tunnel)
+    assert refused.value.status == "failed"
+    assert len(pids) == 1
+    # The next tunnel signs in normally.
+    assert (await logins.start(_server(), _Tunnel()))["state"] == "pending"
+    await logins.close()
+
+
+@pytest.mark.parametrize("during", ["spawn", "url"])
+async def test_cancelled_start_stops_its_cli(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, during: str
+) -> None:
+    if during == "url":
+        monkeypatch.setenv("FAKE_MODE", "silent")
+    spawned = asyncio.Event()
+    spawn = HostMcpLogins._spawn
+
+    pids = []
+
+    async def observed_spawn(self, *args):
+        login = await spawn(self, *args)
+        pids.append(login.process.pid)
+        spawned.set()
+        if during == "spawn":
+            # Still finishing the spawn when the request is cancelled.
+            await asyncio.sleep(0.2)
+        return login
+
+    monkeypatch.setattr(HostMcpLogins, "_spawn", observed_spawn)
+    logins = HostMcpLogins()
+    start = asyncio.create_task(logins.start(_server()))
+    await spawned.wait()
+    if during == "url":
+        await poll_until_async(lambda: bool(logins.pids()), timeout_s=budget(5))
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    await _assert_gone(pids[0])
+    assert not logins.pids()
+    await logins.close()
+
+
+async def test_spawn_holds_the_reaper_guard_until_the_login_is_tracked(fake_cli: Path) -> None:
+    tracked_on_release = []
+
+    @contextlib.contextmanager
+    def guard():
+        try:
+            yield
+        finally:
+            tracked_on_release.append(bool(logins.pids()))
+
+    logins = HostMcpLogins(subprocess_guard=guard)
+    await logins.start(_server())
+    assert tracked_on_release == [True]
+    await logins.close()
 
 
 async def test_unsupported_servers_never_spawn(fake_cli: Path) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
 
 import psutil
@@ -190,7 +190,7 @@ async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, cap
         sign_in_states = ["available", "signed_in"]
         checked = []
 
-        async def sign_in_state(server):
+        async def sign_in_state(server, timeout):
             checked.append(server)
             return sign_in_states.pop(0)
 
@@ -298,7 +298,7 @@ def test_effective_config_expansion_and_inheritance(tmp_path, monkeypatch):
 
 
 async def test_unsupported_and_missing_credentials(monkeypatch):
-    async def no_sign_in_check(server):
+    async def no_sign_in_check(server, timeout):
         raise AssertionError("a harness sign-in can't supply an environment credential")
 
     monkeypatch.setattr(mcp_tools, "harness_sign_in_state", no_sign_in_check)
@@ -440,3 +440,55 @@ async def test_http_network_settings_invalidate_probe_cache(monkeypatch):
         "http://first.example:8080",
         "http://second.example:8080",
     ]
+
+
+async def test_sign_in_check_fits_the_response_budget_and_pauses_reaping(monkeypatch):
+    entry = _entry({"type": "http", "url": "https://mcp.example.test/mcp"})
+    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
+    monkeypatch.setattr(mcp_tools, "RESPONSE_BUDGET_SECONDS", 2.0)
+    monkeypatch.setattr(mcp_tools, "_STATUS_CLEANUP_SECONDS", 0.2)
+
+    async def slow_401(payload):
+        await asyncio.sleep(1.0)
+        return mcp_tools._result("needs_auth")
+
+    guarded = 0
+
+    @contextmanager
+    def guard():
+        nonlocal guarded
+        guarded += 1
+        try:
+            yield
+        finally:
+            guarded -= 1
+
+    timeouts = []
+
+    async def hanging_status(server, timeout):
+        assert guarded == 1, "the orphan reaper must not collect the status command"
+        timeouts.append(timeout)
+        await asyncio.sleep(timeout)
+        return "available"
+
+    monkeypatch.setattr(mcp_tools, "_probe_worker", slow_401)
+    monkeypatch.setattr(mcp_tools, "harness_sign_in_state", hanging_status)
+    discovery = HostMcpTools(subprocess_guard=guard)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await discovery.probe("claude", "docs")
+    assert loop.time() - started < 2.0
+    assert result["harness_sign_in"] == "available"
+    assert len(timeouts) == 1 and timeouts[0] < 1.0
+    assert guarded == 0
+    # A shortened check is a guess, so it isn't cached.
+    assert not discovery._sign_in_cache
+
+    # With no time left for the check, the reply keeps the plain needs-auth result.
+    discovery.clear_cache()
+    async with discovery._sign_in_slots, discovery._sign_in_slots:
+        started = loop.time()
+        result = await discovery.probe("claude", "docs")
+    assert loop.time() - started < 2.0
+    assert "harness_sign_in" not in result
+    assert len(timeouts) == 1

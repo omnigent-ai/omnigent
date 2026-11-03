@@ -1313,11 +1313,13 @@ class HostProcess:
         self._mcp_inventory = HostMcpInventory()
         from omnigent.host.mcp_tools import HostMcpTools
 
-        self._mcp_tools = HostMcpTools()
+        self._mcp_tools = HostMcpTools(subprocess_guard=self._host_subprocess_op)
         from omnigent.host.mcp_login import HostMcpLogins
 
         # A completed sign-in changes what the next probe should report.
-        self._mcp_logins = HostMcpLogins(on_success=self._mcp_tools.clear_cache)
+        self._mcp_logins = HostMcpLogins(
+            on_success=self._mcp_tools.clear_cache, subprocess_guard=self._host_subprocess_op
+        )
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -3943,7 +3945,9 @@ class HostProcess:
             )
         return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
 
-    async def _handle_mcp_login(self, frame: HostMcpLoginFrame) -> HostMcpLoginResultFrame:
+    async def _handle_mcp_login(
+        self, frame: HostMcpLoginFrame, owner: object | None = None
+    ) -> HostMcpLoginResultFrame:
         from omnigent.host.mcp_login import LoginError
         from omnigent.host.mcp_tools import find_configured_server
 
@@ -3957,7 +3961,7 @@ class HostProcess:
                     )
                 except LookupError:
                     raise LoginError("not_found", "MCP server not found") from None
-                result = await self._mcp_logins.start(server)
+                result = await self._mcp_logins.start(server, owner)
             elif frame.login_id is None:
                 raise LoginError("invalid", "Missing sign-in id")
             elif frame.action == "status":
@@ -5607,7 +5611,7 @@ class HostProcess:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
             await self._cancel_all_harness_logins()
-            await self._mcp_logins.close()
+            await self._mcp_logins.close(ws)
 
     async def _harness_readiness_loop(
         self,
@@ -5955,7 +5959,7 @@ class HostProcess:
             tools_result = await self._handle_mcp_tools(frame)
             await self._send_text(ws, encode_host_frame(tools_result))
         elif isinstance(frame, HostMcpLoginFrame):
-            login_result = await self._handle_mcp_login(frame)
+            login_result = await self._handle_mcp_login(frame, ws)
             await self._send_text(ws, encode_host_frame(login_result))
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
