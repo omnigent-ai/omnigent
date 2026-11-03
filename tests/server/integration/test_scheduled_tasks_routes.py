@@ -605,7 +605,18 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         assert back.status_code == 200, back.text
         assert back.json()["workspace"] is None
         invalid_clear = await auth_client.patch(path, json={"workspace": None}, headers=_headers())
-        assert invalid_clear.status_code == 400, invalid_clear.text
+        assert invalid_clear.status_code == 422, invalid_clear.text
+        assert invalid_clear.json() == {
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body"],
+                    "msg": "Value error, workspace cannot be null",
+                    "input": {"workspace": None},
+                    "ctx": {"error": {}},
+                }
+            ]
+        }
         sandbox = await auth_client.patch(
             path,
             json={"execution_target": "managed_sandbox", "workspace": workspace},
@@ -618,7 +629,7 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         auth_app.state.sandbox_config = None
 
 
-@pytest.mark.parametrize("edit", ["rename", "agent", "clear", "invalid"])
+@pytest.mark.parametrize("edit", ["rename", "agent", "clear", "invalid", "repository"])
 async def test_edit_legacy_sandbox_workspace(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
 ) -> None:
@@ -640,6 +651,7 @@ async def test_edit_legacy_sandbox_workspace(
             "agent": {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
             "clear": {"workspace": None},
             "invalid": {"workspace": "/another/directory"},
+            "repository": {"workspace": "https://github.com/example/runtime"},
         }
         updated = await auth_client.patch(
             f"/v1/scheduled-tasks/{task_id}", json=changes[edit], headers=_headers()
@@ -649,9 +661,12 @@ async def test_edit_legacy_sandbox_workspace(
             assert store.get(task_id).workspace == "/home/me"
         else:
             assert updated.status_code == 200, updated.text
-            assert updated.json()["workspace"] is None
-            assert store.get(task_id).workspace is None
-            assert updated.json()["session_id"] == (None if edit == "agent" else session_id)
+            expected_workspace = changes[edit].get("workspace")
+            assert updated.json()["workspace"] == expected_workspace
+            assert store.get(task_id).workspace == expected_workspace
+            expected_session = None if edit in {"agent", "repository"} else session_id
+            assert updated.json()["session_id"] == expected_session
+            assert store.get(task_id).session_id == expected_session
     finally:
         auth_app.state.sandbox_config = None
 

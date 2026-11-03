@@ -22,6 +22,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
@@ -909,8 +910,17 @@ def create_scheduled_tasks_router(
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
         if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
-            raise OmnigentError(
-                "workspace cannot be null for a connected-host task", code=ErrorCode.INVALID_INPUT
+            # Target-dependent validation retains the schema's original 422 response.
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("body",),
+                        "msg": "Value error, workspace cannot be null",
+                        "input": await request.json(),
+                        "ctx": {"error": ValueError("workspace cannot be null")},
+                    }
+                ]
             )
         # Check the effective target even when the PATCH omits execution_target.
         if switching_to_managed and fields.get("host_id") is not None:

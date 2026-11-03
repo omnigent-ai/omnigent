@@ -2026,16 +2026,20 @@ async def _drain_managed_launches() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("launch_outcome", "repository"),
+    ("launch_outcome", "workspace", "expected_repositories"),
     [
-        ("bound", None),
-        ("tracker_failed", None),
-        ("raised", None),
-        ("bound", "https://github.com/example/runtime"),
+        ("bound", None, []),
+        ("tracker_failed", None, []),
+        ("raised", None, []),
+        ("bound", "https://github.com/example/runtime", ["https://github.com/example/runtime"]),
+        ("bound", "/home/me", []),
     ],
 )
 async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
-    monkeypatch: pytest.MonkeyPatch, launch_outcome: str, repository: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    launch_outcome: str,
+    workspace: str | None,
+    expected_repositories: list[str],
 ) -> None:
     """A managed fire saves its prompt before provisioning; a failed launch fails the run."""
     from omnigent.server.managed_hosts import ManagedLaunchTracker
@@ -2059,7 +2063,7 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
     monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", direct_dispatch)
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(execution_target="managed_sandbox", workspace=repository)}
+        rows={"task_1": _task(execution_target="managed_sandbox", workspace=workspace)}
     )
     conversations = FakeConversationStore()
     on_fire = build_on_fire(
@@ -2089,12 +2093,10 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
         assert call.kwargs["sandbox_config"] is config
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
-        assert [repo.url for repo in call.kwargs["repos"]] == ([repository] if repository else [])
+        assert [repo.url for repo in call.kwargs["repos"]] == expected_repositories
     assert len(conversations.created) == 2
     for created in conversations.created:
-        assert fire_mod.read_managed_repo_workspaces(created["labels"]) == (
-            [repository] if repository else []
-        )
+        assert fire_mod.read_managed_repo_workspaces(created["labels"]) == expected_repositories
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
     # The saved prompt is delivered by the host's replica, never directly here.
     direct_dispatch.assert_not_awaited()

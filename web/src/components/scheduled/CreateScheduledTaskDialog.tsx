@@ -504,13 +504,21 @@ export function CreateScheduledTaskDialog({
     setError(null);
     setSubmitting(true);
     try {
-      // Send execution-target and sandbox repository fields only when changed.
+      // Create sends non-default target/repository; edit sends them only when changed.
       const executionTargetChanged = editingTask
         ? editingTask.executionTarget !== executionTarget
         : sandboxMode;
       const selectedWorkspace = workspace.trim();
-      const workspaceChanged = editingTask && selectedWorkspace !== savedWorkspace;
-      const canSelectSandboxWorkspace = sandboxMode && sandboxRepoCatalog.length > 0;
+      const workspaceChanged = editingTask !== null && selectedWorkspace !== savedWorkspace;
+      let workspacePatch: { workspace?: string | null } = {};
+      if (sandboxMode) {
+        const hasNewSelection = editingTask === null && selectedWorkspace !== "";
+        if (sandboxRepoCatalog.length > 0 && (workspaceChanged || hasNewSelection)) {
+          workspacePatch = { workspace: selectedWorkspace || null };
+        }
+      } else if (hostId !== "" && selectedWorkspace !== "") {
+        workspacePatch = { workspace: selectedWorkspace };
+      }
       const input = {
         name: name.trim(),
         prompt: effectivePrompt.trim(),
@@ -518,12 +526,7 @@ export function CreateScheduledTaskDialog({
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
-        ...(canSelectSandboxWorkspace && (workspaceChanged || (!editingTask && selectedWorkspace))
-          ? { workspace: selectedWorkspace || null }
-          : {}),
-        ...(!sandboxMode && hostId !== "" && selectedWorkspace !== ""
-          ? { workspace: selectedWorkspace }
-          : {}),
+        ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
       const projectInput = await projectChangeInput(
