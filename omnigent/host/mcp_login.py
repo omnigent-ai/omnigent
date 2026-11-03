@@ -35,6 +35,7 @@ LOGIN_HARNESSES = ("claude", "codex")
 LOGIN_TIMEOUT_SECONDS = 600.0
 URL_WAIT_SECONDS = 30.0
 STATUS_TIMEOUT_SECONDS = 5.0
+CALLBACK_TIMEOUT_SECONDS = 5.0
 FINISHED_RETENTION_SECONDS = 300.0
 MAX_ACTIVE_LOGINS = 4
 MAX_CALLBACK_URL = 4096
@@ -254,6 +255,25 @@ def valid_callback(callback_url: str, redirect: SplitResult) -> bool:
         return False
 
 
+async def _deliver_callback(master_fd: int, callback_url: str) -> None:
+    """Send a pasted redirect to the CLI, as a browser on the host would have."""
+    import httpx
+
+    try:
+        # The address is the CLI's own loopback listener, checked by ``valid_callback``.
+        async with httpx.AsyncClient(trust_env=False, timeout=CALLBACK_TIMEOUT_SECONDS) as client:
+            await client.get(callback_url)
+        return
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        pass
+    except httpx.HTTPError:
+        # The listener has the request; sending it again would reuse the code.
+        return
+    # No listener: newer CLIs read the redirect from their terminal instead.
+    with contextlib.suppress(OSError):
+        os.write(master_fd, callback_url.encode() + b"\r")
+
+
 @dataclass
 class _Login:
     login_id: str
@@ -294,6 +314,8 @@ class HostMcpLogins:
         # Start requests arrive on separate frame tasks; one at a time keeps a
         # double-click from spawning two CLIs that race for the same redirect.
         self._start_lock = asyncio.Lock()
+        # Whether each installed CLI build accepts ``mcp login --no-browser``.
+        self._no_browser_support: dict[tuple[str, int, int], bool] = {}
 
     def _prune(self) -> None:
         cutoff = time.monotonic() - FINISHED_RETENTION_SECONDS
@@ -350,26 +372,44 @@ class HostMcpLogins:
             raise
         return login.status()
 
+    async def _supports_no_browser(self, executable: str, harness: str) -> bool:
+        try:
+            stat = os.stat(executable)
+        except OSError:
+            return True
+        build = (executable, stat.st_mtime_ns, stat.st_size)
+        if build not in self._no_browser_support:
+            ran = await _run_status_command(
+                [executable, "mcp", "login", "--help"], harness, STATUS_TIMEOUT_SECONDS
+            )
+            if ran is None or ran[0] != 0:
+                return True
+            self._no_browser_support[build] = "--no-browser" in ran[1]
+        return self._no_browser_support[build]
+
     async def _spawn(self, executable: str, name: str, key: tuple[str, str]) -> _Login:
         import fcntl
         import pty
         import struct
         import termios
 
+        argv = [executable, "mcp", "login", name]
+        env = _cli_env(key[0])
+        if await self._supports_no_browser(executable, key[0]):
+            argv.append("--no-browser")
+        else:
+            # Older CLIs open a browser on the host; ``true`` stands in for it on Linux.
+            env["BROWSER"] = "true"
         master_fd, slave_fd = pty.openpty()
         try:
             # Wide enough that the CLI never wraps the authorization URL.
             fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 1000, 0, 0))
             process = await asyncio.create_subprocess_exec(
-                executable,
-                "mcp",
-                "login",
-                name,
-                "--no-browser",
+                *argv,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
-                env=_cli_env(key[0]),
+                env=env,
                 cwd=str(Path.home()),
                 **spawn_kwargs(),
             )
@@ -455,8 +495,7 @@ class HostMcpLogins:
             raise LoginError("invalid", "This sign-in is no longer waiting")
         if not valid_callback(callback_url, login.redirect):
             raise LoginError("invalid", "That isn't the address the sign-in page redirected to")
-        with contextlib.suppress(OSError):
-            os.write(login.master_fd, callback_url.encode() + b"\r")
+        await _deliver_callback(login.master_fd, callback_url)
         return login.status()
 
     async def cancel(self, login_id: str) -> LoginStatus:

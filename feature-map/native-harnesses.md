@@ -130,7 +130,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `mcp-sign-in`: a needs-auth Claude Code MCP server (standalone or plugin) or
   Codex MCP server offers Sign in, which runs the harness CLI's `mcp login` on
   the host and finishes through its loopback listener or a pasted redirect
-  address.
+  address. CLIs without `mcp login --no-browser` (Codex 0.142) are supported:
+  the host suppresses their browser and forwards a pasted redirect to their
+  listener.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 - `harness-settings-navigation`: Harnesses is always available in Settings and
@@ -909,7 +911,8 @@ Cross-harness journeys:
   `web/src/pages/settings/McpSignInDialog.test.tsx`. With the real `claude` and
   `codex` CLIs installed, `tests/e2e_ui/settings/test_mcp_sign_in.py` signs in to
   a local OAuth MCP server through a user server, a plugin server, and Codex's
-  paste path. By hand, check timeout, cancel, a rejected paste, and an older
+  paste path (run it with Codex 0.142 too, via `OMNIGENT_CODEX_PATH`). By hand,
+  check timeout, cancel, a rejected paste, and an older
   host (the row shows Needs auth with no Sign in button).
 
 - **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,

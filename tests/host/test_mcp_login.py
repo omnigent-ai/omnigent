@@ -7,6 +7,7 @@ import contextlib
 import json
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import psutil
 import pytest
@@ -31,14 +32,35 @@ _REDIRECT = "http%3A%2F%2Flocalhost%3A43117%2Fcallback"
 _AUTH_URL = f"https://auth.example.test/authorize?client_id=c&redirect_uri={_REDIRECT}&state=s"
 
 # Stands in for ``claude``/``codex``: logs its argv, prints the URL the way Claude Code
-# does (OSC 8 hyperlink), then waits for a pasted redirect on its terminal.
+# does (OSC 8 hyperlink), then waits for a pasted redirect on its terminal. With
+# FAKE_OLD_CLI it lacks ``--no-browser``; FAKE_MODE=listen waits on a loopback listener.
 FAKE_CLI = f"""#!{sys.executable}
 import json, os, sys, time
 from pathlib import Path
 log = Path(os.environ["FAKE_LOG"])
+if "--help" in sys.argv:
+    with open(str(log) + ".help", "a") as probes:
+        probes.write("probe\\n")
+    print("Usage: mcp login <NAME>" + ("" if os.environ.get("FAKE_OLD_CLI") else " --no-browser"))
+    sys.exit(0)
 log.write_text(json.dumps({{"argv": sys.argv[1:], "tty": sys.stdin.isatty(),
-    "env": sorted(k for k in os.environ if k.startswith("OMNIGENT_")), "pid": os.getpid()}}))
+    "env": sorted(k for k in os.environ if k.startswith("OMNIGENT_")), "pid": os.getpid(),
+    "browser": os.environ.get("BROWSER")}}))
 mode = os.environ.get("FAKE_MODE", "paste")
+if mode == "listen":
+    import http.server
+    class Listener(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            log.with_suffix(".received").write_text(self.path)
+            self.send_response(200)
+            self.end_headers()
+        def log_message(self, *args):
+            pass
+    listener = http.server.HTTPServer(("127.0.0.1", 0), Listener)
+    redirect = "http%3A%2F%2F127.0.0.1%3A" + str(listener.server_address[1]) + "%2Fcallback"
+    print("Visit: https://auth.example.test/authorize?redirect_uri=" + redirect, flush=True)
+    listener.handle_request()
+    sys.exit(0 if "code=" in log.with_suffix(".received").read_text() else 3)
 if sys.argv[1:3] in (["mcp", "get"], ["mcp", "list"]) and mode == "status_hang":
     time.sleep(60)
 if sys.argv[1:3] == ["mcp", "get"]:
@@ -178,6 +200,7 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     with pytest.raises(LoginError) as rejected:
         await logins.submit(started["login_id"], "http://localhost:1/callback?code=abc")
     assert rejected.value.status == "invalid"
+    # Nothing listens on the redirect port, so the CLI reads it from its terminal.
     callback = "http://localhost:43117/callback?code=abc&state=s"
     await logins.submit(started["login_id"], callback)
     finished = await _settled(logins, started["login_id"])
@@ -191,6 +214,26 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     assert completed == ["pending"]
     with pytest.raises(LoginError):
         await logins.submit(started["login_id"], callback)
+    await logins.close()
+
+
+async def test_older_cli_gets_the_redirect_on_its_listener(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_OLD_CLI", "1")
+    monkeypatch.setenv("FAKE_MODE", "listen")
+    logins = HostMcpLogins()
+    await logins.start(_server())
+    started = await logins.start(_server())
+    recorded = json.loads(fake_cli.read_text())
+    assert (recorded["argv"], recorded["browser"]) == (["mcp", "login", "demo"], "true")
+    # The flag check runs once per installed CLI build.
+    assert Path(f"{fake_cli}.help").read_text().count("probe") == 1
+    redirect = parse_qs(urlsplit(started["authorization_url"]).query)["redirect_uri"][0]
+    await logins.submit(started["login_id"], f"{redirect}?code=abc&state=s")
+    finished = await _settled(logins, started["login_id"])
+    assert finished["state"] == "succeeded"
+    assert fake_cli.with_suffix(".received").read_text() == "/callback?code=abc&state=s"
     await logins.close()
 
 
