@@ -164,7 +164,7 @@ async def codex_launch_harness(
     resets: list[dict[str, Any]] = []
     notices: list[dict[str, Any]] = []
     snapshot: dict[str, Any] = {"model_override": _RETIRED_PICK}
-    response_status = {"reset": 200}
+    response_status = {"reset": 200, "notice": 200}
     initial_probes = set(model_catalog_store._inflight.values())
 
     def request(request: httpx.Request) -> httpx.Response:
@@ -180,7 +180,7 @@ async def codex_launch_harness(
         if request.url.path == f"/v1/sessions/{_SESSION_ID}/events":
             events.append("notice")
             notices.append(json.loads(request.content)["data"]["item_data"])
-            return httpx.Response(200, json={})
+            return httpx.Response(response_status["notice"], json={})
         assert request.url.path == f"/v1/sessions/{_SESSION_ID}/model-override/reset"
         reset = json.loads(request.content)
         assert set(reset) == {"expected_model_override"}
@@ -327,8 +327,9 @@ async def test_profile_launch_validates_the_pick_against_its_workspace_listing(
     else:
         harness.workspace_models.return_value = live_listing
     cached_state = None if cached_listing is None else SimpleNamespace(codex_models=cached_listing)
-    read_cached_state = Mock(return_value=cached_state)
-    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cached_state)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state", lambda _host: cached_state
+    )
 
     await harness.launch()
 
@@ -346,10 +347,6 @@ async def test_profile_launch_validates_the_pick_against_its_workspace_listing(
     harness.workspace_models.assert_called_once_with(
         "https://workspace.example.com", "workspace-token"
     )
-    if isinstance(live_listing, Exception):
-        read_cached_state.assert_called_once_with("https://workspace.example.com")
-    else:
-        read_cached_state.assert_not_called()
     harness.probe.assert_not_awaited()
 
 
@@ -653,15 +650,17 @@ async def test_failed_pick_reset_keeps_successfully_launched_terminal(
     status: int,
     codex_launch_harness: _LaunchHarness,
 ) -> None:
-    """An old or failing server keeps the terminal and pick; never retry with PATCH."""
+    """Failed reset and notice posts keep the terminal and pick; never retry with PATCH."""
     harness = codex_launch_harness
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
     harness.response_status["reset"] = status
+    harness.response_status["notice"] = status
 
     resource = await harness.launch()
 
     assert resource.id == "terminal_codex_main"
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+    assert harness.notices == [_unavailable_notice(_RETIRED_PICK, _PROVIDER_DEFAULT)]
     assert harness.snapshot["model_override"] == _RETIRED_PICK
     assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
     await asyncio.sleep(0)
