@@ -336,3 +336,59 @@ def test_permissions_command_opens_the_codex_approval_picker(
     expect(composer).to_have_value("still typing")
     assert handle.session_patches == [{"approval_mode": "approve-for-me"}]
     assert handle.event_posts == []
+
+
+_LONG_SKILL_DESCRIPTION = (
+    "Given the current conversation's context (a bug, error, crash, regression, test failure, "
+    "or feature-compatibility issue), find the owning component, file a ticket with the "
+    "reproduction steps, and link the conversation so the owning team can pick it up."
+)
+_IS_CUT_OFF = "element => element.scrollWidth > element.clientWidth"
+
+
+def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contract) -> None:
+    chat_session_contract.set_skills(
+        [
+            {"name": "review-pr", "description": "Review a pull request"},
+            {"name": "triage", "description": _LONG_SKILL_DESCRIPTION},
+        ]
+    )
+    page.goto(chat_session_contract.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/")
+
+    triage = page.get_by_test_id("slash-menu-item-triage")
+    description = page.get_by_test_id("slash-menu-description-triage")
+    expect(triage).to_be_visible()
+    assert description.evaluate(_IS_CUT_OFF), "an unhighlighted row keeps one line"
+    one_line_height = description.bounding_box()["height"]
+
+    # Hovering the cut-off row shows its whole description in a tooltip.
+    triage.hover()
+    tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
+    expect(tooltip).to_be_visible()
+    expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
+    page.mouse.move(0, 0, steps=5)
+    expect(tooltip).to_have_count(0)
+
+    # Highlighting the row from the keyboard wraps the full description in place.
+    composer.press("ArrowUp")
+    expect(triage).to_have_attribute("data-active", "true")
+    expect(description).to_have_text(_LONG_SKILL_DESCRIPTION)
+    assert not description.evaluate(_IS_CUT_OFF)
+    assert description.bounding_box()["height"] > one_line_height * 1.5
+    assert not page.get_by_test_id("slash-menu-description-review-pr").evaluate(_IS_CUT_OFF)
+
+    # The highlighted row needs no tooltip; moving on collapses it again.
+    triage.hover()
+    page.wait_for_timeout(800)
+    expect(tooltip).to_have_count(0)
+    composer.press("ArrowUp")
+    expect(page.get_by_test_id("slash-menu-item-review-pr")).to_have_attribute(
+        "data-active", "true"
+    )
+    assert description.evaluate(_IS_CUT_OFF)
+    composer.press("ArrowDown")
+    composer.press("Enter")
+    expect(composer).to_have_value("/triage ")

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CircleAlertIcon,
   CommandIcon,
@@ -10,6 +10,7 @@ import {
 import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -408,7 +409,7 @@ function McpServerMenu({
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
-  /** One-line description shown in the detail card when active. */
+  /** Description shown beside the name; wrapped in full on the highlighted row. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
   flatIndex: number;
@@ -442,38 +443,81 @@ function MenuRowButton({
   onSelect: (cmd: string) => void;
 }) {
   const isBuiltin = row.isBuiltin;
+  const descriptionRef = useRef<HTMLSpanElement>(null);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  // Radix reports no close while the tooltip is suppressed, so drop it here.
+  if (active && tooltipOpen) setTooltipOpen(false);
   // Wand in pink for skills (per design feedback — distinct from the
   // info-blue slash-command tint, and from plain Sparkles which marks
   // thinking/reasoning blocks), the ⌘ glyph in slate for built-ins.
   const Icon = isBuiltin ? CommandIcon : WandSparklesIcon;
+  // The highlighted row already wraps its full description, so the hover
+  // tooltip is only for other rows whose one-line description is cut off.
+  const openTooltip = (open: boolean) => {
+    const description = descriptionRef.current;
+    setTooltipOpen(
+      open && !active && description !== null && description.scrollWidth > description.clientWidth,
+    );
+  };
   return (
-    <button
-      type="button"
-      data-testid={`slash-menu-item-${row.name.slice(1)}`}
-      data-active={active ? "true" : undefined}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
-        active && "bg-muted dark:bg-muted/50",
-      )}
-      // preventDefault keeps the textarea focused while the user clicks.
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={() => onSelect(row.name)}
-    >
-      <span className="flex size-4 shrink-0 items-center justify-center">
-        <Icon
+    <Tooltip open={tooltipOpen} onOpenChange={openTooltip}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          data-testid={`slash-menu-item-${row.name.slice(1)}`}
+          data-active={active ? "true" : undefined}
           className={cn(
-            "size-3.5",
-            isBuiltin ? "text-slate-500 dark:text-slate-400" : "text-pink-500 dark:text-pink-400",
+            "flex w-full gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
+            // Baseline alignment keeps a wrapped description's first line level with the name.
+            active ? "items-baseline bg-muted dark:bg-muted/50" : "items-center",
           )}
-        />
-      </span>
-      <span className="shrink-0">{row.name}</span>
-      {/* Description inline (matching the "+" tray), so the menu is
-          self-describing without a separate detail card. */}
+          // preventDefault keeps the textarea focused while the user clicks.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => onSelect(row.name)}
+        >
+          <span
+            className={cn(
+              "flex w-4 shrink-0 items-center justify-center",
+              active ? "h-[1lh] self-start" : "h-4",
+            )}
+          >
+            <Icon
+              className={cn(
+                "size-3.5",
+                isBuiltin
+                  ? "text-slate-500 dark:text-slate-400"
+                  : "text-pink-500 dark:text-pink-400",
+              )}
+            />
+          </span>
+          <span className="shrink-0">{row.name}</span>
+          {/* Description inline (matching the "+" tray), so the menu is
+              self-describing without a separate detail card. */}
+          {row.description && (
+            <span
+              ref={descriptionRef}
+              data-testid={`slash-menu-description-${row.name.slice(1)}`}
+              className={cn(
+                "min-w-0 text-xs text-muted-foreground",
+                active ? "break-words leading-4" : "truncate leading-4",
+              )}
+            >
+              {row.description}
+            </span>
+          )}
+        </button>
+      </TooltipTrigger>
       {row.description && (
-        <span className="truncate text-xs leading-4 text-muted-foreground">{row.description}</span>
+        <TooltipContent
+          side="top"
+          align="end"
+          data-testid={`slash-menu-tooltip-${row.name.slice(1)}`}
+          className="max-w-md break-words text-xs leading-4"
+        >
+          {row.description}
+        </TooltipContent>
       )}
-    </button>
+    </Tooltip>
   );
 }
 
@@ -481,9 +525,9 @@ function MenuRowButton({
  * Floating suggestions menu rendered above the composer when the user
  * starts a slash command, shared by the in-session composer (ChatPage)
  * and the new-chat landing composer (NewChatDialog). Cursor-style
- * layout: a narrow panel with "Commands" / "Skills" section headers and
- * icon + name rows, plus a detail card beside the panel showing the
- * highlighted entry's full description (hidden on small screens).
+ * layout: a panel with "Commands" / "Skills" section headers and icon +
+ * name + one-line description rows. The highlighted row wraps its full
+ * description, and hovering a cut-off row shows it in a tooltip.
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
@@ -552,67 +596,69 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <div
-      data-testid="slash-command-menu"
-      className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
-    >
-      <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
-        {builtinRows.length > 0 && sectionHeader("Commands")}
-        {builtinRows.map((row) => (
-          <MenuRowButton
-            key={row.name}
-            row={row}
-            active={row.flatIndex === activeIndex}
-            onSelect={onSelect}
-          />
-        ))}
-        {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
-        {skillsStatus === "loading" && (
-          <div
-            role="status"
-            className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
-          >
-            <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
-            Loading skills…
-          </div>
-        )}
-        {skillsStatus === "error" && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            Couldn’t load skills. {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
-          </div>
-        )}
-        {skillsStatus === "unavailable" && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {skillsUnavailableMessage}
-          </div>
-        )}
-        {/* An incomplete catalog explains itself; "No skills available" is only claimed when complete. */}
-        {skillsStatus === "ready" && skillsWarnings.length > 0 && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {skillsWarnings.map((warning) => (
-              <span key={warning} className="block break-words">
-                {warning}
-              </span>
-            ))}
-            {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
-          </div>
-        )}
-        {skillsStatus === "ready" &&
-          skillRows.length === 0 &&
-          (query !== "" || skillsWarnings.length === 0) && (
-            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-              {query ? "No matching skills" : "No skills available"}
+    <TooltipProvider delayDuration={400}>
+      <div
+        data-testid="slash-command-menu"
+        className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+      >
+        <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+          {builtinRows.length > 0 && sectionHeader("Commands")}
+          {builtinRows.map((row) => (
+            <MenuRowButton
+              key={row.name}
+              row={row}
+              active={row.flatIndex === activeIndex}
+              onSelect={onSelect}
+            />
+          ))}
+          {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
+          {skillsStatus === "loading" && (
+            <div
+              role="status"
+              className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
+            >
+              <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
+              Loading skills…
             </div>
           )}
-        {skillRows.map((row) => (
-          <MenuRowButton
-            key={row.name}
-            row={row}
-            active={row.flatIndex === activeIndex}
-            onSelect={onSelect}
-          />
-        ))}
+          {skillsStatus === "error" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              Couldn’t load skills. {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
+            </div>
+          )}
+          {skillsStatus === "unavailable" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsUnavailableMessage}
+            </div>
+          )}
+          {/* An incomplete catalog explains itself; "No skills available" is only claimed when complete. */}
+          {skillsStatus === "ready" && skillsWarnings.length > 0 && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsWarnings.map((warning) => (
+                <span key={warning} className="block break-words">
+                  {warning}
+                </span>
+              ))}
+              {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
+            </div>
+          )}
+          {skillsStatus === "ready" &&
+            skillRows.length === 0 &&
+            (query !== "" || skillsWarnings.length === 0) && (
+              <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+                {query ? "No matching skills" : "No skills available"}
+              </div>
+            )}
+          {skillRows.map((row) => (
+            <MenuRowButton
+              key={row.name}
+              row={row}
+              active={row.flatIndex === activeIndex}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
       </div>
-    </div>
+    </TooltipProvider>
   );
 }

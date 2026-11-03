@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -169,6 +169,77 @@ describe("skill discovery state", () => {
   it("preserves the existing empty-menu behavior when discovery state is absent", () => {
     const { container } = render(<SlashCommandMenu {...props} commands={{}} />);
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("full skill descriptions", () => {
+  const triage =
+    "Given the current conversation's context (a bug, error, crash, regression, test failure, " +
+    "or feature-compatibility issue), file a ticket with reproduction steps and the owning team.";
+  const commands = { "/help": "Show help", "/triage": triage, "/review": "Review code" };
+  const description = (name: string) => screen.getByTestId(`slash-menu-description-${name}`);
+
+  /** Make a row's one-line description report overflow, as layout would when it is cut off. */
+  function overflowDescription(name: string, scrollWidth: number) {
+    const element = description(name);
+    Object.defineProperty(element, "clientWidth", { configurable: true, value: 200 });
+    Object.defineProperty(element, "scrollWidth", { configurable: true, value: scrollWidth });
+  }
+
+  it("wraps the highlighted row's full description and keeps other rows to one line", () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={1} />,
+    );
+    expect(description("triage")).toHaveTextContent(triage);
+    expect(description("triage")).not.toHaveClass("truncate");
+    expect(description("review")).toHaveClass("truncate");
+
+    // Moving the highlight collapses the previous row back to one line.
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    expect(description("triage")).toHaveClass("truncate");
+    expect(description("review")).not.toHaveClass("truncate");
+  });
+
+  it("shows a cut-off description in full in a hover tooltip", async () => {
+    render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    const tooltip = await screen.findByTestId("slash-menu-tooltip-triage", {}, { timeout: 2000 });
+    expect(tooltip).toHaveTextContent(triage);
+  });
+
+  it("shows no tooltip when the description already fits or the row is highlighted", async () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("review", 200);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-review"));
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 700);
+    });
+    expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
+
+  it("closes an open tooltip when its row becomes highlighted", async () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("triage", 900);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    await screen.findByTestId("slash-menu-tooltip-triage", {}, { timeout: 2000 });
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    await waitFor(() => expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull());
+    // Arrowing away again does not bring back a tooltip the pointer has left.
+    fireEvent.pointerLeave(screen.getByTestId("slash-menu-item-triage"));
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 700);
+    });
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 });
 

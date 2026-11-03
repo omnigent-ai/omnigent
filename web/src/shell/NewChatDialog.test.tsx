@@ -9315,6 +9315,27 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByTestId("slash-menu-item-cross-review")).not.toBeInTheDocument();
   });
 
+  it("shows the highlighted skill's full description as the user arrows through the menu", () => {
+    const triage =
+      "Given the current conversation's context (a bug, error, crash, regression, or test " +
+      "failure), file a ticket with reproduction steps and the owning team.";
+    mockSkills({
+      skills: [
+        { name: "review-pr", description: "Review a pull request" },
+        { name: "triage", description: triage },
+      ],
+    });
+    renderLanding();
+    typeMessage("/");
+    const description = screen.getByTestId("slash-menu-description-triage");
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toHaveAttribute("data-active", "true");
+    expect(description).toHaveClass("truncate");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
+    expect(screen.getByTestId("slash-menu-item-triage")).toHaveAttribute("data-active", "true");
+    expect(description).toHaveTextContent(triage);
+    expect(description).not.toHaveClass("truncate");
+  });
+
   it("shows Retry for discovery failures and an empty state after successful retry", () => {
     const retry = vi.fn();
     mockSkills({ skillsStatus: "error", refetch: retry });
