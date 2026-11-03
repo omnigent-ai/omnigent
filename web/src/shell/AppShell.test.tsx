@@ -572,6 +572,7 @@ function renderShell(
           <>
             <div>settings</div>
             <NavProbe />
+            {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
             <LocationDisplay />
           </>
         }
@@ -2098,20 +2099,28 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
 
-  it("restores an open sidebar after leaving /settings", () => {
-    // The mirror case: someone who had it open keeps it open, so the restore is
-    // genuinely "put it back", not "always collapse".
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    renderShell("/c/conv_abc");
+  it.each(["", "?sidebar=closed"])(
+    "honors the sidebar preference after leaving settings for %s",
+    (query) => {
+      mockConversations([
+        { id: "conv_abc", permission_level: null },
+        { id: "conv_next", permission_level: null },
+      ]);
+      renderShell("/c/conv_abc", undefined, { sessionNavTo: `/c/conv_next${query}` });
 
-    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
 
-    fireEvent.click(screen.getByTestId("nav-settings"));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    fireEvent.click(screen.getByTestId("nav-home"));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-  });
+      fireEvent.click(screen.getByTestId("nav-settings"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(query === ""));
+      if (query) {
+        fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      }
+    },
+  );
 
   it("keeps the sidebar collapsed after exiting full screen if it was collapsed before", () => {
     useEnvironmentMock.mockReturnValue({
@@ -2131,38 +2140,41 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
 
-  it("restores the collapsed sidebar when a session switch un-maximizes the rail", () => {
-    // Maximizing collapses the sidebar; the toggle handler restores it on exit,
-    // but a session switch un-maximizes directly (setRightPanelMaximized(false))
-    // — it must restore the sidebar too, or the user's open sidebar is silently
-    // lost. Same AppShell mount, only the :conversationId route param changes,
-    // so we build a tree with SessionNavButton (renderShell has none).
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      { id: "conv_abc", permission_level: null },
-      { id: "conv_xyz", permission_level: null },
-    ]);
+  it.each(["", "?sidebar=closed"])(
+    "honors the sidebar preference when a session switch un-maximizes the rail with %s",
+    (query) => {
+      useEnvironmentMock.mockReturnValue({
+        data: { available: true, root: null },
+        isLoading: false,
+      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+      mockConversations([
+        { id: "conv_abc", permission_level: null },
+        { id: "conv_xyz", permission_level: null },
+      ]);
 
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to="/c/conv_xyz" />));
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(sessionShellTree(qc, "/c/conv_abc", <SessionNavButton to={`/c/conv_xyz${query}`} />));
 
-    // Open the sidebar, then maximize → sidebar collapses (state stashed).
-    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+      // Open the sidebar, then maximize → sidebar collapses (state stashed).
+      fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
 
-    // Switch conversation — the rail un-maximizes AND the sidebar is restored.
-    fireEvent.click(screen.getByTestId("nav-session"));
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    // Back to docked (a fresh session starts docked).
-    expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
-      "md:absolute",
-    );
-  });
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(query === ""));
+      // Back to docked (a fresh session starts docked).
+      expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
+        "md:absolute",
+      );
+      if (query) {
+        fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+        fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+        fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+        expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      }
+    },
+  );
 });
 
 describe("Sidebar across the md breakpoint", () => {
@@ -4497,8 +4509,8 @@ describe("Mobile session menu", () => {
 
 describe("AppShell clone/fork action", () => {
   it.each([false, true])(
-    "resolves a scoped recovery source's own restrictions under a blocked parent (child blocked=%s)",
-    (childBlocked) => {
+    "opens a scoped recovery under a managed parent (child managed=%s)",
+    (childManaged) => {
       const parent = sessionSnapshot({
         id: "conv_parent",
         labels: { "omnigent.host_type": "managed" },
@@ -4507,7 +4519,7 @@ describe("AppShell clone/fork action", () => {
         id: "conv_side_child",
         workspace: "/missing/child",
         hostId: "host_a",
-        labels: childBlocked ? { "omnigent.host_type": "managed" } : {},
+        labels: childManaged ? { "omnigent.host_type": "managed" } : {},
       });
       mockConversations([{ id: "conv_parent", permission_level: 4 }]);
       useSessionMock.mockImplementation((sessionId) => ({
@@ -4532,70 +4544,12 @@ describe("AppShell clone/fork action", () => {
       fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
 
       expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      if (childBlocked) {
-        expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-          "Forking this sandbox session is not supported yet.",
-        );
-        expect(screen.queryByTestId("workspace-path-input")).not.toBeInTheDocument();
-        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
-      } else {
-        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
-        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
-      }
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
       expect(forkSessionMock).not.toHaveBeenCalled();
     },
   );
-
-  it("disables directory recovery for an Arclet session that forks only onto a new Arclet", async () => {
-    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
-    useSessionMock.mockReturnValue({
-      session: sessionSnapshot({
-        id: "conv_arclet",
-        workspace: "/missing/repo",
-        hostId: "host_arclet",
-        labels: { "omnigent.host_type": "managed" },
-      }),
-      isLoading: false,
-      error: null,
-    });
-    useHostsMock.mockReturnValue({
-      data: [
-        {
-          host_id: "host_arclet",
-          name: "Arclet",
-          owner: "owner",
-          status: "online",
-          sandbox_provider: "arclet",
-        },
-      ],
-    } as ReturnType<typeof useHosts>);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <CapabilitiesProvider
-        info={serverInfo({ managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] })}
-      >
-        {sessionShellTree(
-          client,
-          "/c/conv_arclet",
-          <ConversationScopeContext.Provider value="conv_arclet">
-            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
-          </ConversationScopeContext.Provider>,
-        )}
-      </CapabilitiesProvider>,
-    );
-
-    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
-    expect(recover).toBeDisabled();
-    fireEvent.focus(screen.getByRole("group", { name: "Continue in another directory…" }));
-    await waitFor(() =>
-      expect(screen.getByRole("tooltip")).toHaveTextContent(
-        "This sandbox session can only be cloned onto a new sandbox.",
-      ),
-    );
-    fireEvent.click(recover);
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
-  });
 
   it("opens workspace recovery and resets it before a later normal fork", async () => {
     const source = sessionSnapshot({
@@ -4629,7 +4583,7 @@ describe("AppShell clone/fork action", () => {
     );
   });
 
-  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+  it("opens direct current-session fork openers for a managed session", () => {
     mockConversations([{ id: "conv_managed", permission_level: 4 }]);
     useSessionMock.mockReturnValue({
       session: sessionSnapshot({
@@ -4641,7 +4595,63 @@ describe("AppShell clone/fork action", () => {
     });
     renderShell("/c/conv_managed");
     fireEvent.click(screen.getByTestId("fork-probe-open"));
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Fork from this response/ })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+  });
+
+  it("offers directory recovery for an Arclet session onto a connected host", () => {
+    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_arclet",
+        workspace: "/missing/repo",
+        hostId: "host_arclet",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    const hosts = [
+      {
+        host_id: "host_arclet",
+        name: "Arclet",
+        owner: "owner",
+        status: "online",
+        sandbox_provider: "arclet",
+      },
+      { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
+    ];
+    // Pickers never see server-managed sandbox hosts, as in fetchHosts.
+    useHostsMock.mockImplementation(
+      (options) =>
+        ({
+          data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        }) as ReturnType<typeof useHosts>,
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_arclet",
+        <ConversationScopeContext.Provider value="conv_arclet">
+          <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+        </ConversationScopeContext.Provider>,
+      ),
+    );
+
+    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(recover).toBeEnabled();
+    fireEvent.click(recover);
+    expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+    const hostSelect = screen.getByTestId("fork-session-host-select");
+    fireEvent.pointerDown(hostSelect, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostSelect);
+    // Recovery continues in an existing directory, so it offers connected hosts only.
+    expect(screen.getByTestId("fork-session-host-option-host_laptop")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-option-host_arclet")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
+    expect(forkSessionMock).not.toHaveBeenCalled();
   });
 
   it("exposes canFork to a read-only collaborator on a top-level session", () => {
@@ -5804,7 +5814,7 @@ describe("AppShell design-mode submission", () => {
   }
 
   it.each([
-    { preference: null, busy: true, backlog: false, queued: true },
+    { preference: null, busy: true, backlog: false, queued: false },
     { preference: "false", busy: true, backlog: false, queued: true },
     { preference: "true", busy: true, backlog: false, queued: false },
     { preference: "true", busy: true, backlog: true, queued: true },
@@ -5875,6 +5885,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("preserves queued instructions when always-steer is enabled mid-session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("First change");
     localStorage.setItem("omnigent:always-steer", "true");
@@ -5889,6 +5900,7 @@ describe("AppShell design-mode submission", () => {
 
   // User-opened tabs submit with their `browser-tab:` view ID, not the session ID.
   it("sends a submission from a user-opened tab in the current session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     submitInstruction("Use a week picker.", "browser-tab:conv_design:tab-two");
     expect(send).not.toHaveBeenCalled();
@@ -5929,6 +5941,7 @@ describe("AppShell design-mode submission", () => {
   });
 
   it("rejects a late pointer submission after switching to another session", () => {
+    localStorage.setItem("omnigent:always-steer", "false");
     renderShell("/c/conv_design");
     chat.conversationId = "conv_other";
     submitInstruction();

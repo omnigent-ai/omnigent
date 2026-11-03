@@ -139,7 +139,6 @@ import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import { workspaceRecoveryDisabledReason } from "@/lib/sessionCapabilities";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -365,10 +364,10 @@ function AppShellImpl() {
     // Leaving /settings: restore, then clear the stash so the next visit
     // captures fresh state.
     if (sidebarOpenBeforeSettingsRef.current !== null) {
-      setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
+      setSidebarOpen(sidebarRequested !== "closed" && sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
+  }, [inSettings, location.pathname, rebasePath, sidebarRequested, setSidebarOpen]);
 
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.
@@ -851,10 +850,7 @@ function AppShellImpl() {
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
-  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
-    serverConversationId,
-    activeConv,
-  );
+  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -1267,7 +1263,10 @@ function AppShellImpl() {
     // If we were maximized, restore the sidebar we collapsed on entry (the
     // toggle handler won't run on a session switch).
     setRightPanelMaximized((wasMaximized) => {
-      if (wasMaximized) restoreSidebarAfterMaximize();
+      if (wasMaximized) {
+        if (sidebarRequested === "closed") setSidebarOpen(false);
+        else restoreSidebarAfterMaximize();
+      }
       return false;
     });
     // A selected file must be visible in the rail. The Files and Changes tabs
@@ -2468,7 +2467,6 @@ function AppShellImpl() {
       currentSessionId: serverConversationId ?? null,
       canFork: canClone,
       disabledReason: forkDisabledReason,
-      workspaceRecoveryDisabledReason: workspaceRecoveryDisabledReason(forkSandboxProvider),
       openForkDialog: (opts) => {
         const sourceSessionId =
           opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
@@ -2490,7 +2488,7 @@ function AppShellImpl() {
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, forkSandboxProvider, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
