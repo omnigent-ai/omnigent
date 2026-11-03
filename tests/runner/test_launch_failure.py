@@ -424,6 +424,14 @@ def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, 
             "Run `databricks auth login` on the host to sign in again, then send your message "
             "again.",
         ),
+        (
+            "provider auth command `sh` exited with status exit status: 1: ERROR Databricks CLI "
+            "returned no access token. Run `databricks auth login` to re-authenticate.",
+            "The model provider's token command failed on the host: ERROR Databricks CLI "
+            "returned no access token. Run `databricks auth login` to re-authenticate.",
+            "Run `databricks auth login` on the host to sign in again, then send your message "
+            "again.",
+        ),
     ],
 )
 def test_codex_provider_auth_diagnosis_covers_each_codex_outcome(

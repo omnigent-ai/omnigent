@@ -453,15 +453,15 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
             f"Check that `{command}` is installed and on PATH on the host, "
             "then send your message again."
         )
-    elif shell_wrapped:
-        remediation = (
-            "Sign in to the model provider again on the host, then send your message again."
-        )
     elif _DATABRICKS_CLI_LOGIN.search(message):
         # A Databricks-backed helper names the CLI login that renews its token.
         remediation = (
             "Run `databricks auth login` on the host to sign in again, then send your message "
             "again."
+        )
+    elif shell_wrapped:
+        remediation = (
+            "Sign in to the model provider again on the host, then send your message again."
         )
     else:
         remediation = (
