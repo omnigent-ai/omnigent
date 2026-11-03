@@ -17,6 +17,7 @@ from omnigent.runner.background_titles.service import (
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.sdk")
+_CLAUDE_TITLE_MIN_OUTPUT_TOKENS = 256
 
 #: Output budget when ``context.instructions`` replaces the title prompt: a
 #: one-sentence JSON verdict, not a 2-5 word title.
@@ -43,6 +44,14 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         spawn_env.pop("HARNESS_CLAUDE_SDK_AGENT_NAME", None)
         spawn_env.pop("HARNESS_CLAUDE_SDK_BUNDLE_DIR", None)
 
+    max_output_tokens = (
+        OVERRIDE_MAX_OUTPUT_TOKENS
+        if context.instructions
+        else background_title_max_output_tokens(context.additional_instructions)
+    )
+    if context.harness == "claude-sdk":
+        # Claude fails at the token ceiling; even a short non-English title can exceed 32 tokens.
+        max_output_tokens = max(max_output_tokens, _CLAUDE_TITLE_MIN_OUTPUT_TOKENS)
     process_key = uuid.uuid4().hex
     event_body = {
         "type": "message",
@@ -52,11 +61,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         "tools": [],
         "instructions": generation_instructions(context),
         "reasoning": {"effort": "low"},
-        "max_output_tokens": (
-            OVERRIDE_MAX_OUTPUT_TOKENS
-            if context.instructions
-            else background_title_max_output_tokens(context.additional_instructions)
-        ),
+        "max_output_tokens": max_output_tokens,
     }
     if context.title_model is not None:
         event_body["model_override"] = context.title_model

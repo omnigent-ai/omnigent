@@ -4079,7 +4079,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     if workspace_host is None:
         return
     _forget_remembered_profile(workspace_host)
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host, org_id)
     if auth_info is not None:
         if org_id is None:
             org_id = _workspace_hosted_profile_org_id(
@@ -13138,6 +13138,13 @@ def _workspace_api_server_url(server: str) -> str:
 
     server = server.rstrip("/")
     parsed = urlsplit(server)
+    # Shown with the caller's own selector: without it the display falls back
+    # to the stored login record, which can name another workspace on the host.
+    org_id = _org_id_from_url(server)
+
+    def _display(url: str) -> str:
+        return display_server_url(f"{url}?o={org_id}" if org_id else url)
+
     # Strip any ?o= selector / query / fragment before probing: callers append
     # a path (``f"{base}/v1/..."``), so a query-bearing base would push that
     # path into the query (``…/?o=123/v1/me``) and break the probe + expansion.
@@ -13154,7 +13161,7 @@ def _workspace_api_server_url(server: str) -> str:
     # still works.
     if parsed.scheme == "https" and parsed.path == WORKSPACE_UI_PATH:
         root = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-        expanded = _workspace_api_server_url(root)
+        expanded = _workspace_api_server_url(f"{root}?o={org_id}" if org_id else root)
         return expanded if expanded != root else server
     if parsed.path not in ("", "/") or parsed.scheme != "https":
         return server
@@ -13179,7 +13186,7 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     if _workspace_mount_probe_matches(candidate, api_probe):
         click.echo(
-            f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent).",
+            f"Using {_display(candidate)} (Databricks workspace-hosted omnigent).",
             err=True,
         )
         return candidate
@@ -13200,7 +13207,7 @@ def _workspace_api_server_url(server: str) -> str:
             authed_probe = None
         if authed_probe is not None and _workspace_mount_probe_matches(candidate, authed_probe):
             click.echo(
-                f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent).",
+                f"Using {_display(candidate)} (Databricks workspace-hosted omnigent).",
                 err=True,
             )
             return candidate
@@ -13395,7 +13402,8 @@ def _resolve_server_url(server: str) -> ServerUrl:
         return _resolved(expanded)  # the canonical host is no better; keep what the user typed
     click.echo(
         f"Note: {display_server_url(normalized)} did not answer as a workspace; "
-        f"using its canonical host {display_server_url(canonical)}."
+        f"using its canonical host "
+        f"{display_server_url(f'{canonical}?o={org_id}' if org_id else canonical)}."
     )
     return _resolved(canonical)
 
@@ -13579,7 +13587,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
     from omnigent.cli_auth import is_workspace_hosted_url
     from omnigent.inner.databricks_executor import _forget_remembered_profile
 
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host, org_id)
     if org_id is None and auth_info is not None:
         org_id = _workspace_hosted_profile_org_id(server, workspace_host, auth_info.profile_name)
 
@@ -13692,7 +13700,7 @@ def _login_and_mint_workspace_auth_info(
 ) -> _DatabricksWorkspaceAuthInfo:
     """Run the browser login and return the selected workspace auth info."""
     _run_databricks_browser_login(workspace_host, org_id)
-    auth_info = _databricks_workspace_auth_info(workspace_host)
+    auth_info = _databricks_workspace_auth_info(workspace_host, org_id)
     if auth_info is None:
         raise click.ClickException(
             f"Workspace login completed but no token resolves for {workspace_host}. "
@@ -13791,15 +13799,22 @@ class _DatabricksWorkspaceAuthInfo:
     auth: _DatabricksBearerAuth | None = None
 
 
-def _databricks_workspace_auth_info(workspace_host: str) -> _DatabricksWorkspaceAuthInfo | None:
-    """Mint a bearer and remember the Databricks profile that supplied it."""
+def _databricks_workspace_auth_info(
+    workspace_host: str, org_id: str | None = None
+) -> _DatabricksWorkspaceAuthInfo | None:
+    """Mint a bearer and remember the Databricks profile that supplied it.
+
+    :param workspace_host: The workspace host, e.g. ``"https://ws.databricks.com"``.
+    :param org_id: The ``?o=`` workspace the bearer is for, e.g. ``"123"``; a
+        profile pinned to it is preferred on a host that fronts several.
+    """
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _resolve_databricks_auth,
     )
 
     try:
-        auth, _host = _resolve_databricks_auth(host=workspace_host)
+        auth, _host = _resolve_databricks_auth(host=workspace_host, workspace_id=org_id)
         token = auth.current_token()
     except (DatabricksAuthError, ImportError, ValueError):
         return None

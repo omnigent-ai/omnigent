@@ -158,6 +158,7 @@ async def test_background_title_uses_isolated_codex_process(
         "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
         "HARNESS_CODEX_SKILLS_FILTER": '"none"',
         "HARNESS_CODEX_SKILLS_DIR": "",
+        "OMNIGENT_CLIENT_SURFACE": "unknown",
     }
     assert _build_harness_spawn_env(env)["HARNESS_CODEX_SKILLS_DIR"] == ""
     assert process_manager.released == [process_key]
@@ -350,7 +351,7 @@ async def test_background_title_resolves_synthetic_claude_policy_gate(
         )
     ]
     [(_url, body)] = harness_client.requests
-    assert body["max_output_tokens"] == 32
+    assert body["max_output_tokens"] == 256
     assert body["model_override"] == "haiku"
 
 
@@ -1158,7 +1159,10 @@ async def test_background_title_dispatches_any_registered_harness(
     }
     [context] = captured
     assert context.harness == "community-example"
-    assert context.spawn_env == {"EXAMPLE_MODEL": "example-model"}
+    assert context.spawn_env == {
+        "EXAMPLE_MODEL": "example-model",
+        "OMNIGENT_CLIENT_SURFACE": "unknown",
+    }
     assert context.model_override == "example-model"
     assert process_manager.get_client_calls == []
     assert process_manager.released == []
@@ -1455,6 +1459,59 @@ async def test_background_title_surfaces_harness_failure_and_releases_process(
     [(_, first_body), (_, second_body)] = harness_client.requests
     assert first_body["model_override"] == "gpt-5.6-luna"
     assert "model_override" not in second_body
+
+
+@pytest.mark.parametrize("additional_instructions", [None, "Prefix the title with today's date."])
+async def test_claude_sdk_title_can_finish_beyond_a_short_output_budget(
+    additional_instructions: str | None,
+) -> None:
+    title = "แก้ไขการตรวจสอบสิทธิ์"
+
+    class TokenLimitedClient(_FakeHarnessClient):
+        def stream(self, method, url, *, json, timeout):
+            self.requests.append((url, json))
+            # Model a provider response needing 80 tokens, including its stop marker.
+            if json["max_output_tokens"] < 80:
+                return _FakeHarnessStream(
+                    [
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "error": {
+                                    "message": (
+                                        "API Error: Claude's response exceeded "
+                                        "the output token maximum."
+                                    )
+                                }
+                            },
+                        }
+                    ]
+                )
+            return _FakeHarnessStream(
+                [
+                    {"type": "response.output_text.delta", "delta": title},
+                    {"type": "response.completed"},
+                ]
+            )
+
+    client = TokenLimitedClient()
+    manager = _FakeProcessManager(client)
+    result = await title_service.generate_background_title(
+        _title_context(
+            "claude-sdk",
+            process_manager=manager,
+            additional_instructions=additional_instructions,
+        )
+    )
+
+    assert result == title
+    [(process_key, harness, _env)] = manager.get_client_calls
+    assert harness == "claude-sdk"
+    assert manager.released == [process_key]
+    [(_url, request)] = client.requests
+    assert request["tools"] == []
+    assert request["model_override"] == background_title_model("claude-sdk")
+    assert 256 <= request["max_output_tokens"] <= 1024
 
 
 @pytest.mark.asyncio
