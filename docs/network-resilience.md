@@ -74,7 +74,9 @@ runs at 120 s because it must outlast Claude Code's request timeout.
 
 Native Claude terminals retry a model request that gets no response headers
 within `RetryPolicy`'s 120 s per-request timeout. To give a slower gateway more
-time, set `API_TIMEOUT_MS` in the provider config or the runner environment.
+time, set `API_TIMEOUT_MS` in the `env` of Claude Code's `settings.json`, or in
+the runner's environment. A host-started runner receives it only when
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` lists `API_TIMEOUT_MS`.
 
 ## Findings
 
