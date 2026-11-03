@@ -65,6 +65,8 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -172,7 +174,6 @@ def _team_role_field(labels: object) -> dict[str, str]:
 
 def _orchestration_source_headers(conversation_id: str | None) -> dict[str, str]:
     """Identify the calling session so the server can apply its project boundary."""
-    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
     return {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id else {}
 
@@ -4928,6 +4929,7 @@ async def _execute_scheduled_task_tool(
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
+    :param conversation_id: Session whose approved tool call is being dispatched.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -4936,6 +4938,13 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
+        action = "create" if tool_name == "sys_scheduled_task_create" else "update"
+        error = scheduled_task_review_error(args, action=action)
+        if error:
+            return json.dumps({"error": f"{tool_name}: {error}"})
     if "project_name" in args and "project_id" in args:
         return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
     raw_project_name = args.get("project_name")
@@ -4947,7 +4956,6 @@ async def _execute_scheduled_task_tool(
     wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
         "project_name" in args or "project_id" in args
     )
-
     source_headers = _orchestration_source_headers(conversation_id)
     try:
         if wants_project:

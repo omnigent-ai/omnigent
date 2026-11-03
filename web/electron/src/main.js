@@ -600,6 +600,10 @@ let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
 // `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
 let reconnectSlowDelayMs = 60_000;
+// A silent reconnect's IP access list refusals are usually the VPN still connecting
+// after wake or idle, so the overlay says the network is blocked only once they have
+// lasted this long. `let` so wiring tests can shrink it via testApi.setBlockedHintDelayMs.
+let blockedHintDelayMs = 30_000;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -641,10 +645,10 @@ const GRANTED_PERMISSIONS = new Set([
  * (localhost-trusted origins, not just pinned ones — see
  * isLocalhostTrustedOrigin). Two names because Chromium renamed the
  * permission: ``loopback-network`` is the granular Chromium 145+ name
- * (valid in Electron 42's Chromium 148, and the one Okta FastPass queries
+ * (valid in Electron 45's Chromium 156, and the one Okta FastPass queries
  * FIRST), ``local-network-access`` the older aggregate it falls back to.
  *
- * The localhost fetches themselves are NOT gated in Electron 42 (Chromium's
+ * The localhost fetches themselves are NOT gated in Electron 45 (Chromium's
  * LNA checks are disabled; verified empirically, including with
  * LocalNetworkAccessChecks force-enabled). But
  * ``navigator.permissions.query({name: ...})`` for these routes through the
@@ -707,7 +711,7 @@ async function ensureSystemMicAccess() {
  * request/check to a webContents — the requesting page is its top-level
  * page. Permission *checks* (the permissions.query path) can arrive with a
  * null webContents; those are allowed on origin trust alone, because the
- * answer is advisory in Electron 42 — it gates nothing beyond what fetch
+ * answer is advisory in Electron 45 — it gates nothing beyond what fetch
  * already allows, and a "denied" would falsely turn away IdP scripts that
  * probe before fetching.
  *
@@ -942,12 +946,14 @@ const UNREACHABLE_NET_ERRORS = new Set([
   -137, // NAME_RESOLUTION_FAILED
 ]);
 
-// Pending silent reconnects behind the overlay:
-// win → { serverUrl, returnUrl, attempt, timer, hint, finalMessage, network }.
+// Pending silent reconnects behind the overlay: win → { serverUrl, returnUrl,
+// attempt, timer, hint, finalMessage, network, blocked, blockedHintAt, hintTimer }.
 const reconnects = new WeakMap();
 
 function cancelReconnect(win) {
-  clearTimeout(reconnects.get(win)?.timer);
+  const state = reconnects.get(win);
+  clearTimeout(state?.timer);
+  clearTimeout(state?.hintTimer);
   reconnects.delete(win);
   reconnectOverlay.hide(win);
 }
@@ -979,25 +985,39 @@ function stopReconnect(win) {
  * Arm the next silent reconnect for a transient failure and show the overlay;
  * false once the schedule runs out. `finalMessage` is what Cancel shows. A
  * `network` failure (unreachable, or blocked by the IP access list) never runs
- * out: past the fast schedule it retries every reconnectSlowDelayMs.
+ * out: past the fast schedule it retries every reconnectSlowDelayMs. A `blocked`
+ * failure's hint waits until the refusals have lasted blockedHintDelayMs, unless
+ * they started with an explicit Connect.
  */
-function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, network = false }) {
+function scheduleReconnect(
+  win,
+  serverUrl,
+  returnUrl,
+  { hint, finalMessage, network = false, blocked = false, interactive = false },
+) {
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
   clearTimeout(previous?.timer);
+  clearTimeout(previous?.hintTimer);
   const attempt = same ? previous.attempt : 0;
   const delayMs = reconnectDelaysMs[attempt] ?? (network ? reconnectSlowDelayMs : undefined);
   if (delayMs === undefined) return false;
+  const now = Date.now();
+  const previousHintAt = same ? previous.blockedHintAt : null;
+  const blockedHintAt = interactive ? now : (previousHintAt ?? now + blockedHintDelayMs);
   const state = {
     serverUrl,
     // Never logged: it can name a conversation.
     returnUrl: returnUrl ?? (same ? previous.returnUrl : undefined) ?? serverUrl,
     attempt: attempt + 1,
     timer: null,
+    hintTimer: null,
     hint,
     finalMessage,
     network,
+    blocked,
+    blockedHintAt: blocked ? blockedHintAt : null,
   };
   const origin = originOf(serverUrl);
   console.log("[omnigent] databricks auth: reconnect scheduled", {
@@ -1023,15 +1043,22 @@ function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, netw
   };
   state.timer = setTimeout(fire, delayMs);
   reconnects.set(win, state);
-  reconnectOverlay.show(win, hint);
+  const hintDelayMs = blocked ? state.blockedHintAt - now : 0;
+  reconnectOverlay.show(win, hintDelayMs > 0 ? "" : hint);
+  if (hintDelayMs > 0) {
+    state.hintTimer = setTimeout(() => {
+      if (reconnects.get(win) === state) reconnectOverlay.show(win, hint);
+    }, hintDelayMs);
+  }
   return true;
 }
 
 let restartsReconnectsOnWake = false;
 
 /**
- * Waking or unlocking the Mac starts pending reconnects' fast schedule over, so
- * a VPN that comes back after wake is picked up within seconds.
+ * Waking or unlocking the Mac starts pending reconnects' fast schedule (and the
+ * wait before a blocked-network hint) over, so a VPN that comes back after wake
+ * is picked up within seconds.
  */
 function restartReconnectsOnWake() {
   if (restartsReconnectsOnWake) return;
@@ -1045,6 +1072,7 @@ function restartReconnectsOnWake() {
         reason,
       });
       state.attempt = 0;
+      state.blockedHintAt = null;
       if (!scheduleReconnect(win, state.serverUrl, state.returnUrl, state)) stopReconnect(win);
     }
   };
@@ -1074,7 +1102,12 @@ function unreachableMessage(serverUrl, blocked = false) {
 
 const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
-function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
+function showDatabricksAuthRequired(
+  win,
+  failedUrl,
+  error,
+  { returnUrl: failedReturnUrl, interactive = false } = {},
+) {
   if (win.isDestroyed()) return;
   diagnostics.record("auth_required", {
     origin: originOf(failedUrl),
@@ -1120,6 +1153,8 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
       hint: unreachable ? reconnectingHint(serverUrl, blocked) : UNAVAILABLE_HINT,
       finalMessage: message,
       network: unreachable,
+      blocked,
+      interactive,
     });
   if (!retrying) showConnectFailure(win, serverUrl, message);
 }
@@ -2240,9 +2275,10 @@ async function loadServerUrl(
           } else {
             // The account URL's workspace was unreachable: reconnect to that workspace.
             const workspaceUrl = error.storedOrigin && databricksWorkspaceUiUrl(error.storedOrigin);
-            if (workspaceUrl) {
-              showDatabricksAuthRequired(win, workspaceUrl, error, { returnUrl: workspaceUrl });
-            } else showDatabricksAuthRequired(win, serverUrl, error, { returnUrl: target });
+            showDatabricksAuthRequired(win, workspaceUrl || serverUrl, error, {
+              returnUrl: workspaceUrl || target,
+              interactive,
+            });
           }
         }
         throw error;
@@ -4350,7 +4386,8 @@ function registerIpc() {
     if (typeof text !== "string") {
       throw new TypeError("copy-setup-text requires a string");
     }
-    clipboard.writeText(text);
+    // Async since Electron 44; returning it lets the page report a failed copy.
+    return clipboard.writeText(text);
   });
 
   // SPA server picker → the sender window's pinned origin plus the persisted

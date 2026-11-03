@@ -24,6 +24,7 @@ from omnigent.runner.tool_dispatch import (
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _SCHEDULED_TASK_TOOLS,
     _execute_scheduled_task_tool,
+    execute_tool,
 )
 from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
 
@@ -34,6 +35,7 @@ _ALL_NAMES = {
     "sys_scheduled_task_delete",
 }
 _TASK_ID = "0123456789abcdef0123456789abcdef"
+_REVIEW_FIELDS = {"prompt": "Review every issue.", "permission_mode": None}
 
 
 class _Resp:
@@ -58,21 +60,18 @@ class _RecordingClient:
 
     def __init__(self, response: _Resp | None = None, *, info: _Resp | None = None) -> None:
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
-        self.sources: list[str | None] = []
+        self.headers: list[dict[str, str] | None] = []
         self._response = response or _Resp(body={"id": "t1"})
         self._info = info or _Resp(
             body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
         )
-
-    def _record_source(self, headers: dict[str, str] | None) -> None:
-        self.sources.append((headers or {}).get(ORCHESTRATION_SOURCE_HEADER))
 
     async def get(
         self, url: str, *, headers: dict[str, str] | None = None, timeout: object = None
     ) -> _Resp:
         self.calls.append(("GET", url, None))
         if url != "/v1/info":
-            self._record_source(headers)
+            self.headers.append(headers)
         return self._info if url == "/v1/info" else self._response
 
     async def post(
@@ -84,7 +83,7 @@ class _RecordingClient:
         timeout: object = None,
     ) -> _Resp:
         self.calls.append(("POST", url, json))
-        self._record_source(headers)
+        self.headers.append(headers)
         return self._response
 
     async def patch(
@@ -96,24 +95,25 @@ class _RecordingClient:
         timeout: object = None,
     ) -> _Resp:
         self.calls.append(("PATCH", url, json))
-        self._record_source(headers)
+        self.headers.append(headers)
         return self._response
 
     async def delete(
         self, url: str, *, headers: dict[str, str] | None = None, timeout: object = None
     ) -> _Resp:
         self.calls.append(("DELETE", url, None))
-        self._record_source(headers)
+        self.headers.append(headers)
         return self._response
 
 
 @pytest.mark.asyncio
 async def test_create_posts_payload() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "name": "nightly"}))
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
-        json.dumps(
+    out = await execute_tool(
+        tool_name="sys_scheduled_task_create",
+        arguments=json.dumps(
             {
+                **_REVIEW_FIELDS,
                 "name": "nightly",
                 "prompt": "go",
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
@@ -128,10 +128,12 @@ async def test_create_posts_payload() -> None:
             }
         ),
         server_client=client,
+        conversation_id="conv_source",
     )
     verb, url, body = client.calls[-1]
     assert (verb, url) == ("POST", "/v1/scheduled-tasks")
     assert body == {
+        **_REVIEW_FIELDS,
         "name": "nightly",
         "prompt": "go",
         "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
@@ -143,6 +145,45 @@ async def test_create_posts_payload() -> None:
         "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
+    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+@pytest.mark.parametrize("missing_field", ["prompt", "permission_mode"])
+async def test_current_runner_refuses_incomplete_review_before_dispatch(
+    tool_name: str, missing_field: str
+) -> None:
+    client = _RecordingClient()
+    arguments: dict[str, object] = {
+        **_REVIEW_FIELDS,
+        "scheduled_task_id": _TASK_ID,
+    }
+    arguments.pop(missing_field)
+    result = await _execute_scheduled_task_tool(
+        tool_name,
+        json.dumps(arguments),
+        server_client=client,
+        conversation_id="conv_source",
+    )
+
+    error = json.loads(result)["error"]
+    assert missing_field in error
+    assert ("List the task" in error) == (tool_name == "sys_scheduled_task_update")
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", ["null", "[]", "42", '"text"', "true"])
+async def test_scheduled_task_dispatch_rejects_non_object_arguments(arguments: str) -> None:
+    client = _RecordingClient()
+    result = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create", arguments, server_client=client
+    )
+    assert json.loads(result) == {
+        "error": "sys_scheduled_task_create: arguments must be an object"
+    }
+    assert client.calls == []
 
 
 @pytest.mark.asyncio
@@ -151,7 +192,7 @@ async def test_create_without_session_args_sends_no_session_fields() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1"}))
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_create",
-        json.dumps({"name": "n", "prompt": "p", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
+        json.dumps({**_REVIEW_FIELDS, "name": "n", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
         server_client=client,
     )
     _, _, body = client.calls[0]
@@ -187,7 +228,7 @@ async def test_session_args_are_refused_before_an_older_server_sees_them(
     """A server without session modes would reject the fields with a bare 422."""
     client = _RecordingClient(info=info)
     out = await _execute_scheduled_task_tool(
-        tool_name, json.dumps(arguments), server_client=client
+        tool_name, json.dumps({**_REVIEW_FIELDS, **arguments}), server_client=client
     )
 
     assert [url for _, url, _ in client.calls] == ["/v1/info"]
@@ -205,10 +246,11 @@ async def test_list_gets() -> None:
 @pytest.mark.asyncio
 async def test_update_patches_by_id() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "state": "paused"}))
-    await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update",
-        json.dumps(
+    await execute_tool(
+        tool_name="sys_scheduled_task_update",
+        arguments=json.dumps(
             {
+                **_REVIEW_FIELDS,
                 "scheduled_task_id": _TASK_ID,
                 "state": "paused",
                 "workspace": "/repo2",
@@ -216,14 +258,17 @@ async def test_update_patches_by_id() -> None:
             }
         ),
         server_client=client,
+        conversation_id="conv_source",
     )
     verb, url, body = client.calls[0]
     assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
     assert body == {
+        **_REVIEW_FIELDS,
         "state": "paused",
         "workspace": "/repo2",
         "host_id": "fedcba9876543210fedcba9876543210",
     }
+    assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
 
 
 @pytest.mark.asyncio
@@ -239,6 +284,7 @@ async def test_update_forwards_agent_switch_cost_cap_and_project() -> None:
         "sys_scheduled_task_update",
         json.dumps(
             {
+                **_REVIEW_FIELDS,
                 "scheduled_task_id": _TASK_ID,
                 "agent_id": "ag_pi",
                 "max_cost_usd": 2.5,
@@ -248,7 +294,7 @@ async def test_update_forwards_agent_switch_cost_cap_and_project() -> None:
         server_client=client,
     )
     _, _, body = client.calls[-1]
-    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5, "project_id": None}
+    assert body == {**_REVIEW_FIELDS, "agent_id": "ag_pi", "max_cost_usd": 2.5, "project_id": None}
 
 
 class _ProjectsClient(_RecordingClient):
@@ -315,7 +361,7 @@ async def test_project_name_is_sent_as_the_resolved_project_id(
     created: bool,
 ) -> None:
     client = _ProjectsClient(list(projects), create_status=create_status)
-    args: dict[str, object] = {"project_name": "  triage "}
+    args: dict[str, object] = {**_REVIEW_FIELDS, "project_name": "  triage "}
     if tool_name == "sys_scheduled_task_update":
         args["scheduled_task_id"] = _TASK_ID
     await _execute_scheduled_task_tool(tool_name, json.dumps(args), server_client=client)
@@ -344,7 +390,7 @@ async def test_project_name_errors_never_reach_the_task_route(
 ) -> None:
     client = _ProjectsClient([], create_status=create_status)
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create", json.dumps(args), server_client=client
+        "sys_scheduled_task_create", json.dumps({**_REVIEW_FIELDS, **args}), server_client=client
     )
     assert error in json.loads(out)["error"]
     assert not [url for _, url, _ in client.calls if url.startswith("/v1/scheduled-tasks")]
@@ -370,7 +416,9 @@ async def test_project_args_are_refused_on_a_server_without_task_projects(
 ) -> None:
     """An older server would 422 the field, so nothing is created or sent."""
     client = _ProjectsClient([], info=info)
-    out = await _execute_scheduled_task_tool(tool_name, json.dumps(args), server_client=client)
+    out = await _execute_scheduled_task_tool(
+        tool_name, json.dumps({**_REVIEW_FIELDS, **args}), server_client=client
+    )
     assert "does not support automation projects" in json.loads(out)["error"]
     assert [url for _, url, _ in client.calls] == ["/v1/info"]
 
@@ -389,7 +437,7 @@ async def test_update_by_name_on_an_unknown_task_creates_no_project() -> None:
     client = _MissingTaskClient([])
     out = await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
-        json.dumps({"scheduled_task_id": _TASK_ID, "project_name": "new"}),
+        json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "project_name": "new"}),
         server_client=client,
     )
     assert json.loads(out)["error"] == "server returned 404"
@@ -402,7 +450,7 @@ async def test_calls_without_project_args_skip_the_capability_check() -> None:
     client = _RecordingClient(info=_Resp(body={}))
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
-        json.dumps({"scheduled_task_id": _TASK_ID, "name": "renamed"}),
+        json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "name": "renamed"}),
         server_client=client,
     )
     assert [url for _, url, _ in client.calls] == [f"/v1/scheduled-tasks/{_TASK_ID}"]
@@ -412,7 +460,15 @@ async def test_calls_without_project_args_skip_the_capability_check() -> None:
 def test_update_schema_accepts_a_project_id_or_null(project_id: str | None) -> None:
     """A schema-validating client can move a task's project or clear it with null."""
     parameters = SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
-    jsonschema.validate({"scheduled_task_id": _TASK_ID, "project_id": project_id}, parameters)
+    jsonschema.validate(
+        {
+            "scheduled_task_id": _TASK_ID,
+            "prompt": "Triage new issues.",
+            "permission_mode": None,
+            "project_id": project_id,
+        },
+        parameters,
+    )
 
 
 @pytest.mark.asyncio
@@ -432,7 +488,11 @@ async def test_update_rejects_path_confusion_task_id() -> None:
     out = await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
         json.dumps(
-            {"scheduled_task_id": "../0123456789abcdef0123456789abcdef", "state": "paused"}
+            {
+                **_REVIEW_FIELDS,
+                "scheduled_task_id": "../0123456789abcdef0123456789abcdef",
+                "state": "paused",
+            }
         ),
         server_client=client,
     )
@@ -444,7 +504,9 @@ async def test_update_rejects_path_confusion_task_id() -> None:
 async def test_update_without_id_errors() -> None:
     client = _RecordingClient()
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update", json.dumps({"state": "paused"}), server_client=client
+        "sys_scheduled_task_update",
+        json.dumps({**_REVIEW_FIELDS, "state": "paused"}),
+        server_client=client,
     )
     assert "scheduled_task_id" in json.loads(out)["error"]
     assert client.calls == []  # never hit the server
@@ -455,7 +517,7 @@ async def test_server_error_becomes_clean_json() -> None:
     client = _RecordingClient(_Resp(status_code=400, body={"error": {"message": "bad rrule"}}))
     out = await _execute_scheduled_task_tool(
         "sys_scheduled_task_create",
-        json.dumps({"name": "x", "prompt": "p", "rrule": "FREQ=SECONDLY", "agent_id": "a"}),
+        json.dumps({**_REVIEW_FIELDS, "name": "x", "rrule": "FREQ=SECONDLY", "agent_id": "a"}),
         server_client=client,
     )
     assert "server returned 400" in json.loads(out)["error"]
@@ -490,7 +552,13 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     assert "base_branch" not in properties
     assert "workspace" not in schema["required"]
     assert "host_id" not in schema["required"]
-    assert set(schema["required"]) == {"name", "prompt", "rrule", "agent_id"}
+    assert set(schema["required"]) == {
+        "name",
+        "prompt",
+        "rrule",
+        "agent_id",
+        "permission_mode",
+    }
 
 
 def test_update_tool_schema_allows_connected_host_changes() -> None:
@@ -502,6 +570,7 @@ def test_update_tool_schema_allows_connected_host_changes() -> None:
     assert "host_id" in properties
     # Switching which agent/harness a task runs is part of the update surface.
     assert "agent_id" in properties
+    assert set(schema["required"]) == {"scheduled_task_id", "prompt", "permission_mode"}
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:
@@ -518,6 +587,7 @@ async def test_update_forwards_session_fields() -> None:
         "sys_scheduled_task_update",
         json.dumps(
             {
+                **_REVIEW_FIELDS,
                 "scheduled_task_id": _TASK_ID,
                 "session_mode": "continue",
                 "session_id": None,
@@ -526,7 +596,7 @@ async def test_update_forwards_session_fields() -> None:
         server_client=client,
     )
     _, _, body = client.calls[-1]
-    assert body == {"session_mode": "continue", "session_id": None}
+    assert body == {**_REVIEW_FIELDS, "session_mode": "continue", "session_id": None}
 
 
 @pytest.mark.asyncio
@@ -536,14 +606,20 @@ async def test_task_calls_identify_the_calling_session() -> None:
     task_id = "a" * 32
     for tool_name, arguments in (
         ("sys_scheduled_task_list", {}),
-        ("sys_scheduled_task_create", {"name": "n", "prompt": "p", "rrule": "r", "agent_id": "a"}),
-        ("sys_scheduled_task_update", {"scheduled_task_id": task_id, "name": "renamed"}),
+        (
+            "sys_scheduled_task_create",
+            {"name": "n", "rrule": "r", "agent_id": "a", **_REVIEW_FIELDS},
+        ),
+        (
+            "sys_scheduled_task_update",
+            {"scheduled_task_id": task_id, "name": "renamed", **_REVIEW_FIELDS},
+        ),
         ("sys_scheduled_task_delete", {"scheduled_task_id": task_id}),
     ):
         await _execute_scheduled_task_tool(
             tool_name, json.dumps(arguments), server_client=client, conversation_id="conv_lead"
         )
-    assert client.sources == ["conv_lead"] * 4
+    assert client.headers == [{ORCHESTRATION_SOURCE_HEADER: "conv_lead"}] * 4
 
 
 @pytest.mark.asyncio
@@ -554,7 +630,7 @@ async def test_project_name_is_refused_inside_the_project_boundary() -> None:
     out = await _execute_scheduled_task_tool(
         "sys_scheduled_task_create",
         json.dumps(
-            {"name": "n", "prompt": "p", "rrule": "r", "agent_id": "a", "project_name": "New"}
+            {"name": "n", "rrule": "r", "agent_id": "a", "project_name": "New", **_REVIEW_FIELDS}
         ),
         server_client=client,
     )
