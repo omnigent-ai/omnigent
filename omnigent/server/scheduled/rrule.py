@@ -163,10 +163,8 @@ def get_next_fire_time(
         horizon_from=after.astimezone(tz) if anchor is not None else None,
         count_after=anchor.astimezone(tz) if anchor is not None else None,
     )
-    # `rule.after` compares in dtstart's timezone, so localize `after` too. A
-    # spring-forward "imaginary" wall time maps to some instant via zoneinfo and
-    # a fall-back duplicated time picks the earlier of the two. Cadences
-    # follow local wall time across DST edges rather than elapsed UTC time.
+    # Localize `after` for dtstart comparisons. Zoneinfo resolves DST gaps/folds
+    # (earlier fold), so cadences follow local wall time rather than elapsed UTC.
     return rule.after(after.astimezone(tz), inc=False)
 
 
@@ -274,6 +272,7 @@ def validate_rrule(
     tz: ZoneInfo | None = None,  # noqa: ARG001
     *,
     session_mode: str = "new",
+    allow_subhour: bool = True,
 ) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
@@ -290,6 +289,7 @@ def validate_rrule(
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
     :param session_mode: Only ``"continue"`` permits the ten-minute minimum.
+    :param allow_subhour: API rollout gate; schedulers retain support for saved rules.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -321,7 +321,9 @@ def validate_rrule(
     if count == 1:
         raise RRuleValidationError("RRULE fires only once")
     minimum = (
-        MIN_CONTINUED_INTERVAL_SECONDS if session_mode == "continue" else MIN_INTERVAL_SECONDS
+        MIN_CONTINUED_INTERVAL_SECONDS
+        if session_mode == "continue" and allow_subhour
+        else MIN_INTERVAL_SECONDS
     )
     if min_gap < minimum:
         raise RRuleValidationError(

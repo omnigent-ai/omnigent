@@ -37,6 +37,19 @@ export interface ScheduleModel {
 }
 
 export const MAX_MINUTE_INTERVAL = 366 * 60;
+export const MIN_CONTINUED_MINUTE_INTERVAL = 10;
+export const MIN_NEW_SESSION_MINUTE_INTERVAL = 60;
+
+export function minimumScheduleInterval(
+  frequency: CustomFreq,
+  sessionMode: "new" | "continue",
+  subhourSupported: boolean,
+): number {
+  if (frequency !== "minutely") return 1;
+  return sessionMode === "continue" && subhourSupported
+    ? MIN_CONTINUED_MINUTE_INTERVAL
+    : MIN_NEW_SESSION_MINUTE_INTERVAL;
+}
 
 export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
   preset: "daily",
@@ -154,7 +167,11 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     if (!parseUntil(until)) return null;
     model.end = { type: "until", until };
   }
-  return validateSchedule(model, { allowPastEnd: true, sessionMode: "continue" }) === null
+  return validateSchedule(model, {
+    allowPastEnd: true,
+    sessionMode: "continue",
+    subhourSupported: true,
+  }) === null
     ? model
     : null;
 }
@@ -257,10 +274,12 @@ export function validateSchedule(
     allowPastEnd = false,
     now = new Date(),
     sessionMode = "new",
+    subhourSupported = false,
   }: {
     allowPastEnd?: boolean;
     now?: Date;
     sessionMode?: "new" | "continue";
+    subhourSupported?: boolean;
   } = {},
 ): string | null {
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
@@ -280,11 +299,14 @@ export function validateSchedule(
     return "Pick at least one day of the week.";
   }
   if (model.preset === "custom") {
-    const minimum = model.customFreq === "minutely" ? (sessionMode === "continue" ? 10 : 60) : 1;
+    const minimum = minimumScheduleInterval(model.customFreq, sessionMode, subhourSupported);
     const maximum = model.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366;
     if (!Number.isInteger(model.interval) || model.interval < minimum || model.interval > maximum) {
-      if (model.customFreq === "minutely" && sessionMode !== "continue" && model.interval < 60)
-        return "Schedules more often than hourly require continuing in the same session.";
+      if (model.customFreq === "minutely" && model.interval < MIN_NEW_SESSION_MINUTE_INTERVAL) {
+        if (sessionMode !== "continue")
+          return "Schedules more often than hourly require continuing in the same session.";
+        if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
+      }
       return `Interval must be a whole number of at least ${minimum} and at most ${maximum}.`;
     }
     if (model.customFreq === "weekly" && model.weekdays.length === 0) {

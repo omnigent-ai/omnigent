@@ -36,6 +36,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
+        "automations_subhour": False,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
         "codex_plan_at_launch": True,

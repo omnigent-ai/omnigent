@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.host import Host, isolated_host
+from tests._helpers.live_server import terminate_process
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -1128,8 +1129,12 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
 
 
-@pytest.mark.usefixtures("automations_v2_host")
-def test_ten_minute_continued_schedule_round_trip(page: Page, automations_v2_server: str) -> None:
+@pytest.mark.parametrize(
+    "automations_v2_server", ["automations_v2,automations_subhour"], indirect=True
+)
+def test_ten_minute_continued_schedule_round_trip(
+    page: Page, automations_v2_server: str, automations_v2_host: Host
+) -> None:
     """The browser exposes minutes only for continuation and the real API preserves the rule."""
     name = f"Ten minute schedule {uuid.uuid4().hex[:8]}"
     _open_automations_page(page, automations_v2_server)
@@ -1152,13 +1157,18 @@ def test_ten_minute_continued_schedule_round_trip(page: Page, automations_v2_ser
     interval.fill("10")
     page.get_by_role("button", name="Apply", exact=True).click()
     expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    # Stop the pinned host before creation, so even a boundary cannot launch an agent.
+    terminate_process(automations_v2_host.proc)
+    assert automations_v2_host.proc.poll() is not None
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
     response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks", timeout=10.0)
     response.raise_for_status()
     task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
     assert (task["rrule"], task["session_mode"]) == ("FREQ=MINUTELY;INTERVAL=10", "continue")
-    # Keep this browser journey about editing, without launching an agent at the next boundary.
+    assert task["host_id"] == automations_v2_host.host_id
+    assert task["session_id"] is None
+    # An offline-host occurrence is harmless; pause the task before editing.
     httpx.patch(
         f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}",
         json={"state": "paused"},

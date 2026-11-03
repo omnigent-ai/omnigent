@@ -1,6 +1,7 @@
 # Persistent task scheduling
 
-Recurring schedules have a minimum interval of **10 minutes** when continuing the
+With `automations_subhour` enabled, recurring schedules have a minimum interval
+of **10 minutes** when continuing the
 existing session, or **one hour** when starting a new session each run. For a
 ten-minute schedule, use `FREQ=MINUTELY;INTERVAL=10` with `session_mode: "continue"`.
 
@@ -555,6 +556,26 @@ false so clients can hide the feature. A callable that raises counts as off. The
 gate does not stop the scheduler: tasks created while it was on keep running,
 and can be paused or deleted only once it is on again. Omitting it enables
 automations.
+
+## Sub-hour schedule rollout
+
+`automations_subhour` defaults off and controls acceptance on create and
+schedule/mode updates. It is advertised in `/v1/info` so clients that cannot
+confirm support keep the hourly minimum. Schedulers in this version always
+understand persisted ten-minute continued schedules, independently of the flag.
+
+1. Deploy this version to every API and scheduler replica sharing the database
+   with `automations_subhour` disabled. Keep the existing scheduler mode unchanged.
+2. Once every replica supports the lower floor, enable `automations_subhour`
+   through `OMNIGENT_FEATURES`; the custom UI also needs `automations_v2`.
+3. To stop accepting new sub-hour schedules, disable `automations_subhour`. Existing
+   schedules keep running and can still be paused, deleted or changed to hourly.
+
+Before rolling binaries back to a version with the hourly-only parser, stop
+accepting sub-hour schedules, pause them and change their recurrence to hourly
+or slower (or delete them). An old scheduler can durably pause unsupported rules
+and clear `next_run_at`, even before its host-ownership filter. Restoring the new
+binary does not automatically resume tasks paused by an old scheduler.
 
 ## Switching schedulers
 

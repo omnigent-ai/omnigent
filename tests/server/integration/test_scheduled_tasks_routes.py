@@ -3142,7 +3142,17 @@ async def test_random_worktree_requires_pinned_repository(
         ("continue", 10, 200),
     ],
 )
-async def test_create_interval_policy(auth_client, session_mode, minutes, status):
+@pytest.mark.parametrize("subhour_enabled", [False, True])
+async def test_create_interval_policy(
+    auth_client, auth_app, session_mode, minutes, status, subhour_enabled
+):
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "automations_subhour" if subhour_enabled else ""}
+    )
+    info = await auth_client.get("/v1/info", headers=_headers())
+    assert info.json()["features"]["automations_subhour"] is subhour_enabled
+    if not subhour_enabled and minutes < 60:
+        status = 400
     response = await auth_client.post(
         "/v1/scheduled-tasks",
         json=_create_body(session_mode=session_mode, rrule=f"FREQ=MINUTELY;INTERVAL={minutes}"),
@@ -3154,7 +3164,10 @@ async def test_create_interval_policy(auth_client, session_mode, minutes, status
         assert response.json()["session_id"] is None
 
 
-async def test_update_validates_effective_schedule_and_session_mode(auth_client):
+async def test_update_validates_effective_schedule_and_session_mode(auth_client, auth_app):
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "automations_subhour"}
+    )
     response = await auth_client.post(
         "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
     )
@@ -3167,6 +3180,14 @@ async def test_update_validates_effective_schedule_and_session_mode(auth_client)
         ({"rrule": "FREQ=MINUTELY;INTERVAL=9"}, 400),
         ({"session_mode": "new"}, 400),
         ({"name": "Renamed"}, 200),
+    ]:
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == expected, response.text
+    auth_app.state.feature_flags = resolve_feature_flags({})
+    for patch, expected in [
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
+        ({"session_mode": "continue"}, 400),
+        ({"state": "paused"}, 200),
     ]:
         response = await auth_client.patch(url, json=patch, headers=_headers())
         assert response.status_code == expected, response.text

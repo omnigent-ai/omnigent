@@ -1,8 +1,13 @@
 # Automations (scheduled tasks)
 
-Recurring schedules have a minimum interval of **10 minutes** when continuing the
+With `automations_subhour` enabled, recurring schedules have a minimum interval
+of **10 minutes** when continuing the
 existing session, or **one hour** when starting a new session each run. For a
 ten-minute schedule, use `FREQ=MINUTELY;INTERVAL=10` with `session_mode: "continue"`.
+The flag defaults off: create and schedule changes require at least one hour until
+it is enabled. The custom editor also requires `automations_v2`. Older servers
+that omit `automations_subhour` keep the hourly client limit without rewriting
+saved schedules. See the [rollout guidance](../omnigent/server/scheduled/README.md#sub-hour-schedule-rollout).
 
 An automation is a saved instruction that fires an agent session on a recurring schedule. Each firing starts or continues a real session, bound to an agent, that runs a stored prompt -- so "triage new issues every weekday at 9" or "summarize yesterday's alerts each morning" runs without anyone at the keyboard.
 

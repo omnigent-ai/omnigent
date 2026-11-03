@@ -28,6 +28,7 @@ import { describeSchedule } from "@/lib/scheduleText";
 import {
   buildRRule,
   MAX_MINUTE_INTERVAL,
+  minimumScheduleInterval,
   formatUntil,
   parseUntil,
   validateSchedule,
@@ -77,6 +78,7 @@ export function ScheduleFields({
   model,
   anchoredScheduling,
   sessionMode = "new",
+  subhourSupported = false,
   onChange,
   timezone,
   onTimezoneChange,
@@ -88,6 +90,7 @@ export function ScheduleFields({
   model: ScheduleModel;
   anchoredScheduling: boolean;
   sessionMode?: "new" | "continue";
+  subhourSupported?: boolean;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
@@ -124,10 +127,18 @@ export function ScheduleFields({
     dateInput.timezone === timezone
       ? dateInput
       : null;
-  const error = activeDateInput?.error ?? validateSchedule(model, { allowPastEnd, sessionMode });
+  const error =
+    activeDateInput?.error ??
+    validateSchedule(model, { allowPastEnd, sessionMode, subhourSupported });
   const recurrence = { ...model, end: undefined };
-  const recurrenceError = validateSchedule(recurrence, { sessionMode: "continue" });
-  const draftError = validateSchedule({ ...draft, end: undefined }, { sessionMode });
+  const recurrenceError = validateSchedule(recurrence, {
+    sessionMode: "continue",
+    subhourSupported: true,
+  });
+  const draftError = validateSchedule(
+    { ...draft, end: undefined },
+    { sessionMode, subhourSupported },
+  );
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
 
   function changeCustomOpen(open: boolean) {
@@ -248,9 +259,7 @@ export function ScheduleFields({
                     id="custom-interval"
                     data-testid="custom-interval"
                     type="number"
-                    min={
-                      draft.customFreq === "minutely" ? (sessionMode === "continue" ? 10 : 60) : 1
-                    }
+                    min={minimumScheduleInterval(draft.customFreq, sessionMode, subhourSupported)}
                     max={draft.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366}
                     step={1}
                     value={Number.isFinite(draft.interval) ? draft.interval : ""}
@@ -267,12 +276,13 @@ export function ScheduleFields({
                     testId="custom-freq-trigger"
                     value={draft.customFreq}
                     options={[
-                      ...(sessionMode === "continue" || draft.customFreq === "minutely"
+                      ...((sessionMode === "continue" && subhourSupported) ||
+                      draft.customFreq === "minutely"
                         ? [
                             {
                               value: "minutely",
                               label: "Minutes",
-                              disabled: sessionMode !== "continue",
+                              disabled: sessionMode !== "continue" || !subhourSupported,
                             },
                           ]
                         : []),
@@ -280,7 +290,16 @@ export function ScheduleFields({
                     ]}
                     onChange={(value) => {
                       const next = { ...draft, customFreq: value as CustomFreq };
-                      if (value === "minutely") next.interval = Math.max(10, next.interval || 10);
+                      if (value === "minutely") {
+                        const minimum = minimumScheduleInterval(
+                          next.customFreq,
+                          sessionMode,
+                          subhourSupported,
+                        );
+                        next.interval = Math.max(minimum, next.interval || minimum);
+                      } else if (draft.customFreq === "minutely") {
+                        next.interval = 1;
+                      }
                       if (value === "hourly" && !Number.isInteger(next.minute)) next.minute = 0;
                       setDraft(next);
                     }}

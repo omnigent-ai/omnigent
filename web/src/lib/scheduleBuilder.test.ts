@@ -210,10 +210,13 @@ describe("minute cadence policy", () => {
     "validates %i minutes by session mode",
     (interval) => {
       const schedule = model({ preset: "custom", customFreq: "minutely", interval });
-      expect(validateSchedule(schedule, { sessionMode: "continue" }) === null).toBe(
-        interval >= 10 && interval <= 366 * 60,
-      );
+      expect(
+        validateSchedule(schedule, { sessionMode: "continue", subhourSupported: true }) === null,
+      ).toBe(interval >= 10 && interval <= 366 * 60);
       expect(validateSchedule(schedule) === null).toBe(interval >= 60 && interval <= 366 * 60);
+      expect(validateSchedule(schedule, { sessionMode: "continue" }) === null).toBe(
+        interval >= 60 && interval <= 366 * 60,
+      );
     },
   );
 });

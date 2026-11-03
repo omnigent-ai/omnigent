@@ -99,6 +99,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
+        "automations_subhour": False,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
         "codex_plan_at_launch": True,

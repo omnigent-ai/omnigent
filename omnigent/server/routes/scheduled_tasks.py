@@ -34,7 +34,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
-from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
+from omnigent.server.feature_flags import DeploymentGate, Feature, deployment_gate_enabled
 from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
@@ -291,10 +291,15 @@ def _run_to_response(
     }
 
 
-async def _validate_rrule_or_400(rrule: str, session_mode: str) -> None:
+async def _validate_rrule_or_400(request: Request, rrule: str, session_mode: str) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        await asyncio.to_thread(validate_rrule, rrule, session_mode=session_mode)
+        await asyncio.to_thread(
+            validate_rrule,
+            rrule,
+            session_mode=session_mode,
+            allow_subhour=request.app.state.feature_flags.enabled(Feature.AUTOMATIONS_SUBHOUR),
+        )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -593,7 +598,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        await _validate_rrule_or_400(body.rrule, body.session_mode)
+        await _validate_rrule_or_400(request, body.rrule, body.session_mode)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -929,7 +934,9 @@ def create_scheduled_tasks_router(
         target_session_mode = fields.get("session_mode", existing.session_mode)
         if body.rrule is not None or "session_mode" in fields:
             await _validate_rrule_or_400(
-                body.rrule if body.rrule is not None else existing.rrule, target_session_mode
+                request,
+                body.rrule if body.rrule is not None else existing.rrule,
+                target_session_mode,
             )
         if target_session_mode == "new":
             if fields.get("session_id") is not None:
