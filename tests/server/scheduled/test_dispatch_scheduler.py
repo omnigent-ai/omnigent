@@ -160,6 +160,7 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
 
 
 async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog) -> None:
+    caplog.set_level(logging.INFO)
     tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
     clock = FakeClock(max(task.next_run_at for task in tasks))
     ordered = store.list_due_tasks(int(clock.now()))
@@ -187,6 +188,24 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog)
     assert [event["operation"] for event in failures] == ["claim"]
     assert store.list_runs(own.id)[0][0].status == "running"
     assert store.list_runs(ordered[0].id)[0] == []
+    observed = _events(caplog, "scheduled_run_occurrence_observed")
+    assert {event["task_id"] for event in observed} == {task.id for task in tasks}
+    assert all(event["observed_at"] == int(clock.now()) for event in observed)
+    assert all(event["rrule"] == tasks[0].rrule for event in observed)
+    assert all(event["schedule_anchor"] == tasks[0].created_at for event in observed)
+
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(_events(caplog, "scheduled_run_occurrence_observed")) == len(observed)
+    clock.advance(3600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    later = _events(caplog, "scheduled_run_occurrence_observed")[len(observed) :]
+    assert len(later) == 1
+    assert later[0]["task_id"] == own.id
+    assert later[0]["scheduled_at"] != next(
+        e["scheduled_at"] for e in observed if e["task_id"] == own.id
+    )
 
 
 async def test_startup_limit_leaves_unclaimed_work_for_next_poll(store) -> None:
@@ -544,6 +563,9 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
         await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
         assert exited.is_set()
         assert all(startup.cancelled() or startup.exception() is None for startup in startups)
+        # gather can return without yielding when startups are already done, so yield once
+        # to run the scheduler's done callback that forgets each finished startup.
+        await asyncio.sleep(0)
         assert scheduler._startups == {}
         run = store.list_runs(task.id)[0][0]
         expected_status = (
@@ -678,6 +700,9 @@ async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
+        # Let the first poll's sweep finish, so the next poll starts a fresh one.
+        assert scheduler._recovery is not None
+        await scheduler._recovery
         clock.advance(120)
         await scheduler.poll_once()
         await _drain(scheduler)
@@ -1571,6 +1596,10 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
 
     names = {task.id: name for name, task in tasks.items()}
     claimed = _events(caplog, "scheduled_run_claimed")
+    attempted = _events(caplog, "scheduled_run_claim_attempted")
+    assert {event["task_id"] for event in attempted} == {task.id for task in tasks.values()}
+    assert all(event["trigger_key"] == f"schedule:{event['scheduled_at']}" for event in attempted)
+    assert all(event["trigger_key"] == f"schedule:{event['scheduled_at']}" for event in claimed)
     assert sorted(names[event["task_id"]] for event in claimed) == [
         "delivered",
         "failed",
@@ -1597,6 +1626,7 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
         "interrupted": "interrupted",
     }
     assert ended["delivered"]["prompt_delay_seconds"] == 10
+    assert ended["delivered"]["startup_delay_seconds"] == 10
     assert ended["delivered"]["session_id"] == session_id
     assert ended["failed"]["error_code"] == "host_offline"
     # Both unresolved startups are handed to recovery.
@@ -1702,6 +1732,11 @@ async def test_failed_operations_log_debug_events(store, monkeypatch, caplog, fa
     try:
         await scheduler.start()
         await poll_until_async(matching)
+        if failure == "claim":
+            [attempt] = _events(caplog, "scheduled_run_claim_attempted")
+            assert attempt["trigger_key"] == matching()[0]["trigger_key"]
+            assert matching()[0]["scheduled_at"] == task.next_run_at
+            assert matching()[0]["failure_stage"] == "claim"
         if failure == "initialize_scan":
             assert all("task_id" not in event for event in matching())
         if failure == "lease_renewal":

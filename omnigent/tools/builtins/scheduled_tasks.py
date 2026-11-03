@@ -94,14 +94,18 @@ class SysScheduledTaskCreateTool(Tool):
                             "description": "Optional per-run reasoning-effort hint, e.g. 'high'.",
                         },
                         "permission_mode": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "Optional permission mode for native coding agents that "
-                                "support one (Claude Code): 'default', 'auto', "
-                                "'acceptEdits', 'plan', 'dontAsk', or 'bypassPermissions'. "
+                                "support one. Use the selected harness's vocabulary: "
+                                "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
+                                "'read-only', 'full-access', 'bypass'), "
+                                "Cursor (e.g. 'auto-review'), "
+                                "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
                                 "stalls waiting for approval — prefer an auto-running mode. "
-                                "Omit for the agent default."
+                                "Set null for the agent default. This field is required so "
+                                "the user can review the effective task setting."
                             ),
                         },
                         "max_cost_usd": {
@@ -175,7 +179,13 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                     },
-                    "required": ["name", "prompt", "rrule", "agent_id"],
+                    "required": [
+                        "name",
+                        "prompt",
+                        "rrule",
+                        "agent_id",
+                        "permission_mode",
+                    ],
                     "additionalProperties": False,
                 },
             },
@@ -225,7 +235,9 @@ class SysScheduledTaskUpdateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Update a scheduled task's mutable fields. Only the fields you pass "
-            "change; omit the rest. Pass agent_id to switch which agent/harness "
+            "change, except prompt and permission_mode: first list the task and "
+            "resend those complete review fields even when they are unchanged. "
+            "Pass agent_id to switch which agent/harness "
             "it runs. Pass state='paused' to stop it firing without deleting it, "
             "or state='active' to resume. A 'completed' task has no remaining "
             "occurrences; change its rrule to schedule it again."
@@ -265,11 +277,15 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": "New reasoning-effort hint.",
                         },
                         "permission_mode": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
-                                "New permission mode for native coding agents (Claude "
-                                "Code): 'default', 'auto', 'acceptEdits', 'plan', "
-                                "'dontAsk', or 'bypassPermissions'."
+                                "New permission mode using the selected harness's vocabulary: "
+                                "Claude Code (e.g. 'acceptEdits'), Codex (e.g. 'read-only'), "
+                                "Cursor (e.g. 'auto-review'), Antigravity ('default', 'skip'), "
+                                "or Devin (e.g. 'smart'). Set null for the agent default. "
+                                "Required for approval review; resend the current value "
+                                "when it is unchanged. When switching to a harness "
+                                "without permission-mode support, send null."
                             ),
                         },
                         "max_cost_usd": {
@@ -330,7 +346,7 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                     },
-                    "required": ["scheduled_task_id"],
+                    "required": ["scheduled_task_id", "prompt", "permission_mode"],
                     "additionalProperties": False,
                 },
             },
