@@ -25,6 +25,7 @@ from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -244,7 +245,9 @@ class ExecutorAdapter(HarnessApp):
         """
         executor = self._ensure_executor()
         messages = _translate_input_to_messages(
-            request.input, include_tool_history=executor.replays_tool_history()
+            request.input,
+            include_tool_history=executor.replays_tool_history(),
+            preserve_content_blocks=executor.preserves_message_content_blocks(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -356,6 +359,7 @@ class ExecutorAdapter(HarnessApp):
                 phase_scope(ErrorPhase.TURN),
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
+                native_shell_authorization(request.authorized_native_shell_command),
             ):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
@@ -730,24 +734,34 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            text = _extract_user_text(injection.input)
-            if not text:
+            content = (
+                _normalize_message_content(injection.input, preserve_content_blocks=True)
+                if executor.preserves_message_content_blocks()
+                else _extract_user_text(injection.input)
+            )
+            if not content:
                 _logger.warning(
-                    "skipping in-band injection with no text payload: %r",
+                    "skipping in-band injection with no supported payload: %r",
                     injection.input,
                 )
                 continue
             if ctx.cancelled.is_set():
                 return
             try:
-                with input_delivery_scope(
-                    injection.model_dump(include=set(INPUT_FIELDS)), response_id=ctx.response_id
+                with (
+                    input_delivery_scope(
+                        injection.model_dump(include=set(INPUT_FIELDS)),
+                        response_id=ctx.response_id,
+                    ),
+                    native_shell_authorization(injection.authorized_native_shell_command),
                 ):
                     log_input_event(
                         _logger, "native_input_steering_started", session_id=ctx.session_id
                     )
                     try:
-                        accepted = await executor.enqueue_session_message(self._session_key, text)
+                        accepted = await executor.enqueue_session_message(
+                            self._session_key, content
+                        )
                         outcome = "executor_accepted" if accepted else "executor_refused"
                     except InjectionDeliveryAmbiguous:
                         # The harness may already hold the message; resending could duplicate it.
@@ -1557,6 +1571,7 @@ def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
     *,
     include_tool_history: bool = False,
+    preserve_content_blocks: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1568,12 +1583,16 @@ def _translate_input_to_messages(
         return [{"role": "user", "content": input_value}]
 
     history_messages = _extract_role_keyed_messages(
-        input_value, include_tool_history=include_tool_history
+        input_value,
+        include_tool_history=include_tool_history,
+        preserve_content_blocks=preserve_content_blocks,
     )
     if history_messages:
         return history_messages
 
-    content = _normalize_message_content(input_value)
+    content = _normalize_message_content(
+        input_value, preserve_content_blocks=preserve_content_blocks
+    )
     return [{"role": "user", "content": content}]
 
 
@@ -1581,6 +1600,7 @@ def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
     *,
     include_tool_history: bool,
+    preserve_content_blocks: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1612,7 +1632,9 @@ def _extract_role_keyed_messages(
         if item_type != "message" or "role" not in item:
             continue
         role = item["role"]
-        content = _normalize_message_content(item.get("content"))
+        content = _normalize_message_content(
+            item.get("content"), preserve_content_blocks=preserve_content_blocks
+        )
         if not content:
             continue
         messages.append({"role": role, "content": content})
@@ -1668,14 +1690,18 @@ _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file"
 
 def _normalize_message_content(
     content: Any,
+    *,
+    preserve_content_blocks: bool = False,
 ) -> str | list[dict[str, Any]]:
-    """Normalize message content: plain string for text-only; full block list for multimodal."""
+    """Keep blocks for opted-in executors and attachments; otherwise join plain text."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
+    if preserve_content_blocks:
+        return content
 
     has_multimodal = any(
         isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES
@@ -1715,23 +1741,84 @@ def _serialize_tool_result(event: ToolCallComplete) -> str:
     return ""
 
 
-def _stringify_tool_payload(value: Any) -> str:
-    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback)."""
-    import json
+_ACP_TOOL_CALL_CONTENT_TYPES = frozenset({"content", "diff", "terminal"})
 
+
+def _stringify_tool_payload(value: Any) -> str:
+    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback).
+
+    Handles Anthropic-style flat text blocks and the ACP ``ToolCallContent`` union
+    (``content`` wrapper, ``diff``, ``terminal``; agentclientprotocol.com/protocol/tool-calls).
+    """
     if isinstance(value, str):
         return value
     if isinstance(value, list):
+        if any(
+            isinstance(block, dict)
+            and isinstance(block.get("type"), str)
+            and block["type"] in _ACP_TOOL_CALL_CONTENT_TYPES
+            for block in value
+        ):
+            # ACP entries are self-contained summaries; keep each on its own line.
+            return "\n".join(_render_acp_tool_call_content(block) for block in value)
         # Anthropic-style content blocks: join text fields; skip non-text (image, tool_use, etc.).
-        text_parts: list[str] = []
-        for block in value:
-            if not isinstance(block, dict):
-                continue
-            block_text = block.get("text")
-            if isinstance(block_text, str):
-                text_parts.append(block_text)
+        text_parts = [
+            block["text"]
+            for block in value
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
         if text_parts:
             return "".join(text_parts)
+    return _json_or_repr(value)
+
+
+def _render_acp_tool_call_content(block: Any) -> str:
+    """Render one ACP ``ToolCallContent`` entry.
+
+    Non-text ``content`` blocks are named rather than dumped; unknown shapes keep a JSON fallback.
+    """
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        if block_type == "content":
+            inner = block.get("content")
+            inner_blocks = [
+                b for b in (inner if isinstance(inner, list) else [inner]) if isinstance(b, dict)
+            ]
+            texts = [b["text"] for b in inner_blocks if isinstance(b.get("text"), str)]
+            # Image, audio and resource blocks can carry large base64 payloads; name them instead.
+            kinds = sorted(
+                {
+                    str(b.get("type", "unknown"))
+                    for b in inner_blocks
+                    if not isinstance(b.get("text"), str)
+                }
+            )
+            parts = ["".join(texts)] if texts else []
+            if kinds:
+                parts.append(f"[content: {', '.join(kinds)}]")
+            if parts:
+                return "\n".join(parts)
+        elif block_type == "diff":
+            path = block.get("path")
+            new_text = block.get("newText")
+            line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
+            count = f"{line_count} line" + ("" if line_count == 1 else "s")
+            label = f"diff {path} ({count})" if path else f"diff ({count})"
+            return f"{label}\n{new_text}" if isinstance(new_text, str) and new_text else label
+        elif block_type == "terminal":
+            terminal_id = block.get("terminalId")
+            return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
+        # Preserve the text of flat text blocks mixed into an ACP list.
+        block_text = block.get("text")
+        if isinstance(block_text, str):
+            return block_text
+    return _json_or_repr(block)
+
+
+def _json_or_repr(value: Any) -> str:
+    """JSON-encode ``value``, falling back to ``repr`` for non-serializable payloads."""
+    import json
+
     try:
         return json.dumps(value)
     except (TypeError, ValueError):

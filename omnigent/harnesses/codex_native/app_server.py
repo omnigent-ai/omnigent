@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import socket
+import sqlite3
 import sys
 import tempfile
 import uuid
@@ -67,6 +68,7 @@ from omnigent.harnesses.codex_native.launch_args import (
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
+    codex_native_process_alive_for_state_dir,
     codex_native_session_tag_cmdline_arg,
     reconcile_codex_native_process_registry,
     register_codex_native_process,
@@ -105,8 +107,9 @@ from omnigent.inner.databricks_executor import (
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
-from omnigent.native import policy_allow_cache
+from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.process_logging import (
+    DATA_DIR_ENV_VAR,
     harness_stderr_capture_enabled,
     log_info_once,
     log_once,
@@ -116,6 +119,7 @@ from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     EFFORT_ORDER,
     clamp_effort_for_model,
+    effort_for_model_switch,
 )
 
 _logger = logging.getLogger(__name__)
@@ -132,6 +136,7 @@ _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 _EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
+_MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -145,6 +150,8 @@ _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
 _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
+# Codex state dbs in a CODEX_HOME (the suffix is codex's schema generation).
+_CODEX_STATE_DB_GLOB = "state_*.sqlite"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -184,6 +191,8 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 # Codex rejects permission flags on remote resume starting with this release.
 _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
+# Codex refuses turns on threads recorded under a provider other than its effective one.
+_MIN_MODEL_PROVIDER_CHECK_CODEX_VERSION = (0, 166, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
@@ -358,10 +367,12 @@ def _codex_mcp_server_config_section(
         f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
         for tool in framework_approved_tools(routed_spawns=routed_spawns)
     )
+    relay_data_dir = native_bridge_common.native_bridge_data_dir()
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
-        f"args = [{args_toml}]\n\n"
+        f"args = [{args_toml}]\n"
+        f"env = {{ {DATA_DIR_ENV_VAR} = {json.dumps(str(relay_data_dir))} }}\n\n"
         f"{approvals}"
     )
 
@@ -1119,6 +1130,26 @@ def is_active_writer_error(exc: BaseException) -> bool:
         and exc.message is not None
         and _CODEX_ACTIVE_WRITER_ERROR in exc.message
     )
+
+
+def codex_resume_current_model_provider(exc: BaseException) -> str | None:
+    """
+    Return the provider Codex requires after a ``thread/resume`` provider mismatch.
+
+    Codex 0.166+ resumes a thread only under its effective provider, and a
+    managed config layer can outrank the launch's ``-c model_provider`` pin.
+
+    :param exc: The exception raised by the resume request.
+    :returns: Codex's current provider, e.g. ``"Databricks"``, or ``None`` for
+        any other failure.
+    """
+    if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
+        return None
+    data = exc.error.get("data") if isinstance(exc.error, dict) else None
+    if not isinstance(data, dict) or data.get("type") != "modelProviderMismatch":
+        return None
+    current = data.get("currentModelProvider")
+    return current if isinstance(current, str) and current else None
 
 
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
@@ -2071,6 +2102,84 @@ async def codex_launch_catalog_is_stale(
     )
 
 
+def _backfill_lease_is_running(db_path: Path) -> bool:
+    """
+    Report whether *db_path*'s backfill row holds a ``running`` lease.
+
+    :param db_path: Codex state db, e.g. ``.../codex-home/state_5.sqlite``.
+    :returns: ``True`` only when a ``running`` lease is confirmed; an
+        unreadable db or a missing table reads ``False`` so startup
+        proceeds unchanged.
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(db_path, timeout=1.0)) as conn:
+            row = conn.execute(
+                "select count(*) from backfill_state where status = 'running'"
+            ).fetchone()
+    except sqlite3.Error:
+        _logger.warning(
+            "Could not inspect the codex state db %s for a backfill lease",
+            db_path,
+            exc_info=True,
+        )
+        return False
+    return bool(row and row[0])
+
+
+def _recover_orphaned_codex_backfill_lease(codex_home: Path, state_dir: Path) -> bool:
+    """
+    Expire a dead-owner ``running`` state-db backfill lease before launch.
+
+    Codex's app-server refuses to start while the state db's backfill
+    lease reads ``running``: it waits ~30s for the holder to finish, then
+    exits 1 — inside the readiness budget, so the session terminal never
+    comes up, and every relaunch fails the same way until the lease
+    expires on its own (~15 minutes). A launch killed mid-backfill leaves
+    exactly that lease behind. The CODEX_HOME here is private to one
+    session, so once no live codex app-server is bound to the session's
+    state dir the lease is provably orphaned; aging it past expiry makes
+    codex's own reclaim path resume the backfill from its persisted
+    watermark — no history is deleted.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param state_dir: Session state dir named on any live app-server's
+        command line, e.g. ``~/.omnigent/codex-native/<hash>``.
+    :returns: Whether an orphaned lease was expired.
+    """
+    try:
+        leased = [
+            db_path
+            for db_path in sorted(codex_home.glob(_CODEX_STATE_DB_GLOB))
+            if _backfill_lease_is_running(db_path)
+        ]
+    except OSError:
+        return False
+    if not leased:
+        return False
+    if codex_native_process_alive_for_state_dir(state_dir):
+        _logger.info(
+            "Codex state-db backfill lease in %s is held by a live app-server; leaving it",
+            codex_home,
+        )
+        return False
+    expired = False
+    for db_path in leased:
+        try:
+            with contextlib.closing(sqlite3.connect(db_path, timeout=1.0)) as conn, conn:
+                # updated_at=0 reads as expired under any lease length codex picks.
+                conn.execute("update backfill_state set updated_at = 0 where status = 'running'")
+        except sqlite3.Error:
+            _logger.warning(
+                "Could not expire the orphaned codex backfill lease in %s",
+                db_path,
+                exc_info=True,
+            )
+            continue
+        expired = True
+        _logger.warning("Expired an orphaned codex state-db backfill lease in %s", db_path)
+    return expired
+
+
 def _configured_app_server_command() -> tuple[str, ...]:
     """The configured app-server wrapper, ``harness.codex-native.app_server``, or ``()``."""
     from omnigent.config import load_effective_config
@@ -2114,7 +2223,9 @@ class CodexNativeAppServer:
     :param socket_path: Codex app-server Unix socket path.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
-    :param config_overrides: Codex ``-c`` config override values.
+    :param config_overrides: Codex ``-c`` config override values. After
+        :meth:`start`, a ``model_provider`` pin names the provider Codex
+        actually runs, which a managed config layer can force.
     :param developer_instructions: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) appended to the private
         session config before app-server startup.
@@ -2431,6 +2542,13 @@ class CodexNativeAppServer:
                 )
         if self.reconcile_process_registry:
             reconcile_codex_native_process_registry()
+        # Off the loop: sqlite reads plus, only when a lease is found, one
+        # machine-wide ps scan.
+        await asyncio.to_thread(
+            _recover_orphaned_codex_backfill_lease,
+            self.codex_home,
+            self.bridge_dir,
+        )
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
@@ -2527,6 +2645,7 @@ class CodexNativeAppServer:
                             _pin_codex_config_effort(
                                 self.codex_home, resolved_effort, effective_model
                             )
+                await self._pin_effective_model_provider(startup_client)
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
@@ -2569,6 +2688,51 @@ class CodexNativeAppServer:
                 "Codex app-server startup failed before cleanup",
                 extra=self._startup_snapshot_event("codex_app_server_start_failed", exc),
             )
+
+    async def _pin_effective_model_provider(self, client: CodexAppServerClient) -> None:
+        """
+        Repoint the launch's ``model_provider`` pin at Codex's effective provider.
+
+        A managed config layer outranks ``-c model_provider``, but a ``--remote``
+        TUI still starts its thread under the pinned provider, and Codex 0.166+
+        then refuses every turn on that thread.
+
+        :param client: Initialized startup client.
+        :returns: None.
+        """
+        if (
+            self.codex_cli_version is not None
+            and self.codex_cli_version < _MIN_MODEL_PROVIDER_CHECK_CODEX_VERSION
+        ) or not any(
+            override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX)
+            for override in self.config_overrides
+        ):
+            return
+        try:
+            response = await asyncio.wait_for(
+                client.request("config/read", {"includeLayers": False, "cwd": str(self.cwd)}),
+                timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+            )
+        except Exception:  # the launch's own pin is still usable
+            _logger.warning("Could not read Codex's effective model provider", exc_info=True)
+            return
+        result = response.get("result")
+        config = result.get("config") if isinstance(result, dict) else None
+        effective = config.get("model_provider") if isinstance(config, dict) else None
+        if not isinstance(effective, str) or not effective:
+            return
+        pin = f"{_MODEL_PROVIDER_OVERRIDE_PREFIX}{json.dumps(effective)}"
+        overrides = [
+            pin if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX) else override
+            for override in self.config_overrides
+        ]
+        if overrides != self.config_overrides:
+            _logger.warning(
+                "Codex runs model provider %r over this launch's pin (likely a managed "
+                "config); the terminal uses it too",
+                effective,
+            )
+            self.config_overrides = overrides
 
     async def _trust_policy_hooks(self, *, client: CodexAppServerClient | None = None) -> None:
         """
@@ -4791,6 +4955,40 @@ def _set_codex_resume_config_value(config: CodexParams, key: str, value: object)
     config[key] = value
 
 
+def _restamp_codex_rollout_model_provider(rollout_path: Path, model_provider: str) -> None:
+    """
+    Rewrite a rollout's ``session_meta.model_provider``, keeping every later record.
+
+    :param rollout_path: Rollout JSONL whose first record is ``session_meta``.
+    :param model_provider: Provider id to record, e.g. ``"Databricks"``.
+    :raises ValueError: If the rollout does not start with ``session_meta``.
+    """
+    tmp: Path | None = None
+    try:
+        with rollout_path.open("rb") as source:
+            record = json.loads(source.readline())
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict) or record.get("type") != "session_meta":
+                raise ValueError(f"{rollout_path} does not start with session_meta")
+            payload["model_provider"] = model_provider
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=rollout_path.parent,
+                prefix=f".{rollout_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as target:
+                tmp = Path(target.name)
+                target.write(json.dumps(record, separators=(",", ":")).encode() + b"\n")
+                while chunk := source.read(1 << 20):
+                    target.write(chunk)
+        os.replace(target.name, rollout_path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
 async def preload_codex_thread_for_resume(
     transport: str,
     thread_id: str,
@@ -4799,6 +4997,7 @@ async def preload_codex_thread_for_resume(
     retain_client: bool = False,
     cwd: Path | None = None,
     model_provider: str | None = None,
+    rollout_path: Path | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -4819,6 +5018,9 @@ async def preload_codex_thread_for_resume(
     :param cwd: Session working directory for resolving additional writable roots.
     :param model_provider: Launch-selected provider to apply over persisted thread settings.
         None preserves Codex's default resume behavior.
+    :param rollout_path: Thread rollout to restamp when Codex refuses the resume
+        because its effective provider differs, e.g. under a managed config.
+        None surfaces that refusal.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -4870,14 +5072,27 @@ async def preload_codex_thread_for_resume(
                 )
             )
             params["cwd"] = str(effective_cwd)
-        await client.request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "excludeTurns": True,
-                **params,
-            },
-        )
+        resume_params: CodexParams = {"threadId": thread_id, "excludeTurns": True, **params}
+        try:
+            await client.request("thread/resume", resume_params)
+        except CodexAppServerResponseError as exc:
+            current_provider = codex_resume_current_model_provider(exc)
+            if current_provider is None or rollout_path is None:
+                raise
+            _logger.warning(
+                "Codex resumes thread %s only under its effective provider %r "
+                "(requested %r); restamping %s",
+                thread_id,
+                current_provider,
+                model_provider,
+                rollout_path,
+            )
+            await asyncio.to_thread(
+                _restamp_codex_rollout_model_provider, rollout_path, current_provider
+            )
+            await client.request(
+                "thread/resume", {**resume_params, "modelProvider": current_provider}
+            )
         if retain_client:
             retained = True
             return client
@@ -4945,6 +5160,57 @@ async def apply_codex_thread_effort(
             )
     finally:
         # A wedged server can stall the closing handshake; it must not mask the result.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
+
+
+async def apply_codex_thread_collaboration_mode(
+    transport: str,
+    thread_id: str,
+    mode: str,
+    *,
+    model: str,
+    effort: str | None = None,
+) -> None:
+    """
+    Set a loaded thread's collaboration mode via ``thread/settings/update``.
+
+    Null ``developer_instructions`` keeps the mode's built-in prompt.
+
+    :param transport: App-server transport, e.g. ``"ws://127.0.0.1:9876"``.
+    :param thread_id: Loaded Codex thread id, e.g. ``"019e96aa-..."``.
+    :param mode: Codex collaboration mode, e.g. ``"plan"``.
+    :param model: Model the thread runs; Codex requires it in the mode settings.
+    :param effort: Session-persisted effort, or ``None``; resolved to a level
+        ``model`` accepts, as :func:`apply_codex_thread_effort` does.
+    :raises Exception: If the app-server rejects the update.
+    """
+    client = client_for_transport(transport, client_name="omnigent-codex-native-plan-mode")
+    try:
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_CONNECT_TIMEOUT_SECONDS)
+        applied_effort = (
+            await resolve_codex_effort_for_model(client, effort, model, transport=transport)
+            if effort is not None
+            else effort_for_model_switch(None, model)
+        )
+        await asyncio.wait_for(
+            client.request(
+                "thread/settings/update",
+                {
+                    "threadId": thread_id,
+                    "collaborationMode": {
+                        "mode": mode,
+                        "settings": {
+                            "model": model,
+                            "reasoning_effort": applied_effort,
+                            "developer_instructions": None,
+                        },
+                    },
+                },
+            ),
+            timeout=_EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS,
+        )
+    finally:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(client.close(), timeout=_EFFORT_CLOSE_TIMEOUT_SECONDS)
 

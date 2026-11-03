@@ -7,6 +7,11 @@ import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
+
 const CONV = "conv-1";
 const URL_ = "https://example.com/page";
 
@@ -17,6 +22,11 @@ let surfaced: { conversationId: string; tabId: string }[];
 let unsubscribe: () => void;
 
 beforeEach(() => {
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: "local-host",
+    parentSessionId: null,
+  }));
   openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
   hasView = vi.fn().mockResolvedValue({ exists: false });
   closeView = vi.fn().mockResolvedValue({ ok: true });
@@ -53,16 +63,20 @@ it.each([true, false])(
       vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     }
     expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
-    expect(openOrNavigate).toHaveBeenCalledOnce();
-    // Model-authored links get the agent navigation policy (no internal hosts).
+    expect(surfaced).toEqual([]);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
     const firstViewId = openOrNavigate.mock.calls[0][0];
     expect(firstViewId).toMatch(/^browser-tab:conv-1:[^:]+$/);
-    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, { agent: true });
-    expect(surfaced).toEqual([]);
+    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, {
+      agent: true,
+      sourceHostId: "local-host",
+      sessionHostProtocol: 1,
+    });
     await vi.waitFor(() =>
       expect(surfaced).toEqual([{ conversationId: CONV, tabId: firstViewId.split(":")[2] }]),
     );
     expect(maybeOpenLinkInApp(CONV, "https://example.com/other")).toBe(true);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
     const secondViewId = openOrNavigate.mock.calls[1][0];
     expect(secondViewId).not.toBe(firstViewId);
     await vi.waitFor(() => expect(surfaced).toHaveLength(2));
@@ -119,7 +133,7 @@ it("coalesces repeated clicks before the first navigation is accepted", async ()
 
   maybeOpenLinkInApp(CONV, URL_);
   maybeOpenLinkInApp(CONV, URL_);
-  expect(openOrNavigate).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
   accept({ ok: true });
   await vi.waitFor(() => expect(surfaced).toHaveLength(1));
 });
@@ -245,4 +259,33 @@ it.each([
   ["http://[", null],
 ])("parseHttpUrl(%j) keeps only http(s) URLs", (href, expected) => {
   expect(parseHttpUrl(href)?.href ?? null).toBe(expected);
+});
+
+it("omits host options when the owning session has no resolvable host", async () => {
+  getSessionSlim.mockRejectedValue(new Error("host unavailable"));
+  maybeOpenLinkInApp(CONV, URL_);
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(expect.any(String), URL_, undefined, {
+      agent: true,
+    }),
+  );
+  expect(getSessionSlim).toHaveBeenCalledWith(CONV);
+});
+
+it("resolves the current host for a new link after the session moves", async () => {
+  getSessionSlim
+    .mockResolvedValueOnce({ id: CONV, hostId: "local-host", parentSessionId: null })
+    .mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
+  maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/before");
+  await vi.waitFor(() => expect(surfaced).toHaveLength(1));
+  maybeOpenLinkInApp(CONV, "http://127.0.0.1:5173/after");
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenLastCalledWith(
+      expect.any(String),
+      "http://127.0.0.1:5173/after",
+      undefined,
+      { agent: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+    ),
+  );
+  expect(getSessionSlim).toHaveBeenCalledTimes(2);
 });
