@@ -254,11 +254,9 @@ describe("full skill descriptions", () => {
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
     overflowDescription("triage", 900);
-    const row = screen.getByTestId("slash-menu-item-triage");
-    fireEvent.pointerMove(row);
+    fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    // The pointer stays on the row, so only the highlight can keep the tooltip closed.
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
-    fireEvent.pointerLeave(row);
-    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
     await new Promise((resolve) => {
       setTimeout(resolve, 700);
     });
