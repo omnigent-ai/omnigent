@@ -27,7 +27,7 @@ class _FakeTask:
     """The slice of ``ScheduledTask`` the scheduler reads.
 
     The scheduler only touches ``id``, ``workspace_id``, ``rrule``,
-    ``timezone``, and ``state``, so the tests drive it with this local stand-in
+    ``timezone``, ``state``, and ``session_mode``, so the tests drive it with this local stand-in
     rather than the full persisted entity — keeping the scheduler unit tests
     independent of the entity's field set.
     """
@@ -37,6 +37,7 @@ class _FakeTask:
     timezone: str
     state: str
     workspace_id: int = 0
+    session_mode: str = "new"
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -440,5 +441,23 @@ async def test_startup_snapshot_preserves_changes_during_load(monkeypatch, mutat
         assert scheduler.is_started == (mutation != "stop")
         assert (scheduler.next_run_at("untouched") is not None) == (mutation != "stop")
         assert len(timers.live()) == scheduler.job_count
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_mode,armed", [("new", False), ("continue", True)])
+async def test_ten_minute_timer_requires_continued_session(session_mode, armed):
+    task = replace(_task("ten_minutes", "FREQ=MINUTELY;INTERVAL=10"), session_mode=session_mode)
+    scheduler, clock, seam, fired = _make([task])
+    await scheduler.start()
+    try:
+        assert bool(seam.live()) is armed
+        if armed:
+            assert 0 < seam.live()[-1].delay <= 600
+            clock.advance(seam.live()[-1].delay)
+            await seam.fire_latest()
+            assert fired.calls == [(0, task.id)]
+            assert seam.live()[-1].delay == 600
     finally:
         scheduler.stop()

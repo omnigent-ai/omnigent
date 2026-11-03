@@ -251,7 +251,7 @@ class ScheduledTaskScheduler:
 
     def _register(self, task: ScheduledTask) -> None:
         """Validate the task's rrule and arm its timer, replacing any existing."""
-        trigger = validate_rrule(task.rrule)
+        trigger = validate_rrule(task.rrule, session_mode=task.session_mode)
         self.remove(task.id)  # replace_existing semantics
         job = _Job(
             task_id=task.id,

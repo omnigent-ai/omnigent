@@ -21,7 +21,8 @@ from omnigent.tools.base import Tool
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
-    "mornings). Must fire at least twice and no more often than once per hour."
+    "mornings). Must fire at least twice. Minimum interval: 10 minutes when "
+    "session_mode is 'continue' (e.g. 'FREQ=MINUTELY;INTERVAL=10'), otherwise 1 hour."
 )
 
 

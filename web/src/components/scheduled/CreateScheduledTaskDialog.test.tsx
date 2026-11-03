@@ -2163,7 +2163,11 @@ describe("CreateScheduledTaskDialog session mode", () => {
   function renderWithSessionModes(editingTask?: ScheduledTasksApiModule.ScheduledTask) {
     return render(
       <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          features: { automations_v2: true },
+        }}
       >
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />
       </CapabilitiesProvider>,
@@ -2274,6 +2278,24 @@ describe("CreateScheduledTaskDialog session mode", () => {
     expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
       "Continue in the same session",
     );
+  });
+
+  it("preserves a minute schedule on edit and blocks switching it to new sessions", async () => {
+    renderWithSessionModes(
+      scheduledTask({ sessionMode: "continue", rrule: "FREQ=MINUTELY;INTERVAL=10" }),
+    );
+    expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
+    fireEvent.keyDown(screen.getByTestId("task-session-mode-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "New session each run" }));
+    expect(screen.getByTestId("custom-schedule-trigger")).toHaveTextContent("Every 10 minutes");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent(
+      "require continuing in the same session",
+    );
+    chooseContinue();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=MINUTELY;INTERVAL=10");
   });
 
   it("offers no new-session option before the first run creates a session", () => {

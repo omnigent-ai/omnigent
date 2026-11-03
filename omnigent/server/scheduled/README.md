@@ -1,5 +1,9 @@
 # Persistent task scheduling
 
+Recurring schedules have a minimum interval of **10 minutes** when continuing the
+existing session, or **one hour** when starting a new session each run. For a
+ten-minute schedule, use `FREQ=MINUTELY;INTERVAL=10` with `session_mode: "continue"`.
+
 Scheduled tasks ("automations") run a saved prompt on a recurring schedule or on
 demand. `PersistentTaskScheduler` keeps the schedule in the database, so every
 occurrence runs once even with several server replicas, and an occurrence

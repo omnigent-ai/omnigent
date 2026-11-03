@@ -5,7 +5,7 @@ import { RRule } from "rrule";
 export type SchedulePreset = "hourly" | "daily" | "weekdays" | "weekly" | "custom";
 
 /** The frequency sub-selector shown under the "custom" preset. */
-export type CustomFreq = "hourly" | "daily" | "weekly" | "monthly" | "yearly";
+export type CustomFreq = "minutely" | "hourly" | "daily" | "weekly" | "monthly" | "yearly";
 
 /** Weekday codes as used by RRULE `BYDAY` (MO..SU), in calendar order. */
 export const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
@@ -35,6 +35,8 @@ export interface ScheduleModel {
   /** Omitted for schedules that never end; UNTIL is an RFC-5545 UTC instant. */
   end?: { type: "count"; count: number } | { type: "until"; until: string };
 }
+
+export const MAX_MINUTE_INTERVAL = 366 * 60;
 
 export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
   preset: "daily",
@@ -85,17 +87,26 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
   const parts = parseRuleParts(rrule);
   if (parts === null) return null;
   const frequency = parts.get("FREQ")?.toLowerCase();
-  if (!["hourly", "daily", "weekly", "monthly", "yearly"].includes(frequency ?? "")) return null;
+  if (!["minutely", "hourly", "daily", "weekly", "monthly", "yearly"].includes(frequency ?? ""))
+    return null;
   const customFreq = frequency as CustomFreq;
-  const interval = parseNumberPart(parts.get("INTERVAL") ?? "1", 1, 366);
-  const minute = parseNumberPart(parts.get("BYMINUTE"), 0, 59);
+  const interval = parseNumberPart(
+    parts.get("INTERVAL") ?? "1",
+    1,
+    customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366,
+  );
+  const minute =
+    customFreq === "minutely"
+      ? DEFAULT_SCHEDULE_MODEL.minute
+      : parseNumberPart(parts.get("BYMINUTE"), 0, 59);
   const hour =
-    customFreq === "hourly"
+    customFreq === "hourly" || customFreq === "minutely"
       ? DEFAULT_SCHEDULE_MODEL.hour
       : parseNumberPart(parts.get("BYHOUR"), 0, 23);
   if (interval === null || hour === null || minute === null) return null;
-  const allowed = ["FREQ", "INTERVAL", "BYMINUTE", "COUNT", "UNTIL"];
-  if (customFreq !== "hourly") allowed.push("BYHOUR");
+  const allowed = ["FREQ", "INTERVAL", "COUNT", "UNTIL"];
+  if (customFreq !== "minutely") allowed.push("BYMINUTE");
+  if (customFreq !== "hourly" && customFreq !== "minutely") allowed.push("BYHOUR");
   if (customFreq === "weekly") allowed.push("BYDAY");
   if (customFreq === "monthly" || customFreq === "yearly") allowed.push("BYMONTHDAY");
   if (customFreq === "yearly") allowed.push("BYMONTH");
@@ -143,7 +154,9 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     if (!parseUntil(until)) return null;
     model.end = { type: "until", until };
   }
-  return validateSchedule(model, { allowPastEnd: true }) === null ? model : null;
+  return validateSchedule(model, { allowPastEnd: true, sessionMode: "continue" }) === null
+    ? model
+    : null;
 }
 
 /** Parse a UTC RRULE cutoff without allowing Date to normalize invalid dates. */
@@ -166,6 +179,8 @@ function buildCustomRRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   const interval = clampInterval(model.interval);
   switch (model.customFreq) {
+    case "minutely":
+      return `FREQ=MINUTELY;INTERVAL=${interval}`;
     case "hourly":
       // every X hours at minute Y
       return `FREQ=HOURLY;INTERVAL=${interval};BYMINUTE=${minute}`;
@@ -238,12 +253,22 @@ function parseWeekdaysPart(value: string | undefined): WeekdayCode[] | null {
 /** Validate visual form constraints; the server remains authoritative for saved rules. */
 export function validateSchedule(
   model: ScheduleModel,
-  { allowPastEnd = false, now = new Date() }: { allowPastEnd?: boolean; now?: Date } = {},
+  {
+    allowPastEnd = false,
+    now = new Date(),
+    sessionMode = "new",
+  }: {
+    allowPastEnd?: boolean;
+    now?: Date;
+    sessionMode?: "new" | "continue";
+  } = {},
 ): string | null {
-  if (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59) {
+  const minutely = model.preset === "custom" && model.customFreq === "minutely";
+  if (!minutely && (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59)) {
     return model.preset === "hourly" ? "Enter a valid minute from 0 to 59." : "Enter a valid time.";
   }
   if (
+    !minutely &&
     !(model.preset === "hourly" || (model.preset === "custom" && model.customFreq === "hourly")) &&
     (!Number.isInteger(model.hour) || model.hour < 0 || model.hour > 23)
   ) {
@@ -255,8 +280,12 @@ export function validateSchedule(
     return "Pick at least one day of the week.";
   }
   if (model.preset === "custom") {
-    if (!Number.isInteger(model.interval) || model.interval < 1 || model.interval > 366) {
-      return "Interval must be a whole number of at least 1 and at most 366.";
+    const minimum = model.customFreq === "minutely" ? (sessionMode === "continue" ? 10 : 60) : 1;
+    const maximum = model.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366;
+    if (!Number.isInteger(model.interval) || model.interval < minimum || model.interval > maximum) {
+      if (model.customFreq === "minutely" && sessionMode !== "continue" && model.interval < 60)
+        return "Schedules more often than hourly require continuing in the same session.";
+      return `Interval must be a whole number of at least ${minimum} and at most ${maximum}.`;
     }
     if (model.customFreq === "weekly" && model.weekdays.length === 0) {
       return "Pick at least one day of the week.";

@@ -27,6 +27,7 @@ import { commonTimezones, dateInTimezone, endOfDayInTimezone } from "@/lib/timez
 import { describeSchedule } from "@/lib/scheduleText";
 import {
   buildRRule,
+  MAX_MINUTE_INTERVAL,
   formatUntil,
   parseUntil,
   validateSchedule,
@@ -75,6 +76,7 @@ const choiceClass = "h-8 w-auto min-w-0 text-ui";
 export function ScheduleFields({
   model,
   anchoredScheduling,
+  sessionMode = "new",
   onChange,
   timezone,
   onTimezoneChange,
@@ -85,6 +87,7 @@ export function ScheduleFields({
 }: {
   model: ScheduleModel;
   anchoredScheduling: boolean;
+  sessionMode?: "new" | "continue";
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
@@ -121,10 +124,10 @@ export function ScheduleFields({
     dateInput.timezone === timezone
       ? dateInput
       : null;
-  const error = activeDateInput?.error ?? validateSchedule(model, { allowPastEnd });
+  const error = activeDateInput?.error ?? validateSchedule(model, { allowPastEnd, sessionMode });
   const recurrence = { ...model, end: undefined };
-  const recurrenceError = validateSchedule(recurrence);
-  const draftError = validateSchedule({ ...draft, end: undefined });
+  const recurrenceError = validateSchedule(recurrence, { sessionMode: "continue" });
+  const draftError = validateSchedule({ ...draft, end: undefined }, { sessionMode });
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
 
   function changeCustomOpen(open: boolean) {
@@ -245,8 +248,10 @@ export function ScheduleFields({
                     id="custom-interval"
                     data-testid="custom-interval"
                     type="number"
-                    min={1}
-                    max={366}
+                    min={
+                      draft.customFreq === "minutely" ? (sessionMode === "continue" ? 10 : 60) : 1
+                    }
+                    max={draft.customFreq === "minutely" ? MAX_MINUTE_INTERVAL : 366}
                     step={1}
                     value={Number.isFinite(draft.interval) ? draft.interval : ""}
                     className="w-24"
@@ -261,9 +266,21 @@ export function ScheduleFields({
                     label="Repeat unit"
                     testId="custom-freq-trigger"
                     value={draft.customFreq}
-                    options={FREQUENCIES}
+                    options={[
+                      ...(sessionMode === "continue" || draft.customFreq === "minutely"
+                        ? [
+                            {
+                              value: "minutely",
+                              label: "Minutes",
+                              disabled: sessionMode !== "continue",
+                            },
+                          ]
+                        : []),
+                      ...FREQUENCIES,
+                    ]}
                     onChange={(value) => {
                       const next = { ...draft, customFreq: value as CustomFreq };
+                      if (value === "minutely") next.interval = Math.max(10, next.interval || 10);
                       if (value === "hourly" && !Number.isInteger(next.minute)) next.minute = 0;
                       setDraft(next);
                     }}
@@ -325,26 +342,28 @@ export function ScheduleFields({
                   </p>
                 </div>
               )}
-              <div className="flex flex-col gap-2">
-                <Label>
-                  {draft.customFreq === "hourly"
-                    ? "At minute"
-                    : `Time (${timezone.replaceAll("_", " ")})`}
-                </Label>
-                {draft.customFreq === "hourly" ? (
-                  <MinuteChoice
-                    model={draft}
-                    onChange={setDraft}
-                    onOpenChange={handleNestedOpenChange}
-                  />
-                ) : (
-                  <ScheduleTimePicker
-                    model={draft}
-                    onChange={setDraft}
-                    onSelectOpenChange={handleNestedOpenChange}
-                  />
-                )}
-              </div>
+              {draft.customFreq !== "minutely" && (
+                <div className="flex flex-col gap-2">
+                  <Label>
+                    {draft.customFreq === "hourly"
+                      ? "At minute"
+                      : `Time (${timezone.replaceAll("_", " ")})`}
+                  </Label>
+                  {draft.customFreq === "hourly" ? (
+                    <MinuteChoice
+                      model={draft}
+                      onChange={setDraft}
+                      onOpenChange={handleNestedOpenChange}
+                    />
+                  ) : (
+                    <ScheduleTimePicker
+                      model={draft}
+                      onChange={setDraft}
+                      onSelectOpenChange={handleNestedOpenChange}
+                    />
+                  )}
+                </div>
+              )}
               {draftError && (
                 <p className="text-sm text-destructive" role="alert">
                   {draftError}

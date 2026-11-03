@@ -1,6 +1,10 @@
 # Automations (scheduled tasks)
 
-An automation is a saved instruction that fires an agent session on a recurring schedule. Each firing creates a real session, bound to an agent, that runs a stored prompt -- so "triage new issues every weekday at 9" or "summarize yesterday's alerts each morning" runs without anyone at the keyboard.
+Recurring schedules have a minimum interval of **10 minutes** when continuing the
+existing session, or **one hour** when starting a new session each run. For a
+ten-minute schedule, use `FREQ=MINUTELY;INTERVAL=10` with `session_mode: "continue"`.
+
+An automation is a saved instruction that fires an agent session on a recurring schedule. Each firing starts or continues a real session, bound to an agent, that runs a stored prompt -- so "triage new issues every weekday at 9" or "summarize yesterday's alerts each morning" runs without anyone at the keyboard.
 
 "Automations" is the user-facing name in the web UI. Everywhere else the feature is called a **scheduled task**: the REST paths (`/v1/scheduled-tasks`), the agent tools (`sys_scheduled_task_*`), the database tables (`scheduled_tasks`, `scheduled_task_runs`), and the code. This guide uses whichever name matches the surface being described.
 
@@ -87,12 +91,14 @@ the scheduler logs the reason and clears its next-run time instead of leaving
 an expired timestamp. Update the rule to resume scheduling.
 An empty search stops at the horizon even when filters yield no candidates.
 Schedules with no occurrence in the window are not armed; validation requires
-at least two occurrences and an hourly minimum.
+at least two occurrences and a ten-minute minimum for continued sessions, or an
+hourly minimum for new sessions.
 
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
 
 | Intent | `rrule` |
 | --- | --- |
+| Every 10 minutes (continued session only) | `FREQ=MINUTELY;INTERVAL=10` |
 | Every hour | `FREQ=HOURLY` |
 | Daily at 09:00 local | `FREQ=DAILY;BYHOUR=9;BYMINUTE=0` |
 | Weekdays at 09:00 local | `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0` |
@@ -101,7 +107,7 @@ The rule is anchored at midnight of the local day, which gives occurrences a det
 
 Beyond syntax checks, create and update reject these cases with a 400:
 
-- **Sub-hour gaps in the validation sample.** The validator checks consecutive occurrences from a fixed UTC anchor, stopping when it reaches an occurrence at least 25 hours after the first or samples 2,000 occurrences. It rejects gaps below one hour within that sample. Irregular recurrence sets can contain shorter gaps later, so passing validation does not guarantee an hourly minimum for every future firing or a bound on cost.
+- **Gaps below the session mode’s minimum in the validation sample.** The validator checks consecutive occurrences from a fixed UTC anchor, stopping when it reaches an occurrence at least 25 hours after the first or samples 2,000 occurrences. It rejects gaps below ten minutes for continued sessions or one hour for new sessions within that sample. Irregular recurrence sets can contain shorter gaps later, so passing validation does not guarantee the minimum for every future firing or a bound on cost.
 - **Never fires.**
 - **Fires only once.** A schedule that cannot recur is not a schedule.
 

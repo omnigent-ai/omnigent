@@ -77,6 +77,9 @@ describe("parseRRuleToScheduleModel", () => {
   });
 
   it.each([
+    { customFreq: "minutely", interval: 10 },
+    { customFreq: "minutely", interval: 11 },
+    { customFreq: "minutely", interval: 366 * 60 },
     { customFreq: "hourly", interval: 3, minute: 7 },
     { customFreq: "daily", interval: 2 },
     { customFreq: "weekly", interval: 3, weekdays: ["MO", "FR"] },
@@ -103,6 +106,9 @@ describe("parseRRuleToScheduleModel", () => {
   );
 
   it.each([
+    "FREQ=MINUTELY;INTERVAL=10;BYMINUTE=5",
+    "FREQ=MINUTELY;INTERVAL=10;BYHOUR=9",
+    "FREQ=MINUTELY;INTERVAL=10;BYSECOND=30",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
     "FREQ=WEEKLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
     "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;INTERVAL=367",
@@ -197,4 +203,17 @@ describe("parseTimeOfDayInput", () => {
     expect(parseTimeOfDayInput("5:99 PM")).toBeNull();
     expect(parseTimeOfDayInput("not a time")).toBeNull();
   });
+});
+
+describe("minute cadence policy", () => {
+  it.each([9, 10, 11, 30, 59, 60, 366 * 60, 366 * 60 + 1])(
+    "validates %i minutes by session mode",
+    (interval) => {
+      const schedule = model({ preset: "custom", customFreq: "minutely", interval });
+      expect(validateSchedule(schedule, { sessionMode: "continue" }) === null).toBe(
+        interval >= 10 && interval <= 366 * 60,
+      );
+      expect(validateSchedule(schedule) === null).toBe(interval >= 60 && interval <= 366 * 60);
+    },
+  );
 });

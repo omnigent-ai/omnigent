@@ -9,13 +9,13 @@ caller-supplied IANA timezone so a preset such as "Daily at 9:00 AM" fires at
 The rule is anchored at midnight of the reference day (localized to the task
 timezone), so occurrence phase is deterministic: an hourly rule fires on the
 hour, a daily rule at its ``BYHOUR``/``BYMINUTE``. :func:`validate_rrule`
-additionally enforces a minimum interval (:data:`MIN_INTERVAL_SECONDS`) and
+additionally enforces a minimum interval based on session mode and
 rejects rules that never fire or fire only once within the search window — each
-fire spawns a real agent session, so a runaway cadence is expensive.
+fire starts or continues real agent work, so a runaway cadence is expensive.
 
 Schedules use a single rule, at most 24 distinct values per BY field and 24 time
 combinations, an eight-year occurrence horizon, and work and elapsed-time limits.
-Hourly-equivalent minute and second rules remain supported for persisted schedules.
+Minute and second rules are subject to the same minimum-gap policy.
 """
 
 from __future__ import annotations
@@ -32,10 +32,9 @@ from dateutil.rrule import rrule, rrulestr  # type: ignore[import-untyped]
 
 from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter_bounded
 
-# Reject anything more frequent than this. Each fire spawns a real agent
-# session, so a tight cadence gets expensive fast. One hour is the tightest
-# cadence we allow: hourly is a useful ceiling with a hard bound on runaway cost.
+# Continuing a session reuses its runner and sandbox instead of provisioning per fire.
 MIN_INTERVAL_SECONDS = 60 * 60
+MIN_CONTINUED_INTERVAL_SECONDS = 10 * 60
 
 _UTC = ZoneInfo("UTC")
 
@@ -166,9 +165,8 @@ def get_next_fire_time(
     )
     # `rule.after` compares in dtstart's timezone, so localize `after` too. A
     # spring-forward "imaginary" wall time maps to some instant via zoneinfo and
-    # a fall-back duplicated time picks the earlier of the two; both are
-    # acceptable at an hourly floor — the schedule slips by at most an hour
-    # across a DST edge.
+    # a fall-back duplicated time picks the earlier of the two. Cadences
+    # follow local wall time across DST edges rather than elapsed UTC time.
     return rule.after(after.astimezone(tz), inc=False)
 
 
@@ -271,12 +269,18 @@ def _parse(
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 
 
-def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  # noqa: ARG001
+def validate_rrule(
+    rule_str: str,
+    tz: ZoneInfo | None = None,  # noqa: ARG001
+    *,
+    session_mode: str = "new",
+) -> RRuleTrigger:
     """Parse and validate an RRULE string for use as a recurring trigger.
 
     Beyond syntax, enforces that the rule (a) fires at least twice within the
     search window and (b) has a minimum gap of at least
-    :data:`MIN_INTERVAL_SECONDS` between *any* two consecutive fires.
+    one hour for new sessions or ten minutes for continued sessions between
+    *any* two consecutive fires.
 
     The interval check samples fires from a fixed UTC anchor, so the verdict is
     deterministic (independent of the wall-clock instant it runs at) and immune
@@ -285,6 +289,7 @@ def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  
     :param rule_str: The RFC 5545 recurrence rule string.
     :param tz: Accepted for API compatibility but not used by the interval
         check, which is timezone-agnostic for the cadences we allow.
+    :param session_mode: Only ``"continue"`` permits the ten-minute minimum.
     :returns: An :class:`RRuleTrigger`.
     :raises RRuleValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
@@ -315,9 +320,11 @@ def validate_rrule(rule_str: str, tz: ZoneInfo | None = None) -> RRuleTrigger:  
         raise RRuleValidationError("RRULE never fires")
     if count == 1:
         raise RRuleValidationError("RRULE fires only once")
-    if min_gap < MIN_INTERVAL_SECONDS:
+    minimum = (
+        MIN_CONTINUED_INTERVAL_SECONDS if session_mode == "continue" else MIN_INTERVAL_SECONDS
+    )
+    if min_gap < minimum:
         raise RRuleValidationError(
-            f"Minimum interval is {MIN_INTERVAL_SECONDS // 60} minutes "
-            f"(this rule fires every {int(min_gap)}s)"
+            f"Minimum interval is {minimum // 60} minutes (this rule fires every {int(min_gap)}s)"
         )
     return RRuleTrigger(rule=rule_str)

@@ -1126,3 +1126,53 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
+
+
+@pytest.mark.usefixtures("automations_v2_host")
+def test_ten_minute_continued_schedule_round_trip(page: Page, automations_v2_server: str) -> None:
+    """The browser exposes minutes only for continuation and the real API preserves the rule."""
+    name = f"Ten minute schedule {uuid.uuid4().hex[:8]}"
+    _open_automations_page(page, automations_v2_server)
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-prompt-input").fill("Check for updates.")
+    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    page.get_by_test_id("custom-freq-trigger").click()
+    expect(page.get_by_role("option", name="Minutes", exact=True)).to_have_count(0)
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    page.get_by_test_id("task-session-mode-trigger").click()
+    page.get_by_test_id("task-session-mode-continue").click()
+    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    _pick_select_option(page, "custom-freq-trigger", "Minutes")
+    interval = page.get_by_label("Repeat every", exact=True)
+    expect(interval).to_have_value("10")
+    interval.fill("9")
+    expect(page.get_by_role("button", name="Apply", exact=True)).to_be_disabled()
+    interval.fill("10")
+    page.get_by_role("button", name="Apply", exact=True).click()
+    expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks", timeout=10.0)
+    response.raise_for_status()
+    task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
+    assert (task["rrule"], task["session_mode"]) == ("FREQ=MINUTELY;INTERVAL=10", "continue")
+    # Keep this browser journey about editing, without launching an agent at the next boundary.
+    httpx.patch(
+        f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}",
+        json={"state": "paused"},
+        timeout=10,
+    ).raise_for_status()
+    row = _row_by_name(page, name)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    page.get_by_test_id("task-session-mode-trigger").click()
+    page.get_by_role("option", name="New session each run", exact=True).click()
+    expect(page.get_by_test_id("custom-schedule-trigger")).to_have_text("Every 10 minutes")
+    expect(page.get_by_test_id("create-scheduled-task-submit")).to_be_disabled()
+    expect(page.get_by_test_id("schedule-error")).to_contain_text(
+        "require continuing in the same session"
+    )

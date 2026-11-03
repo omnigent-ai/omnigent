@@ -3131,3 +3131,49 @@ async def test_random_worktree_requires_pinned_repository(
     )
     assert response.status_code == 422, response.text
     assert "random worktree requires" in response.text
+
+
+@pytest.mark.parametrize(
+    "session_mode,minutes,status",
+    [
+        ("new", 10, 400),
+        ("new", 60, 200),
+        ("continue", 9, 400),
+        ("continue", 10, 200),
+    ],
+)
+async def test_create_interval_policy(auth_client, session_mode, minutes, status):
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode=session_mode, rrule=f"FREQ=MINUTELY;INTERVAL={minutes}"),
+        headers=_headers(),
+    )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["session_mode"] == session_mode
+        assert response.json()["session_id"] is None
+
+
+async def test_update_validates_effective_schedule_and_session_mode(auth_client):
+    response = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    for patch, expected in [
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10", "session_mode": "continue"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=15"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=9"}, 400),
+        ({"session_mode": "new"}, 400),
+        ({"name": "Renamed"}, 200),
+    ]:
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == expected, response.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["session_mode"], saved["rrule"]) == ("continue", "FREQ=MINUTELY;INTERVAL=15")
+    response = await auth_client.patch(
+        url, json={"session_mode": "new", "rrule": "FREQ=HOURLY"}, headers=_headers()
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["session_mode"] == "new"

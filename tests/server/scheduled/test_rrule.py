@@ -425,3 +425,31 @@ def test_legacy_search_horizon_remains_midnight_based() -> None:
     after = _dt(2026, 1, 1, 2)
     assert get_next_fire_time(rule, after, UTC) is None
     assert get_next_fire_time(rule, after, UTC, anchor=after) == _dt(2034, 1, 1, 1)
+
+
+@pytest.mark.parametrize("session_mode,minimum", [("new", 60), ("continue", 10)])
+@pytest.mark.parametrize("minutes", [1, 5, 9, 10, 11, 15, 30, 59, 60])
+def test_minimum_interval_depends_on_session_mode(session_mode, minimum, minutes):
+    rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
+    if minutes < minimum:
+        with pytest.raises(RRuleValidationError, match=f"Minimum interval is {minimum} minutes"):
+            validate_rrule(rule, session_mode=session_mode)
+    else:
+        assert validate_rrule(rule, session_mode=session_mode).rule == rule
+
+
+@pytest.mark.parametrize(
+    "rule,allowed",
+    [
+        ("FREQ=HOURLY;BYMINUTE=5,15,25,35,45,55", True),
+        ("FREQ=HOURLY;BYMINUTE=0,10,19,30", False),
+        ("FREQ=SECONDLY;INTERVAL=600", True),
+        ("FREQ=SECONDLY;INTERVAL=599", False),
+    ],
+)
+def test_continued_session_checks_actual_gaps(rule, allowed):
+    if allowed:
+        assert validate_rrule(rule, session_mode="continue").rule == rule
+    else:
+        with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
+            validate_rrule(rule, session_mode="continue")
