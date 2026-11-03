@@ -441,6 +441,7 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     ("clear_status", "placement", "status", "message"),
     [
         (409, "runner", 400, "Stop the current turn"),
+        (503, "runner", 500, "Clear failed: runner returned 503"),
         (200, "running", 400, "Stop the current turn"),
         (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
@@ -457,10 +458,11 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     status: int,
     message: str,
 ) -> None:
-    """A busy runner or turn, no placement, a non-owner or a sub-agent refuses ``clear``.
+    """A refused ``clear`` creates, initializes and supersedes nothing.
 
-    The caller and session checks run before the runner frees the client, so
-    an editor's or a sub-agent's ``clear`` never reaches the runner.
+    A busy or failing runner, a running turn, no placement, a non-owner or a
+    sub-agent refuses it. The caller and session checks run before the runner
+    frees the client, so only a runner refusal reaches the runner.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     auth_live_runner.clear_status = clear_status
@@ -495,6 +497,7 @@ async def test_claude_sdk_clear_refusals_create_no_session(
         source_id = child.id
     headers = {"X-Forwarded-Email": caller}
     before = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
+    posts_before = len(auth_live_runner.posts)
 
     resp = await auth_client.post(
         f"/v1/sessions/{source_id}/events",
@@ -507,5 +510,7 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     after = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
     assert after == before
     assert auth_live_runner.superseded == []
-    if placement in ("editor", "sub_agent"):
+    # No new session was initialized on the runner.
+    assert "/v1/sessions" not in [path for path, _body in auth_live_runner.posts[posts_before:]]
+    if placement != "runner":
         assert clear_requests(auth_live_runner) == []
