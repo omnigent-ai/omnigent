@@ -1180,8 +1180,12 @@ def test_workspace_url_expands_bare_workspace_host(
     assert cli_mod._workspace_api_server_url(_WORKSPACE) == _WORKSPACE_API_URL
 
 
+@pytest.mark.parametrize("path", ["/", "/omnigent"])
 def test_workspace_url_names_the_requested_workspace_not_the_stored_one(
-    monkeypatch: pytest.MonkeyPatch, token_dir: Path, capsys: pytest.CaptureFixture[str]
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    token_dir: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The expansion notice shows the caller's ``?o=``, not the last login's.
 
@@ -1202,8 +1206,34 @@ def test_workspace_url_names_the_requested_workspace_not_the_stored_one(
         },
     )
 
-    assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}/?o=222") == _WORKSPACE_API_URL
+    assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}{path}?o=222") == _WORKSPACE_API_URL
     assert f"Using {_WORKSPACE}/omnigent?o=222 " in capsys.readouterr().err
+
+
+def test_workspace_auth_info_asks_the_resolver_for_the_requested_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI helper forwards the ``?o=`` workspace to the profile walk."""
+    from omnigent.inner import databricks_executor
+
+    calls: list[dict[str, object]] = []
+
+    class _Auth:
+        profile_name = "target"
+
+        def current_token(self) -> str:
+            return "tok"
+
+    def _resolve(**kwargs: object) -> tuple[_Auth, str]:
+        calls.append(kwargs)
+        return _Auth(), _WORKSPACE
+
+    monkeypatch.setattr(databricks_executor, "_resolve_databricks_auth", _resolve)
+
+    info = cli_mod._databricks_workspace_auth_info(_WORKSPACE, "222")
+
+    assert info is not None and info.token == "tok" and info.profile_name == "target"
+    assert calls == [{"host": _WORKSPACE, "workspace_id": "222"}]
 
 
 def test_workspace_url_leaves_oss_server_alone(

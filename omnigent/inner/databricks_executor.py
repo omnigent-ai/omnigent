@@ -1087,17 +1087,12 @@ def _prefer_profiles_for_workspace(
     workspace_id: str | None,
     sp_sections: set[str],
 ) -> list[str]:
-    """Move profiles pinned to *workspace_id* ahead of the others of their kind.
+    """Within each identity class, prefer profiles pinned to *workspace_id*.
 
-    One host can front many workspaces (``?o=`` selects one), and each
-    ``databricks auth login --host <host>?o=<id>`` records its workspace as the
-    profile's ``workspace_id``. A host-only walk would mint from whichever
-    profile comes first, even one pinned to another workspace, so profiles
-    pinned to the target go first, then unpinned ones, then ones pinned
-    elsewhere. Nothing is dropped: an account-wide grant from any of them may
-    still reach the target. An explicit ``DATABRICKS_CONFIG_PROFILE`` stays
-    first and service principals stay behind every user profile, so the
-    identity preference of :func:`_order_profiles_by_identity_preference` holds.
+    A ``databricks auth login --host <host>?o=<id>`` records ``workspace_id``;
+    profiles pinned to the target go first, then unpinned ones, then ones
+    pinned elsewhere, which stay reachable because an account-wide grant may
+    still reach the target.
 
     :param ordered: Profiles in identity (and remembered) preference order.
     :param config: The parsed ``~/.databrickscfg``, or ``None`` when absent.
