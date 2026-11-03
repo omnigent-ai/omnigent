@@ -527,6 +527,10 @@ describe("template prefill", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
       "Jira tickets",
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "jira",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     expect(screen.queryByTestId("manual-dialog-open")).not.toBeInTheDocument();
@@ -534,11 +538,16 @@ describe("template prefill", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
       "Slack messages",
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "slack",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     // Manual creation must not inherit the previous template.
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe("");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-template", "");
   });
 });
 

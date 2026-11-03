@@ -1480,16 +1480,18 @@ async def test_schedule_search_failure_returns_400_and_rolls_back(
         raise RRuleSearchError("search budget exceeded")
 
     monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", fail_actual_schedule)
-    if operation == "create":
-        response = await auth_client.post(
-            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
-        )
-    else:
-        response = await auth_client.patch(
-            f"/v1/scheduled-tasks/{existing.id}",
-            json={"rrule": "FREQ=DAILY;BYHOUR=12"},
-            headers=_headers(),
-        )
+    with capture_debug_rows("server") as rows:
+        if operation == "create":
+            response = await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+            )
+        else:
+            response = await auth_client.patch(
+                f"/v1/scheduled-tasks/{existing.id}",
+                json={"rrule": "FREQ=DAILY;BYHOUR=12"},
+                headers=_headers(),
+            )
+    assert not any(row["event_name"] == "scheduled_task_created" for row in rows)
     assert response.status_code == 400, response.text
     assert "Could not calculate the next run time for this schedule." in response.text
     expected_outcome = (

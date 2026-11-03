@@ -16,6 +16,7 @@ def log_task_created(
 ) -> None:
     """Count persisted creations across UI, API, and tools without recording user content."""
     source = source if source in {"ui", "agent"} else "api"
+    # Keep accepted IDs in sync with AUTOMATION_TEMPLATE_IDS in web/src/lib/scheduledTasksApi.ts.
     template = (
         template
         if template

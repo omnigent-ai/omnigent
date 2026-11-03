@@ -660,6 +660,10 @@ owner (`local` for auth-disabled servers); attributes are `task_id`,
 `target`, and `session_mode`. Rejected creates emit no creation event. As with
 run logs, delivery is best-effort; reconcile current inventory against the store.
 
+Requests without a recognized source header are classified as `api`, including
+older web and agent clients. During a mixed-version rollout, `creation_source`
+therefore does not precisely distinguish direct API usage from those clients.
+
 UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 
 | Metric | Measurement |

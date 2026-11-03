@@ -118,9 +118,17 @@ export interface ScheduledTaskRun {
   viewerUnread: boolean | null;
 }
 
-/** Fixed template labels for adoption analytics; never prompt or template field text. */
-export type AutomationTemplateId =
-  "custom" | "jira" | "slack" | "github" | "follow-up-monitor" | "pr-sweep" | "news-digest";
+/** Fixed analytics labels; keep in sync with omnigent/server/scheduled/telemetry.py. */
+export const AUTOMATION_TEMPLATE_IDS = [
+  "custom",
+  "jira",
+  "slack",
+  "github",
+  "follow-up-monitor",
+  "pr-sweep",
+  "news-digest",
+] as const;
+export type AutomationTemplateId = (typeof AUTOMATION_TEMPLATE_IDS)[number];
 
 /** Body for `POST /v1/scheduled-tasks`. */
 export interface CreateScheduledTaskInput {
@@ -357,18 +365,15 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
-  const interaction = startTimedInteraction(
-    "create_scheduled_task",
-    undefined,
-    input.templateId ?? "custom",
-  );
+  const templateId = input.templateId ?? "custom";
+  const interaction = startTimedInteraction("create_scheduled_task", undefined, templateId);
   try {
     const res = await authenticatedFetch("/v1/scheduled-tasks", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-omnigent-automation-source": "ui",
-        "x-omnigent-automation-template": input.templateId ?? "custom",
+        "x-omnigent-automation-template": templateId,
       },
       body: JSON.stringify(body),
     });
