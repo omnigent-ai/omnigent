@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -435,6 +436,27 @@ def test_record_to_row_without_event_or_attributes() -> None:
     row = dl.record_to_row(record, source="host")
     assert row["event_name"] is None
     assert row["attributes"] == {}
+
+
+async def test_log_attributes_follow_task_and_thread_without_leaking() -> None:
+    record = logging.makeLogRecord({"msg": "ordinary lifecycle log"})
+
+    async def read(task_id: str) -> dict:
+        with dl.log_attributes_scope(task_id=task_id, run_id="outer"):
+            with dl.log_attributes_scope(run_id="inner"):
+                row = await asyncio.to_thread(dl.record_to_row, record, "server")
+                assert row["attributes"] == {"task_id": task_id, "run_id": "inner"}
+            return dl.record_to_row(record, "server")
+
+    rows = await asyncio.gather(read("first"), read("second"))
+    assert [row["attributes"] for row in rows] == [
+        {"task_id": "first", "run_id": "outer"},
+        {"task_id": "second", "run_id": "outer"},
+    ]
+    assert dl.record_to_row(record, "server")["attributes"] == {}
+    record.attributes = {"run_id": "explicit", "secret": "Bearer test-secret-token"}
+    with dl.log_attributes_scope(run_id="ambient"):
+        assert dl.record_to_row(record, "server")["attributes"]["run_id"] == "explicit"
 
 
 def test_record_to_row_captures_stack_trace() -> None:

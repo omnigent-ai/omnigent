@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import threading
 import time
 import uuid
@@ -17,12 +18,14 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import ManagedLaunchTracker
 from omnigent.server.scheduled import fire as fire_mod
+from omnigent.server.scheduled import telemetry
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentityRevoked,
     PersistentTaskScheduler,
@@ -38,6 +41,7 @@ from omnigent.server.scheduled.schedule import (
     scheduled_trigger_key,
 )
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
@@ -147,13 +151,14 @@ def _runs(store: SqlAlchemyScheduledTaskStore, task: ScheduledTask) -> list[Sche
 # ── Starting a claimed run ───────────────────────────────────────────────────
 
 
-async def test_connected_fire_runs_on_the_claimed_run(store) -> None:
+async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> None:
     claimed = _claim(store)
     conversations = _ConversationStore()
     seen: list[ScheduledTaskRun] = []
 
     async def dispatch(conv: Any, task: ScheduledTask) -> None:
         seen.append(store.list_runs(task.id)[0][0])
+        await asyncio.to_thread(fire_mod._logger.info, "dispatch correlation probe")
 
     executor = ClaimedRunExecutor(
         _deps(store, conversation_store=conversations), launch_dispatch=dispatch
@@ -169,6 +174,204 @@ async def test_connected_fire_runs_on_the_claimed_run(store) -> None:
     task = store.get(claimed.task.id)
     assert task.last_run_conversation_id == session_id
     assert task.last_run_at is not None
+    [row] = [row for row in debug_log_rows if row["message"] == "dispatch correlation probe"]
+    assert row["session_id"] == session_id
+    assert row["attributes"]["run_id"] == run.id
+    assert row["attributes"]["task_id"] == claimed.task.id
+    assert row["attributes"]["trigger_key"] == run.trigger_key
+
+
+@pytest.mark.parametrize(
+    "session_mode,failed_stage",
+    [
+        ("new", stage)
+        for stage in [
+            None,
+            "runner_start",
+            "prompt_prepare",
+            "prompt_send",
+            "native_refusal",
+            "dispatch_bookkeeping",
+        ]
+    ]
+    + [("continue", None), ("continue", "native_refusal")],
+)
+async def test_prompt_logs_measure_delivery_and_locate_failures(
+    store, monkeypatch, caplog, session_mode, failed_stage, db_uri
+) -> None:
+    from omnigent.server.routes import sessions
+
+    caplog.set_level(logging.INFO)
+    claimed = _claim(
+        store,
+        session_mode=session_mode,
+        session_id=_CONV_ID if session_mode == "continue" else None,
+    )
+    conversations = (
+        _ExistingConversationStore(
+            _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+        )
+        if session_mode == "continue"
+        else _ConversationStore()
+    )
+    post_acceptance = failed_stage == "dispatch_bookkeeping"
+    if post_acceptance:
+        conversations = SqlAlchemyConversationStore(db_uri)
+    deps = _deps(store, conversation_store=conversations)
+    monkeypatch.setattr(telemetry, "time", SimpleNamespace(time=lambda: claimed.clock.now() + 15))
+    initialize = AsyncMock(
+        side_effect=RuntimeError("startup failed") if failed_stage == "runner_start" else None
+    )
+    send = AsyncMock(
+        return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None),
+        side_effect=RuntimeError("send failed") if failed_stage == "prompt_send" else None,
+    )
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", initialize)
+    native_refusal = failed_stage == "native_refusal"
+    if native_refusal:
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(
+            orchestration,
+            "_ensure_native_terminal_ready",
+            AsyncMock(
+                return_value=sessions._NativeTerminalEnsureOutcome(
+                    error=RuntimeError("terminal failed")
+                )
+            ),
+        )
+        persisted_failure = AsyncMock(return_value="failure-item")
+        monkeypatch.setattr(orchestration, "_persist_native_terminal_failure", persisted_failure)
+    elif post_acceptance:
+        from omnigent.server.routes._sessions import orchestration
+
+        def fail_acknowledgement(*args, **kwargs):
+            raise RuntimeError("bookkeeping failed after acceptance")
+
+        monkeypatch.setattr(orchestration, "_publish_input_consumed", fail_acknowledgement)
+    else:
+        monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    monkeypatch.setattr(
+        fire_mod,
+        "_agent_revision",
+        AsyncMock(
+            return_value=None,
+            side_effect=RuntimeError("agent read failed")
+            if failed_stage == "prompt_prepare"
+            else None,
+        ),
+    )
+
+    async def dispatch(conv, task):
+        if native_refusal:
+            conv = SimpleNamespace(**vars(conv), kind="default", harness_override="claude-native")
+            conv.labels = {**conv.labels, "omnigent.wrapper": "claude-native"}
+        if post_acceptance:
+            async with httpx.AsyncClient(
+                base_url="http://runner", transport=httpx.MockTransport(accept)
+            ) as runner:
+                await fire_mod._send_prompt(deps, conv, runner, task)
+        else:
+            await fire_mod._send_prompt(deps, conv, object(), task)
+
+    accepted = []
+
+    def accept(request):
+        accepted.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+    if post_acceptance:
+        assert len(accepted) == 1
+    reported_stage = "prompt_send" if post_acceptance else failed_stage
+    sent = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+    ]
+    failed = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+    ]
+    created = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_session_created"
+    ]
+    assert len(created) == int(session_mode == "new")
+    if created:
+        assert created[0].session_id == _runs(store, claimed.task)[0].conversation_id
+        assert created[0].attributes["session_delay_seconds"] == 15
+    if native_refusal:
+        persisted_failure.assert_awaited_once()
+        assert not sent
+        assert not failed
+        [refusal] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_not_accepted"
+        ]
+        assert refusal.attributes["run_id"] == claimed.lease.run.id
+        assert refusal.attributes["failure_stage"] == "prompt_send"
+        assert refusal.attributes["outcome"] == "not_sent"
+        # A native refusal persists its own failure item; dispatch still returns normally.
+        assert _runs(store, claimed.task)[0].status == (
+            "running" if session_mode == "new" else "succeeded"
+        )
+    if failed_stage in {"runner_start", "prompt_prepare"}:
+        assert not any(
+            getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+            for r in caplog.records
+        )
+    if failed_stage and not native_refusal:
+        assert not sent
+        assert len(failed) == 1
+        assert failed[0].attributes["failure_stage"] == reported_stage
+        outcome = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_startup_ended"
+        )
+        assert outcome.attributes["failure_stage"] == reported_stage
+        assert any(
+            getattr(r, "event_name", None) == "scheduled_run_stage_started"
+            and r.attributes["fire_stage"] == reported_stage
+            for r in caplog.records
+        )
+        assert failed[0].attributes["run_id"] == claimed.lease.run.id
+        assert _runs(store, claimed.task)[0].status == "failed"
+    elif not native_refusal:
+        assert not failed
+        assert len(sent) == 1
+        assert sent[0].attributes["prompt_delay_seconds"] == 15
+        assert sent[0].attributes["run_id"] == claimed.lease.run.id
+        assert sent[0].attributes["trigger_key"] == claimed.lease.run.trigger_key
+        assert sent[0].attributes["target"] == "connected_host"
+        assert sent[0].attributes["session_mode"] == session_mode
+        assert sent[0].session_id == _runs(store, claimed.task)[0].conversation_id
+    assert telemetry.current_scheduled_run() is None
+
+
+async def test_delivery_log_failure_does_not_fail_the_run(store, monkeypatch) -> None:
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(store)
+    deps = _deps(store)
+    send = AsyncMock(
+        return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None)
+    )
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("log sink failed")
+
+    monkeypatch.setattr(telemetry._logger, "info", fail_log)
+
+    async def dispatch(conv, task):
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+    send.assert_awaited_once()
+    assert _runs(store, claimed.task)[0].status == "running"
 
 
 async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
@@ -1189,3 +1392,61 @@ async def test_scheduler_records_a_session_that_finished_during_startup(store) -
     [run] = _runs(store, task)
     assert (run.status, run.conversation_id, run.lease_expires_at) == ("succeeded", _CONV_ID, None)
     assert run.finished_at is not None
+
+
+@pytest.mark.parametrize("status", ["running", "succeeded", "failed", "missing", "raced"])
+async def test_late_startup_failure_logs_only_a_transition(store, caplog, monkeypatch, status):
+    caplog.set_level(logging.INFO)
+    claimed = _claim(store)
+    run = claimed.lease.run
+    if status != "missing":
+        await claimed.lease.attach_session(_CONV_ID)
+        await claimed.lease.finish("running", conversation_id=_CONV_ID)
+        if status not in {"running", "raced"}:
+            store.update_run(run.id, status=status, finished_at=int(time.time()))
+    if status == "raced":
+        update = store.update_run
+
+        def finish_before_failure(run_id, **kwargs):
+            update(run_id, status="succeeded", finished_at=int(time.time()))
+            return update(run_id, **kwargs)
+
+        monkeypatch.setattr(store, "update_run", finish_before_failure)
+    with telemetry.scheduled_run_scope(telemetry.run_log_context(claimed.task, run)):
+        await fire_mod._fail_running_run(_deps(store), _CONV_ID, "late failure", "launch_failed")
+    failures = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+    ]
+    assert len(failures) == int(status == "running")
+    assert _runs(store, claimed.task)[0].status == (
+        {"running": "failed", "missing": "starting", "raced": "succeeded"}.get(status, status)
+    )
+
+
+@pytest.mark.parametrize("stage", ["input_validation", "runner_start"])
+def test_stage_started_deduplicates_nested_scopes_per_run(caplog, stage):
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+
+    caplog.set_level(logging.INFO)
+    for run_id in ("A", "B"):
+        run = ScheduledRunLogContext(
+            task_id="task",
+            run_id=run_id,
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        )
+        with telemetry.scheduled_run_scope(run):
+            telemetry.start_fire_stage(stage)
+            with telemetry.fire_stage(stage, session_id="session"):
+                with telemetry.fire_stage(stage, session_id="session"):
+                    telemetry.start_fire_stage(stage, session_id="session")
+                    assert telemetry.current_fire_stage() == stage
+    events = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_stage_started"
+    ]
+    assert [(e["run_id"], e["fire_stage"]) for e in events] == [(run, stage) for run in ("A", "B")]
+    assert telemetry.current_fire_stage() == "input_validation"
