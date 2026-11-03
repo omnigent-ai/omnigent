@@ -84,8 +84,9 @@ invocations below do not pause for registration or require those records.
 4. Records each settled facet on its user-facing surface under `recordings/<slug>/`
    — a suitable journey driver with `OMNIGENT_E2E_RECORD_DIR` for web/terminal
    facets, a rendered VHS tape for CLI facets. The driver may be temporary and
-   separate from the selected regression test. A reproduced facet is filmed failing (before-fix footage
-   the fix step pairs with its after-fix re-recording); an already-fixed facet is
+   separate from the selected regression test. A reproduced or likely-reproduced facet is
+   filmed failing (before-fix footage the fix step pairs with its after-fix re-recording);
+   an already-fixed facet is
    filmed passing (proof-it-works footage). Burns timed step-by-step captions
    below each new clip with `dev/caption_recording.py` and reviews the render;
    the handoff also carries a short attachment description. Best-effort: skipped (and noted) when

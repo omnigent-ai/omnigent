@@ -22,8 +22,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
-from omnigent.server.bundles import validate_agent_bundle
+from omnigent.db.utils import generate_agent_id
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
+from omnigent.server.bundles import agent_for_user, copy_agent_bundle, validate_agent_bundle
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 _SECRET_ENV_VAR = "OMNIGENT_W7_BUNDLE_SECRET"
 _SECRET_VALUE = "server-side-secret-token"
@@ -141,11 +144,8 @@ def test_validate_bundle_accepts_clean_agent() -> None:
 def test_validate_bundle_allows_custom_handler_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a custom handler.
 
-    This is the trusted single-user / local-server path: ``omnigent
-    run`` uploads the operator's own bundle through this same function,
-    so an unregistered custom handler must still load. The routes pass
-    ``enforce_handler_allowlist=not local_single_user_enabled()``, so
-    this mode is what a local server uses.
+    Direct trusted callers retain an explicit opt-out. HTTP routes never
+    select it, including on local single-user servers.
     """
     spec = validate_agent_bundle(
         _single_file_yaml_bundle(
@@ -334,8 +334,8 @@ def test_validate_agent_bundle_allows_contained_relative_cwd(ok_cwd: str) -> Non
     assert spec.name == "uploaded-agent"
 
 
-def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() -> None:
-    """The trusted single-user/local path keeps the documented absolute-cwd
+def test_validate_agent_bundle_allows_absolute_cwd_for_direct_trusted_caller() -> None:
+    """Direct trusted in-process validation keeps the absolute-cwd
     behavior.
 
     With ``enforce_handler_allowlist=False`` the operator uploads their OWN
@@ -387,7 +387,7 @@ def test_validate_bundle_rejects_server_callable_tool() -> None:
 def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a server ``callable:`` tool.
 
-    The trusted single-user / local-server path uploads the operator's own
+    A direct trusted in-process caller loads the operator's own
     bundle through this same function; Python callable tools are the intended
     operator feature there (the operator already has code execution), so the
     guard must not block them — mirroring the handler-allowlist exemption.
@@ -558,3 +558,35 @@ def test_content_digest_is_none_for_an_unreadable_bundle() -> None:
     assert bundle_content_digest(b"not a tarball") is None
     # The location still names the bytes, so nothing is ever stored keyless.
     assert content_bundle_location("ag", b"not a tarball").startswith("ag/")
+
+
+def test_copy_agent_bundle_reports_a_missing_source_blob(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    artifacts = LocalArtifactStore(str(root))
+
+    with pytest.raises(OmnigentError) as excinfo:
+        copy_agent_bundle(
+            artifacts, "30f9aa4d441e344d3eb273f8cc13e4a5/e70dc208", generate_agent_id()
+        )
+
+    assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert excinfo.value.http_status == 410
+    assert excinfo.value.message == SESSION_AGENT_BUNDLE_MISSING_MESSAGE
+    assert [p for p in root.rglob("*") if p.is_file()] == [], "nothing is written without a source"
+
+
+def test_agent_for_user_creates_no_row_when_the_bundle_is_missing(
+    db_uri: str, tmp_path: Path
+) -> None:
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    source = agents.create_user_agent(
+        agent_id, "orion", f"{agent_id}/e70dc208", owner="alice@example.com"
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        agent_for_user(agents, artifacts, source, "bob@example.com")
+
+    assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
+    assert agents.list_user_agents("bob@example.com").data == []

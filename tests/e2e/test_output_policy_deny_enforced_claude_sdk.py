@@ -130,6 +130,7 @@ def test_output_policy_deny_is_enforced_on_claude_sdk(
                 },
             },
         },
+        operator_authored=True,
     )
 
     # Queue several copies: background calls for the same session (e.g.

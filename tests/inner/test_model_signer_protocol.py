@@ -10,6 +10,7 @@ import pytest
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer_service import (
     _MAX_BODY_BYTES,
+    _MAX_RESPONSE_BODY_BYTES,
     _parse_strict_request_headers,
     _parse_strict_request_line,
     _SignerRelay,
@@ -33,7 +34,12 @@ class _Writer:
 
 
 class _BlockingWriter(_Writer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.drain_started = asyncio.Event()
+
     async def drain(self) -> None:
+        self.drain_started.set()
         await asyncio.Future()
 
 
@@ -74,6 +80,7 @@ def test_request_line_accepts_only_the_frozen_route() -> None:
     "headers",
     [
         b"Host: model.test\nContent-Length: 0\n\n",
+        b"Host: model.test\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\n folded: value\r\nContent-Length: 0\r\n\r\n",
         b"Host : model.test\r\nContent-Length: 0\r\n\r\n",
         b"Bad Name: value\r\nContent-Length: 0\r\n\r\n",
@@ -83,11 +90,14 @@ def test_request_line_accepts_only_the_frozen_route() -> None:
         b"Host: model.test\r\nContent-Length: -1\r\n\r\n",
         b"Host: model.test\r\nContent-Length: 1 \r\n\r\n",
         b"Host: model.test\r\nContent-Length: 999999999999999999999\r\n\r\n",
+        b"Host: model.test\r\n\r\n",
         b"Host: model.test\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nTransfer-Encoding: chunked\r\n\r\n",
         b"Host: model.test\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nProxy-Connection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        b"Host: model.test\r\nProxy-Foo: bar\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n",
+        b"Host: model.test\r\nSec-WebSocket-Key: x\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nX-Forwarded-Host: evil.test\r\nContent-Length: 0\r\n\r\n",
         b"Host: model.test\r\nContent-Length: 0\r\n",
@@ -136,6 +146,7 @@ async def test_response_strips_sensitive_and_hop_headers_and_reframes() -> None:
     upstream = _reader(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: application/json\r\n"
+        b"X-RateLimit-Remaining: 9\r\n"
         b"Content-Length: 2\r\n"
         b"Set-Cookie: secret=1\r\n"
         b"Set-Cookie: other=2\r\n"
@@ -153,6 +164,7 @@ async def test_response_strips_sensitive_and_hop_headers_and_reframes() -> None:
     assert bytes(client.data) == (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: application/json\r\n"
+        b"X-RateLimit-Remaining: 9\r\n"
         b"Content-Length: 2\r\n"
         b"Connection: keep-alive\r\n\r\n{}"
     )
@@ -213,6 +225,7 @@ async def test_chunked_sse_is_decoded_and_streamed_without_te_or_cl() -> None:
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\n",
+        f"HTTP/1.1 200 OK\r\nContent-Length: {_MAX_RESPONSE_BODY_BYTES + 1}\r\n\r\n".encode(),
     ],
 )
 async def test_malformed_upstream_response_becomes_no_relay(response: bytes) -> None:
@@ -358,18 +371,42 @@ async def test_total_response_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch
 async def test_total_response_timeout_bounds_client_backpressure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    total_timeout = 60.0
     monkeypatch.setattr(
         "omnigent.inner.model_signer_service._RESPONSE_TOTAL_TIMEOUT_SECONDS",
-        0.001,
+        total_timeout,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.model_signer_service._RESPONSE_IDLE_TIMEOUT_SECONDS",
+        total_timeout * 2,
     )
     relay = object.__new__(_SignerRelay)
     relay._credential_source = Mock()
+    client = _BlockingWriter()
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock_offset = 0.0
+    monkeypatch.setattr(loop, "time", lambda: real_time() + clock_offset)
 
-    with pytest.raises(asyncio.TimeoutError):
-        await relay._relay_response_observing_status(
+    task = asyncio.create_task(
+        relay._relay_response_observing_status(
             _reader(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
-            _BlockingWriter(),
+            client,
         )
+    )
+    try:
+        await asyncio.wait_for(client.drain_started.wait(), timeout=5.0)
+        assert not task.done()
+        # Expire the total deadline only after parsing has reached backpressure.
+        clock_offset = total_timeout + 1.0
+        done, _ = await asyncio.wait({task}, timeout=5.0)
+        assert task in done, "total response deadline did not cancel the blocked drain"
+        with pytest.raises(asyncio.TimeoutError):
+            task.result()
+    finally:
+        clock_offset = 0.0
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_unframed_infinite_response_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     REAL_CODEX_LAUNCH_CATALOG,
@@ -43,7 +45,7 @@ class _LaunchHarness:
     server_client: httpx.AsyncClient
     app_server: SimpleNamespace
     event_client: SimpleNamespace
-    registry: SimpleNamespace
+    registry: SessionResourceRegistry
     events: list[str]
     builds: list[dict[str, Any]]
     resets: list[dict[str, Any]]
@@ -54,7 +56,7 @@ class _LaunchHarness:
         """Run the production launch path, including snapshot and catalog reads."""
         return await runner_native._auto_create_codex_terminal(
             _SESSION_ID,
-            self.registry,  # type: ignore[arg-type]
+            self.registry,
             lambda _sid, _event: None,
             agent_spec=self.agent_spec,
             server_client=self.server_client,
@@ -134,6 +136,11 @@ async def codex_launch_harness(
         if request.method == "GET":
             assert request.url.path == f"/v1/sessions/{_SESSION_ID}"
             return httpx.Response(200, json=snapshot)
+        if request.method == "PATCH" and set(json.loads(request.content)) == {
+            "external_session_id"
+        }:
+            # A fork records the Codex thread it minted.
+            return httpx.Response(200, json={})
         assert request.method == "POST", "fallback must never unconditionally PATCH the pick"
         assert request.url.path == f"/v1/sessions/{_SESSION_ID}/model-override/reset"
         reset = json.loads(request.content)
@@ -187,7 +194,11 @@ async def codex_launch_harness(
     monkeypatch.setattr(codex_app, "build_codex_native_server", build_server)
     monkeypatch.setattr(codex_app, "CodexAppServerClient", lambda **_kwargs: event_client)
     monkeypatch.setattr(runner_native, "_codex_discover_thread_and_forward", forwarder)
-    registry = SimpleNamespace(launch_auxiliary_terminal=AsyncMock(side_effect=launch_terminal))
+    registry = SessionResourceRegistry()
+    registry.set_client_surface(_SESSION_ID, "desktop")
+    monkeypatch.setattr(
+        registry, "launch_auxiliary_terminal", AsyncMock(side_effect=launch_terminal)
+    )
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(request), base_url="http://runner.test"
     ) as server_client:
@@ -231,8 +242,32 @@ async def test_equivalent_gateway_pick_launches_without_reset(
 
     assert harness.builds[0]["model"] == pick
     assert harness.builds[0]["session_id"] == _SESSION_ID
+    assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
     harness.probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_policy_hook_token_refresh_keeps_runner_responsive(
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = codex_launch_harness
+    harness.snapshot["model_override"] = None
+    loop = asyncio.get_running_loop()
+    loop_progressed: list[bool] = []
+
+    def token_factory() -> str:
+        released = threading.Event()
+        loop.call_soon_threadsafe(released.set)
+        loop_progressed.append(released.wait(timeout=1.0))
+        return "test-hook-token"
+
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: token_factory)
+    await harness.launch()
+
+    assert harness.builds[0]["ap_auth_headers"]["Authorization"] == "Bearer test-hook-token"
+    assert loop_progressed == [True], "Codex hook token refresh blocked the runner event loop"
 
 
 @pytest.mark.asyncio
@@ -240,6 +275,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
 async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
     agent_model: str | None,
     codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fresh evidence retires a pick only after its replacement terminal exists."""
     harness = codex_launch_harness
@@ -254,12 +290,41 @@ async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
         ]
     )
 
+    loop = asyncio.get_running_loop()
+    resolve_launch = codex_app.resolve_native_codex_launch
+    loop_progressed: list[bool] = []
+
+    def resolve_without_blocking_loop(**kwargs: Any) -> codex_app.NativeCodexLaunch:
+        if kwargs.get("model") != _RETIRED_PICK:
+            released = threading.Event()
+            loop.call_soon_threadsafe(released.set)
+            loop_progressed.append(released.wait(timeout=1.0))
+        return resolve_launch(**kwargs)
+
+    monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_without_blocking_loop)
     await harness.launch()
 
+    assert loop_progressed and all(loop_progressed), "fallback routing blocked the event loop"
     assert harness.builds[0]["model"] == (agent_model or _PROVIDER_DEFAULT)
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
     assert harness.snapshot["model_override"] is None
     assert harness.events.index("terminal-launch") < harness.events.index("reset")
+
+
+@pytest.mark.asyncio
+async def test_unavailable_pick_also_pinned_by_the_spec_launches_on_the_default(
+    codex_launch_harness: _LaunchHarness,
+) -> None:
+    """`omnigent codex --model` pins one unlisted id in both places; neither may launch."""
+    harness = codex_launch_harness
+    assert isinstance(harness.agent_spec, AgentSpec)
+    harness.agent_spec.executor.config["model"] = _RETIRED_PICK
+    harness.seed_catalog([{"id": "gpt-5.6-sol", "isDefault": True}, {"id": _PROVIDER_DEFAULT}])
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+    assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
 
 
 @pytest.mark.asyncio
@@ -580,6 +645,94 @@ async def test_resumed_fallback_resets_pick_only_if_preload_and_terminal_succeed
     assert harness.resets == (
         [] if preload_fails else [{"expected_model_override": _RETIRED_PICK}]
     )
+
+
+_FORK_PICK = "system.ai.gpt-6-1-sol"
+
+
+def _seed_fork_source(harness: _LaunchHarness, *, source_model: str, carry_history: bool) -> None:
+    """Make the launch a fork onto ``_FORK_PICK`` of a same-host source rollout."""
+    source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    harness.snapshot["model_override"] = _FORK_PICK
+    harness.snapshot["labels"] = {
+        "omnigent.fork.source_id": "conv_source",
+        "omnigent.fork.source_external_session_id": source_thread,
+        **({"omnigent.fork.carry_history": "1"} if carry_history else {}),
+    }
+    harness.seed_catalog([{"id": "gpt-6.1-sol", "isDefault": True}])
+    source_home = codex_native_bridge.codex_home_for_bridge_dir(
+        codex_native_bridge.bridge_dir_for_bridge_id("conv_source")
+    )
+    rollout_dir = source_home / "sessions" / "2026" / "10" / "15"
+    rollout_dir.mkdir(parents=True)
+    turn = {"turn_id": "turn_1", "cwd": "/repo", "model": source_model}
+    (rollout_dir / f"rollout-2026-10-15T16-28-06-{source_thread}.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": source_thread, "cwd": "/repo"}})
+        + "\n"
+        + json.dumps({"type": "turn_context", "payload": turn})
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_model", "carry_history", "rebuilt"),
+    [
+        ("system.ai.gpt-6-astra", True, True),
+        ("gpt-6.1-sol", True, False),
+        # Without the item rebuild, the clone is the only way to carry the history.
+        ("system.ai.gpt-6-astra", False, False),
+    ],
+    ids=["source-on-other-model", "source-on-fork-model", "no-history-rebuild"],
+)
+async def test_fork_onto_another_model_rebuilds_history_instead_of_cloning(
+    source_model: str,
+    carry_history: bool,
+    rebuilt: bool,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork whose model differs from the source's last turn is rebuilt from items."""
+    harness = codex_launch_harness
+    _seed_fork_source(harness, source_model=source_model, carry_history=carry_history)
+    rebuild = AsyncMock(
+        side_effect=lambda *_args, **kwargs: kwargs["codex_home"] / "rebuilt.jsonl"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout", rebuild
+    )
+    preload = AsyncMock()
+    monkeypatch.setattr(codex_app, "preload_codex_thread_for_resume", preload)
+    monkeypatch.setattr(runner_native, "_codex_forward_known_thread", AsyncMock())
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == _FORK_PICK
+    assert rebuild.await_count == (1 if rebuilt else 0)
+    clone_home = harness.builds[0]["codex_home"]
+    assert bool(list(clone_home.glob("sessions/**/rollout-*.jsonl"))) is not rebuilt
+    preload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fork_onto_another_model_fails_when_its_history_cannot_be_rebuilt(
+    codex_launch_harness: _LaunchHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The declined clone leaves only the rebuild, so a fresh launch would drop the history."""
+    from omnigent.harnesses.codex_native.main import _CodexResumeHistoryUnavailableError
+
+    harness = codex_launch_harness
+    _seed_fork_source(harness, source_model="system.ai.gpt-6-astra", carry_history=True)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._ensure_local_codex_resume_rollout",
+        AsyncMock(side_effect=_CodexResumeHistoryUnavailableError("history returned 503")),
+    )
+
+    with pytest.raises(_CodexResumeHistoryUnavailableError, match="503"):
+        await harness.launch()
+
+    harness.registry.launch_auxiliary_terminal.assert_not_awaited()
 
 
 @pytest.mark.asyncio

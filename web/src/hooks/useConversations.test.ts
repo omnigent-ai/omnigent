@@ -23,6 +23,7 @@ import {
   useBulkStopSessions,
   undoArchiveConversations,
   useConversations,
+  useSessionSearch,
   useDeleteProject,
   useProjects,
   useProjectConfig,
@@ -258,27 +259,68 @@ describe("useConversations project filter", () => {
   });
 });
 
-describe("fetchConversationsPage visibility", () => {
-  it.each([undefined, "mine", "shared", "archived"] as const)(
-    "sends explicit visibility for %s",
-    async (visibility) => {
-      fetchMock.mockResolvedValueOnce(
-        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
-      );
-      const queryClient = new QueryClient();
+describe.each([undefined, "updated_at", "created_at"] as const)(
+  "fetchConversationsPage sorting %s",
+  (sortBy) => {
+    it.each([undefined, "mine", "shared", "archived"] as const)(
+      "sends explicit visibility for %s",
+      async (visibility) => {
+        fetchMock.mockResolvedValueOnce(
+          mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+        );
+        const queryClient = new QueryClient();
 
-      await fetchConversationsPage({
-        searchQuery: "",
-        includeArchived: false,
-        visibility,
-        queryClient,
-      });
+        await fetchConversationsPage({
+          searchQuery: "",
+          includeArchived: false,
+          visibility,
+          sortBy,
+          queryClient,
+        });
 
-      const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
-      expect(params.get("visibility")).toBe(visibility ?? "all");
-      queryClient.clear();
+        const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+        expect(params.get("visibility")).toBe(visibility ?? "all");
+        expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
+        expect(params.get("order")).toBe("desc");
+        queryClient.clear();
+      },
+    );
+  },
+);
+
+describe("useSessionSearch", () => {
+  function renderGroup(searchQuery: string, scope: "title" | "content") {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useSessionSearch(searchQuery, scope, { limit: 8 }), { wrapper });
+  }
+
+  it.each(["title", "content"] as const)(
+    "requests the %s group of a search, including archived sessions",
+    async (scope) => {
+      renderGroup("kestrel", scope);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+      const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+      const params = new URL(url, "http://localhost").searchParams;
+      expect(params.get("search_query")).toBe("kestrel");
+      expect(params.get("search_scope")).toBe(scope);
+      expect(params.get("include_archived")).toBe("true");
+      expect(params.get("limit")).toBe("8");
     },
   );
+
+  it("does not fetch for an empty query", async () => {
+    renderGroup("", "title");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("useConversations search timeout", () => {
@@ -710,7 +752,7 @@ describe("useStopAndDeleteConversation cache eviction", () => {
       infinitePage([conversation({ id: "conv_x" })]),
     );
     queryClient.setQueryData(
-      ["project-sessions", "Sprint 42"],
+      ["project-sessions", "Sprint 42", "updated_at", false],
       infinitePage([conversation({ id: "conv_x" }), conversation({ id: "conv_sibling" })]),
     );
     queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
@@ -765,6 +807,8 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     const folder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_sibling"]);
   });
@@ -891,6 +935,8 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     const folder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_x", "conv_sibling"]);
     const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
@@ -1430,7 +1476,7 @@ describe("useRenameConversation cache patching", () => {
     // Seed only the project-folder cache; the flat list is empty (the folder
     // is the sole place this row appears).
     queryClient.setQueryData(
-      ["project-sessions", "Sprint 42"],
+      ["project-sessions", "Sprint 42", "updated_at", false],
       infinitePage([conversation({ id: "conv_x" })]),
     );
 
@@ -2459,31 +2505,101 @@ describe("useProjectSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fetches the viewer's active project sessions, newest-first, when enabled", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
-        first_id: "conv_a",
-        last_id: "conv_a",
-        has_more: false,
-      }),
-    );
+  it.each([
+    ["updated_at", false, ["project-sessions", "Sprint 42", "updated_at", false]],
+    ["created_at", false, ["project-sessions", "Sprint 42", "created_at", false]],
+    ["updated_at", true, ["project-sessions", "Sprint 42", "updated_at", true]],
+    ["created_at", true, ["project-sessions", "Sprint 42", "created_at", true]],
+  ] as const)(
+    "fetches project sessions by %s (archived: %s)",
+    async (sortBy, archived, expectedKey) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            {
+              id: "conv_a",
+              object: "conversation",
+              title: "A",
+              created_at: 0,
+              updated_at: 9,
+              archived,
+            },
+          ],
+          first_id: "conv_a",
+          last_id: "conv_a",
+          has_more: false,
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useProjectSessions("Sprint 42", true, sortBy, archived), {
+        wrapper,
+      });
+
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      const url = fetchMock.mock.calls[0][0] as string;
+      expect(url).toContain("/v1/sessions?");
+      expect(url).toContain("project=Sprint+42");
+      expect(url).toContain("order=desc");
+      expect(url).toContain(`sort_by=${sortBy}`);
+      expect(url).toContain("limit=20");
+      expect(url).toContain(`visibility=${archived ? "all" : "mine"}`);
+      expect(new URL(url, "http://localhost").searchParams.get("include_archived")).toBe(
+        archived ? "true" : null,
+      );
+      expect(queryClient.getQueryData(expectedKey)).toBeDefined();
+      expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+    },
+  );
+
+  it("reaches first-class archives through old-server mixed and live-only pages", async () => {
+    const live = (id: string) => conversation({ id, project_id: "p_sprint", archived: false });
+    const archive = (id: string) => conversation({ id, project_id: "p_sprint", archived: true });
+    const pages = [
+      { ...infinitePage([live("live_1")]).pages[0], has_more: true },
+      { ...infinitePage([archive("archived_1"), live("live_2")]).pages[0], has_more: true },
+      { ...infinitePage([live("live_3")]).pages[0], has_more: true },
+      { ...infinitePage([archive("archived_2")]).pages[0], has_more: true },
+      infinitePage([live("live_4")]).pages[0],
+    ];
+    for (const page of pages) fetchMock.mockResolvedValueOnce(mockResponse(page));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useProjectSessions("Sprint 42", true), { wrapper });
+    const { result } = renderHook(() => useProjectSessions("Sprint 42", true, "updated_at", true), {
+      wrapper,
+    });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const url = fetchMock.mock.calls[0][0] as string;
-    expect(url).toContain("/v1/sessions?");
-    expect(url).toContain("project=Sprint+42");
-    expect(url).toContain("order=desc");
-    expect(url).toContain("sort_by=updated_at");
-    expect(url).toContain("limit=20");
-    expect(url).toContain("visibility=mine");
-    // Folders show active sessions only — archived ones leave the sidebar.
-    expect(url).not.toContain("include_archived");
-    expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+    expect(result.current.data!.pages[0].data.map((row) => row.id)).toEqual(["archived_1"]);
+    // Keep the server cursor even when the final row in its page was filtered out.
+    expect(result.current.data!.pages[0].last_id).toBe("live_2");
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.data!.pages).toHaveLength(2));
+    expect(result.current.data!.pages[1].data.map((row) => row.id)).toEqual(["archived_2"]);
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(result.current.data!.pages[2].data).toEqual([]);
+    const requests = fetchMock.mock.calls.map(
+      ([url]) => new URL(url as string, "http://localhost").searchParams,
+    );
+    expect(requests.map((params) => params.get("after"))).toEqual([
+      null,
+      "live_1",
+      "live_2",
+      "live_3",
+      "archived_2",
+    ]);
+    for (const params of requests) {
+      expect(params.get("visibility")).toBe("all");
+      expect(params.get("include_archived")).toBe("true");
+      expect(params.get("project")).toBe("Sprint 42");
+    }
   });
 });
 
@@ -2645,11 +2761,11 @@ describe("useMoveToProject", () => {
       infinitePage([conversation({ id: "conv_move", labels: { omni_project: "Old folder" } })]),
     );
     queryClient.setQueryData(
-      ["project-sessions", "Old folder"],
+      ["project-sessions", "Old folder", "updated_at", false],
       infinitePage([conversation({ id: "conv_move", labels: { omni_project: "Old folder" } })]),
     );
     queryClient.setQueryData(
-      ["project-sessions", "Sprint 42"],
+      ["project-sessions", "Sprint 42", "updated_at", false],
       infinitePage([conversation({ id: "conv_resident" })]),
     );
     const wrapper = ({ children }: { children: ReactNode }) =>
@@ -2676,6 +2792,8 @@ describe("useMoveToProject", () => {
     const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Old folder",
+      "updated_at",
+      false,
     ]);
     expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_move")).toBeUndefined();
     // … while the target's pages are NOT force-fed the row — the sidebar
@@ -2683,6 +2801,8 @@ describe("useMoveToProject", () => {
     const targetFolder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Sprint 42",
+      "updated_at",
+      false,
     ]);
     expect(targetFolder!.pages[0].data.map((c) => c.id)).toEqual(["conv_resident"]);
 
@@ -2723,7 +2843,7 @@ describe("useMoveToProject", () => {
       infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
     );
     queryClient.setQueryData(
-      ["project-sessions", "Old folder"],
+      ["project-sessions", "Old folder", "updated_at", false],
       infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
     );
     const wrapper = ({ children }: { children: ReactNode }) =>
@@ -2746,6 +2866,8 @@ describe("useMoveToProject", () => {
     const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Old folder",
+      "updated_at",
+      false,
     ]);
     expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_move")).toBeUndefined();
 
@@ -2877,109 +2999,165 @@ describe("useMoveToProject", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
   });
 
-  it("moves a folder-only row into the target folder's cache (no sidebar vanish)", async () => {
-    // A row loaded only through an expanded folder's own pagination is absent
-    // from every ["conversations"] page, so the folder union can't re-home it.
-    // The overlay must insert it into the target folder's cache in the same
-    // pass that removes it from the source folder's.
-    let resolveList: (value: Response) => void = () => {};
-    fetchMock.mockReset();
-    fetchMock
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveList = resolve;
-        }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          id: "conv_deep",
-          object: "conversation",
-          title: "t",
-          created_at: 0,
-          updated_at: 1,
-          project_id: "p_sprint",
-          labels: {},
-        }),
+  it.each([
+    [undefined, false],
+    ["updated_at", false],
+    ["created_at", false],
+    [undefined, true],
+    ["updated_at", true],
+    ["created_at", true],
+  ] as const)(
+    "moves a folder-only row into each matching target cache (window sort: %s, archived: %s)",
+    async (windowSort, archived) => {
+      // A row may be in one sort's main window but only in folder pages for the other.
+      // Each target must be able to render it before its source copy is removed.
+      let resolveList: (value: Response) => void = () => {};
+      fetchMock.mockReset();
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            resolveList = resolve;
+          }),
+        )
+        .mockResolvedValueOnce(
+          mockResponse({
+            id: "conv_deep",
+            object: "conversation",
+            title: "t",
+            created_at: 0,
+            updated_at: 1,
+            project_id: "p_sprint",
+            archived,
+            labels: {},
+          }),
+        );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+      const row = conversation({ id: "conv_deep", project_id: "p_old", archived });
+      for (const sortBy of ["updated_at", "created_at"]) {
+        const sortKey = sortBy === "created_at" ? [sortBy] : [];
+        queryClient.setQueryData(
+          ["conversations", "", archived, null, archived ? "archived" : "mine", ...sortKey],
+          infinitePage(sortBy === windowSort ? [row] : []),
+        );
+        queryClient.setQueryData(
+          ["project-sessions", "Old folder", sortBy, archived],
+          infinitePage([row]),
+        );
+        queryClient.setQueryData(
+          ["project-sessions", "Sprint 42", sortBy, archived],
+          infinitePage([conversation({ id: "conv_resident", archived })]),
+        );
+      }
+      const oppositeKey = ["project-sessions", "Sprint 42", "updated_at", !archived];
+      queryClient.setQueryData(oppositeKey, infinitePage([]));
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+      result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
+
+      await waitFor(() => {
+        for (const sortBy of ["updated_at", "created_at"]) {
+          const sortKey = sortBy === "created_at" ? [sortBy] : [];
+          const target = queryClient.getQueryData<ConversationsInfiniteData>([
+            "project-sessions",
+            "Sprint 42",
+            sortBy,
+            archived,
+          ]);
+          const window = queryClient.getQueryData<ConversationsInfiniteData>([
+            "conversations",
+            "",
+            archived,
+            null,
+            archived ? "archived" : "mine",
+            ...sortKey,
+          ]);
+          expect(target!.pages[0].data.map((c) => c.id)).toEqual(
+            sortBy === windowSort ? ["conv_resident"] : ["conv_deep", "conv_resident"],
+          );
+          const moved = [...window!.pages[0].data, ...target!.pages[0].data].find(
+            (c) => c.id === "conv_deep",
+          );
+          expect(moved?.project_id).toBe("p_sprint");
+          const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+            "project-sessions",
+            "Old folder",
+            sortBy,
+            archived,
+          ]);
+          expect(oldFolder!.pages[0].data).toEqual([]);
+        }
+      });
+
+      expect(
+        queryClient.getQueryData<ConversationsInfiniteData>(oppositeKey)!.pages[0].data,
+      ).toEqual([]);
+      resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    },
+  );
+
+  it.each(["none", "window", "folder"])(
+    "keeps the source row without a matching target (other sort: %s)",
+    async (otherSource) => {
+      // Visibility in Updated must not drop the only copy available in Created.
+      let resolveList: (value: Response) => void = () => {};
+      fetchMock.mockReset();
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            resolveList = resolve;
+          }),
+        )
+        .mockResolvedValueOnce(
+          mockResponse({
+            id: "conv_deep",
+            object: "conversation",
+            title: "t",
+            created_at: 0,
+            updated_at: 1,
+            project_id: "p_sprint",
+            labels: {},
+          }),
+        );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
+      const row = conversation({ id: "conv_deep", project_id: "p_old" });
+      queryClient.setQueryData(
+        ["conversations", "", false, null, "mine", "created_at"],
+        infinitePage([]),
       );
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
-    queryClient.setQueryData(["conversations", "", false], infinitePage([]));
-    queryClient.setQueryData(
-      ["project-sessions", "Old folder"],
-      infinitePage([conversation({ id: "conv_deep", project_id: "p_old" })]),
-    );
-    queryClient.setQueryData(
-      ["project-sessions", "Sprint 42"],
-      infinitePage([conversation({ id: "conv_resident" })]),
-    );
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+      queryClient.setQueryData(
+        ["project-sessions", "Old folder", "created_at", false],
+        infinitePage([row]),
+      );
+      if (otherSource === "window") {
+        queryClient.setQueryData(["conversations", "", false, null, "mine"], infinitePage([row]));
+      } else if (otherSource === "folder") {
+        queryClient.setQueryData(
+          ["project-sessions", "Sprint 42", "updated_at", false],
+          infinitePage([]),
+        );
+      }
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToProject(), { wrapper });
 
-    result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
+      result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
+      resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    await waitFor(() => {
-      const target = queryClient.getQueryData<ConversationsInfiniteData>([
+      const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
         "project-sessions",
-        "Sprint 42",
+        "Old folder",
+        "created_at",
+        false,
       ]);
-      const moved = target!.pages[0].data.find((c) => c.id === "conv_deep")!;
-      expect(moved.project_id).toBe("p_sprint");
-    });
-    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
-      "project-sessions",
-      "Old folder",
-    ]);
-    expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_deep")).toBeUndefined();
-
-    resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-  });
-
-  it("keeps a folder-only row in its source folder when nothing else can show it", async () => {
-    // Same deep row, but the target folder has never been expanded (no cache
-    // to insert into) — dropping the source copy would blank the row from the
-    // sidebar until the refetches land, so the removal must be skipped.
-    let resolveList: (value: Response) => void = () => {};
-    fetchMock.mockReset();
-    fetchMock
-      .mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          resolveList = resolve;
-        }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          id: "conv_deep",
-          object: "conversation",
-          title: "t",
-          created_at: 0,
-          updated_at: 1,
-          project_id: "p_sprint",
-          labels: {},
-        }),
-      );
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
-    queryClient.setQueryData(["conversations", "", false], infinitePage([]));
-    queryClient.setQueryData(
-      ["project-sessions", "Old folder"],
-      infinitePage([conversation({ id: "conv_deep", project_id: "p_old" })]),
-    );
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useMoveToProject(), { wrapper });
-
-    result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
-    resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-
-    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
-      "project-sessions",
-      "Old folder",
-    ]);
-    expect(oldFolder!.pages[0].data.map((c) => c.id)).toEqual(["conv_deep"]);
-  });
+      expect(oldFolder!.pages[0].data.map((c) => c.id)).toEqual(["conv_deep"]);
+    },
+  );
 
   it("restores the previous membership when the PATCH fails", async () => {
     fetchMock.mockReset();
@@ -2997,9 +3175,15 @@ describe("useMoveToProject", () => {
       ]),
     );
     queryClient.setQueryData(
-      ["project-sessions", "Before folder"],
+      ["project-sessions", "Before folder", "updated_at", false],
       infinitePage([conversation({ id: "conv_move", project_id: "p_before" })]),
     );
+    const createdSourceKey = ["project-sessions", "Before folder", "created_at", false];
+    const createdTargetKey = ["project-sessions", "Sprint 42", "created_at", false];
+    const createdSource = infinitePage([conversation({ id: "conv_move", project_id: "p_before" })]);
+    const createdTarget = infinitePage([]);
+    queryClient.setQueryData(createdSourceKey, createdSource);
+    queryClient.setQueryData(createdTargetKey, createdTarget);
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useMoveToProject(), { wrapper });
@@ -3017,8 +3201,12 @@ describe("useMoveToProject", () => {
     const folder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Before folder",
+      "updated_at",
+      false,
     ]);
     expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_move"]);
+    expect(queryClient.getQueryData(createdSourceKey)).toEqual(createdSource);
+    expect(queryClient.getQueryData(createdTargetKey)).toEqual(createdTarget);
   });
 });
 

@@ -578,6 +578,10 @@ async def test_discovery_process_captures_stderr_in_memory(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    # Without an owner lock the fake process is never registered as a live child.
+    monkeypatch.setattr(
+        codex_native_app_server, "acquire_codex_native_process_owner_lock", lambda: None
+    )
 
     discovery = await codex_native_app_server._start_codex_model_discovery_process(
         codex_path="/test/codex",
@@ -588,6 +592,33 @@ async def test_discovery_process_captures_stderr_in_memory(
 
     assert captured_stderr == asyncio.subprocess.PIPE
     assert await discovery.stderr_tail == "Error: provider unavailable"
+
+
+async def test_discovery_spawn_failure_releases_owner_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe that never spawned leaves neither an owner lock nor a registry entry."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import process_registry
+
+    async def _fail_spawn(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fail_spawn)
+
+    with pytest.raises(OSError, match="spawn failed"):
+        await codex_native_app_server._start_codex_model_discovery_process(
+            codex_path="/test/codex",
+            listen_url="ws://127.0.0.1:12345",
+            env={},
+            cwd=Path("/work"),
+        )
+
+    owner_lock_dir = process_registry._codex_native_state_root() / process_registry._OWNER_LOCK_DIR
+    assert list(owner_lock_dir.glob("*.lock")) == []
+    registry_path = process_registry.codex_native_process_registry_path()
+    assert process_registry._read_registry(registry_path) == []
 
 
 async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:

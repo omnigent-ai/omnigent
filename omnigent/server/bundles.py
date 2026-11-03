@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import posixpath
 import tarfile
 import tempfile
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import generate_agent_id, uploaded_agent_id
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from omnigent.entities import Agent
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.artifact_store import ArtifactStore
+
+_logger = logging.getLogger(__name__)
 
 
 def _is_dotted_callable_path(path: str) -> bool:
@@ -118,14 +121,9 @@ def validate_agent_bundle(
     :param bundle_bytes: Raw bytes of the ``.tar.gz`` bundle.
     :param enforce_handler_allowlist: When ``True`` (the default),
         reject any ``type: function`` policy whose handler is not a
-        registered policy handler, before the inner loader
-        can resolve and call it. Callers pass ``False`` only for a
-        trusted single-user/local server, where ``omnigent run`` uploads
-        the operator's own bundle through this same path and custom
-        handlers must keep working (the operator already has code
-        execution, so the restriction would add no security). See the
-        call sites in ``omnigent/server/routes/sessions.py``, which gate
-        this on :func:`omnigent.server.auth.local_single_user_enabled`.
+        registered policy handler, before the inner loader can resolve and
+        call it. HTTP entry points always enforce this, including local
+        single-user servers. ``False`` is for direct trusted in-process callers.
     :returns: The validated :class:`AgentSpec`.
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
@@ -144,6 +142,10 @@ def validate_agent_bundle(
         raise
     except ExtractionError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    except OSError:
+        raise OmnigentError(
+            "Agent bundle validation failed", code=ErrorCode.INTERNAL_ERROR
+        ) from None
     except Exception as exc:
         # Catch YAML parse errors and other unexpected failures
         # during spec loading so they surface as 400, not 500.
@@ -158,11 +160,7 @@ def validate_agent_bundle(
             code=ErrorCode.INVALID_INPUT,
         )
 
-    # Both guards below apply only to untrusted uploads, gated on the same
-    # trust signal as the handler allowlist: a trusted single-user/local server
-    # (enforce_handler_allowlist=False) uploads the operator's OWN bundle, and
-    # the operator legitimately controls cwd and Python callable tools (they
-    # already have code execution), so neither restriction applies there.
+    # HTTP entry points always enforce these uploaded-code boundaries.
     if enforce_handler_allowlist:
         # Terminals and nested agents can override the session working directory.
         _reject_uploaded_escaping_cwd(spec)
@@ -188,7 +186,15 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
 
 def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
     """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
-    data = artifact_store.get(location)
+    try:
+        data = artifact_store.get(location)
+    except KeyError as exc:
+        _logger.warning(
+            "agent bundle %s is missing from the artifact store; cannot copy it", location
+        )
+        raise OmnigentError(
+            SESSION_AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.SESSION_AGENT_MISSING
+        ) from exc
     new_location = bundle_location(new_agent_id, data)
     artifact_store.put(new_location, data)
     return new_location

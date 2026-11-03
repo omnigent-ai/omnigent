@@ -28,9 +28,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 # scripts/sync_version_py.py -> repo root is one level up.
 _REPO_ROOT = Path(__file__).resolve().parents[1]

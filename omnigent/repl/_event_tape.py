@@ -432,9 +432,7 @@ def build_tape_detail(
         return Group(*parts)
 
     # ── 1. Header ───────────────────────────────────────────────
-    wall = datetime.datetime.fromtimestamp(entry.ts, tz=datetime.timezone.utc).strftime(
-        "%H:%M:%S.%f"
-    )[:-3]
+    wall = datetime.datetime.fromtimestamp(entry.ts, tz=datetime.UTC).strftime("%H:%M:%S.%f")[:-3]
     color = _stage_color(entry.stage_reached)
 
     parts.append(
@@ -765,7 +763,7 @@ def log_entry_jsonl(fh: TextIO, entry: TapeEntry) -> None:
     """
     record = {
         "ts": entry.ts,
-        "wall": datetime.datetime.fromtimestamp(entry.ts, tz=datetime.timezone.utc).isoformat(),
+        "wall": datetime.datetime.fromtimestamp(entry.ts, tz=datetime.UTC).isoformat(),
         "delta_ms": round(entry.delta_ms, 2),
         "path": entry.path,
         "raw_type": entry.raw_event_type,

@@ -40,6 +40,11 @@ from typing import Any, Protocol, TypeAlias, cast
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.databricks_ai_gateway import (
+    CODEX_AGENT,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_egress import (
     CERTIFICATE_FAILURE_CODE,
@@ -593,7 +598,7 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with suppress(ProcessLookupError):
             proc.kill()
         with suppress(Exception):
@@ -1302,6 +1307,8 @@ def materialize_codex_provider_config(
 
     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
     untouched: Codex rejects unsupported fields there by discarding the whole config.
+    Custom providers on a Databricks Unity Gateway also get the gateway's
+    usage-attribution ``http_headers``.
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
@@ -1366,6 +1373,12 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
+        base_url = provider_config.get("base_url")
+        if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            headers = provider_config.get("http_headers")
+            provider_config["http_headers"] = with_gateway_attribution(
+                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+            )
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -2178,6 +2191,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    auth_config: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2189,10 +2203,28 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param auth_config: ucode's structured auth command, args and timeout.
+        Invalid or missing values retain the legacy shell helper and defaults.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
-    auth_command_json = json.dumps(auth_command)
+    command = "sh"
+    args = ["-c", auth_command]
+    timeout_ms = _GATEWAY_AUTH_TIMEOUT_MS
+    if auth_config is not None:
+        configured_command = auth_config.get("command")
+        configured_args = auth_config.get("args", [])
+        if (
+            isinstance(configured_command, str)
+            and configured_command.strip()
+            and isinstance(configured_args, list)
+            and all(isinstance(arg, str) for arg in configured_args)
+        ):
+            command = configured_command
+            args = configured_args
+        configured_timeout = auth_config.get("timeout_ms")
+        if type(configured_timeout) is int and configured_timeout > 0:
+            timeout_ms = configured_timeout
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2201,9 +2233,9 @@ def _databricks_codex_config_overrides(
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
-            'auth={command="sh",'
-            f'args=["-c",{auth_command_json}],'
-            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
+            f"auth={{command={json.dumps(command)},"
+            f"args={json.dumps(args)},"
+            f"timeout_ms={timeout_ms},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -2804,12 +2836,10 @@ class _CodexAppServerSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
-        # Last reasoning effort applied via ``thread/settings/update`` on the
-        # current thread. Effort is not part of the executor's session
-        # signature, so a change must be re-applied per turn; this is reset on
-        # a fresh thread so it is re-sent. ``turn/start`` carries no ``effort``
-        # field (it is silently dropped), hence the separate settings update.
+        # Last requested override on this thread; None means its original default.
         self._applied_effort: str | None = None
+        self._default_effort: str | None = None
+        self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
@@ -3113,7 +3143,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001 - never block session startup
+                except Exception:  # never block session startup
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3216,7 +3246,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # noqa: BLE001 - cleanup must continue
+                except Exception:  # cleanup must continue
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3283,7 +3313,7 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # noqa: BLE001 - cleanup must continue
+                    except Exception:  # cleanup must continue
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3391,7 +3421,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+        except Exception:  # any signer failure invalidates the worker
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -3422,7 +3452,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - cleanup state records failure
+            except Exception:  # cleanup state records failure
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:
@@ -3524,7 +3554,7 @@ class _CodexAppServerSession:
                 return final_response
             try:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return final_response
             if isinstance(message, HarnessTransportClosedError):
                 # A completed turn remains successful when its process exits.
@@ -3564,6 +3594,35 @@ class _CodexAppServerSession:
                 final_response = completed_text
             if phase == "final_answer":
                 return final_response
+
+    async def _resolve_default_effort(self) -> str:
+        """Resolve the thread's original configured or model-default effort."""
+        if self._default_effort is not None:
+            return self._default_effort
+        # Null is a no-op for both settings/update and legacy turn/start.
+        # Resolve an explicit value without replacing the thread or its history.
+        if self._thread_model is not None:
+            params: CodexParams = {"includeHidden": True}
+            seen_cursors: set[str] = set()
+            while True:
+                response = await self._request("model/list", params.copy())
+                result = response.get("result", {})
+                for entry in result.get("data", []):
+                    if entry.get("model") == self._thread_model:
+                        effort = entry.get("defaultReasoningEffort")
+                        if isinstance(effort, str) and effort:
+                            self._default_effort = effort
+                            return effort
+                cursor = result.get("nextCursor")
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    break
+                seen_cursors.add(cursor)
+                params["cursor"] = cursor
+        raise RuntimeError(
+            f"Cannot restore Codex default reasoning effort for {self._thread_model!r}: "
+            "the app-server did not provide a default. Select an explicit effort or "
+            "start a new session."
+        )
 
     async def run_turn(
         self,
@@ -3626,6 +3685,14 @@ class _CodexAppServerSession:
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
+            raw_default_effort = response.get("result", {}).get("reasoningEffort")
+            self._default_effort = (
+                raw_default_effort
+                if isinstance(raw_default_effort, str) and raw_default_effort
+                else None
+            )
+            raw_model = response.get("result", {}).get("model")
+            self._thread_model = raw_model if isinstance(raw_model, str) and raw_model else model
             # Fresh thread: cumulative usage counters restart at zero.
             self._thread_usage_total_raw = None
             self._thread_usage_baseline_raw = None
@@ -3668,13 +3735,16 @@ class _CodexAppServerSession:
         # Prefer the persistent thread setting and fall back only for that
         # explicit protocol-version mismatch.
         effort_via_turn_start = False
-        if reasoning_effort and reasoning_effort != self._applied_effort:
+        effort = reasoning_effort
+        if reasoning_effort != self._applied_effort:
+            if effort is None:
+                effort = await self._resolve_default_effort()
             try:
                 await self._request(
                     "thread/settings/update",
                     {
                         "threadId": self.thread_id,
-                        "effort": reasoning_effort,
+                        "effort": effort,
                         "summary": "detailed",
                     },
                 )
@@ -3697,7 +3767,7 @@ class _CodexAppServerSession:
             "input": turn_input,
         }
         if effort_via_turn_start:
-            turn_params["effort"] = reasoning_effort
+            turn_params["effort"] = effort
             turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",

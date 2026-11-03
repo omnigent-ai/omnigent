@@ -26,7 +26,7 @@ from pathlib import Path
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 fault_file = Path(sys.argv.pop(1))
-sys.argv.pop(1)
+del sys.argv[1:5]
 
 def unavailable_when_armed(method):
     def read(self, *args, **kwargs):
@@ -53,8 +53,8 @@ def test_idle_session_stays_healthy_after_unreadable_replica_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A late old-replica timeout cannot add a disconnect error after recovery."""
-    monkeypatch.setattr(rig, "_UNAVAILABLE_BACKEND_BOOTSTRAP", _READ_OUTAGE_BOOTSTRAP)
-    stack = rig._ReconnectStack(mock_llm_server_url, tmp_path, fail_conversation_reads=True)
+    monkeypatch.setattr(rig, "_REPLICA_A_BOOTSTRAP", _READ_OUTAGE_BOOTSTRAP)
+    stack = rig._ReconnectStack(mock_llm_server_url, tmp_path, store_fault_scope="reads")
     replica = None
     try:
         stack.start()
@@ -124,8 +124,8 @@ def test_idle_session_stays_healthy_after_unreadable_replica_handoff(
             what="the recovered session stream on replica B",
         )
         # The recovered runner is healthy before A's 90-second grace expires.
-        assert stack.conversation_read_fault is not None
-        stack.conversation_read_fault.touch()
+        assert stack.store_fault is not None
+        stack.store_fault.touch()
         page.goto(f"{replica.base_url}/c/{session_id}")
         expect(page.get_by_text("Check complete.", exact=True)).to_be_visible()
         expect(page.get_by_test_id("error-pill")).to_have_count(0)
@@ -143,7 +143,7 @@ def test_idle_session_stays_healthy_after_unreadable_replica_handoff(
         assert replica.runner_online()
 
         # A browser request can return to A once its backend reads recover.
-        stack.conversation_read_fault.unlink()
+        stack.store_fault.unlink()
         page.goto(f"{stack.base_url}/c/{session_id}")
         expect(page.get_by_text("Check complete.", exact=True)).to_be_visible()
         pill = page.get_by_test_id("error-pill")
@@ -158,8 +158,8 @@ def test_idle_session_stays_healthy_after_unreadable_replica_handoff(
         assert snapshot.get("last_task_error") is None
         assert not rig._FAILURE_SIGNATURE.search(log)
     finally:
-        if stack.conversation_read_fault is not None:
-            stack.conversation_read_fault.unlink(missing_ok=True)
+        if stack.store_fault is not None:
+            stack.store_fault.unlink(missing_ok=True)
         if replica is not None:
             replica.teardown()
         stack.teardown()

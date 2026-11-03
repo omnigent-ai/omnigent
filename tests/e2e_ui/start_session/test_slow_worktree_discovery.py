@@ -11,12 +11,12 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _WORKTREES_RE,
     _register_common_routes,
     _run_in_fresh_loop,
-    _wait_until,
 )
 
 
@@ -60,7 +60,7 @@ async def _drive_slow_worktree_discovery(base_url: str, session_id: str) -> None
             await page.goto(f"{base_url}/")
             composer = page.get_by_test_id("new-chat-landing-input")
             await composer.wait_for(state="visible", timeout=30_000)
-            await _wait_until(lambda: len(worktree_requests) == 1)
+            await poll_until_async(lambda: len(worktree_requests) == 1)
             await composer.fill("set up the project")
 
             submit = page.get_by_test_id("new-chat-landing-submit")
@@ -68,7 +68,7 @@ async def _drive_slow_worktree_discovery(base_url: str, session_id: str) -> None
             assert not release_worktrees.is_set()
             await submit.click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID
             assert body["workspace"] == "/work/repo"

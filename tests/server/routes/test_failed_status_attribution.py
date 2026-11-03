@@ -11,11 +11,18 @@ from __future__ import annotations
 import ast
 import logging
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 import omnigent.server.routes._sessions.helpers as helpers
 from omnigent.debug_logging import _attributes
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.server.failed_status_diagnostics import (
+    bound_runner_connection,
+    failed_status_intake_attributes,
+)
 from omnigent.server.schemas import ErrorDetail
 
 # Statuses that are not failures. Anything else a publish site can pass —
@@ -230,3 +237,75 @@ def test_every_failure_publish_site_names_itself() -> None:
             )
     # A scan that silently matched nothing would pass forever.
     assert checked >= 7, f"expected the known failure publish sites, found {checked}"
+
+
+@pytest.mark.parametrize(
+    ("data", "field", "state"),
+    [
+        ({}, "error", "missing"),
+        ({"error": None}, "error", "null"),
+        ({"error": []}, "error", "invalid"),
+        ({"error": {}}, "error", "empty"),
+        ({"error": {"code": 42}}, "code", "invalid"),
+        ({"error": {"message": "  "}}, "message", "empty"),
+        ({"output": "private-synthetic-token"}, "output", "present"),
+        ({"failure_detail": "https://example.test/private"}, "detail", "present"),
+        ({"failure_context": {}}, "context", "empty"),
+        ({"failure_context": {"native_hook_event": "StopFailure"}}, "context", "present"),
+    ],
+)
+def test_failed_status_intake_records_availability_without_content(
+    data: dict[str, object], field: str, state: str
+) -> None:
+    attributes = failed_status_intake_attributes(
+        data, runner_id="runner_one", connection=None, source="relay_stream"
+    )
+    assert attributes[f"failure_wire_{field}"] == state
+    assert attributes["failure_connection_state"] == "unavailable"
+    assert "private-synthetic-token" not in str(attributes)
+    assert "example.test" not in str(attributes)
+    assert "StopFailure" not in str(attributes)
+
+
+@pytest.mark.asyncio
+async def test_bound_runner_observation_is_explicit_and_ignores_replacement_identity() -> None:
+    registry = TunnelRegistry()
+    observed = registry.register(
+        "runner_one",
+        Mock(),
+        HelloFrame(runner_version="0.20.0", frame_protocol_version=1, connection_id="conn_old"),
+    )
+    assert bound_runner_connection(registry, "runner_one") is observed
+    replacement = registry.register(
+        "runner_one",
+        Mock(),
+        HelloFrame(runner_version="0.21.0", frame_protocol_version=1, connection_id="conn_new"),
+    )
+    attributes = failed_status_intake_attributes(
+        {}, runner_id="runner_one", connection=observed, source="bound_runner_at_intake"
+    )
+    assert attributes["failure_connection_source"] == "bound_runner_at_intake"
+    assert attributes["failure_runner_version"] == "0.20.0"
+    assert attributes["failure_connection_id"] == "conn_old"
+    assert attributes["failure_connection_generation"] == str(observed.generation)
+    assert observed.generation != replacement.generation
+    assert bound_runner_connection(registry, "missing") is None
+    assert bound_runner_connection(None, "runner_one") is None
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"runner_id": "another_runner", "runner_version": "0.20.0"},
+        {"runner_id": "runner_one", "runner_version": "https://example.test/private"},
+    ],
+)
+def test_failed_status_intake_rejects_mismatched_or_unsafe_connection_fields(
+    connection: dict[str, object],
+) -> None:
+    attributes = failed_status_intake_attributes(
+        {}, runner_id="runner_one", connection=connection, source="relay_stream"
+    )
+    assert "failure_runner_version" not in attributes
+    assert "another_runner" not in str(attributes)
+    assert "example.test" not in str(attributes)

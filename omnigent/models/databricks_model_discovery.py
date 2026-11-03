@@ -20,16 +20,17 @@ _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
 _MODEL_SERVICES_MAX_RESULTS = 1000
 _MODEL_SERVICES_PARENT = "schemas/system.ai"
+#: Wire API a model service must advertise for the codex Responses route to serve it.
+_CODEX_RESPONSES_API_TYPE = "codex/v1/responses"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
-#: preference: a workspace exposing both keeps the ``databricks-`` id, so every
-#: consumer (routing candidates, the model picker, the launch alias pins) names
-#: a model the same way no matter which listing answered.
-_CATALOG_SPELLINGS: tuple[str, ...] = ("databricks-", _SYSTEM_MODEL_PREFIX)
+#: Unity Catalog model-service ids are the routable v3 spelling. The legacy
+#: ``databricks-`` form remains accepted for comparisons and compatibility.
+_CATALOG_SPELLINGS: tuple[str, ...] = (_SYSTEM_MODEL_PREFIX, "databricks-")
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
 #: ``gpt-5-6-sol`` → ``("gpt", "5", "6", "sol")``. Mirrors
@@ -58,16 +59,18 @@ def _natural_model_key(model_id: str) -> tuple[tuple[int, str | int], ...]:
     )
 
 
-def _prefer_databricks_spelling(model_ids: Iterable[str]) -> list[str]:
-    """Collapse duplicate spellings of one model onto the preferred one.
+def _prefer_system_model_spelling(model_ids: Iterable[str]) -> list[str]:
+    """Canonicalize model ids onto the Unity Catalog spelling.
 
     :param model_ids: Catalog ids from one or more listings, possibly naming
         the same endpoint under two spellings.
-    :returns: One id per model, sorted, with ``databricks-`` winning ties.
+    :returns: One id per model, sorted, with ``system.ai.`` winning ties.
     """
     best: dict[str, str] = {}
     for model_id in model_ids:
         bare = _bare_model_id(model_id)
+        if model_id.lower().startswith("databricks-"):
+            model_id = f"{_SYSTEM_MODEL_PREFIX}{bare}"
         current = best.get(bare)
         if current is None or _spelling_rank(model_id) < _spelling_rank(current):
             best[bare] = model_id
@@ -133,7 +136,7 @@ def preferred_served_claude_model(
     preferred_family = _claude_family_of(preferred_model_id, marker="claude-")
     if preferred_family is None:
         return None
-    claude_ids = _prefer_databricks_spelling(
+    claude_ids = _prefer_system_model_spelling(
         model_id
         for model_id in served_ids
         if _claude_family_of(model_id, marker="claude-") is not None
@@ -150,12 +153,33 @@ def preferred_served_claude_model(
     return _models_by_claude_family(claude_ids, marker="claude-").get(preferred_family)
 
 
+def _advertises_api_type(service: dict[str, object], api_type: str) -> bool:
+    """Whether *service* serves *api_type*, compared trimmed and case-insensitively.
+
+    A missing, ``null`` or empty ``supported_api_types`` counts as yes, matching
+    listings that predate the field; any other non-list value counts as no.
+    """
+    api_types = service.get("supported_api_types")
+    if api_types is None or api_types == []:
+        return True
+    if not isinstance(api_types, list):
+        return False
+    reported = {value.strip().lower() for value in api_types if isinstance(value, str)}
+    return api_type.lower() in reported
+
+
 def _list_model_service_ids(
     client: httpx.Client,
     workspace_url: str,
     headers: dict[str, str],
+    *,
+    api_type: str | None = None,
 ) -> list[str]:
-    """List Databricks-managed ``system.ai`` model-service identifiers."""
+    """List Databricks-managed ``system.ai`` model-service identifiers.
+
+    :param api_type: When set, keep only services that advertise it, e.g.
+        ``"codex/v1/responses"`` (see :func:`_advertises_api_type`).
+    """
     model_ids: list[str] = []
     page_token: str | None = None
     seen_tokens: set[str] = set()
@@ -180,6 +204,8 @@ def _list_model_service_ids(
             for service in services:
                 raw_name = service.get("name") if isinstance(service, dict) else None
                 if not isinstance(raw_name, str):
+                    continue
+                if api_type is not None and not _advertises_api_type(service, api_type):
                     continue
                 model_id = raw_name.strip()
                 if model_id.startswith(_MODEL_SERVICE_PREFIX):
@@ -261,8 +287,8 @@ def discover_databricks_claude_catalog(
     endpoint under both spellings (``system.ai.claude-opus-5`` from Unity
     Catalog model services, ``databricks-claude-opus-5`` from the Anthropic AI
     Gateway) and answering with whichever listing happened to succeed makes the
-    catalog nondeterministic. Duplicates collapse onto the ``databricks-``
-    spelling so every consumer names a model the same way.
+    catalog nondeterministic. Duplicates collapse onto the ``system.ai.``
+    spelling used by Unity Catalog model services v3.
 
     The gateway listing is therefore issued even when Unity Catalog already
     named Claude models — short-circuiting on the UC hit would cost one HTTP
@@ -298,7 +324,7 @@ def discover_databricks_claude_catalog(
     if primary_error is not None and gateway_error is not None:
         raise gateway_error from primary_error
 
-    merged = _prefer_databricks_spelling([*model_service_ids, *gateway_ids])
+    merged = _prefer_system_model_spelling([*model_service_ids, *gateway_ids])
     models = _models_by_claude_family(merged, marker="claude-")
     if models:
         return DatabricksClaudeCatalog(
@@ -363,7 +389,9 @@ def discover_databricks_codex_models(
     Unity Catalog model services is the only listing that reports what the
     codex Responses route will serve, so ids are ``system.ai.`` by
     construction — unlike the Claude catalog above, which also has a legacy
-    gateway listing to merge in.
+    gateway listing to merge in. A model must advertise the codex Responses API:
+    a GPT-named model such as ``gpt-oss-120b`` that serves only chat routes
+    cannot run a codex turn.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
@@ -378,9 +406,22 @@ def discover_databricks_codex_models(
 
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        model_ids = _list_model_service_ids(client, workspace_url, headers)
+        model_ids = _list_model_service_ids(
+            client, workspace_url, headers, api_type=_CODEX_RESPONSES_API_TYPE
+        )
     codex_ids = [model_id for model_id in model_ids if is_codex_compatible_model(model_id)]
     return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
+
+
+def discover_databricks_gemini_models(
+    workspace_url: str, token: str, *, transport: httpx.BaseTransport | None = None
+) -> tuple[str, ...]:
+    """List Gemini model services accepted by the native Gemini gateway route."""
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        models = _list_model_service_ids(
+            client, workspace_url, {"Authorization": f"Bearer {token}"}
+        )
+    return tuple(model for model in models if _bare_model_id(model).startswith("gemini-"))
 
 
 def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:

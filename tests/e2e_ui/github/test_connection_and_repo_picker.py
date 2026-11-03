@@ -68,11 +68,15 @@ def test_github_connection_controls(
     )
     page.goto(f"{base_url}/settings/integrations")
     if width < 768:
-        page.get_by_test_id("settings-nav-integrations").click()
+        expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+            "aria-hidden", "true"
+        )
     page.get_by_role("button", name="Connect GitHub", exact=True).click()
     expect(page.get_by_role("status")).to_contain_text("GitHub account connected.")
     if width < 768:
-        page.get_by_test_id("settings-nav-integrations").click()
+        expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+            "aria-hidden", "true"
+        )
         page.get_by_role("button", name="About GitHub", exact=True).focus()
         expect(page.get_by_role("tooltip")).to_contain_text("Connected as octocat.")
     else:
@@ -85,16 +89,25 @@ def test_github_connection_controls(
     page.screenshot(path=tmp_path / "github-disconnected.png", animations="disabled")
     page.goto(f"{base_url}/settings/integrations?github=error")
     if width < 768:
-        page.get_by_test_id("settings-nav-integrations").click()
+        expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+            "aria-hidden", "true"
+        )
     expect(page.get_by_role("alert")).to_contain_text("Couldn't connect your GitHub account.")
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize("native_kind", [None, "ios", "android"])
 def test_github_repository_and_branch_picker(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path, width: int
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    width: int,
+    native_kind: str | None,
 ) -> None:
     base_url, _ = seeded_session
     page.set_viewport_size({"width": width, "height": 900})
+    if native_kind:
+        page.add_init_script(f"window.omnigentNative = {{kind: '{native_kind}'}};")
     _enable_github(page, managed=True)
     page.route(
         "**/v1/connections/github/repos",
@@ -122,7 +135,14 @@ def test_github_repository_and_branch_picker(
     page.goto(base_url)
     chip = page.get_by_test_id("new-chat-landing-repo-chip")
     expect(chip).to_be_visible(timeout=30_000)
-    chip.click()
+    if native_kind:
+        chip_box = chip.bounding_box()
+        row_box = page.get_by_test_id("new-chat-landing-workspace-controls").bounding_box()
+        assert chip_box and row_box
+        assert chip_box["height"] >= 44 and row_box["height"] <= 49
+    # Tap just inside the bottom edge; positions exclude the 1px border.
+    chip.click(position={"x": 22, "y": 42} if native_kind else None)
+    expect(page.get_by_role("dialog")).to_have_attribute("data-side", "top")
     page.get_by_role("combobox", name="GitHub repository", exact=True).click()
     page.get_by_placeholder("Search repositories…").fill("hello")
     page.get_by_role("option", name="octocat/hello", exact=True).click()

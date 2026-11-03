@@ -196,6 +196,32 @@ def test_single_file_accepts_plain_parameterized_case_labels(case: str) -> None:
     assert case in result
 
 
+def test_single_changed_file_accepts_case_rows_alongside_existing_tests_from_other_files() -> None:
+    review = (
+        _REVIEW.replace(
+            "tests/test_parser.py::test_empty",
+            "`test_empty[missing-input]` — added",
+        )
+        .replace(
+            "### Tests\n",
+            "### Tests\nChanged test file: `tests/test_parser.py`.\n",
+        )
+        .replace(
+            "### Scope\n",
+            "| `tests/test_other.py::test_existing` — unchanged | Existing behavior |"
+            " Unit | keep | Still relevant. |\n"
+            "### Scope\n",
+        )
+    )
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+
+    assert "`test_empty[missing-input]` — added" in result
+    assert "`tests/test_other.py::test_existing` — unchanged" in result
+
+
 def test_single_file_accepts_case_row_with_an_example_path() -> None:
     review = _REVIEW.replace(
         "tests/test_parser.py::test_empty",
@@ -350,3 +376,137 @@ def test_workflow_inserts_computed_summary_before_secret_scan_and_publication(
     assert receipt["with"]["name"] == (
         "polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}"
     )
+
+
+def _fake_gh(directory: Path, script: str) -> dict[str, str]:
+    gh = directory / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport json, pathlib, sys\n{script}")
+    gh.chmod(0o755)
+    return {**os.environ, "PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}
+
+
+def _run_linked_issues(
+    directory: Path, env: dict[str, str], pull_request: str = "test/repo#12"
+) -> subprocess.CompletedProcess[str]:
+    destination = directory / "linked_issues.json"
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT), "linked-issues", pull_request, str(destination)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+
+
+def test_linked_issues_marks_truncated_bodies_and_omitted_issues(tmp_path: Path) -> None:
+    limit = _HELPERS["LINKED_ISSUE_BODY_LIMIT"]
+    nodes = [
+        {
+            "number": 7,
+            "title": "Short",
+            "state": "OPEN",
+            "body": None,
+            "repository": {"nameWithOwner": "test/repo"},
+        },
+        {
+            "number": 8,
+            "title": "Long",
+            "state": "CLOSED",
+            "body": "x" * (limit + 1),
+            "repository": {"nameWithOwner": "other/repo"},
+        },
+        None,
+    ]
+    response = {
+        "data": {
+            "repository": {
+                "pullRequest": {"closingIssuesReferences": {"totalCount": 4, "nodes": nodes}}
+            }
+        }
+    }
+    env = _fake_gh(
+        tmp_path,
+        "pathlib.Path(sys.argv[0]).with_name('args.json').write_text(json.dumps(sys.argv[1:]))\n"
+        f"print({json.dumps(json.dumps(response))})\n",
+    )
+
+    result = _run_linked_issues(tmp_path, env)
+
+    assert result.stdout == ""
+    args = json.loads((tmp_path / "args.json").read_text())
+    assert args[:2] == ["api", "graphql"]
+    assert {"owner=test", "name=repo", "number=12"} <= set(args)
+    # -F sends the PR number as the Int the query declares; -f would send a string.
+    assert args[args.index("number=12") - 1] == "-F"
+    assert args[args.index("owner=test") - 1] == args[args.index("name=repo") - 1] == "-f"
+    assert "closingIssuesReferences(first: 5)" in args[-1]
+    assert json.loads((tmp_path / "linked_issues.json").read_text()) == {
+        "issues": [
+            {
+                "issue": "test/repo#7",
+                "title": "Short",
+                "state": "OPEN",
+                "body": "",
+                "body_truncated": False,
+            },
+            {
+                "issue": "other/repo#8",
+                "title": "Long",
+                "state": "CLOSED",
+                "body": "x" * limit,
+                "body_truncated": True,
+            },
+        ],
+        "omitted": 2,
+    }
+
+
+_PARTIAL_NODE = {
+    "data": {
+        "repository": {
+            "pullRequest": {
+                "closingIssuesReferences": {
+                    "totalCount": 1,
+                    "nodes": [{"number": 7, "repository": {"nameWithOwner": "test/repo"}}],
+                }
+            }
+        }
+    }
+}
+
+
+@pytest.mark.parametrize(
+    ("pull_request", "gh_script", "detail"),
+    [
+        ("test-repo-12", "sys.exit(1)\n", "ValueError"),
+        (
+            "test/repo#12",
+            "sys.stderr.write('HTTP 401: Bad credentials\\n'); sys.exit(1)\n",
+            "CalledProcessError: HTTP 401: Bad credentials",
+        ),
+        ("test/repo#12", "print('not json')\n", "JSONDecodeError"),
+        ("test/repo#12", "print(json.dumps({'data': {'repository': None}}))\n", "TypeError"),
+        (
+            "test/repo#12",
+            f"print({json.dumps(json.dumps(_PARTIAL_NODE))})\n",
+            "KeyError: 'title'",
+        ),
+    ],
+    ids=[
+        "malformed-reference",
+        "command-failure",
+        "invalid-json",
+        "missing-pull-request",
+        "partial-node",
+    ],
+)
+def test_linked_issues_lookup_failure_records_unavailable(
+    tmp_path: Path, pull_request: str, gh_script: str, detail: str
+) -> None:
+    result = _run_linked_issues(tmp_path, _fake_gh(tmp_path, gh_script), pull_request)
+
+    assert result.stdout.startswith("::warning::Could not read linked issues")
+    assert detail in result.stdout
+    assert result.stdout.count("\n") == 1
+    assert json.loads((tmp_path / "linked_issues.json").read_text()) is None
