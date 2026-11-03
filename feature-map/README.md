@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Automation failure visibility](./automation-failures.md) covers failed-run card
+  warnings, Inbox surfacing, session deduplication and browser-local dismissal.
+
 - [Automation templates](./automation-templates.md) covers the gallery tabs,
   empty-state preview, and direct template setup.
 

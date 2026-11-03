@@ -2301,3 +2301,121 @@ def test_an_executor_records_succeeded_for_a_prompt_delivered_into_a_session(
     assert (delivered.status, delivered.conversation_id) == ("succeeded", _uid("c1"))
     assert delivered.finished_at == now + 30
     assert delivered.lease_expires_at is None
+
+
+@pytest.mark.parametrize("state", ["active", "paused"])
+def test_inbox_failures_latest_run_and_session_dedup(store, state):
+    task = _session_task(store, "inbox", state=state)
+    run_id = _uid("inbox-failure")
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+        error="private error must not be returned",
+    )
+    failures, cursor = store.list_inbox_failures(owner_user_id=task.user_id)
+    assert cursor is None
+    assert [item.run_id for item in failures] == [run_id]
+    assert failures[0].error_code == "host_offline"
+    assert not hasattr(failures[0], "error")
+    assert not hasattr(failures[0], "prompt")
+
+    # A linked failure stays on the session Inbox even if it is read or not loaded.
+    store.create_run(
+        run_id=_uid("linked"),
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=200,
+        conversation_id=_uid("session"),
+        error_code="launch_failed",
+    )
+    assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
+    store.create_run(
+        run_id=_uid("recovered"),
+        scheduled_task_id=task.id,
+        status="succeeded",
+        scheduled_at=300,
+    )
+    assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
+
+
+def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generation(store):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.db.db_models import SqlScheduledTask
+
+    tasks = [_session_task(store, f"inbox-page-{i}") for i in range(4)]
+    for task in tasks:
+        store.create_run(
+            run_id=_uid(task.id),
+            scheduled_task_id=task.id,
+            status="failed",
+            scheduled_at=100,
+            error_code="no_online_host",
+        )
+    ordered = sorted(tasks, key=lambda task: (task.created_at, task.id), reverse=True)
+    with store._session("test_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[0].id)).state = 3  # deleted, retained history
+        session.get(SqlScheduledTask, (0, ordered[1].id)).account_generation = "old"
+    # Post-page filtering must still advance through empty pages.
+    first, cursor = store.list_inbox_failures(owner_user_id=tasks[0].user_id, limit=1)
+    assert first == [] and cursor is not None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        second, next_cursor = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id,
+            generation="current",
+            check_generation=True,
+            after=cursor,
+            limit=1,
+        )
+    assert second == [] and next_cursor is not None and next_cursor != cursor
+    remaining, final = store.list_inbox_failures(
+        owner_user_id=tasks[0].user_id,
+        after=next_cursor,
+        limit=2,
+    )
+    assert [item.task_id for item in remaining] == [task.id for task in ordered[2:]]
+    assert final is None
+    assert store.list_inbox_failures(owner_user_id="someone-else") == ([], None)
+    assert store.list_inbox_failures(owner_user_id=None) == ([], None)
+    with workspace_scope(99):
+        assert store.list_inbox_failures(owner_user_id=tasks[0].user_id) == ([], None)
+
+
+def test_inbox_query_plans_use_bounded_task_and_run_indexes(store):
+    from sqlalchemy import event
+
+    task = _session_task(store, "inbox-plan")
+    store.create_run(
+        run_id=_uid("plan-run"), scheduled_task_id=task.id, scheduled_at=100, status="failed"
+    )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.list_inbox_failures(owner_user_id=task.user_id, limit=1)
+        store.list_inbox_failures(
+            owner_user_id=task.user_id, after=(task.created_at + 1, task.id), limit=1
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(queries) == 4
+    with store._engine.connect() as connection:
+        for statement, parameters in queries:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            index = (
+                "ix_scheduled_task_runs_scheduled_task_id"
+                if "FROM scheduled_task_runs" in statement
+                else "ix_scheduled_tasks_user_scope"
+            )
+            assert index in plan
+            assert "SEARCH" in plan and "TEMP B-TREE" not in plan
+            assert "LIMIT" in statement

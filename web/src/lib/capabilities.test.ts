@@ -473,3 +473,11 @@ describe("picker curation", () => {
     expect(pickerCuration(info({})).defaultAgentName).toBeNull();
   });
 });
+
+it.each([true, false, undefined, "true"])(
+  "parses automation Inbox support strictly: %s",
+  async (value) => {
+    const parsed = await probe({ scheduled_task_inbox: value });
+    expect(parsed.scheduled_task_inbox).toBe(value === true);
+  },
+);

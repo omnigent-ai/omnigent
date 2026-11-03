@@ -49,7 +49,11 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     scheduled_trigger_key,
 )
-from omnigent.stores.scheduled_task_store import AdoptOutcome, ScheduledTaskStore
+from omnigent.stores.scheduled_task_store import (
+    AdoptOutcome,
+    AutomationFailure,
+    ScheduledTaskStore,
+)
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
@@ -707,6 +711,79 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _run_to_entity(row)
 
         return run_write_transaction(self._session_immediate, "insert_task_run", write)
+
+    def list_inbox_failures(
+        self,
+        *,
+        owner_user_id: str | None,
+        generation: str | None = None,
+        check_generation: bool = False,
+        after: tuple[int, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
+        """Bound discovery by the owner/task index, then read one indexed run/task."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._session("list_inbox_failures") as session:
+            stmt = select(
+                SqlScheduledTask.id,
+                SqlScheduledTask.name,
+                SqlScheduledTask.created_at,
+                SqlScheduledTask.state,
+                SqlScheduledTask.account_generation,
+            ).where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.user_id == owner_user_id,
+            )
+            if after is not None:
+                stmt = stmt.where(tuple_(SqlScheduledTask.created_at, SqlScheduledTask.id) < after)
+            tasks = session.execute(
+                stmt.order_by(
+                    SqlScheduledTask.created_at.desc(), SqlScheduledTask.id.desc()
+                ).limit(limit + 1)
+            ).all()
+            page = tasks[:limit]
+            cursor = (page[-1].created_at, page[-1].id) if len(tasks) > limit else None
+            failures = []
+            for task in page:
+                # Filter after paging to bound scans even through deleted/rotated owners.
+                if task.state == encode_scheduled_task_state("deleted") or (
+                    check_generation and task.account_generation != generation
+                ):
+                    continue
+                run = session.execute(
+                    select(
+                        SqlScheduledTaskRun.id,
+                        SqlScheduledTaskRun.status,
+                        SqlScheduledTaskRun.conversation_id,
+                        SqlScheduledTaskRun.scheduled_at,
+                        SqlScheduledTaskRun.finished_at,
+                        SqlScheduledTaskRun.error_code,
+                    )
+                    .where(
+                        SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskRun.scheduled_task_id == task.id,
+                    )
+                    .order_by(
+                        SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc()
+                    )
+                    .limit(1)
+                ).first()
+                if run is not None and (
+                    run.status == encode_scheduled_task_run_status("failed")
+                    and run.conversation_id is None
+                ):
+                    failures.append(
+                        AutomationFailure(
+                            task_id=task.id,
+                            task_name=task.name,
+                            run_id=run.id,
+                            scheduled_at=run.scheduled_at,
+                            finished_at=run.finished_at,
+                            error_code=run.error_code,
+                        )
+                    )
+            return failures, cursor
 
     def list_runs(
         self,

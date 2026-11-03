@@ -15,6 +15,7 @@ import {
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
+  listAutomationFailures,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -325,4 +326,14 @@ describe("error path", () => {
     expect(err.status).toBe(500);
     expect(err.code).toBeNull();
   });
+});
+
+it("requests bounded automation Inbox pages and preserves empty continuations", async () => {
+  fetchMock.mockResolvedValue(mockResponse({ data: [], next_cursor: "100:task" }));
+  expect(await listAutomationFailures(null)).toEqual({ data: [], next_cursor: "100:task" });
+  expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/scheduled-tasks/inbox?limit=50");
+  await listAutomationFailures("100:task");
+  expect(String(fetchMock.mock.calls[1]![0])).toBe(
+    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask",
+  );
 });

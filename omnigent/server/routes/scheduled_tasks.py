@@ -60,7 +60,7 @@ from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
-from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -74,6 +74,13 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset({"agent_id", "host_id", "workspace", "execution_target"})
+
+
+class AutomationFailurePage(BaseModel):
+    """Failures from one bounded page of owned automations."""
+
+    data: list[AutomationFailure]
+    next_cursor: str | None
 
 
 class CreateScheduledTaskRequest(BaseModel):
@@ -694,6 +701,38 @@ def create_scheduled_tasks_router(
                 for t in tasks
             ]
         }
+
+    @router.get("/scheduled-tasks/inbox", response_model=AutomationFailurePage)
+    async def list_automation_inbox(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=100),
+        after: str | None = Query(default=None, max_length=64),
+    ) -> AutomationFailurePage:
+        """Latest sessionless failures; session-linked failures use the session Inbox."""
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        cursor = None
+        if after is not None:
+            try:
+                timestamp, task_id = after.split(":")
+                cursor = (int(timestamp), uuid.UUID(task_id).hex)
+                if not 0 <= cursor[0] <= 2**63 - 1:
+                    raise ValueError("invalid timestamp")
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail="Invalid automation Inbox cursor"
+                ) from exc
+        failures, next_cursor = store.list_inbox_failures(
+            owner_user_id=owner_id,
+            generation=account_generation(owner_id or RESERVED_USER_LOCAL),
+            check_generation=current_account_user() is not None,
+            after=cursor,
+            limit=limit,
+        )
+        return AutomationFailurePage(
+            data=failures,
+            next_cursor=f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None,
+        )
 
     @router.get("/scheduled-tasks/{scheduled_task_id}")
     async def get_scheduled_task(

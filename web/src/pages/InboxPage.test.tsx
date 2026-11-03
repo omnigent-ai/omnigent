@@ -22,6 +22,7 @@ import type * as approvalCard from "@/components/blocks/ApprovalCard";
 import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
+import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import * as sessionsApi from "@/lib/sessionsApi";
 import {
@@ -77,6 +78,7 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
 }));
+vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
 // Real exports (ApiError, codes) so failure handling sees genuine error types.
 vi.mock("@/lib/sessionsApi", async (importActual) => ({
@@ -157,7 +159,21 @@ function renderPage(
   );
 }
 
+function automationInboxStub(overrides: Record<string, unknown> = {}) {
+  return {
+    items: [],
+    isLoading: false,
+    isError: false,
+    hasNextPage: false,
+    markRead: vi.fn(),
+    refetch: vi.fn(),
+    fetchNextPage: vi.fn(),
+    ...overrides,
+  } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
+}
+
 beforeEach(() => {
+  vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
   vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(commentInboxStub());
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
@@ -1561,4 +1577,54 @@ it("recovers a native request after an empty snapshot without reloading", async 
     queryClient.clear();
     vi.useRealTimers();
   }
+});
+
+describe("automation failures", () => {
+  it("renders reason, links to automations, dismisses only the run, and excludes Awaiting response", () => {
+    const markRead = vi.fn();
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        markRead,
+        items: [
+          {
+            task_id: "task",
+            task_name: "Daily report",
+            run_id: "run",
+            scheduled_at: 1_700_000_000,
+            finished_at: 1_700_000_010,
+            error_code: "host_offline",
+          },
+        ],
+      }),
+    );
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Automation failed: Daily report" }));
+    expect(screen.getByText("Host · The host was offline.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Open automation/ })).toHaveAttribute("href", "/tasks");
+    fireEvent.click(screen.getByRole("button", { name: "Mark as read" }));
+    expect(markRead).toHaveBeenCalledWith("run");
+    selectTab("Awaiting response");
+    expect(screen.queryByTestId("inbox-automation-item")).toBeNull();
+    selectTab("Unread");
+    expect(screen.getByTestId("inbox-automation-item")).toBeInTheDocument();
+  });
+
+  it("offers continuation for an empty task page and retries feed failures", () => {
+    const fetchNextPage = vi.fn();
+    const refetch = vi.fn();
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        hasNextPage: true,
+        fetchNextPage,
+        isError: true,
+        refetch,
+      }),
+    );
+    renderPage();
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load automation failures.");
+    fireEvent.click(screen.getByRole("button", { name: "Retry automations" }));
+    expect(refetch).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Check more automations" }));
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
 });

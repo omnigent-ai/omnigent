@@ -295,6 +295,8 @@ class ServerInfoResponse(BaseModel):
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
+    # Bounded latest-failure feed for the Inbox.
+    scheduled_task_inbox: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3638,6 +3640,8 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "scheduled_task_projects": project_store is not None,
+                "scheduled_task_inbox": scheduled_task_store is not None
+                and deployment_gate_enabled(app.state.automations, "automations"),
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
                 "branding": branding_snapshot.config(),

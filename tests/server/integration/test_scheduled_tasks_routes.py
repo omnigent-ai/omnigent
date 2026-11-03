@@ -388,7 +388,9 @@ async def test_automations_gate_is_checked_per_request(
     async with _serve(app, mock_llm, tmp_path) as client:
 
         async def enabled_in_info() -> bool:
-            return (await client.get("/v1/info", headers=_headers())).json()["automations_enabled"]
+            info = (await client.get("/v1/info", headers=_headers())).json()
+            assert info["scheduled_task_inbox"] == info["automations_enabled"]
+            return info["automations_enabled"]
 
         created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
         assert created.status_code == 200, created.text
@@ -400,6 +402,7 @@ async def test_automations_gate_is_checked_per_request(
             gate["state"] = state
             for method, url in (
                 ("GET", "/v1/scheduled-tasks"),
+                ("GET", "/v1/scheduled-tasks/inbox"),
                 ("POST", "/v1/scheduled-tasks"),
                 ("GET", task_url),
                 ("PATCH", task_url),
@@ -2963,3 +2966,64 @@ async def test_changing_where_a_task_runs_starts_a_new_session(
 
     assert moved.status_code == 200, moved.text
     assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)
+
+
+async def test_automation_inbox_owner_scope_and_cursor(auth_client, db_uri):
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    run_id = uuid.uuid4().hex
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task_id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+        error="private launch details",
+    )
+    response = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers())
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "data": [
+            {
+                "task_id": task_id,
+                "task_name": created.json()["name"],
+                "run_id": run_id,
+                "scheduled_at": 100,
+                "finished_at": 101,
+                "error_code": "host_offline",
+            }
+        ],
+        "next_cursor": None,
+    }
+    other = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers("bob@example.com"))
+    assert other.status_code == 200 and other.json()["data"] == []
+    for params in ({"limit": 0}, {"limit": 101}, {"after": "bad"}, {"after": "-1:" + task_id}):
+        invalid = await auth_client.get(
+            "/v1/scheduled-tasks/inbox", headers=_headers(), params=params
+        )
+        assert invalid.status_code == 422
+
+
+async def test_automation_inbox_does_not_duplicate_a_deleted_session(auth_client, db_uri):
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    session_id = _owned_session(db_uri)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.create_run(
+        run_id=uuid.uuid4().hex,
+        scheduled_task_id=created.json()["id"],
+        status="failed",
+        scheduled_at=100,
+        conversation_id=session_id,
+        error_code="launch_failed",
+    )
+    for delete_session in (False, True):
+        if delete_session:
+            assert await SqlAlchemyConversationStore(db_uri).delete_conversation(session_id)
+        response = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers())
+        assert response.status_code == 200 and response.json()["data"] == []

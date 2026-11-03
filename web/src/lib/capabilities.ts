@@ -271,6 +271,8 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
+  /** Latest sessionless automation failures can be listed for Inbox. */
+  scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
@@ -579,6 +581,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
+          scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),

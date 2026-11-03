@@ -442,3 +442,26 @@ export async function runScheduledTaskNow(id: string): Promise<void> {
   });
   if (!res.ok) throw await errorFromResponse(res);
 }
+
+/** Latest failed run from an automation without a session Inbox entry. */
+export interface AutomationFailure {
+  task_id: string;
+  task_name: string;
+  run_id: string;
+  scheduled_at: number;
+  finished_at: number | null;
+  error_code: string | null;
+}
+
+export interface AutomationFailurePage {
+  data: AutomationFailure[];
+  next_cursor: string | null;
+}
+
+/** Pages over owned tasks; an empty result can still have a continuation. */
+export async function listAutomationFailures(after: string | null): Promise<AutomationFailurePage> {
+  const params = new URLSearchParams({ limit: "50" });
+  if (after !== null) params.set("after", after);
+  const response = await authenticatedFetch(`/v1/scheduled-tasks/inbox?${params}`);
+  return readJsonOrThrow<AutomationFailurePage>(response);
+}
