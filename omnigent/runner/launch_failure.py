@@ -133,6 +133,11 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -147,6 +152,23 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
+        FailureDiagnosis(
+            title="Claude session is already running in the background",
+            cause=(
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
+            ),
+            remediation=(
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
