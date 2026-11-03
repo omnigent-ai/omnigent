@@ -1204,7 +1204,8 @@ _PR_WITHOUT_CHECKS = {
     "headRefName": "feature",
     "headRefOid": "a" * 40,
     "baseRefOid": "b" * 40,
-    "headRepository": {"id": "R_1", "name": "repo", "nameWithOwner": "contributor/repo"},
+    "headRepository": {"id": "R_1", "name": "repo"},
+    "headRepositoryOwner": {"id": "U_1", "login": "contributor"},
     "body": "Description",
     "comments": [],
     "reviews": [
@@ -1410,28 +1411,33 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("pr_url", "head", "expected"),
+    ("pr_url", "head", "owner", "expected"),
     [
         (
             "https://github.com/acme/repo/pull/1",
-            {"name": "repo", "nameWithOwner": "acme/repo"},
+            {"id": "R_1", "name": "repo"},
+            {"id": "U_1", "login": "acme"},
             "https://github.com/acme/repo",
         ),
         (
             "https://github.com/acme/repo/pull/1",
-            {"name": "repo", "nameWithOwner": "contributor/repo"},
-            "https://github.com/contributor/repo",
+            {"id": "R_2", "name": "repo-fork"},
+            {"id": "U_2", "login": "contributor"},
+            "https://github.com/contributor/repo-fork",
         ),
         (
             "https://ghe.example.com/acme/repo/pull/1",
-            {"name": "repo", "nameWithOwner": "contributor/repo"},
+            {"id": "R_2", "name": "repo"},
+            {"id": "U_2", "login": "contributor"},
             "https://ghe.example.com/contributor/repo",
         ),
-        # gh reports a deleted fork as null; an older gh omits nameWithOwner.
-        ("https://github.com/acme/repo/pull/1", None, None),
-        ("https://github.com/acme/repo/pull/1", {"id": "R_1", "name": "repo"}, None),
+        # gh reports a deleted fork as null.
+        ("https://github.com/acme/repo/pull/1", None, None, None),
+        ("https://github.com/acme/repo/pull/1", {"id": "R_2", "name": "repo"}, None, None),
     ],
 )
-def test_head_repository_url(pr_url: str, head: object, expected: str | None) -> None:
+def test_head_repository_url(
+    pr_url: str, head: object, owner: object, expected: str | None
+) -> None:
     reference = PullRequestRef.from_url(pr_url)
-    assert github_resource._head_repository_url(reference, head) == expected
+    assert github_resource._head_repository_url(reference, head, owner) == expected

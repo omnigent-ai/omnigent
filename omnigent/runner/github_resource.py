@@ -977,10 +977,14 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
     )
 
 
-def _head_repository_url(reference: PullRequestRef, head: object) -> str | None:
+def _head_repository_url(reference: PullRequestRef, head: object, owner: object) -> str | None:
     """The source (possibly fork) repository's web URL; ``None`` once the fork is deleted."""
-    name = head.get("nameWithOwner") if isinstance(head, dict) else None
-    return f"https://{reference.host}/{name}" if isinstance(name, str) and name else None
+    # Older gh reports headRepository as only {id, name}, so the owner comes separately.
+    name = head.get("name") if isinstance(head, dict) else None
+    login = owner.get("login") if isinstance(owner, dict) else None
+    if isinstance(name, str) and name and isinstance(login, str) and login:
+        return f"https://{reference.host}/{login}/{name}"
+    return None
 
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
@@ -1001,7 +1005,11 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info["selected_account"] = preferred or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
-    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository")
+    data = _pr_json(
+        root,
+        reference,
+        _PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
+    )
     if data is None:
         return info
     author = data.get("author")
@@ -1019,7 +1027,9 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "head_ref": data.get("headRefName"),
         "head_sha": data.get("headRefOid"),
         "base_sha": data.get("baseRefOid"),
-        "head_repository_url": _head_repository_url(reference, data.get("headRepository")),
+        "head_repository_url": _head_repository_url(
+            reference, data.get("headRepository"), data.get("headRepositoryOwner")
+        ),
         **_checks_fields(data),
         "body": data.get("body") or None,
         **_comments_payload(data),

@@ -96,7 +96,7 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
         B: "Second",
     }
     assert [call[-1] for call in calls] == [
-        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository",
+        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
         "title",
     ]
     registry = SessionPrRegistry("session")
