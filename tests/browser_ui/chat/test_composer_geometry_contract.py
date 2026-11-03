@@ -277,6 +277,139 @@ def test_label_collapse_preserves_submit_geometry(
     assert_same_vertical_center(box(leading), box(_submit(page, surface)))
 
 
+@pytest.mark.parametrize(
+    ("native_kind", "viewport", "touch"),
+    [
+        pytest.param(
+            "android",
+            {"width": 360, "height": 800},
+            True,
+            id="android-bridge-chromium-touch-360",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+        pytest.param(
+            "ios",
+            {"width": 402, "height": 874},
+            True,
+            id="ios-bridge-chromium-touch-402",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+        pytest.param(
+            None,
+            {"width": 360, "height": 800},
+            True,
+            id="browser-touch-360",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+        pytest.param("ios", {"width": 402, "height": 874}, False, id="ios-bridge-mouse-402"),
+        pytest.param(None, {"width": 360, "height": 800}, False, id="browser-mouse-360"),
+        pytest.param(None, DESKTOP, False, id="desktop-mouse-keyboard"),
+    ],
+)
+def test_live_primary_actions_and_stop_remain_reachable(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    native_kind: str | None,
+    viewport: dict[str, int],
+    touch: bool,
+) -> None:
+    """Touch/native target growth preserves hit areas and Stop through active-turn reflow."""
+    chat = chat_session_contract
+    enlarged = bool(native_kind) or touch
+    if native_kind:
+        page.add_init_script(f"window.omnigentNative = {{kind: '{native_kind}'}};")
+    chat.set_catalog(
+        harness="claude-native",
+        models=[model_option("databricks-claude-fable-5-extended-thinking", is_default=True)],
+        selected_model="databricks-claude-fable-5-extended-thinking",
+    )
+    chat.update_session(
+        labels={"omnigent.wrapper": "claude-code-native-ui"}, reasoning_effort="xhigh"
+    )
+    page.emulate_media(color_scheme="light")
+    open_live(page, chat, viewport)
+    page.evaluate("() => document.fonts.ready")
+    if native_kind:
+        expect(page.locator("html")).to_have_attribute("data-mobile-app", "true")
+    else:
+        expect(page.locator("html")).not_to_have_attribute("data-mobile-app", "true")
+    assert page.evaluate("matchMedia('(pointer: coarse)').matches") == touch
+    assert page.evaluate("matchMedia('(hover: none)').matches") == touch
+    if viewport["width"] < 768:
+        expect(_action_row(page, "live")).to_have_attribute("data-labels", "collapsed")
+    page.get_by_label("Message the agent").fill("Keep the primary actions reachable")
+
+    def assert_action(control: Locator) -> None:
+        expect(control).to_be_visible()
+        expect(control).to_be_enabled()
+        bounds = box(control)
+        assert_within_viewport(bounds, viewport["width"])
+        assert bounds["y"] >= -TOLERANCE
+        assert bounds["y"] + bounds["height"] <= viewport["height"] + TOLERANCE
+        if enlarged:
+            assert bounds["width"] >= 44 and bounds["height"] >= 44, (
+                f"{control}: expected >=44x44 CSS px, observed {bounds}"
+            )
+        assert control.evaluate("""element => {
+            const r = element.getBoundingClientRect();
+            const x = r.left + r.width / 2, y = r.top + r.height / 2;
+            return [[x, y], [r.left + 2, y], [r.right - 2, y],
+                [x, r.top + 2], [x, r.bottom - 2]].every(([px, py]) =>
+                    element.contains(document.elementFromPoint(px, py)));
+        }"""), f"{control}: another element owns part of the hit area"
+
+    add = page.get_by_role("button", name="Add", exact=True)
+    permission = page.get_by_test_id("composer-permission-chip")
+    model = page.get_by_test_id("composer-config-gear")
+    send = page.get_by_role("button", name="Send", exact=True)
+    if not enlarged:
+        for control in (add, send):
+            bounds = box(control)
+            assert bounds["width"] == pytest.approx(
+                32 if viewport["width"] < 768 else 28, abs=TOLERANCE
+            )
+            assert bounds["height"] == pytest.approx(
+                32 if viewport["width"] < 768 else 28, abs=TOLERANCE
+            )
+    for control in (add, permission, model, send):
+        assert_action(control)
+    if touch:
+        add.tap(position={"x": box(add)["width"] / 2, "y": box(add)["height"] - 3})
+    else:
+        add.focus()
+        add.press("Enter")
+    menu = page.get_by_test_id("composer-add-menu")
+    expect(menu).to_be_visible()
+    _settle_menu(menu)
+    for row in (
+        menu.get_by_role("menuitem", name="Files and images", exact=True),
+        page.get_by_test_id("composer-side-chat-action"),
+    ):
+        row.scroll_into_view_if_needed()
+        assert_action(row)
+    menu.press("Escape")
+    expect(menu).not_to_be_visible()
+    expect(add).to_be_focused()
+
+    page.get_by_label("Message the agent").fill("")
+    chat.emit_busy("touch-target-turn")
+    stop = page.get_by_role("button", name="Interrupt", exact=True)
+    expect(stop).to_be_visible()
+    for control in (add, permission, model, stop):
+        assert_action(control)
+    for other in (add, permission, model):
+        assert_no_overlap(box(other), box(stop))
+    with page.expect_response(
+        lambda response: response.url.endswith(f"/{chat.session_id}/events")
+    ):
+        if touch:
+            stop.tap(position={"x": box(stop)["width"] / 2, "y": box(stop)["height"] - 3})
+        else:
+            stop.click()
+    assert len(chat.event_posts) == 1
+    assert chat.event_posts[0]["body"]["type"] == "interrupt"
+
+
 @pytest.mark.parametrize("surface", ["landing", "live"])
 def test_attachment_chips_follow_the_row_grid(
     page: Page,

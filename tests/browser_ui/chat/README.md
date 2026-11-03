@@ -49,6 +49,15 @@ The stream queues events emitted before its first connection once and never
 replays prior events on reconnect, matching the server. Call `wait_for_stream()`
 after navigation before emitting status or transcript events.
 
+For touch-target changes, extend the nearby rendered scenario with an explicit
+list of primary actions selected by role/name or stable test ID. Check the
+44×44 CSS-pixel floor, viewport containment, hit ownership and activation under
+coarse/no-hover input. Include a native bridge with a fine pointer to isolate
+native eligibility, and a mouse profile to preserve compact browser controls.
+`test_live_primary_actions_and_stop_remain_reachable` is the composer example;
+add new actions/states explicitly so losing a sizing class cannot hide them.
+These scenarios run in the existing Browser Contract UI lane for full UI scope.
+
 ## Choosing coverage
 
 Use this lane for DOM geometry, local drafts, picker labels/payloads, and UI
