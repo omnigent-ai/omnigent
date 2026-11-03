@@ -1,5 +1,5 @@
 import * as CollapsiblePrimitive from "radix-ui/collapsible";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useReducer, useRef, useState } from "react";
 
 function Collapsible({ ...props }: React.ComponentProps<typeof CollapsiblePrimitive.Root>) {
   return <CollapsiblePrimitive.Root data-slot="collapsible" {...props} />;
@@ -50,10 +50,13 @@ function RetainedCollapsibleContent({
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
   const [concealed, setConcealed] = useState(!open);
+  const [, rerender] = useReducer((renders: number) => renders + 1, 0);
   useLayoutEffect(() => {
-    // Revealing re-renders after Radix measures the opened content, refreshing its height variable.
+    // Radix measures opened content without re-rendering under forceMount, so
+    // re-render on every open to refresh its height variable.
     if (open) {
       setConcealed(false);
+      rerender();
       return;
     }
     const running = contentRef.current?.getAnimations?.() ?? [];
@@ -70,21 +73,19 @@ function RetainedCollapsibleContent({
     };
   }, [open]);
 
+  // Holds the close animation's last frame only until concealed: a filled
+  // animation frame would override the concealed inline styles.
+  const closedStyle: React.CSSProperties = concealed
+    ? { ...style, ...CONCEALED_CONTENT_STYLE }
+    : { ...style, animationFillMode: "forwards" };
+
   return (
     <CollapsiblePrimitive.CollapsibleContent
       data-slot="collapsible-content"
       {...props}
       ref={contentRef}
       forceMount
-      style={
-        open
-          ? style
-          : {
-              ...style,
-              animationFillMode: "forwards",
-              ...(concealed && CONCEALED_CONTENT_STYLE),
-            }
-      }
+      style={open ? style : closedStyle}
     />
   );
 }

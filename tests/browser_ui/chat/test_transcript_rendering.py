@@ -663,8 +663,8 @@ def test_folded_markdown_is_laid_out_when_opened(
     rendered_answer = bubble.locator("svg[aria-roledescription] >> visible=true")
     expect(rendered_answer).to_be_visible(timeout=20_000)
     expect(bubble.get_by_text("Narration marker.")).to_be_hidden()
-    # A reader opens the settled turn a moment after it loads.
-    page.wait_for_timeout(1_000)
+    # The folded narration and reasoning diagrams render before a reader opens them.
+    expect(bubble.locator("svg[aria-roledescription]")).to_have_count(3, timeout=20_000)
 
     worked = bubble.get_by_test_id("turn-worked-fold").locator('[data-slot="collapsible-trigger"]')
     _open_and_assert_laid_out(page, worked.first, "Narration marker.")
@@ -672,8 +672,10 @@ def test_folded_markdown_is_laid_out_when_opened(
     reasoning = bubble.get_by_role("button", name="Thought for a few seconds")
     _open_and_assert_laid_out(page, reasoning, "Reasoning marker.")
     reasoning.click()
-    expect(bubble.get_by_text("Reasoning marker.")).to_be_hidden()
-    page.wait_for_timeout(500)
+    hidden_reasoning = bubble.get_by_text("Reasoning marker.")
+    expect(hidden_reasoning).to_be_hidden()
+    hidden_height = hidden_reasoning.evaluate("(p) => p.getBoundingClientRect().height")
+    assert hidden_height < 1, f"the closed thought still spans {hidden_height:.1f}px"
     _open_and_assert_laid_out(page, reasoning, "Reasoning marker.")
 
 

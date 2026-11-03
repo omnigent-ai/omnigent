@@ -73,6 +73,17 @@ describe("Reasoning — auto-expand", () => {
     expect(screen.getByRole("button").getAttribute("data-state")).toBe("open");
     expect(screen.getByText("Some reasoning text")).toBeVisible();
   });
+
+  it("hides the content when the caller passes open={false} while streaming", () => {
+    render(
+      <Reasoning isStreaming={true} open={false}>
+        <ReasoningTrigger />
+        <ReasoningContent>Some reasoning text</ReasoningContent>
+      </Reasoning>,
+    );
+    expect(screen.getByRole("button").getAttribute("data-state")).toBe("closed");
+    expect(screen.getByText("Some reasoning text")).not.toBeVisible();
+  });
 });
 
 describe("Reasoning — non-expandable (nothing to show)", () => {

@@ -22,12 +22,16 @@ function toggle() {
   fireEvent.click(screen.getByRole("button", { name: "Details" }));
 }
 
-function stubCloseAnimation(content: HTMLElement) {
+function content() {
+  return document.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
+}
+
+function stubCloseAnimation(element: HTMLElement) {
   let finish!: () => void;
   const finished = new Promise<void>((resolve) => {
     finish = resolve;
   });
-  content.getAnimations = () => [{ finished } as unknown as Animation];
+  element.getAnimations = () => [{ finished } as unknown as Animation];
   return async () => {
     await act(async () => {
       finish();
@@ -54,10 +58,10 @@ describe("RetainedCollapsibleContent", () => {
   it("stays visible until its close animation finishes", async () => {
     render(<RetainedSection defaultOpen />);
     const details = screen.getByText("Rendered details");
-    const finishAnimation = stubCloseAnimation(details.parentElement!);
+    const finishAnimation = stubCloseAnimation(content());
 
     toggle();
-    expect(details.parentElement).toHaveAttribute("data-state", "closed");
+    expect(content()).toHaveAttribute("data-state", "closed");
     expect(details).toBeVisible();
 
     await finishAnimation();
@@ -67,11 +71,23 @@ describe("RetainedCollapsibleContent", () => {
   it("stays visible when reopened before its close animation finishes", async () => {
     render(<RetainedSection defaultOpen />);
     const details = screen.getByText("Rendered details");
-    const finishAnimation = stubCloseAnimation(details.parentElement!);
+    const finishAnimation = stubCloseAnimation(content());
 
     toggle();
     toggle();
     await finishAnimation();
     expect(details).toBeVisible();
+  });
+
+  it("animates a reopen to the current height when its close animation is still running", () => {
+    render(<RetainedSection defaultOpen />);
+    stubCloseAnimation(content());
+    let height = 100;
+    content().getBoundingClientRect = () => ({ height, width: 200 }) as DOMRect;
+
+    toggle();
+    height = 150;
+    toggle();
+    expect(content().style.getPropertyValue("--radix-collapsible-content-height")).toBe("150px");
   });
 });
