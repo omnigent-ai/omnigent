@@ -19,7 +19,7 @@ import {
   startMcpLogin,
   submitMcpLoginCallback,
   type McpLogin,
-} from "@/hooks/useMcpLogin";
+} from "@/lib/mcpLoginApi";
 import { ApiError } from "@/lib/sessionsApi";
 
 export const MCP_LOGIN_POLL_MS = 1500;
@@ -111,6 +111,7 @@ export function McpSignInDialog({
     const pollFailed = (error: unknown) => {
       if (!active || controller.signal.aborted) return;
       if (error instanceof ApiError && error.status === 404) {
+        loginId = null;
         setPhase({ kind: "error", message: "This sign-in ended on the host." });
         return;
       }
@@ -237,6 +238,8 @@ function PendingSteps({
     setSubmitting(true);
     setSubmitError(null);
     submitMcpLoginCallback(hostId, login.login_id, value)
+      // Sending the same address twice would reuse its one-time code.
+      .then(() => setCallbackUrl(""))
       .catch((error: unknown) => setSubmitError(requestErrorMessage(error, hostName)))
       .finally(() => setSubmitting(false));
   };

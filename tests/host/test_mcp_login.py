@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -13,7 +14,7 @@ import psutil
 import pytest
 
 from omnigent.host import mcp_login
-from omnigent.host.frames import MCP_LOGIN_MAX_URL
+from omnigent.host.frames import MCP_LOGIN_MAX_CALLBACK, MCP_LOGIN_MAX_URL
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.host.mcp_login import (
     HostMcpLogins,
@@ -148,6 +149,14 @@ def test_find_authorization_url(output: str, expected: str | None) -> None:
     assert (found[0] if found else None) == expected
 
 
+_CALLBACK = "http://localhost:43117/callback?code="
+
+
+def _padded(callback: str, size: int) -> str:
+    """*callback* with a query parameter that makes it *size* bytes long."""
+    return callback + "&pad=" + "a" * (size - len(callback.encode()) - len("&pad="))
+
+
 @pytest.mark.parametrize(
     "callback,valid",
     [
@@ -159,7 +168,10 @@ def test_find_authorization_url(output: str, expected: str | None) -> None:
         ("http://localhost:43117/other?code=abc", False),
         ("https://localhost:43117/callback?code=abc", False),
         ("http://localhost:43117/callback?code=abc\nx", False),
-        ("http://localhost:43117/callback?code=" + "a" * 4096, False),
+        (_padded(_CALLBACK + "abc", MCP_LOGIN_MAX_CALLBACK), True),
+        (_padded(_CALLBACK + "abc", MCP_LOGIN_MAX_CALLBACK + 1), False),
+        # The limit counts bytes, not characters.
+        (_padded(_CALLBACK + "\u00e9", MCP_LOGIN_MAX_CALLBACK + 1), False),
     ],
 )
 def test_valid_callback(callback: str, valid: bool) -> None:
@@ -200,8 +212,9 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     with pytest.raises(LoginError) as rejected:
         await logins.submit(started["login_id"], "http://localhost:1/callback?code=abc")
     assert rejected.value.status == "invalid"
-    # Nothing listens on the redirect port, so the CLI reads it from its terminal.
-    callback = "http://localhost:43117/callback?code=abc&state=s"
+    # Nothing listens on the redirect port, so the CLI reads it from its terminal,
+    # which takes the longest accepted address whole.
+    callback = _padded("http://localhost:43117/callback?code=abc&state=s", MCP_LOGIN_MAX_CALLBACK)
     await logins.submit(started["login_id"], callback)
     finished = await _settled(logins, started["login_id"])
     assert finished == {
@@ -215,6 +228,32 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     with pytest.raises(LoginError):
         await logins.submit(started["login_id"], callback)
     await logins.close()
+
+
+async def test_redirect_written_to_a_busy_terminal_arrives_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    real_write = os.write
+    calls = []
+
+    def short_write(fd: int, data: bytes) -> int:
+        calls.append(len(data))
+        if len(calls) == 2:
+            raise BlockingIOError
+        return real_write(fd, data[:10])
+
+    monkeypatch.setattr(mcp_login.os, "write", short_write)
+    try:
+        await mcp_login._write_all(write_fd, b"x" * 25)
+        assert os.read(read_fd, 100) == b"x" * 25
+        os.close(read_fd)
+        calls.clear()
+        with pytest.raises(LoginError) as failed:
+            await mcp_login._write_all(write_fd, b"x")
+        assert failed.value.status == "failed"
+    finally:
+        os.close(write_fd)
 
 
 async def test_older_cli_gets_the_redirect_on_its_listener(

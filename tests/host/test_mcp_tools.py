@@ -490,7 +490,7 @@ async def test_sign_in_state_is_cached_until_a_sign_in(monkeypatch):
     async def needs_auth(payload):
         return mcp_tools._result("needs_auth")
 
-    states = iter(["available", "available", "signed_in"])
+    states = iter(["available", "available", "signed_in", "signed_in"])
     checks = 0
     checking = asyncio.Event()
     release = asyncio.Event()
@@ -526,3 +526,21 @@ async def test_sign_in_state_is_cached_until_a_sign_in(monkeypatch):
     assert not discovery._sign_in_cache
     assert await sign_in() == "signed_in"
     assert checks == 3
+
+    # So is a tools probe the server refused just before the sign-in.
+    discovery.clear_cache()
+    probing = asyncio.Event()
+    refuse = asyncio.Event()
+
+    async def refused_before_sign_in(payload):
+        probing.set()
+        await refuse.wait()
+        return mcp_tools._result("needs_auth")
+
+    monkeypatch.setattr(mcp_tools, "_probe_worker", refused_before_sign_in)
+    before = asyncio.create_task(sign_in())
+    await probing.wait()
+    discovery.clear_cache()
+    refuse.set()
+    await before
+    assert not discovery._cache

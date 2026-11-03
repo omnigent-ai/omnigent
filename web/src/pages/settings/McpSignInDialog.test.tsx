@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { cancelMcpLogin, isSafeSignInUrl, type McpLogin } from "@/hooks/useMcpLogin";
+import { cancelMcpLogin, isSafeSignInUrl, type McpLogin } from "@/lib/mcpLoginApi";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   MAX_POLL_FAILURES,
@@ -133,6 +133,32 @@ describe("McpSignInDialog", () => {
     expect(screen.getByRole("link", { name: /Open sign-in page/ })).toBeTruthy();
   });
 
+  it("moves a starting sign-in to the newly chosen host", async () => {
+    const otherBase = "/v1/hosts/host%2F2/mcp-servers/login";
+    let respond: (response: Response) => void = () => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+    );
+    on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
+    on("POST", otherBase, () => json(login({ login_id: "L2" })));
+    on("GET", `${otherBase}/L2`, () => json(login({ login_id: "L2" })));
+    const view = await renderDialog();
+
+    view.rerender(<McpSignInDialog {...props} host={{ ...props.host, host_id: "host/2" }} />);
+    await act(async () => {});
+    await act(async () => respond(json(login())));
+    await tick();
+
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(0);
+    expect(calls("POST", otherBase)).toHaveLength(1);
+    expect(calls("GET", `${otherBase}/L2`)).toHaveLength(1);
+    expect(screen.getByRole("link", { name: /Open sign-in page/ })).toBeTruthy();
+  });
+
   it("sends a pasted redirect address to the host and shows its rejection", async () => {
     on("POST", BASE, () => json(login()));
     on("GET", `${BASE}/L1`, () => json(login()));
@@ -163,6 +189,8 @@ describe("McpSignInDialog", () => {
       { callback_url: "http://localhost:9/callback?code=c&state=s" },
     ]);
     expect(screen.queryByRole("alert")).toBeNull();
+    expect((input as HTMLInputElement).value).toBe("");
+    expect(finish).toBeDisabled();
   });
 
   it("shows why the sign-in ended and starts a fresh one on retry", async () => {
@@ -261,6 +289,8 @@ describe("McpSignInDialog", () => {
     await renderDialog();
     await tick();
     expect(screen.getByRole("alert").textContent).toBe("This sign-in ended on the host.");
+    cleanup();
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(0);
   });
 
   it("keeps polling through a brief outage and gives up after repeated failures", async () => {

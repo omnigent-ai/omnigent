@@ -80,11 +80,13 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
             json={"harness": "claude", "server": "docs"},
         )
         assert response.status_code == 200, response.text
-        assert response.json() == {
+        tools = response.json()
+        # Servers older than harness sign-in omit the field.
+        assert tools.pop("harness_sign_in", None) is None
+        assert tools == {
             "tools": [{"name": "read_docs", "description": "Read documentation."}],
             "connection": "connected",
             "truncated": False,
-            "harness_sign_in": None,
         }
         assert "synthetic-config-secret" not in response.text
         assert str(tmp_path) not in response.text

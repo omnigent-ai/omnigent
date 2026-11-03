@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from omnigent.host.frames import (
     CAP_MCP_LOGIN,
     CAP_MCP_TOOLS,
+    MCP_LOGIN_MAX_CALLBACK,
     MCP_LOGIN_MAX_URL,
     HostMcpLoginFrame,
     HostMcpToolsFrame,
@@ -49,7 +50,7 @@ class McpLoginRequest(BaseModel):
 
 
 class McpLoginCallbackRequest(BaseModel):
-    callback_url: str = Field(min_length=1, max_length=4096)
+    callback_url: str = Field(min_length=1, max_length=MCP_LOGIN_MAX_CALLBACK)
 
 
 class McpLoginResponse(BaseModel):

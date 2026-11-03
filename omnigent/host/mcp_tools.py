@@ -283,6 +283,7 @@ class HostMcpTools:
         if cached is not None:
             return cached
         attempted = False
+        generation = self._cache_generation
         try:
             async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
                 async with self._slots:
@@ -295,7 +296,9 @@ class HostMcpTools:
             if not attempted:
                 raise BlockingIOError("MCP probe capacity exhausted") from None
             result = _result("timeout")
-        self._cache[key] = result
+        # A probe that spans a sign-in may have been refused before it.
+        if generation == self._cache_generation:
+            self._cache[key] = result
         return result
 
 

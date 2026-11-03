@@ -14,6 +14,7 @@ from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     CAP_MCP_LOGIN,
     CAP_MCP_TOOLS,
+    MCP_LOGIN_MAX_CALLBACK,
     HostHelloFrame,
     HostMcpLoginFrame,
     HostMcpLoginResultFrame,
@@ -338,7 +339,7 @@ async def test_mcp_login_host_errors(
             (CAP_MCP_LOGIN,),
             "POST",
             "/abc/callback",
-            {"callback_url": "x" * 4097},
+            {"callback_url": "x" * (MCP_LOGIN_MAX_CALLBACK + 1)},
             422,
         ),
     ],

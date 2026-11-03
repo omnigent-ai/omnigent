@@ -23,7 +23,7 @@ from typing import Literal, TypedDict
 from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from omnigent._platform import IS_POSIX, resolve_cli_binary
-from omnigent.host.frames import MCP_LOGIN_MAX_URL
+from omnigent.host.frames import MCP_LOGIN_MAX_CALLBACK, MCP_LOGIN_MAX_URL
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.inner._proc import remember_process_group, spawn_kwargs
 from omnigent.inner._subprocess_lifecycle import terminate_subprocess
@@ -38,7 +38,6 @@ STATUS_TIMEOUT_SECONDS = 5.0
 CALLBACK_TIMEOUT_SECONDS = 5.0
 FINISHED_RETENTION_SECONDS = 300.0
 MAX_ACTIVE_LOGINS = 4
-MAX_CALLBACK_URL = 4096
 _MAX_OUTPUT = 64 * 1024
 _BINARY_ENV = {"claude": "OMNIGENT_CLAUDE_PATH", "codex": "OMNIGENT_CODEX_PATH"}
 _LOOPBACK_NAMES = {"localhost"}
@@ -238,7 +237,7 @@ def find_authorization_url(output: str) -> tuple[str, SplitResult] | None:
 
 def valid_callback(callback_url: str, redirect: SplitResult) -> bool:
     """Whether a pasted address is the redirect the harness is waiting for."""
-    if len(callback_url) > MAX_CALLBACK_URL or any(
+    if len(callback_url.encode()) > MCP_LOGIN_MAX_CALLBACK or any(
         ch.isspace() or not ch.isprintable() for ch in callback_url
     ):
         return False
@@ -270,8 +269,21 @@ async def _deliver_callback(master_fd: int, callback_url: str) -> None:
         # The listener has the request; sending it again would reuse the code.
         return
     # No listener: newer CLIs read the redirect from their terminal instead.
-    with contextlib.suppress(OSError):
-        os.write(master_fd, callback_url.encode() + b"\r")
+    await _write_all(master_fd, callback_url.encode() + b"\r")
+
+
+async def _write_all(master_fd: int, data: bytes) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CALLBACK_TIMEOUT_SECONDS
+    while data:
+        try:
+            data = data[os.write(master_fd, data) :]
+        except BlockingIOError:
+            if loop.time() > deadline:
+                raise LoginError("failed", "Couldn't hand the address to the harness") from None
+            await asyncio.sleep(0.02)
+        except OSError:
+            raise LoginError("failed", "Couldn't hand the address to the harness") from None
 
 
 @dataclass

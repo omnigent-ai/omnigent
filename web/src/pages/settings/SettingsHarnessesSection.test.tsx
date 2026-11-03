@@ -277,6 +277,8 @@ afterEach(() => {
   harnessInstall = true;
   databricksFeatures = true;
   fixDialogProps.mockReset();
+  signInDialogProps.mockClear();
+  vi.mocked(showToast).mockClear();
   startupCalls.mockClear();
   accountRefreshCalls.mockClear();
   startupData = STARTUP;
@@ -1329,6 +1331,44 @@ it("offers the harness sign-in for a server that needs it", async () => {
   expect(showToast).toHaveBeenCalledWith("Signed in to Linear.");
   expect(invalidate).toHaveBeenCalledWith({
     queryKey: ["mcp-tools", ONLINE.host_id, "claude", "linear", "toolkit", undefined],
+  });
+});
+
+it("signs in to the installed plugin MCP the user chose", () => {
+  hosts = [ONLINE];
+  mcpResult = {
+    data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "available" },
+    isPending: false,
+  };
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: ["first", "second"].map((marketplace) => ({
+        id: marketplace,
+        name: "toolkit",
+        harness: "claude",
+        marketplace,
+        enabled: true,
+        skills: [],
+        mcp_servers: ["docs"],
+        mcp_entries: [{ id: `${marketplace}-mcp`, name: "docs" }],
+      })),
+    },
+  };
+  const queryClient = renderHarnesses("claude-native");
+  const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+  selectTab("Plugins · 2");
+  fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
+  selectTab("MCPs · 1");
+  fireEvent.click(screen.getByTestId("catalog-row-docs"));
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(signInDialogProps).toHaveBeenLastCalledWith(
+    expect.objectContaining({ server: "docs", plugin: "toolkit", sourceId: "second-mcp" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Finish MCP sign-in" }));
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ["mcp-tools", ONLINE.host_id, "claude", "docs", "toolkit", "second-mcp"],
   });
 });
 

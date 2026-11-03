@@ -1356,6 +1356,8 @@ class HostMcpLoginFrame:
 
 # Longest authorization URL a host publishes or the server relays.
 MCP_LOGIN_MAX_URL = 8192
+# Longest pasted redirect in bytes; it must fit a terminal's 4096-byte line buffer.
+MCP_LOGIN_MAX_CALLBACK = 4000
 
 
 @dataclass
