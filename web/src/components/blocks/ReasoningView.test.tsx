@@ -49,15 +49,15 @@ describe("ReasoningView — expandable gating", () => {
   it("a settled section with content IS expandable and shows its text", () => {
     // The normal completed-thought case: expandable header that, when
     // clicked open, reveals the reasoning body. A settled section starts
-    // collapsed and Radix unmounts the content while closed, so we click
-    // the trigger to expand first. Asserting on the actual text after
-    // expanding proves the content path still renders end-to-end, not
-    // just that a button exists.
+    // collapsed with its rendered body hidden, and expanding reveals that
+    // same body rather than rendering it again, so its markdown is ready.
     render(<ReasoningView text="Considered the options." isStreaming={false} duration={2.5} />);
     const trigger = screen.getByRole("button");
     expect(trigger).toBeTruthy();
-    expect(screen.queryByText("Considered the options.")).toBeNull(); // collapsed
+    const body = screen.getByText("Considered the options.");
+    expect(body).not.toBeVisible(); // collapsed
     fireEvent.click(trigger);
-    expect(screen.getByText("Considered the options.")).toBeTruthy(); // expanded
+    expect(screen.getByText("Considered the options.")).toBe(body);
+    expect(body).toBeVisible(); // expanded
   });
 });

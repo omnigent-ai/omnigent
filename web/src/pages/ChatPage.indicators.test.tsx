@@ -513,7 +513,7 @@ describe("BubbleView dispatch", () => {
     render(<BubbleView bubble={codexTurn} />);
     expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Worked for 2m 27s" })).toBeInTheDocument();
-    expect(screen.queryByText("Reading the tests.")).not.toBeInTheDocument();
+    expect(screen.getByText("Reading the tests.")).not.toBeVisible();
     expect(screen.getByText("Added the test.")).toBeVisible();
     cleanup();
 
