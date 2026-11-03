@@ -9,8 +9,9 @@
 // mocked out (irrelevant to save wiring); only the write endpoint is mocked, to
 // assert the PUT fires with the edited content.
 
-import { act, render } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as FileContentModule from "@/hooks/useFileContent";
 
 // Captured callbacks the component registers on the editor, so tests can drive
 // edits / blur / ⌘S. Hoisted because the @monaco-editor/react mock factory
@@ -121,15 +122,22 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
+// The pre-write conflict check GETs the live file before every save.
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  fetchFileContent: vi.fn(),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
 }));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
+import { CONFLICT_CHECK_TIMEOUT_MS } from "./useEditorAutoSave";
 import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
+import { fetchFileContent, type FileContentResponse } from "@/hooks/useFileContent";
 
 const PATH = "src/a.ts";
 const INITIAL = "const x = 1;\n";
@@ -147,13 +155,23 @@ function mockWrite(): void {
   } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 }
 
+function serverFile(content: string): FileContentResponse {
+  return {
+    object: "session.environment.filesystem.file_content",
+    path: PATH,
+    content_type: "text/typescript",
+    encoding: "utf-8",
+    content,
+    bytes: content.length,
+  };
+}
+
 // Fresh element each call so rerender() doesn't bail on an identical reference
 // (the reconnect test relies on re-reading the runner-online mock).
-function makeEditor() {
+function makeEditor(content: string = INITIAL) {
   return (
     <MonacoCodeEditor
-      content={INITIAL}
-      // Not the focused/running session → pre-write conflict GET is skipped.
+      content={content}
       conversationId="conv_monaco_autosave"
       path={PATH}
       isSettled={true}
@@ -189,6 +207,7 @@ beforeEach(() => {
   h.scroll = null;
   h.domNode = document.createElement("div");
   mockWrite();
+  vi.mocked(fetchFileContent).mockResolvedValue(serverFile(INITIAL));
   // Online → auto-save enabled.
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
 });
@@ -291,6 +310,117 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
       await writePromise;
     });
     expect(calls).toBe(1);
+  });
+
+  it("keeps edits typed during a save when another writer's update arrives", async () => {
+    let resolveWrite!: () => void;
+    mutateAsync.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveWrite = resolve;
+        }),
+    );
+    const { rerender } = await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Typed while the save is in flight; its own debounce hasn't fired yet.
+    await fireEdit(EDITED + "// newer\n");
+    await act(async () => resolveWrite());
+    await act(async () => rerender(makeEditor("const y = 3;\n")));
+
+    expect(fakeEditor!.getValue()).toBe(EDITED + "// newer\n");
+    expect(screen.getByText(/modified externally/)).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Unresolved conflict: auto-save waits for Keep mine / Load latest.
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
+  });
+
+  it("raises the conflict instead of saving over another writer's change", async () => {
+    vi.mocked(fetchFileContent).mockResolvedValue(serverFile("const y = 3;\n"));
+    await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(fakeEditor!.getValue()).toBe(EDITED);
+    expect(screen.getByText(/modified externally/)).toBeInTheDocument();
+  });
+
+  it("skips the write when the buffer is clean again after the conflict check", async () => {
+    let answerCheck!: (file: FileContentResponse) => void;
+    vi.mocked(fetchFileContent).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answerCheck = resolve;
+        }),
+    );
+    await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Undone while the check is in flight; the server meanwhile has newer text,
+    // which the next refresh (not this possibly older response) applies.
+    await fireEdit(INITIAL);
+    await act(async () => answerCheck(serverFile("const y = 3;\n")));
+
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(fakeEditor!.getValue()).toBe(INITIAL);
+  });
+
+  it("starts the save over when a refresh lands during the conflict check", async () => {
+    let answerCheck!: (file: FileContentResponse) => void;
+    vi.mocked(fetchFileContent).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answerCheck = resolve;
+        }),
+    );
+    const { rerender } = await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    // Undone, a refresh applies newer text in place, then the user types again.
+    await fireEdit(INITIAL);
+    await act(async () => rerender(makeEditor("const y = 3;\n")));
+    expect(fakeEditor!.getValue()).toBe("const y = 3;\n");
+    await fireEdit("const y = 3;\n// mine\n");
+    vi.mocked(fetchFileContent).mockResolvedValue(serverFile("const y = 3;\n"));
+    // The check answers with content from before the refresh.
+    await act(async () => answerCheck(serverFile(INITIAL)));
+
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({
+      path: PATH,
+      content: "const y = 3;\n// mine\n",
+    });
+    expect(screen.queryByText(/modified externally/)).toBeNull();
+  });
+
+  it("saves anyway when the conflict check stalls", async () => {
+    vi.mocked(fetchFileContent).mockImplementationOnce(
+      (_conversationId, _path, signal) =>
+        new Promise((_, reject) => {
+          signal!.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    await renderMounted(makeEditor());
+    await fireEdit(EDITED);
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(CONFLICT_CHECK_TIMEOUT_MS);
+    });
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
   });
 
   it("flushes accumulated edits when the runner reconnects", async () => {

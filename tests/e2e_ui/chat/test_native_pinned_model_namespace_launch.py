@@ -49,7 +49,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -61,6 +60,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.native_session import create_native_session
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -87,12 +87,6 @@ _ERROR_PILL = '[data-testid="error-pill"]'
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
 # that must not intercept loopback requests to the spawned server.
 _client = httpx.Client(trust_env=False)
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 #: Ambient provider/credential variables that would otherwise leak into the
@@ -158,7 +152,7 @@ def native_launch_rig(
     for path in (config_home, home_dir, state_dir, artifacts):
         path.mkdir(parents=True, exist_ok=True)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 

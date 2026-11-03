@@ -7,7 +7,6 @@ These POSIX permission tests skip on Windows and when run as root."""
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -16,6 +15,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -34,15 +35,6 @@ pytestmark = [
         reason="root bypasses permission bits, so the unreadable staging is inert.",
     ),
 ]
-
-
-def _find_free_port() -> int:
-    """Pick a free TCP port for the server subprocess to bind."""
-    s = socket.socket()
-    s.bind(("", 0))
-    port: int = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _server_env(tmp_parent: Path, home: Path) -> dict[str, str]:
@@ -73,7 +65,7 @@ def _boot_server_and_wait_health(
     :param tmp_parent: Staged harness root.
     :param tmp_path: Scratch directory for database, artifacts and logs.
     :yields: Process, healthy/exited/timeout outcome, and captured log path."""
-    port = _find_free_port()
+    port = find_free_port()
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
     home_dir = tmp_path / "home"

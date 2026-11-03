@@ -18,6 +18,8 @@ export interface ForkDialogContextValue {
   canFork: boolean;
   /** Visible but unavailable: callers disable the action and explain why. */
   disabledReason?: string;
+  /** Why the current session can't continue in another directory, beyond `disabledReason`. */
+  workspaceRecoveryDisabledReason?: string;
   /**
    * Open the fork/clone dialog. With `upToResponseId` set, the dialog
    * submits a truncated fork ("fork from this response"); without it,

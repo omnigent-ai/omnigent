@@ -50,7 +50,7 @@
         <activity
             android:name=".OAuthCallbackActivity"
             android:exported="true">
-            <intent-filter android:autoVerify="true">
+            <intent-filter android:autoVerify="${databricksOAuthRedirectAutoVerify}">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />

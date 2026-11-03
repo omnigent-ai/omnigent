@@ -9,6 +9,7 @@ from contextlib import suppress
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
 from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     _launcher_for_teardown,
@@ -203,14 +204,24 @@ class ManagedSandboxReaper:
                 return 0
 
             reaped = 0
+            # An owner-identity launcher acts as one user; each candidate host
+            # may belong to a different owner, so bind per candidate.
+            per_owner = getattr(launcher, "owner_credential_provider", None) is not None
             with launcher.reaper_identity(workspace_id):
                 for candidate in candidates:
                     try:
+                        acting = (
+                            _launcher_for_teardown(candidate, self._sandbox_config)
+                            if per_owner
+                            else launcher
+                        )
+                        if acting is None:
+                            continue
                         if candidate.deleted_at is not None:
                             sandbox_id = candidate.terminating_sandbox_id or candidate.sandbox_id
                             if sandbox_id is None:
                                 continue
-                            launcher.terminate(sandbox_id)
+                            acting.terminate(sandbox_id)
                             if self._host_store.mark_sandbox_terminated(
                                 candidate.host_id,
                                 sandbox_id=sandbox_id,
@@ -236,12 +247,19 @@ class ManagedSandboxReaper:
                                 candidate.host_id,
                             )
                             continue
-                        launcher.terminate(sandbox_id)
+                        acting.terminate(sandbox_id)
                         if self._host_store.mark_sandbox_terminated(
                             candidate.host_id,
                             sandbox_id=sandbox_id,
                         ):
                             reaped += 1
+                    except OwnerCredentialMissingError:
+                        # Expected until the owner reconnects; retried next sweep.
+                        _logger.warning(
+                            "Managed sandbox reaper cannot act as the owner of host %s "
+                            "(not connected); retrying later",
+                            candidate.host_id,
+                        )
                     except Exception:
                         _logger.exception(
                             "Managed sandbox reaper failed for host %s; continuing",

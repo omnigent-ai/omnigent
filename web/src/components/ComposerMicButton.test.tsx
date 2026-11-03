@@ -232,13 +232,18 @@ describe("ComposerMicButton", () => {
   });
 
   it("surfaces a permission-denied error in the tooltip and a toast", () => {
-    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
     act(() => handlers.error?.({ error: "not-allowed" }));
     const message = "Microphone access denied. Allow access and try again.";
     expect(button).toHaveAttribute("title", message);
     expect(showToastMock).toHaveBeenCalledWith(message);
+    expect(sessionStartMock).not.toHaveBeenCalled();
   });
 
   it("ignores routine no-speech/aborted errors (no tooltip change, no toast)", () => {
@@ -505,11 +510,9 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(onInterim).not.toHaveBeenCalledWith("");
   });
 
-  it("falls back to server dictation when Web Speech dies with a network error", async () => {
-    // Electron / plain Chromium: the SpeechRecognition constructor exists
-    // (so Web Speech is picked first) but its cloud backend rejects the
-    // build at runtime with "network". The take must fall back to server
-    // dictation so the user's click still lands.
+  it.each(["network", "service-not-allowed"])("falls back on %s", async (error) => {
+    // The browser exposes Web Speech but its service rejects the request.
+    // Server transcription can still use the client's microphone.
     const onInterim = vi.fn();
     render(
       <CapabilitiesContext.Provider value={DICTATION_INFO}>
@@ -520,7 +523,7 @@ describe("ComposerMicButton (server dictation)", () => {
 
     fireEvent.click(button);
     expect(startSpy).toHaveBeenCalledTimes(1);
-    await act(async () => handlers.error?.({ error: "network" }));
+    await act(async () => handlers.error?.({ error }));
 
     // The take restarted on the server path, with no error tooltip for
     // the silent switch, and partials flow.
@@ -557,7 +560,7 @@ describe("ComposerMicButton (server dictation)", () => {
     );
   });
 
-  it("keeps the plain error path when the server offers no dictation", async () => {
+  it.each(["network", "service-not-allowed"])("reports %s without a server", async (error) => {
     render(
       <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
         <ComposerMicButton onTranscript={vi.fn()} />
@@ -565,7 +568,7 @@ describe("ComposerMicButton (server dictation)", () => {
     );
     const button = screen.getByRole("button", { name: "Voice dictation" });
     fireEvent.click(button);
-    await act(async () => handlers.error?.({ error: "network" }));
+    await act(async () => handlers.error?.({ error }));
     expect(sessionStartMock).not.toHaveBeenCalled();
     expect(button).toHaveAttribute("title", "Voice input isn't available on this device.");
     expect(showToastMock).toHaveBeenCalledWith("Voice input isn't available on this device.");
