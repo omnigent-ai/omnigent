@@ -16,11 +16,23 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
-@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
 
-/* CSS-pixel floor, independent of viewport width and pointer capability. */
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  @media (pointer: coarse) and (hover: none) {
     min-width: 44px;
     min-height: 44px;
   }
@@ -486,6 +498,11 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
@@ -508,7 +525,7 @@
   width: calc(100% - 24px);
   margin-inline: 12px;
   margin-bottom: -0.5px;
-  padding: 6px 8px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
   background-color: var(--composer-header-bg);
   border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
   border-bottom: none;
@@ -2517,6 +2534,9 @@ html[data-electron-mac] .breadcrumb-folder {
 .turn-fold-row-enter {
   display: grid;
   grid-template-rows: 0fr;
+}
+/* Starts with the trace's collapse (the fold closes a frame after it mounts). */
+[data-state="closed"] > .turn-fold-row-enter {
   animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 .turn-fold-row-enter > * {
@@ -2524,9 +2544,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow: hidden;
 }
 @media (prefers-reduced-motion: reduce) {
-  .turn-fold-row-enter {
+  [data-state="closed"] > .turn-fold-row-enter {
     grid-template-rows: 1fr;
     animation: none;
+  }
+  [data-state="closed"] > .turn-fold-row-enter > * {
+    overflow: visible;
   }
 }
 
