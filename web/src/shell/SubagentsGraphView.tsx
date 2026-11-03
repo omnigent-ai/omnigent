@@ -16,6 +16,7 @@ import {
   type AgentNodeData,
 } from "./subagentGraphLayout";
 import { activityDotClassName, sessionStatus } from "./subagentStatus";
+import { useOpenSubagentInPanel } from "./subagentPanelOpener";
 
 import "@xyflow/react/dist/style.css";
 
@@ -211,8 +212,11 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
 
   const navigate = useNavigate();
   const location = useLocation();
+  const openInPanel = useOpenSubagentInPanel();
   const handleNodeClick = useCallback(
-    (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
+    (event: React.MouseEvent, node: Node<AgentNodeData>) => {
+      const childSessionId = node.data.sessionId;
+      if (openInPanel(childSessionId, event)) return;
       const params = new URLSearchParams(location.search);
       for (const key of ["file", "diff", "comment", "view", "message"]) params.delete(key);
       const search = params.toString();
@@ -221,7 +225,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         search: search ? `?${search}` : "",
       });
     },
-    [navigate, location.search],
+    [navigate, location.search, openInPanel],
   );
 
   return (

@@ -23,6 +23,7 @@ from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.models import model_catalog_store
 from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native import orchestration as runner_native
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     REAL_CODEX_LAUNCH_CATALOG,
@@ -44,7 +45,7 @@ class _LaunchHarness:
     server_client: httpx.AsyncClient
     app_server: SimpleNamespace
     event_client: SimpleNamespace
-    registry: SimpleNamespace
+    registry: SessionResourceRegistry
     events: list[str]
     builds: list[dict[str, Any]]
     resets: list[dict[str, Any]]
@@ -55,7 +56,7 @@ class _LaunchHarness:
         """Run the production launch path, including snapshot and catalog reads."""
         return await runner_native._auto_create_codex_terminal(
             _SESSION_ID,
-            self.registry,  # type: ignore[arg-type]
+            self.registry,
             lambda _sid, _event: None,
             agent_spec=self.agent_spec,
             server_client=self.server_client,
@@ -193,7 +194,11 @@ async def codex_launch_harness(
     monkeypatch.setattr(codex_app, "build_codex_native_server", build_server)
     monkeypatch.setattr(codex_app, "CodexAppServerClient", lambda **_kwargs: event_client)
     monkeypatch.setattr(runner_native, "_codex_discover_thread_and_forward", forwarder)
-    registry = SimpleNamespace(launch_auxiliary_terminal=AsyncMock(side_effect=launch_terminal))
+    registry = SessionResourceRegistry()
+    registry.set_client_surface(_SESSION_ID, "desktop")
+    monkeypatch.setattr(
+        registry, "launch_auxiliary_terminal", AsyncMock(side_effect=launch_terminal)
+    )
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(request), base_url="http://runner.test"
     ) as server_client:
@@ -237,6 +242,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
 
     assert harness.builds[0]["model"] == pick
     assert harness.builds[0]["session_id"] == _SESSION_ID
+    assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
     harness.probe.assert_not_awaited()
 
