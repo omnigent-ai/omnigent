@@ -60,7 +60,8 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
+import { getFileEditDiff } from "@/lib/toolEditDiff";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
@@ -77,6 +78,7 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+import { FileEditDiffView } from "./FileEditBody";
 
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
@@ -201,6 +203,8 @@ interface ApprovalCardProps {
    * plan-review actions. Optional/null for other elicitations.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** The full file-edit tool call; when it describes a change, the card shows it as a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command approval details. When present, the
    * card renders command metadata instead of the raw JSON preview.
@@ -273,6 +277,7 @@ export function ApprovalCard({
   response,
   askUserQuestion,
   exitPlanMode,
+  fileEdit,
   codexCommand,
   allowAllEdits,
   allowAutoMode,
@@ -410,13 +415,22 @@ export function ApprovalCard({
   const showPhase = phase !== "" && !isNativePolicy;
   const askUserQuestionTitle = questionPromptTitle(policyName, phase);
 
+  const fileEditDiff = useMemo(
+    () => (fileEdit ? getFileEditDiff(fileEdit.toolName, fileEdit.toolInput) : null),
+    [fileEdit],
+  );
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
+    isAskUserQuestion ||
+    isExitPlanMode ||
+    isMultiChoice ||
+    isSchemaForm ||
+    isCodexCommandApproval ||
+    fileEditDiff !== null
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -661,6 +675,7 @@ export function ApprovalCard({
               {formattedPreview}
             </pre>
           )}
+          {fileEditDiff && <FileEditDiffView diff={fileEditDiff} />}
           {unconfirmed && nativeDelivery.action && (
             <div className="flex flex-wrap gap-2">
               <Button
@@ -946,6 +961,7 @@ export function ApprovalCard({
                 {formattedPreview}
               </pre>
             )}
+            {fileEditDiff && <FileEditDiffView diff={fileEditDiff} />}
             {directoryScope}
             {isExternalUrl ? (
               <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
@@ -1024,6 +1040,7 @@ export function ElicitationCard({
       response={item.response}
       askUserQuestion={item.askUserQuestion}
       exitPlanMode={item.exitPlanMode}
+      fileEdit={item.fileEdit}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       allowAutoMode={item.allowAutoMode}

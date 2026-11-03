@@ -74,12 +74,14 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { isRecord } from "./toolValue";
 import { routingExtrasFromWire } from "./routingDecision";
 import type {
   AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
+  FileEditRequest,
   ModelUsage,
   RememberScope,
   Response,
@@ -1033,6 +1035,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // Claude is gating the built-in ExitPlanMode tool. Surface it
     // so the ApprovalCard can render the plan-review card.
     const exitPlanModeRaw = p.exit_plan_mode;
+    const fileEditRaw = p.file_edit;
+    const fileEdit: FileEditRequest | null =
+      isRecord(fileEditRaw) &&
+      typeof fileEditRaw.tool_name === "string" &&
+      isRecord(fileEditRaw.tool_input)
+        ? { toolName: fileEditRaw.tool_name, toolInput: fileEditRaw.tool_input }
+        : null;
     const command = p.command;
     const cwd = p.cwd;
     const reason = p.reason;
@@ -1131,6 +1140,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
           : null,
+      fileEdit,
       codexCommand:
         phase === "codex_command_approval" && typeof command === "string" && command
           ? {

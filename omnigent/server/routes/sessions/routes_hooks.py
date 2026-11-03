@@ -69,6 +69,7 @@ from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_EDIT_TOOLS,
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
     _llm_response_denied_turns,
@@ -415,6 +416,14 @@ def register_hooks_routes(
             and tool_input
         ):
             extras["exit_plan_mode"] = tool_input
+        # The full input lets the UI show an edit as a diff; content_preview is truncated.
+        if (
+            is_claude
+            and tool_name in _CLAUDE_NATIVE_EDIT_TOOLS
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
+            extras["file_edit"] = {"tool_name": tool_name, "tool_input": tool_input}
         asking_name = native_agent.display_name if native_agent is not None else hook_label
         asking_vendor = (
             _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
