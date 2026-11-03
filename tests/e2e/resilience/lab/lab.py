@@ -495,7 +495,14 @@ class Lab:
         return self.root / "t"
 
     def _client(self, base_url: str, *, timeout: float = 30.0) -> httpx.Client:
-        client = httpx.Client(base_url=base_url, timeout=timeout, trust_env=False)
+        # Retire pooled sockets before Uvicorn's five-second idle close, whose
+        # FIN can reach a client later through a proxy.
+        client = httpx.Client(
+            base_url=base_url,
+            timeout=timeout,
+            limits=httpx.Limits(keepalive_expiry=1.0),
+            trust_env=False,
+        )
         self._clients.append(client)
         return client
 

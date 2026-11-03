@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { MemoryRouter } from "react-router-dom";
 import { userEvent, within } from "storybook/test";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
@@ -19,9 +20,12 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -43,11 +47,14 @@ const meta = {
     onDelete: () => undefined,
     busy: false,
   },
+  // MemoryRouter: the card body navigates to the task's detail page.
   decorators: [
     (Story) => (
-      <div className="w-[620px]">
-        <Story />
-      </div>
+      <MemoryRouter>
+        <div className="w-[620px]">
+          <Story />
+        </div>
+      </MemoryRouter>
     ),
   ],
 } satisfies Meta<typeof ScheduledTaskRow>;

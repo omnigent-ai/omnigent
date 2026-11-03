@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useRenameConversation } from "@/hooks/useConversations";
+import { useRenameSessionHotkey } from "@/hooks/useRenameSessionHotkey";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
@@ -16,6 +18,7 @@ import { cn } from "@/lib/utils";
 export function HeaderTitle({ conversationId, title }: { conversationId: string; title: string }) {
   const rename = useRenameConversation();
   const [editing, setEditing] = useState(false);
+  useRenameSessionHotkey(() => setEditing(true), !editing && !rename.isPending);
 
   if (!editing) {
     return (
@@ -24,6 +27,7 @@ export function HeaderTitle({ conversationId, title }: { conversationId: string;
           <button
             type="button"
             data-testid="header-title"
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+R`}
             onClick={() => setEditing(true)}
             className="min-w-0 cursor-pointer truncate rounded text-left text-foreground hover:underline focus-visible:underline focus-visible:outline-none"
           >
@@ -32,7 +36,9 @@ export function HeaderTitle({ conversationId, title }: { conversationId: string;
         </TooltipTrigger>
         {/* Bottom placement: the header sits at top-0, so a top-side tooltip
             would clip above the viewport edge. */}
-        <TooltipContent side="bottom">Rename</TooltipContent>
+        <TooltipContent side="bottom" shortcut={[MOD_KEY, ALT_KEY, "R"]}>
+          Rename
+        </TooltipContent>
       </Tooltip>
     );
   }

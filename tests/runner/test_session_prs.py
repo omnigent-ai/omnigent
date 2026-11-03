@@ -373,6 +373,17 @@ def test_creation_metadata_preserves_other_write_identities() -> None:
     assert created
 
 
+def test_single_creation_ignores_other_printed_prs() -> None:
+    """A printed old PR URL stays out until the deferred lookup verifies it."""
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"printf '%s\\n' {A} && gh pr create --fill"},
+        {"stdout": f"{A}\n{B}\n", "gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert created
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -510,6 +521,35 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert store.list() == []
     store.record([reference], relationship="attached", source="user")
     assert [entry.url for entry in store.list()] == [A]
+
+
+def test_associations_stay_unreported_until_acknowledged(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test")
+    revision, pending = store.pending_reports()
+    assert [entry.url for entry in pending] == [A]
+    # A change recorded while that report was in flight survives its acknowledgement.
+    store.record([PullRequestRef.from_url(B)], relationship="worked_on", source="test")
+    store.mark_reported(revision, [A])
+    revision, pending = store.pending_reports()
+    assert [entry.url for entry in pending] == [B]
+    store.mark_reported(revision, [B])
+    assert store.pending_reports()[1] == []
+    store.record([PullRequestRef.from_url(A)], relationship="worked_on", source="test")
+    store.remove(A)
+    assert store.pending_reports()[1] == []
+
+
+def test_files_from_before_reporting_are_reported_once(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test")
+    legacy = json.loads(store.path.read_text())
+    del legacy["unreported"], legacy["revision"]
+    store.path.write_text(json.dumps(legacy))
+    revision, pending = store.pending_reports()
+    assert [entry.url for entry in pending] == [A]
+    store.mark_reported(revision, [A])
+    assert store.pending_reports()[1] == []
 
 
 @pytest.mark.parametrize(

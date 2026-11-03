@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -27,6 +28,13 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 @pytest.mark.parametrize("runner_bound", [True, False])
+@pytest.mark.parametrize(
+    ("runner_grace_s", "host_grace_s"),
+    [
+        pytest.param(1.0, 2.0, id="short-reconnect-grace"),
+        pytest.param(None, None, id="production-reconnect-grace", marks=pytest.mark.nightly),
+    ],
+)
 def test_offline_native_host_preserves_failed_turn_and_retry(
     page: Page,
     built_spa: None,
@@ -35,10 +43,41 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
     request: pytest.FixtureRequest,
     harness: NativeHarness,
     runner_bound: bool,
+    runner_grace_s: float | None,
+    host_grace_s: float | None,
 ) -> None:
-    """A stopped host yields actionable copy without losing input or recovery."""
+    """A stopped host yields actionable copy after grace, preserving input and retry.
+
+    PR coverage uses short real waits; nightly retains the production budgets.
+    """
+    wait_trace = tmp_path / "reconnect-waits.jsonl"
+    server_bootstrap = (
+        "import json, time\n"
+        "from pathlib import Path\n"
+        "from omnigent.server.routes import sessions\n"
+        "from omnigent.server.routes.sessions import routes_events\n"
+        f"host_grace_s = {host_grace_s!r}\n"
+        "if host_grace_s is not None:\n"
+        "    sessions._HOST_RECONNECT_GRACE_S = host_grace_s\n"
+        f"    sessions._HOST_BOUND_RUNNER_CONNECT_GRACE_S = {runner_grace_s!r}\n"
+        "def observe_wait(name, wait):\n"
+        "    async def observed(*args, **kwargs):\n"
+        "        started = time.monotonic()\n"
+        "        result = await wait(*args, **kwargs)\n"
+        f"        with Path({str(wait_trace)!r}).open('a') as trace:\n"
+        "            trace.write(json.dumps({'name': name, 'timeout_s': kwargs['timeout_s'], "
+        "'elapsed_s': time.monotonic() - started, 'connected': result is not None}) + '\\n')\n"
+        "        return result\n"
+        "    return observed\n"
+        "sessions._wait_for_runner_client = observe_wait(\n"
+        "    'bound_runner', sessions._wait_for_runner_client)\n"
+        "routes_events._wait_for_host_reconnect = observe_wait(\n"
+        "    'host_reconnect', routes_events._wait_for_host_reconnect)\n"
+        "from omnigent.cli import cli\n"
+        "cli()\n"
+    )
     with (
-        server_runner(tmp_path) as stack,
+        server_runner(tmp_path, server_bootstrap=server_bootstrap) as stack,
         httpx.Client(base_url=stack.base_url, timeout=100.0, trust_env=False) as client,
     ):
         stack.start_host(
@@ -92,6 +131,7 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
             assert client.get(f"/v1/sessions/{session_id}").json()["runner_id"] is None
 
         marker = f"OFFLINE_HOST_{uuid.uuid4().hex}"
+        wait_trace.unlink(missing_ok=True)
         started = time.monotonic()
         response = client.post(
             f"/v1/sessions/{session_id}/events",
@@ -106,7 +146,21 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
         elapsed = time.monotonic() - started
         assert response.status_code == 202, response.text
         assert response.json()["queued"] is True
-        assert 29.0 <= elapsed < 90.0
+        expected_host_grace_s = 30.0 if host_grace_s is None else host_grace_s
+        expected_runner_grace_s = 10.0 if runner_grace_s is None else runner_grace_s
+        expected_waits = [("bound_runner", expected_runner_grace_s)] if runner_bound else []
+        expected_waits.append(("host_reconnect", expected_host_grace_s))
+        observed = [json.loads(line) for line in wait_trace.read_text().splitlines()]
+        assert [(wait["name"], wait["timeout_s"]) for wait in observed] == expected_waits
+        # Allow millisecond timer rounding when comparing expiry with monotonic time.
+        timer_tolerance_s = 0.01
+        assert all(
+            wait["elapsed_s"] >= wait["timeout_s"] - timer_tolerance_s for wait in observed
+        ), observed
+        assert all(not wait["connected"] for wait in observed), observed
+        minimum_elapsed = sum(timeout for _, timeout in expected_waits)
+        minimum_elapsed -= timer_tolerance_s * len(expected_waits)
+        assert minimum_elapsed <= elapsed < 90.0
 
         items = client.get(f"/v1/sessions/{session_id}/items").json()["data"]
         errors = [item for item in items if item["type"] == "error"]
@@ -137,8 +191,9 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
 
         output = Path(request.config.getoption("--output"))
         output.mkdir(parents=True, exist_ok=True)
+        budget = "production" if host_grace_s is None else "short"
         page.screenshot(
-            path=str(output / f"host-offline-{harness}-bound-{runner_bound}.png"),
+            path=str(output / f"host-offline-{harness}-bound-{runner_bound}-{budget}.png"),
             full_page=True,
         )
 

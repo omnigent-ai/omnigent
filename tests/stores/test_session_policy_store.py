@@ -271,6 +271,29 @@ def test_update_changes_name(
     assert updated.updated_at > 0
 
 
+def test_update_replaces_factory_params_in_one_write(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    store.create(
+        policy_id="5f2b8c1d9e0a4b7c8d6e5f4a3b2c1d0e",
+        session_id=session_id,
+        name="capped",
+        type="python",
+        handler="mod.func",
+        factory_params={"max_cost_usd": 2.0},
+    )
+
+    updated = store.update(
+        "5f2b8c1d9e0a4b7c8d6e5f4a3b2c1d0e", session_id, factory_params={"max_cost_usd": 5.0}
+    )
+
+    assert updated is not None and updated.factory_params == {"max_cost_usd": 5.0}
+    assert store.get("5f2b8c1d9e0a4b7c8d6e5f4a3b2c1d0e", session_id).factory_params == {
+        "max_cost_usd": 5.0
+    }
+
+
 def test_update_duplicate_name_raises(
     store: SqlAlchemyPolicyStore,
     session_id: str,

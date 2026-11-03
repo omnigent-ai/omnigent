@@ -1,35 +1,120 @@
 diff --git a/dist/index.cjs b/dist/index.cjs
-index 15c9728c6ad3eefa66306cfd3906c7c5311af06c..499a68ef7f49ea2518c45d9f94f4b0f1d243faea 100644
+index 15c9728c6..cd39d46c5 100644
 --- a/dist/index.cjs
 +++ b/dist/index.cjs
-@@ -965,7 +965,9 @@ var ReactNodeView = class extends _tiptap_core.NodeView {
- 		const nodeViewContentRef = (element) => {
- 			if (element && this.contentDOMElement && element.firstChild !== this.contentDOMElement) {
- 				if (element.hasAttribute("data-node-view-wrapper")) element.removeAttribute("data-node-view-wrapper");
+@@ -84 +84,3 @@ function createContentComponent() {
+-	let renderers = {};
++	const renderers = new Map();
++	let snapshot;
++	const getSnapshot = () => snapshot ??= Object.fromEntries(renderers);
+@@ -104,6 +106,2 @@ function createContentComponent() {
+-		getSnapshot() {
+-			return renderers;
+-		},
+-		getServerSnapshot() {
+-			return renderers;
+-		},
++		getSnapshot,
++		getServerSnapshot: getSnapshot,
+@@ -114,4 +112,2 @@ function createContentComponent() {
+-			renderers = {
+-				...renderers,
+-				[id]: react_dom.default.createPortal(renderer.reactElement, renderer.element, id)
+-			};
++			renderers.set(id, react_dom.default.createPortal(renderer.reactElement, renderer.element, id));
++			snapshot = void 0;
+@@ -124,3 +120,2 @@ function createContentComponent() {
+-			const nextRenderers = { ...renderers };
+-			delete nextRenderers[id];
+-			renderers = nextRenderers;
++			renderers.delete(id);
++			snapshot = void 0;
+@@ -968 +963,3 @@ var ReactNodeView = class extends _tiptap_core.NodeView {
 -				const restoreSelection = captureDOMSelection(this.contentDOMElement);
 +				const pos = this.getPos();
 +				const { from, to } = this.editor.state.selection;
 +				const restoreSelection = typeof pos === "number" && from > pos && to < pos + this.node.nodeSize ? captureDOMSelection(this.contentDOMElement) : null;
- 				element.appendChild(this.contentDOMElement);
- 				restoreSelection === null || restoreSelection === void 0 || restoreSelection();
- 			}
+@@ -1396 +1393 @@ Object.keys(_tiptap_core).forEach(function(k) {
+-//# sourceMappingURL=index.cjs.map
+\ No newline at end of file
++//# sourceMappingURL=index.cjs.map
 diff --git a/dist/index.js b/dist/index.js
-index 54376b761251f4618b2a8c17585824c8d2c1d64c..f5a2eca579453a6ac8b8347dcf1023c48e79a885 100644
+index 54376b761..9f945e6a9 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -941,7 +941,9 @@ var ReactNodeView = class extends NodeView {
- 		const nodeViewContentRef = (element) => {
- 			if (element && this.contentDOMElement && element.firstChild !== this.contentDOMElement) {
- 				if (element.hasAttribute("data-node-view-wrapper")) element.removeAttribute("data-node-view-wrapper");
+@@ -60 +60,3 @@ function createContentComponent() {
+-	let renderers = {};
++	const renderers = new Map();
++	let snapshot;
++	const getSnapshot = () => snapshot ??= Object.fromEntries(renderers);
+@@ -80,6 +82,2 @@ function createContentComponent() {
+-		getSnapshot() {
+-			return renderers;
+-		},
+-		getServerSnapshot() {
+-			return renderers;
+-		},
++		getSnapshot,
++		getServerSnapshot: getSnapshot,
+@@ -90,4 +88,2 @@ function createContentComponent() {
+-			renderers = {
+-				...renderers,
+-				[id]: ReactDOM.createPortal(renderer.reactElement, renderer.element, id)
+-			};
++			renderers.set(id, ReactDOM.createPortal(renderer.reactElement, renderer.element, id));
++			snapshot = void 0;
+@@ -100,3 +96,2 @@ function createContentComponent() {
+-			const nextRenderers = { ...renderers };
+-			delete nextRenderers[id];
+-			renderers = nextRenderers;
++			renderers.delete(id);
++			snapshot = void 0;
+@@ -944 +939,3 @@ var ReactNodeView = class extends NodeView {
 -				const restoreSelection = captureDOMSelection(this.contentDOMElement);
 +				const pos = this.getPos();
 +				const { from, to } = this.editor.state.selection;
 +				const restoreSelection = typeof pos === "number" && from > pos && to < pos + this.node.nodeSize ? captureDOMSelection(this.contentDOMElement) : null;
- 				element.appendChild(this.contentDOMElement);
- 				restoreSelection === null || restoreSelection === void 0 || restoreSelection();
- 			}
+@@ -1337 +1334 @@ export { EditorConsumer, EditorContent, EditorContext, EditorProvider, MarkViewC
+-//# sourceMappingURL=index.js.map
+\ No newline at end of file
++//# sourceMappingURL=index.js.map
+diff --git a/src/EditorContent.tsx b/src/EditorContent.tsx
+index cedf56dba..091ca2219 100644
+--- a/src/EditorContent.tsx
++++ b/src/EditorContent.tsx
+@@ -50 +50,5 @@ export function createContentComponent(): ContentComponent {
+-  let renderers: Record<string, React.ReactPortal> = {}
++  const renderers = new Map<string, React.ReactPortal>()
++  let snapshot: Record<string, React.ReactPortal> | undefined
++  // TODO: Remove when upstream avoids copying the registry for each node view.
++  // Cache immutable snapshots so batched writes only copy when React reads.
++  const getSnapshot = () => (snapshot ??= Object.fromEntries(renderers))
+@@ -76,6 +80,2 @@ export function createContentComponent(): ContentComponent {
+-    getSnapshot() {
+-      return renderers
+-    },
+-    getServerSnapshot() {
+-      return renderers
+-    },
++    getSnapshot,
++    getServerSnapshot: getSnapshot,
+@@ -86,5 +86,2 @@ export function createContentComponent(): ContentComponent {
+-      renderers = {
+-        ...renderers,
+-        [id]: ReactDOM.createPortal(renderer.reactElement, renderer.element, id),
+-      }
+-
++      renderers.set(id, ReactDOM.createPortal(renderer.reactElement, renderer.element, id))
++      snapshot = undefined
+@@ -97,4 +94,2 @@ export function createContentComponent(): ContentComponent {
+-      const nextRenderers = { ...renderers }
+-
+-      delete nextRenderers[id]
+-      renderers = nextRenderers
++      renderers.delete(id)
++      snapshot = undefined
 diff --git a/src/ReactNodeViewRenderer.tsx b/src/ReactNodeViewRenderer.tsx
-index f11ad9384f11b2a53cc071d443239ee1651bc262..f5dd45d5fbd3ffab07267662e33f66b2867c377d 100644
+index f11ad9384..f5dd45d5f 100644
 --- a/src/ReactNodeViewRenderer.tsx
 +++ b/src/ReactNodeViewRenderer.tsx
 @@ -202,2 +202,7 @@ export class ReactNodeView<

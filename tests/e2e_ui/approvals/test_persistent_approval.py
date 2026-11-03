@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _log = logging.getLogger(__name__)
 
@@ -44,16 +45,6 @@ def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
     return resp.json().get("pending_elicitations") or []
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 @pytest.mark.timeout(90)
@@ -126,4 +117,4 @@ def test_persistent_approval_remembers_webfetch_domain(
         ]
 
     # The parked prompt drains — the remember verdict reached the blocked call.
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
