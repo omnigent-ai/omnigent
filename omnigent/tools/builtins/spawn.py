@@ -938,7 +938,8 @@ class SysSessionCreateTool(Tool):
             "using the server's configured default provider. Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
-            "and a private sending session, including its side-chat source chain. "
+            "and a sending session that is private or shared read-only, including its "
+            "side-chat source chain. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -974,6 +975,22 @@ class SysSessionCreateTool(Tool):
                                 "Default child; same_host or managed launches a private "
                                 "top-level session (agent_id only)."
                             ),
+                        },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": "Optional provider for placement='managed'.",
+                        },
+                        "sandbox_profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Authorized profile ID for placement='managed', required by "
+                                "providers that manage profiles. Use a selection supplied by "
+                                "the user or discovered through GET /v1/sandbox-profiles."
+                            ),
+                        },
+                        "sandbox_profile_revision": {
+                            "type": "string",
+                            "description": "Expected catalog revision of sandbox_profile_id.",
                         },
                         "agent_id": {
                             "type": "string",

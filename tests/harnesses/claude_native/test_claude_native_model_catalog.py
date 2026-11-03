@@ -201,7 +201,10 @@ async def test_model_probe_interrupt_terminates_wrapper_children(
         while not Path(sys.argv[2]).exists():
             time.sleep(0.01)
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        Path(sys.argv[1]).write_text(f"{child.pid} {os.getpid()}")
+        # Publish readiness only once both PIDs can be read.
+        pending_pid_path = Path(sys.argv[1]).with_suffix(".tmp")
+        pending_pid_path.write_text(f"{child.pid} {os.getpid()}")
+        pending_pid_path.replace(sys.argv[1])
         if sys.argv[3] == "wait":
             child.wait()
         """)
@@ -245,6 +248,8 @@ async def test_model_probe_interrupt_terminates_wrapper_children(
         if child is not None:
             await poll_until_async(lambda: not _proc.process_alive(child.pid), timeout_s=1)
     finally:
+        # Cancel even when setup fails before the interruption assertion.
+        task.cancel()
         # Release inherited pipes if only the wrapper was terminated.
         if child is not None:
             with contextlib.suppress(psutil.NoSuchProcess):

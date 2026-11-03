@@ -1267,17 +1267,30 @@ Request body matches `SessionForkRequest`:
 
   workspace (string | null, optional)
     Git repository URL, optionally `#<branch>`, cloned into the
-    fork's sandbox as its working directory. Omitting the field
-    inherits the repository the source session recorded, so cloning
-    a sandbox session lands the fork in the same checkout; an
+    fork's sandbox as its working directory. Omitting both workspace
+    fields inherits every repository the source session recorded, so
+    cloning a sandbox session preserves all of its checkouts; an
     explicit null gives the fork an empty sandbox. Only valid with
     `host_type: "managed"` (422 otherwise) — an external fork's
     directory is chosen when it binds a host.
 
-    The source's recorded-repository label is never copied onto the
-    fork: the fork records whichever repository it actually resolved
+  workspaces (array of strings | null, optional)
+    Repository URLs, each optionally `#<branch>`, replacing the source's
+    selection. Send only when `GET /v1/info` reports
+    `session_fork_workspaces: true`; older servers reject this field.
+    Without it, use `workspace` for zero/one repository, omit both fields
+    to inherit unchanged repositories, and require a server upgrade for
+    changes to a multi-repository selection.
+    Accepts up to 10 repositories. Several repositories require
+    a sandbox provider with `multi_repo` support and are cloned as siblings;
+    the session starts in their parent directory. Sending `[]` or null
+    starts an empty sandbox. Mutually exclusive with `workspace`, including
+    explicit nulls. Only valid with `host_type: "managed"` (422 otherwise).
+
+    The source's recorded-repository labels are never copied onto the
+    fork: the fork records whichever repositories it actually resolved
     (none, for an empty sandbox or an external fork), so a later
-    sandbox relaunch re-clones the fork's own repository rather than
+    sandbox relaunch re-clones the fork's own repositories rather than
     the source's.
 
 201 Created — body matches `SessionResponse` (status "idle",
@@ -1286,14 +1299,16 @@ Request body matches `SessionForkRequest`:
 400 Bad Request — source session is a sub-agent session, has
   no agent binding, up_to_response_id names no response in
   the source session, or a managed fork asks for a sandbox this
-  server has not configured
+  server has not configured, or requests multiple repositories on a
+  provider that supports only one
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
 409 Conflict — host_id names an existing host, or its
   `managed-<first 8 hex>` name is already taken
-422 Unprocessable Entity — host_id / sandbox_provider / workspace without
+422 Unprocessable Entity — host_id / sandbox_provider / workspace(s) without
   `host_type: "managed"`, a malformed host_id, or a managed
-  workspace that is not a repository URL
+  workspace that is not a repository URL, both workspace fields supplied,
+  or more than 10 repositories in workspaces
 ```
 
 Creates a new session by deep-copying every item from the source
@@ -1313,6 +1328,24 @@ The response is a full `SessionResponse` snapshot of the fork — same
 shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
+
+### Read Fork Repository Branch Suggestions
+
+`GET /v1/sessions/{session_id}/resources/repository-branches` requires session
+read access and returns the managed repositories in their original launch order:
+
+```json
+{"repositories": [{"url": "https://github.com/org/repo", "branch": "feature", "pushed": true}]}
+```
+
+Repository URLs and checkout paths come from server-owned launch metadata; this
+endpoint accepts no paths or URLs. It inspects the existing workspace through
+the runner or connected host without waking a sandbox, fetching, or changing Git
+state. `pushed` means the current branch exists at its original clone URL, not
+that all local commits or working-tree changes are pushed. It is `false` only
+when the remote confirms the branch is absent. Detached HEADs, an unavailable
+workspace, or a failed remote check produce `null` values so clients can retain
+the original selection. Non-managed sessions return an empty repository list.
 
 ### Stream Session
 

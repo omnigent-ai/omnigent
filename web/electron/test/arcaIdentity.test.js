@@ -47,6 +47,17 @@ describe("Arca daemon identity", () => {
     assert.deepEqual(readArcaIdentity(output([sameWorkspace]), SERVER), identity);
   });
 
+  it("accepts a daemon target with the requested or a sign-in-resolved ?o=, never another one", () => {
+    const withOrg = (org) => ({ ...daemon, target: `${daemon.target}?o=${org}` });
+    assert.deepEqual(readArcaIdentity(output([withOrg("123")]), SERVER), identity);
+    const unscoped = "https://account.databricks.com/omnigent";
+    assert.deepEqual(readArcaIdentity(output([withOrg("999")]), unscoped), {
+      serverUrl: arcaTarget(unscoped),
+      hostId: HOST,
+    });
+    assert.equal(readArcaIdentity(output([withOrg("456")]), SERVER), null);
+  });
+
   it("rejects unknown, ambiguous, mismatched, offline and failed status", () => {
     for (const rows of [
       [],
