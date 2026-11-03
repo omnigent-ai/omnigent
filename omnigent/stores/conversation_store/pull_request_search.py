@@ -15,18 +15,22 @@ from omnigent.git_providers import resolve_pr_url
 
 # "#1234", "!12", "PR 1234", "pr-1234", "MR !12", "pull request #1234". A bare
 # number stays a plain substring search.
+_REFERENCE_LABEL = r"(?:pr|mr|pull request|merge request)"
 _NUMBER_QUERY = re.compile(
-    r"(?:(?:pr|mr|pull request|merge request)\s*[-:]?\s*)?[#!]?([1-9][0-9]{0,8})",
+    rf"(?:{_REFERENCE_LABEL}\s*[-:]?\s*)?[#!]?([1-9][0-9]{{0,8}})",
     re.IGNORECASE,
 )
 # What precedes a number in a PR reference: "#"/"!", a PR URL path segment, or
 # the word "PR"/"MR". Patterns use only syntax shared by SQLite (Python re),
 # PostgreSQL, CockroachDB (RE2), and MySQL (ICU).
 _REFERENCE_PREFIX = (
-    r"(#|!|/pull/|/pulls/|/merge_requests/|/pullrequests?/|(^|[^a-zA-Z0-9_])(pr|mr)[ :-]?)"
+    r"(#|!|/pull/|/pulls/|/merge_requests/|/pullrequests?/|"
+    rf"(^|[^a-zA-Z0-9_]){_REFERENCE_LABEL}\s*[-:]?\s*)"
 )
 # A following digit would make it a different, longer PR number.
 _NUMBER_END = r"([^0-9]|$)"
+# A repository-qualified reference cannot start inside another hostname.
+_HOST_START = r"(^|[^a-zA-Z0-9_.-])"
 _REGEX_SPECIAL = re.compile(r"[\\^$.|?*+()\[\]{}]")
 
 
@@ -70,4 +74,4 @@ def parse_pull_request_query(query: str) -> PullRequestSearch | None:
     # The canonical URL ends with the number; the scheme is left out so an
     # http:// or scheme-less mention still matches.
     location = _REGEX_SPECIAL.sub(lambda char: f"\\{char[0]}", parsed.url.split("://", 1)[1])
-    return PullRequestSearch(parsed.number, f"(?i){location}{_NUMBER_END}")
+    return PullRequestSearch(parsed.number, f"(?i){_HOST_START}{location}{_NUMBER_END}")

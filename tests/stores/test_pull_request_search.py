@@ -9,13 +9,25 @@ from omnigent.stores.conversation_store.pull_request_search import parse_pull_re
 
 @pytest.mark.parametrize(
     "query",
-    ["#1234", " PR 1234 ", "pr#1234", "PR-1234", "pull request #1234", "MR !1234", "!1234"],
+    [
+        "#1234",
+        " PR 1234 ",
+        "PR  1234",
+        "pr#1234",
+        "PR-1234",
+        "pull request #1234",
+        "pull request 1234",
+        "merge request: 1234",
+        "MR !1234",
+        "!1234",
+    ],
 )
 def test_number_queries_name_a_pull_request(query: str) -> None:
     """Each common way of writing a PR number names that PR."""
     search = parse_pull_request_query(query)
     assert search is not None
     assert search.number == 1234
+    assert search.matched_text(query) is not None
 
 
 @pytest.mark.parametrize(
@@ -71,5 +83,7 @@ def test_url_search_matches_only_that_repository() -> None:
     assert search.number == 1234
     assert search.matched_text("Opened https://github.com/acme/app/pull/1234.") is not None
     assert search.matched_text("https://github.com/other/app/pull/1234") is None
+    assert search.matched_text("https://notgithub.com/acme/app/pull/1234") is None
+    assert search.matched_text("https://enterprise.github.com/acme/app/pull/1234") is None
     assert search.matched_text("https://github.com/acme/app/pull/12345") is None
     assert search.matched_text("Merged #1234") is None

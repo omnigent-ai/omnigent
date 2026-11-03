@@ -2093,6 +2093,7 @@ def test_list_conversations_search_pull_request_reference(
     assert "/pull/1234" in (by_id[linked].search_snippet or "")
     assert by_id[titled.id].search_snippet is None
 
+    session_with_text("Other host", "https://notgithub.com/acme/app/pull/1234")
     url_page = conversation_store.list_conversations(
         search_query="https://github.com/acme/app/pull/1234/files"
     )
