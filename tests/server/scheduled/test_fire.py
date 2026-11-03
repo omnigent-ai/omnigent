@@ -2824,6 +2824,21 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             {"base_branch": "HEAD"},
             "continued_session_incompatible",
         ),
+        (
+            _continued_session(
+                git_branch="worktree-test",
+                workspace="/repo-worktrees/test",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "another_task",
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/repo"
+                    ),
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
         (_continued_session(host_id="host_2"), {}, "continued_session_incompatible"),
         (_continued_session(workspace="/elsewhere"), {}, "continued_session_incompatible"),
         (
