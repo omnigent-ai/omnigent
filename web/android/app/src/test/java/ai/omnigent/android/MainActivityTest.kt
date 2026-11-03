@@ -20,6 +20,7 @@ import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -344,11 +345,7 @@ class MainActivityTest {
         shell.openLink("omnigent://example.com/c/abc")
 
         assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
-        assertEquals(
-            "window.__omnigentNativeEmitNotificationActivated && " +
-                "window.__omnigentNativeEmitNotificationActivated(\"/c/abc\");",
-            shadowOf(activity.webView()).lastEvaluatedJavascript,
-        )
+        assertEquals(activation("/c/abc"), shadowOf(activity.webView()).lastEvaluatedJavascript)
     }
 
     @Test
@@ -363,8 +360,15 @@ class MainActivityTest {
 
         assertEquals("https://second.example.test", shadowOf(activity.webView()).lastLoadedUrl)
         assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+        assertNotEquals(activation("/c/abc"), shadowOf(activity.webView()).lastEvaluatedJavascript)
+
+        // Keeps the insets script, which follows the activation, from overwriting it.
+        activity.assign("lastInsets", null)
         activity.invoke("onPageReady", arrayOf(String::class.java), "https://second.example.test/")
+
+        assertEquals(activation("/c/abc"), shadowOf(activity.webView()).lastEvaluatedJavascript)
         assertNull(activity.declared<String?>("pendingNavigatePath"))
+        assertNull(activity.intent.getStringExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH))
     }
 
     @Test
@@ -408,6 +412,13 @@ class MainActivityTest {
 
         assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
         assertNull(activity.declared<String?>("pendingNavigatePath"))
+        // A relaunch, e.g. after a font-size change, rebuilds the shell from its retained intent.
+        val relaunched =
+            Robolectric
+                .buildActivity(MainActivity::class.java, activity.intent)
+                .setup()
+                .get()
+        assertNull(relaunched.declared<String?>("pendingNavigatePath"))
     }
 
     @Test
@@ -643,6 +654,21 @@ class MainActivityTest {
             .getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this) as T
+
+    private fun MainActivity.assign(
+        name: String,
+        value: Any?,
+    ) {
+        MainActivity::class
+            .java
+            .getDeclaredField(name)
+            .apply { isAccessible = true }
+            .set(this, value)
+    }
+
+    private fun activation(path: String): String =
+        "window.__omnigentNativeEmitNotificationActivated && " +
+            "window.__omnigentNativeEmitNotificationActivated(\"$path\");"
 
     private fun MainActivity.switchButton(): View =
         MainActivity::class

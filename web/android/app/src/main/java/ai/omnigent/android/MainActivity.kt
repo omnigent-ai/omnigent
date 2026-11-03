@@ -847,8 +847,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun switchToServer(url: String) {
-        // A path held for the server being left must not open on the new one.
+        // A path held for the server being left must not open on the new one,
+        // including when a recreation rereads the retained intent.
         pendingNavigatePath = null
+        intent?.removeExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
         val store = ServerStore(this)
         store.connect(url)
         val target = store.currentServerUrl()
@@ -1593,6 +1595,7 @@ class MainActivity : AppCompatActivity() {
         if (!isWorkspacePage(webView.url) && originOf(webView.url) != pinnedOrigin) return
         emitNotificationActivation(pendingNavigatePath)
         pendingNavigatePath = null
+        intent?.removeExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH)
     }
 
     private fun navigatePathOf(intent: Intent?): String? =

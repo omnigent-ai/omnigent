@@ -94,6 +94,21 @@ class DeepLinkActivityTest {
 
         assertTrue(activity.isFinishing)
         assertNull(shadowOf(activity).peekNextStartedActivity())
+        assertEquals("https://omnigent.example.com", store.currentServerUrl())
+        assertEquals(listOf("https://omnigent.example.com"), store.recentServers())
+    }
+
+    @Test
+    fun `dismissing the consent leaves the app untouched`() {
+        store.connect("https://omnigent.example.com")
+        val activity = launch("omnigent://new.example.com/c/abc")
+
+        ShadowAlertDialog.getLatestAlertDialog().cancel()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(activity.isFinishing)
+        assertNull(shadowOf(activity).peekNextStartedActivity())
+        assertEquals("https://omnigent.example.com", store.currentServerUrl())
         assertEquals(listOf("https://omnigent.example.com"), store.recentServers())
     }
 
