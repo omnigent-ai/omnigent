@@ -201,7 +201,8 @@ def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> No
     "harness,expected",
     [
         ("claude-native", {"project", "user", "agents", "toolkit:review"}),
-        ("codex-native", {"codex-user"}),
+        ("codex-native", {"agents", "codex-user"}),
+        ("codex", {"agents"}),
     ],
 )
 async def test_host_discovers_harness_skills_without_a_runner(
