@@ -676,6 +676,8 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
     newest_written = threading.Event()
     original_update = store.update_harness_readiness
     older, newest = {"codex": False}, {"codex": True}
+    older_accounts = {"codex": {"kind": "unknown", "expired": True}}
+    newest_accounts = {"codex": {"kind": "chatgpt"}}
 
     def delayed_update(host_id, configured_harnesses, **kwargs):
         if configured_harnesses == older:
@@ -691,7 +693,8 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
 
     monkeypatch.setattr(store, "update_harness_readiness", delayed_update)
     replies["__refresh__"] = {
-        "configured_harnesses": newest if first_update == "notification" else older
+        "configured_harnesses": newest if first_update == "notification" else older,
+        "harness_accounts": newest_accounts if first_update == "notification" else older_accounts,
     }
     refresh_task = None
     try:
@@ -708,7 +711,10 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
                         HostHarnessReadinessFrame(
                             configured_harnesses=older
                             if first_update == "notification"
-                            else newest
+                            else newest,
+                            harness_accounts=older_accounts
+                            if first_update == "notification"
+                            else newest_accounts,
                         )
                     ),
                 }
@@ -728,6 +734,7 @@ async def test_refresh_and_readiness_keep_the_newest_snapshot(
         conn = registry.get(_HOST_ID)
         assert persisted is not None and persisted.configured_harnesses == newest
         assert conn is not None and conn.hello.configured_harnesses == newest
+        assert conn.hello.harness_accounts == newest_accounts
     finally:
         release.set()
         if refresh_task is not None and not refresh_task.done():

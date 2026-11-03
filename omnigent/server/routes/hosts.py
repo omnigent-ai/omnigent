@@ -858,6 +858,8 @@ def create_hosts_router(
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         result_configured = result.get("configured_harnesses")
         result_accounts = result.get("harness_accounts")
+        if isinstance(result_accounts, dict):
+            update_harness_accounts(conn, result_accounts)
         if isinstance(result_configured, dict):
             snapshot = dict(result_configured)
             conn.hello.configured_harnesses = snapshot
@@ -870,8 +872,6 @@ def create_hosts_router(
                     or conn.hello.configured_harnesses is not snapshot
                 ),
             )
-        if isinstance(result_accounts, dict):
-            update_harness_accounts(conn, result_accounts)
         return conn.hello.configured_harnesses, conn.hello.harness_accounts
 
     @router.get("/hosts")
