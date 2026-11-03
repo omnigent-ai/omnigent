@@ -144,11 +144,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
   that prompt, on the same host, workspace and runner, with the prompt back in
-  the composer to edit; the original session keeps everything and links to the
-  new one. Offered only when `/v1/info` reports `session_rewind`; otherwise a
-  typed `/rewind` is sent as text. Files are not restored. States: loading
-  prompts, prompts failed to load, no prompts, refused while a turn runs or the
-  runner and host are offline (error under the composer).
+  the composer to edit, attachments included; the original session keeps
+  everything and links to the new one. Workspace files are not rolled back.
+  The picker reads the newest prompts first and offers **Load older prompts**,
+  which stays while searching. Offered only when `/v1/info` reports
+  `session_rewind`; otherwise a typed `/rewind` is sent as text, or runs a
+  custom command of that name (likewise `/clear`). States: loading prompts,
+  prompts failed to load, no prompts, older prompts loading or failed, refused
+  while a turn runs or the runner and host are offline (error under the
+  composer), prompt arriving after the new session opened (filled unless the
+  user has typed there).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -301,6 +306,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
+- In a claude-sdk session, type `/cl` and click **/clear**, or type the whole
+  `/clear` and press Enter; either opens a new, empty chat on the same machine.
+- In a claude-sdk or Claude Code native session with a few prompts sent,
+  type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
+  pick a prompt (search, or **Load older prompts** in a long session). The new
+  chat opens with that prompt, and its attachments, in the composer.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -639,6 +650,20 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_new_command_deleted_project_opens_unfiled`
   covers deleted projects with dangling session membership.
   No running agent is needed.
+- **`slash-menu` (claude-sdk `/clear`) and `slash-rewind`:** the browser
+  scenarios select the command from the menu against a real Claude CLI on the
+  mock LLM:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`
+  and
+  `tests/e2e_ui/chat/test_claude_sdk_rewind.py::test_claude_sdk_rewind_follows_the_truncated_session`.
+  Claude Code native `/rewind` is covered at the process boundary by
+  `tests/e2e/test_host_claude_native_fork_e2e.py::test_rewind_claude_native_resumes_only_the_earlier_history`
+  (and `::test_rewind_claude_sdk_keeps_only_the_earlier_turns`). The typed
+  full command, the fallback to text or a custom command, older-prompt
+  loading, and a prompt that arrives after the redirect are component-covered
+  in `web/src/pages/ChatPage.composer.test.tsx`. Manually, repeat both entry
+  routes (menu click; whole command plus Enter) for SDK `/clear`, SDK
+  `/rewind` and native `/rewind`, and rewind to a prompt with an attachment.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,

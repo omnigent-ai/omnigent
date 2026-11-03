@@ -128,6 +128,12 @@ implements them separately, so a fix for one harness does not reach the others.
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `claude-rewind`: Claude Code native `/rewind` from the web composer (see
+  `slash-rewind` in [composer.md](./composer.md)) opens a new session whose own
+  Claude pane resumes a transcript rebuilt from the kept items. The original
+  session's pane is neither rewound nor stopped: it keeps the full
+  conversation, a message sent there resumes it, and otherwise it closes on
+  idle reap. Unlike a native `/clear`, the terminal does not move to the new session.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
