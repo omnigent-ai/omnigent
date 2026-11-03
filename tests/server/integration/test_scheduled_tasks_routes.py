@@ -1796,6 +1796,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
     conv_store.set_session_live_status(conv.id, "idle")
+    conv_store.set_session_usage(conv.id, {"total_cost_usd": 1.234})
     _set_read_state("alice@example.com", conv.id, conv.updated_at - 1, True)
     # A known session the viewer saw but never flagged, waiting on its harness.
     waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
@@ -1841,6 +1842,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert succ["conversation_status"] == "idle"
     assert succ["viewer_last_seen"] == conv.updated_at - 1
     assert succ["viewer_unread"] is True
+    assert succ["session_cost_usd"] == 1.234
 
     # Status reads as the sessions list reports it ("waiting" is "running"), and
     # an unflagged session is explicitly not unread rather than unknown.
@@ -1848,6 +1850,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert running["conversation_status"] == "running"
     assert running["viewer_last_seen"] == 1_700_000_100
     assert running["viewer_unread"] is False
+    assert running["session_cost_usd"] is None
 
     # The skipped run (no conversation_id) gets null for all three fields.
     skip = runs[skipped_id]
@@ -1855,6 +1858,23 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["conversation_status"] is None
     assert skip["viewer_last_seen"] is None
     assert skip["viewer_unread"] is None
+    assert skip["session_cost_usd"] is None
+
+    # Continuing the same session reports its current total on every run.
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=2500,
+        status="succeeded",
+        conversation_id=conv.id,
+    )
+    conv_store.set_session_usage(conv.id, {"total_cost_usd": 2.5})
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200
+    shared = [row for row in resp.json()["runs"] if row["conversation_id"] == conv.id]
+    assert len(shared) == 2
+    assert all(row["session_cost_usd"] == 2.5 for row in shared)
 
 
 @pytest.mark.usefixtures("clean_session_read_state")

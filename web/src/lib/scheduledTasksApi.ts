@@ -89,6 +89,8 @@ export interface ScheduledTask {
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
 export interface ScheduledTaskRun {
+  /** Current cumulative session cost; null when not reported (not a per-run delta). */
+  sessionCostUsd: number | null;
   id: string;
   scheduledTaskId: string;
   status: ScheduledTaskRunStatus;
@@ -226,6 +228,7 @@ interface ScheduledTaskWire {
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
 interface ScheduledTaskRunWire {
+  session_cost_usd?: number | null;
   id: string;
   scheduled_task_id: string;
   status: ScheduledTaskRunStatus;
@@ -310,6 +313,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
 
 function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
   return {
+    sessionCostUsd: wire.session_cost_usd ?? null,
     id: wire.id,
     scheduledTaskId: wire.scheduled_task_id,
     status: wire.status,

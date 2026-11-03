@@ -138,6 +138,7 @@ describe("listScheduledTaskRuns", () => {
       conversationStatus: null,
       viewerLastSeen: null,
       viewerUnread: null,
+      sessionCostUsd: null,
     });
   });
 
@@ -158,6 +159,7 @@ describe("listScheduledTaskRuns", () => {
             conversation_status: "idle",
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
+            session_cost_usd: 0,
           },
         ],
       }),
@@ -168,6 +170,7 @@ describe("listScheduledTaskRuns", () => {
       conversationStatus: "idle",
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
+      sessionCostUsd: 0,
     });
   });
 });
