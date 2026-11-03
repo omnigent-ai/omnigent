@@ -528,6 +528,8 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     assert by_path["src/fileA.py"]["status"] == "modified"
     assert by_path["fileB.py"]["status"] == "deleted"
     assert by_path["new/name.py"]["status"] == "renamed"
+    assert by_path["new/name.py"]["previous_path"] == "old/name.py"
+    assert by_path["src/fileA.py"]["previous_path"] is None
     # Line counts and the display name come straight from the PR file entry.
     assert by_path["newfile.py"]["lines_added"] == 1
     assert by_path["src/fileA.py"]["name"] == "fileA.py"
