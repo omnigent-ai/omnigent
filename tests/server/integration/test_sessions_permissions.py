@@ -2806,10 +2806,12 @@ async def test_fork_switch_denies_session_scoped_target_without_access(
     assert [s["id"] for s in corey_sessions] == [source["id"]]
 
 
+@pytest.mark.parametrize("bundle", [False, True], ids=["agent-id", "bundle"])
 async def test_create_session_rejects_other_users_host(
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,
     db_uri: str,
+    bundle: bool,
 ) -> None:
     """
     Creating a session that targets another user's host is rejected
@@ -2826,34 +2828,50 @@ async def test_create_session_rejects_other_users_host(
     The ``detail == "not your host"`` assertion pins the 403 to the
     host-owner check (an agent-access rejection would 403 differently),
     and the empty ``outbound_queue`` proves the order: a missing check
-    would have enqueued the stat frame to Alice's connection.
+    would have enqueued the stat frame to Alice's connection. A Plan-mode
+    create must not get the older-host 409 either, which would reveal her build.
     """
     # Alice owns an online host.
     _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
     alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
-    # A bindable BUILT-IN (template) agent: session_id IS NULL, so any
-    # user can bind it. Session-scoped agents are owned by one session
-    # and would block Bob at the agent-access check before the host
-    # check (see designs/BUILTIN_AGENTS.md); creating a template here
-    # isolates the host-owner check.
+    # A bindable template agent (session_id NULL) running Codex: isolates the
+    # host-owner check from agent access and the Plan-mode 409.
     SqlAlchemyAgentStore(db_uri).create(
         "f2b40a7cc3eaec4ee8cbb151e1021c75",
-        "builtin-xuser-agent",
+        "codex-native-ui",
         "f2b40a7cc3eaec4ee8cbb151e1021c75/bundle",
     )
 
     # Bob targets Alice's host.
-    resp = await host_perm_client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75",
-            "host_id": "f54bb9272002938a3a934bfcb6bb228a",
-            "workspace": "/tmp",
-        },
-        headers={"X-Forwarded-Email": "bob@example.com"},
-    )
+    metadata = {
+        "host_id": "f54bb9272002938a3a934bfcb6bb228a",
+        "workspace": "/tmp",
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+    }
+    if bundle:
+        resp = await host_perm_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        name="bob-xuser-bundle",
+                        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+                    ),
+                    "application/gzip",
+                )
+            },
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+    else:
+        resp = await host_perm_client.post(
+            "/v1/sessions",
+            json={**metadata, "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75"},
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
 
     assert resp.status_code == 403, (
         f"Bob targeting Alice's host should be 403, got {resp.status_code}: {resp.text}"
