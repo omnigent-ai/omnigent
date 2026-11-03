@@ -20,6 +20,7 @@ from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, managed_repo_labels
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.server.integration.test_sessions_clear import (
     _EDITOR,
@@ -226,6 +227,57 @@ async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
         for a in attachments
     ]
     assert contents == [b"\x89PNG fake", b"parser notes"]
+
+
+async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rewound session already exists, so a failed attachment lookup drops only them."""
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store)
+    upload = await client.post(
+        f"/v1/sessions/{source_id}/resources/files",
+        files={"file": ("notes.txt", b"parser notes", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    [prompt] = store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_3",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_file", "file_id": upload.json()["id"]},
+                        {"type": "input_text", "text": "Q3"},
+                    ],
+                ),
+            )
+        ],
+    )
+    list_files = SqlAlchemyFileStore.list
+
+    def list_only_the_source(
+        self: SqlAlchemyFileStore, session_id: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        if session_id != source_id:
+            raise RuntimeError("file store unavailable")
+        return list_files(self, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyFileStore, "list", list_only_the_source)
+
+    resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
+
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["session_id"]
+    assert (resp.json()["prompt"], resp.json()["attachments"]) == ("Q3", [])
+    assert message_texts(store, new_id) == ["Q1", "A1", "Q2", "A2"]
+    assert live_runner.superseded == [(source_id, new_id, "rewind")]
 
 
 @pytest.mark.parametrize(
