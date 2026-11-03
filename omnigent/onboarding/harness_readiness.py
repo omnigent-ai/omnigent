@@ -57,11 +57,10 @@ from omnigent.onboarding.harness_install import (
     KIRO_KEY,
     OPENCODE_KEY,
     PI_KEY,
-    QWEN_KEY,
     PROBE_UNANSWERED,
+    QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
     harness_cli_binary,
-    harness_cli_installed,
     harness_cli_probe_outcome,
     required_cli_for_harness,
 )
@@ -912,9 +911,7 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
     to upgrade rather than "binary-missing".
     """
-    outcome = harness_cli_probe_outcome(
-        install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S
-    )
+    outcome = harness_cli_probe_outcome(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
     if outcome is True:
         return True
     if outcome == PROBE_UNANSWERED:
