@@ -8626,10 +8626,10 @@ def test_bundle_local_agent_source_packs_nested_links_as_links(tmp_path: Path) -
 def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A component swapped for a symlink after resolution, or a directory
-    replaced between its inspection and opening, fails the walk, and a FIFO,
-    present up front or swapped in after inspection, is refused without
-    blocking."""
+    """A component swapped for a symlink after resolution, or a directory or
+    file replaced by a symlink between its inspection and opening, fails the
+    walk, and a FIFO, present up front or swapped in after inspection, is
+    refused without blocking."""
     from omnigent.runner import tool_dispatch
 
     root = tmp_path / "work"
@@ -8660,6 +8660,30 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
         tool_dispatch._bundle_local_agent_source(root, swap_dir)
     monkeypatch.undo()
     assert swapped
+
+    link_agent = root / "link_agent"
+    (link_agent / "sub").mkdir(parents=True)
+    (link_agent / "config.yaml").write_text("name: helper\n")
+    nested_file = link_agent / "sub" / "notes.txt"
+    nested_file.write_text("notes\n")
+    prebuilt = root / "helper.tar.gz"
+    prebuilt.write_bytes(b"prebuilt bundle")
+    to_swap = {nested_file.name: nested_file, prebuilt.name: prebuilt}
+
+    def stat_then_link_to_secret(name: str, *args: object, **kwargs: object) -> os.stat_result:
+        result = real_stat(name, *args, **kwargs)
+        target = to_swap.pop(name, None)
+        if target is not None:
+            target.unlink()
+            target.symlink_to(outside / "config.yaml")
+        return result
+
+    monkeypatch.setattr(os, "stat", stat_then_link_to_secret)
+    for source in (link_agent, prebuilt):
+        with pytest.raises(OSError):
+            tool_dispatch._bundle_local_agent_source(root, source)
+    monkeypatch.undo()
+    assert not to_swap
 
     agent_dir = root / "fifo_agent"
     agent_dir.mkdir()
