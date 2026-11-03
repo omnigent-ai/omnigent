@@ -409,7 +409,7 @@ function McpServerMenu({
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
-  /** Description shown beside the name; wrapped in full on the highlighted row. */
+  /** Description shown beside the name; wrapped to up to four lines when highlighted. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
   flatIndex: number;
@@ -451,7 +451,7 @@ function MenuRowButton({
   // info-blue slash-command tint, and from plain Sparkles which marks
   // thinking/reasoning blocks), the ⌘ glyph in slate for built-ins.
   const Icon = isBuiltin ? CommandIcon : WandSparklesIcon;
-  // The highlighted row already wraps its full description, so the hover
+  // The highlighted row already wraps its description, so the hover
   // tooltip is only for other rows whose one-line description is cut off.
   const openTooltip = (open: boolean) => {
     const description = descriptionRef.current;
@@ -499,7 +499,8 @@ function MenuRowButton({
               data-testid={`slash-menu-description-${row.name.slice(1)}`}
               className={cn(
                 "min-w-0 text-xs text-muted-foreground",
-                active ? "break-words leading-4" : "truncate leading-4",
+                // Clamped so one long description can't fill the capped list.
+                active ? "line-clamp-4 break-words leading-4" : "truncate leading-4",
               )}
             >
               {row.description}
@@ -512,7 +513,8 @@ function MenuRowButton({
           side="top"
           align="end"
           data-testid={`slash-menu-tooltip-${row.name.slice(1)}`}
-          className="max-w-md break-words text-xs leading-4"
+          // Top-aligned so a description taller than the cap scrolls from its first line.
+          className="max-h-64 max-w-md items-start overflow-y-auto break-words text-xs leading-4"
         >
           {row.description}
         </TooltipContent>
@@ -526,8 +528,8 @@ function MenuRowButton({
  * starts a slash command, shared by the in-session composer (ChatPage)
  * and the new-chat landing composer (NewChatDialog). Cursor-style
  * layout: a panel with "Commands" / "Skills" section headers and icon +
- * name + one-line description rows. The highlighted row wraps its full
- * description, and hovering a cut-off row shows it in a tooltip.
+ * name + one-line description rows. The highlighted row wraps its
+ * description to up to four lines, and hovering a cut-off row shows it in a tooltip.
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded

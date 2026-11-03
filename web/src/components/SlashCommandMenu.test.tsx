@@ -186,11 +186,12 @@ describe("full skill descriptions", () => {
     Object.defineProperty(element, "scrollWidth", { configurable: true, value: scrollWidth });
   }
 
-  it("wraps the highlighted row's full description and keeps other rows to one line", () => {
+  it("wraps the highlighted row's description to up to four lines and keeps other rows to one line", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={1} />,
     );
     expect(description("triage")).toHaveTextContent(triage);
+    expect(description("triage")).toHaveClass("line-clamp-4", "break-words");
     expect(description("triage")).not.toHaveClass("truncate");
     expect(description("review")).toHaveClass("truncate");
 
@@ -211,6 +212,7 @@ describe("full skill descriptions", () => {
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
     const tooltip = await screen.findByTestId("slash-menu-tooltip-triage", {}, { timeout: 2000 });
     expect(tooltip).toHaveTextContent(triage);
+    expect(tooltip).toHaveClass("max-h-64", "overflow-y-auto", "items-start");
   });
 
   it("shows no tooltip when the description already fits or the row is highlighted", async () => {

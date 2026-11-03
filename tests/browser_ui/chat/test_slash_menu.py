@@ -396,3 +396,60 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     composer.press("ArrowDown")
     composer.press("Enter")
     expect(composer).to_have_value("/triage ")
+
+
+_SPRAWLING_SKILL_DESCRIPTION = " ".join(
+    f"Step {step}: collect the logs, compare them with the last good run, and note what changed."
+    for step in range(1, 41)
+)
+_LINE_HEIGHT = "element => parseFloat(getComputedStyle(element).lineHeight)"
+_OVERFLOWS_VERTICALLY = "element => element.scrollHeight > element.clientHeight"
+_FIRST_LINE_OFFSET = """element => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    return range.getClientRects()[0].top - element.getBoundingClientRect().top;
+}"""
+
+
+def test_slash_menu_bounds_a_very_long_skill_description(
+    page: Page, chat_session_contract
+) -> None:
+    chat_session_contract.set_skills(
+        [
+            {"name": "review-pr", "description": "Review a pull request"},
+            {"name": "sprawl", "description": _SPRAWLING_SKILL_DESCRIPTION},
+        ]
+    )
+    page.goto(chat_session_contract.url)
+    composer = _composer(page)
+    expect(composer).to_be_visible()
+    composer.fill("/")
+
+    # The highlighted row wraps to four lines and hides the rest.
+    composer.press("ArrowUp")
+    sprawl = page.get_by_test_id("slash-menu-item-sprawl")
+    expect(sprawl).to_have_attribute("data-active", "true")
+    description = page.get_by_test_id("slash-menu-description-sprawl")
+    line_height = description.evaluate(_LINE_HEIGHT)
+    description_box = description.bounding_box()
+    assert description_box is not None
+    assert description_box["height"] == pytest.approx(4 * line_height, abs=1)
+    assert description.evaluate(_OVERFLOWS_VERTICALLY)
+
+    # Off the highlight, the hover tooltip stops at its height cap and scrolls from the top.
+    composer.press("ArrowUp")
+    expect(page.get_by_test_id("slash-menu-item-review-pr")).to_have_attribute(
+        "data-active", "true"
+    )
+    sprawl.hover()
+    tooltip = page.get_by_test_id("slash-menu-tooltip-sprawl")
+    expect(tooltip).to_be_visible()
+    tooltip_box = tooltip.bounding_box()
+    assert tooltip_box is not None
+    assert tooltip_box["height"] <= 256 + 1
+    assert tooltip.evaluate(_OVERFLOWS_VERTICALLY)
+    assert 0 <= tooltip.evaluate(_FIRST_LINE_OFFSET) < line_height
+    tooltip.hover()
+    page.mouse.wheel(0, 200)
+    page.wait_for_function("element => element.scrollTop > 0", arg=tooltip.element_handle())
+    expect(tooltip).to_be_visible()
