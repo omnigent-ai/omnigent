@@ -12,7 +12,7 @@ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
 
@@ -377,6 +377,77 @@ describe("Composer status line (branch + context ring)", () => {
     expect(badge.tagName).toBe("BUTTON");
     expect(badge).toHaveAccessibleName("Host mac-laptop, offline");
     fireEvent.keyDown(badge, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
+    expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("says the host is connecting while a just-sent session's runner boots, then connected", () => {
+    // The first prompt was sent from the landing: the session exists and is
+    // bound to a live host, but its runner hasn't registered yet.
+    bindHost("mac-laptop");
+    const onShowReconnectHelp = vi.fn();
+    const { rerender } = renderComposer({
+      runnerOnline: false,
+      runnerStarting: true,
+      onShowReconnectHelp,
+    });
+
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger).toHaveAccessibleName("Host mac-laptop, connecting");
+    expect(trigger.className).toContain("after:content-['Connecting…']");
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-host-menu");
+    expect(within(menu).getByText("Connecting to this host…")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-host-menu-status")).toHaveAttribute(
+      "data-status",
+      "starting",
+    );
+    fireEvent.keyDown(menu, { key: "Escape" });
+
+    rerender(
+      <TooltipProvider>
+        <Composer
+          {...composerProps({ runnerOnline: true, runnerStarting: false, onShowReconnectHelp })}
+        />
+      </TooltipProvider>,
+    );
+    expect(trigger).toHaveAccessibleName("Host mac-laptop, online");
+    expect(trigger.className).not.toContain("after:content-['Connecting…']");
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(
+      within(screen.getByTestId("composer-host-menu")).queryByText("Connecting to this host…"),
+    ).toBeNull();
+  });
+
+  it("swaps connecting for reconnect once a booting session's host never comes up", () => {
+    bindHost("mac-laptop");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onShowReconnectHelp = vi.fn();
+    const { rerender } = renderComposer({
+      runnerOnline: false,
+      runnerStarting: true,
+      onShowReconnectHelp,
+    });
+
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger).toHaveAccessibleName("Host mac-laptop, connecting");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("composer-host-menu"), { key: "Escape" });
+
+    // The startup grace lapsed with the host still down: liveness is host_offline.
+    rerender(
+      <TooltipProvider>
+        <Composer
+          {...composerProps({ runnerOnline: false, runnerStarting: false, onShowReconnectHelp })}
+        />
+      </TooltipProvider>,
+    );
+    expect(trigger).toHaveAccessibleName("Host mac-laptop, offline");
+    expect(trigger.className).not.toContain("after:content-['Connecting…']");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
     fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
   });

@@ -14,6 +14,7 @@ import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
 import {
+  COMPOSER_HOST_CONNECTING_CLASS,
   ComposerConfigTooltipRows,
   ComposerHostTrigger,
   ComposerMenuTooltip,
@@ -99,6 +100,7 @@ export function HostBadge({
   sessionId,
   onReconnect,
   starting = false,
+  connecting = false,
   appearance = "status",
   readOnly = false,
 }: {
@@ -106,6 +108,8 @@ export function HostBadge({
   onReconnect?: () => void;
   /** The session's sandbox is being woken; the composer dot spins until it is online. */
   starting?: boolean;
+  /** The session's runner hasn't registered yet; the composer says it is connecting. */
+  connecting?: boolean;
   appearance?: "status" | "composer";
   readOnly?: boolean;
 }) {
@@ -172,16 +176,27 @@ export function HostBadge({
     const localWakeRunning = starting && !!badge;
     const hostStarting = (localWakeRunning || launchInProgress) && badge?.status !== "online";
     const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
-    const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
+    // A booting runner isn't reachable yet even when its host is online.
+    const runnerConnecting = connecting && !!badge && !launchStatus && !hostStarting;
+    const dotStatus = hostStarting || runnerConnecting ? "starting" : (badge?.status ?? "unknown");
     // Only this tab's own wake hides Reconnect: a server-reported stage can go stale.
     const reconnectable =
-      !launchStatus && !localWakeRunning && badge?.status === "offline" && !!onReconnect;
-    const statusWord = hostStarting ? startingWord : STATUS_WORD[badge?.status ?? "unknown"];
+      !launchStatus &&
+      !localWakeRunning &&
+      !runnerConnecting &&
+      badge?.status === "offline" &&
+      !!onReconnect;
+    const statusWord = hostStarting
+      ? startingWord
+      : runnerConnecting
+        ? "connecting"
+        : STATUS_WORD[badge?.status ?? "unknown"];
     let label = badge ? `Host ${badge.label}, ${statusWord}` : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
     let connectionWord = CONNECTION_WORD[badge?.status ?? "unknown"];
     if (hostStarting) connectionWord = startingWord;
+    else if (runnerConnecting) connectionWord = "Connecting…";
     else if (asleep) connectionWord = "Asleep — wakes on next message";
     let tooltipRows = badge
       ? [
@@ -214,6 +229,7 @@ export function HostBadge({
                 label={label}
                 status={launchStatus && !hostStarting ? undefined : dotStatus}
                 cloud={!!launchStatus || !!host?.sandbox_provider}
+                className={cn(runnerConnecting && COMPOSER_HOST_CONNECTING_CLASS)}
                 data-testid="composer-host-select"
               />
             </DropdownMenuTrigger>
@@ -247,9 +263,10 @@ export function HostBadge({
                 Switch host…
               </SessionActionMenuItem>
             )}
-            {(launchStatus || !badge) && (
+            {(launchStatus || !badge || runnerConnecting) && (
               <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
-                {launchStatus ?? "This session has no host binding."}
+                {launchStatus ??
+                  (badge ? "Connecting to this host…" : "This session has no host binding.")}
               </p>
             )}
           </DropdownMenuContent>

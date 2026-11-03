@@ -141,6 +141,10 @@ export function HostStatusDot({
   );
 }
 
+/** Widens the host chip to show a pulsing "Connecting…" beside its icon. */
+export const COMPOSER_HOST_CONNECTING_CLASS =
+  "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']";
+
 export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {

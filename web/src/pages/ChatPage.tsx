@@ -4278,6 +4278,7 @@ function ComposerImpl(
                   readOnly={isReadOnly}
                   onReconnect={onShowReconnectHelp}
                   starting={sandboxStarting}
+                  connecting={runnerStarting}
                 />
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
