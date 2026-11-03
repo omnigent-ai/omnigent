@@ -18,6 +18,8 @@ import pytest
 from omnigent.entities import Conversation
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.scheduled_context import (
+    SCHEDULED_RUN_HEADER,
+    add_scheduled_run_header,
     current_scheduled_run,
     scheduled_run_scope,
 )
@@ -136,6 +138,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     async with httpx.AsyncClient(
         base_url="http://runner",
         transport=httpx.MockTransport(respond),
+        event_hooks={"request": [add_scheduled_run_header]},
     ) as runner:
         with capture_debug_rows("server") as rows:
             try:
@@ -174,6 +177,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     [request] = requests
     assert request.method == "GET"
     assert request.url.path == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+    assert SCHEDULED_RUN_HEADER not in request.headers
 
 
 class _ScriptedStreamResponse:
