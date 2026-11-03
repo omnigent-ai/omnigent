@@ -18,11 +18,13 @@ import asyncio
 import contextlib
 import json
 import shutil
+import subprocess
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from unittest.mock import DEFAULT, AsyncMock, Mock
 
 import httpx
 import pytest
@@ -33,15 +35,17 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
 )
 from omnigent.inner.datamodel import TerminalEnvSpec
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, native_file_observer
 from omnigent.runner.native import ResolvedSpec
 from omnigent.runner.native import orchestration as native_runtime
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from omnigent.terminals.pane_reaper import PaneRef
@@ -281,7 +285,7 @@ def _skip_tools_changed_notification(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def app(tmp_path: Path) -> FastAPI:
+def app(tmp_path: Path, request: pytest.FixtureRequest) -> FastAPI:
     """
     Build a runner app with a non-spawning resource registry stub.
 
@@ -291,6 +295,7 @@ def app(tmp_path: Path) -> FastAPI:
     return create_runner_app(
         resource_registry=_StubResourceRegistry(tmp_path),
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=tmp_path if getattr(request, "param", False) else None,
     )
 
 
@@ -428,6 +433,134 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     # (start_tool_relay bound a socket), not just that a file was written.
     assert info["url"].startswith("http://127.0.0.1:")
     assert info["token"]
+
+
+@pytest.mark.parametrize("app", [True], indirect=True)
+async def test_native_observer_uses_first_original_and_skips_git_reads(
+    relay_env: _RelayEnv,
+    app: FastAPI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    resources = SessionResourceRegistry(runner_workspace=tmp_path)
+    environment = resources.resolve_environment(relay_env.session_id, "default")
+    request.addfinalizer(environment.close)
+    monkeypatch.setattr(
+        app.state.session_resource_registry,
+        "resolve_environment",
+        resources.resolve_environment,
+        raising=False,
+    )
+    start = Mock(wraps=bridge.start_tool_relay)
+    read_file = environment.read
+    read = AsyncMock(wraps=read_file)
+    resolve = Mock(wraps=native_file_observer.resolve_native_original)
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
+    monkeypatch.setattr(environment, "read", read)
+    monkeypatch.setattr(native_file_observer, "resolve_native_original", resolve)
+    response = await _launch_terminal(
+        relay_env.client, relay_env.session_id, bridge_inject_dir=True
+    )
+    assert response.status_code == 200, response.text
+    observe = start.call_args.kwargs["file_change_observer"]
+
+    async def patch_file(path: str, patch: str, started: asyncio.Event | None = None) -> None:
+        if started is not None:
+            started.set()
+        await observe(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "changes": [{"path": path, "kind": {"type": "update"}, "diff": patch}]
+                },
+            }
+        )
+
+    registry = app.state.filesystem_registry
+    events: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    app.state.session_event_queues[relay_env.session_id] = events
+    for path in ("failed.txt", "continued.txt"):
+        (tmp_path / path).write_text("first\n")
+    read.side_effect = [OSError("helper startup failed"), DEFAULT]
+    await observe(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {
+                "changes": [
+                    {"path": path, "kind": "update", "diff": "@@ -1 +1 @@\n-old\n+first\n"}
+                    for path in ("failed.txt", "continued.txt")
+                ]
+            },
+        }
+    )
+    read.side_effect = None
+    assert read.await_count == 2
+    assert resolve.call_count == 1
+    for path in ("failed.txt", "continued.txt"):
+        record = registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
+    assert registry.get_baseline("continued.txt") == "old\n"
+    assert events.get_nowait() == {
+        "type": "session.changed_files.invalidated",
+        "session_id": relay_env.session_id,
+        "environment_id": "default",
+    }
+    read.reset_mock()
+    resolve.reset_mock()
+    (tmp_path / "failed.txt").write_text("second\n")
+    await patch_file("failed.txt", "@@ -1 +1 @@\n-first\n+second\n")
+    read.assert_not_awaited()
+    resolve.assert_not_called()
+    assert not registry.needs_snapshot("failed.txt")
+    assert registry.get_baseline("failed.txt") is None
+
+    first_read_started = asyncio.Event()
+    release_first_read = asyncio.Event()
+    second_event_started = asyncio.Event()
+
+    async def gated_read(*args: Any, **kwargs: Any) -> Any:
+        result = await read_file(*args, **kwargs)
+        if not first_read_started.is_set():
+            first_read_started.set()
+            await release_first_read.wait()
+        return result
+
+    read.side_effect = gated_read
+    for path, first_patch, original in (
+        ("known.txt", "@@ -1 +1 @@\n-old\n+first\n", "old\n"),
+        ("unknown.txt", "incomplete patch", None),
+    ):
+        first_read_started.clear()
+        release_first_read.clear()
+        second_event_started.clear()
+        reads_before = read.await_count
+        (tmp_path / path).write_text("first\n")
+        tasks = [asyncio.create_task(patch_file(path, first_patch))]
+        try:
+            await asyncio.wait_for(first_read_started.wait(), timeout=5)
+            (tmp_path / path).write_text("second\n")
+            tasks.append(
+                asyncio.create_task(
+                    patch_file(path, "@@ -1 +1 @@\n-first\n+second\n", second_event_started)
+                )
+            )
+            await asyncio.wait_for(second_event_started.wait(), timeout=5)
+            assert read.await_count == reads_before + 1
+        finally:
+            release_first_read.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        assert app.state.filesystem_registry.get_baseline(path) == original
+        record = app.state.filesystem_registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
+    assert read.await_count == resolve.call_count == 2
+    for call in read.await_args_list:
+        assert call.kwargs == {"max_bytes": 1_048_576, "regular_only": True}
+    subprocess.run(["git", "init", str(tmp_path / "repo")], check=True, capture_output=True)
+    await patch_file("repo/file.txt", "@@ -1 +1 @@\n-old\n+new\n")
+    assert read.await_count == resolve.call_count == 2
 
 
 @pytest.mark.asyncio

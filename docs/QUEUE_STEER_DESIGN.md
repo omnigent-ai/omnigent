@@ -83,7 +83,7 @@ message that arrives mid-response:
 | **claude-native** | `send-keys` into the **live pane**; the TUI folds the paste into the response | ✅ verified (best-effort timing) |
 | cursor-native / hermes-native | `send-keys` paste into the **live pane** (`supports_enqueue=True`) | ⚠️ app-defined — mechanism confirmed in code, **not yet verified live** |
 | pi-native | queued to the **resident extension** (`supports_enqueue=True`) | ⚠️ app-defined — mechanism confirmed in code, not yet verified live |
-| opencode-native | HTTP prompt (`supports_enqueue=True`); the native server has **no live-steer endpoint** → admitted as a new prompt, promoted by the server's own queue at turn end | ❌ next turn (code-confirmed) |
+| opencode-native | HTTP prompt with `delivery:"steer"` for a live turn, `delivery:"queue"` for enqueued input (`supports_enqueue=True`) | ⚠️ app-defined — mechanism confirmed in code, not yet verified live |
 | qwen / goose / kimi / kiro / antigravity -native | paste / file / RPC into the app (`supports_enqueue=True`) | ⚠️ app-defined — not yet verified live |
 
 > **TODO (live verification):** every native harness above reports
@@ -91,9 +91,7 @@ message that arrives mid-response:
 > in code (see the enqueue path per harness), but whether the vendor app folds
 > the steered message in **mid-response** vs. at the **next turn** is confirmed
 > against a *live* runner only for claude-native + codex-native. Run a live
-> steer per harness to upgrade the ⚠️ rows. opencode-native is settled: its app
-> server exposes no live-steer endpoint, so the steered message is always
-> promoted at the next turn boundary.
+> steer per harness to upgrade the ⚠️ rows.
 
 **No runner change is required for native steer** — every native `run_turn`
 returns right after delivering the input (decoupled from the response), so the
