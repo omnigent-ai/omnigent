@@ -4,7 +4,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { gitProviderCopy } from "@/lib/gitProviders";
-import { parseHttpUrl } from "@/lib/openLinkInApp";
+import { followLinkWithPopupFallback, parseHttpUrl } from "@/lib/openLinkInApp";
 import {
   getPullRequestStatus,
   pullRequestStatusPresentation,
@@ -44,12 +44,21 @@ function previewDescription(rows: readonly PreviewRow[]): string {
   return `Pull requests: ${entries.join(". ")}`;
 }
 
-function OpenPullRequestLink({ href, identity }: { href: string; identity: string }) {
+function OpenPullRequestLink({
+  href,
+  identity,
+  conversationId,
+}: {
+  href: string;
+  identity: string;
+  conversationId: string | undefined;
+}) {
   return (
     <a
       href={href}
       target="_blank"
-      rel="noreferrer"
+      rel="noopener noreferrer"
+      onClick={(event) => followLinkWithPopupFallback(event, href, conversationId)}
       data-testid="composer-pr-preview-open"
       aria-label={`Open ${identity} in a new tab`}
       title="Open in new tab"
@@ -71,6 +80,7 @@ function OpenPullRequestLink({ href, identity }: { href: string; identity: strin
  * @param prNumber - The primary PR's number, shown when ``prCount === 1``.
  * @param prNumberPrefix - Precedes ``prNumber``; ``#`` for GitHub, ``!`` for Azure DevOps.
  * @param onOpen - Opens the Pull Requests tab; ``null`` hides the link.
+ * @param conversationId - Lets PR links honor the in-app browser preference.
  */
 export function ComposerPrLink({
   state,
@@ -80,6 +90,7 @@ export function ComposerPrLink({
   prs = NO_PULL_REQUESTS,
   prStatus = null,
   onOpen,
+  conversationId,
   className,
 }: {
   state: ComposerPrState;
@@ -89,6 +100,7 @@ export function ComposerPrLink({
   prs?: readonly ComposerPullRequest[];
   prStatus?: PullRequestStatus | null;
   onOpen: (() => void) | null;
+  conversationId?: string;
   className?: string;
 }) {
   const isCoarsePointer = useIsCoarsePointer();
@@ -182,7 +194,11 @@ export function ComposerPrLink({
             {rows.map(({ pr, status: rowStatus, identity, title, href }) => {
               const rowPresentation = pullRequestStatusPresentation(rowStatus);
               const openLink = href ? (
-                <OpenPullRequestLink href={href} identity={identity} />
+                <OpenPullRequestLink
+                  href={href}
+                  identity={identity}
+                  conversationId={conversationId}
+                />
               ) : null;
               return (
                 <li

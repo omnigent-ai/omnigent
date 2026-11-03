@@ -5,8 +5,13 @@ import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 
 vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: vi.fn(() => false) }));
+vi.mock("@/lib/openLinkInApp", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/openLinkInApp")>()),
+  followLinkWithPopupFallback: vi.fn(),
+}));
 
 afterEach(() => {
   cleanup();
@@ -221,6 +226,7 @@ describe("ComposerPrLink", () => {
         prStatus="conflict"
         prs={prs}
         onOpen={onOpen}
+        conversationId="conv_1"
       />,
     );
     const trigger = screen.getByTestId("composer-pr-link");
@@ -231,7 +237,7 @@ describe("ComposerPrLink", () => {
     const titled = within(rows[0]).getByRole("link", { name: "Open example/app #42 in a new tab" });
     expect(titled).toHaveAttribute("href", "https://github.com/example/app/pull/42");
     expect(titled).toHaveAttribute("target", "_blank");
-    expect(titled).toHaveAttribute("rel", "noreferrer");
+    expect(titled).toHaveAttribute("rel", "noopener noreferrer");
     expect(titled).toHaveAttribute("title", "Open in new tab");
     expect(titled.parentElement).toHaveTextContent("Resolve conflicting changes");
 
@@ -250,7 +256,13 @@ describe("ComposerPrLink", () => {
         "example/app !7, Merged. example/app #40, Open, Untrusted link",
     );
 
+    // Clicks share chat's external-link handling for host panes and the in-app browser.
     fireEvent.click(titled);
+    expect(followLinkWithPopupFallback).toHaveBeenCalledWith(
+      expect.anything(),
+      "https://github.com/example/app/pull/42",
+      "conv_1",
+    );
     expect(onOpen).not.toHaveBeenCalled();
     expect(screen.getByTestId("composer-pr-preview")).toBeVisible();
   });
