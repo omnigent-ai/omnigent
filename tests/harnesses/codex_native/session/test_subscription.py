@@ -377,6 +377,145 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
 
 @pytest.mark.parametrize(
+    ("failure_source", "close_fails"),
+    [
+        ("subscriber", False),
+        ("side_chat", False),
+        ("mcp_timer", False),
+        ("event_stream", False),
+        ("cancellation", False),
+        ("event_stream", True),
+        ("cancellation", True),
+        ("subscriber", True),
+        ("none", True),
+    ],
+)
+async def test_supervise_forwarder_finishes_cleanup_after_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_source: str, close_fails: bool
+) -> None:
+    """Shutdown drains resources without replacing the original failure or cancellation."""
+    failure = (
+        asyncio.CancelledError("synthetic cancellation")
+        if failure_source == "cancellation"
+        else TypeError("synthetic forwarder failure")
+    )
+    background_failure = ValueError("synthetic secondary background failure")
+    close_failure = RuntimeError("synthetic close failure")
+    child_ready = asyncio.Event()
+    side_chat_started = asyncio.Event()
+    timer_started = asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    states: list[codex_native_forwarder._CodexForwarderState] = []
+    http_clients: list[httpx.AsyncClient] = []
+
+    async def subscribe(
+        _client: object,
+        ap_client: httpx.AsyncClient,
+        *,
+        forwarder_state: codex_native_forwarder._CodexForwarderState,
+        **_kwargs: object,
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        states.append(forwarder_state)
+        http_clients.append(ap_client)
+        stream = forwarder_state.child_stream(ap_client, "thread_child", "conv_child")
+        await stream.delta_coalescer.append("synthetic child output", message_id="child-message")
+        worker = stream.delta_coalescer._worker_task
+        assert worker is not None
+        tasks.append(worker)
+        child_ready.set()
+        if failure_source == "subscriber":
+            raise failure
+        if failure_source in {"event_stream", "cancellation"}:
+            raise background_failure
+        await asyncio.Event().wait()
+
+    async def drive_side_chat(*_args: object, **_kwargs: object) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await child_ready.wait()
+        side_chat_started.set()
+        if failure_source == "side_chat":
+            raise failure
+        await asyncio.Event().wait()
+
+    async def settle_mcp() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await side_chat_started.wait()
+        timer_started.set()
+        if failure_source == "mcp_timer":
+            raise failure
+        await asyncio.Event().wait()
+
+    async def seed_mcp(*_args: object, **_kwargs: object) -> asyncio.Task[None]:
+        return asyncio.create_task(settle_mcp())
+
+    class Client(_FakeCodexAppServerClient):
+        async def iter_events(self) -> Any:
+            await timer_started.wait()
+            if failure_source in {"event_stream", "cancellation"}:
+                raise failure
+            for event in self.events:
+                yield event
+
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(codex_native_forwarder, "_subscribe_until_ready", subscribe)
+    monkeypatch.setattr(codex_native_forwarder, "_drive_side_chat_requests", drive_side_chat)
+    monkeypatch.setattr(codex_native_forwarder, "_seed_mcp_startup_round", seed_mcp)
+    if close_fails:
+        usage_close = codex_native_forwarder._SessionUsageCoalescer.close
+
+        async def fail_usage_close(
+            coalescer: codex_native_forwarder._SessionUsageCoalescer,
+        ) -> None:
+            await usage_close(coalescer)
+            raise close_failure
+
+        monkeypatch.setattr(
+            codex_native_forwarder._SessionUsageCoalescer, "close", fail_usage_close
+        )
+    client = Client()
+    expected_failure = close_failure if failure_source == "none" else failure
+    try:
+        with pytest.raises(type(expected_failure)) as raised:
+            await codex_native_forwarder.supervise_forwarder(
+                base_url="http://127.0.0.1:1",
+                headers={},
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                client=client,  # type: ignore[arg-type]
+                ap_transport=httpx.MockTransport(handler),
+            )
+
+        assert raised.value is expected_failure
+        assert all(task.done() for task in tasks)
+        assert not states[0].child_streams
+        assert client.closed
+        assert http_clients[0].is_closed
+        assert any(
+            event["type"] == "external_output_text_delta"
+            and event["data"]["delta"] == "synthetic child output"
+            for event in posted
+        )
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
     ("message", "expected"),
     [
         # Rollout file missing — the first transient fresh-thread state.
