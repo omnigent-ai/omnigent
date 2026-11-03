@@ -151,6 +151,8 @@
   /* App-default interface/body text — every control, label, and menu item. */
   --text-ui: 1rem;
   --text-ui--line-height: 1.6;
+  --text-message: var(--text-ui);
+  --text-message--line-height: 1.6;
   /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
    * body step, mapped below so it tracks the Appearance setting. */
   --text-sm: 0.9rem;
@@ -1420,6 +1422,22 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+.plain-text-fallback.text-message {
+  font-size: var(--text-sm);
+}
+
+/* Touch devices retain conversation sizing when rotation changes the layout.
+ * The saved override is separate from the viewport-specific interface default. */
+@media (width < 48rem), (pointer: coarse) {
+  :root {
+    --text-message: var(--mobile-message-font-size, 16px);
+  }
+
+  .plain-text-fallback.text-message {
+    font-size: var(--text-message);
+  }
+}
+
 /* Geist Mono renders wider than Geist Sans at the same point size, making
  * streamdown's default text-sm inline code and code blocks look larger than
  * the surrounding prose. Scale both down to ~87.5 % of the parent font size
@@ -1502,6 +1520,10 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"],
 [data-streamdown="heading-6"] {
+  font-size: 1em;
+}
+
+.text-message [data-streamdown="heading-5"] {
   font-size: 1em;
 }
 

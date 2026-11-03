@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from omnigent.inner._proc import process_alive
+from omnigent.inner.egress.ca import ensure_ca
+from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.relay import start_relay
 from omnigent.inner.model_egress import FrozenModelRoute
@@ -190,6 +192,11 @@ async def test_signer_receives_non_secret_config_and_returns_readiness(
 ) -> None:
     child = tmp_path / "signer_child.py"
     _write_child(child)
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
+    child.write_text(
+        "import os\nassert os.environ.get('OMNIGENT_CLIENT_SURFACE') == 'desktop'\n"
+        + child.read_text()
+    )
     monkeypatch.setattr(
         "omnigent.inner.model_signer._signer_child_argv",
         lambda: [sys.executable, str(child)],
@@ -406,6 +413,76 @@ async def test_sigkill_signer_during_ucode_preflight_reaps_helper_tree(
             break
         await asyncio.sleep(0.02)
     assert not process_alive(child_pid)
+
+
+@pytest.mark.parametrize("binding_id", ["databricks-ucode-v1", "test-fake-provider-v1"])
+async def test_signer_gateway_attribution_reaches_tls_upstream(
+    tmp_path: Path, binding_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.model_signer_service import _gateway_attribution
+
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
+    route = FrozenModelRoute(
+        method="POST",
+        host="workspace.cloud.databricks.com",
+        path="/ai-gateway/codex/v1/responses",
+    )
+    ca_cert, ca_key = ensure_ca(tmp_path / "ca")
+    captured: list[bytes] = []
+
+    async def receive(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            captured.append(await reader.readuntil(b"\r\n\r\n"))
+            await reader.readexactly(len(b'{"model":"fake"}'))
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async with await asyncio.start_server(
+        receive,
+        "127.0.0.1",
+        0,
+        ssl=HostCertCache(ca_cert, ca_key).get_ssl_context(route.host),
+    ) as upstream:
+        relay = _SignerRelay(
+            route=route,
+            placeholder="oa_cred_test",
+            bearer_token="synthetic-key",
+            ca_cert_path=ca_cert,
+            ca_key_path=ca_key,
+            ca_bundle_path=ca_cert,
+            provider_port=upstream.sockets[0].getsockname()[1],
+            trusted_headers=_gateway_attribution(binding_id, route),
+        )
+        port = await relay.start_tcp()
+        try:
+            status, _, _ = await asyncio.to_thread(
+                _raw_proxy_post,
+                proxy_port=port,
+                ca_bundle_path=ca_cert,
+                host=route.host,
+                path=route.path,
+                headers={
+                    "Authorization": "Bearer oa_cred_test",
+                    "Content-Type": "application/json",
+                    "databricks-custom-coding-agent": "stale-agent",
+                    "databricks-custom-client-surfaces": "stale-app",
+                },
+                body=b'{"model":"fake"}',
+            )
+        finally:
+            await relay.stop()
+    assert status == 200
+    assert len(captured) == 1
+    attributed = binding_id == "databricks-ucode-v1"
+    assert (b"Databricks-Custom-Coding-Agent: codex\r\n" in captured[0]) is attributed
+    assert (
+        b"Databricks-Custom-Client-Surfaces: omnigent, omnigent-desktop, ug\r\n" in captured[0]
+    ) is attributed
+    assert b"stale-agent" not in captured[0]
+    assert b"stale-app" not in captured[0]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="signer relay uses a Unix socket")
