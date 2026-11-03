@@ -57,14 +57,14 @@ def _exercise_input(page: Page, element: Locator, *, mobile: bool) -> None:
 @pytest.mark.parametrize(
     ("width", "font_size", "native"),
     [
-        pytest.param(390, 11, False, marks=_TOUCH, id="mobile-small"),
-        pytest.param(390, 13, False, marks=_TOUCH, id="mobile-default"),
-        pytest.param(390, 18, False, marks=_TOUCH, id="mobile-large"),
+        pytest.param(393, 11, False, marks=_TOUCH, id="mobile-small"),
+        pytest.param(393, 13, False, marks=_TOUCH, id="mobile-default"),
+        pytest.param(393, 18, False, marks=_TOUCH, id="mobile-large"),
         pytest.param(1440, 11, False, id="desktop-small"),
         pytest.param(1440, 13, False, id="desktop-default"),
         pytest.param(1440, 18, False, id="desktop-large"),
-        pytest.param(390, 13, True, marks=_TOUCH, id="ios-default"),
-        pytest.param(390, 18, True, marks=_TOUCH, id="ios-large"),
+        pytest.param(393, 13, True, marks=_TOUCH, id="ios-default"),
+        pytest.param(393, 18, True, marks=_TOUCH, id="ios-large"),
     ],
 )
 def test_composer_input_font_setting_and_alignment(
@@ -110,9 +110,29 @@ def test_composer_input_font_setting_and_alignment(
     hint = page.get_by_text("Describe a task, or try a skill", exact=True)
     expect(hint).to_be_visible(timeout=30_000)
     observed = {"landing-hint": _metrics(hint)}
-    skill_metrics = _metrics(page.get_by_test_id("skill-pill-context"))
+    composer = page.get_by_test_id("new-chat-landing-composer")
+    skill_pills = composer.get_by_test_id("skill-pills")
+    skill = skill_pills.get_by_role("button", name="/context", exact=True)
+    if mobile:
+        expect(skill_pills).to_be_hidden()
+        expect(composer.locator('[data-testid^="skill-pill-"]:visible')).to_have_count(0)
+    else:
+        expect(skill).to_be_visible()
+    skill_metrics = None if mobile else _metrics(skill)
     page.screenshot(path=tmp_path / "landing-placeholder.png", animations="disabled")
     _exercise_input(page, landing, mobile=mobile)
+    expect(hint).to_have_count(0)
+    expect(skill_pills).to_have_count(0)
+    landing.fill("")
+    expect(hint).to_be_visible()
+    if mobile:
+        expect(skill_pills).to_be_hidden()
+        expect(composer.locator('[data-testid^="skill-pill-"]:visible')).to_have_count(0)
+    else:
+        expect(skill).to_be_visible()
+        skill.click()
+        expect(landing).to_have_value("/context ")
+    landing.fill("First line\nSecond line")
     observed.update(
         {"landing": _metrics(landing), "landing-area": _metrics(landing.locator(".."))}
     )
@@ -167,7 +187,8 @@ def test_composer_input_font_setting_and_alignment(
             measured,
         )
     assert quote_metrics["fontSize"] == pytest.approx(expected_size * 0.9, abs=0.01)
-    assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
+    if skill_metrics is not None:
+        assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
 
     textarea_metrics, overlay_metrics = observed["slash-input"], observed["slash-overlay"]
     for property_name in (

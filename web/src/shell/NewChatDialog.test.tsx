@@ -9641,7 +9641,7 @@ describe("NewChatLandingScreen skills menu", () => {
   });
 });
 
-// Always-visible skill pills under the landing composer for allowlisted
+// Desktop skill pills under the landing composer for allowlisted
 // orchestrators (polly/debby): pills surface bundled skills without
 // typing "/", and clicking one prefills the composer — it never sends.
 describe("NewChatLandingScreen skill pills", () => {
@@ -9668,12 +9668,11 @@ describe("NewChatLandingScreen skill pills", () => {
     return screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
   }
 
-  it("renders bundled skills as pills without typing anything", () => {
+  it("renders bundled skills as desktop-only pills without hiding the prompt", () => {
     mockAgents([debbyAgent()]);
     renderLanding();
-    // Both pills render on a pristine screen — proving the pills are
-    // always-visible (not gated on a "/" draft like the slash menu) and
-    // fed from GET /v1/agents bundled skills.
+    expect(screen.getByTestId("skill-pills")).toHaveClass("hidden", "md:flex");
+    expect(screen.getByText("Describe a task, or try a skill")).toBeVisible();
     expect(screen.getByTestId("skill-pill-debate").textContent).toBe("/debate");
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
   });
@@ -9731,7 +9730,7 @@ describe("NewChatLandingScreen skill pills", () => {
     expect(input().value).toBe("/debate ");
   });
 
-  it("hides the prompt text and pills once the user types", () => {
+  it("hides the prompt text and pills while typing and restores them when cleared", () => {
     mockAgents([debbyAgent()]);
     renderLanding();
     // Pristine empty draft: the prompt text and the pills share the first
@@ -9744,6 +9743,12 @@ describe("NewChatLandingScreen skill pills", () => {
     fireEvent.change(input(), { target: { value: "h" } });
     expect(screen.queryByText("Describe a task, or try a skill")).toBeNull();
     expect(screen.queryByTestId("skill-pills")).toBeNull();
+
+    fireEvent.change(input(), { target: { value: "" } });
+    expect(screen.getByText("Describe a task, or try a skill")).toBeVisible();
+    expect(screen.getByTestId("skill-pills")).toHaveClass("hidden", "md:flex");
+    expect(screen.getByTestId("skill-pill-debate")).toHaveTextContent("/debate");
+    expect(screen.getByTestId("skill-pill-compare")).toHaveTextContent("/compare");
   });
 
   it("shows the skill description bubble on focus, like the / menu detail card", () => {
