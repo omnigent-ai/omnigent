@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
 import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -46,9 +48,11 @@ from omnigent.runner import create_runner_app, native_file_observer
 from omnigent.runner.native import ResolvedSpec
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from omnigent.terminals.pane_reaper import PaneRef
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -366,11 +370,50 @@ async def _launch_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scheduled", [False, True])
 async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     relay_env: _RelayEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled: bool,
 ) -> None:
-    """A bridge_inject_dir launch writes tool_relay.json with the relay tools."""
-    resp = await _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
+    """The session relay and its notifier must not retain the launching occurrence."""
+    started = bridge.start_tool_relay
+    notified = threading.Event()
+
+    def start(**kwargs):
+        logging.getLogger("omnigent.runner.test").info("session relay started")
+        return started(**kwargs)
+
+    def notify(*args, **kwargs):
+        logging.getLogger("omnigent.runner.test").info("session relay notified")
+        notified.set()
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
+    monkeypatch.setattr(bridge, "post_tools_changed", notify)
+    if scheduled:
+        relay_env.client.headers[SCHEDULED_RUN_HEADER] = json.dumps(
+            {
+                "task_id": "task",
+                "run_id": "run",
+                "task_workspace_id": 7,
+                "scheduled_at": 1000,
+                "target": "connected_host",
+                "session_mode": "continue",
+            }
+        )
+    with capture_debug_rows("runner") as rows:
+        resp = await _launch_terminal(
+            relay_env.client, relay_env.session_id, bridge_inject_dir=True
+        )
+        assert await asyncio.to_thread(notified.wait, 5)
+    relay_env.client.headers.pop(SCHEDULED_RUN_HEADER, None)
+    probes = [
+        row
+        for row in rows
+        if row["message"] in {"session relay started", "session relay notified"}
+    ]
+    assert len(probes) == 2
+    assert all("run_id" not in row["attributes"] for row in probes)
     assert resp.status_code == 200, f"terminal launch failed: {resp.text}"
 
     relay_file = relay_env.bridge_dir / _TOOL_RELAY_FILE

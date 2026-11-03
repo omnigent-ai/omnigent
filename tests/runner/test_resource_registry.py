@@ -41,7 +41,7 @@ from omnigent.terminals import TerminalRegistry
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
 
-# Stands in for Claude's terminal: answers the OSC 7501 probe, then writes one report per key.
+# Stands in for Claude: completes OSC negotiation, reports working, then one report per key.
 _CLAUDE_OSC_PEER_SCRIPT = (
     "import os,sys,tty\n"
     "tty.setraw(0)\n"
@@ -291,7 +291,6 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
-        await instance.send(keys="w")
         await _wait_for_status_edge(statuses, ("running", None))
         await instance.send(keys="e")
         # No hook edge arrives, so the runner's grace period is what ends the turn.
@@ -331,7 +330,6 @@ async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
-        await instance.send(keys="w")
         await _wait_for_status_edge(statuses, ("running", None))
         await instance.send(keys="e")
         async with asyncio.timeout(5):
