@@ -7,14 +7,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
+import { BlockRenderer, pointsBackward, rendersOnlyWorkedFold } from "./BlockRenderer";
 
 afterEach(cleanup);
 
@@ -827,7 +827,11 @@ describe("BlockRenderer dispatch", () => {
           <BlockRenderer items={items} sessionStatus="idle" workedForS={2} />
         </FileViewerContext.Provider>,
       );
-      expect(screen.getByText(new RegExp(reportLine))).toBeVisible();
+      const fold = screen.getByRole("button", { name: "Worked for 2s" });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      const pinned = screen.getByText(new RegExp(reportLine));
+      expect(pinned).toBeVisible();
+      expect(fold.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
     it("keeps Codex commentary readable when the final answer points to it above", () => {
@@ -873,6 +877,7 @@ describe("BlockRenderer dispatch", () => {
       "The test output above shows the failure.",
       "All set. The summary is above.",
       "As noted above, billing is degraded.",
+      "Here you go\n\nAbove is the full log.",
     ])("shows the narration and output an answer points back to: %s", (answer) => {
       render(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
@@ -893,13 +898,14 @@ describe("BlockRenderer dispatch", () => {
       "Latency is above the threshold.",
       "Latency was above-average today.",
       "Above all, the build is green.",
+      // Points within the answer itself, not to earlier output.
       "The table above lists each step.",
       "Error logs above 1GB were rotated.",
       "Results above the baseline were flagged.",
       "The results are above expectations.",
       "Results above average were flagged.",
       "Logs above threshold were rotated.",
-    ])("keeps narration and output folded when the answer compares: %s", (answer) => {
+    ])("keeps narration and output folded when no earlier output is meant: %s", (answer) => {
       render(
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
           <BlockRenderer items={codexTurnEndingWith(answer)} sessionStatus="idle" workedForS={3} />
@@ -908,6 +914,14 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
       expect(screen.queryByText("Checking the services.")).toBeNull();
       expect(screen.queryByText(/api-gateway healthy/)).toBeNull();
+    });
+
+    it("checks a long blank run for a backward reference in linear time", () => {
+      const blankRun = "\n".repeat(50_000);
+      const start = performance.now();
+      expect(pointsBackward(`Report:${blankRun}x`)).toBe(false);
+      expect(pointsBackward(`Report:${blankRun}Above is the full log.`)).toBe(true);
+      expect(performance.now() - start).toBeLessThan(250);
     });
 
     it("opens only the latest tool output that has text, between the fold and the answer", () => {
@@ -935,7 +949,15 @@ describe("BlockRenderer dispatch", () => {
       ).toBeTruthy();
 
       fireEvent.click(fold);
-      expect(screen.getAllByText("second output")).toHaveLength(1);
+      fireEvent.click(screen.getByText("Ran 3 shell commands, called 1 other tool"));
+      const foldBody = screen.getByTestId("turn-worked-fold");
+      for (const card of within(foldBody).getAllByRole("button", { name: "Bash" })) {
+        fireEvent.click(card);
+      }
+      expect(within(foldBody).getByText("first output")).toBeVisible();
+      expect(within(foldBody).getByText("second output")).toBeVisible();
+      expect(foldBody.contains(pinned)).toBe(false);
+      expect(pinned).toBeVisible();
     });
 
     describe("with foldNarration", () => {

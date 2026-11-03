@@ -318,7 +318,8 @@ export function BlockRenderer({
     for (const [segmentIndex, segment] of partition.segments.entries()) {
       if (segment.kind === "text") {
         const referenced = referencedOutputTool(partition.segments[segmentIndex - 1], segment);
-        // A copy, so the fold still holds the full trace in order.
+        // A copy, so the fold still holds the full trace in order. Its open panel
+        // mounts tooltips, so it carries a provider for renders outside the app root.
         if (referenced) {
           rendered.push(
             <TooltipProvider key={`referenced-output:${keyFor(referenced, segment.startIndex)}`}>
@@ -613,13 +614,14 @@ const BACKWARD_REFERENCE = new RegExp(
     String.raw`\babove(?=\s*(?:[.,;:!?)]|$))`,
     String.raw`\b(?:shown|printed|displayed|listed|posted|noted|mentioned|described|see)\s+above\b`,
     String.raw`\b(?:output|report|results?|logs?|summary|update|message)\s+above\b(?!\s*(?:[\d$%-]|(?:a|an|the|all|average|baseline|threshold|normal|expectations?)\b))`,
-    String.raw`(?:^|[.!?]\s+|\n\s*)above(?:\s+(?:is|are)\b|\s*:)`,
+    // `[^\S\n]` keeps long blank runs linear; `\s` would rescan them from each newline.
+    String.raw`(?:^|[.!?]\s+|\n[^\S\n]*)above(?:\s+(?:is|are)\b|\s*:)`,
     String.raw`\bscroll(?:ing)?\s+up\b`,
   ].join("|"),
   "i",
 );
 
-function pointsBackward(text: string): boolean {
+export function pointsBackward(text: string): boolean {
   return BACKWARD_REFERENCE.test(text);
 }
 
