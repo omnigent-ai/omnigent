@@ -7,6 +7,7 @@ shape using minimal real-type stubs — no MagicMock.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 import httpx
@@ -202,6 +203,7 @@ class _ConversationStore:
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
+        side_chat_listing: str | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.
@@ -310,6 +312,8 @@ class _ConversationStore:
             and not key.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
         }
         fork_labels.update(extra_labels or {})
+        if side_chat_listing is not None:
+            fork_labels[SIDE_CHAT_PARENT_LABEL_KEY] = side_chat_listing
         fork = Conversation(
             id=fork_id,
             created_at=100,
@@ -720,7 +724,9 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
         assert response.status_code == 202, response.text
         return response.json()["child_session_id"]
 
-    side_chat = await fork(parent.id, {"side_chat": True})
+    # Created through a dashed spelling of the parent's id; listed through either.
+    dashed_parent = str(uuid.UUID(hex=parent.id))
+    side_chat = await fork(dashed_parent, {"side_chat": True})
     closed_side_chat = await fork(parent.id, {"side_chat": True})
     other_side_chat = await fork(other_parent.id, {"side_chat": True})
     plain_fork = await fork(parent.id, {})
@@ -730,11 +736,9 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
     await codex_child({"thread_id": "thread_worker", "agent_nickname": "Worker"})
     store.set_labels(closed_side_chat["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
 
-    assert await _side_chat_ids(client, parent.id) == {
-        side_chat["id"]: False,
-        closed_side_chat["id"]: True,
-        codex_side_chat: False,
-    }
+    expected = {side_chat["id"]: False, closed_side_chat["id"]: True, codex_side_chat: False}
+    assert await _side_chat_ids(client, parent.id) == expected
+    assert await _side_chat_ids(client, dashed_parent) == expected
     # The pane hides history through this response on any device.
     assert side_chat["labels"][SIDE_CHAT_HISTORY_LABEL_KEY] == "resp_parent"
     assert SIDE_CHAT_HISTORY_LABEL_KEY not in other_side_chat["labels"]
@@ -755,24 +759,31 @@ async def test_side_chats_are_listed_only_for_the_user_who_started_them(
     permissions = SqlAlchemyPermissionStore(db_uri)
     agent = await create_test_agent(client, name="side-chat-privacy")
     parent = store.create_conversation(agent_id=agent["id"])
-    listed_for_owner = {SIDE_CHAT_PARENT_LABEL_KEY: side_chat_parent_label_value(parent.id, owner)}
-    side = store.fork_conversation(parent.id, extra_labels=listed_for_owner)
-    codex_side = store.create_conversation(
-        agent_id=agent["id"],
-        kind="sub_agent",
-        parent_conversation_id=parent.id,
-        labels=listed_for_owner,
-    )
     for user in (owner, reader):
         permissions.ensure_user(user)
     permissions.grant(owner, parent.id, LEVEL_OWNER)
-    permissions.grant(owner, side.id, LEVEL_OWNER)
     permissions.grant(reader, parent.id, LEVEL_READ)
+    owner_headers = {"X-Forwarded-Email": owner}
+    forked = await auth_client.post(
+        f"/v1/sessions/{parent.id}/fork", json={"side_chat": True}, headers=owner_headers
+    )
+    assert forked.status_code == 201, forked.text
+    side_id = forked.json()["id"]
+    registered = await auth_client.post(
+        f"/v1/sessions/{parent.id}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+        headers=owner_headers,
+    )
+    assert registered.status_code == 202, registered.text
+    codex_side_id = registered.json()["child_session_id"]
 
-    as_owner = {"headers": {"X-Forwarded-Email": owner}}
+    as_owner = {"headers": owner_headers}
     assert await _side_chat_ids(auth_client, parent.id, **as_owner) == {
-        side.id: False,
-        codex_side.id: False,
+        side_id: False,
+        codex_side_id: False,
     }
     as_reader = await auth_client.get(
         f"/v1/sessions/{parent.id}/side_chats",
@@ -787,64 +798,6 @@ async def test_side_chats_are_listed_only_for_the_user_who_started_them(
         "last_id": None,
         "has_more": False,
     }
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("listing_write_fails", [False, True])
-async def test_side_chat_is_listed_together_with_its_copied_history(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    listing_write_fails: bool,
-) -> None:
-    """No device can list a side chat before it knows which copied history to hide."""
-    agent = await create_test_agent(client)
-    store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation(agent_id=agent["id"])
-    store.append(
-        parent.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_parent",
-                data=MessageData(
-                    role="assistant",
-                    agent="test",
-                    content=[{"type": "output_text", "text": "Parent answer"}],
-                ),
-            )
-        ],
-    )
-    listing_writes: list[dict[str, str]] = []
-    set_labels = SqlAlchemyConversationStore.set_labels
-
-    def record(
-        self: SqlAlchemyConversationStore,
-        conversation_id: str,
-        updates: dict[str, str],
-        updated_at: int | None = None,
-    ) -> None:
-        if SIDE_CHAT_PARENT_LABEL_KEY in updates:
-            listing_writes.append(dict(updates))
-            if listing_write_fails:
-                raise RuntimeError("label write failed")
-        set_labels(self, conversation_id, updates, updated_at)
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", record)
-
-    if listing_write_fails:
-        with pytest.raises(RuntimeError, match="label write failed"):
-            await client.post(f"/v1/sessions/{parent.id}/fork", json={"side_chat": True})
-        assert await _side_chat_ids(client, parent.id) == {}
-        return
-    response = await client.post(f"/v1/sessions/{parent.id}/fork", json={"side_chat": True})
-    assert response.status_code == 201, response.text
-    assert listing_writes == [
-        {
-            SIDE_CHAT_PARENT_LABEL_KEY: side_chat_parent_label_value(parent.id, None),
-            SIDE_CHAT_HISTORY_LABEL_KEY: "resp_parent",
-        }
-    ]
 
 
 @pytest.mark.asyncio

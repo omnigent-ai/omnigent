@@ -93,6 +93,11 @@ import {
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
+/** The block fields that place it relative to a side chat's copied history. */
+interface CopiedBlock {
+  ctx?: { responseId?: string; createdAtS?: number };
+}
+
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
@@ -246,16 +251,22 @@ export function SideChatPane({
     writeInheritedBoundary(childId, ids);
   }
   const inherited = boundaryRef.current.ids;
+  const forkedAtS = session?.createdAt;
   const visibleBlocks = useMemo(() => {
     if (filterHistory && serverBoundary !== undefined) {
-      // Everything through the last copied response is the parent's; older pages load above it.
-      const end =
-        serverBoundary === null
-          ? -1
-          : blocks.findLastIndex(
-              (b) => (b as { ctx?: { responseId?: string } }).ctx?.responseId === serverBoundary,
-            );
-      return end === -1 ? blocks : blocks.slice(end + 1);
+      if (serverBoundary === null) return blocks;
+      // Everything through the last copied response is the parent's.
+      const end = blocks.findLastIndex(
+        (b) => (b as CopiedBlock).ctx?.responseId === serverBoundary,
+      );
+      if (end !== -1) return blocks.slice(end + 1);
+      // The copied tail renders nothing (e.g. a hidden input), or sits on a page not
+      // loaded yet. Copies keep the parent's timestamps, so hide what predates the fork.
+      // ponytail: a copied item from the fork's own second still shows.
+      return blocks.filter((b) => {
+        const at = (b as CopiedBlock).ctx?.createdAtS;
+        return at === undefined || forkedAtS === undefined || at >= forkedAtS;
+      });
     }
     return inherited === null
       ? blocks
@@ -263,7 +274,7 @@ export function SideChatPane({
           const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
           return !(typeof id === "string" && inherited.has(id));
         });
-  }, [blocks, inherited, filterHistory, serverBoundary]);
+  }, [blocks, inherited, filterHistory, serverBoundary, forkedAtS]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {

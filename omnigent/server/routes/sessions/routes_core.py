@@ -4348,6 +4348,9 @@ def register_core_routes(
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
+                side_chat_listing=(
+                    side_chat_parent_label_value(source_id, user_id) if body.side_chat else None
+                ),
             )
         except LookupError as exc:
             await drop_unused_copy()
@@ -4366,21 +4369,6 @@ def register_core_routes(
         except Exception:
             await drop_unused_copy()
             raise
-
-        if body.side_chat:
-            # List the side chat with its copied-history boundary in one write, so no
-            # device sees it before it knows which history to hide. Reading the fork
-            # itself means a parent turn racing the copy can't skew the boundary.
-            copied = await asyncio.to_thread(
-                conversation_store.list_items, new_conv.id, limit=1, order="desc"
-            )
-            listing = {
-                SIDE_CHAT_PARENT_LABEL_KEY: side_chat_parent_label_value(source_id, user_id)
-            }
-            if copied.data and copied.data[0].response_id:
-                listing[SIDE_CHAT_HISTORY_LABEL_KEY] = copied.data[0].response_id
-            await asyncio.to_thread(conversation_store.set_labels, new_conv.id, listing)
-            new_conv.labels = {**new_conv.labels, **listing}
 
         try:
             await record_profile(request, new_conv.id, sandbox_profile, conversation_store)

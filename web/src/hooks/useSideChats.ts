@@ -114,10 +114,13 @@ export function useSideChats(conversationId: string) {
       const pending =
         unsaved.current?.conversationId === conversationId ? unsaved.current.changes : [];
       const changes = [...pending, mutate];
-      const next = changes.reduce(
-        (current, change) => change(current),
-        readSideChatTabsState(conversationId),
-      );
+      const stored = readSideChatTabsState(conversationId);
+      const next = changes.reduce((current, change) => change(current), stored);
+      if (pending.length === 0 && next === stored) {
+        // Nothing to save; still show what other windows saved.
+        setState(stored);
+        return;
+      }
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
@@ -153,17 +156,15 @@ export function useSideChats(conversationId: string) {
       const missing = open.filter((id) => !kept.includes(id));
       return room > 0 ? [...kept, ...missing.slice(-room)] : kept;
     };
-    const current = readSideChatTabsState(conversationId).tabs;
-    const next = syncedTabs(current);
-    if (next.length === current.length && next.every((id, index) => id === current[index])) {
-      return;
-    }
-    update((latest) => ({
-      ...latest,
-      tabs: syncedTabs(latest.tabs),
-      selected:
-        latest.selected !== null && closed.includes(latest.selected) ? null : latest.selected,
-    }));
+    // Through update, so tabs a failed storage write is still holding are synced too.
+    update((latest) => {
+      const tabs = syncedTabs(latest.tabs);
+      const selected =
+        latest.selected !== null && closed.includes(latest.selected) ? null : latest.selected;
+      const same =
+        tabs.length === latest.tabs.length && tabs.every((id, index) => id === latest.tabs[index]);
+      return same && selected === latest.selected ? latest : { ...latest, tabs, selected };
+    });
   }, [serverSideChats, conversationId, update]);
 
   /** Select a side-chat tab, or clear the selection (null). */

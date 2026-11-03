@@ -342,6 +342,26 @@ describe("side-chat tabs when storage writes fail", () => {
     act(() => result.current.open("conv_b"));
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_a", "conv_b"]);
   });
+
+  it("still drop a tab closed on another device", async () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
+    await waitFor(() =>
+      expect(queryClient.getQueryCache().getAll()[0]?.state.status).toBe("success"),
+    );
+    // Opened while writes fail, so only the unsaved changes hold this tab.
+    act(() => result.current.open("conv_side"));
+    expect(result.current.selected).toBe("conv_side");
+
+    serverSideChats([{ id: "conv_side", created_at: 1, closed: true }]);
+    await act(() => queryClient.invalidateQueries());
+
+    await waitFor(() => expect(result.current.tabs).toEqual([]));
+    expect(result.current.selected).toBeNull();
+    setItem.mockRestore();
+  });
 });
 
 describe("side chats opened on another device", () => {

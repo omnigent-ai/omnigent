@@ -1271,6 +1271,27 @@ describe("history a side chat copied from its parent", () => {
     expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
   });
 
+  it("is hidden by the fork's time when the copied tail renders nothing", () => {
+    // The last copied response is a hidden input, so no block carries the boundary.
+    mockSession.labels = { ...listed, "omnigent.side_chat.history_response_id": "resp_tail" };
+    mockSession.snapshot = { createdAt: 1_000 };
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([
+        { ...userItem("item_old", "resp_old", "Copied earlier"), created_at: 990 },
+        { ...userItem("item_tail", "resp_tail", "Hidden input"), created_at: 999, is_meta: true },
+        { ...userItem("item_side", "resp_side", "Asked in the side chat"), created_at: 1_000 },
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied earlier")).toBeNull();
+    expect(screen.queryByText("Hidden input")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+  });
+
   it("hides nothing when the server recorded no copied history", () => {
     mockSession.labels = listed;
     const entry = conversationRegistry.acquire(childId);

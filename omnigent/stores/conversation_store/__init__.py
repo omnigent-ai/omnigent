@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.util.uuid import normalize_uuid
 
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
@@ -135,10 +136,7 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
-# Lists a side chat in its parent's Workspace rail on its creator's devices. Set by
-# the server on generic and Codex side chats, with a value from
-# ``side_chat_parent_label_value``; ``list_conversation_ids_with_label`` finds them
-# through the labels lookup index.
+# Server-owned parent/user lookup marker for cross-device side-chat tabs.
 SIDE_CHAT_PARENT_LABEL_KEY = "omnigent.side_chat.parent_id"
 
 # Response id of the last item a generic side chat copied from its parent, so
@@ -195,7 +193,9 @@ def side_chat_parent_label_value(parent_id: str, user_id: str | None) -> str:
     :returns: ``"<parent_id>:<32 hex chars>"``.
     """
     user = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
-    return f"{parent_id}:{hashlib.sha256(user.encode('utf-8')).hexdigest()[:32]}"
+    # Dashed and legacy-prefixed spellings of one parent must list the same side chats.
+    parent = normalize_uuid(parent_id) or parent_id
+    return f"{parent}:{hashlib.sha256(user.encode('utf-8')).hexdigest()[:32]}"
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -2152,6 +2152,7 @@ class ConversationStore(ABC):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        side_chat_listing: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -2266,6 +2267,10 @@ class ConversationStore(ABC):
         :param created_by: Identity of the forking user, recorded on the
             cloned session-scoped agent so its code can only be mutated by
             the owner. ``None`` in single-user mode or when no clone is made.
+        :param side_chat_listing: A ``side_chat_parent_label_value`` that lists
+            the fork as a side chat. Stamped with the last copied response
+            (``SIDE_CHAT_HISTORY_LABEL_KEY``) in the fork's own transaction, so
+            the side chat is never listed before its copied history is known.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.

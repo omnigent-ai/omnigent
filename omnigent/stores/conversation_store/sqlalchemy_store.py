@@ -103,6 +103,8 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -5239,6 +5241,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        side_chat_listing: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -5367,6 +5370,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             cloned session-scoped agent (when a clone is created) so its
             code can only be mutated by the owner. ``None`` in single-user
             mode, or when the fork binds an existing agent (no clone).
+        :param side_chat_listing: A ``side_chat_parent_label_value`` that lists
+            the fork as a side chat. Stamped with the last copied response
+            (``SIDE_CHAT_HISTORY_LABEL_KEY``) in the fork's own transaction, so
+            the side chat is never listed before its copied history is known.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -5398,6 +5405,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
+            side_chat_listing=side_chat_listing,
         )
 
     def _fork_conversation_with_id(
@@ -5427,6 +5435,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        side_chat_listing: str | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -5827,6 +5836,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # only path that sets it, and only from an explicit request field.
             if extra_labels:
                 fork_labels.update(extra_labels)
+            if side_chat_listing is not None:
+                fork_labels[SIDE_CHAT_PARENT_LABEL_KEY] = side_chat_listing
+                if source_items and source_items[-1].response_id:
+                    fork_labels[SIDE_CHAT_HISTORY_LABEL_KEY] = source_items[-1].response_id
 
         def insert_ap(session: Session) -> SqlConversation:
             if (
