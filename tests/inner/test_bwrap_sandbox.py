@@ -1940,13 +1940,14 @@ def test_seccomp_blocks_clone_with_namespace_flags_inside_helper(
     """
     probe = """
 import base64, ctypes, errno, json, signal, sys
+from omnigent.inner._seccomp import _load_libseccomp
 from omnigent.inner.sandbox import SandboxPolicy, activate_sandbox
 policy = SandboxPolicy.from_jsonable(
     json.loads(base64.urlsafe_b64decode(sys.argv[1]).decode("utf-8"))
 )
 activate_sandbox(policy)
 libc = ctypes.CDLL(None, use_errno=True)
-NR_CLONE = 56  # x86_64
+NR_CLONE = _load_libseccomp().seccomp_syscall_resolve_name(b"clone")  # 56 x86_64, 220 aarch64
 CLONE_NEWNET = 0x40000000
 results = {}
 # Block test: clone with CLONE_NEWNET set must return EPERM.
