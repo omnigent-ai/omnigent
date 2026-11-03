@@ -14843,6 +14843,162 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 
   /**
+   * Pump a native conversation mid-turn on `resp_live` with one posted send,
+   * over fresh stream sinks, answering status snapshots with `snapshotStatus`
+   * and an empty `pending_inputs` list.
+   */
+  async function startMissedEventPump(id: string, snapshotStatus: string) {
+    const before = userMessage(`${id}_pre`, "before the gap");
+    seedSession(id, [before]);
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === `/v1/sessions/${id}/stream`) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: snapshotStatus,
+          active_response_id: "resp_live",
+          created_at: 0,
+          labels: {},
+          pending_inputs: [],
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest(id, {
+      abortController: controller,
+      isNativeTerminalSession: true,
+      sessionStatus: "running",
+      status: "streaming",
+      activeResponse: { responseId: "resp_live", state: "streaming", error: null },
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "temp_mid_turn",
+          content: [{ type: "input_text", text: "restore the old format" }],
+          posted: true,
+          pendingId: "pending_mid_turn",
+          sentMidTurn: true,
+        },
+      ],
+    });
+    const loop = startStreamPump(id, controller, bound.set, bound.get);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+    return {
+      before,
+      sinks,
+      bound,
+      stop: async () => {
+        controller.abort();
+        await drainAsync(2);
+        await loop;
+      },
+    };
+  }
+
+  it("backfills a reply and clears a consumed send a heartbeat-only stream missed", async () => {
+    const pump = await startMissedEventPump("conv_missed_reply", "running");
+    // The agent read the queued send and replied; no event reached this stream.
+    const consumed = userMessage("resp_live", "restore the old format");
+    const reply = assistantMessage("resp_live", "Restoring the previous layout");
+    seedSessionItems("conv_missed_reply", [pump.before, consumed, reply]);
+
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([
+      pump.before.id,
+      consumed.id,
+      reply.id,
+    ]);
+    expect(pump.bound.get().pendingUserMessages).toEqual([]);
+    expect(pump.bound.get().activeResponse).toMatchObject({
+      responseId: "resp_live",
+      state: "streaming",
+    });
+    expect(pump.sinks).toHaveLength(2);
+
+    await pump.stop();
+  });
+
+  it("recycles the stream once for a send the snapshot no longer lists", async () => {
+    const pump = await startMissedEventPump("conv_forgotten_send", "running");
+
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.sinks).toHaveLength(2);
+
+    // Nothing committed, so the bubble stays; a later tick must not recycle again.
+    await advanceWithHeartbeats(pump.sinks[1]!, 2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.sinks).toHaveLength(2);
+    expect(pump.bound.get().pendingUserMessages.map((p) => p.pendingId)).toEqual([
+      "pending_mid_turn",
+    ]);
+
+    await pump.stop();
+  });
+
+  it("backfills the reply of a turn whose end a heartbeat-only stream missed", async () => {
+    const pump = await startMissedEventPump("conv_missed_end", "idle");
+    pump.bound.set({ pendingUserMessages: [] });
+    const reply = assistantMessage("resp_live", "It's published now");
+    seedSessionItems("conv_missed_end", [pump.before, reply]);
+
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+    expect(pump.bound.get().sessionStatus).toBe("idle");
+    expect(pump.bound.get().activeResponse?.state).toBe("completed");
+    expect(pump.sinks).toHaveLength(2);
+
+    await pump.stop();
+  });
+
+  it("backfills the reply and releases a send latch whose unnamed turn ended unseen", async () => {
+    const pump = await startMissedEventPump("conv_missed_latched_end", "idle");
+    // The running edge named no response, so only the send latch shows the turn.
+    pump.bound.set({ pendingUserMessages: [], activeResponse: null });
+    const reply = assistantMessage("resp_live", "Done with the migration");
+    seedSessionItems("conv_missed_latched_end", [pump.before, reply]);
+
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+    expect(pump.bound.get().status).toBe("idle");
+    expect(pump.bound.get().sessionStatus).toBe("idle");
+    expect(pump.sinks).toHaveLength(2);
+
+    await pump.stop();
+  });
+
+  it("keeps a fresh send latch when the snapshot predates its turn", async () => {
+    const pump = await startMissedEventPump("conv_fresh_latch", "idle");
+    pump.bound.set({ pendingUserMessages: [], activeResponse: null, sessionStatus: "idle" });
+
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+
+    expect(pump.bound.get().status).toBe("streaming");
+    expect(pump.sinks).toHaveLength(1);
+
+    await pump.stop();
+  });
+
+  /**
    * Pump a conversation whose "Compacting…" spinner is owned by `owner`, and
    * whose status snapshot is `snapshot` (the idle seed when omitted).
    */
@@ -14853,11 +15009,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     snapshot?: Record<string, unknown>,
   ) {
     seedSession(id, []);
-    const sink = pushableStream();
+    const sinks: StreamSink[] = [];
     let snapshotFetches = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === `/v1/sessions/${id}/stream`) {
+        const sink = pushableStream();
+        sinks.push(sink);
         init?.signal?.addEventListener("abort", () =>
           sink.error(new DOMException("aborted", "AbortError")),
         );
@@ -14883,7 +15041,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const loop = startStreamPump(id, controller, bound.set, bound.get);
     await drainAsync();
     return {
-      sink,
+      get sink() {
+        return sinks.at(-1)!;
+      },
+      streamOpens: () => sinks.length,
       bound,
       snapshotFetches: () => snapshotFetches,
       spinnerIds: () =>
@@ -14907,10 +15068,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     });
 
     // Heartbeats keep the stream open while both the compaction terminal
-    // and the turn's idle edge are missing.
+    // and the turn's idle edge are missing, so the stream recycles to backfill.
     await advanceWithHeartbeats(pump.sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
 
+    expect(pump.streamOpens()).toBe(2);
     expect(pump.bound.get().activeResponse?.state).toBe("completed");
     expect(pump.spinnerIds()).toEqual([]);
 

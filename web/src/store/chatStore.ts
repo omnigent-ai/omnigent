@@ -5402,16 +5402,18 @@ function reconnectStatusPatch(
   // reconnect and strand the composer on the "(queued)" placeholder — re-queuing
   // sends, the exact behavior this fix removes. `sessionStatus` stays `waiting`
   // and `backgroundTaskCount` is recovered above, so the spinner survives.
-  if (
-    (session.status === "idle" || session.status === "failed") &&
-    s.activeResponse?.state === "streaming"
-  ) {
+  const snapshotEnded = session.status === "idle" || session.status === "failed";
+  if (snapshotEnded && s.activeResponse?.state === "streaming") {
     patch.activeResponse = {
       ...s.activeResponse,
       state: session.status === "failed" ? "failed" : "completed",
       error: null,
       completedAt: Date.now(),
     };
+    patch.status = "idle";
+  } else if (snapshotEnded && s.status === "streaming" && s.sessionStatus === "running") {
+    // A send latch whose turn was seen running has ended; a fresh send's latch
+    // (session not yet running) waits for its own turn.
     patch.status = "idle";
   } else if (session.status === "waiting") {
     // Turn ended, background work remains. Finalize a still-streaming response
@@ -5459,18 +5461,29 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
   set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
+/** How a status reconcile hands a stream that missed events to the reconnect backfill. */
+interface MissedEventRecovery {
+  /** Abort the connected stream attempt; false when none is connected. */
+  recycleStream: () => boolean;
+  /** Sends already recycled for, so a server that forgot one recycles only once. */
+  revealedPendingIds: Set<string>;
+}
+
 /**
  * Reconcile the visible conversation's lifecycle from its persisted snapshot.
  *
  * A stream pump can keep receiving heartbeats while missing a lifecycle event.
  * Periodically re-read durable status, discarding a snapshot if any semantic
- * stream event arrives during the fetch.
+ * stream event arrives during the fetch. A snapshot that shows the visible turn
+ * ended, or a posted send no longer queued, proves the stream also missed that
+ * turn's items, so the stream is recycled for the reconnect backfill instead.
  */
 async function reconcileActiveSessionStatus(
   id: string,
   controller: AbortController,
   set: Setter,
   get: Getter,
+  recovery: MissedEventRecovery,
 ): Promise<void> {
   if (
     queryClient === null ||
@@ -5518,6 +5531,26 @@ async function reconcileActiveSessionStatus(
     current.sessionCostUsd !== stateBeforeFetch.sessionCostUsd ||
     current.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
   ) {
+    return;
+  }
+  const queuedPendingIds = new Set((session.pendingInputs ?? []).map((p) => p.pendingId));
+  const consumedPendingIds = stateBeforeFetch.pendingUserMessages.flatMap((p) =>
+    p.posted &&
+    p.pendingId &&
+    !queuedPendingIds.has(p.pendingId) &&
+    !recovery.revealedPendingIds.has(p.pendingId)
+      ? [p.pendingId]
+      : [],
+  );
+  const turnSeenRunning =
+    current.activeResponse?.state === "streaming" ||
+    (current.status === "streaming" && current.sessionStatus === "running");
+  const turnEnded =
+    turnSeenRunning &&
+    (session.status === "idle" || session.status === "failed" || session.status === "waiting");
+  // The reconnect reconciles status too; its in-flight drop needs the turn still streaming.
+  if ((turnEnded || consumedPendingIds.length > 0) && recovery.recycleStream()) {
+    for (const pendingId of consumedPendingIds) recovery.revealedPendingIds.add(pendingId);
     return;
   }
   set((s) => {
@@ -6114,6 +6147,19 @@ export async function startStreamPump(
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
   let statusReconcileInFlight = false;
+  // Ordinary failed opens still use bindStream's initial snapshot; successful
+  // connections and host readdresses need reconnect reconciliation.
+  let hasConnected = false;
+  // The open currently live, so routing changes and missed events can recycle it.
+  let liveAttempt: AbortController | null = null;
+  const missedEventRecovery: MissedEventRecovery = {
+    recycleStream: () => {
+      if (liveAttempt === null || !hasConnected) return false;
+      liveAttempt.abort();
+      return true;
+    },
+    revealedPendingIds: new Set<string>(),
+  };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
   // reconciliations stay serialized: a catch-up tick that straddles a slow
   // snapshot fetch (or the periodic tick) is skipped rather than issuing a
@@ -6121,7 +6167,7 @@ export async function startStreamPump(
   const runGuardedStatusReconcile = (): void => {
     if (statusReconcileInFlight) return;
     statusReconcileInFlight = true;
-    void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+    void reconcileActiveSessionStatus(id, controller, set, get, missedEventRecovery).finally(() => {
       statusReconcileInFlight = false;
     });
   };
@@ -6156,17 +6202,13 @@ export async function startStreamPump(
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
-  // Ordinary failed opens still use bindStream's initial snapshot; successful
-  // connections and host readdresses need reconnect reconciliation.
-  let hasConnected = false;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
   let hostReaddressed = false;
-  // The host the latest open was addressed to, and that open while it is live.
+  // The host the latest open was addressed to.
   let openedHost = getSessionHost(id);
-  let liveAttempt: AbortController | null = null;
   const unsubscribeHost = isDatabricksWorkspace()
     ? subscribeSessionHostChanges(() => {
         const host = getSessionHost(id);
