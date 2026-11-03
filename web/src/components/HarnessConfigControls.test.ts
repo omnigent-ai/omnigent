@@ -1,5 +1,43 @@
 import { describe, expect, it } from "vitest";
-import { defaultModelLabel, nativeModelLabel } from "./HarnessConfigControls";
+import {
+  CLAUDE_NATIVE_EFFORTS,
+  PI_NATIVE_EFFORTS,
+  defaultModelLabel,
+  nativeEffortOptions,
+  nativeModelLabel,
+} from "./HarnessConfigControls";
+
+describe("nativeEffortOptions", () => {
+  const codexCatalog = [
+    {
+      id: "gpt-5.5",
+      isDefault: true,
+      supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "xhigh" }],
+    },
+    { id: "gpt-mini", supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+  ];
+
+  it("returns the fixed Claude Code and Pi ladders", () => {
+    expect(nativeEffortOptions("claude-native", [], null)).toBe(CLAUDE_NATIVE_EFFORTS);
+    expect(nativeEffortOptions("pi-native", [], "any")).toBe(PI_NATIVE_EFFORTS);
+  });
+
+  it("reads Codex levels from the pinned model, else the catalog default", () => {
+    expect(nativeEffortOptions("codex-native", codexCatalog, "gpt-mini")).toEqual([
+      { value: "low", label: "Low" },
+    ]);
+    expect(nativeEffortOptions("codex-native", codexCatalog, "")).toEqual([
+      { value: "medium", label: "Medium" },
+      { value: "xhigh", label: "xHigh" },
+    ]);
+    expect(nativeEffortOptions("codex-native", [], null)).toEqual([]);
+  });
+
+  it("returns null for harnesses without a create-time effort", () => {
+    expect(nativeEffortOptions("cursor-native", codexCatalog, null)).toBeNull();
+    expect(nativeEffortOptions(null, [], null)).toBeNull();
+  });
+});
 
 describe("nativeModelLabel", () => {
   it.each([

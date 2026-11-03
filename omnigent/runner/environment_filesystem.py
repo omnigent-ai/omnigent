@@ -73,6 +73,20 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def _python_script_command(script: str) -> str:
+    """Shell command that runs a stdlib-only *script* with ``python3``.
+
+    The helper runs it with the workspace as cwd. Isolated mode (``-I``) keeps
+    that directory off ``sys.path`` and ignores ``PYTHON*`` variables, so
+    workspace files never stand in for the modules the script imports. ``-P``
+    would need Python 3.11, which the environment's ``python3`` may predate.
+
+    :param script: Python source that imports only the standard library.
+    :returns: Shell-quoted command for ``os_env.shell``.
+    """
+    return f"python3 -I -c {_shell_quote(script)}"
+
+
 def _glob_to_regex(pattern: str) -> str:
     """Translate a VSCode/Cursor-style glob into an anchored regex over a path.
 
@@ -850,7 +864,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code") != 0:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
@@ -1074,7 +1088,7 @@ print(json.dumps({'r': results, 't': truncated}))
         _script = _header + "\n" + _body
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Root directory not accessible: {result['error']}")
@@ -1303,7 +1317,7 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             return None
@@ -1489,7 +1503,7 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {validated!r} not found")
@@ -1522,7 +1536,7 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         check = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in check or check.get("exit_code") != 0:
             return True

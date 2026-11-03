@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -19,6 +21,13 @@ from omnigent.host.frames import (
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
+    HostHarnessLoginCancelFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -44,6 +53,10 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostProbeAccountsFrame,
+    HostProbeAccountsResultFrame,
+    HostRefreshHarnessesFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -207,6 +220,12 @@ def test_import_local_frames_round_trip() -> None:
         HostSkillsResultFrame(request_id="req_skills", status="ok"),
         HostSkillsResultFrame(
             request_id="req_skills",
+            status="ok",
+            skills=[{"name": "review", "description": "Review changes"}],
+            warnings=["Codex plugin skills unavailable: `codex plugin list` exited 1"],
+        ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
             status="failed",
             error_code="invalid_path",
             error="path must be absolute",
@@ -215,6 +234,29 @@ def test_import_local_frames_round_trip() -> None:
 )
 def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skills_result_from_an_older_host_is_a_complete_catalog() -> None:
+    frame = decode_host_frame(
+        json.dumps({"kind": "host.skills_result", "request_id": "r", "status": "ok"})
+    )
+    assert isinstance(frame, HostSkillsResultFrame)
+    assert frame.warnings == []
+
+
+@pytest.mark.parametrize("warnings", ["codex", [1], [None]])
+def test_skills_result_rejects_malformed_warnings(warnings: object) -> None:
+    with pytest.raises(ValueError, match="warnings"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.skills_result",
+                    "request_id": "r",
+                    "status": "ok",
+                    "warnings": warnings,
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -263,6 +305,139 @@ def test_mcp_servers_frames_round_trip(
     frame: HostMcpServersFrame | HostMcpServersResultFrame,
 ) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_a_managed_server_still_reads_as_user_scope_for_an_older_server() -> None:
+    """``scope`` is a closed set on the server side, so managed-ness travels beside it.
+
+    An older server pins ``scope`` to ``"user"`` and would reject the whole inventory
+    for any other value, hiding every server on an upgraded host.
+    """
+    from typing import Literal
+
+    from pydantic import BaseModel
+
+    class OldMcpServerSummary(BaseModel):
+        """The model as it stands on a server that predates this field."""
+
+        name: str
+        harness: str
+        transport: Literal["stdio", "http"]
+        scope: Literal["user"]
+        plugin: str | None = None
+        source_id: str | None = None
+        url_host: str | None = None
+
+    wire = {
+        "name": "linear",
+        "harness": "claude",
+        "transport": "http",
+        "scope": "user",
+        "managed": "true",
+    }
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [wire],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [wire]
+    # The extra key is ignored rather than fatal, because Pydantic ignores unknown fields.
+    assert OldMcpServerSummary.model_validate(frame.mcp_servers[0]).scope == "user"
+
+
+def test_mcp_servers_result_carries_account_state_through_the_tunnel() -> None:
+    """Account state must survive encode/decode, or `/mcp` never sees it."""
+    frame = HostMcpServersResultFrame(
+        "r",
+        "ok",
+        mcp_servers=[
+            {
+                "name": "linear",
+                "harness": "claude",
+                "transport": "http",
+                "scope": "user",
+                "auth_status": "sign_in_required",
+                "sign_in_url": "https://auth.example.com/start?state=abc",
+            }
+        ],
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "reported,expected",
+    [
+        ({"auth_status": "connected"}, {"auth_status": "connected"}),
+        # A URL is only passed on while sign-in is due, and only when a browser opens it.
+        (
+            {"auth_status": "connected", "sign_in_url": "https://a.b/go"},
+            {"auth_status": "connected"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "javascript:alert(1)"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "//auth.example.com/go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        # Credentials in the URL would be published to the browser and sit in the DOM.
+        (
+            {
+                "auth_status": "sign_in_required",
+                "sign_in_url": "https://user:pw@auth.example.com/go",
+            },
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https:// auth.example.com/go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https://auth.example.com/go\n"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https:///go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        # urlsplit raises on an unclosed IPv6 literal; that must not reject the frame.
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "http://[::1"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": 7},
+            {"auth_status": "sign_in_required"},
+        ),
+        # A state this build does not know degrades to "nothing reported".
+        ({"auth_status": "expired", "sign_in_url": "https://a.b/go"}, {}),
+        ({"auth_status": None}, {}),
+        ({}, {}),
+    ],
+)
+def test_mcp_servers_result_validates_reported_account_state(
+    reported: dict[str, object], expected: dict[str, str]
+) -> None:
+    server = {"name": "linear", "harness": "claude", "transport": "http", "scope": "user"}
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [{**server, **reported}],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [{**server, **expected}]
 
 
 def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
@@ -383,7 +558,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
 ) -> None:
     """An oversized session is sliced into ordered chunk frames that reassemble."""
     monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
-    session = _session_with_payload("x" * 500)
+    session = dataclasses.replace(_session_with_payload("x" * 500), archived=True)
 
     frames = [
         decode_host_frame(text)
@@ -403,6 +578,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
     reassembled = [assembler.add(f) for f in frames]
     assert reassembled[:-1] == [None] * (len(frames) - 1)
     assert reassembled[-1] == session
+    assert reassembled[-1].archived is True
 
 
 def _session_json(session: HostImportedLocalSession) -> str:
@@ -763,6 +939,24 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.session_id == "conv_abc123"
 
 
+def test_launch_runner_superseded_runner_ids_round_trip() -> None:
+    """Named, empty, and absent supersession lists stay distinct on the wire."""
+    for ids in (("runner_old",), ()):
+        frame = HostLaunchRunnerFrame(
+            request_id="req_s",
+            binding_token="tok",
+            workspace="/w",
+            session_id="conv_s",
+            superseded_runner_ids=ids,
+        )
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+    legacy = HostLaunchRunnerFrame(request_id="req_l", binding_token="tok", workspace="/w")
+    assert "superseded_runner_ids" not in encode_host_frame(legacy)
+    decoded = decode_host_frame(encode_host_frame(legacy))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.superseded_runner_ids is None
+
+
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
     config = {
         "providers": {
@@ -880,6 +1074,88 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_hello_and_readiness_frames_round_trip_harness_accounts() -> None:
+    accounts = {
+        "codex": {
+            "kind": "chatgpt",
+            "email": "person@example.test",
+            "plan": "pro",
+            "expired": False,
+        }
+    }
+    hello = decode_host_frame(
+        encode_host_frame(
+            HostHelloFrame(
+                version="0.1.0",
+                frame_protocol_version=1,
+                name="laptop",
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.harness_accounts == accounts
+
+    readiness = decode_host_frame(
+        encode_host_frame(
+            HostHarnessReadinessFrame(
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(readiness, HostHarnessReadinessFrame)
+    assert readiness.harness_accounts == accounts
+
+
+def test_legacy_hello_without_harness_accounts_decodes_to_none() -> None:
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "old-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.harness_accounts is None
+
+
+def test_harness_login_frames_round_trip() -> None:
+    frames = [
+        HostHarnessLoginFrame(request_id="start-1", harness="codex", login_id="login-1"),
+        HostHarnessLoginResultFrame(
+            request_id="start-1",
+            status="ok",
+            login_id="login-1",
+            verification_url="https://example.test/device",
+            user_code="ABCD-EFGH",
+            expires_at=1234,
+        ),
+        HostHarnessLoginCancelFrame(request_id="cancel-1", login_id="login-1"),
+        HostHarnessLoginCancelResultFrame(request_id="cancel-1", status="ok"),
+        HostHarnessLoginCompletedFrame(
+            login_id="login-1",
+            success=True,
+            expired=False,
+            configured_harnesses={"codex": True},
+            harness_accounts={"codex": {"kind": "chatgpt", "expired": False}},
+        ),
+        HostHarnessLogoutFrame(request_id="logout-1", harness="codex"),
+        HostHarnessLogoutResultFrame(
+            request_id="logout-1",
+            status="ok",
+            configured_harnesses={"codex": "needs-auth"},
+            harness_accounts={"codex": {"kind": "unknown", "expired": True}},
+        ),
+    ]
+
+    assert [decode_host_frame(encode_host_frame(frame)) for frame in frames] == frames
 
 
 def test_connection_error_frame_round_trip() -> None:
@@ -1136,6 +1412,37 @@ def test_launch_runner_result_frame_legacy_payload_decodes_error_code_none() -> 
     decoded = decode_host_frame(legacy)
     assert isinstance(decoded, HostLaunchRunnerResultFrame)
     assert decoded.error_code is None
+
+
+def test_launch_runner_result_frame_workspace_recreated_round_trip() -> None:
+    """
+    Verify ``workspace_recreated`` survives encode → decode and reads as
+    False from an OLDER host that never sends the key.
+
+    The server persists its "workspace was recreated" notice off this flag;
+    if it is dropped, the user is never told their directory is now empty.
+    """
+    original = HostLaunchRunnerResultFrame(
+        request_id="req_001",
+        status="launched",
+        runner_id="runner_token_abc",
+        workspace_recreated=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostLaunchRunnerResultFrame)
+    assert decoded.workspace_recreated is True
+
+    legacy = json.dumps(
+        {
+            "kind": "host.launch_runner_result",
+            "request_id": "req_001",
+            "status": "launched",
+            "runner_id": "runner_token_abc",
+        }
+    )
+    decoded_legacy = decode_host_frame(legacy)
+    assert isinstance(decoded_legacy, HostLaunchRunnerResultFrame)
+    assert decoded_legacy.workspace_recreated is False
 
 
 def test_stop_runner_frame_round_trip() -> None:
@@ -1605,13 +1912,15 @@ def test_create_worktree_frame_round_trip() -> None:
     """Verify HostCreateWorktreeFrame survives encode → decode.
 
     A garbled repo_path or branch_name would create the worktree in
-    the wrong place or with the wrong branch.
+    the wrong place or with the wrong branch; a lost timeout_s would cut
+    a large checkout short.
     """
     original = HostCreateWorktreeFrame(
         request_id="req_wt_1",
         repo_path="/Users/alice/myrepo",
         branch_name="feature/login",
         base_branch="main",
+        timeout_s=3600.0,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
@@ -1661,6 +1970,34 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
     decoded = decode_host_frame(json.dumps(msg))
     assert isinstance(decoded, HostCreateWorktreeFrame)
     assert decoded.existing_branch is False
+
+
+def test_create_worktree_frame_timeout_absent_defaults_none() -> None:
+    """A frame from an older server, without ``timeout_s``, decodes as ``None``."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_6", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("timeout_s")
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.timeout_s is None
+
+
+@pytest.mark.parametrize(
+    "raw_timeout",
+    ["0", "-1", "true", '"60"', "Infinity", "NaN", "1" + "0" * 400],
+    ids=["zero", "negative", "bool", "string", "infinity", "nan", "overflow"],
+)
+def test_create_worktree_frame_timeout_rejects_unusable_values(raw_timeout: str) -> None:
+    """A budget the host cannot wait on is a malformed frame, not silently kept."""
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_7", repo_path="/repo", branch_name="wip")
+    )
+    with pytest.raises(ValueError, match="timeout_s"):
+        decode_host_frame(encoded.replace('"timeout_s": null', f'"timeout_s": {raw_timeout}'))
 
 
 def test_create_worktree_result_frame_round_trip() -> None:
@@ -1934,6 +2271,7 @@ def test_install_harness_result_success_round_trip() -> None:
         request_id="req_install_2",
         status="ok",
         configured_harnesses={"claude-native": True, "codex-native": "needs-auth"},
+        version="2.1.295",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostInstallHarnessResultFrame)
@@ -1942,6 +2280,7 @@ def test_install_harness_result_success_round_trip() -> None:
         "claude-native": True,
         "codex-native": "needs-auth",
     }
+    assert decoded.version == "2.1.295"
     assert decoded.error is None
 
 
@@ -1963,8 +2302,53 @@ def test_install_harness_result_failure_round_trip() -> None:
     assert isinstance(decoded, HostInstallHarnessResultFrame)
     assert decoded.status == "failed"
     assert decoded.configured_harnesses is None
+    assert decoded.version is None
     assert decoded.gateway_inference is None
     assert decoded.error == "npm not found"
+
+
+def test_refresh_harnesses_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(HostRefreshHarnessesFrame(request_id="refresh-1"))
+    )
+    assert isinstance(request, HostRefreshHarnessesFrame)
+    assert request.request_id == "refresh-1"
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostRefreshHarnessesResultFrame(
+                request_id="refresh-1",
+                status="ok",
+                configured_harnesses={"codex-native": True},
+                gateway_inference={"codex-native": False},
+            )
+        )
+    )
+    assert isinstance(result, HostRefreshHarnessesResultFrame)
+    assert result.configured_harnesses == {"codex-native": True}
+    assert result.gateway_inference == {"codex-native": False}
+
+
+def test_probe_harness_accounts_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True))
+    )
+    assert request == HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True)
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostProbeAccountsResultFrame(
+                request_id="accounts-1",
+                status="ok",
+                harness_accounts={"codex": {"kind": "chatgpt"}},
+            )
+        )
+    )
+    assert result == HostProbeAccountsResultFrame(
+        request_id="accounts-1",
+        status="ok",
+        harness_accounts={"codex": {"kind": "chatgpt"}},
+    )
 
 
 def test_result_frames_round_trip_gateway_inference() -> None:
@@ -2275,6 +2659,9 @@ def test_fs_result_null_payload_round_trip() -> None:
         (None, "runner exited with code 1", None),
         (None, None, None),
         ("some_future_code", "any text", None),
+        # A launch-handler fault is a generic failure: the server cannot
+        # describe its cause, so the host's text must not be surfaced.
+        (LAUNCH_HANDLER_FAILED_ERROR_CODE, "host failed to handle the launch request: x", None),
     ],
 )
 def test_classify_launch_refusal(
@@ -2429,6 +2816,43 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+def test_import_local_session_archived_flag_defaults_and_must_be_a_bool() -> None:
+    """``archived`` defaults to False from older hosts and must be a bool.
+
+    The oversized-session chunk test covers its round trip.
+    """
+    legacy_session = {
+        "external_session_id": "s1",
+        "workspace": None,
+        "items": [],
+        "source": "codex",
+    }
+    legacy = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.import_local_session",
+                "request_id": "req_imp",
+                "total": 1,
+                "session": legacy_session,
+            }
+        )
+    )
+    assert isinstance(legacy, HostImportLocalSessionFrame)
+    assert legacy.session.archived is False
+
+    with pytest.raises(ValueError, match="archived"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.import_local_session",
+                    "request_id": "req_imp",
+                    "total": 1,
+                    "session": {**legacy_session, "archived": "yes"},
+                }
+            )
+        )
 
 
 def test_legacy_runner_exit_has_unknown_connection_history() -> None:

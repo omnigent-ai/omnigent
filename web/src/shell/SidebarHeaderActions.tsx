@@ -14,8 +14,9 @@ const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
- * inside the sidebar (every browser and non-mac platform) and, on the macOS
- * desktop shell, in the persistent title-bar strip. There it must survive the
+ * inside the sidebar (every browser and non-mac platform, and the macOS shell
+ * below md, where the phone drawer owns it) and, on the macOS desktop shell at
+ * md+, in the persistent title-bar strip. There it must survive the
  * sidebar collapsing — the sidebar goes `md:w-0 md:overflow-hidden` and turns
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the

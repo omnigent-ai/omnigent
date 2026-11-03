@@ -64,7 +64,7 @@ async def _tmux_session_alive(socket_path: str, tmux_target: str) -> bool:
             proc.communicate(),
             timeout=_TMUX_HAS_SESSION_TIMEOUT_S,
         )
-    except (asyncio.TimeoutError, OSError):
+    except (TimeoutError, OSError):
         _logger.debug("tmux pane-dead probe timed out", exc_info=True)
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
@@ -96,7 +96,7 @@ async def _check_pane_dead_definitive(socket_path: str, tmux_target: str) -> boo
             proc.communicate(),
             timeout=_TMUX_HAS_SESSION_TIMEOUT_S,
         )
-    except (asyncio.TimeoutError, OSError):
+    except (TimeoutError, OSError):
         _logger.debug("tmux pane-dead probe timed out", exc_info=True)
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
