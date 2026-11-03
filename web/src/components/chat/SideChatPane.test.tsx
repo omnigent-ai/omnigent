@@ -1237,6 +1237,57 @@ describe("unsent composer state survives the pane moving", () => {
   );
 });
 
+describe("history a side chat copied from its parent", () => {
+  function userItem(id: string, responseId: string, text: string) {
+    return {
+      id,
+      response_id: responseId,
+      type: "message" as const,
+      role: "user" as const,
+      status: "completed" as const,
+      content: [{ type: "input_text" as const, text }],
+    };
+  }
+  const listed = { "omnigent.side_chat": "1", "omnigent.side_chat.parent_id": "conv_main" };
+
+  it("is hidden through the copied response the server recorded, on any device", () => {
+    mockSession.labels = { ...listed, "omnigent.side_chat.history_response_id": "resp_copied" };
+    // This browser's own snapshot would hide nothing; the server's record wins.
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, "[]");
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      loadingConversation: false,
+      blocks: itemsToBlocks([
+        userItem("item_old", "resp_old", "Copied earlier"),
+        userItem("item_copied", "resp_copied", "Copied from the parent"),
+        userItem("item_side", "resp_side", "Asked in the side chat"),
+      ]),
+    });
+
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Copied earlier")).toBeNull();
+    expect(screen.queryByText("Copied from the parent")).toBeNull();
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+  });
+
+  it("hides nothing when the server recorded no copied history", () => {
+    mockSession.labels = listed;
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} />);
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([userItem("item_side", "resp_side", "Asked in the side chat")]),
+      }),
+    );
+
+    expect(screen.getByText("Asked in the side chat")).toBeInTheDocument();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
+});
+
 describe("side chat sealed by the server", () => {
   it("is read-only once the server marks the child closed", () => {
     mockSession.labels = { "omnigent.closed": "true" };

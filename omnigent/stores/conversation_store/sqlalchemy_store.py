@@ -1570,6 +1570,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).all()
             ]
 
+    def list_conversation_ids_with_label(
+        self,
+        key: str,
+        value: str,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        stmt = select(SqlConversationLabel.conversation_id).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.key == key,
+            SqlConversationLabel.value == value,
+        )
+        if after is not None:
+            stmt = stmt.where(SqlConversationLabel.conversation_id > after)
+        with self._conv_session("list_conversation_ids_with_label") as ap_sess:
+            return list(
+                ap_sess.scalars(stmt.order_by(SqlConversationLabel.conversation_id).limit(limit))
+            )
+
     def set_labels(
         self,
         conversation_id: str,

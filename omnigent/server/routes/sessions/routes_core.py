@@ -234,7 +234,9 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
@@ -4135,6 +4137,7 @@ def register_core_routes(
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
             extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
+            extra_labels[SIDE_CHAT_PARENT_LABEL_KEY] = source_id
 
         # A managed fork's chosen sandbox host id is born with the row, as on a
         # create: the caller routes the fork by it until its host binds, so no
@@ -4363,6 +4366,16 @@ def register_core_routes(
         except Exception:
             await drop_unused_copy()
             raise
+
+        if body.side_chat:
+            # Read from the fork itself, so a parent turn racing the copy can't skew it.
+            copied = await asyncio.to_thread(
+                conversation_store.list_items, new_conv.id, limit=1, order="desc"
+            )
+            if copied.data and copied.data[0].response_id:
+                history_end = {SIDE_CHAT_HISTORY_LABEL_KEY: copied.data[0].response_id}
+                await asyncio.to_thread(conversation_store.set_labels, new_conv.id, history_end)
+                new_conv.labels = {**new_conv.labels, **history_end}
 
         try:
             await record_profile(request, new_conv.id, sandbox_profile, conversation_store)

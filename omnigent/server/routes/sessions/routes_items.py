@@ -37,15 +37,20 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SideChatList,
+    SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import SIDE_CHAT_PARENT_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.session_lifecycle import is_session_closed
 
 
 def register_items_routes(
@@ -203,4 +208,82 @@ def register_items_routes(
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+        )
+
+    # ── GET /sessions/{session_id}/side_chats ────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/side_chats",
+        response_model=None,
+        responses={200: {"model": SideChatList}},
+    )
+    async def list_side_chats(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> PaginatedList:
+        """
+        List the side chats shown as tabs in a session's Workspace rail.
+
+        Pages in side-chat id order over the labels lookup index, so a page
+        reads at most ``limit`` side chats. Only side chats the caller can read
+        are returned, so a page may be short while ``has_more`` is true;
+        continue from ``last_id``. Closed side chats are included, so other
+        devices can close their tabs.
+
+        :param request: Inbound HTTP request; carries the caller identity.
+        :param session_id: Parent session id, e.g. ``"conv_abc123"``.
+        :param limit: Maximum side chats to examine (1-1000, default 100).
+        :param after: Cursor: the previous page's ``last_id``.
+        :returns: A :class:`PaginatedList` of :class:`SideChatSummary`.
+        :raises OmnigentError: 403 if the caller lacks READ on
+            ``session_id``; 404 if no session exists there.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None and (
+            await asyncio.to_thread(conversation_store.get_conversation, session_id) is None
+        ):
+            raise _session_not_found()
+        ids = await asyncio.to_thread(
+            conversation_store.list_conversation_ids_with_label,
+            SIDE_CHAT_PARENT_LABEL_KEY,
+            session_id,
+            after=after,
+            limit=limit + 1,
+        )
+        has_more = len(ids) > limit
+        ids = ids[:limit]
+        by_id = await asyncio.to_thread(conversation_store.get_conversations, ids)
+        rows = [by_id[side_id] for side_id in ids if side_id in by_id]
+        # A generic side chat is a private top-level fork with its own grants; a
+        # Codex side chat is a child whose access follows this session's.
+        private = [row.id for row in rows if row.parent_conversation_id != session_id]
+        if permission_store is not None and auth_provider is not None and private:
+            grants = await asyncio.to_thread(permission_store.list_for_sessions, private)
+            is_admin = user_id is not None and await asyncio.to_thread(
+                permission_store.is_admin, user_id
+            )
+            hidden = {
+                side_id
+                for side_id in private
+                if (_permission_level_from_grants(user_id, grants.get(side_id, []), is_admin) or 0)
+                < LEVEL_READ
+            }
+            rows = [row for row in rows if row.id not in hidden]
+        return PaginatedList(
+            data=[
+                SideChatSummary(
+                    id=row.id,
+                    created_at=row.created_at,
+                    closed=is_session_closed(row.labels, row.title),
+                )
+                for row in rows
+            ],
+            first_id=ids[0] if ids else None,
+            last_id=ids[-1] if ids else None,
+            has_more=has_more,
         )

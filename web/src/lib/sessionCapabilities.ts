@@ -137,7 +137,13 @@ export function readOnlyReasonForSessionLabels(
     const nickname =
       activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
       activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
-    if (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat") {
+    // Closing a generic side chat's tab closes it too.
+    const sideChat =
+      activeSession?.labels?.["omnigent.side_chat"] ?? activeConv?.labels?.["omnigent.side_chat"];
+    if (
+      sideChat === "1" ||
+      (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat")
+    ) {
       return "This side chat has ended and can't receive new messages";
     }
     return "This sub-agent session is closed";

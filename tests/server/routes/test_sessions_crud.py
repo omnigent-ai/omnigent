@@ -788,27 +788,38 @@ async def test_patch_rejects_client_supplied_sandbox_labels(
         assert key not in conv.labels
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "omnigent.codex_native.subagent_thread_id",
+        # A forged parent marker would list this session in another's side chats.
+        "omnigent.side_chat.parent_id",
+        "omnigent.side_chat.history_response_id",
+    ],
+)
 async def test_patch_rejects_client_supplied_side_chat_thread_id_label(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
+    key: str,
 ) -> None:
     """``omnigent.codex_native.subagent_thread_id`` records the Codex thread a
     ``/side`` child forwards follow-up turns onto. The server writes it and later
     re-reads the child's own copy to drive ``turn/start``, so a client seed would
-    redirect another session's follow-up into an attacker-chosen thread. It must
-    be rejected and nothing persisted."""
+    redirect another session's follow-up into an attacker-chosen thread. The
+    side-chat listing labels are server-written too. They must be rejected and
+    nothing persisted."""
     conv_store = SqlAlchemyConversationStore(db_uri)
 
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
-        json={"labels": {"omnigent.codex_native.subagent_thread_id": "thread_evil"}},
+        json={"labels": {key: "forged"}},
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 400
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
-    assert "omnigent.codex_native.subagent_thread_id" not in conv.labels
+    assert key not in conv.labels
 
 
 async def test_patch_rejects_client_supplied_archived_at_label(

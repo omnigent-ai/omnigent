@@ -61,7 +61,7 @@ const MAX_SESSIONS = 100;
 // Cap the open-file tabs persisted per session so one session that churns
 // through many files can't bloat the store. Tabs are appended in open order, so
 // the most-recent (tail) entries are kept.
-const MAX_OPEN_FILES = 20;
+export const MAX_OPEN_FILES = 20;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;

@@ -135,6 +135,15 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
+# The session whose Workspace rail lists this side chat, on every device. Set by
+# the server on generic and Codex side chats; ``list_conversation_ids_with_label``
+# finds them through the labels lookup index.
+SIDE_CHAT_PARENT_LABEL_KEY = "omnigent.side_chat.parent_id"
+
+# Response id of the last item a generic side chat copied from its parent, so
+# every device hides the same inherited history.
+SIDE_CHAT_HISTORY_LABEL_KEY = "omnigent.side_chat.history_response_id"
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -241,6 +250,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
 }
@@ -770,6 +781,23 @@ class ConversationStore(ABC):
 
         Pass the last row's (creation time, ID) as *after* to continue via
         the workspace/parent/creation-time/ID index.
+        """
+        ...
+
+    @abstractmethod
+    def list_conversation_ids_with_label(
+        self,
+        key: str,
+        value: str,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        """Return ids of conversations whose label *key* equals *value*, in id order.
+
+        Pass the last id as *after* to continue via the labels lookup index on
+        (workspace, key, value, conversation id), so each page reads at most
+        *limit* rows.
         """
         ...
 

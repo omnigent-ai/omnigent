@@ -21,11 +21,12 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
     MessageData,
+    NewConversationItem,
     PagedList,
     StoredFile,
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
-from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -38,10 +39,14 @@ from omnigent.server.routes.sessions import create_sessions_router, routes_core
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     FORK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_PARENT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.server.helpers import create_test_agent
 
 # ── Minimal store stubs ──────────────────────────────────────────
@@ -630,6 +635,7 @@ def test_side_chat_records_its_source_without_a_persisted_workspace(
     labels = response.json()["labels"]
     assert labels[SIDE_CHAT_LABEL_KEY] == "1"
     assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+    assert labels[SIDE_CHAT_PARENT_LABEL_KEY] == source.id
     assert FORK_SOURCE_LABEL_KEY not in labels
     assert response.json()["kind"] == "default"
     assert response.json()["host_id"] is None
@@ -638,7 +644,12 @@ def test_side_chat_records_its_source_without_a_persisted_workspace(
 
 def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     source = _make_conversation(
-        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"}
+        labels={
+            SIDE_CHAT_LABEL_KEY: "1",
+            SIDE_CHAT_SOURCE_LABEL_KEY: "original",
+            SIDE_CHAT_PARENT_LABEL_KEY: "original",
+            SIDE_CHAT_HISTORY_LABEL_KEY: "resp_original",
+        }
     )
     store = _ConversationStore({source.id: source})
     client = TestClient(_build_app(store))
@@ -646,7 +657,121 @@ def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
     response = client.post(f"/v1/sessions/{source.id}/fork", json={})
 
     assert response.status_code == 201, response.text
-    assert SIDE_CHAT_SOURCE_LABEL_KEY not in response.json()["labels"]
+    labels = response.json()["labels"]
+    assert SIDE_CHAT_SOURCE_LABEL_KEY not in labels
+    assert SIDE_CHAT_PARENT_LABEL_KEY not in labels
+    assert SIDE_CHAT_HISTORY_LABEL_KEY not in labels
+
+
+async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: Any) -> dict:
+    """Every side chat listed for *parent_id*, one per page, mapped to its closed flag."""
+    listed: dict[str, bool] = {}
+    after = None
+    while True:
+        params = {"limit": 1, **({"after": after} if after else {})}
+        response = await client.get(
+            f"/v1/sessions/{parent_id}/side_chats", params=params, **kwargs
+        )
+        assert response.status_code == 200, response.text
+        page = response.json()
+        listed.update({row["id"]: row["closed"] for row in page["data"]})
+        if not page["has_more"]:
+            return listed
+        after = page["last_id"]
+
+
+@pytest.mark.asyncio
+async def test_side_chats_are_listed_for_their_parent_on_every_device(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A parent's side chats, generic and Codex, are listed page by page."""
+    agent = await create_test_agent(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(agent_id=agent["id"])
+    other_parent = store.create_conversation(agent_id=agent["id"])
+    store.append(
+        parent.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_parent",
+                data=MessageData(
+                    role="assistant",
+                    agent="test",
+                    content=[{"type": "output_text", "text": "Parent answer"}],
+                ),
+            )
+        ],
+    )
+
+    async def fork(source_id: str, body: dict[str, Any]) -> dict:
+        response = await client.post(f"/v1/sessions/{source_id}/fork", json=body)
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    async def codex_child(data: dict[str, str]) -> str:
+        response = await client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={"type": "external_codex_subagent_start", "data": data},
+        )
+        assert response.status_code == 202, response.text
+        return response.json()["child_session_id"]
+
+    side_chat = await fork(parent.id, {"side_chat": True})
+    closed_side_chat = await fork(parent.id, {"side_chat": True})
+    other_side_chat = await fork(other_parent.id, {"side_chat": True})
+    plain_fork = await fork(parent.id, {})
+    codex_side_chat = await codex_child(
+        {"thread_id": "thread_side", "agent_nickname": "Side chat"}
+    )
+    await codex_child({"thread_id": "thread_worker", "agent_nickname": "Worker"})
+    store.set_labels(closed_side_chat["id"], {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+
+    assert await _side_chat_ids(client, parent.id) == {
+        side_chat["id"]: False,
+        closed_side_chat["id"]: True,
+        codex_side_chat: False,
+    }
+    # The pane hides history through this response on any device.
+    assert side_chat["labels"][SIDE_CHAT_HISTORY_LABEL_KEY] == "resp_parent"
+    assert SIDE_CHAT_HISTORY_LABEL_KEY not in other_side_chat["labels"]
+    sidebar = await client.get("/v1/sessions")
+    assert sidebar.status_code == 200, sidebar.text
+    sidebar_ids = {row["id"] for row in sidebar.json()["data"]}
+    assert plain_fork["id"] in sidebar_ids
+    assert not sidebar_ids & {side_chat["id"], closed_side_chat["id"], other_side_chat["id"]}
+
+
+@pytest.mark.asyncio
+async def test_side_chats_stay_private_to_their_owner(
+    auth_client: httpx.AsyncClient, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A reader of the parent can't list the owner's side chat; Codex ones follow the parent."""
+    owner, reader = "owner@example.com", "reader@example.com"
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    agent = await create_test_agent(client, name="side-chat-privacy")
+    parent = store.create_conversation(agent_id=agent["id"])
+    side = store.fork_conversation(parent.id, extra_labels={SIDE_CHAT_PARENT_LABEL_KEY: parent.id})
+    codex_side = store.create_conversation(
+        agent_id=agent["id"],
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        labels={SIDE_CHAT_PARENT_LABEL_KEY: parent.id},
+    )
+    for user in (owner, reader):
+        permissions.ensure_user(user)
+    permissions.grant(owner, parent.id, LEVEL_OWNER)
+    permissions.grant(owner, side.id, LEVEL_OWNER)
+    permissions.grant(reader, parent.id, LEVEL_READ)
+
+    as_owner = {"headers": {"X-Forwarded-Email": owner}}
+    as_reader = {"headers": {"X-Forwarded-Email": reader}}
+    assert await _side_chat_ids(auth_client, parent.id, **as_owner) == {
+        side.id: False,
+        codex_side.id: False,
+    }
+    assert await _side_chat_ids(auth_client, parent.id, **as_reader) == {codex_side.id: False}
 
 
 @pytest.mark.asyncio

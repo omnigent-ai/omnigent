@@ -202,6 +202,13 @@ export function SideChatPane({
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
   const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
+  // A newer side chat has its last copied response recorded on the server, so
+  // every device hides the same history; older ones use this browser's snapshot.
+  const serverBoundary =
+    session?.labels?.["omnigent.side_chat.parent_id"] !== undefined
+      ? (session.labels["omnigent.side_chat.history_response_id"] ?? null)
+      : undefined;
+  const useLocalBoundary = filterHistory && !pending && serverBoundary === undefined;
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -214,7 +221,7 @@ export function SideChatPane({
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
     boundaryRef.current = {
       childId,
-      ids: filterHistory && !pending ? readInheritedBoundary(childId) : null,
+      ids: useLocalBoundary ? readInheritedBoundary(childId) : null,
       loadSeen: false,
     };
   }
@@ -225,8 +232,7 @@ export function SideChatPane({
   // and persist so later mounts/reloads hide the same set, not new turns.
   if (
     boundaryRef.current.ids === null &&
-    !pending &&
-    filterHistory &&
+    useLocalBoundary &&
     boundaryRef.current.loadSeen &&
     !loadingConversation &&
     conversationLoadError === null
@@ -240,16 +246,24 @@ export function SideChatPane({
     writeInheritedBoundary(childId, ids);
   }
   const inherited = boundaryRef.current.ids;
-  const visibleBlocks = useMemo(
-    () =>
-      inherited === null
-        ? blocks
-        : blocks.filter((b) => {
-            const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
-            return !(typeof id === "string" && inherited.has(id));
-          }),
-    [blocks, inherited],
-  );
+  const visibleBlocks = useMemo(() => {
+    if (filterHistory && serverBoundary !== undefined) {
+      // Everything through the last copied response is the parent's; older pages load above it.
+      const end =
+        serverBoundary === null
+          ? -1
+          : blocks.findLastIndex(
+              (b) => (b as { ctx?: { responseId?: string } }).ctx?.responseId === serverBoundary,
+            );
+      return end === -1 ? blocks : blocks.slice(end + 1);
+    }
+    return inherited === null
+      ? blocks
+      : blocks.filter((b) => {
+          const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
+          return !(typeof id === "string" && inherited.has(id));
+        });
+  }, [blocks, inherited, filterHistory, serverBoundary]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
