@@ -803,13 +803,23 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
 
 @pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
 @pytest.mark.parametrize("legacy", [False, True], ids=["complete-review", "legacy"])
+@pytest.mark.parametrize("scheduled_origin", [False, True], ids=["chat", "automation-origin"])
 async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
     client: httpx.AsyncClient,
     tool_name: str,
     legacy: bool,
+    scheduled_origin: bool,
+    db_uri: str,
 ) -> None:
+    """Creation provenance alone must not disable later human approvals."""
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
+    if scheduled_origin:
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            session_id, {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "automation"}
+        )
     arguments = {"prompt": "Review every issue.", "permission_mode": None}
     if tool_name == "sys_scheduled_task_update":
         arguments.update(

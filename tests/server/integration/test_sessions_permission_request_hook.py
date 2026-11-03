@@ -143,9 +143,12 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("harness", [None, "claude-native"])
+@pytest.mark.parametrize("scheduled_origin", [False, True], ids=["chat", "automation-origin"])
 async def test_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
     harness: str | None,
+    scheduled_origin: bool,
+    db_uri: str,
 ) -> None:
     """
     UI approves Claude's permission request → endpoint returns
@@ -163,6 +166,13 @@ async def test_permission_request_hook_allow_round_trip(
         executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
     )
     session_id = await _create_session(client, agent["id"])
+    if scheduled_origin:
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+        from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+        SqlAlchemyConversationStore(db_uri).set_labels(
+            session_id, {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "automation"}
+        )
     payload = await _claude_permission_payload()
 
     # Fire the hook POST and the verdict event concurrently — the hook
@@ -183,6 +193,7 @@ async def test_permission_request_hook_allow_round_trip(
     event = await drain_task
     assert event["params"]["message"] == "Claude wants to call **Bash**"
     assert event["params"]["policy_name"] == "claude_native_permission"
+    assert not hook_task.done()
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202, verdict.text
 
