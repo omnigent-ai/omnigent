@@ -2902,11 +2902,13 @@ describe("NewChatLandingScreen cached picker preview", () => {
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
     expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
     expect(permission).toHaveTextContent("Plan");
-    for (const control of [workspace, permission]) {
-      expect(control).toHaveAttribute("aria-busy", "true");
-      expect(control).toHaveClass("disabled:opacity-100");
-    }
-    expect(workspace).toBeDisabled();
+    expect(permission).toHaveAttribute("aria-busy", "true");
+    expect(permission).toHaveClass("disabled:opacity-100");
+    expect(workspace).not.toHaveAttribute("aria-busy");
+    expect(workspace).toBeEnabled();
+    fireEvent.click(workspace);
+    expect(screen.getByRole("button", { name: "/Users/corey/repo" })).toBeEnabled();
+    closeMenu();
     expect(permission).toBeEnabled();
     openPermissions();
     expect(screen.getByTestId("new-chat-landing-permission-menu")).toBeVisible();
@@ -2919,7 +2921,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     mockAgents(DEFAULT_LANDING_AGENTS);
     mockHosts([host("online")]);
     fireEvent.change(input, { target: { value: "Wait for directory metadata and model catalog" } });
-    expect(workspace).toBeDisabled();
+    expect(workspace).toBeEnabled();
     expect(permission).toHaveTextContent("Plan");
     expect(permission).toBeEnabled();
 
@@ -2942,7 +2944,155 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 
-  it("spins through home-directory discovery without painting temporary directory or permission defaults", () => {
+  it.each(["online", "offline", "missing"] as const)(
+    "keeps an early cached repo choice while the live host resolves %s",
+    (availability) => {
+      const chosen = "/work/chosen";
+      localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: ["/Users/corey/repo", chosen] }));
+      seedResolvedPicker();
+      mockHosts(undefined);
+      const view = renderLanding();
+      const directory = screen.getByTestId("new-chat-landing-workspace-chip");
+      expect(directory).toBeEnabled();
+      fireEvent.click(directory);
+      fireEvent.click(screen.getByRole("button", { name: chosen }));
+      expect(directory).toHaveAttribute("title", chosen);
+      expect(JSON.parse(localStorage.getItem(RECENT_KEY)!).host_1[0]).toBe(chosen);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Use the repo I chose during startup" },
+      });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      mockHosts(
+        availability === "missing"
+          ? [{ ...host("online"), host_id: "another-host" }]
+          : [host(availability)],
+      );
+      view.rerenderWith({});
+      expect(directory).toHaveAttribute("title", chosen);
+      expect(useHostWorktreesMock).toHaveBeenCalledWith("host_1", chosen);
+      if (availability === "online") {
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      } else {
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+        expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("does not offer a cached host that the live list has removed", () => {
+    seedResolvedPicker();
+    mockHosts([]);
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeDisabled();
+  });
+
+  it.each(["cancel", "confirm"] as const)(
+    "keeps cached folder browsing provisional when project defaults change (%s)",
+    (action) => {
+      const cachedPath = "/Users/corey/repo";
+      const projectPath = "/other-host/project";
+      const projectHost = { ...host("online"), host_id: "host_2" };
+      localStorage.setItem("omnigent:last-host-choice", "unavailable-host");
+      useProjectsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [{ id: "project_1", name: "Project" }],
+      });
+      useProjectConfigMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { host_id: "host_1", workspace: cachedPath, agent_id: "a1" },
+      });
+      const first = renderLanding({}, "/?project=Project");
+      expect(readNewChatWorkspaceCache(getNewChatPickerCacheKey("Project"))?.hostId).toBe("host_1");
+      first.unmount();
+      resetLandingDraft();
+      mockHosts(undefined);
+      useProjectConfigMock.mockReturnValue({ ...PENDING_QUERY_STATE, data: undefined });
+      useHostFilesystemMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        isPlaceholderData: false,
+        data: { entries: [fsEntry(`${cachedPath}/src`)], truncated: false },
+      } as ReturnType<typeof useHostFilesystem>);
+      const view = renderLanding({}, "/?project=Project");
+      mockHosts([host("online"), projectHost]);
+      view.rerenderWith({});
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+        "title",
+        cachedPath,
+      );
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+
+      mockHosts([host("online"), projectHost]);
+      useProjectConfigMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { host_id: "host_2", workspace: projectPath, agent_id: "a1" },
+      });
+      useHostFilesystemMock.mockClear();
+      view.rerenderWith({});
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+        "title",
+        projectPath,
+      );
+      expect(useHostFilesystemMock).toHaveBeenCalledWith("host_1", cachedPath);
+
+      fireEvent.click(
+        screen.getByTestId(
+          action === "cancel" ? "workspace-picker-cancel" : "workspace-picker-select",
+        ),
+      );
+      const expectedHost = action === "cancel" ? "host_2" : "host_1";
+      const expectedPath = action === "cancel" ? projectPath : cachedPath;
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+        "title",
+        expectedPath,
+      );
+      expect(useHostWorktreesMock).toHaveBeenCalledWith(expectedHost, expectedPath);
+    },
+  );
+
+  it("preserves a folder chosen before home discovery and server configuration finish", () => {
+    localStorage.removeItem(RECENT_KEY);
+    const chosen = "/work/chosen";
+    let homeReady = false;
+    useHostFilesystemMock.mockImplementation((_host, path) => {
+      if (path === chosen || (path === "" && homeReady)) {
+        return {
+          ...SUCCESS_QUERY_STATE,
+          isPlaceholderData: false,
+          data: {
+            entries: [fsEntry(`${path === chosen ? chosen : "/home/tester"}/src`)],
+            truncated: false,
+          },
+        } as ReturnType<typeof useHostFilesystem>;
+      }
+      return { ...PENDING_QUERY_STATE, data: undefined } as ReturnType<typeof useHostFilesystem>;
+    });
+    const view = renderLanding("loading");
+    const directory = screen.getByTestId("new-chat-landing-workspace-chip");
+    expect(directory).toBeEnabled();
+    fireEvent.click(directory);
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+    const pathInput = screen.getByTestId("workspace-picker-search-input");
+    fireEvent.change(pathInput, { target: { value: chosen } });
+    fireEvent.keyDown(pathInput, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(directory).toHaveAttribute("title", chosen);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep this explicit folder" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    homeReady = true;
+    view.rerenderWith({});
+    expect(directory).toHaveAttribute("title", chosen);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("opens the folder picker before home discovery without changing permission defaults", () => {
     localStorage.removeItem(RECENT_KEY);
     localStorage.setItem(
       HARNESS_OPTIONS_KEY,
@@ -2953,12 +3103,9 @@ describe("NewChatLandingScreen cached picker preview", () => {
     useHostFilesystemMock.mockReturnValue({ ...PENDING_QUERY_STATE, data: undefined } as ReturnType<
       typeof useHostFilesystem
     >);
-    const directories: string[] = [];
     const permissions: string[] = [];
     renderLanding({}, "/", () => {
-      const directory = screen.queryByTestId("new-chat-landing-workspace-chip");
       const permission = screen.queryByTestId("new-chat-landing-permission-chip");
-      if (directory) directories.push(directory.getAttribute("title")!);
       if (permission) permissions.push(permission.textContent!);
     });
     expect(screen.getByRole("status", { name: "Loading working directory" })).toBeVisible();
@@ -2967,7 +3114,13 @@ describe("NewChatLandingScreen cached picker preview", () => {
     mockHosts([host("online")]);
     const input = screen.getByTestId("new-chat-landing-input");
     fireEvent.change(input, { target: { value: "Wait for home" } });
-    expect(screen.getByRole("status", { name: "Loading working directory" })).toBeVisible();
+    expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
+    const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
+    expect(workspace).toBeEnabled();
+    fireEvent.click(workspace);
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+    expect(screen.getByTestId("workspace-picker")).toBeVisible();
+    fireEvent.click(screen.getByTestId("workspace-picker-cancel"));
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     useHostFilesystemMock.mockReturnValue({
@@ -2980,14 +3133,12 @@ describe("NewChatLandingScreen cached picker preview", () => {
       "/home/tester",
     );
     expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
-    expect(directories.length).toBeGreaterThan(0);
-    expect(directories.every((directory) => directory === "/home/tester")).toBe(true);
     expect(permissions.length).toBeGreaterThan(0);
     expect(permissions.every((permission) => permission === "Plan")).toBe(true);
   });
 
   it.each(["empty", "error"] as const)(
-    "ends directory loading after an %s home-directory response",
+    "keeps folder selection available after an %s home-directory response",
     (result) => {
       localStorage.removeItem(RECENT_KEY);
       useHostFilesystemMock.mockReturnValue({
@@ -2995,7 +3146,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
         data: undefined,
       } as ReturnType<typeof useHostFilesystem>);
       renderLanding();
-      expect(screen.getByRole("status", { name: "Loading working directory" })).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeEnabled();
       useHostFilesystemMock.mockReturnValue({
         ...SUCCESS_QUERY_STATE,
         data: result === "empty" ? { entries: [], truncated: false } : undefined,
@@ -5529,7 +5680,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("keeps placeholder worktrees from relabeling the selected directory", async () => {
+  it("keeps the folder picker usable while placeholder worktrees load", async () => {
     let worktreeResult = {
       data: [
         { path: "/Users/corey/legacy", branch: "main", is_main: true, detached: false },
@@ -5545,8 +5696,8 @@ describe("NewChatLandingScreen", () => {
     useHostWorktreesMock.mockImplementation(() => worktreeResult);
     renderLanding();
 
-    expect(screen.getByRole("status", { name: "Loading working directory" })).toBeVisible();
-    expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
+    expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeEnabled();
     expect(screen.queryByText("legacy")).toBeNull();
 
     worktreeResult = {
@@ -6014,8 +6165,8 @@ describe("NewChatLandingScreen", () => {
       data: undefined,
     } as ReturnType<typeof useHostWorktrees>);
     renderLanding();
-    // The directory control keeps reporting the pending discovery.
-    expect(await screen.findByRole("status", { name: "Loading working directory" })).toBeVisible();
+    expect(await screen.findByTestId("new-chat-landing-workspace-chip")).toBeEnabled();
+    expect(screen.queryByRole("status", { name: "Loading working directory" })).toBeNull();
     const submit = screen.getByTestId("new-chat-landing-submit");
     fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
