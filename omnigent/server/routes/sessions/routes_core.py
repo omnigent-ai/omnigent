@@ -241,6 +241,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
+    side_chat_parent_label_value,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
@@ -4137,7 +4138,6 @@ def register_core_routes(
         if body.side_chat:
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
             extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
-            extra_labels[SIDE_CHAT_PARENT_LABEL_KEY] = source_id
 
         # A managed fork's chosen sandbox host id is born with the row, as on a
         # create: the caller routes the fork by it until its host binds, so no
@@ -4368,14 +4368,19 @@ def register_core_routes(
             raise
 
         if body.side_chat:
-            # Read from the fork itself, so a parent turn racing the copy can't skew it.
+            # List the side chat with its copied-history boundary in one write, so no
+            # device sees it before it knows which history to hide. Reading the fork
+            # itself means a parent turn racing the copy can't skew the boundary.
             copied = await asyncio.to_thread(
                 conversation_store.list_items, new_conv.id, limit=1, order="desc"
             )
+            listing = {
+                SIDE_CHAT_PARENT_LABEL_KEY: side_chat_parent_label_value(source_id, user_id)
+            }
             if copied.data and copied.data[0].response_id:
-                history_end = {SIDE_CHAT_HISTORY_LABEL_KEY: copied.data[0].response_id}
-                await asyncio.to_thread(conversation_store.set_labels, new_conv.id, history_end)
-                new_conv.labels = {**new_conv.labels, **history_end}
+                listing[SIDE_CHAT_HISTORY_LABEL_KEY] = copied.data[0].response_id
+            await asyncio.to_thread(conversation_store.set_labels, new_conv.id, listing)
+            new_conv.labels = {**new_conv.labels, **listing}
 
         try:
             await record_profile(request, new_conv.id, sandbox_profile, conversation_store)

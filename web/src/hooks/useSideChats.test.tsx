@@ -382,7 +382,32 @@ describe("side chats opened on another device", () => {
 
     const { result } = renderHook(() => useSideChats("session-a"), { wrapper });
 
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(queryClient.getQueryCache().getAll()[0]?.state.status).toBe("error"),
+    );
     expect(result.current.tabs).toEqual(["conv_local"]);
+  });
+
+  it("never push a local tab out of storage to make room for them", async () => {
+    writeSessionWorkspaceState("session-a", { openSideChats: ["pending:draft"] });
+    // Storage keeps 20 side-chat tabs; the newest 19 listed ones fit beside the draft.
+    const listed = Array.from({ length: 20 }, (_, index) => ({
+      id: `conv_${String(index).padStart(2, "0")}`,
+      created_at: index,
+    }));
+    serverSideChats(listed);
+
+    const first = renderHook(() => useSideChats("session-a"), { wrapper });
+
+    const shown = ["pending:draft", ...listed.slice(1).map((row) => row.id)];
+    await waitFor(() => expect(first.result.current.tabs).toEqual(shown));
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(shown);
+    first.unmount();
+    // After a reload the draft is still a tab, and the list doesn't reshuffle anything.
+    const reloaded = renderHook(() => useSideChats("session-a"), { wrapper });
+    await waitFor(() =>
+      expect(queryClient.getQueryCache().getAll()[0]?.state.dataUpdateCount).toBe(2),
+    );
+    expect(reloaded.result.current.tabs).toEqual(shown);
   });
 });

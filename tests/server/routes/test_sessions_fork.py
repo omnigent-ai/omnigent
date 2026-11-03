@@ -43,6 +43,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_PARENT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    side_chat_parent_label_value,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -635,7 +636,7 @@ def test_side_chat_records_its_source_without_a_persisted_workspace(
     labels = response.json()["labels"]
     assert labels[SIDE_CHAT_LABEL_KEY] == "1"
     assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
-    assert labels[SIDE_CHAT_PARENT_LABEL_KEY] == source.id
+    assert labels[SIDE_CHAT_PARENT_LABEL_KEY] == side_chat_parent_label_value(source.id, None)
     assert FORK_SOURCE_LABEL_KEY not in labels
     assert response.json()["kind"] == "default"
     assert response.json()["host_id"] is None
@@ -674,6 +675,8 @@ async def _side_chat_ids(client: httpx.AsyncClient, parent_id: str, **kwargs: An
         )
         assert response.status_code == 200, response.text
         page = response.json()
+        # Pagination only ever names the side chats this page returned.
+        assert {page["first_id"], page["last_id"]} <= {row["id"] for row in page["data"]} | {None}
         listed.update({row["id"]: row["closed"] for row in page["data"]})
         if not page["has_more"]:
             return listed
@@ -743,21 +746,22 @@ async def test_side_chats_are_listed_for_their_parent_on_every_device(
 
 
 @pytest.mark.asyncio
-async def test_side_chats_stay_private_to_their_owner(
+async def test_side_chats_are_listed_only_for_the_user_who_started_them(
     auth_client: httpx.AsyncClient, client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A reader of the parent can't list the owner's side chat; Codex ones follow the parent."""
+    """A reader of the shared parent learns nothing about the owner's side chats."""
     owner, reader = "owner@example.com", "reader@example.com"
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     agent = await create_test_agent(client, name="side-chat-privacy")
     parent = store.create_conversation(agent_id=agent["id"])
-    side = store.fork_conversation(parent.id, extra_labels={SIDE_CHAT_PARENT_LABEL_KEY: parent.id})
+    listed_for_owner = {SIDE_CHAT_PARENT_LABEL_KEY: side_chat_parent_label_value(parent.id, owner)}
+    side = store.fork_conversation(parent.id, extra_labels=listed_for_owner)
     codex_side = store.create_conversation(
         agent_id=agent["id"],
         kind="sub_agent",
         parent_conversation_id=parent.id,
-        labels={SIDE_CHAT_PARENT_LABEL_KEY: parent.id},
+        labels=listed_for_owner,
     )
     for user in (owner, reader):
         permissions.ensure_user(user)
@@ -766,12 +770,81 @@ async def test_side_chats_stay_private_to_their_owner(
     permissions.grant(reader, parent.id, LEVEL_READ)
 
     as_owner = {"headers": {"X-Forwarded-Email": owner}}
-    as_reader = {"headers": {"X-Forwarded-Email": reader}}
     assert await _side_chat_ids(auth_client, parent.id, **as_owner) == {
         side.id: False,
         codex_side.id: False,
     }
-    assert await _side_chat_ids(auth_client, parent.id, **as_reader) == {codex_side.id: False}
+    as_reader = await auth_client.get(
+        f"/v1/sessions/{parent.id}/side_chats",
+        params={"limit": 1},
+        headers={"X-Forwarded-Email": reader},
+    )
+    assert as_reader.status_code == 200, as_reader.text
+    assert as_reader.json() == {
+        "object": "list",
+        "data": [],
+        "first_id": None,
+        "last_id": None,
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing_write_fails", [False, True])
+async def test_side_chat_is_listed_together_with_its_copied_history(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    listing_write_fails: bool,
+) -> None:
+    """No device can list a side chat before it knows which copied history to hide."""
+    agent = await create_test_agent(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(agent_id=agent["id"])
+    store.append(
+        parent.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_parent",
+                data=MessageData(
+                    role="assistant",
+                    agent="test",
+                    content=[{"type": "output_text", "text": "Parent answer"}],
+                ),
+            )
+        ],
+    )
+    listing_writes: list[dict[str, str]] = []
+    set_labels = SqlAlchemyConversationStore.set_labels
+
+    def record(
+        self: SqlAlchemyConversationStore,
+        conversation_id: str,
+        updates: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        if SIDE_CHAT_PARENT_LABEL_KEY in updates:
+            listing_writes.append(dict(updates))
+            if listing_write_fails:
+                raise RuntimeError("label write failed")
+        set_labels(self, conversation_id, updates, updated_at)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", record)
+
+    if listing_write_fails:
+        with pytest.raises(RuntimeError, match="label write failed"):
+            await client.post(f"/v1/sessions/{parent.id}/fork", json={"side_chat": True})
+        assert await _side_chat_ids(client, parent.id) == {}
+        return
+    response = await client.post(f"/v1/sessions/{parent.id}/fork", json={"side_chat": True})
+    assert response.status_code == 201, response.text
+    assert listing_writes == [
+        {
+            SIDE_CHAT_PARENT_LABEL_KEY: side_chat_parent_label_value(parent.id, None),
+            SIDE_CHAT_HISTORY_LABEL_KEY: "resp_parent",
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -2726,6 +2726,7 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
+                user_id=user_id,
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_DEVIN_SUBAGENT_START_TYPE:

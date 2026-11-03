@@ -19393,7 +19393,7 @@
     },
     "/v1/sessions/{session_id}/side_chats": {
       "get": {
-        "description": "List the side chats shown as tabs in a session's Workspace rail.\n\nPages in side-chat id order over the labels lookup index, so a page\nreads at most `limit` side chats. Only side chats the caller can read\nare returned, so a page may be short while `has_more` is true;\ncontinue from `last_id`. Closed side chats are included, so other\ndevices can close their tabs.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "description": "List the side chats shown as tabs in a session's Workspace rail.\n\nLists only side chats the caller started, in id order over the labels\nlookup index, so a page reads at most `limit` of them and reveals\nnothing about other users' side chats. Closed side chats are included,\nso other devices can close their tabs.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
         "operationId": "list_side_chats_v1_sessions__session_id__side_chats_get",
         "parameters": [
           {

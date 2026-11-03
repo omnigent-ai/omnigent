@@ -135,9 +135,10 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
-# The session whose Workspace rail lists this side chat, on every device. Set by
-# the server on generic and Codex side chats; ``list_conversation_ids_with_label``
-# finds them through the labels lookup index.
+# Lists a side chat in its parent's Workspace rail on its creator's devices. Set by
+# the server on generic and Codex side chats, with a value from
+# ``side_chat_parent_label_value``; ``list_conversation_ids_with_label`` finds them
+# through the labels lookup index.
 SIDE_CHAT_PARENT_LABEL_KEY = "omnigent.side_chat.parent_id"
 
 # Response id of the last item a generic side chat copied from its parent, so
@@ -178,6 +179,23 @@ def pinned_label_key(user_id: str | None) -> str:
         # 64 hex chars — well within the budget and collision-safe.
         suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
     return f"{PINNED_LABEL_KEY}.{suffix}"
+
+
+def side_chat_parent_label_value(parent_id: str, user_id: str | None) -> str:
+    """
+    The ``SIDE_CHAT_PARENT_LABEL_KEY`` value listing a side chat for its creator.
+
+    Scoped to one user, so a lookup by (key, value) finds only the caller's own
+    side chats and a reader of a shared parent learns nothing about anyone
+    else's. The user part is hashed, so the label never shows an email.
+
+    :param parent_id: Session whose rail lists the side chat, e.g. ``"conv_abc123"``.
+    :param user_id: The creator, e.g. ``"alice@example.com"``, or ``None`` in
+        single-user / no-auth mode.
+    :returns: ``"<parent_id>:<32 hex chars>"``.
+    """
+    user = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
+    return f"{parent_id}:{hashlib.sha256(user.encode('utf-8')).hexdigest()[:32]}"
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -798,6 +816,21 @@ class ConversationStore(ABC):
         Pass the last id as *after* to continue via the labels lookup index on
         (workspace, key, value, conversation id), so each page reads at most
         *limit* rows.
+        """
+        ...
+
+    @abstractmethod
+    def get_created_at_and_label(
+        self, conversation_ids: list[str], key: str
+    ) -> dict[str, tuple[int, str | None]]:
+        """Return each existing conversation's creation time and its label *key*.
+
+        Reads one conversation row and at most one label row per id, never the
+        conversation's other labels.
+
+        :param conversation_ids: Conversations to read, e.g. ``["conv_abc123"]``.
+        :param key: The one label to read, e.g. ``"omnigent.closed"``.
+        :returns: ``{id: (created_at, value or None)}``; missing ids are omitted.
         """
         ...
 

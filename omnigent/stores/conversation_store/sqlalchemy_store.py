@@ -1592,6 +1592,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_sess.scalars(stmt.order_by(SqlConversationLabel.conversation_id).limit(limit))
             )
 
+    def get_created_at_and_label(
+        self, conversation_ids: list[str], key: str
+    ) -> dict[str, tuple[int, str | None]]:
+        if not conversation_ids:
+            return {}
+        stmt = (
+            select(SqlConversation.id, SqlConversation.created_at, SqlConversationLabel.value)
+            .outerjoin(
+                SqlConversationLabel,
+                and_(
+                    SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                    SqlConversationLabel.conversation_id == SqlConversation.id,
+                    SqlConversationLabel.key == key,
+                ),
+            )
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id.in_(conversation_ids),
+            )
+        )
+        with self._conv_session("get_created_at_and_label") as ap_sess:
+            return {
+                conv_id: (created_at, value)
+                for conv_id, created_at, value in ap_sess.execute(stmt).all()
+            }
+
     def set_labels(
         self,
         conversation_id: str,

@@ -143,21 +143,24 @@ export function useSideChats(conversationId: string) {
   });
   useEffect(() => {
     if (!serverSideChats) return;
-    const { closed } = serverSideChats;
-    // Storage keeps the newest tabs past its cap, so add only those, or each sync would reshuffle.
-    const open = serverSideChats.open.slice(-MAX_OPEN_FILES);
-    const current = readSideChatTabsState(conversationId);
-    const changed =
-      open.some((id) => !current.tabs.includes(id)) ||
-      current.tabs.some((id) => closed.includes(id));
-    if (!changed) return;
-    // A tab the list doesn't name (pending, just created, or an older side chat) stays open.
+    const { open, closed } = serverSideChats;
+    const syncedTabs = (tabs: string[]): string[] => {
+      // A tab the list doesn't name (pending, just created, or an older side chat) stays.
+      const kept = tabs.filter((id) => !closed.includes(id));
+      // Storage holds at most MAX_OPEN_FILES tabs, so only the newest listed ones
+      // fill the free slots and a kept tab is never pushed out.
+      const room = MAX_OPEN_FILES - kept.length;
+      const missing = open.filter((id) => !kept.includes(id));
+      return room > 0 ? [...kept, ...missing.slice(-room)] : kept;
+    };
+    const current = readSideChatTabsState(conversationId).tabs;
+    const next = syncedTabs(current);
+    if (next.length === current.length && next.every((id, index) => id === current[index])) {
+      return;
+    }
     update((latest) => ({
       ...latest,
-      tabs: [
-        ...latest.tabs.filter((id) => !closed.includes(id)),
-        ...open.filter((id) => !latest.tabs.includes(id)),
-      ],
+      tabs: syncedTabs(latest.tabs),
       selected:
         latest.selected !== null && closed.includes(latest.selected) ? null : latest.selected,
     }));

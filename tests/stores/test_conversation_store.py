@@ -172,6 +172,45 @@ def test_fork_drops_per_user_pin_labels(
     assert pinned_label_key("bob") not in fork.labels
 
 
+def test_side_chats_are_found_by_label_one_page_at_a_time(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The label lookup pages in id order and reads only the one requested label."""
+    from omnigent.stores.conversation_store import (
+        SIDE_CHAT_PARENT_LABEL_KEY,
+        side_chat_parent_label_value,
+    )
+
+    mine = side_chat_parent_label_value("parent", "alice")
+    others = side_chat_parent_label_value("parent", "bob")
+    side_chats = [conversation_store.create_conversation() for _ in range(3)]
+    for side_chat in side_chats:
+        conversation_store.set_labels(
+            side_chat.id,
+            {SIDE_CHAT_PARENT_LABEL_KEY: mine, "omnigent.closed": "true", "unrelated": "x"},
+        )
+    conversation_store.set_labels(
+        conversation_store.create_conversation().id, {SIDE_CHAT_PARENT_LABEL_KEY: others}
+    )
+
+    first = conversation_store.list_conversation_ids_with_label(
+        SIDE_CHAT_PARENT_LABEL_KEY, mine, limit=2
+    )
+    rest = conversation_store.list_conversation_ids_with_label(
+        SIDE_CHAT_PARENT_LABEL_KEY, mine, after=first[-1], limit=2
+    )
+
+    assert first + rest == sorted(side_chat.id for side_chat in side_chats)
+    assert conversation_store.get_created_at_and_label(first, "omnigent.closed") == {
+        side_chat.id: (side_chat.created_at, "true")
+        for side_chat in side_chats
+        if side_chat.id in first
+    }
+    assert conversation_store.get_created_at_and_label(rest, "missing") == {
+        rest[0]: (next(c.created_at for c in side_chats if c.id == rest[0]), None)
+    }
+
+
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     assert len(conv.id) == 32

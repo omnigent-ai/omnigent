@@ -37,7 +37,6 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import _permission_level_from_grants
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
@@ -48,9 +47,12 @@ from omnigent.server.schemas import (
     SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import SIDE_CHAT_PARENT_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SIDE_CHAT_PARENT_LABEL_KEY,
+    side_chat_parent_label_value,
+)
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.util.session_lifecycle import is_session_closed
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 
 def register_items_routes(
@@ -226,11 +228,10 @@ def register_items_routes(
         """
         List the side chats shown as tabs in a session's Workspace rail.
 
-        Pages in side-chat id order over the labels lookup index, so a page
-        reads at most ``limit`` side chats. Only side chats the caller can read
-        are returned, so a page may be short while ``has_more`` is true;
-        continue from ``last_id``. Closed side chats are included, so other
-        devices can close their tabs.
+        Lists only side chats the caller started, in id order over the labels
+        lookup index, so a page reads at most ``limit`` of them and reveals
+        nothing about other users' side chats. Closed side chats are included,
+        so other devices can close their tabs.
 
         :param request: Inbound HTTP request; carries the caller identity.
         :param session_id: Parent session id, e.g. ``"conv_abc123"``.
@@ -251,37 +252,24 @@ def register_items_routes(
         ids = await asyncio.to_thread(
             conversation_store.list_conversation_ids_with_label,
             SIDE_CHAT_PARENT_LABEL_KEY,
-            session_id,
+            side_chat_parent_label_value(session_id, user_id),
             after=after,
             limit=limit + 1,
         )
         has_more = len(ids) > limit
         ids = ids[:limit]
-        by_id = await asyncio.to_thread(conversation_store.get_conversations, ids)
-        rows = [by_id[side_id] for side_id in ids if side_id in by_id]
-        # A generic side chat is a private top-level fork with its own grants; a
-        # Codex side chat is a child whose access follows this session's.
-        private = [row.id for row in rows if row.parent_conversation_id != session_id]
-        if permission_store is not None and auth_provider is not None and private:
-            grants = await asyncio.to_thread(permission_store.list_for_sessions, private)
-            is_admin = user_id is not None and await asyncio.to_thread(
-                permission_store.is_admin, user_id
-            )
-            hidden = {
-                side_id
-                for side_id in private
-                if (_permission_level_from_grants(user_id, grants.get(side_id, []), is_admin) or 0)
-                < LEVEL_READ
-            }
-            rows = [row for row in rows if row.id not in hidden]
+        rows = await asyncio.to_thread(
+            conversation_store.get_created_at_and_label, ids, CLOSED_LABEL_KEY
+        )
         return PaginatedList(
             data=[
                 SideChatSummary(
-                    id=row.id,
-                    created_at=row.created_at,
-                    closed=is_session_closed(row.labels, row.title),
+                    id=side_id,
+                    created_at=rows[side_id][0],
+                    closed=rows[side_id][1] == CLOSED_LABEL_VALUE,
                 )
-                for row in rows
+                for side_id in ids
+                if side_id in rows
             ],
             first_id=ids[0] if ids else None,
             last_id=ids[-1] if ids else None,

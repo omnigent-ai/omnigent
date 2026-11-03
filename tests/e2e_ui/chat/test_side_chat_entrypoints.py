@@ -17,6 +17,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, Route, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
 
@@ -649,11 +650,8 @@ def test_side_chat_follows_the_user_to_another_device(
     assert len(side_chat_forks) == 1
 
     # A separate context has its own storage, like a second device.
-    phone_context = browser.new_context(
-        **{**browser_context_args, "viewport": {"width": 390, "height": 844}}
-    )
-    try:
-        phone = phone_context.new_page()
+    phone_options = {**browser_context_args, "viewport": {"width": 390, "height": 844}}
+    with user_page(browser, headers={}, **phone_options) as phone:
         phone.goto(f"{base_url}/c/{session_id}")
         phone.get_by_role("button", name="Conversation actions").click()
         phone.get_by_role("menuitem", name="Side chats").click()
@@ -668,8 +666,6 @@ def test_side_chat_follows_the_user_to_another_device(
             drawer.get_by_role("button", name="Close Side chat 1", exact=True).click()
         assert stopped.value.ok
         expect(drawer.get_by_role("tab", name="Side chat 1", exact=True)).to_have_count(0)
-    finally:
-        phone_context.close()
 
     page.reload()
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()

@@ -422,6 +422,7 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
     pinned_label_key,
     runner_seen_is_fresh,
+    side_chat_parent_label_value,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
@@ -2816,6 +2817,8 @@ async def _persist_external_codex_subagent_start(
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    *,
+    user_id: str | None = None,
 ) -> str:
     """
     Mint or update a child Conversation for a Codex AgentControl sub-agent.
@@ -2828,6 +2831,8 @@ async def _persist_external_codex_subagent_start(
     :param parent_conv: Pre-fetched parent row.
     :param body: POST event body with ``data.thread_id`` required.
     :param conversation_store: Store for reading/creating child rows.
+    :param user_id: User the event was posted as; a ``/side`` fork is listed
+        in the parent's rail on that user's devices.
     :returns: Child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: If ``thread_id`` is missing or parent has
         no bound agent.
@@ -2851,8 +2856,8 @@ async def _persist_external_codex_subagent_start(
     from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 
     if is_side_chat_child(labels):
-        # Lists the /side fork in its parent's Workspace rail on every device.
-        labels[SIDE_CHAT_PARENT_LABEL_KEY] = parent_id
+        # Lists the /side fork in its parent's Workspace rail on the user's devices.
+        labels[SIDE_CHAT_PARENT_LABEL_KEY] = side_chat_parent_label_value(parent_id, user_id)
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         await record_subagent_activity(
