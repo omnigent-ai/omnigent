@@ -107,6 +107,8 @@ describe("pullRequestIdentityFromUrl", () => {
       "https://dev.azure.com/org/proj/_git/repo/pullrequest/42",
       "https://org.visualstudio.com/Proj/_git/Repo/pullrequest/42",
       "https://org.visualstudio.com/DefaultCollection/Proj/_git/Repo/pullRequest/42/",
+      "https://dev.azure.com/org/%70roj/_git/repo/pullrequest/42",
+      "https://org.visualstudio.com/%44efaultCollection/Proj/_git/Repo/pullrequest/42",
     ].map((url) => pullRequestIdentityFromUrl(url, null));
     for (const variant of variants) expect(variant).toEqual(AZURE_PR);
     expect(
@@ -127,6 +129,8 @@ describe("pullRequestIdentityFromUrl", () => {
     ["https://dev.azure.com:8443/org/proj/_git/repo/pullrequest/7", null],
     ["https://dev.azure.com/org/a/b/_git/repo/pullrequest/7", null],
     ["https://dev.azure.com/_git/repo/pullrequest/7", null],
+    ["https://dev.azure.com/org/a%2Fb/_git/repo/pullrequest/7", null],
+    ["https://dev.azure.com/org/%E0%A4%A/_git/repo/pullrequest/7", null],
   ])("rejects %s for provider %s", (url, provider) => {
     expect(pullRequestIdentityFromUrl(url, provider)).toBeNull();
   });
@@ -183,14 +187,22 @@ describe("readViewed / writeViewed", () => {
     }
     expect(readViewed(key, "head1").paths.size).toBe(0);
     expect(readViewed(key, "head2").paths).toEqual(new Set(["head2.ts"]));
+    expect(readViewed(key, "head3").paths).toEqual(new Set(["head3.ts"]));
     expect(readViewed(key, "head4").paths).toEqual(new Set(["head4.ts"]));
   });
 
   it("reads corrupt or unknown values as empty", () => {
     localStorage.setItem(key, "{not json");
     expect(readViewed(key, "head1")).toEqual({ paths: new Set(), resetFromHead: null });
-    localStorage.setItem(key, JSON.stringify({ v: 1, headSha: "head1", paths: ["a.ts"] }));
-    expect(readViewed(key, "head1").paths.size).toBe(0);
+    for (const value of [
+      { v: 1, headSha: "head1", paths: ["a.ts"] },
+      { v: 2, heads: { head1: { paths: ["a.ts"], updatedAt: 1 } } },
+      { v: 1, heads: { head1: { paths: "a.ts", updatedAt: 1 } } },
+      { v: 1, heads: { head1: { paths: [1], updatedAt: "1" } } },
+    ]) {
+      localStorage.setItem(key, JSON.stringify(value));
+      expect(readViewed(key, "head1")).toEqual({ paths: new Set(), resetFromHead: null });
+    }
   });
 
   it("prunes entries older than 90 days", () => {
@@ -201,10 +213,12 @@ describe("readViewed / writeViewed", () => {
     vi.setSystemTime(150 * DAY_MS);
     writeViewed(recent, "h", ["a.ts"]);
     localStorage.setItem(`${KEY_PREFIX}corrupt`, "{");
+    localStorage.setItem("omnigent:unrelated", "keep");
     vi.setSystemTime(191 * DAY_MS);
     writeViewed(key, "h", ["a.ts"]);
 
     expect(storedKeys().sort()).toEqual([key, recent].sort());
+    expect(localStorage.getItem("omnigent:unrelated")).toBe("keep");
   });
 
   it("keeps only the 500 most recently written entries", () => {
@@ -305,6 +319,20 @@ describe("useViewedFiles", () => {
 
     rerender({ head: "head1" });
     expect(result.current.viewed).toEqual(new Set(["a.ts"]));
+  });
+
+  it("bases the reset notice on marks, not on writes that leave a head empty", () => {
+    const { result, rerender } = renderHook(({ head }) => useViewedFiles(PR, head), {
+      initialProps: { head: "head1" },
+    });
+    act(() => result.current.setMany(["a.ts"], false));
+    rerender({ head: "head2" });
+    expect(result.current.resetNotice).toBe(false);
+
+    act(() => result.current.toggle("b.ts"));
+    rerender({ head: "head3" });
+    act(() => result.current.setMany(["c.ts"], false));
+    expect(result.current.resetNotice).toBe(true);
   });
 
   it("reports unsaved marks from the store, across remounts and identity changes", () => {

@@ -37,11 +37,28 @@ function pathIdentity(provider: string, url: URL, pattern: RegExp): PullRequestI
   };
 }
 
+/** A percent-decoded path segment, or null when it is empty, `.`/`..`, contains `/` or is malformed. */
+function decodeSegment(segment: string): string | null {
+  try {
+    const name = decodeURIComponent(segment);
+    return name && name !== "." && name !== ".." && !name.includes("/") ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Azure DevOps Services only, normalized to `dev.azure.com/{org}/{project}/{repo}` like the server. */
 function azureIdentity(url: URL): PullRequestIdentity | null {
   const match = AZURE_PATH.exec(url.pathname);
   if (!match || url.port) return null;
-  const prefix = match[1]?.split("/") ?? [];
+  const repo = decodeSegment(match[2]);
+  if (repo === null) return null;
+  const prefix: string[] = [];
+  for (const segment of match[1]?.split("/") ?? []) {
+    const name = decodeSegment(segment);
+    if (name === null) return null;
+    prefix.push(name);
+  }
   const host = url.hostname.toLowerCase();
   let org: string | undefined;
   if (host === AZURE_HOST) {
@@ -51,7 +68,7 @@ function azureIdentity(url: URL): PullRequestIdentity | null {
     if (prefix[0]?.toLowerCase() === "defaultcollection") prefix.shift();
   }
   if (!org || prefix.length > 1) return null;
-  const [, , repo, number] = match;
+  const number = match[3];
   // A project's default repository URL omits the project; it shares the repository's name.
   const project = prefix[0] ?? repo;
   return {
@@ -205,8 +222,10 @@ export function writeViewed(
     .filter(([sha]) => sha !== headSha)
     .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
     .slice(0, MAX_HEADS - 1);
+  const marked = [...new Set(paths)];
+  // A head with no marks gets no record, so a record always means "this head had marks".
   const heads = Object.fromEntries([
-    [headSha, { paths: [...new Set(paths)], updatedAt }],
+    ...(marked.length > 0 ? [[headSha, { paths: marked, updatedAt }] as const] : []),
     ...otherHeads,
   ]);
   const value = JSON.stringify({ v: 1, heads });
