@@ -40,10 +40,23 @@ import {
   PullRequestFileSection,
   STATUS_META,
   type DiffOptions,
+  type FindHighlight,
 } from "./PullRequestFileSection";
+import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
-import { selectVisibleFiles } from "./pullRequestReview";
-import { useChangesViewState } from "./useChangesViewState";
+import {
+  buildSearchCorpus,
+  findMatches,
+  firstMatchAtOrBelow,
+  MATCH_LIMIT,
+  refreshedMatchIndex,
+  selectVisibleFiles,
+  type Match,
+} from "./pullRequestReview";
+import { useChangesViewState, type FindState } from "./useChangesViewState";
+
+/** Frames to wait for a section to mount before a pending jump gives up. */
+const REVEAL_RETRY_FRAMES = 30;
 
 /** Centered muted message filling the panel — the shared loading/transient shell. */
 export function PanelMessage({ children }: { children: React.ReactNode }) {
@@ -240,7 +253,7 @@ function ChangesToolbar({
 }) {
   return (
     <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-      <div className="flex items-center gap-0.5">
+      <div className="flex min-w-0 flex-1 items-center gap-0.5">
         {showFileControls && (
           <IconButton
             label={sidebarCollapsed ? "Show file list" : "Hide file list"}
@@ -379,7 +392,12 @@ export function PullRequestChangesTab({
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal } = view;
+  const { revealedPaths, reveal, clearReveal, find } = view;
+  const findInputRef = useRef<HTMLInputElement>(null);
+  // A jump or thread target: its header scrolls once the file is visible and its section is mounted.
+  const [pendingReveal, setPendingReveal] = useState<{ path: string } | null>(null);
+  // The match the reader navigated to. Null until seeded when the bar opens or its query changes.
+  const [findTarget, setFindTarget] = useState<Match | null>(null);
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
@@ -404,6 +422,7 @@ export function PullRequestChangesTab({
   // The sidebar groups the flat file list into a compacted folder tree (the
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
+  const visiblePaths = useMemo(() => visibleFiles.map((file) => file.path), [visibleFiles]);
 
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
@@ -510,6 +529,10 @@ export function PullRequestChangesTab({
           color: var(--sidebar-active-foreground);
           box-shadow: inset -3px 0 var(--sidebar-active-foreground);
         }
+        ::highlight(pr-find-active) {
+          background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+          color: inherit;
+        }
       `,
       // The section renders its own header; the diff body has none.
       disableFileHeader: true,
@@ -563,10 +586,123 @@ export function PullRequestChangesTab({
     (path: string) => {
       setActivePath(path);
       reveal(path);
-      sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
+      setPendingReveal({ path });
     },
     [reveal],
   );
+
+  // A filtered-out target is visible only after the filter clears, so wait for it.
+  useEffect(() => {
+    if (!pendingReveal || !visiblePaths.includes(pendingReveal.path)) return;
+    let frame = 0;
+    let frames = 0;
+    const scrollToHeader = () => {
+      const section = sectionEls.current.get(pendingReveal.path);
+      if (section) section.scrollIntoView({ block: "start" });
+      if (section || frames++ >= REVEAL_RETRY_FRAMES) setPendingReveal(null);
+      else frame = requestAnimationFrame(scrollToHeader);
+    };
+    scrollToHeader();
+    return () => cancelAnimationFrame(frame);
+  }, [pendingReveal, visiblePaths]);
+
+  // Find searches the visible files; the hidden count searches the rest, and no filter changes.
+  // Corpora are built only while the bar is open.
+  const { matchCase, regex } = find;
+  const query = find.open ? find.query : "";
+  const searchCorpus = useMemo(
+    () => (find.open ? buildSearchCorpus(filesByPath, visibleFiles) : []),
+    [find.open, filesByPath, visibleFiles],
+  );
+  const hiddenCorpus = useMemo(() => {
+    if (!find.open) return [];
+    const shown = new Set(visiblePaths);
+    return buildSearchCorpus(
+      filesByPath,
+      files.filter((file) => !shown.has(file.path)),
+    );
+  }, [find.open, filesByPath, files, visiblePaths]);
+  const search = useMemo(
+    () => findMatches(searchCorpus, query, { matchCase, regex, limit: MATCH_LIMIT }),
+    [searchCorpus, query, matchCase, regex],
+  );
+  const hiddenSearch = useMemo(
+    () => findMatches(hiddenCorpus, query, { matchCase, regex, limit: MATCH_LIMIT }),
+    [hiddenCorpus, query, matchCase, regex],
+  );
+  const { matches } = search;
+  const activeIndex = findTarget && matches.length ? refreshedMatchIndex(matches, findTarget) : -1;
+  const activeMatch = activeIndex >= 0 ? matches[activeIndex] : null;
+  const activeFilePath = activeMatch?.target.path ?? null;
+  // A line match is painted by its section; split out the primitives so a refresh that
+  // keeps the same match doesn't re-centre the row.
+  const lineMatch = activeMatch?.target.kind === "line" ? activeMatch : null;
+  const highlightSide = lineMatch?.target.side;
+  const highlightLine = lineMatch?.target.line;
+  const highlightStart = lineMatch?.start;
+  const highlightEnd = lineMatch?.end;
+  const highlight = useMemo<FindHighlight | null>(
+    () =>
+      highlightSide &&
+      highlightLine !== undefined &&
+      highlightStart !== undefined &&
+      highlightEnd !== undefined
+        ? { side: highlightSide, line: highlightLine, start: highlightStart, end: highlightEnd }
+        : null,
+    [highlightSide, highlightLine, highlightStart, highlightEnd],
+  );
+
+  // Seed the match when the bar opens or its query changes: the first at or below the viewport top.
+  useEffect(() => {
+    if (!find.open || findTarget || !matches.length) return;
+    setFindTarget(matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)]);
+  }, [find.open, findTarget, matches, visiblePaths, activePath]);
+
+  // The active match's file opens even if the reader collapsed it earlier.
+  useEffect(() => {
+    if (activeFilePath) reveal(activeFilePath);
+  }, [activeFilePath, findTarget, reveal]);
+
+  const stepMatch = (direction: 1 | -1) => {
+    if (!matches.length) return;
+    const next =
+      matches[activeIndex < 0 ? 0 : (activeIndex + direction + matches.length) % matches.length];
+    setFindTarget(next);
+    if (next.target.kind === "path") setPendingReveal({ path: next.target.path });
+  };
+  // Changing the query or an option re-seeds the match from the viewport.
+  const changeFind = (patch: Partial<FindState>) => {
+    setFindTarget(null);
+    view.setFind(patch);
+  };
+  const closeFind = () => {
+    setFindTarget(null);
+    view.setFind({ open: false });
+  };
+  const showHidden = () => {
+    view.setPathFilter("");
+    view.setHideViewed(false);
+  };
+  const onTabKeyDown = (event: React.KeyboardEvent) => {
+    if (
+      !(event.metaKey || event.ctrlKey) ||
+      event.altKey ||
+      event.shiftKey ||
+      event.key.toLowerCase() !== "f"
+    ) {
+      return;
+    }
+    event.preventDefault();
+    if (!find.open) view.setFind({ open: true });
+    else findInputRef.current?.select();
+    findInputRef.current?.focus();
+  };
+  const patchFileCount = files.filter((file) => filesByPath.has(file.path)).length;
+  const withoutText = files.length - patchFileCount;
+  const coverageNote =
+    find.open && (changes.data?.has_more || withoutText > 0)
+      ? `Search covers the fetched patch: ${patchFileCount} of ${changes.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
+      : null;
 
   const [focusedThread, setFocusedThread] = useState<{ id: string } | null>(null);
   useEffect(() => {
@@ -650,7 +786,7 @@ export function PullRequestChangesTab({
 
   // A controls row, then the sidebar (jump-to-file) + one scroll of all files' diffs.
   return (
-    <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
+    <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col" onKeyDown={onTabKeyDown}>
       {data.capabilities.review_threads &&
         (reviews.page?.has_more ||
           reviews.historyStale ||
@@ -690,6 +826,11 @@ export function PullRequestChangesTab({
           {changes.data.warning || "The changed-file list is incomplete."}
         </p>
       )}
+      {coverageNote && (
+        <p className="shrink-0 border-b border-border px-2 py-1 text-xs text-muted-foreground">
+          {coverageNote}
+        </p>
+      )}
       {(files.length > 0 || unresolved.length > 0 || reviews.isFetching) && (
         <ChangesToolbar
           showFileControls={files.length > 0}
@@ -702,6 +843,26 @@ export function PullRequestChangesTab({
           onToggleDiffStyle={toggleDiffStyle}
           allCollapsed={allCollapsed}
           onToggleAll={toggleAll}
+          navigation={
+            <PullRequestFindBar
+              find={find}
+              inputRef={findInputRef}
+              position={activeIndex + 1}
+              total={matches.length}
+              truncated={search.truncated}
+              invalid={search.invalid}
+              hiddenCount={hiddenSearch.matches.length}
+              hiddenTruncated={hiddenSearch.truncated}
+              onOpen={() => view.setFind({ open: true })}
+              onClose={closeFind}
+              onQueryChange={(next) => changeFind({ query: next })}
+              onToggleOption={(option) =>
+                changeFind(option === "matchCase" ? { matchCase: !matchCase } : { regex: !regex })
+              }
+              onStep={stepMatch}
+              onShowHidden={showHidden}
+            />
+          }
         />
       )}
       <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
@@ -781,6 +942,9 @@ export function PullRequestChangesTab({
                 registerRef={registerRef}
                 collapsed={collapsedPaths.has(file.path)}
                 forceExpanded={revealedPaths.has(file.path)}
+                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
+                highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
                 threads={threadsByFile.get(file.path) ?? []}
                 threadContext={threadContext}

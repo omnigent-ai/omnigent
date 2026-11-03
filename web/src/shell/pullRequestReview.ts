@@ -1,5 +1,6 @@
 // Pure helpers for the pull request Changes tab's review navigation.
 
+import type { FileDiffMetadata } from "@pierre/diffs";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
 
 /** Files whose path or previous path contains `query`, ignoring case and slash direction. */
@@ -25,4 +26,141 @@ export function selectVisibleFiles(
   return opts.hiddenPaths.size
     ? matching.filter((file) => !opts.hiddenPaths.has(file.path))
     : matching;
+}
+
+/** One searchable string of the fetched patch: a file path or a line of its hunks. */
+export interface PatchMatchTarget {
+  /** Current path of the file whose section reveals the match. */
+  path: string;
+  kind: "line" | "path";
+  side?: "additions" | "deletions";
+  /** New-file number for additions and context, old-file number for deletions. */
+  line?: number;
+  /** The line without its newline, as the diff renders it; the path for `kind: "path"`. */
+  text: string;
+}
+
+export interface Match {
+  target: PatchMatchTarget;
+  /** Character offsets into `target.text`. */
+  start: number;
+  end: number;
+}
+
+/** Path targets for every file, then the lines of each file's fetched hunks. */
+export function buildSearchCorpus(
+  diffs: ReadonlyMap<string, FileDiffMetadata>,
+  files: PullRequestChangedFile[],
+): PatchMatchTarget[] {
+  const corpus: PatchMatchTarget[] = [];
+  for (const file of files) {
+    const diff = diffs.get(file.path);
+    const previousPath = file.previous_path ?? diff?.prevName;
+    corpus.push({ path: file.path, kind: "path", text: file.path });
+    if (previousPath && previousPath !== file.path) {
+      corpus.push({ path: file.path, kind: "path", text: previousPath });
+    }
+    if (diff) pushPatchLines(corpus, file.path, diff);
+  }
+  return corpus;
+}
+
+function pushPatchLines(corpus: PatchMatchTarget[], path: string, file: FileDiffMetadata) {
+  for (const hunk of file.hunks) {
+    for (const content of hunk.hunkContent) {
+      for (const side of ["deletions", "additions"] as const) {
+        // Context lines exist once, on the additions side.
+        const count =
+          content.type === "context" ? (side === "additions" ? content.lines : 0) : content[side];
+        const start = side === "additions" ? content.additionLineIndex : content.deletionLineIndex;
+        const hunkIndex = side === "additions" ? hunk.additionLineIndex : hunk.deletionLineIndex;
+        const first = side === "additions" ? hunk.additionStart : hunk.deletionStart;
+        const source = side === "additions" ? file.additionLines : file.deletionLines;
+        for (let offset = 0; offset < count; offset++) {
+          const text = source[start + offset];
+          if (text === undefined) break;
+          corpus.push({
+            path,
+            kind: "line",
+            side,
+            line: first + start - hunkIndex + offset,
+            text: text.replace(/\r?\n$/, ""),
+          });
+        }
+      }
+    }
+  }
+}
+
+/** Matches beyond this count are dropped and the result is marked truncated. */
+export const MATCH_LIMIT = 10_000;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Every non-empty occurrence of `query` in the corpus, in corpus order. */
+export function findMatches(
+  corpus: readonly PatchMatchTarget[],
+  query: string,
+  opts: { matchCase: boolean; regex: boolean; limit: number },
+): { matches: Match[]; truncated: boolean; invalid: boolean } {
+  const matches: Match[] = [];
+  if (!query.trim()) return { matches, truncated: false, invalid: false };
+  let pattern: RegExp;
+  try {
+    pattern = new RegExp(opts.regex ? query : escapeRegExp(query), opts.matchCase ? "g" : "gi");
+  } catch {
+    return { matches, truncated: false, invalid: true };
+  }
+  for (const target of corpus) {
+    for (const found of target.text.matchAll(pattern)) {
+      if (!found[0]) continue;
+      if (matches.length === opts.limit) return { matches, truncated: true, invalid: false };
+      matches.push({ target, start: found.index, end: found.index + found[0].length });
+    }
+  }
+  return { matches, truncated: false, invalid: false };
+}
+
+/** Index of the first match in a file at or below `topPath` (in `filePaths` order), else 0. */
+export function firstMatchAtOrBelow(
+  matches: readonly Match[],
+  filePaths: readonly string[],
+  topPath: string | null,
+): number {
+  const order = new Map(filePaths.map((path, index) => [path, index]));
+  const top = topPath === null ? 0 : (order.get(topPath) ?? 0);
+  return Math.max(
+    matches.findIndex((match) => (order.get(match.target.path) ?? 0) >= top),
+    0,
+  );
+}
+
+/**
+ * Index in a refreshed match list for the previous match: the same target if it
+ * still exists, else the nearest line in its file, else 0.
+ */
+export function refreshedMatchIndex(matches: readonly Match[], previous: Match): number {
+  const { target, start } = previous;
+  const same = matches.findIndex(
+    (match) =>
+      match.start === start &&
+      match.target.path === target.path &&
+      match.target.kind === target.kind &&
+      match.target.side === target.side &&
+      match.target.line === target.line,
+  );
+  if (same >= 0) return same;
+  let nearest = 0;
+  let nearestDistance = Infinity;
+  matches.forEach((match, index) => {
+    if (match.target.path !== target.path) return;
+    const distance = Math.abs((match.target.line ?? 0) - (target.line ?? 0));
+    if (distance < nearestDistance) {
+      nearest = index;
+      nearestDistance = distance;
+    }
+  });
+  return nearest;
 }
