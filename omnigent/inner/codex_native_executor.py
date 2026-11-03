@@ -184,13 +184,23 @@ def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
     )
 
 
+# Bridge-state fields that identify one native session binding.
+_CODEX_BINDING_FIELDS = ("session_id", "thread_id", "socket_path", "codex_home")
+
+
+def _codex_binding_matches(
+    current: CodexNativeBridgeState, expected: CodexNativeBridgeState
+) -> bool:
+    """Whether *current* still names the session binding *expected* was read from."""
+    return all(
+        getattr(current, field) == getattr(expected, field) for field in _CODEX_BINDING_FIELDS
+    )
+
+
 def _require_codex_binding(bridge_dir: Path, expected: CodexNativeBridgeState) -> None:
     """Refuse unsent input when an await outlives the original session binding."""
     current = read_bridge_state(bridge_dir)
-    if current is None or any(
-        getattr(current, field) != getattr(expected, field)
-        for field in ("session_id", "thread_id", "socket_path", "codex_home")
-    ):
+    if current is None or not _codex_binding_matches(current, expected):
         raise _CodexNativeInputUndelivered(
             CodexStartupFailure(
                 message="Codex native session changed before this message could be delivered.",
@@ -574,12 +584,7 @@ async def _wait_for_shell_completion(
     )
     while True:
         current = read_bridge_state(bridge_dir)
-        if (
-            current is None
-            or current.session_id != state.session_id
-            or current.thread_id != state.thread_id
-            or current.socket_path != state.socket_path
-        ):
+        if current is None or not _codex_binding_matches(current, state):
             if not require_idle:
                 return state
             raise _CodexNativeInputUndelivered(
@@ -659,12 +664,7 @@ async def _wait_for_compaction_turn(
     try:
         while True:
             current = read_bridge_state(bridge_dir)
-            if (
-                current is None
-                or current.session_id != state.session_id
-                or current.thread_id != state.thread_id
-                or current.socket_path != state.socket_path
-            ):
+            if current is None or not _codex_binding_matches(current, state):
                 outcome = "session_changed"
                 raise _CodexNativeInputUndelivered(
                     CodexStartupFailure(
