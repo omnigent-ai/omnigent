@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import httpx
 
 from omnigent.inner import _proc
+from omnigent.scheduled_context import add_scheduled_run_header
 
 
 def _is_tcp_listening(host: str, port: int) -> bool:
@@ -88,6 +89,7 @@ class RunnerTCPSubprocess:
             self.port = _pick_free_port()
         cmd = [
             sys.executable,
+            "-P",
             "-m",
             "uvicorn",
             "--factory",
@@ -163,4 +165,8 @@ def create_tcp_client(
         every request so the runner auth middleware accepts
         the call.
     """
-    return httpx.AsyncClient(base_url=base_url, headers=auth_headers or {})
+    return httpx.AsyncClient(
+        event_hooks={"request": [add_scheduled_run_header]},
+        base_url=base_url,
+        headers=auth_headers or {},
+    )

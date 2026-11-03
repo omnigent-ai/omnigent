@@ -24,6 +24,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { cn } from "@/lib/utils";
 import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
@@ -53,7 +54,7 @@ export function ComposerWorkspaceBar({
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
+        "composer-context-bar group/composer-workspace relative z-0 -mb-px flex h-7 mobile-app:h-auto mobile-app:flex-wrap min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
         COMPOSER_CONTENT_INSET_CLASS,
         COMPOSER_TRAY_INSET_CLASS,
         className,
@@ -87,7 +88,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       // Icon-only while the bar is collapsed, so the label is the name.
       aria-label={label}
       className={cn(
-        "relative inline-flex h-6 min-w-10 max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
+        "relative inline-flex h-6 min-w-10 mobile-touch-target mobile-app:h-auto max-w-[calc(50%-0.25rem)] cursor-pointer items-center gap-1 rounded-md border border-transparent bg-transparent px-1 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50 md:min-w-11",
         className,
       )}
       {...props}
@@ -106,11 +107,45 @@ export const ComposerWorkspaceTrigger = forwardRef<
   );
 });
 
+export type HostStatusDotStatus = "online" | "offline" | "unknown" | "starting";
+
+const HOST_RING_CLASS = "border-[1.5px] border-muted-foreground";
+
+const HOST_STATUS_DOT_CLASS: Record<HostStatusDotStatus, string> = {
+  online: "bg-success",
+  offline: HOST_RING_CLASS,
+  unknown: HOST_RING_CLASS,
+  // The ring's gap keeps "starting" distinct when motion is reduced.
+  starting: `${HOST_RING_CLASS} border-t-transparent animate-spin motion-reduce:animate-none`,
+};
+
+/**
+ * Host liveness dot shared by the composer's host chip and its host menu, so
+ * the two agree: a ring while not running, a spinning ring while starting,
+ * and a filled green dot once online.
+ */
+export function HostStatusDot({
+  status,
+  testId,
+}: {
+  status: HostStatusDotStatus;
+  testId?: string;
+}) {
+  return (
+    <span
+      aria-hidden
+      data-status={status}
+      className={cn("size-2 shrink-0 rounded-full", HOST_STATUS_DOT_CLASS[status])}
+      data-testid={testId}
+    />
+  );
+}
+
 export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status?: "online" | "offline" | "unknown";
+    status?: HostStatusDotStatus;
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -125,7 +160,7 @@ export const ComposerHostTrigger = forwardRef<
       type="button"
       aria-label={label}
       className={cn(
-        "flex h-8 w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
+        "flex h-8 mobile-touch-target w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
         className,
       )}
       {...props}
@@ -133,14 +168,7 @@ export const ComposerHostTrigger = forwardRef<
       <span className="flex items-center">
         {status && (
           <span className="flex size-4 shrink-0 items-center justify-center">
-            <span
-              aria-hidden
-              className={cn(
-                "size-2 rounded-full",
-                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-              )}
-              data-testid={`${testIdPrefix}-host-status`}
-            />
+            <HostStatusDot status={status} testId={`${testIdPrefix}-host-status`} />
           </span>
         )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
@@ -156,11 +184,13 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  disabledReason,
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
   onSelect,
   testIdPrefix = "composer",
+  openNonce = 0,
 }: {
   label: string;
   value: string;
@@ -168,26 +198,38 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hover text explaining why the picker is disabled. */
+  disabledReason?: string;
   /** Hide the visible value; it stays in the accessible name. */
   iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
+  /** Opens the menu each time this changes to a new nonzero value. */
+  openNonce?: number;
 }) {
+  const inert = disabled || (loading && !interactiveWhileLoading);
+  const [open, setOpen] = useState(false);
+  const appliedOpenNonce = useRef(openNonce);
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    if (!inert) setOpen(true);
+  }, [openNonce, inert]);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild disabled={inert}>
         <button
           type="button"
-          disabled={disabled || (loading && !interactiveWhileLoading)}
+          disabled={inert}
           aria-busy={loading || undefined}
           className={cn(
-            "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
+            "flex h-8 mobile-touch-target mobile-app:h-auto min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
             loading && "disabled:opacity-100",
           )}
           aria-label={`${label}: ${value}`}
-          title={`${label}: ${value}`}
+          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
@@ -221,7 +263,7 @@ export function ComposerPermissionPicker({
               value={option.value}
               data-testid={`${testIdPrefix}-permission-option-${option.value}`}
               data-permission-concept={permissionModeConcept(harness, option.value)}
-              className="whitespace-normal break-words"
+              className="mobile-touch-target whitespace-normal break-words"
             >
               {option.label}
             </DropdownMenuRadioItem>
@@ -250,34 +292,6 @@ export function ComposerConfigTooltipRows({
       ))}
     </>
   );
-}
-
-const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
-
-function useMenuGuardedTooltip(menuOpen: boolean) {
-  const [wantsOpen, setWantsOpen] = useState(false);
-  // Epoch millis until which open requests are ignored; Infinity while the
-  // menu is open. A ref, not state: it is only read when Radix requests an
-  // open, so changing it never needs a re-render.
-  const suppressedUntil = useRef(0);
-  useEffect(() => {
-    if (menuOpen) {
-      setWantsOpen(false);
-      suppressedUntil.current = Number.POSITIVE_INFINITY;
-    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
-      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
-    }
-  }, [menuOpen]);
-  return {
-    open: wantsOpen && !menuOpen,
-    onOpenChange: (next: boolean) =>
-      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
-    triggerProps: {
-      onPointerEnter: () => {
-        if (!menuOpen) suppressedUntil.current = 0;
-      },
-    },
-  } as const;
 }
 
 /**
@@ -365,7 +379,7 @@ export const ComposerHarnessTrigger = forwardRef<
       aria-label={label}
       aria-busy={loading || undefined}
       className={cn(
-        "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
+        "h-auto min-h-8 mobile-touch-target min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
       )}
       {...props}

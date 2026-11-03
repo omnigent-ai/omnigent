@@ -10,9 +10,8 @@ Design notes:
 
 * **Source of truth is the DB.** :meth:`ScheduledTaskScheduler.start` loads every
   active task via ``store.list_active_all_workspaces()`` and arms a timer for
-  each. There is no in-memory schedule state beyond the live timers. Missed
-  fires (server was down) are **not** replayed — only the next future occurrence
-  is armed.
+  each, preserving route updates made during the load. Missed fires (server
+  was down) are **not** replayed — only the next future occurrence is armed.
 * **Timer overlap policy is SKIP.** If an ``on_fire`` callback for the same job
   is still running when the next tick arrives, the tick is dropped. The fire
   path also tracks its own longer-running session creation work.
@@ -27,6 +26,7 @@ tests can drive the scheduler with a fake clock and manual timer firing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -131,6 +131,7 @@ class ScheduledTaskScheduler:
         self._cancel_call = cancel_call or _default_cancel_call
         self._jobs: dict[_JobKey, _Job] = {}
         self._started = False
+        self._startup_changes: set[str] | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -145,21 +146,34 @@ class ScheduledTaskScheduler:
         if self._started:
             _logger.debug("scheduler: start() called but already started; ignoring")
             return
-        for task in self._store.list_active_all_workspaces():
-            try:
-                self._register(task)
-            except RRuleValidationError as exc:
-                _logger.warning(
-                    "scheduler: skipping task %s with invalid rrule %r: %s",
-                    task.id,
-                    task.rrule,
-                    exc,
-                )
-        self._started = True
-        _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
+        changed: set[str] = set()
+        self._startup_changes = changed
+        try:
+            tasks = await asyncio.to_thread(self._store.list_active_all_workspaces)
+            if self._startup_changes is not changed:
+                return  # stop() invalidated this load.
+            for task in tasks:
+                # Route mutations already updated the timers while the read was pending.
+                if task.id in changed:
+                    continue
+                try:
+                    self._register(task)
+                except RRuleValidationError as exc:
+                    _logger.warning(
+                        "scheduler: skipping task %s with invalid rrule %r: %s",
+                        task.id,
+                        task.rrule,
+                        exc,
+                    )
+            self._started = True
+            _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
+        finally:
+            if self._startup_changes is changed:
+                self._startup_changes = None
 
     def stop(self) -> None:
         """Cancel every armed timer and drop all jobs."""
+        self._startup_changes = None
         for job in self._jobs.values():
             if job.timer is not None:
                 self._cancel_call(job.timer)
@@ -189,6 +203,9 @@ class ScheduledTaskScheduler:
 
     def remove(self, task_id: str) -> None:
         """Cancel and forget a task's timer. Idempotent."""
+        # A removal must also suppress a snapshot timer that has not been armed yet.
+        if self._startup_changes is not None:
+            self._startup_changes.add(task_id)
         for key, job in list(self._jobs.items()):
             if job.task_id == task_id:
                 self._jobs.pop(key, None)

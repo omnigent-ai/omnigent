@@ -3,6 +3,6 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.4"
+    "@earendil-works/pi-coding-agent": "1.3.0"
   }
 }
