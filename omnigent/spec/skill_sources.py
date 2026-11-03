@@ -104,6 +104,10 @@ class SkillSourceContext:
         Set by :func:`resolve_harness_skills` from the harness id. Gates the
         terminal-matching resolution (including config-home tiers)
         so it applies only to native harnesses, never the in-process SDK ones.
+    :param warnings: When not ``None``, providers append a user-facing note
+        for each source they could not read (for example a failed
+        ``codex plugin list``), so callers can show an incomplete catalog as
+        incomplete rather than empty.
     """
 
     roots: tuple[Path, ...]
@@ -113,6 +117,7 @@ class SkillSourceContext:
     claude_config_dir: Path | None = None
     codex_home: Path | None = None
     is_native: bool = False
+    warnings: list[str] | None = None
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -124,6 +129,7 @@ def skill_source_context_from_env(
     harness: str | None,
     skills_filter: str | list[str] = "all",
     bundle_dir: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> SkillSourceContext:
     """Use the same ambient harness configuration for host and runner discovery."""
     configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -142,6 +148,7 @@ def skill_source_context_from_env(
             Path(configured_claude_dir).expanduser() if configured_claude_dir else None
         ),
         codex_home=codex_home,
+        warnings=warnings,
     )
 
 
@@ -271,7 +278,11 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 
 def resolve_session_skills(
-    spec: AgentSpec, roots: tuple[Path, ...], bundle_dir: Path | None
+    spec: AgentSpec,
+    roots: tuple[Path, ...],
+    bundle_dir: Path | None,
+    *,
+    warnings: list[str] | None = None,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -281,7 +292,11 @@ def resolve_session_skills(
     seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
     harness = canonicalize_harness(spec.executor.harness_kind)
     ctx = skill_source_context_from_env(
-        roots=roots, harness=harness, skills_filter=spec.skills_filter, bundle_dir=bundle_dir
+        roots=roots,
+        harness=harness,
+        skills_filter=spec.skills_filter,
+        bundle_dir=bundle_dir,
+        warnings=warnings,
     )
     for skill in resolve_harness_skills(ctx, harness):
         if skill.name in seen:
@@ -883,7 +898,9 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
     cwd = ctx.roots[0] if ctx.roots else None
-    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
+    out.extend(
+        discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
+    )
     return out
 
 

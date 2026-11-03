@@ -155,7 +155,7 @@ async function startDesignBackend(tmpDir) {
         "  harness: openai-agents",
         "os_env:",
         "  type: caller_process",
-        `  cwd: ${JSON.stringify(tmpDir)}`,
+        "  cwd: .",
         "  sandbox:",
         "    type: none",
         "",
