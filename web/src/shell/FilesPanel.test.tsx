@@ -19,6 +19,7 @@ import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFi
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
