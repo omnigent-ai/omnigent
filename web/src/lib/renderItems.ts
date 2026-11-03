@@ -230,6 +230,8 @@ export type Bubble =
        * the ordinary trailing-text heuristic cannot distinguish the two.
        */
       defaultExpanded?: boolean;
+      /** Temp id of the still-pending send this reply preview answers; it renders above. */
+      answersPendingSend?: string;
       /** Freshest epoch stamp in the group (latest activity) —
        *  server-stamped from history, client-stamped while live.
        *  Display-only. */
@@ -620,11 +622,16 @@ function isUserInputElicitationBlock(b: AnyBlock): boolean {
   return b.type === "elicitation" && isUserInputElicitation(b);
 }
 
+/** Temp id of the pending send a reply preview answers, if it streamed in before the ack. */
+function answersPendingSend(b: AnyBlock): string | undefined {
+  return b.type === "text_done" ? b.answersPendingSend : undefined;
+}
+
 /** Whether a later assistant bubble continues the turn started at `from`. */
 function hasAssistantContinuation(bubbles: Bubble[], from: number): boolean {
   for (let i = from + 1; i < bubbles.length; i += 1) {
     const next = bubbles[i]!;
-    if (next.kind === "assistant") return true;
+    if (next.kind === "assistant") return next.answersPendingSend === undefined;
     // A real user turn ends this one; system markers do not.
     if (next.kind === "user" && !isSystemUserContent(next.content)) return false;
     // Compaction / routing markers are mid-turn events — keep scanning.
@@ -1012,6 +1019,8 @@ function walkBubbles(
     // A question/plan card is the user's own answer point, so it takes a
     // bubble of its own even under the turn's response id.
     const groupOpenedOnUserInput = isUserInputElicitationBlock(b);
+    // The reply to a not-yet-acknowledged send starts that send's turn.
+    const groupAnswersSend = answersPendingSend(b);
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -1035,6 +1044,8 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      const curAnswersSend = answersPendingSend(cur);
+      if (curAnswersSend !== undefined && curAnswersSend !== groupAnswersSend) break;
       if (isSubagentActivityBlock(cur)) {
         // A notice stays in its turn's bubble until committed work from another
         // response follows it, then opens that response's bubble: a native fold
@@ -1141,6 +1152,7 @@ function walkBubbles(
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
       ...(groupCreatedAtS !== undefined ? { createdAtS: groupCreatedAtS } : {}),
+      ...(groupAnswersSend !== undefined ? { answersPendingSend: groupAnswersSend } : {}),
       ...(expandNextAssistantResponseId !== null &&
       groupBlocks.some((block) => block.ctx.responseId === expandNextAssistantResponseId)
         ? { defaultExpanded: true }

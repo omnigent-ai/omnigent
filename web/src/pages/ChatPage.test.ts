@@ -604,6 +604,16 @@ describe("mergePendingBubbles", () => {
     ]);
   });
 
+  it("splices a pending send above its early reply and keeps later sends last", () => {
+    const committed = [
+      userBubble("u1"),
+      assistantText("a1"),
+      { ...assistantText("reply"), answersPendingSend: "pend_1" },
+    ];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1"), userBubble("pend_2")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "a1", "pend_1", "reply", "pend_2"]);
+  });
+
   it("returns committed unchanged when there are no pending bubbles", () => {
     const committed = [userBubble("u1"), elicitationBubble("e1", "request")];
     const merged = mergePendingBubbles(committed, []);

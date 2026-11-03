@@ -275,9 +275,23 @@ function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
 }
 
 // Place optimistic pending user bubbles into the committed timeline, keeping
-// the prompt above a trailing REQUEST-phase card or create-time routing chip.
+// the prompt above its early reply preview, a trailing REQUEST-phase card or a
+// create-time routing chip.
 export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
   if (pending.length === 0) return committed;
+  for (let replyAt = 0; replyAt < committed.length; replyAt += 1) {
+    const reply = committed[replyAt]!;
+    if (reply.kind !== "assistant" || reply.answersPendingSend === undefined) continue;
+    const sendAt = pending.findIndex(
+      (bubble) => bubble.kind === "user" && bubble.itemId === reply.answersPendingSend,
+    );
+    if (sendAt === -1) continue;
+    return [
+      ...committed.slice(0, replyAt),
+      ...pending.slice(0, sendAt + 1),
+      ...mergePendingBubbles(committed.slice(replyAt), pending.slice(sendAt + 1)),
+    ];
+  }
   let insertAt = committed.length;
   while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;

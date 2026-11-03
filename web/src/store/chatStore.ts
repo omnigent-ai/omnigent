@@ -387,6 +387,7 @@ export function beginLocalConversation(
     initialDraft: { text, files: files ?? [] },
     createdAtS: Math.floor(Date.now() / 1000),
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+    sentWhileIdle: true,
   };
 
   // Seed the model/agent identity so the optimistic composer shows the selected
@@ -618,6 +619,8 @@ export interface PendingUserMessage {
    * it. Unset on snapshot-replayed entries.
    */
   sentMidTurn?: boolean;
+  /** Sent with no turn in flight; a reply preview streamed before its ack renders below it. */
+  sentWhileIdle?: boolean;
 }
 
 /**
@@ -2770,6 +2773,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
                 ...(sentMidTurn ? { sentMidTurn } : {}),
+                ...(!alreadyStreaming && !sentMidTurn ? { sentWhileIdle: true } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -6625,9 +6629,16 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: n
     if (at === -1) {
       const live = s.activeResponse;
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
+      // Deltas outrun the transcript, so the send that started this turn may
+      // still be pending; the preview must render below it.
+      const startingSend = s.pendingUserMessages.find((p) => p.sentWhileIdle && !p.initialDraft);
+      const preview = makeLiveTextBlock(itemId, delta, responseId, index);
       return {
         ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
+        blocks: [
+          ...s.blocks,
+          startingSend ? { ...preview, answersPendingSend: startingSend.tempId } : preview,
+        ],
       };
     }
     const existing = s.blocks[at]!;
@@ -7835,6 +7846,17 @@ function committedUserBlock(
   };
 }
 
+/** Append a promoted send, above any reply preview that streamed in before its ack. */
+function withPromotedSend(blocks: AnyBlock[], userBlock: UserMessageBlock): AnyBlock[] {
+  const tempId = userBlock.stableKey;
+  const replyAt =
+    tempId === undefined
+      ? -1
+      : blocks.findIndex((b) => b.type === "text_done" && b.answersPendingSend === tempId);
+  if (replyAt === -1) return [...blocks, userBlock];
+  return [...blocks.slice(0, replyAt), userBlock, ...blocks.slice(replyAt)];
+}
+
 interface RefetchRunnerBackedSessionStateOptions {
   /** Force the AP server to re-read runner-backed caches before returning. */
   refreshState?: boolean;
@@ -8747,8 +8769,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
               // stableKey = the optimistic bubble's temp id → the
               // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
+              blocks: withPromotedSend(
+                s.blocks,
                 committedUserBlock(
                   event.itemId,
                   content,
@@ -8756,7 +8778,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
-              ],
+              ),
             };
           }
         }
@@ -8783,8 +8805,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             pendingUserMessages: s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
+            blocks: withPromotedSend(
+              s.blocks,
               committedUserBlock(
                 event.itemId,
                 content,
@@ -8792,7 +8814,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? head.author,
                 head.createdAtS,
               ),
-            ],
+            ),
           };
         }
 

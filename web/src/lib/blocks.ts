@@ -394,6 +394,8 @@ export interface TextDone {
   previewInterrupted?: boolean;
   /** Last native chunk index rendered in this provisional preview. */
   streamIndex?: number;
+  /** UI-only: temp id of the unacknowledged send this provisional preview replies to. */
+  answersPendingSend?: string;
 }
 
 // ── Reasoning ────────────────────────────────────────────

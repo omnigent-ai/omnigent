@@ -36,6 +36,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
 import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
+import { buildPendingBubbles, mergePendingBubbles } from "@/components/chat/chatBubbleParts";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
@@ -17218,6 +17219,177 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
     // m1 committed (ci_1) + m2 provisional (live:m2).
     expect(dones.map((b) => b.ctx.itemId)).toEqual(["ci_1", "live:m2"]);
+
+    controller.abort();
+  });
+
+  /** Role and text of each bubble in the order the transcript renders them. */
+  function renderedTranscript(): { role: string; text: string }[] {
+    const state = useChatStore.getState();
+    const bubbles = mergePendingBubbles(
+      buildBubbles(state.blocks, state.activeResponse),
+      buildPendingBubbles(state.pendingUserMessages, null),
+    );
+    return bubbles.map((bubble) => {
+      if (bubble.kind === "user") {
+        const text = bubble.content.map((block) => ("text" in block ? block.text : "")).join("");
+        return { role: "user", text };
+      }
+      if (bubble.kind === "assistant") {
+        const text = bubble.items.map((item) => (item.kind === "text" ? item.text : "")).join("");
+        return { role: "assistant", text };
+      }
+      return { role: bubble.kind, text: "" };
+    });
+  }
+
+  it.each([
+    ["the first turn", [], []],
+    [
+      "a later turn",
+      [
+        userMessage("resp_prev", "earlier question"),
+        assistantMessage("resp_prev", "earlier answer"),
+      ],
+      [
+        { role: "user", text: "earlier question" },
+        { role: "assistant", text: "earlier answer" },
+      ],
+    ],
+  ])(
+    "keeps the question above a reply preview that arrives before its ack on %s",
+    async (_label, history, renderedHistory) => {
+      useChatStore.setState({
+        conversationId: "conv_live_order",
+        blocks: itemsToBlocks(history),
+        isNativeTerminalSession: true,
+        abortController: new AbortController(),
+      });
+      const { sink, controller } = startPump("conv_live_order");
+      await useChatStore.getState().send("new question", "agent_xyz");
+      const expected = [
+        ...renderedHistory,
+        { role: "user", text: "new question" },
+        { role: "assistant", text: "new answer" },
+      ];
+
+      sink.push(
+        sse("session.status", {
+          conversation_id: "conv_live_order",
+          status: "running",
+          response_id: null,
+        }),
+      );
+      sink.push(nativeDelta("m_new", 0, "new answer", true));
+      await tick();
+      expect(renderedTranscript()).toEqual(expected);
+
+      sink.push(
+        sse("session.input.consumed", {
+          data: {
+            item_id: "item_new_user",
+            type: "message",
+            data: { role: "user", content: [{ type: "input_text", text: "new question" }] },
+          },
+        }),
+      );
+      await tick();
+      expect(renderedTranscript()).toEqual(expected);
+
+      sink.push(messageDone("ci_new", "resp_new", "new answer", "m_new"));
+      await tick();
+      expect(renderedTranscript()).toEqual(expected);
+
+      controller.abort();
+    },
+  );
+
+  it.each([
+    ["sent by the client", false],
+    ["accepted at create", true],
+  ])(
+    "keeps a new session's first message above an early reply preview when %s",
+    async (_label, initialInputAccepted) => {
+      seedSession("conv_live_order_new");
+      const { tempConvId, pendingMsgTempId } = beginLocalConversation("new question", undefined)!;
+      hydrateLocalConversation(
+        tempConvId,
+        "conv_live_order_new",
+        "agent_xyz",
+        "new question",
+        undefined,
+        pendingMsgTempId,
+        null,
+        () => {},
+        undefined,
+        undefined,
+        initialInputAccepted,
+      );
+      await tick();
+      await tick();
+      useChatStore.setState({ isNativeTerminalSession: true });
+      const { sink, controller } = startPump("conv_live_order_new");
+      const expected = [
+        { role: "user", text: "new question" },
+        { role: "assistant", text: "new answer" },
+      ];
+
+      sink.push(nativeDelta("m_first", 0, "new answer", true));
+      await tick();
+      expect(renderedTranscript()).toEqual(expected);
+
+      sink.push(
+        sse("session.input.consumed", {
+          data: {
+            item_id: "item_first_user",
+            type: "message",
+            data: { role: "user", content: [{ type: "input_text", text: "new question" }] },
+          },
+        }),
+      );
+      await tick();
+      expect(renderedTranscript()).toEqual(expected);
+
+      controller.abort();
+    },
+  );
+
+  it("keeps a message sent during the turn below the early reply preview", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_order_mid",
+      blocks: [],
+      isNativeTerminalSession: true,
+      abortController: new AbortController(),
+    });
+    const { sink, controller } = startPump("conv_live_order_mid");
+    await useChatStore.getState().send("first question", "agent_xyz");
+    await useChatStore.getState().send("follow-up", "agent_xyz");
+
+    sink.push(
+      sse("session.status", {
+        conversation_id: "conv_live_order_mid",
+        status: "running",
+        response_id: null,
+      }),
+    );
+    sink.push(nativeDelta("m_1", 0, "first answer", true));
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: "item_first_user",
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "first question" }] },
+        },
+      }),
+    );
+    sink.push(nativeDelta("m_2", 0, " continued", true));
+    await tick();
+
+    expect(renderedTranscript()).toEqual([
+      { role: "user", text: "first question" },
+      { role: "assistant", text: "first answer continued" },
+      { role: "user", text: "follow-up" },
+    ]);
 
     controller.abort();
   });
