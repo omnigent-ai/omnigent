@@ -40,6 +40,7 @@ from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -890,23 +891,82 @@ def _claude_agent_deps(
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_becomes_terminal_launch_args() -> None:
-    """A Claude task's permission_mode fires as the runner's --permission-mode args."""
+@pytest.mark.parametrize(
+    ("harness", "mode", "args", "bypass"),
+    [
+        ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
+        (
+            "codex-native",
+            "full-access",
+            ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+            False,
+        ),
+        (
+            "codex-native",
+            "read-only",
+            ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+            False,
+        ),
+        ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
+        ("cursor-native", "auto-review", ["--auto-review"], False),
+        ("cursor-native", "plan", ["--mode", "plan"], False),
+        ("cursor-native", "ask", ["--mode", "ask"], False),
+        ("cursor-native", "yolo", ["--yolo"], False),
+        ("antigravity-native", "skip", ["--dangerously-skip-permissions"], False),
+        ("devin-native", "normal", None, False),
+        ("devin-native", "accept-edits", ["--permission-mode", "accept-edits"], False),
+        ("devin-native", "smart", ["--permission-mode", "smart"], False),
+        ("devin-native", "dangerous", ["--permission-mode", "dangerous"], False),
+    ],
+)
+async def test_permission_mode_launch_options(
+    harness: str, mode: str, args: list[str] | None, bypass: bool
+) -> None:
+    task = _task(permission_mode=mode)
+    deps = _claude_agent_deps(FakeScheduledTaskStore(), FakeConversationStore(), harness=harness)
+
+    launch_args, labels = await fire_mod._permission_mode_launch_options(deps, task)
+
+    assert launch_args == args
+    assert labels == ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"} if bypass else {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode", "args", "bypass"),
+    [
+        ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
+        ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
+    ],
+)
+async def test_permission_mode_becomes_terminal_launch_args(
+    harness: str,
+    mode: str,
+    args: list[str] | None,
+    bypass: bool,
+) -> None:
+    """Each saved permission choice reaches its native launch representation."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        _claude_agent_deps(store, conv_store, harness=harness),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
     await _drain()
 
     assert len(conv_store.created) == 1
-    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+    assert conv_store.created[0]["terminal_launch_args"] == args
+
+    assert conv_store.created[0]["labels"].get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == (
+        "1" if bypass else None
+    )
 
 
 @pytest.mark.asyncio
@@ -930,28 +990,28 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_omitted_for_non_claude_agent() -> None:
-    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
-
-    The injection is harness-gated fail-safe: even if a permission_mode somehow
-    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
-    (which would break the launch) — it launches with the agent's own default.
-    """
+async def test_incompatible_permission_mode_fails_without_session() -> None:
+    """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
 
-    async def _launch(conv: Any, task: Any) -> None:
-        return None
+    launch = AsyncMock()
 
     on_fire = build_on_fire(
         _claude_agent_deps(store, conv_store, harness="codex-native"),
-        launch_dispatch=_launch,
+        launch_dispatch=launch,
     )
     await on_fire(0, "task_1")
     await _drain()
 
-    assert len(conv_store.created) == 1
-    assert conv_store.created[0]["terminal_launch_args"] is None
+    launch.assert_not_awaited()
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "permission_mode_unsupported"
+    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
+    assert "Edit the automation" in store.runs[0]["error"]
+    assert store.runs[0]["conversation_id"] is None
 
 
 def _effort_agent_deps(
@@ -1238,8 +1298,9 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
         return None
 
-    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
+    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
         captured["agent_revision"] = kwargs.get("agent_revision")
+        return sessions_routes._SessionEventDispatchResult(item_id="item", pending_id=None)
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -1287,8 +1348,9 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
 
     async def _dispatch_session_event_to_runner(
         session_id: str, conv: Any, event: SessionEventInput, *args: Any, **kwargs: Any
-    ) -> None:
+    ) -> sessions_routes._SessionEventDispatchResult:
         sent.append(event)
+        return sessions_routes._SessionEventDispatchResult(item_id="item", pending_id=None)
 
     monkeypatch.setattr(
         sessions_routes, "_ensure_runner_session_initialized", _ensure_runner_session_initialized
@@ -1882,6 +1944,44 @@ async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_managed_sandbox_permission_resolution_failure_prevents_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(execution_target="managed_sandbox", permission_mode="read-only")}
+    )
+    cache = FakeAgentCache()
+
+    def fail_load(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError("agent cache directory is inaccessible")
+
+    monkeypatch.setattr(cache, "load", fail_load)
+    launch = AsyncMock()
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+            agent_cache=cache,
+            sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+        ),
+        launch_dispatch=launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    launch.assert_not_awaited()
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "permission_harness_unresolved"
+    assert "Cannot resolve the agent's harness" in store.runs[0]["error"]
+    assert "Restore access to the agent and retry" in store.runs[0]["error"]
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_managed_sandbox_dispatch_failure_records_one_failed_run() -> None:
     """A managed dispatch failure records exactly one failed run."""
     conv_store = FakeConversationStore()
@@ -1925,9 +2025,21 @@ async def _drain_managed_launches() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("launch_outcome", ["bound", "tracker_failed", "raised"])
+@pytest.mark.parametrize(
+    ("launch_outcome", "workspace", "expected_repositories"),
+    [
+        ("bound", None, []),
+        ("tracker_failed", None, []),
+        ("raised", None, []),
+        ("bound", "https://github.com/example/runtime", ["https://github.com/example/runtime"]),
+        ("bound", "/home/me", []),
+    ],
+)
 async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
-    monkeypatch: pytest.MonkeyPatch, launch_outcome: str
+    monkeypatch: pytest.MonkeyPatch,
+    launch_outcome: str,
+    workspace: str | None,
+    expected_repositories: list[str],
 ) -> None:
     """A managed fire saves its prompt before provisioning; a failed launch fails the run."""
     from omnigent.server.managed_hosts import ManagedLaunchTracker
@@ -1950,11 +2062,15 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     direct_dispatch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
     monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", direct_dispatch)
-    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(execution_target="managed_sandbox", workspace=workspace)}
+    )
+    conversations = FakeConversationStore()
     on_fire = build_on_fire(
         _deps(
             store,
             sandbox_config=config,
+            conversation_store=conversations,
             managed_launches=ManagedLaunchTracker(),
             startup_inputs=startup,
         )
@@ -1977,7 +2093,10 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
         assert call.kwargs["sandbox_config"] is config
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
-        assert call.kwargs["repos"] == ()
+        assert [repo.url for repo in call.kwargs["repos"]] == expected_repositories
+    assert len(conversations.created) == 2
+    for created in conversations.created:
+        assert fire_mod.read_managed_repo_workspaces(created["labels"]) == expected_repositories
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
     # The saved prompt is delivered by the host's replica, never directly here.
     direct_dispatch.assert_not_awaited()
@@ -2707,15 +2826,21 @@ async def test_a_sandbox_task_continues_only_a_session_on_its_own_host(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_exists", [False, True])
+@pytest.mark.parametrize(
+    ("host_exists", "repository"),
+    [(False, None), (True, None), (True, "https://github.com/example/runtime")],
+)
 async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
-    monkeypatch: pytest.MonkeyPatch, host_exists: bool
+    monkeypatch: pytest.MonkeyPatch, host_exists: bool, repository: str | None
 ) -> None:
     """An existing host, left by a reset session, gets a new sandbox, not a second host row."""
     from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, ManagedLaunchTracker
     from omnigent.server.routes import sessions
 
-    task = _sandbox_continue_task()
+    task = _sandbox_continue_task(
+        workspace=repository,
+        last_run_conversation_id="conv_prev" if repository else None,
+    )
     own = continued_sandbox_host_id(task.id, task.workspace_id)
     existing = _FakeHost(own, "local", sandbox_provider="agent_sandbox")
 
@@ -2724,7 +2849,14 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
     managed_launch = AsyncMock(side_effect=launch)
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
-    conv_store = FakeConversationStore()
+    conv_store = _ExistingConversationStore()
+    if repository:
+        earlier = _continued_session(
+            host_id=own,
+            workspace="/sandbox/ws",
+            labels=fire_mod.managed_repo_labels(["https://github.com/example/universe"]),
+        )
+        conv_store.existing[earlier.id] = earlier
     store = FakeScheduledTaskStore(rows={"task_1": task})
     on_fire = build_on_fire(
         _deps(
@@ -2742,6 +2874,7 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
     await _drain_managed_launches()
 
     [call] = managed_launch.await_args_list
+    assert [repo.url for repo in call.kwargs["repos"]] == ([repository] if repository else [])
     assert call.kwargs["host_id"] == own
     assert call.kwargs["relaunch_host"] is (existing if host_exists else None)
     # A relaunch keeps routing the sandbox by the task's host id.
@@ -2750,16 +2883,22 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,
+    repository: str | None,
 ) -> None:
     """After a reset, the next session runs on the same sandbox, woken like a user message."""
     from omnigent.server.routes import sessions
 
-    task = _sandbox_continue_task(last_run_conversation_id="conv_prev")
+    task = _sandbox_continue_task(last_run_conversation_id="conv_prev", workspace=repository)
     own = continued_sandbox_host_id(task.id, task.workspace_id)
     conv_store = _ExistingConversationStore(
-        _continued_session(host_id=own, workspace="/sandbox/ws")
+        _continued_session(
+            host_id=own,
+            workspace="/sandbox/ws",
+            labels=fire_mod.managed_repo_labels([repository] if repository else []),
+        )
     )
     managed_launch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
@@ -2780,6 +2919,29 @@ async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_work
     assert [conv.host_id for conv in launched] == [own]
     managed_launch.assert_not_awaited()
     assert [run["status"] for run in store.runs] == ["running"]
+
+    assert fire_mod.read_managed_repo_workspaces(created["labels"]) == (
+        [repository] if repository else []
+    )
+    if repository:
+        changed = replace(task, workspace="https://github.com/example/other")
+        deps = _deps(store, conversation_store=conv_store, host_store=hosts)
+        assert await fire_mod._continued_host_binding(deps, changed) is None
+        problem = await fire_mod.continued_session_problem(
+            task,
+            _continued_session(host_id=own, workspace="/sandbox/ws", labels=created["labels"]),
+            host_store=hosts,
+            permission_store=None,
+        )
+        assert problem is None
+        problem = await fire_mod.continued_session_problem(
+            changed,
+            _continued_session(host_id=own, workspace="/sandbox/ws", labels=created["labels"]),
+            host_store=hosts,
+            permission_store=None,
+        )
+        assert problem is not None
+        assert problem[1] == "continued_session_incompatible"
 
 
 @pytest.mark.asyncio

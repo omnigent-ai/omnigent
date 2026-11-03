@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnigent-client"
-version = "0.21.0.dev0"
+version = "0.22.0.dev0"
 description = "Python client SDK for the omnigent server API"
 readme = "README.md"
 license = "Apache-2.0"

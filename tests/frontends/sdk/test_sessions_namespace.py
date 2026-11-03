@@ -231,9 +231,8 @@ async def test_get_returns_typed_session() -> None:
         assert str(request.url) == "http://srv/v1/sessions/conv_abc"
         return httpx.Response(
             200,
-            json=_session_response_body(
-                items=[{"id": "msg_1", "type": "message"}],
-            ),
+            json=_session_response_body(items=[{"id": "msg_1", "type": "message"}])
+            | {"sandbox_status": {"stage": "failed", "error": "Launch failed"}},
         )
 
     ns, client = _make_namespace(handler)
@@ -247,6 +246,7 @@ async def test_get_returns_typed_session() -> None:
     # un-modeled per the namespace docstring).
     assert session.items == [{"id": "msg_1", "type": "message"}]
     assert session.updated_at == 1700000042
+    assert session.sandbox_status == {"stage": "failed", "error": "Launch failed"}
 
 
 @pytest.mark.asyncio
@@ -266,6 +266,7 @@ async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
         await client.aclose()
 
     assert session.updated_at is None
+    assert session.sandbox_status is None
 
 
 @pytest.mark.asyncio
@@ -1477,10 +1478,12 @@ async def test_list_preserves_host_id_on_rows() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_id", [None, "host_1"])
+@pytest.mark.parametrize(
+    "host_id,host_type", [(None, "external"), ("host_1", "external"), (None, "managed")]
+)
 @pytest.mark.parametrize("read_timeout", [0.05, 7200.0, None])
 async def test_create_from_agent_id_preserves_request_timeouts(
-    host_id: str | None, read_timeout: float | None
+    host_id: str | None, host_type: Literal["external", "managed"], read_timeout: float | None
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -1491,14 +1494,23 @@ async def test_create_from_agent_id_preserves_request_timeouts(
 
     ns, client = _make_namespace(handler)
     client.timeout = httpx.Timeout(connect=2, read=read_timeout, write=3, pool=4)
+    workspace = "https://github.com/example/repo" if host_type == "managed" else "/w"
     try:
-        await ns.create_from_agent_id("ag_abc", workspace="/w", host_id=host_id)
+        await ns.create_from_agent_id(
+            "ag_abc",
+            workspace=workspace,
+            host_id=host_id,
+            host_type=host_type,
+            sandbox_provider="modal" if host_type == "managed" else None,
+        )
     finally:
         await client.aclose()
 
-    expected_body: dict[str, object] = {"agent_id": "ag_abc", "workspace": "/w"}
+    expected_body: dict[str, object] = {"agent_id": "ag_abc", "workspace": workspace}
     if host_id is not None:
         expected_body["host_id"] = host_id
+    if host_type == "managed":
+        expected_body.update(host_type="managed", sandbox_provider="modal")
     assert captured["body"] == expected_body
     timeout = captured["timeout"]
     assert {key: timeout[key] for key in ("connect", "write", "pool")} == {

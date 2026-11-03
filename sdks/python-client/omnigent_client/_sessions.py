@@ -183,6 +183,7 @@ class Session:
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
     :param host_id: Host owning this session's runner, or ``None`` when unbound.
+    :param sandbox_status: Managed launch progress or failure details, when available.
     """
 
     id: str
@@ -205,6 +206,7 @@ class Session:
     external_session_id: str | None = None
     archived: bool = False
     host_id: str | None = None
+    sandbox_status: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -242,6 +244,7 @@ class Session:
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
             host_id=raw.get("host_id"),
+            sandbox_status=raw.get("sandbox_status"),
         )
 
 
@@ -457,6 +460,8 @@ class SessionsNamespace:
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -479,6 +484,10 @@ class SessionsNamespace:
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :param host_id: Launch the runner on this host; read timeout is at least
             3660 seconds. Longer or unlimited client timeouts are retained.
+        :param host_type: Use ``managed`` to provision a fresh sandbox host.
+            Its optional workspace is a repository URL instead of a host path.
+        :param sandbox_provider: Explicit managed sandbox provider, e.g. ``modal``.
+            Only valid with ``host_type="managed"``; validated by the server.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx status,
             or a host-targeted create times out before its outcome is known.
@@ -494,6 +503,10 @@ class SessionsNamespace:
             body["workspace"] = workspace
         if host_id is not None:
             body["host_id"] = host_id
+        if host_type != "external":
+            body["host_type"] = host_type
+        if sandbox_provider is not None:
+            body["sandbox_provider"] = sandbox_provider
         timeout = httpx.Timeout(self._http.timeout)
         if host_id is not None and timeout.read is not None:
             timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)

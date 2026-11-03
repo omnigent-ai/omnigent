@@ -22,6 +22,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
@@ -34,14 +35,13 @@ from omnigent.runner.identity import (
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
+from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
-    validate_permission_mode_agent_support,
     validate_session_agent,
     validate_session_model_metadata,
-    validate_session_permission_mode,
 )
 from omnigent.server.routes._sessions.helpers import (
     _read_state_entry,
@@ -49,8 +49,13 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.scheduled.harness_settings import (
+    validate_scheduled_permission_mode,
+    validate_scheduled_permission_support,
+)
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -64,7 +69,7 @@ _logger = logging.getLogger(__name__)
 # sandbox per fire, using the server's normal sandbox lifecycle.
 _VALID_EXECUTION_TARGETS = frozenset({"connected_host", "managed_sandbox"})
 _MANAGED_SANDBOX_WITH_HOST_MSG = (
-    "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id or workspace"
+    "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
 # A continued session cannot follow a change to these, so the next run starts a new one.
@@ -83,25 +88,19 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
-    # Native-harness permission mode (Claude Code), e.g. "acceptEdits". The fire
-    # path derives the runner's --permission-mode launch arg from it.
+    # Native-harness permission or execution mode; validated against the agent.
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)
     # "continue" sends every run's prompt into one session: ``session_id`` when
     # given, else the session the first run creates.
     session_mode: Literal["new", "continue"] = "new"
     session_id: str | None = Field(default=None, min_length=1)
-    # Optional: no PINNED host/workspace. When both are unset the fire path
-    # resolves the owner's online host at fire time and defaults the workspace to
-    # that host's home directory (a failed run is recorded if none is online) —
-    # it does not run hostless. ``min_length=1`` still rejects an empty string
-    # (the field is unset via omission / null, not ""), mirroring the PATCH
-    # request. PATCH still cannot null an already-set workspace/host_id (see
-    # ``UpdateScheduledTaskRequest``).
+    # Unpinned connected-host tasks resolve an online host and its home at fire time.
+    # Omission or null selects the default; empty strings are invalid.
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     # ``managed_sandbox`` runs the task in a fresh server-provisioned sandbox
-    # (no host_id/workspace); default keeps the connected-host behavior.
+    # (no host_id, optional repository URL); default keeps connected-host behavior.
     execution_target: str = "connected_host"
     # One of the caller's projects to file fired sessions into.
     project_id: str | None = None
@@ -110,9 +109,7 @@ class CreateScheduledTaskRequest(BaseModel):
     def _validate_create(self) -> CreateScheduledTaskRequest:
         if self.execution_target not in _VALID_EXECUTION_TARGETS:
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
-        if self.execution_target == "managed_sandbox" and (
-            self.host_id is not None or self.workspace is not None
-        ):
+        if self.execution_target == "managed_sandbox" and self.host_id is not None:
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if self.session_id is not None and self.session_mode != "continue":
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
@@ -150,17 +147,13 @@ class UpdateScheduledTaskRequest(BaseModel):
         """Keep the public update surface to active/paused connected-host runs."""
         if self.state is not None and self.state not in {"active", "paused"}:
             raise ValueError("state must be 'active' or 'paused'; use DELETE to delete a task")
-        if "workspace" in self.model_fields_set and self.workspace is None:
-            raise ValueError("workspace cannot be null")
         if "host_id" in self.model_fields_set and self.host_id is None:
             raise ValueError("host_id cannot be null")
         if self.execution_target is not None and self.execution_target not in (
             _VALID_EXECUTION_TARGETS
         ):
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
-        if self.execution_target == "managed_sandbox" and (
-            "host_id" in self.model_fields_set or "workspace" in self.model_fields_set
-        ):
+        if self.execution_target == "managed_sandbox" and "host_id" in self.model_fields_set:
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
@@ -417,8 +410,8 @@ def create_scheduled_tasks_router(
         host and a workspace are supplied, the workspace is validated against the
         host boundary here so a bad pin fails fast at create.
 
-        A ``managed_sandbox`` target has no host/workspace to validate — the fire
-        provisions a fresh sandbox — but the server must be able to launch one, so
+        A ``managed_sandbox`` target accepts a repository URL instead of a host
+        directory. The server must be able to launch a sandbox, so
         an unconfigured server rejects the task at create instead of failing every
         fire.
         """
@@ -434,10 +427,8 @@ def create_scheduled_tasks_router(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
         )
-        # Gate permission_mode on the resolved agent's harness (Claude Code
-        # only), mirroring the web dialog's capability gate. A non-Claude agent
-        # carrying a mode would break the fire (unknown --permission-mode flag).
-        await validate_permission_mode_agent_support(
+        # Each harness has its own permission vocabulary and launch flags.
+        await validate_scheduled_permission_support(
             permission_mode=permission_mode,
             agent=agent,
             agent_cache=agent_cache,
@@ -455,7 +446,12 @@ def create_scheduled_tasks_router(
                     "use a connected host or a default provider without profiles",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            return agent, None, validated_model, validated_effort
+            if workspace is not None:
+                try:
+                    parse_repo_workspace(workspace)
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            return agent, workspace, validated_model, validated_effort
         if host_id is not None:
             host_store = getattr(request.app.state, "host_store", None)
             if host_store is not None:
@@ -571,7 +567,7 @@ def create_scheduled_tasks_router(
         )
         await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
-        permission_mode = validate_session_permission_mode(body.permission_mode)
+        permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
@@ -648,6 +644,12 @@ def create_scheduled_tasks_router(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             raise
+        log_task_created(
+            task,
+            owner=owner,
+            source=request.headers.get("x-omnigent-automation-source"),
+            template=request.headers.get("x-omnigent-automation-template"),
+        )
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False
@@ -848,6 +850,14 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        legacy_workspace = (
+            existing.execution_target == "managed_sandbox"
+            and existing.workspace is not None
+            and not is_repo_workspace(existing.workspace)
+        )
+        if legacy_workspace:
+            # Legacy directory pins already run with the provider default.
+            existing = replace(existing, workspace=None)
         if body.rrule is not None:
             await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
@@ -865,7 +875,7 @@ def create_scheduled_tasks_router(
         new_copy: Agent | None = None
         if agent_changed:
             # A harness switch invalidates the per-agent settings stored beside
-            # it: a model id is provider-bound and permission_mode is Claude-only.
+            # it: model ids and permission vocabularies belong to the harness.
             # Clear whichever the caller did not resend so a switched task never
             # fires the new harness with the old one's flags.
             for stale in ("model_override", "reasoning_effort", "permission_mode"):
@@ -880,7 +890,7 @@ def create_scheduled_tasks_router(
             if "reasoning_effort" in fields:
                 fields["reasoning_effort"] = reasoning_effort
         if "permission_mode" in fields:
-            new_mode = validate_session_permission_mode(fields["permission_mode"])
+            new_mode = validate_scheduled_permission_mode(fields["permission_mode"])
             fields["permission_mode"] = new_mode
             # Gate a newly-SET mode on the (immutable) agent's harness. Clearing
             # to null needs no gate — the fire path injects nothing for null.
@@ -892,39 +902,42 @@ def create_scheduled_tasks_router(
                     permission_store=permission_store,
                     conversation_store=conversation_store,
                 )
-                await validate_permission_mode_agent_support(
+                await validate_scheduled_permission_support(
                     permission_mode=new_mode,
                     agent=agent,
                     agent_cache=agent_cache,
                 )
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
-        # Reject pinning a host/workspace on a managed-sandbox task rather than
-        # silently dropping it. The request model already rejects this when
-        # execution_target is explicitly in the PATCH; this also covers a PATCH
-        # that pins a field on an ALREADY-managed task (no execution_target sent),
-        # validating against the EFFECTIVE target.
-        if switching_to_managed and (
-            fields.get("host_id") is not None or fields.get("workspace") is not None
-        ):
+        if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
+            # Target-dependent validation retains the schema's original 422 response.
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("body",),
+                        "msg": "Value error, workspace cannot be null",
+                        "input": await request.json(),
+                        "ctx": {"error": ValueError("workspace cannot be null")},
+                    }
+                ]
+            )
+        # Check the effective target even when the PATCH omits execution_target.
+        if switching_to_managed and fields.get("host_id") is not None:
             raise OmnigentError(
                 _MANAGED_SANDBOX_WITH_HOST_MSG,
                 code=ErrorCode.INVALID_INPUT,
             )
+        target_changed = target_execution != existing.execution_target
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
-            # On a switch this runs the full create-time gauntlet against the NEW
-            # agent: existence + bindability, and the pinned workspace re-checked
-            # against that agent's os_env boundary (the boundary is per-agent, so
-            # a workspace valid for the old harness need not be valid here). A
-            # managed_sandbox target validates against no host/workspace (the fire
-            # provisions a fresh sandbox) and checks the server can launch one.
+            # Revalidate placement against the selected agent and execution target.
             agent, workspace, _, _ = await _validate_launch_inputs(
                 request,
                 owner=owner,
                 agent_id=target_agent_id,
                 host_id=None if switching_to_managed else fields.get("host_id", existing.host_id),
                 workspace=(
-                    None if switching_to_managed else fields.get("workspace", existing.workspace)
+                    fields.get("workspace", None if target_changed else existing.workspace)
                 ),
                 model_override=fields.get("model_override", existing.model_override),
                 reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
@@ -932,19 +945,17 @@ def create_scheduled_tasks_router(
                 execution_target=target_execution,
             )
             if switching_to_managed:
-                # A managed-sandbox task carries no pinned host or workspace. Clear
-                # BOTH (workspace via the store's explicit-null) so a later switch
-                # back to connected execution isn't rejected for "workspace without
-                # host", and the fire never binds a dead pin.
+                # A sandbox has no pinned host; its workspace is a repository URL.
                 fields["host_id"] = None
-                fields["workspace"] = None
-            elif "workspace" in fields:
+            if "workspace" in fields or target_changed:
                 fields["workspace"] = workspace
             # A picked session keeps the agent it runs, so the task takes no copy.
             if agent_changed and fields.get("session_id") is None:
                 bound = await _bind_agent(agent, owner_id)
                 fields["agent_id"] = bound.id
                 new_copy = bound if bound.id != agent.id else None
+        if legacy_workspace:
+            fields.setdefault("workspace", None)
         if "session_id" not in fields and any(
             name in fields and fields[name] != getattr(existing, name)
             for name in _SESSION_BOUND_FIELDS

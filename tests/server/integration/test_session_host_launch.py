@@ -35,6 +35,7 @@ from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.entities import Conversation
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -56,6 +57,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server.app import create_app
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes._host_launch import (
@@ -2553,11 +2555,13 @@ async def test_host_reports_runner_unknown_skips_connect_grace(
     assert launch_frame.binding_token, "relaunch frame should carry a fresh binding token"
 
 
+@pytest.mark.parametrize("scheduled", [False, True], ids=["interactive", "scheduled"])
 async def test_host_session_message_relaunches_offline_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    scheduled: bool,
 ) -> None:
     """A message to a host session whose runner is offline (but NOT
     deliberately stopped) asks the host to launch a fresh runner.
@@ -2589,19 +2593,33 @@ async def test_host_session_message_relaunches_offline_runner(
 
     # Runner offline (no runner client resolves) and the session was never
     # stopped: the message path must take the host-relaunch branch.
-    set_runner_client(None)
-    post_task = asyncio.create_task(
-        client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                },
-            },
+    occurrence = (
+        ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            trigger_key="cron:1000",
+            target="connected_host",
+            session_mode="continue",
         )
+        if scheduled
+        else None
     )
+    set_runner_client(None)
+    with scheduled_run_scope(occurrence):
+        post_task = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                },
+            )
+        )
     try:
         # The launch frame is sent (and the runner_id rotated) before the
         # route's 30s wait-for-runner loop, so a small budget suffices;
@@ -2621,6 +2639,7 @@ async def test_host_session_message_relaunches_offline_runner(
         "trigger host.launch_runner so the host can re-spawn a runner; none "
         "arrived — the relaunch branch in post_event did not fire"
     )
+    assert launch_frame.scheduled_run == occurrence
     # Relaunch forwards the session's canonical workspace (not garbage),
     # proving it read the persisted workspace off the conversation row.
     assert launch_frame.workspace == _WORKSPACE, (
@@ -4152,11 +4171,15 @@ async def test_relaunch_stops_the_superseded_runner(
     )
 
 
+@pytest.mark.parametrize(
+    "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
+)
 async def test_concurrent_relaunches_are_single_flight(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_after_rotation: bool,
 ) -> None:
     """Two racing messages to an offline-runner session launch ONE runner.
 
@@ -4188,11 +4211,11 @@ async def test_concurrent_relaunches_are_single_flight(
         observed_bindings.append(args[0].runner_id)
         if len(observed_bindings) == 2:
             both_callers_ready.set()
-        await both_callers_ready.wait()
+        if not snapshot_after_rotation:
+            await both_callers_ready.wait()
         return await launch_runner(*args, **kwargs)
 
-    # Both requests must snapshot the offline binding before either rotates it.
-    # With startup grace disabled, a later snapshot would request another launch.
+    # Race both old snapshots, or let the second caller read the in-flight binding.
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
 
     def _post() -> Any:
@@ -4207,11 +4230,14 @@ async def test_concurrent_relaunches_are_single_flight(
             },
         )
 
-    tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
+    tasks = [asyncio.create_task(_post())]
+    if not snapshot_after_rotation:
+        tasks.append(asyncio.create_task(_post()))
     launches: list[HostLaunchRunnerFrame] = []
     try:
-        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
-        assert observed_bindings == [session["runner_id"], session["runner_id"]]
+        if not snapshot_after_rotation:
+            await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+            assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
@@ -4224,6 +4250,13 @@ async def test_concurrent_relaunches_are_single_flight(
                 frame = decode_host_frame(output["text"])
                 if isinstance(frame, HostLaunchRunnerFrame):
                     launches.append(frame)
+                    if snapshot_after_rotation and len(launches) == 1:
+                        tasks.append(asyncio.create_task(_post()))
+                        await asyncio.wait_for(both_callers_ready.wait(), timeout=budget(10.0))
+                        assert observed_bindings == [
+                            session["runner_id"],
+                            token_bound_runner_id(frame.binding_token),
+                        ]
                     # Answer "launched" so the first flight's result wait
                     # returns and releases the relaunch lock — the second
                     # flight must then SHORT-CIRCUIT on the rotated binding
