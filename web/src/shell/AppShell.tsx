@@ -1493,9 +1493,13 @@ function AppShellImpl() {
     },
     [],
   );
+  // Mobile Back returns to the Content search drawer for files opened from it.
+  const fileOpenedFromContentSearchRef = useRef(false);
   const openFileViewer = useCallback(
-    (path: string, options?: OpenFileOptions) =>
-      guardFileNavigation(path, options, () => commitFileNavigation(path, options)),
+    (path: string, options?: OpenFileOptions) => {
+      fileOpenedFromContentSearchRef.current = false;
+      guardFileNavigation(path, options, () => commitFileNavigation(path, options));
+    },
     [guardFileNavigation, commitFileNavigation],
   );
 
@@ -1817,7 +1821,9 @@ function AppShellImpl() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
-    setFilesPanelOpen(true);
+    if (fileOpenedFromContentSearchRef.current) setContentSearchPanelOpen(true);
+    else setFilesPanelOpen(true);
+    fileOpenedFromContentSearchRef.current = false;
   }
 
   // Deselect the active file tab to reveal the scope view (Changed/All list
@@ -2905,7 +2911,7 @@ function AppShellImpl() {
                   </RenderErrorBoundary>
                 </MobilePanelDrawer>
               )}
-              {conversationId && railTabsAvailable["content-search"] && (
+              {conversationId && mobileViewport && railTabsAvailable["content-search"] && (
                 <MobilePanelDrawer
                   open={contentSearchPanelOpen}
                   title="Content search"
@@ -2915,7 +2921,10 @@ function AppShellImpl() {
                   <ContentSearchPanel
                     key={conversationId}
                     conversationId={conversationId}
-                    onFileSelect={openFileViewer}
+                    onFileSelect={(path, options) => {
+                      openFileViewer(path, options);
+                      fileOpenedFromContentSearchRef.current = true;
+                    }}
                   />
                 </MobilePanelDrawer>
               )}

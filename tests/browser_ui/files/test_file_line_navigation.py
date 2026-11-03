@@ -500,23 +500,27 @@ def test_content_search_opens_line_and_preserves_results(
     """The tab, picker and hotkey preserve search and line navigation."""
     seeded_session.features["workspace_content_search"] = True
     _seed_citation_file(page, seeded_session)
-    seeded_session.contract.json(
-        f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
-        {
-            "matches": [
-                {
-                    "path": _FILE_PATH,
-                    "line": 351,
-                    "column": 3,
-                    "text": _AFTER_LINES[350],
-                    "match_start": 2,
-                    "match_end": 9,
-                }
-            ],
-            "truncated": False,
-            "warning": None,
-        },
-    )
+
+    def serve_match(line: int) -> None:
+        seeded_session.contract.json(
+            f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
+            {
+                "matches": [
+                    {
+                        "path": _FILE_PATH,
+                        "line": line,
+                        "column": 3,
+                        "text": _AFTER_LINES[line - 1],
+                        "match_start": 2,
+                        "match_end": 9,
+                    }
+                ],
+                "truncated": False,
+                "warning": None,
+            },
+        )
+
+    serve_match(351)
     _open_monaco(page, seeded_session)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Content search", exact=True).click()
@@ -573,15 +577,31 @@ def test_content_search_opens_line_and_preserves_results(
     expect(search).to_have_value("")
 
     # Phones reach the same search from the session menu as a full-screen drawer.
+    # A different line proves the tap navigates rather than inheriting line=351.
+    serve_match(200)
     page.set_viewport_size({"width": 390, "height": 1000})
     page.get_by_role("button", name="Conversation actions", exact=True).click()
     page.get_by_role("menuitem", name="Content search", exact=True).click()
     drawer = page.get_by_test_id("content-search-panel-drawer")
-    drawer.get_by_role("searchbox", name="Search file contents").fill("changed")
-    drawer.get_by_role("searchbox", name="Search file contents").press("Enter")
-    drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 351").click()
+    drawer_search = drawer.get_by_role("searchbox", name="Search file contents")
+    drawer_search.fill("changed")
+    drawer_search.press("Enter")
+    drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 200").click()
     expect(drawer).to_have_attribute("data-state", "closed")
-    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
+    expect(page).to_have_url(re.compile(r"[?&]line=200(?:&|$)"))
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[199], "diff": False})
+
+    # Back from a result returns to the preserved search, not the Files drawer.
+    page.get_by_role("button", name="Close file viewer", exact=True).click()
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer_search).to_have_value("changed")
+    expect(drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 200")).to_be_visible()
+
+    # Widening hands the same query and results to the desktop rail.
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    rail.get_by_role("tab", name="Content search", exact=True).click()
+    expect(search).to_have_value("changed")
+    expect(rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 200")).to_be_visible()
 
 
 def test_source_citation_centers_last_loaded_line(

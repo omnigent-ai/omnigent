@@ -83,5 +83,5 @@ shortcut should be unavailable.
   runners or missing ripgrep show an error. Search has no host-daemon fallback.
 - Workspace file-sharing permissions apply. A shared conversation alone does not
   grant access to its file contents.
-- On mobile, tapping a result closes the drawer and opens the file viewer;
-  reopen **Content search** from the menu to return to the preserved search.
+- On mobile, tapping a result opens the file viewer; its back button returns
+  to the drawer with the preserved search.
