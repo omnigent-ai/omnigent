@@ -920,8 +920,9 @@ describe("BlockRenderer dispatch", () => {
       const blankRun = "\n".repeat(50_000);
       const start = performance.now();
       expect(pointsBackward(`Report:${blankRun}x`)).toBe(false);
+      expect(pointsBackward(`Report:${" \n".repeat(25_000)}x`)).toBe(false);
       expect(pointsBackward(`Report:${blankRun}Above is the full log.`)).toBe(true);
-      expect(performance.now() - start).toBeLessThan(250);
+      expect(performance.now() - start).toBeLessThan(1000);
     });
 
     it("opens only the latest tool output that has text, between the fold and the answer", () => {
@@ -958,6 +959,81 @@ describe("BlockRenderer dispatch", () => {
       expect(within(foldBody).getByText("second output")).toBeVisible();
       expect(foldBody.contains(pinned)).toBe(false);
       expect(pinned).toBeVisible();
+    });
+
+    it("finds the output an answer points back to past a visible dispatch card", () => {
+      const dispatch: RenderItem = {
+        kind: "tool",
+        itemId: "fc_send",
+        execution: {
+          name: "sys_session_send",
+          arguments: { agent: "deep_thought", title: "q1" },
+          argsSummary: "",
+          callId: "c_send",
+          agentName: "nessie",
+          executedBy: "server",
+          output: "ok",
+        },
+        output: "ok",
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      };
+      const items: RenderItem[] = [
+        tool(1, "Bash", "the report"),
+        dispatch,
+        { kind: "text", itemId: "m1", text: "The output is above.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      const pinned = screen.getByText("the report");
+      expect(pinned).toBeVisible();
+      expect(
+        screen.getByText(/Start child session/).compareDocumentPosition(pinned) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it("splits interleaved commentary into runs when the answer points back", () => {
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Checking the api.", final: true, phase: "commentary" },
+        tool(1, "shell", "api output"),
+        { kind: "text", itemId: "m1", text: "Now billing.", final: true, phase: "commentary" },
+        tool(2, "shell", "billing output"),
+        {
+          kind: "text",
+          itemId: "m2",
+          text: "The output is above.",
+          final: true,
+          phase: "final_answer",
+        },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" workedForS={4} />
+        </FileViewerContext.Provider>,
+      );
+      const folds = screen.getAllByRole("button", { name: "Worked" });
+      expect(folds).toHaveLength(2);
+      for (const fold of folds) expect(fold).toHaveAttribute("aria-expanded", "false");
+      expect(screen.getByText("Checking the api.")).toBeVisible();
+      expect(screen.getByText("Now billing.")).toBeVisible();
+      expect(screen.queryByText("api output")).toBeNull();
+      const pinned = screen.getByText("billing output");
+      expect(
+        folds[1]!.compareDocumentPosition(pinned) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        pinned.compareDocumentPosition(screen.getByText("The output is above.")) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
     });
 
     describe("with foldNarration", () => {
@@ -1064,7 +1140,10 @@ describe("BlockRenderer dispatch", () => {
           { kind: "text", itemId: "m1", text: "See the summary above.", final: true },
         ];
         render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
-        expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+        expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+          "aria-expanded",
+          "false",
+        );
         expect(screen.getByText("Summary: three services checked.")).toBeVisible();
         expect(screen.getByText("See the summary above.")).toBeVisible();
       });

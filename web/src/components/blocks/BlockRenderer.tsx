@@ -317,21 +317,13 @@ export function BlockRenderer({
     const rendered: ReactNode[] = [];
     for (const [segmentIndex, segment] of partition.segments.entries()) {
       if (segment.kind === "text") {
-        const referenced = referencedOutputTool(partition.segments[segmentIndex - 1], segment);
+        const referenced = referencedOutputTool(partition.segments, segmentIndex);
         // A copy, so the fold still holds the full trace in order. Its open panel
         // mounts tooltips, so it carries a provider for renders outside the app root.
         if (referenced) {
           rendered.push(
             <TooltipProvider key={`referenced-output:${keyFor(referenced, segment.startIndex)}`}>
-              <ToolCard
-                name={referenced.execution.name}
-                arguments={referenced.execution.arguments}
-                output={referenced.output}
-                state={referenced.state}
-                startedAt={referenced.startedAt}
-                duration={referenced.duration}
-                defaultOpen
-              />
+              {toolCard(referenced, undefined, true)}
             </TooltipProvider>,
           );
         }
@@ -627,12 +619,12 @@ export function pointsBackward(text: string): boolean {
 
 type ToolItem = Extract<RenderItem, { kind: "tool" }>;
 
-/** The latest output in the work run just before a message that points back to it. */
-function referencedOutputTool(
-  previous: TurnSegment | undefined,
-  segment: TurnSegment,
-): ToolItem | undefined {
-  if (previous?.kind !== "work" || segment.kind !== "text") return undefined;
+/** The latest output in the work run before a message that points back to it. */
+function referencedOutputTool(segments: TurnSegment[], index: number): ToolItem | undefined {
+  const segment = segments[index];
+  // Exempt cards stay visible, so the hidden output can sit above them.
+  const previous = segments.slice(0, index).findLast((earlier) => earlier.kind !== "exempt");
+  if (previous?.kind !== "work" || segment?.kind !== "text") return undefined;
   if (!segment.items.some((item) => item.kind === "text" && pointsBackward(item.text))) {
     return undefined;
   }
@@ -934,6 +926,21 @@ function isInProgressTool(item: RenderItem): boolean {
   return item.kind === "tool" && item.state === "input-available";
 }
 
+function toolCard(item: ToolItem, key?: string, defaultOpen = false): ReactNode {
+  return (
+    <ToolCard
+      key={key}
+      name={item.execution.name}
+      arguments={item.execution.arguments}
+      output={item.output}
+      state={item.state}
+      startedAt={item.startedAt}
+      duration={item.duration}
+      defaultOpen={defaultOpen}
+    />
+  );
+}
+
 function renderItem(
   item: RenderItem,
   index: number,
@@ -992,17 +999,7 @@ function renderItem(
           />
         );
       }
-      return (
-        <ToolCard
-          key={key}
-          name={item.execution.name}
-          arguments={item.execution.arguments}
-          output={item.output}
-          state={item.state}
-          startedAt={item.startedAt}
-          duration={item.duration}
-        />
-      );
+      return toolCard(item, key);
     case "native_tool":
       // Reuse the same tool card. Native tools are server-side
       // (provider-managed) so they're always "completed" by the
