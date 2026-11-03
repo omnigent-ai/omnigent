@@ -33,12 +33,6 @@ def send_and_wait(page: Page, text: str, reply: str) -> None:
     expect(page.locator(WORKING)).to_have_count(0, timeout=180_000)
 
 
-def run_slash_command(page: Page, typed: str, command: str) -> None:
-    """Type *typed* and pick *command* from the slash menu."""
-    page.get_by_placeholder(COMPOSER).fill(typed)
-    page.get_by_test_id(f"slash-menu-item-{command}").click()
-
-
 def session_mentions(base_url: str, session_id: str, text: str) -> bool:
     """Whether one of *session_id*'s newest messages contains *text*."""
     items = httpx.get(
@@ -67,7 +61,8 @@ def test_claude_sdk_clear_follows_a_new_empty_session(
     page.goto(f"{live_server}/c/{source_id}")
     send_and_wait(page, f"Say ack. {token}", "ack one")
 
-    run_slash_command(page, "/cle", "clear")
+    page.get_by_placeholder(COMPOSER).fill("/cle")
+    page.get_by_test_id("slash-menu-item-clear").click()
     expect(page).not_to_have_url(re.compile(f"/c/{source_id}$"), timeout=30_000)
     cleared_id = page.url.rsplit("/c/", 1)[1]
     expect(page.get_by_placeholder(COMPOSER)).to_be_visible()

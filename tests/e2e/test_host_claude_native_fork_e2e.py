@@ -891,18 +891,6 @@ def test_fork_native_source_into_sdk_carries_history(
             )
 
 
-def _plant_code_words(client: httpx.Client, *, session_id: str, words: list[str]) -> None:
-    """Plant each code word in its own turn and wait for Claude's ACK."""
-    for index, word in enumerate(words):
-        ack = f"ACK{index}"
-        _send_user_message(
-            client,
-            session_id=session_id,
-            text=f"Remember this code word for later: {word}. Reply with exactly: {ack}",
-        )
-        _poll_for_assistant_marker(client, session_id=session_id, marker=ack, timeout=180.0)
-
-
 def _wait_until_idle(client: httpx.Client, *, session_id: str) -> None:
     """Wait for *session_id*'s turn to end; the turn-end edge can trail the reply."""
     poll_until(
@@ -952,7 +940,12 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
     with _host_daemon(tmp_path, live_server):
         host_id = _online_host_id(http_client, timeout=30.0)
         source_id = _create_sdk_session_on_host(http_client, host_id=host_id, workspace=workspace)
-        _plant_code_words(http_client, session_id=source_id, words=[word])
+        _send_user_message(
+            http_client,
+            session_id=source_id,
+            text=f"Remember this code word for later: {word}. Reply with exactly: ACK0",
+        )
+        _poll_for_assistant_marker(http_client, session_id=source_id, marker="ACK0", timeout=180.0)
         # /clear refuses a running turn.
         _wait_until_idle(http_client, session_id=source_id)
 
