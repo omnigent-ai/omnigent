@@ -72,7 +72,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
-  agent chosen.
+  agent chosen, and a configured agent that picker curation
+  (`restrict_to_agent_names`, see `native-harnesses.md`) does not offer, which
+  New Chat reports as unavailable until the user picks an offered agent while
+  project settings keeps storing it.
 - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
   in both composers (Ctrl on every platform). The relevant menu briefly opens
   with the selected choice highlighted, preserving draft and input focus. In an
@@ -87,6 +90,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `permissions-command`: in Codex native sessions, `/permissions` opens the
+  composer's approval-mode menu instead of Codex's own popup. Other sessions,
+  including Claude Code (whose `/permissions` edits tool rules) and Devin, don't
+  list it and send it as text. States: non-owner or change in flight (error, no
+  menu), arguments rejected.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
@@ -156,6 +164,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
   dismissed or the missing setup is completed.
+- `sandbox-profiles`: participating providers add a [profile picker](sandbox-profiles.md)
+  to New session; Start waits for an authorized, current selection.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.
@@ -265,8 +275,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
   Design mode, and click an element. Type an instruction in the floating popup
   and use Send or Enter.
-- Change Settings → Always steer to choose whether busy-session follow-ups
-  queue or send immediately. Existing queued messages retain FIFO ordering.
+- Change Settings → Always steer (on by default) to choose whether
+  busy-session follow-ups queue or send immediately. Existing queued messages
+  retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 
@@ -363,6 +374,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
   example a server agent's name) keeps the dialog open with the server's reason.
+  Under picker curation (`restrict_to_agent_names`, see
+  `native-harnesses.md`) this New Chat entry point is absent: a curated
+  deployment offers no bundle import from New Chat.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
@@ -525,6 +539,12 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/lib/permissionModeCycle.test.ts`.
   `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
   page leaves the launch mode unchanged and does not prevent focus traversal.
+- **`permissions-command`:** with a real Codex CLI (nightly),
+  `tests/e2e_ui/chat/test_codex_native_permissions_command.py::test_permissions_command_opens_codex_approval_picker`.
+  `tests/browser_ui/chat/test_slash_menu.py::test_permissions_command_opens_the_codex_approval_picker`
+  checks that the menu closes after a pick. Gating, the owner check, arguments,
+  and the plain-text fallback on Claude Code, Devin, and claude-sdk are in
+  `web/src/pages/ChatPage.composer.test.tsx`.
 - **`plan-mode`:** with a real Codex CLI and a mock model, creation in Plan mode
   and subsequent composer toggles preserve the preset and agent instructions in
   `tests/e2e_ui/chat/test_codex_plan_mode_instructions.py::test_codex_plan_mode_creation_and_toggles_preserve_instructions`.
@@ -805,6 +825,9 @@ Other connection providers alone do not enable the managed MCP picker.
   creators, so Claude and Codex catalogs normally stay flat. A model whose IDs
   don't name a known creator (a router alias such as Pi's `radius/balanced`)
   lands in Other models; that is expected, not a missing catalog.
+- The Claude and Codex pickers here list the native harnesses' catalogs. A
+  `claude-sdk` or `codex` SDK worker has no picker of its own, so don't verify
+  its models here: see the smart routing note in the [index](./README.md#not-yet-mapped).
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.

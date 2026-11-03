@@ -82,6 +82,14 @@ the header menu), and each place is a separate entry point.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
+- `fork-sandbox-repositories`: edit the inherited repository list before cloning
+  onto a fresh sandbox. Add repositories from connected GitHub search or by URL,
+  remove repositories, and choose each branch independently. Providers that
+  support multiple repositories allow several; switching to a single-repository
+  provider keeps the selection visible and asks you to remove the extras.
+  Each repository starts on its current branch if pushed, otherwise its original
+  launch branch. A quiet note explains an unpushed branch's fallback; unavailable
+  source workspaces retain their original selections.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
@@ -90,6 +98,8 @@ the header menu), and each place is a separate entry point.
 - `fork-arclet`: an Arclet session forks only onto a new Arclet, the dialog's
   single host choice. Without one on the server, Fork stays disabled.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
+  Participating sandbox providers require a [profile selection](sandbox-profiles.md)
+  before submission, including branch clones.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
   itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
@@ -182,8 +192,11 @@ menu → **Open in grid** and choose the pane and direction. Each pane has its o
 transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes. Shared-session
-terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
+screen; drafts and terminal connections survive view changes.
+Render failures in one chat or terminal show **Try again** in that view while
+cell controls, the other view and neighboring sessions stay usable. Clear the
+fault and retry to recover.
+Shared-session terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
 their `/grid/<id>` URL on the same desktop browser. All sessions in the open grid
@@ -269,6 +282,14 @@ agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
+**Sandbox fork repositories:** from the header menu, sidebar row menu,
+right-click menu, or a message's Fork action, choose a sandbox destination. The
+repository list appears directly in the dialog with the source's repositories
+preselected. Search connected GitHub repositories or paste a repository URL,
+choose a branch for each, and remove any repositories the clone does not need.
+Removing every repository starts an empty sandbox. The phone header's Fork
+action offers the same choices.
+
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.
@@ -293,9 +314,12 @@ offers Display only.
 **Offline pull requests:** link PRs to a session, then stop its host. Open the
 Pull Requests tab from the Workspace rail or composer (desktop and mobile).
 On phones, Refresh and Link sit beside Close in the single drawer header;
-in details, the header title becomes the back-to-list button.
-The list retains stored titles and status pills; each row shows **Host offline**
-(or **Sandbox asleep**) instead of checks and Merge. Hover or focus that notice
+with multiple PRs, the details header title becomes the back-to-list button.
+A single PR opens its stored summary directly under **Pull Requests**, with its
+title, status, last sync time and reconnect guidance. Unlink is in the header.
+With multiple PRs, the list retains stored titles and status pills; each row
+shows **Host offline** (or **Sandbox asleep**) instead of checks and Merge.
+Hover or focus that notice
 for the last sync time and reconnect guidance. Click a row for its stored summary,
 then **All pull requests** to return. The row menu can open, copy, or unlink the
 PR while offline; linking needs the host. Reconnect and verify live checks and
@@ -333,7 +357,9 @@ Open a Canvas session outside the loaded sidebar pages to see its current host
 status and live session updates, including when the app is embedded.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
-in the chat; the dialog shows the command for this situation (for example
+in the chat. Its **Clone** tab uses the shared fork form, including the searchable
+sandbox-profile picker and source-profile default for participating providers.
+The dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, **Reconnect host** acts
 directly for this machine or a recognized Arca host; Arca's connect console
@@ -346,9 +372,19 @@ composer open: sending starts the same Arca reconnect, the message waits in the
 queue as **Waiting for host** without reaching the server, and it sends once the
 host is back. In a sandbox session (for example an Arclet) whose host is
 asleep, **Reconnect host** in the composer's host menu has the server wake the
-sandbox and start the agent without sending a message, in the browser too; a
-toast says when it's back online or why the wake failed. Reloading during the
-wake keeps its progress (for example "Provisioning sandbox…") in the chat.
+sandbox and start the agent without sending a message, in the browser too.
+The host status dot in the composer chip and its menu spins while the sandbox
+starts and turns green once it is online. A toast appears only when the wake
+fails or, after the server answers, three regular host health checks still
+find the host offline. Extra checks, such as the one run right after the
+server answers, don't count. The checks count only once the server stops
+reporting launch progress. If the server reports the launch failed or waiting
+on the user, the dot stops and Reconnect host returns. If the server is still
+reporting launch progress 5 minutes later, Reconnect host returns without a
+toast while the dot keeps spinning on the server's stage.
+Reloading during the wake keeps it spinning, with the stage (for example
+"Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
+stays in the menu then, in case that stage never finishes.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -508,6 +544,11 @@ plain `uv run pytest`, which starts a private server for the test.
   Layout combinations and malformed local storage have unit coverage in
   `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
   `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  Per-view render recovery, preserved neighboring drafts, usable cell controls
+  and independent chat/terminal retry have component coverage in
+  `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
+  exception into one chat or terminal, confirm the other views stay usable,
+  clear the fault, and choose **Try again** in the failed view.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
@@ -589,6 +630,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
   Its SDK-to-SDK target is a built-in agent that only the test's own server
   loads; run it with plain `uv run pytest` so that target is available.
+- **`fork-sandbox-repositories`, header, message, sidebar row, right-click, and phone header:**
+  `tests/browser_ui/chat/test_fork_sandbox_repositories.py::test_sandbox_fork_edits_multiple_repositories_and_branches`
+  runs without a repro instance using `uv run pytest <test>
+--browser-ui-skip-build --video=on --output=<evidence-directory>`.
+  Each entry checks current-branch prefilling and the unpushed-branch fallback.
+  Desktop and phone header variants remove a repo, search for another, choose
+  independent branches, and check the fork request and navigation. The message
+  variant submits the inherited selection and checks the history cutoff; sidebar
+  variants stop after opening and checking the prefill. The built SPA uses mocked
+  sandbox and GitHub responses and advertises support for editable fork workspaces;
+  this proves browser behavior and the submitted payload, not sandbox provisioning.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>
@@ -811,10 +863,13 @@ plain `uv run pytest`, which starts a private server for the test.
   and a message that waits for the host, not live SSH or the desktop's consent
   console.
 - **`reconnect`, asleep sandbox:**
-  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_asks_server_to_wake_asleep_host`
-  drives the real SPA and server with the session patched to an asleep host. It
-  checks that Reconnect host sends `retry_session` and shows the server's answer,
-  not a live sandbox resume.
+  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_wakes_asleep_sandbox_in_status_dot`
+  drives the real SPA and server with the session patched to an asleep Arclet
+  host. It checks that Reconnect host sends `retry_session`, spins the chip and
+  menu dots with no toast, and turns them green once `/health` reports the host
+  online. Sibling tests cover a failed wake's error toast and retry, a
+  session opened mid-wake, and a wake whose stage outlasts its limit. None
+  of them resume a live sandbox.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

@@ -158,6 +158,7 @@ function loadNavigationHarness({
   internalFeatures = false,
   cliPath = null,
   hostConnectResult = { ok: true },
+  serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
   network = null,
@@ -166,6 +167,10 @@ function loadNavigationHarness({
   notificationsSupported = false,
   oidc = {},
   acceptedSessions = new Set(),
+  deepLinks = null,
+  localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
+  clipboardWriteText = async () => {},
+  localHostNow = Date.now,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -415,7 +420,7 @@ function loadNavigationHarness({
       },
       { isSupported: () => notificationsSupported },
     ),
-    clipboard: { writeText: () => {} },
+    clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
@@ -477,7 +482,7 @@ function loadNavigationHarness({
       getDatabricksInternalFeaturesEnabled: () => internalFeatures,
       getManagedServerNames: () => managedServerNames,
     },
-    "./deepLink": {
+    "./deepLink": deepLinks ?? {
       parseOmnigentDeepLink: () => null,
       chooseDeepLinkStrategy: () => null,
     },
@@ -643,6 +648,14 @@ function loadNavigationHarness({
       stripCrossOriginOpenerHeaders: () => {},
       WEB_SCHEMES: new Set(),
     },
+    "./hostIdentity": {
+      ...require("../src/hostIdentity"),
+      createHostThisMachineChecker: () =>
+        require("../src/hostIdentity").createHostThisMachineChecker({
+          cli: localHostCli,
+          now: localHostNow,
+        }),
+    },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => (cliPath ? { path: cliPath } : null),
@@ -654,7 +667,7 @@ function loadNavigationHarness({
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => ({ ok: true }),
+      ensureServerAuth: async () => serverAuthResult,
       ensureHostConnected: async () => hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
@@ -683,7 +696,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -1923,6 +1936,8 @@ describe("Databricks auth mode wiring", () => {
         });
         t.after(h.cleanup);
         h.api.setReconnectDelaysMs(retries);
+        // Show the blocked-network hint right away so its wording can be asserted.
+        h.api.setBlockedHintDelayMs(0);
         if (failure) {
           // oxlint-disable-next-line no-await-in-loop
           await assert.rejects(h.api.loadServerUrl(h.win, workspace));
@@ -2557,7 +2572,7 @@ describe("browser permission wiring", () => {
     }
   });
 
-  it("guards each agent partition's document requests through its own Chromium session", async () => {
+  it("guards each agent partition's network requests through its own Chromium session", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
       const sessions = new Map();
@@ -2607,13 +2622,13 @@ describe("browser permission wiring", () => {
       const ses = sessions.get(partitions[0]);
       assert.deepEqual(
         // main.js runs in its own vm realm, so copy its arrays before deepEqual.
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
         [
-          ["request", ["mainFrame", "subFrame", "object"]],
-          ["sendHeaders", ["mainFrame", "subFrame", "object"]],
-          ["headers", ["mainFrame", "subFrame", "object"]],
+          ["request", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
+          ["sendHeaders", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
+          ["headers", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
         ],
-        "installed once per partition, for document requests only",
+        "installed once per partition, with every resource type reaching each network hook",
       );
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
@@ -2632,6 +2647,30 @@ describe("browser permission wiring", () => {
         requestHeaders: { "Cache-Control": "no-cache" },
       });
       assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }), { cancel: true });
+      ses.lookups.length = 0;
+      const worker = { webContentsId: 0, resourceType: "script" };
+      assert.deepEqual(
+        await decide("request", { ...worker, url: "http://169.254.169.254/worker.js" }),
+        { cancel: true },
+        "a worker without a view ID is guarded using its partition",
+      );
+      assert.deepEqual(await decide("sendHeaders", { ...worker, url: next, requestHeaders: {} }), {
+        requestHeaders: { "Cache-Control": "no-cache" },
+      });
+      assert.deepEqual(await decide("headers", { ...worker, url: next, ip: "127.0.0.1" }), {
+        cancel: true,
+      });
+      assert.deepEqual(await decide("request", { url: next, resourceType: "xhr" }), {
+        cancel: false,
+      });
+      assert.deepEqual(ses.lookups, ["example.com"], "subresources resolve DNS before sending");
+      ses.lookups.length = 0;
+      assert.deepEqual(
+        await decide("request", { url: "ws://lvh.me/live", resourceType: "webSocket" }),
+        { cancel: true },
+      );
+      assert.deepEqual(ses.lookups, ["lvh.me"], "WebSocket handshakes resolve DNS first");
+      ses.lookups.length = 0;
       ses.resolveProxy = async () => {
         throw new Error("proxy lookup failed");
       };
@@ -2649,9 +2688,9 @@ describe("browser permission wiring", () => {
       const otherSession = sessions.get(partitions[2]);
       assert.notEqual(otherSession, ses);
       assert.deepEqual(
-        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        "each independent session receives all document hooks",
+        otherSession.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
+        "each independent session receives all network hooks",
       );
       otherSession.dns["example.com"] = "127.0.0.1";
       ses.lookups.length = 0;
@@ -2695,6 +2734,30 @@ describe("setup clipboard IPC wiring", () => {
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
     );
+  });
+
+  it("settles the copy only after the asynchronous clipboard write", async (t) => {
+    const written = [];
+    let failureMessage = null;
+    const h = loadNavigationHarness({
+      clipboardWriteText: async (text) => {
+        await new Promise((resolve) => {
+          setImmediate(resolve);
+        });
+        if (failureMessage) throw new Error(failureMessage);
+        written.push(text);
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const copy = h.ipc.get("omnigent:copy-setup-text");
+    const event = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+
+    await copy(event, "https://host.example/ml/omnigents");
+    assert.deepEqual(written, ["https://host.example/ml/omnigents"]);
+
+    failureMessage = "clipboard unavailable";
+    await assert.rejects(copy(event, "https://other.example"), /clipboard unavailable/);
   });
 });
 
@@ -2744,7 +2807,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -3438,6 +3501,33 @@ describe("deep-link path join wiring (src/main.js)", () => {
 // serialized queue, the protocol registration, and the orchestrator — the
 // half no behavior test can see. Losing any silently reopens the readiness
 // race (macOS open-url before whenReady) or the single-instance funnel.
+describe("CLI deep-link handoff", () => {
+  for (const accepted of [true, false]) {
+    it(`navigates only after accepting the CLI request (${accepted})`, async () => {
+      const acknowledgments = [];
+      const h = loadNavigationHarness({
+        serverUrl: "http://localhost:6767/",
+        deepLinks: {
+          ...require("../src/deepLink"),
+          acceptCliDeepLink: async (raw) => {
+            acknowledgments.push(raw);
+            return accepted;
+          },
+        },
+      });
+      const url = "omnigent://localhost:6767/";
+      await h.api.handleDeepLink(url);
+      assert.deepEqual(acknowledgments, [url]);
+      assert.deepEqual(
+        h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+        accepted ? [{ channel: "omnigent:open-path", data: "/" }] : [],
+      );
+      assert.deepEqual(h.calls.loadURL, []);
+      h.api.disposeAuth();
+    });
+  }
+});
+
 describe("deep-link ingestion wiring (src/main.js)", () => {
   it("registers open-url with preventDefault + enqueueDeepLink as live code", () => {
     assert.match(
@@ -3764,6 +3854,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     );
     // Only network failures use the minute-long retries.
     assert.equal(h.api.reconnectSlowDelayMs(), 60_000);
+    assert.equal(h.api.blockedHintDelayMs(), 30_000);
   });
 
   const setupEvent = (h) => ({
@@ -3892,25 +3983,85 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, null);
   });
 
+  const unreachable = "Check your network connection.";
+  const blocked = "Databricks blocked this network. Connect from a network the workspace allows.";
   for (const event of ["resume", "unlock-screen"]) {
-    it(`starts the fast retries over on ${event}`, async (t) => {
+    // [renewal failure, overlay hint before the wake, overlay hints shown from the wake on]
+    for (const [failure, hint, sinceWake] of [
+      [() => new TypeError("fetch failed"), unreachable, [unreachable, unreachable]],
+      // Refusals after wake wait again before saying the network is blocked.
+      [
+        () => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+        blocked,
+        ["", "", blocked],
+      ],
+    ]) {
+      it(`starts the fast retries over on ${event} after "${failure().message}"`, async (t) => {
+        const h = browserHarness(t, [20], {
+          ensureSession: async () => {
+            throw failure();
+          },
+        });
+        h.api.setReconnectSlowDelayMs(60_000);
+        h.api.setBlockedHintDelayMs(300);
+        await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+        await until(() => h.calls.auth.length === 2, "the fast retry");
+        await until(() => h.overlay.hint === hint, "the hint before the wake");
+        // The next retry is a minute away.
+        assert.equal(h.calls.auth.length, 2);
+        const wakeShows = h.overlay.shows.length;
+        h.powerMonitor.emit(event);
+        assert.equal(h.overlay.hint, sinceWake[0]);
+        await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+        // The fast retry falls within any restarted wait; the hint returns once it ends.
+        await until(
+          () => h.overlay.shows.length >= wakeShows + sinceWake.length,
+          "the overlay after the retry",
+        );
+        assert.deepEqual(h.overlay.shows.slice(wakeShows), sinceWake);
+        assert.deepEqual(h.calls.loadFile, []);
+      });
+    }
+
+    it(`restarts a blocked-network wait still running on ${event}`, async (t) => {
       const h = browserHarness(t, [20], {
         ensureSession: async () => {
-          throw new TypeError("fetch failed");
+          throw Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
         },
       });
       h.api.setReconnectSlowDelayMs(60_000);
+      h.api.setBlockedHintDelayMs(600);
       await assert.rejects(h.api.loadServerUrl(h.win, workspace));
       await until(() => h.calls.auth.length === 2, "the fast retry");
-      // The next retry is a minute away.
-      await wait(60);
-      assert.equal(h.calls.auth.length, 2);
+      await wait(300);
+      assert.equal(h.overlay.hint, "");
+      const wokeAt = Date.now();
       h.powerMonitor.emit(event);
-      await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
-      assert.equal(h.overlay.hint, "Check your network connection.");
-      assert.deepEqual(h.calls.loadFile, []);
+      await until(() => h.overlay.hint === blocked, "the hint after the restarted wait");
+      // Not at the first refusal's deadline, about 300 ms after the wake.
+      assert.ok(Date.now() - wokeAt >= 590, `hint ${Date.now() - wokeAt} ms after ${event}`);
     });
   }
+
+  it("waits again for the blocked-network hint after an unreachable retry", async (t) => {
+    const failures = [
+      Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+      new TypeError("fetch failed"),
+      Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+    ];
+    // The unreachable stretch outlasts the first blocked wait.
+    const h = browserHarness(t, [10, 200, 60_000], {
+      ensureSession: async () => {
+        throw failures.shift();
+      },
+    });
+    h.api.setBlockedHintDelayMs(100);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await until(() => h.calls.auth.length === 3, "the second blocked retry");
+    await until(() => h.overlay.hint === blocked, "the blocked-network hint");
+    assert.deepEqual(h.overlay.shows, ["", unreachable, "", blocked]);
+    h.api.cancelReconnect(h.win);
+  });
 
   it("returns a failed deep link to its conversation", async (t) => {
     let first = true;
@@ -3927,35 +4078,62 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, null);
   });
 
-  it("stops on Cancel, Change Server, a new connection, or closing the window", async (t) => {
-    const cancelled = browserHarness(t, [40]);
-    const changed = browserHarness(t, [40]);
-    const connected = browserHarness(t, [40], {
-      expandWorkspace: async () => "http://127.0.0.1:1/",
+  // [failure, session renewal, start the reconnect, hint when stopped, Cancel's final message]
+  for (const [failure, ensureSession, start, hint, finalMessage] of [
+    [
+      "an unreachable page",
+      undefined,
+      (h, url) => failLoad(h, url),
+      unreachable,
+      "Couldn't reach Databricks. Check your network connection, then click Connect.",
+    ],
+    // Stopping during the blocked-network wait keeps its hint from showing later.
+    [
+      "an IP access list refusal",
+      async () => {
+        throw Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
+      },
+      (h) => h.api.loadServerUrl(h.win, workspace).catch(() => {}),
+      "",
+      "Databricks blocked this network. Connect from a network the workspace allows, then click Connect.",
+    ],
+  ]) {
+    it(`stops on Cancel, Change Server, a new connection, or closing the window after ${failure}`, async (t) => {
+      const cancelled = browserHarness(t, [40], { ensureSession });
+      const changed = browserHarness(t, [40], { ensureSession });
+      const connected = browserHarness(t, [40], {
+        expandWorkspace: async () => "http://127.0.0.1:1/",
+        ensureSession,
+      });
+      const closed = browserHarness(t, [40], { ensureSession });
+      const all = [cancelled, changed, connected, closed];
+      for (const h of all) h.api.setBlockedHintDelayMs(300);
+      closed.api.createWindow(workspace);
+      connected.api.registerIpc();
+      await wait(10);
+      const closedLoads = [...closed.calls.loadURL];
+      for (const h of [cancelled, changed, connected]) start(h, page);
+      start(closed, workspace);
+      await wait(10);
+      for (const h of all) assert.equal(h.overlay.hint, hint);
+      cancelled.overlay.cancel();
+      changed.api.loadSetupPage(changed.win);
+      void connected.ipc.get("omnigent:set-server-url")(
+        setupEvent(connected),
+        "http://127.0.0.1:1/",
+      );
+      closed.emitWindow("closed");
+      // Past both the next retry and the blocked-network wait.
+      await wait(350);
+      for (const h of all) assert.equal(h.overlay.hint, null);
+      for (const h of [cancelled, changed]) assert.deepEqual(h.calls.loadURL, []);
+      assert.deepEqual(connected.calls.loadURL, [["http://127.0.0.1:1/"]]);
+      // Only the window's own initial load ran, if its session allowed it.
+      assert.deepEqual(closed.calls.loadURL, closedLoads);
+      // Cancel shows the final message.
+      assert.deepEqual(setupParams(cancelled), { error: finalMessage, url: workspace });
     });
-    const closed = browserHarness(t, [40]);
-    closed.api.createWindow(workspace);
-    connected.api.registerIpc();
-    await wait(10);
-    for (const h of [cancelled, changed, connected]) failLoad(h);
-    failLoad(closed, workspace);
-    await wait(10);
-    cancelled.overlay.cancel();
-    changed.api.loadSetupPage(changed.win);
-    void connected.ipc.get("omnigent:set-server-url")(setupEvent(connected), "http://127.0.0.1:1/");
-    closed.emitWindow("closed");
-    await wait(70);
-    for (const h of [cancelled, changed, connected, closed]) assert.equal(h.overlay.hint, null);
-    for (const h of [cancelled, changed]) assert.deepEqual(h.calls.loadURL, []);
-    assert.deepEqual(connected.calls.loadURL, [["http://127.0.0.1:1/"]]);
-    // Only the window's own initial load ran.
-    assert.deepEqual(closed.calls.loadURL, [[workspace]]);
-    // Cancel shows the final message.
-    assert.deepEqual(setupParams(cancelled), {
-      error: "Couldn't reach Databricks. Check your network connection, then click Connect.",
-      url: workspace,
-    });
-  });
+  }
 
   it("does not retry credential failures", async (t) => {
     const h = browserHarness(t, [25], {
@@ -4043,17 +4221,23 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     ["the workspace redirects to login", loginRedirect],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
-      const { h, network } = await connected(t, [30, 30, 30]);
+      const { h, network } = await connected(t, Array(6).fill(40));
+      h.api.setBlockedHintDelayMs(100);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
       drop(h, network);
       await until(() => h.overlay.hint !== null, "the reconnecting overlay");
-      // The conversation stays underneath, no longer trusted.
-      assert.equal(h.overlay.hint, `${blocked}.`);
+      // The conversation stays underneath, no longer trusted, behind a hint-less overlay.
+      assert.equal(h.overlay.shows[0], "");
       assert.equal(h.api.windows.get(h.win).origin, null);
       assert.deepEqual(h.calls.loadFile, []);
-      // Connect, the blocked renewal, then one blocked background retry.
-      await until(() => network.sessionCreates === 3, "a blocked retry");
+      // Connect, the blocked renewal, then blocked background retries outlasting the wait.
+      // The first refusal's wait holds across them, so the hint comes during the fast retries.
+      await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
+      assert.ok(
+        network.sessionCreates >= 3 && network.sessionCreates < 8,
+        `${network.sessionCreates} session-creates before the hint`,
+      );
       network.verdict = "allow";
       await until(() => h.calls.loadURL.length === 2, "the reconnect");
       // Back on the page the user was on; setup never showed.
@@ -4073,6 +4257,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
     const { h, network } = await connected(t, [20]);
     h.api.setReconnectSlowDelayMs(20);
+    h.api.setBlockedHintDelayMs(20);
     h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
     network.verdict = "blocked";
     network.removeCookie();
@@ -4087,6 +4272,32 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(h.overlay.hint, null);
     assert.deepEqual(h.calls.loadFile, []);
     assert.equal(network.browserSignIns, 0);
+  });
+
+  it("shows the blocked-network hint when the wait ends, between retries", async (t) => {
+    const { h, network } = await connected(t, [60_000]);
+    h.api.setBlockedHintDelayMs(30);
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    assert.equal(h.overlay.hint, "");
+    await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
+    // Connect and the blocked renewal only: the next retry is a minute away.
+    assert.equal(network.sessionCreates, 2);
+    h.api.cancelReconnect(h.win);
+  });
+
+  it("drops the pending blocked-network hint once the reconnect succeeds", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    h.api.setBlockedHintDelayMs(400);
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    await wait(450);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.overlay.shows, [""]);
   });
 
   it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
@@ -4107,11 +4318,15 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       requestId: "connect",
     });
     assert.equal(result.reconnecting, true);
-    // Connect off the VPN puts the overlay over the setup page and restarts the loop.
+    // Connect off the VPN puts the overlay over the setup page and restarts the loop,
+    // saying right away that the network is blocked.
     assert.equal(h.overlay.hint, `${blocked}.`);
+    const sinceConnect = h.overlay.shows.length - 1;
     assert.equal(h.calls.loadFile.length, 1);
     // The loop restarted: another blocked background attempt follows Connect.
     await until(() => network.sessionCreates === 4, "a blocked retry after Connect");
+    await until(() => h.overlay.shows.length > sinceConnect + 1, "the retry's overlay");
+    assert.deepEqual(new Set(h.overlay.shows.slice(sinceConnect)), new Set([`${blocked}.`]));
 
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 2, "the reconnect");
@@ -4310,8 +4525,10 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     h.api.registerIpc();
     const registry = h.api.createBrowserRegistryForWindow(h.win);
     h.api.windows.get(h.win).browserRegistry = registry;
-    const context = h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId);
-    const eligible = h.browserRegistryDeps().isArcaAgentContext;
+    const context = h
+      .browserIpcDeps()
+      .getAgentContextForEvent({ sender: h.webContents }, { sourceHostId: hostId });
+    const eligible = h.browserRegistryDeps().allowsLocalhost;
     const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
@@ -4324,7 +4541,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);
     assert.equal(eligible(context), false);
     assert.equal(
-      eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
+      eligible(
+        h
+          .browserIpcDeps()
+          .getAgentContextForEvent({ sender: h.webContents }, { sourceHostId: hostId }),
+      ),
       false,
     );
   });
@@ -4728,7 +4949,24 @@ describe("onboarding runner IPC", () => {
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
     assert.equal(result.ok, false);
-    assert.match(result.error, /omnigent CLI was not found/);
+    assert.equal(result.errorMessage, "The omnigent CLI was not found.");
+    assert.equal(result.errorAction, "Install it or set its path.");
+    assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
+  });
+
+  it("passes separate authentication message and action fields to the setup page", async (t) => {
+    const errorMessage = "Sign-in to https://host.example/ml/omnigents didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const legacyError = `${errorMessage} ${errorAction}`;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: { ok: false, error: legacyError, errorMessage, errorAction },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(result), { ok: false, error: legacyError, errorMessage, errorAction });
   });
 
   // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
@@ -5178,6 +5416,32 @@ describe("find bar teardown (src/main.js)", () => {
     assert.doesNotThrow(() => bar.close());
     assert.equal(h.calls.focused, undefined);
   });
+
+  it("tells the page the bar opened, since the menu sends no page keydown", (t) => {
+    const { h } = openBar();
+    t.after(h.cleanup);
+    const opened = h.calls.progress.filter(({ channel }) => channel === "omnigent:find-opened");
+    assert.equal(opened.length, 1);
+  });
+
+  it("closes when the window switches conversation, not within one or in a subframe, under a mount", (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://omni.example/tenant/c/foo/c/alpha" });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = () => {};
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    h.webContents.emit(
+      "did-navigate-in-page",
+      "https://omni.example/tenant/c/foo/c/alpha?message=m1",
+      true,
+    );
+    h.webContents.emit("did-navigate-in-page", "https://embed.example/#tab", false);
+    assert.equal(bar.isDestroyed(), false);
+    h.webContents.emit("did-navigate-in-page", "https://omni.example/tenant/c/foo/c/beta", true);
+    assert.equal(bar.isDestroyed(), true);
+  });
 });
 
 describe("server names from the manifest", () => {
@@ -5404,6 +5668,31 @@ describe("SSH connect IPC", () => {
     });
   }
 
+  // On the remote machine, localhost is that machine; a LAN address may be reachable.
+  const reachCases = {
+    "a server on localhost": ["http://localhost:5190", false],
+    "a server on 127.0.0.1": ["http://127.0.0.1:6767", false],
+    "a server on [::1]": ["http://[::1]:6767", false],
+    "a server on another machine in the network": ["http://192.168.1.20:6767", true],
+  };
+  for (const [label, [serverUrl, connects]] of Object.entries(reachCases)) {
+    it(`${connects ? "connects" : "refuses before connecting"} for ${label}`, async (t) => {
+      const h = sshHarness(t, { serverUrl });
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+      const result = await h.ipc.get("omnigent:ssh-connect")(event, "devbox");
+
+      assert.equal(result.ok, connects);
+      assert.equal(h.calls.sshConnects.length, connects ? 1 : 0);
+      if (!connects) {
+        assert.equal(
+          result.error,
+          `devbox can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server devbox can reach, or, if devbox runs this server itself, run "omnigent host" there.`,
+        );
+      }
+    });
+  }
+
   it("gives no page a way to list the user's SSH hosts", (t) => {
     // Aliases can name internal machines, and the server page is untrusted.
     const h = sshHarness(t);
@@ -5411,6 +5700,70 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(
       [...h.ipc.keys()].filter((channel) => /ssh/i.test(channel)),
       ["omnigent:ssh-connect"],
+    );
+  });
+});
+
+describe("main-owned local host eligibility", () => {
+  it("denies local eligibility when the window loses its pinned origin or is destroyed", (t) => {
+    const h = loadNavigationHarness({ serverUrl: "https://server.example" });
+    t.after(h.cleanup);
+    h.api.createBrowserRegistryForWindow(h.win);
+    const eligible = h.browserRegistryDeps().allowsLocalhost;
+    const context = { hostIsThisMachine: true, sourceHostId: "local" };
+    assert.equal(eligible(context), true);
+    assert.equal(eligible({ ...context, revoked: true }), false);
+    h.api.windows.get(h.win).origin = null;
+    assert.equal(eligible(context), false);
+    h.api.windows.get(h.win).origin = "https://server.example";
+    h.win.isDestroyed = () => true;
+    assert.equal(eligible(context), false);
+  });
+
+  it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
+    let live = true;
+    let now = 0;
+    const serverUrl = "https://server.example";
+    const h = loadNavigationHarness({
+      serverUrl,
+      localHostNow: () => now,
+      localHostCli: {
+        readLocalHostId: () => "local",
+        liveDaemonRecordFor: (target) => {
+          assert.equal(target, serverUrl);
+          return live ? { host_id: "local" } : null;
+        },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const context = (opts) =>
+      h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, opts);
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: false })
+        .hostIsThisMachine,
+      true,
+    );
+    assert.equal(
+      context({ sourceHostId: "remote", sessionHostProtocol: 1, hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
+    );
+    assert.equal(
+      context({ sourceHostId: "local", hostIsThisMachine: true }).hostIsThisMachine,
+      false,
+    );
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: "1", hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
+    );
+    live = false;
+    now = 1000;
+    assert.equal(
+      context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
+        .hostIsThisMachine,
+      false,
     );
   });
 });

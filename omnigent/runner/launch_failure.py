@@ -24,6 +24,7 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
+    "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
@@ -207,6 +208,24 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+)
+
+
+# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
+# ``killall tmux`` run anywhere on the host stops that server too.
+TERMINAL_CLOSED_OUTSIDE_OMNIGENT = FailureDiagnosis(
+    title="Claude Code's terminal was closed outside Omnigent",
+    cause=(
+        "Claude Code's tmux session, or the tmux server running it, was ended and Omnigent "
+        "did not end it. A tmux command such as `tmux kill-session`, `tmux kill-server` or "
+        "`killall tmux`, or another tool on the host, closes it this way."
+    ),
+    remediation=(
+        "Send your message again to relaunch Claude Code. Don't use `killall tmux` or kill "
+        "tmux sessions you didn't start; give your own tmux its own server with "
+        "`tmux -L <name>` and stop it with `tmux -L <name> kill-server`."
+    ),
+    category=ErrorCategory.USER,
 )
 
 
@@ -622,6 +641,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
     ),
+    "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

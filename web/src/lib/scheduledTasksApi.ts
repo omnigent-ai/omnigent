@@ -49,7 +49,7 @@ export interface ScheduledTask {
   modelOverride: string | null;
   reasoningEffort: string | null;
   /**
-   * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
+   * Harness-specific permission or execution mode, e.g. `acceptEdits`, or `null`
    * to use the agent's configured default. The server derives the runner's
    * `--permission-mode` launch arg from it at fire time.
    */
@@ -126,7 +126,7 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
-  /** Native-harness permission mode (Claude Code); omit for the agent default. */
+  /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
