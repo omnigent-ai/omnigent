@@ -5,10 +5,11 @@
 // "is the runner asleep vs. is the host down vs. is this not host-bound"
 // inline at every render site.
 
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
-import type { Session } from "@/lib/types";
+import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
+import type { SandboxStatus, Session } from "@/lib/types";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 
 /**
@@ -225,6 +226,55 @@ export function useSessionLiveness(
   if (prev.current !== null && livenessEqual(prev.current, raw)) return prev.current;
   prev.current = raw;
   return raw;
+}
+
+/**
+ * Whether the composer host chip should say the open session is connecting.
+ *
+ * Follows `starting` liveness or an in-flight sandbox launch, but never a
+ * launch stopped on a failure or a user action, which keep their own status.
+ * Each connecting attempt is bounded to {@link STARTING_GRACE_S}: a timer ends
+ * it even if nothing else re-renders, so a host that never comes up falls
+ * back to its offline status and Reconnect. A session switch starts over.
+ *
+ * @param attemptStartsMs Epoch ms when this attempt may have begun before the
+ *   view saw it (the session's creation, a host-switch launch). The earliest
+ *   one inside the grace anchors the window; otherwise it starts now.
+ */
+export function useSessionHostConnecting(
+  sessionId: string | undefined,
+  liveness: SessionLiveness,
+  sandboxStatus: SandboxStatus | null,
+  attemptStartsMs: readonly (number | null | undefined)[],
+): boolean {
+  const starting =
+    !isSandboxLaunchStopped(sandboxStatus) &&
+    (sandboxStatus !== null || liveness.kind === "starting");
+  const graceMs = STARTING_GRACE_S * 1000;
+  const attemptRef = useRef<{ id: string | undefined; deadline: number | null }>({
+    id: sessionId,
+    deadline: null,
+  });
+  if (attemptRef.current.id !== sessionId) attemptRef.current = { id: sessionId, deadline: null };
+  if (!starting) {
+    attemptRef.current.deadline = null;
+  } else if (attemptRef.current.deadline === null) {
+    const now = Date.now();
+    const earlierStarts = attemptStartsMs.filter(
+      (start): start is number =>
+        typeof start === "number" && start <= now && now - start < graceMs,
+    );
+    attemptRef.current.deadline = Math.min(now, ...earlierStarts) + graceMs;
+  }
+  const deadline = attemptRef.current.deadline;
+  // Re-render at the deadline; re-arm if the timer fires early.
+  const [expiryCheck, setExpiryCheck] = useState(0);
+  useEffect(() => {
+    if (deadline === null || Date.now() >= deadline) return;
+    const timer = setTimeout(() => setExpiryCheck((check) => check + 1), deadline - Date.now());
+    return () => clearTimeout(timer);
+  }, [deadline, expiryCheck]);
+  return deadline !== null && Date.now() < deadline;
 }
 
 /** Structural equality for the small `SessionLiveness` union. */

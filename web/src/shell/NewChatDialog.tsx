@@ -24,7 +24,6 @@ import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
   ComposerWorkspaceBar,
   ComposerWorkspaceTrigger,
-  COMPOSER_HOST_CONNECTING_CLASS,
   ComposerHostTrigger,
   ComposerPermissionPicker,
   ComposerConfigTooltipRows,
@@ -6975,7 +6974,10 @@ export function NewChatLandingScreen() {
                               sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
                             }
                             cloud={isCloudHost}
-                            className={cn(connectingThisMachine && COMPOSER_HOST_CONNECTING_CLASS)}
+                            className={cn(
+                              connectingThisMachine &&
+                                "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']",
+                            )}
                             testIdPrefix="new-chat-landing"
                             data-testid="new-chat-landing-host-chip"
                           />

@@ -1,9 +1,11 @@
-import { renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   STARTING_GRACE_S,
   type LivenessRow,
+  type SessionLiveness,
   livenessRowFromSession,
+  useSessionHostConnecting,
   useSessionLiveness,
 } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
@@ -375,5 +377,34 @@ describe("useSessionLiveness — derivation truth table", () => {
       const row = livenessRowFromSession(session({ hostId: "h1", permissionLevel: null }));
       expect(derive(false, false, row)).toEqual({ kind: "host_offline", isOwner: true });
     });
+  });
+});
+
+describe("useSessionHostConnecting", () => {
+  const starting: SessionLiveness = { kind: "starting" };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    vi.setSystemTime(new Date("2026-11-03T12:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("ends the window at the grace measured from an earlier known start", () => {
+    const createdAtMs = Date.now() - 30_000;
+    const { result } = renderHook(() =>
+      useSessionHostConnecting(SID, starting, null, [createdAtMs]),
+    );
+    expect(result.current).toBe(true);
+    act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 30) * 1000 - 1));
+    expect(result.current).toBe(true);
+    act(() => vi.advanceTimersByTime(1));
+    expect(result.current).toBe(false);
+  });
+
+  it("never reports a failed launch as connecting", () => {
+    const { result } = renderHook(() =>
+      useSessionHostConnecting(SID, starting, { stage: "failed", error: "boom" }, []),
+    );
+    expect(result.current).toBe(false);
   });
 });

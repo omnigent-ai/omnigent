@@ -141,10 +141,6 @@ export function HostStatusDot({
   );
 }
 
-/** Widens the host chip to show a pulsing "Connecting…" beside its icon. */
-export const COMPOSER_HOST_CONNECTING_CLASS =
-  "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']";
-
 export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
@@ -152,9 +148,11 @@ export const ComposerHostTrigger = forwardRef<
     status?: HostStatusDotStatus;
     cloud?: boolean;
     testIdPrefix?: string;
+    /** Transient status beside the icon (e.g. "Connecting…"); hidden while the row is collapsed. */
+    statusText?: string;
   }
 >(function ComposerHostTrigger(
-  { label, status, cloud = false, testIdPrefix = "composer", className, ...props },
+  { label, status, cloud = false, testIdPrefix = "composer", statusText, className, ...props },
   ref,
 ) {
   const Icon = cloud ? MonitorCloudIcon : LaptopIcon;
@@ -165,6 +163,7 @@ export const ComposerHostTrigger = forwardRef<
       aria-label={label}
       className={cn(
         "flex h-8 mobile-touch-target w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
+        statusText && "w-auto min-w-11 gap-1",
         className,
       )}
       {...props}
@@ -177,6 +176,17 @@ export const ComposerHostTrigger = forwardRef<
         )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
       </span>
+      {statusText && (
+        <span
+          className={cn(
+            "text-xs font-normal animate-pulse motion-reduce:animate-none",
+            COMPOSER_COLLAPSED_LABEL_CLASS,
+          )}
+          data-testid={`${testIdPrefix}-host-status-text`}
+        >
+          {statusText}
+        </span>
+      )}
     </button>
   );
 });

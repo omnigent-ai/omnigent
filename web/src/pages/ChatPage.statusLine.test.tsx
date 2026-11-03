@@ -381,73 +381,39 @@ describe("Composer status line (branch + context ring)", () => {
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
   });
 
-  it("says the host is connecting while a just-sent session's runner boots, then connected", () => {
-    // The first prompt was sent from the landing: the session exists and is
-    // bound to a live host, but its runner hasn't registered yet.
+  it("shows the session's bounded connecting state on the host chip and its menu", () => {
     bindHost("mac-laptop");
-    const onShowReconnectHelp = vi.fn();
-    const { rerender } = renderComposer({
-      runnerOnline: false,
-      runnerStarting: true,
-      onShowReconnectHelp,
-    });
+    const { rerender } = renderComposer({ runnerStarting: true, hostConnecting: true });
 
     const trigger = screen.getByTestId("composer-host-select");
     expect(trigger).toHaveAccessibleName("Host mac-laptop, connecting");
-    expect(trigger.className).toContain("after:content-['Connecting…']");
-    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
+    expect(within(trigger).getByText("Connecting…")).toBeInTheDocument();
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
     const menu = screen.getByTestId("composer-host-menu");
     expect(within(menu).getByText("Connecting to this host…")).toBeInTheDocument();
-    expect(screen.getByTestId("composer-host-menu-status")).toHaveAttribute(
-      "data-status",
-      "starting",
-    );
     fireEvent.keyDown(menu, { key: "Escape" });
 
     rerender(
       <TooltipProvider>
-        <Composer
-          {...composerProps({ runnerOnline: true, runnerStarting: false, onShowReconnectHelp })}
-        />
+        <Composer {...composerProps({ runnerOnline: true })} />
       </TooltipProvider>,
     );
     expect(trigger).toHaveAccessibleName("Host mac-laptop, online");
-    expect(trigger.className).not.toContain("after:content-['Connecting…']");
-    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
-    fireEvent.keyDown(trigger, { key: "ArrowDown" });
-    expect(
-      within(screen.getByTestId("composer-host-menu")).queryByText("Connecting to this host…"),
-    ).toBeNull();
+    expect(within(trigger).queryByText("Connecting…")).toBeNull();
   });
 
-  it("swaps connecting for reconnect once a booting session's host never comes up", () => {
+  it("leaves an offline host reconnectable when only raw runner startup is reported", () => {
+    // `runnerStarting` also covers stopped sandbox stages and unbounded relaunches,
+    // so it must not hide Reconnect by itself.
     bindHost("mac-laptop");
     useSessionHostOnlineMock.mockReturnValue(false);
     const onShowReconnectHelp = vi.fn();
-    const { rerender } = renderComposer({
-      runnerOnline: false,
-      runnerStarting: true,
-      onShowReconnectHelp,
-    });
+    renderComposer({ runnerStarting: true, onShowReconnectHelp });
 
-    const trigger = screen.getByTestId("composer-host-select");
-    expect(trigger).toHaveAccessibleName("Host mac-laptop, connecting");
-    fireEvent.keyDown(trigger, { key: "ArrowDown" });
-    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).toBeNull();
-    fireEvent.keyDown(screen.getByTestId("composer-host-menu"), { key: "Escape" });
-
-    // The startup grace lapsed with the host still down: liveness is host_offline.
-    rerender(
-      <TooltipProvider>
-        <Composer
-          {...composerProps({ runnerOnline: false, runnerStarting: false, onShowReconnectHelp })}
-        />
-      </TooltipProvider>,
-    );
-    expect(trigger).toHaveAccessibleName("Host mac-laptop, offline");
-    expect(trigger.className).not.toContain("after:content-['Connecting…']");
-    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const badge = screen.getByTestId("composer-host-select");
+    expect(badge).toHaveAccessibleName("Host mac-laptop, offline");
+    expect(within(badge).queryByText("Connecting…")).toBeNull();
+    fireEvent.keyDown(badge, { key: "ArrowDown" });
     fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
   });

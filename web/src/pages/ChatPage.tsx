@@ -198,6 +198,7 @@ import {
   type SessionLiveness,
   IMPORT_SOURCE_LABEL_KEY,
   livenessRowFromSession,
+  useSessionHostConnecting,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
@@ -853,6 +854,12 @@ export function ChatPage() {
     turnActive: status === "streaming",
     launchedAt: runnerLaunchedAt,
   });
+  const hostConnecting = useSessionHostConnecting(
+    sessionConvId ?? undefined,
+    liveness,
+    sandboxStatus,
+    [livenessRow?.created_at ? livenessRow.created_at * 1000 : null, runnerLaunchedAt],
+  );
 
   // Browser tab title mirrors the header; "● " flags main-session work in background tabs.
   // Sessions missing from the loaded sidebar rows use their snapshot (sub-agent name for
@@ -1231,6 +1238,7 @@ export function ChatPage() {
       onShowReconnectHelp={onShowReconnectHelp}
       sendReconnectsArca={sendReconnectsArca}
       sandboxStarting={sandboxStarting}
+      hostConnecting={hostConnecting}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1388,6 +1396,8 @@ interface MainAgentSurfaceProps {
   sendReconnectsArca: boolean;
   /** Reconnect host is waking this session's sandbox; the composer host dot spins. */
   sandboxStarting: boolean;
+  /** The session is connecting to its host, bounded to the startup grace. */
+  hostConnecting: boolean;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   /** Whether older messages exist that haven't been loaded yet. */
@@ -1565,6 +1575,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   onShowReconnectHelp,
   sendReconnectsArca,
   sandboxStarting,
+  hostConnecting,
   agents,
   selectedAgentId,
   hasMoreHistory,
@@ -1917,6 +1928,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             }
             sendReconnectsArca={sendReconnectsArca}
             sandboxStarting={sandboxStarting}
+            hostConnecting={hostConnecting}
             onShowReconnectHelp={onShowReconnectHelp}
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
@@ -2071,6 +2083,8 @@ interface ComposerProps {
   sendReconnectsArca?: boolean;
   /** Reconnect host is waking this session's sandbox; the host badge's dot spins. */
   sandboxStarting?: boolean;
+  /** The session is connecting to its host; the host badge says so. */
+  hostConnecting?: boolean;
   /**
    * Open the reconnect help dialog. Always wired to the status line's host
    * badge, which turns itself into a clickable reconnect affordance whenever
@@ -2371,6 +2385,7 @@ function ComposerImpl(
     unreachable = false,
     sendReconnectsArca = false,
     sandboxStarting = false,
+    hostConnecting = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
     subAgentLabel = null,
@@ -4278,7 +4293,7 @@ function ComposerImpl(
                   readOnly={isReadOnly}
                   onReconnect={onShowReconnectHelp}
                   starting={sandboxStarting}
-                  connecting={runnerStarting}
+                  connecting={hostConnecting}
                 />
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (

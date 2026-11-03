@@ -14,7 +14,6 @@ import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
 import {
-  COMPOSER_HOST_CONNECTING_CLASS,
   ComposerConfigTooltipRows,
   ComposerHostTrigger,
   ComposerMenuTooltip,
@@ -108,7 +107,7 @@ export function HostBadge({
   onReconnect?: () => void;
   /** The session's sandbox is being woken; the composer dot spins until it is online. */
   starting?: boolean;
-  /** The session's runner hasn't registered yet; the composer says it is connecting. */
+  /** The session is connecting to its host (see `useSessionHostConnecting`); the composer says so. */
   connecting?: boolean;
   appearance?: "status" | "composer";
   readOnly?: boolean;
@@ -229,7 +228,7 @@ export function HostBadge({
                 label={label}
                 status={launchStatus && !hostStarting ? undefined : dotStatus}
                 cloud={!!launchStatus || !!host?.sandbox_provider}
-                className={cn(runnerConnecting && COMPOSER_HOST_CONNECTING_CLASS)}
+                statusText={runnerConnecting ? "Connecting…" : undefined}
                 data-testid="composer-host-select"
               />
             </DropdownMenuTrigger>
