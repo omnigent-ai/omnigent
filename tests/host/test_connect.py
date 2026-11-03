@@ -33,6 +33,7 @@ from omnigent.host.connect import (
     HostRetryableConnectionError,
     ModelOptionsResult,
     _build_runner_env,
+    _connection_refused,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -98,7 +99,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
-from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -201,7 +202,8 @@ def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> No
     "harness,expected",
     [
         ("claude-native", {"project", "user", "agents", "toolkit:review"}),
-        ("codex-native", {"codex-user"}),
+        ("codex-native", {"agents", "codex-user"}),
+        ("codex", {"agents"}),
     ],
 )
 async def test_host_discovers_harness_skills_without_a_runner(
@@ -916,6 +918,45 @@ def _make_host_process() -> HostProcess:
     )
 
 
+async def test_local_host_does_not_dial_port_after_its_server_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local host whose server is gone never registers on the port's next owner.
+
+    Registering there would rotate away the same-name row of the host that
+    owns that server, leaving it connected but invisible to ``GET /v1/hosts``.
+    """
+    owned = [True]
+    host = HostProcess(
+        identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        server_url="http://127.0.0.1:6767",
+        server_still_ours=lambda: owned[0],
+    )
+    dialed: list[str] = []
+
+    class _RejectedConnection:
+        async def __aenter__(self) -> None:
+            raise ConnectionError("dialed")
+
+    def _connect(url: str, **_kwargs: object) -> _RejectedConnection:
+        dialed.append(url)
+        return _RejectedConnection()
+
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr("omnigent.host.connect.websockets.asyncio.client.connect", _connect)
+
+    with pytest.raises(ConnectionError, match="dialed"):
+        await host._connect_and_serve()
+    assert len(dialed) == 1
+
+    owned[0] = False
+    with pytest.raises(ConnectionRefusedError) as refused:
+        await host._connect_and_serve()
+    assert len(dialed) == 1
+    # Counted as refused, so the loopback give-up bound still applies.
+    assert _connection_refused(refused.value)
+
+
 def _cleanup_host(host: HostProcess) -> None:
     """Terminate a test host's spawned runners and exit watchers.
 
@@ -1252,6 +1293,10 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     tmp_path: Path,
 ) -> None:
     """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from omnigent.host.frames import decode_host_frame, encode_host_frame
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
 
     def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
@@ -1264,10 +1309,24 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
         binding_token="token_disk_full",
         workspace=str(tmp_path),
         session_id="session_disk_full",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="new",
+        ),
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        result = await host._handle_launch(frame)
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    with capture_debug_rows("host") as rows:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            result = await host._handle_launch(decoded)
+    row = next(row for row in rows if row["event_name"] == "runner_launch_failed")
+    assert row["attributes"]["run_id"] == "run"
+    assert row["attributes"]["task_id"] == "task"
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed"
@@ -2043,6 +2102,9 @@ async def test_watch_runner_reports_unexpected_exit(
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
     maintenance_reasons: list[str] = []
     host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
@@ -2076,24 +2138,34 @@ async def test_watch_runner_reports_unexpected_exit(
         request_id="req_watch",
         binding_token="tok_watch",
         workspace=str(workspace),
+        session_id="watched-session",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task-A",
+            run_id="A",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        ),
     )
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-        result = await host._handle_launch(frame)
-    assert result.status == "launched", result.error
+    with capture_debug_rows("host") as rows:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
 
-    handle = host._runners[token_bound_runner_id("tok_watch")]
-    assert handle.connect_marker is not None
-    if marker_state == "connected":
-        handle.connect_marker.touch()
-    elif marker_state == "unavailable":
-        handle.connect_marker = None
-    elif marker_state == "unreadable":
-        handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
-            exists=Mock(side_effect=[OSError("marker unavailable"), False])
-        )
+        handle = host._runners[token_bound_runner_id("tok_watch")]
+        assert handle.connect_marker is not None
+        if marker_state == "connected":
+            handle.connect_marker.touch()
+        elif marker_state == "unavailable":
+            handle.connect_marker = None
+        elif marker_state == "unreadable":
+            handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
+                exists=Mock(side_effect=[OSError("marker unavailable"), False])
+            )
 
-    # Wait for the watcher to observe the death and send its report.
-    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+        # Wait for the watcher to observe the death and send its report.
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # Exactly one report; a second would double-record server-side.
     assert len(tunnel.sent) == 1
@@ -2106,6 +2178,20 @@ async def test_watch_runner_reports_unexpected_exit(
     expected = {"connected": True, "not_connected": False}.get(marker_state)
     assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
+
+    [spawned] = [row for row in rows if row["event_name"] == "runner_spawned"]
+    assert spawned["attributes"]["run_id"] == "A"
+    [died] = [row for row in rows if row["event_name"] == "runner_died"]
+    assert died["session_id"] == "watched-session"
+    assert died["attributes"]["runner_id"] == report.runner_id
+    assert died["hostname"] == spawned["hostname"]
+    assert died["hostname"]
+    if marker_state == "not_connected":
+        assert died["attributes"]["run_id"] == "A"
+        assert died["attributes"]["task_id"] == "task-A"
+    else:
+        assert "run_id" not in died["attributes"]
+        assert "task_id" not in died["attributes"]
 
 
 @pytest.mark.parametrize("connected", [False, True])
@@ -4500,6 +4586,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "KUBECONFIG": "/home/alice/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
+        "GIT_SSL_CAINFO": "/etc/openshell-tls/ca-bundle.pem",
+        "GIT_SSL_CAPATH": "/etc/openshell-tls/certs",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL": "sonnet",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
@@ -4564,6 +4652,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # BROWSER names the user's URL opener; dropping it sends CLI logins in the
     # runner to a local browser instead of the one the user configured.
     assert env["BROWSER"] == "www-browser"
+    # git's CA paths are trust stores, not secrets; git ignores SSL_CERT_FILE.
+    assert env["GIT_SSL_CAINFO"] == "/etc/openshell-tls/ca-bundle.pem"
+    assert env["GIT_SSL_CAPATH"] == "/etc/openshell-tls/certs"
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
@@ -8086,6 +8177,82 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh", "stale"])
+async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
+    stale: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A store-backed CLI-login listing serves the CLI-login catalog's own rows.
+
+    Those rows keep the probe's display names, aliases and default; the listing's
+    wire ids stay routable. A stale catalog still serves at once and refreshes in
+    the background on the CLI-login launch, never a re-resolved native config.
+    """
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.models import model_catalog_store
+    from omnigent.models.model_catalog import ModelEntry, ModelListing
+
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path)
+    rows = [
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5", "isDefault": True}
+    ]
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+    model_catalog_store.write_catalog("claude-native", fingerprint, rows)
+    if stale:
+        old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+        os.utime(model_catalog_store.catalog_path("claude-native", fingerprint), (old, old))
+    probed_configs: list[object] = []
+    release_probe = asyncio.Event()
+
+    async def _probe(claude_config: object) -> list[dict[str, object]]:
+        probed_configs.append(claude_config)
+        await release_probe.wait()
+        return rows
+
+    def _fake_listing(spec: object, harness: str) -> ModelListing:
+        assert harness == "claude-sdk"
+        return ModelListing(
+            source="cli",
+            verified=not stale,
+            models=(ModelEntry(id="claude-sonnet-5", family="claude"),),
+            note="test catalog",
+        )
+
+    monkeypatch.setattr(claude_native, "claude_model_catalog", _probe)
+    monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
+    host = _make_host_process()
+
+    async def _unexpected_probe() -> None:
+        raise AssertionError("a store-backed listing must not re-resolve the native config")
+
+    monkeypatch.setattr(host, "_probed_claude_model_options", _unexpected_probe)
+
+    try:
+        # The probe stays blocked, so a reply proves the picker never waits on the refresh.
+        result = await asyncio.wait_for(
+            host._handle_model_options(
+                HostModelOptionsFrame(request_id="req_sdk_store", harness="claude-sdk"),
+            ),
+            timeout=10,
+        )
+        assert result == HostModelOptionsResultFrame(
+            request_id="req_sdk_store",
+            status="ok",
+            models=rows,
+            routable_models=["claude-sonnet-5"],
+        )
+    finally:
+        release_probe.set()
+        refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
+        if refresh is not None:
+            await refresh
+    assert probed_configs == ([None] if stale else [])
+    assert not model_catalog_store.catalog_is_stale("claude-native", fingerprint)
+    _cleanup_host(host)
+
+
 async def test_model_options_frame_replies_off_the_receive_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8420,12 +8587,15 @@ def _spawn_with_fake_zygote(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     zygote: _FakeZygote,
+    popen_kwargs: list[dict[str, object]] | None = None,
 ) -> tuple[HostProcess, list[list[str]]]:
     """Drive ``_spawn_runner_proc`` with *zygote* and a stubbed direct Popen.
 
     :param monkeypatch: The pytest monkeypatch fixture.
     :param tmp_path: Holds the fake runner log file.
     :param zygote: The scripted zygote installed on the host.
+    :param popen_kwargs: Optional sink for the keyword arguments of every
+        direct ``Popen`` call.
     :returns: The host and the argv of every direct ``Popen`` call.
     """
     host = _make_host_process()
@@ -8444,14 +8614,35 @@ def _spawn_with_fake_zygote(
         return log_path, open(log_path, "ab", buffering=0)
 
     def _fake_popen(argv: list[str], **kwargs: object) -> _FakeSpawnedProc:
-        del kwargs
         popen_argvs.append(list(argv))
+        if popen_kwargs is not None:
+            popen_kwargs.append(kwargs)
         return _FakeSpawnedProc()
 
     monkeypatch.setattr("omnigent.host.connect.open_process_log_file", _fake_open_log)
     monkeypatch.setattr("omnigent.host.connect.subprocess.Popen", _fake_popen)
     host._spawn_runner_proc({}, "slug", tmp_path)
     return host, popen_argvs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions")
+def test_direct_runner_spawn_starts_its_own_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A directly spawned runner leaves the daemon's terminal session.
+
+    A hangup of that terminal would otherwise reach the runner and its harness
+    children mid-turn instead of only the daemon.
+    """
+    popen_kwargs: list[dict[str, object]] = []
+    _spawn_with_fake_zygote(
+        monkeypatch, tmp_path, _FakeZygote(fail_at="start", running=False), popen_kwargs
+    )
+
+    assert len(popen_kwargs) == 1
+    assert popen_kwargs[0]["start_new_session"] is True
+    assert popen_kwargs[0]["stdin"] is subprocess.DEVNULL
 
 
 def test_dead_zygote_is_reaped_and_respawnable(
@@ -9087,7 +9278,147 @@ async def test_stop_frame_never_overtakes_launch(
     assert order == ["launch:start", "launch:end", "stop"]
 
 
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_filesystem_frame_keeps_host_control_responsive(
+    operation: str,
+    disconnect: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stalled filesystem request must not hold heartbeats or runner probes."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+
+    class _QueuedTunnel(_CollectingWs):
+        def __init__(self) -> None:
+            super().__init__()
+            self.incoming: asyncio.Queue[str] = asyncio.Queue()
+            self.outgoing: asyncio.Queue[str] = asyncio.Queue()
+
+        async def recv(self) -> str:
+            return await self.incoming.get()
+
+        async def send(self, data: str) -> None:
+            await super().send(data)
+            self.outgoing.put_nowait(data)
+
+    host = _make_host_process()
+    host._capabilities_initialized = True
+    host._configured_harnesses = {}
+    host._gateway_inference = {}
+    ws = _QueuedTunnel()
+    target = tmp_path / "project"
+    request: HostStatFrame | HostCreateDirFrame
+    expected: HostStatResultFrame | HostCreateDirResultFrame
+    if operation == "stat":
+        target.mkdir()
+        request = HostStatFrame(request_id="filesystem", path=str(target))
+        expected = HostStatResultFrame(
+            request_id="filesystem",
+            status="ok",
+            exists=True,
+            type="directory",
+            canonical_path=str(target.resolve()),
+        )
+    else:
+        request = HostCreateDirFrame(request_id="filesystem", path=str(target))
+        expected = HostCreateDirResultFrame(request_id="filesystem", status="ok", path=str(target))
+    handle = getattr(host, f"_handle_{operation}")
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_filesystem(frame: HostStatFrame | HostCreateDirFrame) -> object:
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(timeout=5), "filesystem request blocked the host event loop"
+            return handle(frame)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(host, f"_handle_{operation}", blocked_filesystem)
+    serving = asyncio.create_task(host._serve_frames(ws))  # type: ignore[arg-type]
+    replacement = _CollectingWs()
+    try:
+        hello = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        assert isinstance(decode_host_frame(hello), HostHelloFrame)
+        ws.incoming.put_nowait(encode_host_frame(request))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        ws.incoming.put_nowait(encode_frame(PingFrame(ts=123)))
+        ws.incoming.put_nowait(encode_host_frame(HostRunnerStatusFrame("status", "runner_absent")))
+        pong = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        status = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        assert not finished.is_set(), "control replies must arrive while filesystem I/O waits"
+        assert decode_frame(pong) == PongFrame(ts=123)
+        assert decode_host_frame(status) == HostRunnerStatusResultFrame("status", "unknown")
+        if disconnect:
+            await _cancel(serving)
+            await host._quiesce_frame_tasks()
+            host._ws = replacement  # type: ignore[assignment]
+    finally:
+        release.set()
+        await _drain_frame_tasks(host)
+        await _cancel(serving)
+        assert await asyncio.to_thread(finished.wait, 5), "filesystem worker did not finish"
+    if disconnect:
+        assert len(ws.sent) == 3
+        assert replacement.sent == []
+    else:
+        assert decode_host_frame(ws.sent[-1]) == expected
+    assert target.is_dir()
+
+
+@pytest.mark.posix_only
+async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unrelated queued launch can proceed after the stopped runner exits."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    manager = ZygoteManager()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    proc = ZygoteRunnerProc(child.pid, manager)
+    host._runners["runner_old"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    launched = asyncio.Event()
+
+    async def _record_launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        launched.set()
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id, status="launched", runner_id="runner_new"
+        )
+
+    monkeypatch.setattr(host, "_handle_launch", _record_launch)
+    try:
+        with manager._lock:
+            for frame in (
+                HostStopRunnerFrame(request_id="stop", runner_id="runner_old"),
+                HostLaunchRunnerFrame(request_id="launch", binding_token="tok", workspace="/w"),
+            ):
+                host._start_frame_task(ws, encode_host_frame(frame))  # type: ignore[arg-type]
+            await asyncio.wait_for(launched.wait(), timeout=2)
+            await _drain_frame_tasks(host)
+            assert child.poll() is not None
+            assert "runner_old" not in host._runners
+            replies = [decode_host_frame(raw) for raw in ws.sent]
+            assert [(reply.request_id, reply.status) for reply in replies] == [
+                ("stop", "stopped"),
+                ("launch", "launched"),
+            ]
+    finally:
+        await _drain_frame_tasks(host)
+        child.kill()
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
 async def test_frame_handler_failure_is_contained(
+    operation: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -9100,14 +9431,19 @@ async def test_frame_handler_failure_is_contained(
     host = _make_host_process()
     ws = _CollectingWs()
 
-    def _boom(self_: HostProcess, frame: HostStatFrame) -> HostStatResultFrame:
-        raise RuntimeError("scripted stat failure")
+    def _boom(self_: HostProcess, frame: HostStatFrame | HostCreateDirFrame) -> None:
+        raise RuntimeError("scripted filesystem failure")
 
-    monkeypatch.setattr(HostProcess, "_handle_stat", _boom)
+    monkeypatch.setattr(HostProcess, f"_handle_{operation}", _boom)
+    frame = (
+        HostStatFrame(request_id="req_boom", path=str(tmp_path))
+        if operation == "stat"
+        else HostCreateDirFrame(request_id="req_boom", path=str(tmp_path / "project"))
+    )
     with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
         host._start_frame_task(
             ws,  # type: ignore[arg-type] — duck-typed ws
-            encode_host_frame(HostStatFrame(request_id="req_boom", path=str(tmp_path))),
+            encode_host_frame(frame),
         )
         await _drain_frame_tasks(host)
 
@@ -10336,6 +10672,31 @@ def test_host_serves_a_pr_the_server_vouches_for(
     assert written.status == "ok", written
 
 
+async def test_host_repository_branches_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_registry(*_args: object) -> None:
+        pytest.fail("Branch lookup must not initialize change tracking")
+
+    monkeypatch.setattr("omnigent.workspace_fs.create_filesystem_registry", unexpected_registry)
+    host = _make_host_process()
+    url = "https://github.com/org/repo"
+    try:
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="repository-branches",
+                op="repository_branches",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"repositories": [{"url": url, "path": ""}]},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert result.status == "ok", result
+    assert result.payload == {"repositories": [{"url": url, "branch": None, "pushed": None}]}
+
+
 def test_host_reads_a_file_named_as_the_workspace_root(tmp_path: Path) -> None:
     """An absolute file target sent as the root is read rather than refused as a missing dir."""
     target = tmp_path / "notes.md"
@@ -10604,9 +10965,9 @@ def test_github_reviewer_ops_are_served_on_host(
     ]
 
 
-@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
+@pytest.mark.parametrize("kind", ["details", "comment", "review_reply"])
 async def test_github_details_update_is_served_on_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, comment: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     """The host writes PR text when the runner is offline, as the session's tracked PR."""
     from omnigent.host.frames import HostFsWriteFrame
@@ -10615,6 +10976,7 @@ async def test_github_details_update_is_served_on_host(
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    comment = kind != "details"
     sent: list[dict[str, str]] = []
     answer = (
         {
@@ -10627,7 +10989,30 @@ async def test_github_details_update_is_served_on_host(
     )
 
     def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        sent.append(json.loads(Path(argv[argv.index("--input") + 1]).read_text()))
+        payload = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
+        if "query" in payload:
+            assert payload["variables"]["id"] == "thread-1"
+            return (
+                0,
+                json.dumps(
+                    {
+                        "data": {
+                            "node": {
+                                "id": "thread-1",
+                                "viewerCanReply": True,
+                                "pullRequest": {"url": url},
+                                "root": {
+                                    "nodes": [{"fullDatabaseId": "123", "state": "SUBMITTED"}]
+                                },
+                            }
+                        }
+                    }
+                ),
+                "",
+            )
+        if kind == "review_reply":
+            assert "repos/example/one/pulls/42/comments/123/replies" in argv
+        sent.append(payload)
         return 0, json.dumps(answer), ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -10640,11 +11025,16 @@ async def test_github_details_update_is_served_on_host(
         edited = host._handle_fs_write(
             HostFsWriteFrame(
                 request_id="details-update",
-                op="github_comment_create" if comment else "github_details_update",
+                op={
+                    "details": "github_details_update",
+                    "comment": "github_comment_create",
+                    "review_reply": "github_review_thread_reply",
+                }[kind],
                 workspace=str(tmp_path),
                 session_id="session",
                 params={
                     "pr_url": url,
+                    **({"thread_id": "thread-1"} if kind == "review_reply" else {}),
                     **({"body": "Body"} if comment else {"title": " Renamed ", "body": None}),
                 },
             )
@@ -10653,6 +11043,12 @@ async def test_github_details_update_is_served_on_host(
         _cleanup_host(host)
 
     assert edited.status == "ok", edited
+    if kind == "review_reply":
+        assert edited.payload["thread_id"] == "thread-1"
+        assert edited.payload["comment"]["id"] == "99"
+        assert edited.payload["comment"]["body"] == "Body"
+        assert sent == [{"body": "Body"}]
+        return
     assert edited.payload == (
         {
             "object": "session.github.pr_comment",

@@ -16,6 +16,30 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
+
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
+@utility mobile-touch-target {
+  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
+  @media (pointer: coarse) and (hover: none) {
+    &:is(:root, :root *) {
+      min-width: 44px;
+      min-height: 44px;
+    }
+  }
+}
 
 @theme inline {
   --font-heading: var(--font-sans);
@@ -127,6 +151,8 @@
   /* App-default interface/body text — every control, label, and menu item. */
   --text-ui: 1rem;
   --text-ui--line-height: 1.6;
+  --text-message: var(--text-ui);
+  --text-message--line-height: 1.6;
   /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
    * body step, mapped below so it tracks the Appearance setting. */
   --text-sm: 0.9rem;
@@ -477,6 +503,11 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
@@ -499,7 +530,7 @@
   width: calc(100% - 24px);
   margin-inline: 12px;
   margin-bottom: -0.5px;
-  padding: 6px 8px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
   background-color: var(--composer-header-bg);
   border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
   border-bottom: none;
@@ -1049,9 +1080,10 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. */
+ * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
-  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
@@ -1094,6 +1126,10 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-header {
+    --omnigent-header-top-overlap: 0.5rem;
+  }
+
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
@@ -1386,6 +1422,22 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+.plain-text-fallback.text-message {
+  font-size: var(--text-sm);
+}
+
+/* Touch devices retain conversation sizing when rotation changes the layout.
+ * The saved override is separate from the viewport-specific interface default. */
+@media (width < 48rem), (pointer: coarse) {
+  :root {
+    --text-message: var(--mobile-message-font-size, 16px);
+  }
+
+  .plain-text-fallback.text-message {
+    font-size: var(--text-message);
+  }
+}
+
 /* Geist Mono renders wider than Geist Sans at the same point size, making
  * streamdown's default text-sm inline code and code blocks look larger than
  * the surrounding prose. Scale both down to ~87.5 % of the parent font size
@@ -1424,6 +1476,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-features: "liga" 0, "calt" 0;
 }
 
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {
@@ -1459,6 +1520,10 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"],
 [data-streamdown="heading-6"] {
+  font-size: 1em;
+}
+
+.text-message [data-streamdown="heading-5"] {
   font-size: 1em;
 }
 
@@ -1549,6 +1614,12 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"] {
   overflow-wrap: break-word;
+}
+
+/* Mermaid sizes each label box before the diagram joins the chat prose; an
+ * inherited `wrap-anywhere` re-wraps long words inside it and clips the extra lines. */
+[data-streamdown="mermaid-block"] svg {
+  overflow-wrap: normal;
 }
 
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
@@ -2494,6 +2565,9 @@ html[data-electron-mac] .breadcrumb-folder {
 .turn-fold-row-enter {
   display: grid;
   grid-template-rows: 0fr;
+}
+/* Starts with the trace's collapse (the fold closes a frame after it mounts). */
+[data-state="closed"] > .turn-fold-row-enter {
   animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 .turn-fold-row-enter > * {
@@ -2501,9 +2575,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow: hidden;
 }
 @media (prefers-reduced-motion: reduce) {
-  .turn-fold-row-enter {
+  [data-state="closed"] > .turn-fold-row-enter {
     grid-template-rows: 1fr;
     animation: none;
+  }
+  [data-state="closed"] > .turn-fold-row-enter > * {
+    overflow: visible;
   }
 }
 
