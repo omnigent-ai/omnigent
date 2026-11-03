@@ -6,6 +6,11 @@ completed turn.
 
 ## Contract and parameters
 
+When a newer tunnel replaces an older one on the same server, delayed cleanup
+of the older connection releases only its own resources. It must preserve the
+newer outage's timer and close evidence, even if the newer tunnel has already
+disconnected. An old idle-close attestation cannot settle newly active work.
+
 Every query takes these named parameters:
 
 | Parameter | Meaning |
