@@ -67,7 +67,7 @@ lists the path for each lab.
 
 `omnigent setup` asks for one base URL per gateway credential, and Neon needs a
 different path for each family. Add the provider to `~/.omnigent/config.yaml`
-directly:
+directly, replacing the host with your branch's `NEON_AI_GATEWAY_BASE_URL`:
 
 ```yaml
 providers:
@@ -75,7 +75,7 @@ providers:
     kind: gateway
     default: true
     anthropic:
-      base_url: $NEON_AI_GATEWAY_BASE_URL/anthropic
+      base_url: https://br-<name>-api.ai.<cell>.<region>.aws.neon.tech/anthropic
       api_key_ref: env:NEON_AI_GATEWAY_TOKEN
       models:
         default: claude-sonnet-4-6
@@ -83,12 +83,19 @@ providers:
         sonnet: claude-sonnet-4-6
         haiku: claude-haiku-4-5
     openai:
-      base_url: $NEON_AI_GATEWAY_BASE_URL/openai/v1
+      base_url: https://br-<name>-api.ai.<cell>.<region>.aws.neon.tech/openai/v1
       api_key_ref: env:NEON_AI_GATEWAY_TOKEN
       wire_api: responses
       models:
         default: gpt-5-3-codex
 ```
+
+Write the host into `base_url` literally. Omnigent starts the harness in a
+runner with a filtered environment: it forwards the variable an `api_key_ref:
+env:` names, but not variables referenced inside `base_url`, so a
+`$NEON_AI_GATEWAY_BASE_URL/...` value fails turn setup with `Unresolved
+environment variable`. If you want the variable anyway, also list it in
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` where the host runs.
 
 `default: true` makes `neon` the default for both families it serves. Omit it
 to keep your current defaults and select Neon per agent instead (see below).
@@ -99,7 +106,7 @@ titles, so pin it; otherwise Claude Code requests its canonical model ID, which
 the gateway may not route.
 
 To reach non-OpenAI models over the OpenAI surface, point the `openai` block at
-`$NEON_AI_GATEWAY_BASE_URL/v1` with `wire_api: chat` and a chat model such as
+`<host>/v1` with `wire_api: chat` and a chat model such as
 `gemini-3-flash`. Codex model variants do not work on that path.
 
 If you prefer the wizard, run `omnigent setup` twice and add two **Gateway**
@@ -156,6 +163,7 @@ follow-up turn, and a resumed session prove the full agent flow.
 | `429` mentioning the input or output token limit | The account's 200,000 tokens per minute limit (input and output are counted separately). Requests resume when the window resets. |
 | `429` with `REQUEST_LIMIT_EXCEEDED` | Neon's account-level daily spend cap. See Neon's [troubleshooting guide](https://neon.com/docs/ai-gateway/troubleshooting). |
 | Claude Code reports `There's an issue with the selected model`, and no Messages request reaches Neon | A managed Claude Code settings file (on macOS, `/Library/Application Support/ClaudeCode/managed-settings.json`) sets `ANTHROPIC_BASE_URL` or `apiKeyHelper`. Managed settings take precedence over the environment Omnigent passes, so Claude Code calls that endpoint instead of Neon. Use a machine without that policy, or route through the `openai` family. |
+| Turn setup fails with `Unresolved environment variable '$NEON_AI_GATEWAY_BASE_URL'` | `base_url` references a variable the runner does not receive. Write the host literally, or add the variable to `OMNIGENT_RUNNER_ENV_PASSTHROUGH`. |
 | Claude Code falls back to its own login | The `anthropic` block is missing or its credential does not resolve, for example `NEON_AI_GATEWAY_TOKEN` is unset in the process running `omnigent host`. |
 
 Neon's [AI Gateway docs](https://neon.com/docs/ai-gateway/overview) are the
