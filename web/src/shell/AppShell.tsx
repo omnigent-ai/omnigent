@@ -133,6 +133,7 @@ import { revealFolderInFilesPanel } from "./FilesPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { ContentSearchPanel } from "./ContentSearchPanel";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -524,6 +525,7 @@ function AppShellImpl() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
+  const [contentSearchPanelOpen, setContentSearchPanelOpen] = useState(false);
   const [sideChatsPanelOpen, setSideChatsPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
@@ -1168,6 +1170,7 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
@@ -1374,6 +1377,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setContentSearchPanelOpen(false);
     selectRightRailTab("subagents");
     setRightPanelOpenImmediately(true);
     setSubagentsPanelOpen(isMobileViewport());
@@ -1435,6 +1439,7 @@ function AppShellImpl() {
       // A side chat's reply can link into the workspace: close its full-screen
       // drawer so the file viewer the tap just opened is what the user sees.
       setSideChatsPanelOpen(false); // close mobile side-chats drawer
+      setContentSearchPanelOpen(false); // close mobile content-search drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Subagents). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
@@ -1947,6 +1952,7 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
 
@@ -2132,6 +2138,7 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setExecutionLogsKey(key);
   }
@@ -2147,6 +2154,7 @@ function AppShellImpl() {
       setSubagentsPanelOpen(false); // close mobile agents drawer
       setShellsPanelOpen(false); // close mobile shells drawer
       setGithubPanelOpen(false); // close mobile github drawer
+      setContentSearchPanelOpen(false); // close mobile content-search drawer
       setSideChatsPanelOpen(false); // close mobile side-chats drawer
       setFilesDrawerFlatView(flatView);
       setFilesPanelOpen(true);
@@ -2166,6 +2174,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setSubagentsPanelOpen(true);
   }
@@ -2182,6 +2191,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setShellsPanelOpen(true);
   }
@@ -2198,8 +2208,24 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setGithubPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
+
+  // Mobile FAB → "Content search" opens the desktop rail's Content search tab
+  // as a full-screen drawer.
+  function openContentSearchPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
+    setContentSearchPanelOpen(true);
+  }
 
   // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
@@ -2676,6 +2702,7 @@ function AppShellImpl() {
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       githubPanelOpen,
+                      contentSearchPanelOpen,
                       sideChatsPanelOpen,
                       showSideChats: showSideChats || hasSubagentTabs,
                       hideTerminalsTab,
@@ -2695,6 +2722,8 @@ function AppShellImpl() {
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
+                      showContentSearch: railTabsAvailable["content-search"],
+                      onOpenContentSearch: openContentSearchPanel,
                       onOpenSideChats: openSideChatsPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
@@ -2874,6 +2903,20 @@ function AppShellImpl() {
                   <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
                     <PullRequestPanel conversationId={conversationId} />
                   </RenderErrorBoundary>
+                </MobilePanelDrawer>
+              )}
+              {conversationId && railTabsAvailable["content-search"] && (
+                <MobilePanelDrawer
+                  open={contentSearchPanelOpen}
+                  title="Content search"
+                  onClose={() => setContentSearchPanelOpen(false)}
+                  testId="content-search-panel-drawer"
+                >
+                  <ContentSearchPanel
+                    key={conversationId}
+                    conversationId={conversationId}
+                    onFileSelect={openFileViewer}
+                  />
                 </MobilePanelDrawer>
               )}
               <div ref={setMobileFileTarget} className="md:hidden" />

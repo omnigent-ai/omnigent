@@ -60,6 +60,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  contentSearchPanelOpen: false,
+  showContentSearch: false,
+  onOpenContentSearch: () => {},
   sideChatsPanelOpen: false,
   showSideChats: false,
   onOpenSideChats: () => {},
@@ -1024,6 +1027,26 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens the content-search drawer from the kebab when the feature is available", () => {
+    const onOpenContentSearch = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showContentSearch: true, onOpenContentSearch },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Content search" }));
+    expect(onOpenContentSearch).toHaveBeenCalled();
   });
 
   it("opens the side-chats drawer from the kebab when the harness supports it", () => {

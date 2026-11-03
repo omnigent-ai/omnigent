@@ -572,6 +572,17 @@ def test_content_search_opens_line_and_preserves_results(
     )
     expect(search).to_have_value("")
 
+    # Phones reach the same search from the session menu as a full-screen drawer.
+    page.set_viewport_size({"width": 390, "height": 1000})
+    page.get_by_role("button", name="Conversation actions", exact=True).click()
+    page.get_by_role("menuitem", name="Content search", exact=True).click()
+    drawer = page.get_by_test_id("content-search-panel-drawer")
+    drawer.get_by_role("searchbox", name="Search file contents").fill("changed")
+    drawer.get_by_role("searchbox", name="Search file contents").press("Enter")
+    drawer.get_by_role("button", name=f"Open {_FILE_PATH} at line 351").click()
+    expect(drawer).to_have_attribute("data-state", "closed")
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
+
 
 def test_source_citation_centers_last_loaded_line(
     page: Page,
