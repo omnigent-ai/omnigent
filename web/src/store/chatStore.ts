@@ -5467,6 +5467,10 @@ interface MissedEventRecovery {
   recycleStream: () => boolean;
   /** Sends already recycled for, so a server that forgot one recycles only once. */
   revealedPendingIds: Set<string>;
+  /** Ended turns already recycled for; a later tick settles them from the snapshot. */
+  recycledTurnKeys: Set<string>;
+  /** The last reconnect backfill failed, so status reconciles retry it. */
+  backfillOwed: boolean;
 }
 
 /**
@@ -5476,7 +5480,8 @@ interface MissedEventRecovery {
  * Periodically re-read durable status, discarding a snapshot if any semantic
  * stream event arrives during the fetch. A snapshot that shows the visible turn
  * ended, or a posted send no longer queued, proves the stream also missed that
- * turn's items, so the stream is recycled for the reconnect backfill instead.
+ * turn's items, so the stream is recycled once for the reconnect backfill
+ * instead. A failed backfill is retried on this cadence until one lands.
  */
 async function reconcileActiveSessionStatus(
   id: string,
@@ -5548,8 +5553,14 @@ async function reconcileActiveSessionStatus(
   const turnEnded =
     turnSeenRunning &&
     (session.status === "idle" || session.status === "failed" || session.status === "waiting");
+  const turnKey =
+    current.activeResponse?.state === "streaming"
+      ? current.activeResponse.responseId
+      : `latch:${current.sendLatchedAt}`;
+  const recycleForTurn = turnEnded && !recovery.recycledTurnKeys.has(turnKey);
   // The reconnect reconciles status too; its in-flight drop needs the turn still streaming.
-  if ((turnEnded || consumedPendingIds.length > 0) && recovery.recycleStream()) {
+  if ((recycleForTurn || consumedPendingIds.length > 0) && recovery.recycleStream()) {
+    if (recycleForTurn) recovery.recycledTurnKeys.add(turnKey);
     for (const pendingId of consumedPendingIds) recovery.revealedPendingIds.add(pendingId);
     return;
   }
@@ -5562,13 +5573,14 @@ async function reconcileActiveSessionStatus(
   const ignored = nativePreviewTombstonesByController.get(controller);
   if (
     ignored &&
-    get().blocks.some(
-      (block) =>
-        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
-    )
+    (recovery.backfillOwed ||
+      get().blocks.some(
+        (block) =>
+          isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+      ))
   ) {
-    // Retry a missed final-item backfill on the existing status-reconcile cadence.
-    await reconcileOnReconnect(id, set, get, ignored);
+    // Retry a failed or missed final-item backfill on the existing status-reconcile cadence.
+    recovery.backfillOwed = !(await reconcileOnReconnect(id, set, get, ignored));
   }
 }
 
@@ -5792,16 +5804,16 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
-): Promise<void> {
+): Promise<boolean> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
   let fresh: SessionItemsPage;
   try {
     fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS });
   } catch {
-    return;
+    return false;
   }
-  if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  if (isConversationDisposed(id) || get().historyGeneration !== generation) return false;
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -5857,6 +5869,7 @@ async function rehydrateWindowOnReconnect(
     };
   });
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
+  return true;
 }
 
 /**
@@ -5882,8 +5895,8 @@ async function rehydrateWindowOnReconnect(
  * are not items, so the item backfill can't recover prompts that fired or
  * resolved while the socket was dead. The backfill path leaves history-window
  * state (`hasMoreHistory` / `oldestItemId`) untouched — a reconnect is not a
- * re-hydrate. Swallows fetch errors: a transient
- * failure just means the next reconnect retries. All writes are
+ * re-hydrate. Swallows fetch errors, resolving false so the caller can
+ * retry; true once the snapshot was applied. All writes are
  * `historyGeneration`-guarded so a window reset mid-fetch voids them.
  */
 async function reconcileOnReconnect(
@@ -5891,8 +5904,8 @@ async function reconcileOnReconnect(
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
-): Promise<void> {
-  if (queryClient === null) return;
+): Promise<boolean> {
+  if (queryClient === null) return false;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
@@ -5925,9 +5938,9 @@ async function reconcileOnReconnect(
       fetchSessionItemsPage(id),
     ]);
   } catch {
-    return;
+    return false;
   }
-  if (stale()) return;
+  if (stale()) return false;
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
 
   // Page backwards until the fetched window reaches the pre-gap transcript
@@ -5950,9 +5963,9 @@ async function reconcileOnReconnect(
       // backfill with the gap still uncovered so the full rehydrate below
       // runs, instead of leaving items no path can fetch.
       if (isStaleCursorError(error)) break;
-      return;
+      return false;
     }
-    if (stale()) return;
+    if (stale()) return false;
     items = [...older.items, ...items];
     hasMore = older.hasMore;
     covered = !hasMore || older.items.some((it) => preGapIds.has(it.id));
@@ -5962,7 +5975,7 @@ async function reconcileOnReconnect(
   const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   if (!covered) {
-    await rehydrateWindowOnReconnect(
+    return rehydrateWindowOnReconnect(
       id,
       session,
       preGapIds,
@@ -5972,7 +5985,6 @@ async function reconcileOnReconnect(
       ignoredNativeMessageIds,
       launchBeforeFetch,
     );
-    return;
   }
 
   const snapshotBlocks = itemsToBlocks(items);
@@ -6052,6 +6064,7 @@ async function reconcileOnReconnect(
     return patch;
   });
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
+  return true;
 }
 
 // ── Presence idle reporting ─────────────────────────────────────────
@@ -6159,6 +6172,8 @@ export async function startStreamPump(
       return true;
     },
     revealedPendingIds: new Set<string>(),
+    recycledTurnKeys: new Set<string>(),
+    backfillOwed: false,
   };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
   // reconciliations stay serialized: a catch-up tick that straddles a slow
@@ -6388,7 +6403,12 @@ export async function startStreamPump(
           ignoredNativeMessageIds,
         );
         if (reconnecting) {
-          await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
+          missedEventRecovery.backfillOwed = !(await reconcileOnReconnect(
+            id,
+            set,
+            get,
+            ignoredNativeMessageIds,
+          ));
           // reconcileOnReconnect can read a stale "running" when the server
           // just restarted and hasn't reprocessed the turn's completion yet,
           // stranding the tab on "Working…" until the 60s periodic reconcile.
