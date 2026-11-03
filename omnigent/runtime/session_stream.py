@@ -537,7 +537,7 @@ async def subscribe(
             else:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval_s)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Queue was idle past the heartbeat deadline. Emit
                     # a synthetic keepalive. Its wire bytes give the
                     # route's ``request.is_disconnected()`` check and
