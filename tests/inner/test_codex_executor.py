@@ -5104,23 +5104,22 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
     """Bundle and Codex-specific skills take precedence over shared skills."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
     (home / ".agents" / "skills").mkdir(parents=True)
-    assert codex_skill_sources(bundle, home) == [
-        bundle / "skills",
-        home / ".codex" / "skills",
-        home / ".agents" / "skills",
-    ]
+    assert codex_skill_sources(bundle, home) == CodexSkillSources(
+        linked=[bundle / "skills", home / ".codex" / "skills", home / ".agents" / "skills"],
+        native=[],
+    )
 
 
 def test_codex_skill_sources_workspace_repo_scope_order(tmp_path: Path) -> None:
-    """Workspace ``.agents`` skills up to the git root rank between bundle and host skills."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    """Workspace ``.agents`` skills up to the git root are native, nearest first, never linked."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
 
     bundle = tmp_path / "bundle"
     home = tmp_path / "home"
@@ -5137,18 +5136,18 @@ def test_codex_skill_sources_workspace_repo_scope_order(tmp_path: Path) -> None:
         directory.mkdir(parents=True)
     # A worktree's .git file marks the repository root like a .git directory.
     (repo / ".git").write_text("gitdir: elsewhere\n")
-    assert codex_skill_sources(bundle, home, workspace=workspace) == [
-        bundle / "skills",
-        workspace.resolve() / ".agents" / "skills",
-        repo.resolve() / ".agents" / "skills",
-        home / ".codex" / "skills",
-        home / ".agents" / "skills",
-    ]
+    assert codex_skill_sources(bundle, home, workspace=workspace) == CodexSkillSources(
+        linked=[bundle / "skills", home / ".codex" / "skills", home / ".agents" / "skills"],
+        native=[
+            workspace.resolve() / ".agents" / "skills",
+            repo.resolve() / ".agents" / "skills",
+        ],
+    )
 
 
 def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
     """Outside a repo only the workspace's own dir counts; ``$HOME`` keeps its user rank."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
 
     if any((parent / ".git").exists() for parent in Path(os.path.realpath(tmp_path)).parents):
         pytest.skip("tmp_path is inside a git checkout; outside-repo scoping can't be exercised")
@@ -5163,16 +5162,17 @@ def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
     ):
         directory.mkdir(parents=True)
     host_tiers = [home / ".codex" / "skills", home / ".agents" / "skills"]
-    assert codex_skill_sources(None, home, workspace=workspace) == [
-        workspace.resolve() / ".agents" / "skills",
-        *host_tiers,
-    ]
-    assert codex_skill_sources(None, home, workspace=home) == host_tiers
+    assert codex_skill_sources(None, home, workspace=workspace) == CodexSkillSources(
+        linked=host_tiers, native=[workspace.resolve() / ".agents" / "skills"]
+    )
+    assert codex_skill_sources(None, home, workspace=home) == CodexSkillSources(
+        linked=host_tiers, native=[]
+    )
 
 
 def test_codex_skill_sources_skips_symlink_loops(tmp_path: Path) -> None:
     """A looping skills symlink is skipped without hiding the valid workspace or host tiers."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
 
     home = tmp_path / "home"
     repo = tmp_path / "repo"
@@ -5187,10 +5187,9 @@ def test_codex_skill_sources_skips_symlink_loops(tmp_path: Path) -> None:
         directory.mkdir(parents=True)
     for looping in (home / ".agents" / "skills", repo / ".agents" / "skills"):
         looping.symlink_to(looping)
-    assert codex_skill_sources(None, home, workspace=workspace) == [
-        workspace.resolve() / ".agents" / "skills",
-        home / ".codex" / "skills",
-    ]
+    assert codex_skill_sources(None, home, workspace=workspace) == CodexSkillSources(
+        linked=[home / ".codex" / "skills"], native=[workspace.resolve() / ".agents" / "skills"]
+    )
 
 
 def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
@@ -5199,8 +5198,8 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
 
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
-    assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
-    assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]
+    assert codex_skill_sources(None, home).linked == [home / ".codex" / "skills"]
+    assert codex_skill_sources(tmp_path / "no-bundle", home).linked == [home / ".codex" / "skills"]
 
 
 def test_clean_codex_env_honors_extra_allow(monkeypatch):
