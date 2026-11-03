@@ -251,7 +251,7 @@ describe("themePalette", () => {
     const omni = PALETTES[0];
     for (const mode of ["light", "dark"] as const) {
       const tokens = omni.tokens[mode];
-      const weight = /var\(--brand-accent\) (\d+)%/.exec(tokens.sidebarActive);
+      const weight = tokens.sidebarActive.match(/var\(--brand-accent\) (\d+)%/);
       expect(weight).not.toBeNull();
       const activeBackground = composite(
         { rgb: parseColor(tokens.brandAccent).rgb, alpha: Number(weight![1]) / 100 },
