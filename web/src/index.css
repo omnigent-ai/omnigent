@@ -1616,6 +1616,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow-wrap: break-word;
 }
 
+/* Mermaid sizes each label box before the diagram joins the chat prose; an
+ * inherited `wrap-anywhere` re-wraps long words inside it and clips the extra lines. */
+[data-streamdown="mermaid-block"] svg {
+  overflow-wrap: normal;
+}
+
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
  * gets its own horizontal scroll surface instead of relying on the surrounding
  * chat bubble to clip or wrap it. (No overflow-y override: with overflow-x
