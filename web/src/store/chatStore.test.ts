@@ -14333,6 +14333,54 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("replaces a status-only failure card with its persisted error on reconnect", async () => {
+    // The failed status reaches the client before the transcript item that
+    // records the same failure; later content separates the two by the time
+    // a reconnect backfills that item.
+    const failure = { code: "startup_input_failed", message: "The message could not be delivered" };
+    const persisted: ConversationItem = {
+      id: "err_startup",
+      response_id: "startup_launch_failed",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      ...failure,
+    };
+    const resend = userMessage("resp_resend", "try again");
+    seedSession("conv_status_error", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_status_error", abortController: controller });
+
+    const loop = startStreamPump("conv_status_error", controller, setState, getState);
+    await drainAsync();
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_status_error",
+      status: "failed",
+      responseId: "startup_launch_failed",
+      error: failure,
+    });
+    useChatStore.setState((s) => ({ blocks: [...s.blocks, ...itemsToBlocks([resend])] }));
+    expect(useChatStore.getState().blocks.map((b) => b.type)).toEqual(["error", "user_message"]);
+
+    seedSessionItems("conv_status_error", [persisted, resend]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const errors = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ ...failure, ctx: { itemId: persisted.id } });
+    expect(errors[0]).not.toHaveProperty("fromSessionStatus");
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   /** The card a send leaves when its POST gets no answer. */
   function unansweredSendCard(send: NonNullable<ErrorBlock["unansweredSend"]>): ErrorBlock {
     return {

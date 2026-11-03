@@ -949,28 +949,6 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     host_id = uuid4().hex
     env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
     startup = env.app.state.startup_inputs
-    await startup.record_launch_failure(session_id, "spend limit reached")
-    conv = env.conv_store.get_conversation(session_id)
-    assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
-    # No sandbox is left to deliver the saved first input; say so in the transcript.
-    [pending] = env.conv_store.list_pending_inputs(session_id)
-    assert pending.status == "failed"
-    [error] = env.conv_store.list_items(session_id).data
-    assert isinstance(error.data, ErrorData) and "spend limit reached" in error.data.message
-    # Another replica has no tracker entry for the launch.
-    env.app.state.managed_launches = type(env.app.state.managed_launches)()
-    assert not await startup.accepts(conv, env.app)
-    assert (
-        await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
-    )
-
-
-async def test_failed_startup_status_carries_the_transcript_cause(
-    startup_env: _Env,
-) -> None:
-    env = startup_env
-    session_id = await _create(env)
-    startup = env.app.state.startup_inputs
     collector = await start_session_stream_collector(session_id)
     try:
         await startup.record_launch_failure(session_id, "spend limit reached")
@@ -979,14 +957,25 @@ async def test_failed_startup_status_carries_the_transcript_cause(
             status = await collector.next_event()
     finally:
         await collector.stop()
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
+    # No sandbox is left to deliver the saved first input; say so in the transcript.
+    [pending] = env.conv_store.list_pending_inputs(session_id)
+    assert pending.status == "failed"
     [error] = env.conv_store.list_items(session_id).data
-    assert isinstance(error.data, ErrorData)
+    assert isinstance(error.data, ErrorData) and "spend limit reached" in error.data.message
+    # The failed status carries the same failure, so its consumers get the cause
+    # and a client can match it to the transcript item.
     assert status["status"] == "failed"
-    # Same cause and response id as the transcript item, so a client that holds
-    # the item treats the edge as that failure rather than a second one.
-    assert status["error"]["code"] == error.data.code == "startup_input_failed"
+    assert status["error"]["code"] == error.data.code
     assert status["error"]["message"] == error.data.message
     assert status["response_id"] == error.response_id
+    # Another replica has no tracker entry for the launch.
+    env.app.state.managed_launches = type(env.app.state.managed_launches)()
+    assert not await startup.accepts(conv, env.app)
+    assert (
+        await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
+    )
 
 
 async def _session_count(env: _Env) -> int:

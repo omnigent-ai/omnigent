@@ -5670,6 +5670,37 @@ function withoutRebuiltUserInputCards(
   });
 }
 
+/** What identifies one failure across its status card and its persisted error item. */
+function failureKey(block: ErrorBlock): string {
+  return JSON.stringify([block.ctx.responseId, block.code, block.message]);
+}
+
+/**
+ * Drop status-only error cards whose failure a persisted error item now carries.
+ *
+ * A `failed` status can deliver a failure before its transcript item reaches
+ * this client. The status card has no item id, so an id-based history merge
+ * keeps both, and once other content lands between them they render as two
+ * cards. The persisted item is the durable copy, so it wins.
+ *
+ * @param liveBlocks - Blocks the live pump produced.
+ * @param historyBlocks - Blocks translated from persisted items.
+ * @returns `liveBlocks` without the status cards history now carries.
+ */
+function withoutPersistedStatusErrors(
+  liveBlocks: AnyBlock[],
+  historyBlocks: AnyBlock[],
+): AnyBlock[] {
+  const persisted = new Set<string>();
+  for (const b of historyBlocks) {
+    if (b.type === "error" && b.ctx.itemId) persisted.add(failureKey(b));
+  }
+  if (persisted.size === 0) return liveBlocks;
+  return liveBlocks.filter(
+    (b) => !(b.type === "error" && b.fromSessionStatus && persisted.has(failureKey(b))),
+  );
+}
+
 /**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
@@ -5797,7 +5828,7 @@ async function rehydrateWindowOnReconnect(
     const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
     const merged = mergeReconnectWindow(
       windowBlocks,
-      withoutRebuiltUserInputCards(tail, windowBlocks),
+      withoutPersistedStatusErrors(withoutRebuiltUserInputCards(tail, windowBlocks), windowBlocks),
     );
     const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
     const blocks =
@@ -5981,7 +6012,10 @@ async function reconcileOnReconnect(
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(reconciledBlocks, unseen);
+      const kept = withoutPersistedStatusErrors(
+        withoutRebuiltUserInputCards(reconciledBlocks, unseen),
+        unseen,
+      );
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);

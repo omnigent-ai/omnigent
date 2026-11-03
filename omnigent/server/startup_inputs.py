@@ -598,10 +598,7 @@ class ManagedStartupInputs:
             ],
         )
         _publish_sandbox_status(session_id, "failed", message)
-        # The failed edge carries the transcript item's cause: without it the
-        # failure log and a scheduled run record no reason, and a connected
-        # client shows no card until it reloads. The shared response id lets
-        # the client match the edge to the transcript item it loads later.
+        # Match the persisted error so status consumers receive its cause and identity.
         _publish_status(
             session_id,
             "failed",
