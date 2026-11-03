@@ -3943,13 +3943,15 @@ class HostProcess:
             )
         return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
 
-    async def _post_runtime_flags(self, path: str, *, json: object) -> httpx.Response:
+    async def _post_runtime_flags(self, path: str, *, json: dict[str, object]) -> httpx.Response:
         """POST a runtime-flag request with this host's tunnel credentials."""
+        # A launch token is valid only for the host it was issued to.
+        body = {**json, "host_id": self._identity.host_id}
 
         def post() -> httpx.Response:
             return httpx.post(
                 f"{self._server_url}{path}",
-                json=json,
+                json=body,
                 headers=self._build_connect_headers(),
                 timeout=10.0,
                 verify=client_ssl_context(),

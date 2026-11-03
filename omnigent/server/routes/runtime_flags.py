@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -17,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runtime_flags import (
     DEFAULT_REFRESH_INTERVAL_S,
     MAX_RUNTIME_FLAGS_PER_REQUEST,
@@ -27,6 +29,7 @@ from omnigent.runtime_flags import (
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.runtime_flags import RuntimeFlagCaller, RuntimeFlagProvider, RuntimeFlagQuery
+from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
 
@@ -56,6 +59,8 @@ class RuntimeFlagsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     flags: Annotated[list[RuntimeFlagRequestItem], Field(max_length=MAX_RUNTIME_FLAGS_PER_REQUEST)]
+    # The host a launch token is bound to; required with that token, else unused.
+    host_id: str | None = None
 
     @model_validator(mode="after")
     def _unique_names(self) -> RuntimeFlagsRequest:
@@ -75,21 +80,38 @@ class RuntimeFlagsResponse(BaseModel):
 def create_runtime_flags_router(
     provider: RuntimeFlagProvider | None,
     auth_provider: AuthProvider | None = None,
+    host_store: HostStore | None = None,
 ) -> APIRouter:
     """Build the runtime-flag route, mounted under ``/v1``.
 
     :param provider: Evaluates flags; ``None`` serves none.
     :param auth_provider: Resolves the caller; ``None`` skips authentication.
+    :param host_store: Resolves a managed host's launch token to the session
+        owner; ``None`` rejects launch-token requests.
     :returns: The router.
     """
     router = APIRouter()
+
+    async def resolve_caller(request: Request, body: RuntimeFlagsRequest) -> RuntimeFlagCaller:
+        launch_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        if not launch_token:
+            return RuntimeFlagCaller(user_id=require_user(request, auth_provider))
+        # A sandbox host has no user credential; its launch token names the owner.
+        managed = None
+        if host_store is not None and body.host_id:
+            managed = await asyncio.to_thread(
+                host_store.resolve_launch_token, body.host_id, launch_token
+            )
+        if managed is None:
+            raise HTTPException(status_code=401, detail="unauthenticated host")
+        return RuntimeFlagCaller(user_id=managed.user_id)
 
     @router.post("/runtime-flags", response_model=RuntimeFlagsResponse)
     async def evaluate_runtime_flags(
         request: Request, body: RuntimeFlagsRequest
     ) -> RuntimeFlagsResponse:
         """Evaluate the caller's declared runtime flags."""
-        caller = RuntimeFlagCaller(user_id=require_user(request, auth_provider))
+        caller = await resolve_caller(request, body)
         refresh_after_s = int(DEFAULT_REFRESH_INTERVAL_S)
         if provider is None or not body.flags:
             return RuntimeFlagsResponse(values={}, refresh_after_s=refresh_after_s)

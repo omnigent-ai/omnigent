@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import random
 import re
 import threading
@@ -66,7 +67,10 @@ def runtime_flag_value_matches(value_type: RuntimeFlagType, value: object) -> bo
         low, high = (_INT32_MIN, _INT32_MAX) if value_type == "int" else (_INT64_MIN, _INT64_MAX)
         return low <= value <= high
     if value_type == "float":
-        return isinstance(value, int | float) and not isinstance(value, bool)
+        # JSON cannot carry NaN or infinity.
+        return (
+            isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+        )
     if value_type == "string":
         return isinstance(value, str)
     if value_type == "string_list":
@@ -163,16 +167,25 @@ def declared_runtime_flags() -> tuple[_FeatureFlag[Any], ...]:
         return tuple(_registry[name] for name in sorted(_registry))
 
 
-def _apply_served_values(flags: Sequence[_FeatureFlag[Any]], served: object) -> None:
-    """Replace the in-memory values with the server's answer for *flags*."""
-    global _values
+def _accepted_values(
+    flags: Sequence[_FeatureFlag[Any]], served: object
+) -> dict[str, RuntimeFlagValue]:
+    """Return the served values for *flags* whose type matches the declaration."""
     served_values = served if isinstance(served, dict) else {}
     accepted: dict[str, RuntimeFlagValue] = {}
     for flag in flags:
         value = served_values.get(flag.name)
         if value is not None and runtime_flag_value_matches(flag.value_type, value):
             accepted[flag.name] = value
-    _values = MappingProxyType(accepted)
+    return accepted
+
+
+class _RefreshFailed(Exception):
+    """One request of a refresh failed; :attr:`retry_after_s` says when to retry."""
+
+    def __init__(self, retry_after_s: float) -> None:
+        super().__init__(retry_after_s)
+        self.retry_after_s = retry_after_s
 
 
 RuntimeFlagPost = Callable[..., Awaitable[httpx.Response]]
@@ -203,15 +216,37 @@ class RuntimeFlagRefresher:
     async def refresh_once(self) -> float:
         """Fetch the declared flags once and store the server's answer.
 
+        Declarations are sent in batches of :data:`MAX_RUNTIME_FLAGS_PER_REQUEST`.
+        The stored values change only when every batch succeeds.
+
         :returns: Seconds to wait before the next refresh.
         """
+        global _values
         flags = declared_runtime_flags()
         if not flags:
             return self._default_interval_s
+        accepted: dict[str, RuntimeFlagValue] = {}
+        delay = _MAX_REFRESH_INTERVAL_S
+        try:
+            for start in range(0, len(flags), MAX_RUNTIME_FLAGS_PER_REQUEST):
+                batch = flags[start : start + MAX_RUNTIME_FLAGS_PER_REQUEST]
+                body = await self._request(batch)
+                accepted.update(_accepted_values(batch, body.get("values")))
+                delay = min(delay, self._suggested_delay(body.get("refresh_after_s")))
+        except _RefreshFailed as failure:
+            return failure.retry_after_s
+        _values = MappingProxyType(accepted)
+        return delay
+
+    async def _request(self, batch: Sequence[_FeatureFlag[Any]]) -> dict[str, Any]:
+        """Send one batch and return the response body.
+
+        :raises _RefreshFailed: If the request or its response is unusable.
+        """
         payload = {
             "flags": [
                 {"name": flag.name, "type": flag.value_type, "default": flag.default_value}
-                for flag in flags[:MAX_RUNTIME_FLAGS_PER_REQUEST]
+                for flag in batch
             ]
         }
         try:
@@ -220,26 +255,28 @@ class RuntimeFlagRefresher:
             )
         except (httpx.HTTPError, OSError, TimeoutError) as exc:
             _logger.debug("runtime flag refresh failed: %s", type(exc).__name__)
-            return self._default_interval_s
+            raise _RefreshFailed(self._default_interval_s) from exc
         if response.status_code in (404, 405):
             if not self._unsupported_logged:
                 _logger.info("server does not serve runtime flags; using defaults")
                 self._unsupported_logged = True
-            return _UNSUPPORTED_SERVER_RETRY_S
+            raise _RefreshFailed(_UNSUPPORTED_SERVER_RETRY_S)
         if response.status_code != 200:
             _logger.debug("runtime flag refresh returned HTTP %d", response.status_code)
-            return self._default_interval_s
+            raise _RefreshFailed(self._default_interval_s)
         try:
             body = response.json()
-        except ValueError:
+        except ValueError as exc:
             _logger.debug("runtime flag refresh returned invalid JSON")
-            return self._default_interval_s
+            raise _RefreshFailed(self._default_interval_s) from exc
         if not isinstance(body, dict):
-            return self._default_interval_s
-        _apply_served_values(flags[:MAX_RUNTIME_FLAGS_PER_REQUEST], body.get("values"))
-        suggested = body.get("refresh_after_s")
-        if isinstance(suggested, int | float) and not isinstance(suggested, bool):
-            return min(max(float(suggested), _MIN_REFRESH_INTERVAL_S), _MAX_REFRESH_INTERVAL_S)
+            raise _RefreshFailed(self._default_interval_s)
+        return body
+
+    def _suggested_delay(self, suggested: object) -> float:
+        """Clamp the server's suggested delay, or use the default."""
+        if runtime_flag_value_matches("float", suggested):
+            return min(max(float(suggested), _MIN_REFRESH_INTERVAL_S), _MAX_REFRESH_INTERVAL_S)  # type: ignore[arg-type]
         return self._default_interval_s
 
     async def _run(self) -> None:

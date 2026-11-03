@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from types import MappingProxyType
 
 import httpx
@@ -14,7 +15,9 @@ from omnigent.runtime_flags import (
     BoolFeatureFlag,
     FloatFeatureFlag,
     IntFeatureFlag,
+    LongFeatureFlag,
     RuntimeFlagRefresher,
+    StringFeatureFlag,
     StringListFeatureFlag,
 )
 
@@ -88,26 +91,64 @@ async def test_refresh_serves_values_and_falls_back_to_defaults() -> None:
     assert delay == 15.0  # suggested delays are clamped to the minimum
 
 
-async def test_failed_refresh_keeps_last_values_and_old_server_backs_off() -> None:
+async def test_failed_refresh_keeps_last_values_and_old_server_backs_off(monkeypatch) -> None:
     enabled = BoolFeatureFlag("test.enabled", False)
+    monkeypatch.setattr(runtime_flags, "_REQUEST_TIMEOUT_S", 0.01)
     server = _FakeServer(
         _served({"test.enabled": True}),
         httpx.ConnectError("down"),
         httpx.Response(503),
+        httpx.Response(200, content=b"not json"),
+        httpx.Response(200, json=["not", "an", "object"]),
         httpx.Response(404),
+        httpx.Response(405),
         _served({}),
     )
     refresher = RuntimeFlagRefresher(server.post, default_interval_s=30)
 
     assert await refresher.refresh_once() == 60
-    assert await refresher.refresh_once() == 30
-    assert await refresher.refresh_once() == 30
-    assert enabled.get_current_value() is True
-    assert await refresher.refresh_once() == 3600
+    for _ in range(4):  # connection error, 503, invalid JSON, non-object body
+        assert await refresher.refresh_once() == 30
+        assert enabled.get_current_value() is True
+    assert await refresher.refresh_once() == 3600  # 404
+    assert await refresher.refresh_once() == 3600  # 405
     assert enabled.get_current_value() is True
     # An authoritative answer without the flag returns it to its default.
     await refresher.refresh_once()
     assert enabled.get_current_value() is False
+
+
+async def test_timed_out_request_keeps_last_values(monkeypatch) -> None:
+    enabled = BoolFeatureFlag("test.enabled", False)
+    monkeypatch.setattr(runtime_flags, "_REQUEST_TIMEOUT_S", 0.01)
+    await RuntimeFlagRefresher(_FakeServer(_served({"test.enabled": True})).post).refresh_once()
+
+    async def hang(path: str, *, json: object) -> httpx.Response:
+        await asyncio.sleep(10)
+        raise AssertionError("unreachable")
+
+    assert await RuntimeFlagRefresher(hang, default_interval_s=30).refresh_once() == 30
+    assert enabled.get_current_value() is True
+
+
+async def test_refresh_includes_all_declared_flags(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_flags, "MAX_RUNTIME_FLAGS_PER_REQUEST", 2)
+    flags = [BoolFeatureFlag(f"test.flag{index}", False) for index in range(3)]
+    everything = {flag.name: True for flag in flags}
+    server = _FakeServer(
+        _served(everything, refresh_after_s=120),
+        _served(everything, refresh_after_s=90),
+        _served({}),
+        httpx.Response(503),
+    )
+    refresher = RuntimeFlagRefresher(server.post)
+
+    assert await refresher.refresh_once() == 90  # the shortest suggested delay
+    assert [len(body["flags"]) for _, body in server.requests] == [2, 1]
+    assert all(flag.get_current_value() for flag in flags)
+    # A failed later batch leaves the previous complete answer in place.
+    await refresher.refresh_once()
+    assert all(flag.get_current_value() for flag in flags)
 
 
 async def test_no_declared_flags_sends_no_request() -> None:
@@ -126,9 +167,11 @@ async def test_background_refresh_runs_until_closed() -> None:
 
     refresher = RuntimeFlagRefresher(post)
     refresher.start()
+    task = refresher._task
     await asyncio.wait_for(served.wait(), timeout=5)
     await refresher.aclose()
     assert enabled.get_current_value() is True
+    assert task is not None and task.cancelled()
 
 
 def test_declarations_validate_name_default_and_conflicts() -> None:
@@ -147,3 +190,22 @@ def test_declarations_validate_name_default_and_conflicts() -> None:
         IntFeatureFlag("test.limit", True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="wrong type"):
         IntFeatureFlag("test.limit", 2**31)
+    assert LongFeatureFlag("test.long_max", 2**63 - 1).default_value == 2**63 - 1
+    with pytest.raises(ValueError, match="wrong type"):
+        LongFeatureFlag("test.long_over", 2**63)
+    assert StringFeatureFlag("test.mode", "on").get_current_value() == "on"
+    with pytest.raises(ValueError, match="wrong type"):
+        StringFeatureFlag("test.mode_number", 1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+async def test_non_finite_float_defaults_are_rejected(value) -> None:
+    valid = BoolFeatureFlag("test.enabled", False)
+    with pytest.raises(ValueError, match="wrong type"):
+        FloatFeatureFlag("test.ratio", value)
+    server = _FakeServer(_served({"test.enabled": True}))
+    await RuntimeFlagRefresher(server.post).refresh_once()
+    assert valid.get_current_value() is True
+    assert server.requests[0][1] == {
+        "flags": [{"name": "test.enabled", "type": "bool", "default": False}]
+    }

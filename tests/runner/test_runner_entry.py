@@ -2748,6 +2748,19 @@ async def test_runner_shutdown_closes_terminal_registry(
         sync_clients.append(client)
         return client
 
+    flag_refresher_events: list[str] = []
+
+    class _TrackingFlagRefresher:
+        def __init__(self, post: Any) -> None:
+            del post
+
+        def start(self) -> None:
+            flag_refresher_events.append("start")
+
+        async def aclose(self) -> None:
+            flag_refresher_events.append("close")
+
+    monkeypatch.setattr("omnigent.runtime_flags.RuntimeFlagRefresher", _TrackingFlagRefresher)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
     if host_owns_global_cleanup:
         monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
@@ -2787,6 +2800,7 @@ async def test_runner_shutdown_closes_terminal_registry(
             # Block only this test loop until the independent watchdog captures it.
             record = stall_records.get(timeout=budget(2))
             assert watching
+            assert flag_refresher_events == ["start"]
             assert record.event_name == "runner_event_loop_stalled"
             assert "test_runner_shutdown_closes_terminal_registry" in record.captured_stack_trace
     finally:
@@ -2795,6 +2809,7 @@ async def test_runner_shutdown_closes_terminal_registry(
 
     assert watchdog_roles == ["runner"]
     assert not watching
+    assert flag_refresher_events == ["start", "close"]
     assert process_managers and process_managers[0].started
     assert process_managers[0].shutdown_called
     assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])

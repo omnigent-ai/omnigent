@@ -3998,7 +3998,7 @@ def create_app(
         )
 
     app.include_router(
-        create_runtime_flags_router(runtime_flag_provider, auth_provider),
+        create_runtime_flags_router(runtime_flag_provider, auth_provider, host_store),
         prefix="/v1",
         tags=["runtime-flags"],
     )

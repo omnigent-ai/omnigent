@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from pydantic import ValidationError
 
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.routes.runtime_flags import RuntimeFlagsRequest, create_runtime_flags_router
 from omnigent.server.runtime_flags import (
     RuntimeFlagCaller,
     RuntimeFlagQuery,
@@ -92,20 +97,72 @@ async def test_provider_values_are_filtered_by_query_and_type(db_uri, tmp_path, 
 @pytest.mark.parametrize(
     "body",
     [
-        _request(("a.limit", "int", True)),  # default of the wrong type
         _request(("a.limit", "int", "3")),
+        _request(("a.ratio", "float", "1.5")),
+        _request(("a.groups", "string_list", ["a", 1])),
         _request(("bad name", "bool", False)),
         _request(("a.flag", "unknown", False)),
         _request(("a.flag", "bool", False), ("a.flag", "bool", False)),
         {"flags": [{"name": "a.flag", "type": "bool", "default": False, "extra": 1}]},
+        {"flags": [], "unexpected": True},
     ],
 )
-async def test_invalid_requests_are_rejected(db_uri, tmp_path, body):
+def test_invalid_request_bodies(body):
+    with pytest.raises(ValidationError):
+        RuntimeFlagsRequest.model_validate(body)
+
+
+async def test_invalid_request_is_422_without_calling_provider(db_uri, tmp_path):
     provider = _RecordingProvider({})
     async with _client(_app(db_uri, tmp_path, provider, auth=False)) as client:
-        response = await client.post(_PATH, json=body)
+        response = await client.post(_PATH, json=_request(("a.limit", "int", True)))
     assert response.status_code == 422
     assert provider.calls == []
+
+
+@dataclass
+class _ManagedHost:
+    user_id: str
+
+
+class _FakeHostStore:
+    """Resolves one (host_id, launch token) pair to its owner."""
+
+    def resolve_launch_token(self, host_id: str, token: str) -> _ManagedHost | None:
+        if (host_id, token) == ("host_a", "launch-token-a"):
+            return _ManagedHost("owner@example.test")
+        return None
+
+
+@pytest.mark.parametrize(
+    ("token", "host_id", "status"),
+    [
+        ("launch-token-a", "host_a", 200),
+        ("wrong-token", "host_a", 401),
+        ("launch-token-a", "host_b", 401),
+        ("launch-token-a", None, 401),
+    ],
+)
+async def test_managed_host_launch_token_resolves_owner(token, host_id, status):
+    provider = _RecordingProvider({"a.enabled": True})
+    app = FastAPI()
+    app.include_router(
+        create_runtime_flags_router(
+            provider,
+            UnifiedAuthProvider(source="header"),
+            _FakeHostStore(),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    body = {**_request(("a.enabled", "bool", False)), "host_id": host_id}
+    async with _client(app) as client:
+        response = await client.post(_PATH, headers={MANAGED_HOST_TOKEN_HEADER: token}, json=body)
+    assert response.status_code == status
+    if status == 200:
+        assert response.json()["values"] == {"a.enabled": True}
+        assert provider.calls[0][1] == RuntimeFlagCaller(user_id="owner@example.test")
+    else:
+        assert provider.calls == []
 
 
 async def test_provider_failure_is_503(db_uri, tmp_path):
