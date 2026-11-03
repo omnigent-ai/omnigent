@@ -43,6 +43,7 @@ import {
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { ApiError } from "@/lib/sessionsApi";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as filesApi from "@/lib/filesApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
@@ -1241,6 +1242,69 @@ describe("Composer slash-command menu", () => {
 
     expect(await screen.findByText("Stop the current turn before running /rewind.")).toBeTruthy();
   });
+
+  it.each([false, true])(
+    "/rewind fills the new session's composer when the redirect lands first (typed there: %s)",
+    async (typedAfterLanding) => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      renderRewindComposer("claude-sdk", { session_rewind: true });
+      let respond!: (rewound: Awaited<ReturnType<typeof sessionsApi.rewindSession>>) => void;
+      vi.spyOn(sessionsApi, "rewindSession").mockReturnValue(
+        new Promise((resolve) => {
+          respond = resolve;
+        }),
+      );
+      const diagram = new File(["png"], "diagram.png", { type: "image/png" });
+      const download = vi.spyOn(filesApi, "downloadSessionFile").mockResolvedValue(diagram);
+      fireEvent.change(textarea(), { target: { value: "/rewind" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.click((await screen.findAllByTestId("rewind-prompt"))[1]!);
+
+      // The source's stream redirects before the rewind responds, so the page
+      // opens the new session's composer first.
+      act(() =>
+        handleSessionEvent({
+          type: "session_superseded",
+          conversationId: "conv_test",
+          targetConversationId: "conv_new",
+          reason: "rewind",
+        }),
+      );
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+      cleanup();
+      act(() =>
+        useChatStore.setState({ conversationId: "conv_new", redirectToConversationId: null }),
+      );
+      render(
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, session_rewind: true }}>
+          <Composer {...composerProps()} />
+        </CapabilitiesProvider>,
+      );
+      expect(textarea()).toHaveValue("");
+      if (typedAfterLanding) fireEvent.change(textarea(), { target: { value: "My own words" } });
+
+      await act(async () =>
+        respond({
+          sessionId: "conv_new",
+          prompt: "Write the parser",
+          attachments: [{ type: "input_image", fileId: "file_new", filename: "diagram.png" }],
+        }),
+      );
+
+      expect(download).toHaveBeenCalledExactlyOnceWith("conv_new", "file_new", "diagram.png");
+      await waitFor(() => expect(useChatStore.getState().rewindPrefill).toBeNull());
+      if (typedAfterLanding) {
+        expect(textarea()).toHaveValue("My own words");
+        expect(screen.queryByAltText("diagram.png")).toBeNull();
+      } else {
+        expect(textarea()).toHaveValue("Write the parser");
+        expect(screen.getByAltText("diagram.png")).toBeTruthy();
+      }
+    },
+  );
 
   it("/rewind shows a prompt list that failed to load", async () => {
     renderRewindComposer("claude-sdk", { session_rewind: true });

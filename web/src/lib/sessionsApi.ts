@@ -1034,6 +1034,16 @@ export async function fetchRewindPrompts(
   return prompts;
 }
 
+/** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */
+export interface RewindAttachment {
+  /** The prompt's content block type. */
+  type: "input_file" | "input_image";
+  /** The rewound session's copy of the file, e.g. "file_abc". */
+  fileId: string;
+  /** The attachment's name, e.g. "diagram.png". */
+  filename: string;
+}
+
 /**
  * Rewind a Claude session to just before one of its prompts:
  * `POST /v1/sessions/{id}/rewind`.
@@ -1044,19 +1054,32 @@ export async function fetchRewindPrompts(
  *
  * @param sessionId - Session to rewind, e.g. "conv_abc".
  * @param itemId - The user prompt to return to, e.g. "msg_abc".
- * @returns The rewound session's id and the prompt's text.
+ * @returns The rewound session's id, the prompt's text and its attachments
+ *   (empty from servers that return none).
  */
 export async function rewindSession(
   sessionId: string,
   itemId: string,
-): Promise<{ sessionId: string; prompt: string }> {
+): Promise<{ sessionId: string; prompt: string; attachments: RewindAttachment[] }> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/rewind`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ item_id: itemId }),
   });
-  const body = await readJsonOrThrow<{ session_id: string; prompt: string }>(res);
-  return { sessionId: body.session_id, prompt: body.prompt };
+  const body = await readJsonOrThrow<{
+    session_id: string;
+    prompt: string;
+    attachments?: { type: RewindAttachment["type"]; file_id: string; filename: string }[];
+  }>(res);
+  return {
+    sessionId: body.session_id,
+    prompt: body.prompt,
+    attachments: (body.attachments ?? []).map((attachment) => ({
+      type: attachment.type,
+      fileId: attachment.file_id,
+      filename: attachment.filename,
+    })),
+  };
 }
 
 /**

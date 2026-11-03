@@ -7366,6 +7366,64 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
       expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
       expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+      expect(useChatStore.getState().rewindPrefill).toEqual({
+        conversationId: "conv_new",
+        text: "Add parser tests",
+        files: [],
+      });
+    });
+
+    it("restores the prompt's attachments as the new session's own files", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json({
+          session_id: "conv_new",
+          prompt: "",
+          attachments: [
+            { type: "input_image", file_id: "file_fork_png", filename: "diagram.png" },
+            { type: "input_file", file_id: "file_fork_gone", filename: "gone.txt" },
+            { type: "input_file", file_id: "file_fork_txt", filename: "notes.txt" },
+          ],
+        }),
+      );
+      const contents: Record<string, Response> = {
+        file_fork_png: new Response("png", { headers: { "Content-Type": "image/png" } }),
+        file_fork_gone: Response.json({ error: { code: "not_found" } }, { status: 404 }),
+        file_fork_txt: new Response("notes", { headers: { "Content-Type": "text/plain" } }),
+      };
+      const uploads: string[] = [];
+      const posted: unknown[] = [];
+      const rewindFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const content = /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/.exec(url);
+        if (content) return Promise.resolve(contents[content[1]!]!);
+        if (url.endsWith("/resources/files")) uploads.push(url);
+        if (url.endsWith("/v1/sessions/conv_new/events") && init?.method === "POST")
+          posted.push(JSON.parse(String(init.body)));
+        return rewindFetch(input, init);
+      });
+
+      await useChatStore.getState().rewindToPrompt("msg_second");
+
+      const files = getSessionDraft("conv_new")?.files ?? [];
+      expect(files.map((file) => [file.name, file.type])).toEqual([
+        ["diagram.png", "image/png"],
+        ["notes.txt", "text/plain"],
+      ]);
+      expect(await files[1]!.text()).toBe("notes");
+      expect(useChatStore.getState().rewindPrefill?.files).toEqual(files);
+
+      // Sending them reuses the new session's copies instead of uploading again.
+      useChatStore.setState({ conversationId: "conv_new", abortController: new AbortController() });
+      await useChatStore.getState().send("", "agent_xyz", files);
+      expect(uploads).toEqual([]);
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_png"');
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_txt"');
     });
 
     it("leaves the view in place when the server refuses", async () => {
