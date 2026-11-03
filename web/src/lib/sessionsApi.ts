@@ -227,8 +227,6 @@ interface SessionResponseWire {
    * optimistic bubble. Empty for non-native sessions.
    */
   pending_inputs?: PendingInputWire[];
-  /** The viewer's startup messages a failed managed launch did not deliver. */
-  failed_inputs?: PendingInputWire[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -373,7 +371,6 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
     pendingInputs: (wire.pending_inputs ?? []).map(pendingInputFromWire),
-    failedInputs: (wire.failed_inputs ?? []).map(pendingInputFromWire),
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
@@ -1258,6 +1255,39 @@ export async function getSessionSlim(
     { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
+ * List the viewer's startup messages a failed managed launch could not
+ * deliver, following the route's cursor across pages.
+ *
+ * @param sessionId - The session whose launch failed.
+ * @param options - `signal` aborts the read.
+ * @returns The messages, empty unless the launch failed and no runner is bound.
+ * @throws When a page can't be read, including from servers without the route.
+ */
+export async function listFailedInputs(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<PendingInput[]> {
+  const inputs: PendingInput[] = [];
+  let after: string | null = null;
+  // Each page provides the cursor for the next request.
+  /* oxlint-disable no-await-in-loop */
+  do {
+    const query: string = after !== null ? `?after=${encodeURIComponent(after)}` : "";
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/failed-inputs${query}`,
+      { signal: options.signal },
+    );
+    const page = await readJsonOrThrow<{ data: PendingInputWire[]; next_cursor: string | null }>(
+      res,
+    );
+    inputs.push(...page.data.map(pendingInputFromWire));
+    after = page.next_cursor;
+  } while (after !== null);
+  /* oxlint-enable no-await-in-loop */
+  return inputs;
 }
 
 export interface SessionSignInLink {

@@ -23,6 +23,7 @@ import {
   getSessionUsage,
   importLocalSessions,
   interrupt,
+  listFailedInputs,
   listRunners,
   openSessionStream,
   postEvent,
@@ -186,7 +187,6 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
-      failedInputs: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -336,7 +336,7 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs and failed_inputs (snake) to camel case with content", async () => {
+  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
@@ -351,26 +351,12 @@ describe("createSession", () => {
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
         ],
-        failed_inputs: [
-          {
-            pending_id: "pending_2",
-            content: [{ type: "input_text", text: "undelivered" }],
-            created_by: "user_1",
-          },
-        ],
       }),
     );
 
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
-    ]);
-    expect(session.failedInputs).toEqual([
-      {
-        pendingId: "pending_2",
-        content: [{ type: "input_text", text: "undelivered" }],
-        createdBy: "user_1",
-      },
     ]);
   });
 
@@ -1489,6 +1475,64 @@ describe("getSessionUsage", () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 }));
 
     await expect(getSessionUsage("conv_abc")).rejects.toMatchObject({ status: 503 });
+  });
+});
+
+describe("listFailedInputs", () => {
+  it("follows the cursor across pages and maps each input", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          data: [
+            {
+              pending_id: "pending_1",
+              content: [{ type: "input_text", text: "first" }],
+              created_by: "user_1",
+            },
+          ],
+          next_cursor: "1",
+        }),
+      )
+      .mockResolvedValueOnce(mockJsonResponse({ data: [], next_cursor: "2" }))
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          data: [{ pending_id: "pending_3", content: [{ type: "input_text", text: "third" }] }],
+          next_cursor: null,
+        }),
+      );
+    const controller = new AbortController();
+
+    const inputs = await listFailedInputs("conv with space", { signal: controller.signal });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/conv%20with%20space/failed-inputs",
+      "/v1/sessions/conv%20with%20space/failed-inputs?after=1",
+      "/v1/sessions/conv%20with%20space/failed-inputs?after=2",
+    ]);
+    expect(fetchMock.mock.calls.map(([, init]) => init.signal)).toEqual([
+      controller.signal,
+      controller.signal,
+      controller.signal,
+    ]);
+    expect(inputs).toEqual([
+      {
+        pendingId: "pending_1",
+        content: [{ type: "input_text", text: "first" }],
+        createdBy: "user_1",
+      },
+      { pendingId: "pending_3", content: [{ type: "input_text", text: "third" }] },
+    ]);
+  });
+
+  it("rejects when the server has no failed-inputs route", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { detail: "Not Found" },
+        { ok: false, status: 404, statusText: "Not Found" },
+      ),
+    );
+
+    await expect(listFailedInputs("conv_abc")).rejects.toThrow();
   });
 });
 

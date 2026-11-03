@@ -13881,7 +13881,6 @@ async def _get_session_snapshot(
         queued = await startup.pending_snapshot(session_id)
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
-        response.failed_inputs = await startup.failed_snapshot(conv, viewer_id)
     return response
 
 

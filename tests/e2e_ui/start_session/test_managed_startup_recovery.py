@@ -108,8 +108,10 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             timeout=60,
         )
         assert snapshot["pending_inputs"] == []
-        [failed] = snapshot["failed_inputs"]
+        page = (await client.get(f"{rig.b}{path}/failed-inputs")).raise_for_status().json()
+        [failed] = page["data"]
         assert failed["content"] == [{"type": "input_text", "text": _PROMPT}]
+        assert page["next_cursor"] is None
         errors = [item for item in snapshot["items"] if item["type"] == "error"]
         # The provider's own text stays server-side; the launch failure is named.
         assert any(

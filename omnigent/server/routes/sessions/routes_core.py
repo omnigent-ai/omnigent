@@ -211,6 +211,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
     SessionEventInput,
+    SessionFailedInputPage,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -1759,6 +1760,54 @@ def register_core_routes(
             # Collapse per-user pin keys for this caller (never leak another
             # user's pin key to a native harness bridge).
             labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
+        )
+
+    @router.get(
+        "/sessions/{session_id}/failed-inputs",
+        response_model=SessionFailedInputPage,
+    )
+    async def list_session_failed_inputs(
+        request: Request,
+        response: Response,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=100),
+        after: str | None = Query(default=None, max_length=19),
+    ) -> SessionFailedInputPage:
+        """
+        List the caller's startup inputs a failed managed launch could not deliver.
+
+        Clients hand them back to the composer for resending. The list is empty
+        unless the launch failed, and stays empty once a runner is bound.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param response: The FastAPI response (for cache headers).
+        :param session_id: Session/conversation identifier.
+        :param limit: The most saved inputs to read for this page.
+        :param after: The previous page's ``next_cursor``.
+        :returns: A page of the caller's failed inputs.
+        :raises OmnigentError: 404 if no session exists.
+        """
+        response.headers["Cache-Control"] = "no-store"
+        if after is not None and not (after.isascii() and after.isdigit() and int(after) < 2**63):
+            raise HTTPException(status_code=422, detail="Invalid failed-input cursor")
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        startup = getattr(request.app.state, "startup_inputs", None)
+        if startup is None:
+            return SessionFailedInputPage()
+        data, next_position = await startup.failed_page(
+            conv, user_id, after=int(after) if after is not None else None, limit=limit
+        )
+        return SessionFailedInputPage(
+            data=data,
+            next_cursor=str(next_position) if next_position is not None else None,
         )
 
     # ── GET /sessions ───────────────────────────────────────────

@@ -509,11 +509,6 @@ Fields:
     redraw a bubble the person stopped. Empty for non-native sessions,
     which already carry the message in `items`.
 
-  failed_inputs (array, default `[]`)
-    The viewer's own startup inputs that a failed managed launch could not
-    deliver, shaped like `pending_inputs`. Clients offer them back to the
-    composer for resending. Empty once a runner is bound to the session.
-
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",
@@ -614,11 +609,11 @@ already uploaded or registered an agent. The response is the full
     history-seeding behavior and cannot be combined with `initial_input`.
     Attribution comes from the authenticated creator; EDIT permission and input
     policies are checked again at dispatch. Pending input appears in the session
-    snapshot's `pending_inputs`; after a failed launch, it appears in its sender's
-    `failed_inputs` instead. Additional messages sent to `/events` during
-    startup are also saved and acknowledged immediately, in submission order,
-    unless the launch already failed or the bound host is gone; those take the
-    ordinary error or relaunch path.
+    snapshot's `pending_inputs`; after a failed launch, its sender reads it from
+    `GET /v1/sessions/{session_id}/failed-inputs` instead. Additional messages
+    sent to `/events` during startup are also saved and acknowledged
+    immediately, in submission order, unless the launch already failed or the
+    bound host is gone; those take the ordinary error or relaunch path.
     Up to 100 pending inputs are accepted per session; excess sends are refused.
 
     Pending messages use the existing conversation items and status fields.
@@ -829,6 +824,25 @@ replace newer metadata. The request performs its own authorization; the initial
 snapshot does not start a detached usage worker.
 Older servers omit `usage_included` and ignore `include_usage`; their snapshot
 already includes usage, so clients should not issue the separate request.
+
+### List Failed Startup Inputs
+
+```
+GET /v1/sessions/{session_id}/failed-inputs[?limit=100&after=<next_cursor>]
+
+200 OK — {"data": [{pending_id, content}], "next_cursor": string|null}
+404 Not Found — no session with that id is visible to the caller
+422 Unprocessable Entity — `after` is not a cursor this route returned
+```
+
+Returns the caller's own startup inputs that a failed managed launch
+(`omnigent.startup` label `failed`) could not deliver, shaped like the
+snapshot's `pending_inputs`, so clients can offer them back to the composer for
+resending. The list is empty for any other startup state and once a runner is
+bound to the session. Each page reads at most `limit` (1-100) of the session's
+saved startup inputs, so a page can hold fewer than `limit` entries while
+`next_cursor` is set; pass it as `after` until it is `null`. Older servers
+answer 404 for this route. The response is `Cache-Control: no-store`.
 
 ### Delete Session
 

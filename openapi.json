@@ -6896,6 +6896,34 @@
         "title": "SessionCreatedEvent",
         "type": "object"
       },
+      "SessionFailedInputPage": {
+        "description": "A page of `GET /v1/sessions/{id}/failed-inputs`.",
+        "properties": {
+          "data": {
+            "description": "The viewer's startup inputs a failed managed launch could not deliver, each `{\"pending_id\", \"content\"}` like `pending_inputs`. A page can hold fewer than `limit` inputs while more remain.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `after` value for the next page, or `None` on the last page.",
+            "title": "Next Cursor"
+          }
+        },
+        "title": "SessionFailedInputPage",
+        "type": "object"
+      },
       "SessionForkRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/sessions/{source_id}/fork`.\n\nCreates a deep copy of an existing session's items into a new\nsession. All fields are optional.",
@@ -8608,15 +8636,6 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Populated by the wrapper bridge.",
             "title": "External Session Id"
-          },
-          "failed_inputs": {
-            "description": "The viewer's own startup inputs a failed managed launch could not deliver, shaped like `pending_inputs`. Clients hand them back to the composer for resending. Empty once a runner is bound to the session.",
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Failed Inputs",
-            "type": "array"
           },
           "git_branch": {
             "anyOf": [
@@ -15798,6 +15817,81 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/failed-inputs": {
+      "get": {
+        "description": "List the caller's startup inputs a failed managed launch could not deliver.\n\nClients hand them back to the composer for resending. The list is empty\nunless the launch failed, and stays empty once a runner is bound.\n\n**Returns:** A page of the caller's failed inputs.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "operationId": "list_session_failed_inputs_v1_sessions__session_id__failed_inputs_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most saved inputs to read for this page.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's `next_cursor`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 19,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionFailedInputPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Failed Inputs",
+        "tags": [
+          "sessions"
         ]
       }
     },

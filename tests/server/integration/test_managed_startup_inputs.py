@@ -25,6 +25,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
@@ -1034,12 +1035,66 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     # The undelivered first message stays recoverable for its sender to resend.
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
     assert snapshot["pending_inputs"] == []
-    [failed] = snapshot["failed_inputs"]
+    page = (await env.client.get(f"/v1/sessions/{session_id}/failed-inputs")).json()
+    [failed] = page["data"]
     assert failed["content"] == _INPUT["data"]["content"]
-    assert await env.app.state.startup_inputs.failed_snapshot(conv, "someone-else") == []
+    assert page["next_cursor"] is None
     env.conv_store.set_runner_id(session_id, uuid4().hex)
-    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
-    assert snapshot["failed_inputs"] == []
+    page = (await env.client.get(f"/v1/sessions/{session_id}/failed-inputs")).json()
+    assert page == {"data": [], "next_cursor": None}
+
+
+async def test_failed_launch_returns_each_sender_their_own_inputs_page_by_page(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    startup_permissions: SqlAlchemyPermissionStore,
+) -> None:
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    agent = await create_test_agent(auth_client)
+    response = await auth_client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert response.status_code == 201, response.text
+    session_id = response.json()["id"]
+    startup = auth_app.state.startup_inputs
+    startup.conversations.set_labels(session_id, {STARTUP_LABEL: "pending"})
+    startup_permissions.grant("bob", session_id, LEVEL_EDIT)
+    for sender, text in (("alice", "first"), ("bob", "from bob"), ("alice", "second")):
+        auth_client.headers["X-Forwarded-Email"] = sender
+        event = {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+                "stable_id": uuid4().hex,
+            },
+        }
+        response = await auth_client.post(f"/v1/sessions/{session_id}/events", json=event)
+        assert response.status_code == 202, response.text
+    url = f"/v1/sessions/{session_id}/failed-inputs"
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    assert (await auth_client.get(url)).json() == {"data": [], "next_cursor": None}
+    await startup.record_launch_failure(session_id, "sandbox never came online")
+
+    async def read_all(sender: str) -> list[list[str]]:
+        auth_client.headers["X-Forwarded-Email"] = sender
+        pages: list[list[str]] = []
+        params: dict[str, Any] = {"limit": 1}
+        while True:
+            response = await auth_client.get(url, params=params)
+            assert response.status_code == 200, response.text
+            page = response.json()
+            pages.append([entry["content"][0]["text"] for entry in page["data"]])
+            if page["next_cursor"] is None:
+                return pages
+            params["after"] = page["next_cursor"]
+
+    # One saved input per page, so another sender's leaves an empty page.
+    assert await read_all("alice") == [["first"], [], ["second"]]
+    assert await read_all("bob") == [[], ["from bob"], []]
+    for cursor in ("-1", "x", "9" * 19):
+        response = await auth_client.get(url, params={"after": cursor})
+        assert response.status_code == 422, response.text
+    startup.conversations.set_runner_id(session_id, uuid4().hex)
+    assert await read_all("alice") == [[]]
 
 
 async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(

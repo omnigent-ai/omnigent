@@ -5507,8 +5507,8 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
   });
 
-  it.each<[string, StoredReplyDraft | undefined, string]>([
-    ["a message", undefined, "also check the docs\n\nrun the linter next"],
+  it.each<[string, StoredReplyDraft | undefined, string | undefined, string]>([
+    ["a message", undefined, "stable_queued", "also check the docs\n\nrun the linter next"],
     [
       "a reply",
       {
@@ -5516,11 +5516,18 @@ describe("Composer reply quotes", () => {
         quotes: [{ before: "", text: "the failing test" }],
         text: "run the linter next",
       },
+      "stable_queued",
       "also check the docs\n\n> the failing test\n\nrun the linter next",
+    ],
+    [
+      "a failed launch's message",
+      undefined,
+      undefined,
+      "also check the docs\n\nrun the linter next",
     ],
   ])(
     "adds %s recovered on load after the draft the reload kept, sending neither",
-    async (_, replyDraft, joined) => {
+    async (_, replyDraft, stableId, joined) => {
       setSessionDraft("conv_test", { text: "also check the docs", files: [] });
       const props = composerProps();
       render(<Composer {...props} />);
@@ -5532,7 +5539,7 @@ describe("Composer reply quotes", () => {
             conversationId: "conv_test",
             text: replyDraft ? serializeReplyDraft(replyDraft) : "run the linter next",
             files: [],
-            stableId: "stable_queued",
+            ...(stableId ? { stableId } : {}),
             ...(replyDraft ? { replyDraft } : {}),
             serverRefused: false,
             recovered: true,

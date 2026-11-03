@@ -2040,6 +2040,21 @@ class SessionLabelsResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
 
 
+class SessionFailedInputPage(BaseModel):
+    """
+    A page of ``GET /v1/sessions/{id}/failed-inputs``.
+
+    :param data: The viewer's startup inputs a failed managed launch could not
+        deliver, each ``{"pending_id", "content"}`` like ``pending_inputs``. A
+        page can hold fewer than ``limit`` inputs while more remain.
+    :param next_cursor: The ``after`` value for the next page, or ``None`` on
+        the last page.
+    """
+
+    data: list[dict[str, Any]] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 # Stages of a managed-sandbox launch, in pipeline order: the sandbox
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
@@ -2367,10 +2382,6 @@ class SessionResponse(BaseModel):
         Ordinary native sends use the in-memory
         :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
         survive server restart in the conversation store.
-    :param failed_inputs: The viewer's own startup inputs a failed managed
-        launch could not deliver, shaped like ``pending_inputs``. Clients
-        hand them back to the composer for resending. Empty once a runner
-        is bound to the session.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2471,7 +2482,6 @@ class SessionResponse(BaseModel):
     # Durable startup inputs plus ordinary native inputs awaiting a receipt.
     # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
-    failed_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
