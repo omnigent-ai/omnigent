@@ -1189,6 +1189,12 @@ def test_composer_growth_reflows_without_covering_output(
         assert abs(touch_grown["overlap"]) <= TOLERANCE
 
     page.set_viewport_size({"width": 1280, "height": 720})
+    # Rows measured under touch keep their larger message-font heights after
+    # unmounting; reload so the desktop checks start from desktop measurements.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    composer = page.get_by_label("Message the agent")
+    composer.click()
     composer.fill("")
     settled_geometry(page)
     scroll_to_distance_from_bottom(page, 180)
