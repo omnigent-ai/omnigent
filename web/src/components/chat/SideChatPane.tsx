@@ -162,7 +162,7 @@ export function SideChatPane({
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
-  const { session } = useSession(pending ? null : childId);
+  const { session, error: sessionError } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
@@ -223,7 +223,8 @@ export function SideChatPane({
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
   const needsBoundary = boundaryRef.current.ids === null && !pending && filterHistory;
-  // The loaded window holds at most this many items older than the copied one.
+  // A filtered pane never pages older history, so one window-sized page covers
+  // every copied item it can show.
   const copiedHistory = useQuery({
     queryKey: ["side_chat_history", childId, historyItemId],
     queryFn: async () => {
@@ -245,11 +246,8 @@ export function SideChatPane({
       writeInheritedBoundary(childId, ids);
     }
   } else if (
-    // Older servers don't record the copied history: capture once, when the
-    // fork's load has actually completed — even if it is EMPTY (a parent with
-    // no history), so the side chat's first message isn't mistaken for
-    // inherited history and hidden. Snapshot the inherited item ids and
-    // persist so later mounts/reloads hide the same set, not new turns.
+    // Older servers lack the label: persist the ids present once the fork's load
+    // completes, even if empty, so the side chat's first message stays visible.
     needsBoundary &&
     session !== null &&
     boundaryRef.current.loadSeen &&
@@ -268,7 +266,9 @@ export function SideChatPane({
   // Hide the transcript until the copied history is known rather than flash it;
   // if it can't be fetched, show everything.
   const awaitingBoundary =
-    inherited === null && needsBoundary && Boolean(historyItemId) && !copiedHistory.isError;
+    inherited === null &&
+    needsBoundary &&
+    (session === null ? sessionError === null : Boolean(historyItemId) && !copiedHistory.isError);
   const visibleBlocks = useMemo(() => {
     if (awaitingBoundary) return [];
     if (inherited === null) return blocks;

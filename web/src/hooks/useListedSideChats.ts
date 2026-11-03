@@ -21,7 +21,7 @@ export function useListedSideChats(conversationId: string): string[] | null {
     queryKey: listedSideChatsQueryKey(sessionId ?? ""),
     queryFn: () => listSideChats(sessionId as string),
     enabled: sessionId !== null,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: "always",
   });
   return useMemo(() => data?.map((sideChat) => sideChat.id) ?? null, [data]);
 }

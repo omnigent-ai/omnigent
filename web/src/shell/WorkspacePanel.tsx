@@ -907,10 +907,13 @@ function WorkspacePanelImpl({
   useEffect(() => {
     if (listedSideChats !== null) syncSideChats(listedSideChats);
   }, [listedSideChats, syncSideChats]);
-  const refreshListedSideChats = useCallback(
-    () => void queryClient.invalidateQueries({ queryKey: listedSideChatsQueryKey(conversationId) }),
-    [queryClient, conversationId],
-  );
+  const refreshListedSideChats = useCallback(() => {
+    const queryKey = listedSideChatsQueryKey(conversationId);
+    // A list fetched before this change would undo it, e.g. reopen a closed tab.
+    void queryClient
+      .cancelQueries({ queryKey })
+      .then(() => queryClient.invalidateQueries({ queryKey }));
+  }, [queryClient, conversationId]);
   const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
   useEffect(() => {
     onHasSubagentTabsChange?.(hasSubagentTabs);

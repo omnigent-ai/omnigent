@@ -155,9 +155,9 @@ export function useSideChats(conversationId: string) {
     [update],
   );
 
-  /** Close a tab. Drops only the client-side reference — an ephemeral Codex
-   *  fork dies with its process, and a generic child stays hidden server-side.
-   *  A closed selected tab hands the selection to its left neighbour in the strip. */
+  /** Close a tab. Drops only the client-side reference; the caller stops the
+   *  child and removes it from the server's side-chat list. A closed selected
+   *  tab hands the selection to its left neighbour in the strip. */
   const close = useCallback(
     (childId: string) => update((current) => withoutTab(current, childId)),
     [update],

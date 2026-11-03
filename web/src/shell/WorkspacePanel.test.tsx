@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
 import type { ReactNode, RefObject } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1474,6 +1474,26 @@ describe("WorkspacePanel side chats from the user's other devices", () => {
     expect(sessionsApi.listSideChats).toHaveBeenCalledWith("conv_ws");
   });
 
+  it("closes a side chat another device closed once the window regains focus", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    vi.mocked(sessionsApi.listSideChats).mockResolvedValue([{ id: "conv_remote", createdAt: 1 }]);
+    renderWorkspace({ rightRailTab: "sidechat", queryClient });
+    expect(await screen.findByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
+    vi.mocked(sessionsApi.listSideChats).mockResolvedValue([]);
+
+    try {
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await waitFor(() => expect(screen.queryByRole("tab", { name: "Side chat 1" })).toBeNull());
+    } finally {
+      focusManager.setFocused(undefined);
+    }
+  });
+
   it("stops listing a side chat closed here, and keeps it open if that fails", async () => {
     writeSessionWorkspaceState("conv_ws", {
       openSideChats: ["conv_side_a", "conv_side_b"],
@@ -1499,6 +1519,42 @@ describe("WorkspacePanel side chats from the user's other devices", () => {
       ["conv_ws", "conv_side_b"],
       ["conv_ws", "conv_side_b"],
     ]);
+  });
+
+  it("keeps a side chat closed when a list fetched before the close still names it", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      selectedSideChatId: "conv_side_b",
+    });
+    vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
+    let resolveStale: (sideChats: sessionsApi.ListedSideChat[]) => void = () => {};
+    vi.mocked(sessionsApi.listSideChats)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveStale = resolve;
+        }),
+      )
+      .mockResolvedValue([{ id: "conv_side_a", createdAt: 1 }]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Side chat 2" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
+    );
+    await act(async () => {
+      resolveStale([
+        { id: "conv_side_a", createdAt: 1 },
+        { id: "conv_side_b", createdAt: 2 },
+      ]);
+      // React Query notifies observers on a later task.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(screen.queryByRole("tab", { name: "Side chat 2" })).toBeNull();
+    await waitFor(() => expect(sessionsApi.listSideChats).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("tab", { name: "Side chat 2" })).toBeNull();
   });
 });
 

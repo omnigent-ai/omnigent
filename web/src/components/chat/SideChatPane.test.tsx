@@ -36,14 +36,16 @@ vi.mock("@/components/ComposerMicButton", () => ({
 const mockSession = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
   snapshot: {} as Partial<Session>,
+  unloaded: false,
+  error: null as Error | null,
 }));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
-    session: { ...mockSession.snapshot, labels: mockSession.labels },
+    session: mockSession.unloaded ? null : { ...mockSession.snapshot, labels: mockSession.labels },
     isLoading: id != null && id === loadingSession.id,
-    error: null,
+    error: mockSession.error,
   }),
 }));
 vi.mock("@/hooks/useWorkingLabelTick", () => ({ useWorkingLabelTick: () => 0 }));
@@ -76,6 +78,8 @@ const renderPane = (ui: ReactNode) =>
 beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
+  mockSession.unloaded = false;
+  mockSession.error = null;
   loadingSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
@@ -1344,6 +1348,40 @@ describe("history a generic side chat copied from its parent", () => {
 
     expect(screen.getByText("Side question")).toBeInTheDocument();
     expect(fetchOlder).not.toHaveBeenCalled();
+  });
+
+  it("stays hidden until the session snapshot names the copied history", async () => {
+    mockSession.unloaded = true;
+    vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
+      items: [message("item_parent_q", "user", "Parent question")],
+      hasMore: false,
+    });
+    showChild([
+      message("item_parent_q", "user", "Parent question"),
+      message("item_parent_a", "assistant", "Parent answer"),
+      ...sideChatTurn,
+    ]);
+    const { rerender } = renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Parent question")).toBeNull();
+    expect(screen.queryByText("Side question")).toBeNull();
+    mockSession.unloaded = false;
+    mockSession.labels = { "omnigent.side_chat.history_item_id": "item_parent_a" };
+    rerender(<SideChatPane childId={childId} />);
+
+    expect(await screen.findByText("Side question")).toBeInTheDocument();
+    expect(screen.queryByText("Parent question")).toBeNull();
+    expect(screen.queryByText("Parent answer")).toBeNull();
+  });
+
+  it("shows the whole transcript when the session snapshot can't be read", () => {
+    mockSession.unloaded = true;
+    mockSession.error = new Error("offline");
+    showChild([message("item_parent_a", "assistant", "Parent answer"), ...sideChatTurn]);
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.getByText("Side question")).toBeInTheDocument();
+    expect(screen.getByText("Parent answer")).toBeInTheDocument();
   });
 
   it("shows the whole transcript when the copied history can't be read", async () => {
