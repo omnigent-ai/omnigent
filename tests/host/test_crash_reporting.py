@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.host import crash_reporting as cr
+from omnigent.process_logging import LOG_TTY_FD_ENV_VAR
 
 
 def _events(caplog: pytest.LogCaptureFixture, name: str) -> list[logging.LogRecord]:
@@ -282,6 +283,49 @@ def test_stop_signal_reaches_sink_then_dies_by_signal(tmp_path: Path, signum: in
     assert attrs["reason"] == "signal"
     assert attrs["signal"] == signal.Signals(signum).name
     assert attrs["exit_code"] == str(128 + signum)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_stop_signal_exit_row_reaches_the_terminal_mirror(tmp_path: Path) -> None:
+    """The terminal mirror writes from a thread, so the signal exit waits for it briefly."""
+    read_fd, write_fd = os.pipe()
+    script = _CHILD_PRELUDE + textwrap.dedent(
+        """
+        from omnigent.process_logging import nonblocking_terminal_stdio, terminal_stream_handler
+        nonblocking_terminal_stdio()  # as the host does, so the mirror writes from a thread
+        mirror = terminal_stream_handler()
+        mirror.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(mirror)
+        cr.install_host_signal_handlers()
+        print("ready", flush=True)
+        while True:
+            time.sleep(0.05)
+        """
+    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path / "rows.jsonl")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, LOG_TTY_FD_ENV_VAR: str(write_fd)},
+            pass_fds=(write_fd,),
+        )
+    finally:
+        os.close(write_fd)
+    with os.fdopen(read_fd, encoding="utf-8") as mirror_output:
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "ready"
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        mirrored = mirror_output.read()
+
+    assert proc.returncode == -signal.SIGTERM
+    assert "host exiting (signal)" in mirrored
 
 
 def test_uncaught_crash_reaches_sink(tmp_path: Path) -> None:

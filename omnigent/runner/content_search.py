@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from omnigent.runner.environment_filesystem import _python_script_command
+from omnigent.runner.environment_filesystem import _python_script_command, split_glob_list
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import threading
 
-args = ["rg", "--json", "--no-config", "--hidden",
+args = ["rg", "--json", "--no-config", "--hidden", *glob_args,
         "--glob=!.git", "--color=never", "--", query, "."]
 args[1:1] = ["--case-sensitive" if case_sensitive else "--ignore-case"]
 if not regex:
@@ -129,6 +129,8 @@ async def search_content(
     *,
     case_sensitive: bool = False,
     regex: bool = False,
+    include: str = "",
+    exclude: str = "",
     limit: int = 500,
 ) -> dict[str, Any]:
     """Search on-disk workspace text without bypassing the environment sandbox.
@@ -137,6 +139,8 @@ async def search_content(
     :param query: A single-line literal or ripgrep regular expression.
     :param case_sensitive: Whether letter case must match.
     :param regex: Interpret the query as a regular expression.
+    :param include: Comma-separated ripgrep globs; explicit includes override ignore rules.
+    :param exclude: Comma-separated ripgrep globs to exclude, taking precedence over includes.
     :param limit: Maximum matching lines returned, from 1 to 500.
     :returns: Matches and partial-result metadata, or a user-facing error.
     """
@@ -144,9 +148,19 @@ async def search_content(
         return {"error": "Enter a single-line search query of 1–4096 characters."}
     if not 1 <= limit <= 500:
         return {"error": "Search limit must be between 1 and 500."}
+    glob_args = []
+    for raw, prefix in ((include, ""), (exclude, "!")):
+        if len(raw) > 4096 or any(c in raw for c in "\x00\r\n"):
+            return {"error": "Enter single-line file filters of at most 4096 characters."}
+        for pattern in split_glob_list(raw):
+            if pattern.startswith("!"):
+                return {"error": "Use the Include and Exclude fields instead of ! prefixes."}
+            if pattern.endswith("/"):
+                pattern += "**"
+            glob_args.append(f"--glob={prefix}{pattern}")
     parameters = (
         f"query = {query!r}\ncase_sensitive = {case_sensitive!r}\n"
-        f"regex = {regex!r}\nlimit = {limit!r}\n"
+        f"regex = {regex!r}\nlimit = {limit!r}\nglob_args = {glob_args!r}\n"
     )
     # ponytail: one capped response; stream batches if large-workspace latency warrants it.
     result = await environment.shell(

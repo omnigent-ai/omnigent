@@ -1,11 +1,12 @@
-import { type RefObject, useEffect, useState } from "react";
+import { type RefObject, useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FileIcon, SearchIcon } from "lucide-react";
+import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
+import { cn } from "@/lib/utils";
 
 interface ContentMatch {
   path: string;
@@ -26,6 +27,8 @@ interface ContentSearchInput {
   query: string;
   caseSensitive: boolean;
   regex: boolean;
+  include: string;
+  exclude: string;
 }
 
 export function ContentSearchPanel({
@@ -40,12 +43,14 @@ export function ContentSearchPanel({
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
     queryKey: ["content-search-input", conversationId],
-    initialData: { query: "", caseSensitive: false, regex: false },
+    initialData: { query: "", caseSensitive: false, regex: false, include: "", exclude: "" },
     enabled: false,
     gcTime: Infinity,
   });
   const [input, setInput] = useState(cachedInput.data);
-  const { query, caseSensitive, regex } = input;
+  const [showFilters, setShowFilters] = useState(false);
+  const filtersId = useId();
+  const { query, caseSensitive, regex, include, exclude } = input;
   useEffect(() => {
     queryClient.setQueryData(["content-search-input", conversationId], input);
   }, [conversationId, input, queryClient]);
@@ -60,6 +65,8 @@ export function ContentSearchPanel({
         q: query,
         case_sensitive: String(caseSensitive),
         regex: String(regex),
+        include,
+        exclude,
       });
       const response = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/default/content-search?${params}`,
@@ -92,15 +99,31 @@ export function ContentSearchPanel({
         }}
       >
         <div className="flex gap-2">
-          <Input
-            ref={inputRef}
-            aria-label="Search file contents"
-            placeholder="Search file contents"
-            type="search"
-            maxLength={4096}
-            value={query}
-            onChange={(event) => setInput({ ...input, query: event.target.value })}
-          />
+          <div className="flex flex-1">
+            <Input
+              ref={inputRef}
+              aria-label="Search file contents"
+              placeholder="Search file contents"
+              type="search"
+              maxLength={4096}
+              value={query}
+              onChange={(event) => setInput({ ...input, query: event.target.value })}
+              className="rounded-r-none"
+            />
+            <Button
+              type="button"
+              variant={include.trim() || exclude.trim() ? "secondary" : "outline"}
+              size="icon"
+              aria-label="Filter files"
+              aria-expanded={showFilters}
+              aria-controls={filtersId}
+              title="Include / exclude files"
+              onClick={() => setShowFilters((visible) => !visible)}
+              className={cn("rounded-l-none border-l-0", showFilters && "bg-muted!")}
+            >
+              <FilterIcon className="size-4" />
+            </Button>
+          </div>
           <Button type="submit" disabled={!query.trim() || search.isFetching}>
             <SearchIcon className="size-4" />
             Search
@@ -124,9 +147,30 @@ export function ContentSearchPanel({
             Regular expression
           </label>
         </div>
+        <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">
+          <label className="block space-y-1">
+            <span>Include</span>
+            <Input
+              placeholder="e.g. src/**, *.{ts,tsx}"
+              maxLength={4096}
+              value={include}
+              onChange={(event) => setInput({ ...input, include: event.target.value })}
+            />
+          </label>
+          <label className="block space-y-1">
+            <span>Exclude</span>
+            <Input
+              placeholder="e.g. **/tests/**, *.min.js"
+              maxLength={4096}
+              value={exclude}
+              onChange={(event) => setInput({ ...input, exclude: event.target.value })}
+            />
+          </label>
+          <p className="text-muted-foreground">Comma-separated globs. Exclude takes precedence.</p>
+        </div>
         <p className="text-xs text-muted-foreground">
-          Searches workspace contents on disk. Respects readable ignore files; skips binary files
-          and .git.
+          Searches workspace contents on disk. Respects readable ignore files unless explicitly
+          included; skips binary files and .git.
         </p>
       </form>
       <div className="min-h-0 flex-1 overflow-auto p-2" aria-busy={search.isFetching}>

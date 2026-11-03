@@ -26,12 +26,31 @@ it("searches only on submission and allows the same query to run again", async (
   const { rerender } = render(view(1));
   expect(authenticatedFetch).not.toHaveBeenCalled();
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "  needle  " } });
+  const filters = screen.getByRole("button", { name: "Filter files" });
+  expect(screen.getByRole("searchbox").nextElementSibling).toBe(filters);
+  expect(filters).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByLabelText("Include")).not.toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
+  expect(filters).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByLabelText("Include")).toBeVisible();
+  fireEvent.change(screen.getByLabelText("Include"), { target: { value: "src/**" } });
+  fireEvent.change(screen.getByLabelText("Exclude"), { target: { value: "*.test.ts" } });
+  fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
+  expect(filters).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByLabelText("Include")).not.toBeVisible();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
   expect(await screen.findByText(/No matches for/)).toBeInTheDocument();
   expect(screen.getByRole("searchbox")).toHaveValue("  needle  ");
   expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
+  fireEvent.change(screen.getByLabelText("Include"), { target: { value: "" } });
+  fireEvent.change(screen.getByLabelText("Exclude"), { target: { value: "" } });
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
   await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
+  const cleared = new URL(String(vi.mocked(authenticatedFetch).mock.calls[1][0]), "http://test");
+  expect(cleared.searchParams.get("include")).toBe("");
+  expect(cleared.searchParams.get("exclude")).toBe("");
   expect(await screen.findByText(/No matches for/)).toBeInTheDocument();
   rerender(view(2));
   expect(screen.getByRole("searchbox")).toHaveValue("  needle  ");
@@ -61,6 +80,11 @@ it("submits content and options explicitly, highlights results and opens the exa
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "  Needle.*  " } });
   fireEvent.click(screen.getByLabelText("Match case"));
   fireEvent.click(screen.getByLabelText("Regular expression"));
+  fireEvent.click(screen.getByRole("button", { name: "Filter files" }));
+  fireEvent.change(screen.getByLabelText("Include"), { target: { value: "src/**, *.{py,txt}" } });
+  fireEvent.change(screen.getByLabelText("Exclude"), {
+    target: { value: "**/tests/**, a & b/**" },
+  });
   expect(authenticatedFetch).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
   await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
@@ -72,6 +96,8 @@ it("submits content and options explicitly, highlights results and opens the exa
     q: "  Needle.*  ",
     case_sensitive: "true",
     regex: "true",
+    include: "src/**, *.{py,txt}",
+    exclude: "**/tests/**, a & b/**",
   });
   expect(screen.getByText("Searching…")).toBeInTheDocument();
   resolve(
@@ -102,11 +128,16 @@ it("submits content and options explicitly, highlights results and opens the exa
   rerender(view("session-two"));
   expect(screen.getByRole("searchbox")).toHaveValue("");
   expect(screen.getByLabelText("Match case")).not.toBeChecked();
+  expect(screen.getByLabelText("Include")).toHaveValue("");
+  expect(screen.getByLabelText("Exclude")).toHaveValue("");
   expect(screen.queryByRole("button", { name: /Open src\/main.py/ })).not.toBeInTheDocument();
   rerender(view("session-one"));
   expect(screen.getByRole("searchbox")).toHaveValue("unsent draft");
   expect(screen.getByLabelText("Match case")).toBeChecked();
   expect(screen.getByLabelText("Regular expression")).toBeChecked();
+  expect(screen.getByLabelText("Include")).toHaveValue("src/**, *.{py,txt}");
+  expect(screen.getByLabelText("Exclude")).toHaveValue("**/tests/**, a & b/**");
+  expect(screen.getByRole("button", { name: "Filter files" })).toBeInTheDocument();
   expect(screen.getByText(/matching lines.*Needle/)).toBeInTheDocument();
   expect(screen.getByText(/first 1 matching lines/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Open src/main.py at line 351" }));

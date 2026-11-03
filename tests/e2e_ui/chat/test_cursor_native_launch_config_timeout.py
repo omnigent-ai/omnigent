@@ -291,7 +291,7 @@ class _SnapshotDelayProxy:
                     # read budget firing -> EOF) before the delay elapses.
                     try:
                         extra = await asyncio.wait_for(creader.read(65536), timeout=_STALL_S)
-                    except (TimeoutError, asyncio.TimeoutError):
+                    except TimeoutError:
                         extra = None  # caller rode out the slow read
                     if extra == b"":
                         # The caller gave up mid-stall: its read timed out and

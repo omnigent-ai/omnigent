@@ -44,7 +44,11 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
-from omnigent.server.schemas import CreateResponseRequest
+from omnigent.server.schemas import (
+    CreateResponseRequest,
+    ElicitationRequestParams,
+    ElicitationResult,
+)
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -248,6 +252,33 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
     assert terminal.type == "response.cancelled"
     assert terminal.sequence_number == 3
     assert terminal.response.status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_elicit_emits_resolved_on_every_exit(cancel: bool) -> None:
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_elicit", queue, asyncio.Event())
+    task = asyncio.create_task(
+        ctx.elicit("elicit_test", ElicitationRequestParams(mode="form", message="approve?"))
+    )
+    request = await queue.get()
+    assert request.type == "response.elicitation_request"
+    assert request.elicitation_id == "elicit_test"
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_elicitations["elicit_test"].set_result(ElicitationResult(action="accept"))
+        assert (await task).action == "accept"
+    resolved = await queue.get()
+    assert resolved.type == "response.elicitation_resolved"
+    assert resolved.elicitation_id == "elicit_test"
+    assert resolved.action == (None if cancel else "accept")
+    assert resolved.reason == ("unanswered" if cancel else None)
+    assert ctx._pending_elicitations == {}
+    assert queue.empty()
 
 
 @pytest.mark.asyncio
@@ -553,7 +584,7 @@ async def test_heartbeat_carries_server_time_and_last_event_seq(
     import datetime
 
     parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=datetime.timezone.utc
+        tzinfo=datetime.UTC
     )
     assert parsed.year >= 2026
 

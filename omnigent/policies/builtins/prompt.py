@@ -11,7 +11,9 @@ mentions Canada"); the framework generates the full JSON-schema
 envelope, calls the LLM, and coerces the response into a
 ``PolicyResponse``.
 
-Register via the session policy API::
+Register via the session policy API:
+
+.. code-block:: text
 
     POST /v1/sessions/{session_id}/policies
     {

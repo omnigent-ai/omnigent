@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
+ORCHESTRATION_SOURCE_HEADER = "X-Omnigent-Orchestration-Source"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Host-launched runners delegate machine-global stale-process cleanup to the
 # host daemon. CLI-local runners leave this unset and retain standalone cleanup.

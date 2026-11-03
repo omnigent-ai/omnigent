@@ -34,7 +34,7 @@ from omnigent.repl._repl import (
     _SessionsChatReplAdapter,
     _should_discover_subagents,
 )
-from omnigent.server.schemas import SessionStatusEvent
+from omnigent.server.schemas import SessionHeartbeatEvent, SessionStatusEvent
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 # ── Host-level: chattability + closed status (B / F2 / F5) ─────────────────
@@ -297,8 +297,9 @@ class _ChatSessions:
         return _snapshot(session_id)
 
     async def stream(self, session_id: str):  # type: ignore[no-untyped-def]
-        # Block until a turn is posted, then emit one terminal idle status and
-        # park (so the pump doesn't reconnect-spin) until cancelled.
+        # Like the server, confirm the subscription; then block until a turn is
+        # posted, emit one terminal idle status and park until cancelled.
+        yield SessionHeartbeatEvent(type="session.heartbeat")
         await self._posted.wait()
         if not self._idle_delivered.is_set():
             self._idle_delivered.set()

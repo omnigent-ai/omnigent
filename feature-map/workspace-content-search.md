@@ -7,6 +7,11 @@ panel, then open a matching file at its line. Filename search remains in Files.
 
 - `search`: submit a literal query with Enter or Search, optionally matching case
   or using a ripgrep regular expression; results show paths, lines and previews.
+- `filter`: click **Filter files** (the funnel button between the query and
+  Search) to show or hide **Include** and **Exclude** globs. The button is
+  highlighted while filters are set, even when the fields are hidden.
+  Comma-separated patterns and brace alternatives work (for example `src/**,
+  *.{ts,tsx}`); excludes take precedence. Clear both fields to search all files again.
 - `navigate`: open a result at its line and return to the preserved search;
   switching conversations restores each conversation's query, options and results.
 - `states`: initial, searching, no matches, errors and partial results.
@@ -38,6 +43,9 @@ input receives focus. Collapse Workspace and press it again: Workspace should
 reopen with the input focused and the previous query and results intact.
 Switch sessions and confirm results from the previous session are absent, then
 switch back and confirm its query, options and results return without a new search.
+Click Filter files, include `src/**` and exclude `**/tests/**`, then submit.
+Confirm results respect both filters, including after collapsing the filters or
+switching conversations. Clear both fields and submit to restore the full search.
 Restart the test server without the flag and reload: the tab, picker entry and
 shortcut should be unavailable.
 
@@ -61,8 +69,9 @@ shortcut should be unavailable.
   to a conversation restores its last search; submit again to refresh the results.
 - Search covers the session workspace on disk, including hidden and untracked
   files allowed by ignore rules. Unsaved editor changes are not searched.
-- Binary files, `.git`, ignored files and symlinks are excluded. `.gitignore`
-  follows ripgrep's normal repository detection; `.ignore` works outside Git.
+- Binary files, `.git` and symlinks are excluded. Ignore rules apply unless an
+  explicit Include glob overrides them, as in ripgrep. `.gitignore` follows
+  ripgrep's normal repository detection; `.ignore` works outside Git.
 - Read errors retain partial results with a warning. Only sandbox-readable ignore
   rules apply; inaccessible ignore files can leave normally ignored paths in results.
 - Searches return at most 500 matching lines and stop after 15 seconds. Partial

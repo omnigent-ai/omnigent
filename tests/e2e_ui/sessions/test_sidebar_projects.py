@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -81,20 +82,24 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
 
 def test_move_session_into_new_project(
     page: Page,
-    seeded_session: tuple[str, str],
+    seeded_session_pair: tuple[str, str, str],
 ) -> None:
     """Filing a session into a freshly-created project moves the row into it.
 
     The session starts under "Sessions"; after creating the project (+ button)
     and picking it from "Add to project", a project folder with that name
     appears under the "Projects" group and the row lives under it (once
-    expanded) and no longer under "Sessions".
+    expanded) and no longer under "Sessions". With Custom ordering available,
+    dropping another session over a member row still files it, and releasing a
+    row over itself neither navigates nor blocks the next click.
     """
-    base_url, session_id = seeded_session
+    base_url, session_id, other_id = seeded_session_pair
     title = f"e2e-proj-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
+    _set_title(base_url, other_id, f"{title}-other")
     project = f"Project {uuid.uuid4().hex[:6]}"
 
+    enable_grouping_ui(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     row = _row(page, session_id)
@@ -111,6 +116,43 @@ def test_move_session_into_new_project(
 
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+    other = _row(page, other_id)
+    other.scroll_into_view_if_needed()
+    box = other.bounding_box()
+    assert box
+    x, y = box["x"] + 30, box["y"] + box["height"] / 2
+    time_origin = page.evaluate("performance.timeOrigin")
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    page.mouse.move(x, y)
+    page.mouse.up()
+    expect(other).not_to_have_class(re.compile("opacity-40"))
+    expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    assert page.evaluate("performance.timeOrigin") == time_origin
+
+    page.mouse.down()
+    page.mouse.move(x + 12, y)
+    expect(other).to_have_class(re.compile("opacity-40"))
+    target = _row(page, session_id).bounding_box()
+    assert target
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and response.url.endswith(f"/v1/sessions/{other_id}")
+        )
+    ) as filed:
+        page.mouse.up()
+    assert filed.value.ok
+    expect(_section(page, project).locator(f'a[href="/c/{other_id}"]')).to_be_visible()
+    view = page.evaluate('JSON.parse(localStorage.getItem("omnigent:sidebar-view"))') or {}
+    assert view.get("ordering", "updated") == "updated"
+
+    _row(page, other_id).get_by_role("link").click()
+    expect(page).to_have_url(f"{base_url}/c/{other_id}")
 
 
 def test_fork_of_filed_session_joins_the_folder_without_reload(

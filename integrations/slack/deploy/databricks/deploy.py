@@ -35,9 +35,8 @@ import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 # Must match resources.apps.<key> and bundle.name in databricks.yml.
 _BUNDLE_RESOURCE_KEY = "omnigent-slack"
