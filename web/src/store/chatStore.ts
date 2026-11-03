@@ -2721,12 +2721,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
-    // A reply already streaming, or owed to an earlier unacknowledged send, is not this send's.
+    // A reply already streaming, or owed to an earlier send or committed input, is not this send's.
     const sentWhileIdle =
       !alreadyStreaming &&
       !sentMidTurn &&
       !targetState?.blocks.some(isLiveProvisionalBlock) &&
-      !targetState?.pendingUserMessages.length;
+      !targetState?.pendingUserMessages.length &&
+      !committedInputAwaitsReply(targetState?.blocks ?? []);
     if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
@@ -6614,20 +6615,29 @@ const TURN_NEUTRAL_BLOCK_TYPES: ReadonlySet<AnyBlock["type"]> = new Set([
   "file",
 ]);
 
-/** Whether the newest committed input is one this client did not send, still without a reply. */
-function foreignInputAwaitsReply(blocks: AnyBlock[]): boolean {
+/** Whether committed input owns the turn after it; an interrupt record closes its turn. */
+function opensTurn(content: MessageContentBlock[]): boolean {
+  return parseSystemMessage(messageContentText(content))?.kind !== "interrupted";
+}
+
+/** Whether the newest committed input, other than a promoted local send, is still without a reply. */
+function committedInputAwaitsReply(blocks: AnyBlock[]): boolean {
   for (let at = blocks.length - 1; at >= 0; at -= 1) {
     const block = blocks[at]!;
     if (block.type === "user_message") {
-      // A promoted local send keeps its temp id; an interrupt record closes its turn.
-      return (
-        block.stableKey === undefined &&
-        parseSystemMessage(messageContentText(block.content))?.kind !== "interrupted"
-      );
+      return block.stableKey === undefined && opensTurn(block.content);
     }
     if (!TURN_NEUTRAL_BLOCK_TYPES.has(block.type)) return false;
   }
   return false;
+}
+
+/** Input committed ahead of an idle send owns the next turn, so that send no longer claims it. */
+function withoutIdleClaims(pending: PendingUserMessage[]): Partial<ChatState> {
+  if (!pending.some((p) => p.sentWhileIdle)) return {};
+  return {
+    pendingUserMessages: pending.map((p) => (p.sentWhileIdle ? { ...p, sentWhileIdle: false } : p)),
+  };
 }
 
 /**
@@ -6662,20 +6672,10 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: n
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
       // Deltas outrun the transcript, so the send that started this turn may
       // still be pending; the preview must render below it.
-      const idleSend = s.pendingUserMessages.find((p) => p.sentWhileIdle && !p.initialDraft);
-      // Another client's or the terminal's input still owed a reply owns this turn instead.
-      const turnOwnedByCommittedInput = idleSend !== undefined && foreignInputAwaitsReply(s.blocks);
-      const startingSend = turnOwnedByCommittedInput ? undefined : idleSend;
+      const startingSend = s.pendingUserMessages.find((p) => p.sentWhileIdle && !p.initialDraft);
       const preview = makeLiveTextBlock(itemId, delta, responseId, index);
       return {
         ...startupPatch,
-        ...(turnOwnedByCommittedInput
-          ? {
-              pendingUserMessages: s.pendingUserMessages.map((p) =>
-                p.sentWhileIdle ? { ...p, sentWhileIdle: false } : p,
-              ),
-            }
-          : {}),
         blocks: [
           ...s.blocks,
           startingSend ? { ...preview, answersPendingSend: startingSend.tempId } : preview,
@@ -8794,7 +8794,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
           if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
-            return {};
+            return eventContent !== null && opensTurn(eventContent)
+              ? withoutIdleClaims(s.pendingUserMessages)
+              : {};
           }
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
             return {};
@@ -8871,6 +8873,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    event payload fresh.
         if (eventContent === null) return {};
         return {
+          ...(settledShell || !opensTurn(eventContent)
+            ? {}
+            : withoutIdleClaims(s.pendingUserMessages)),
           blocks: [
             ...s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
