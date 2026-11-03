@@ -105,10 +105,9 @@ export interface PromptHistory {
   appendEntry: (text: string, replyDraft?: StoredReplyDraft) => void;
 
   /**
-   * Walk back to an older entry. On first call, captures `currentText` as
-   * the draft so it can be restored later. Returns the recalled entry,
-   * or null when there's nothing to recall (history empty, or already at
-   * the oldest entry).
+   * Walk back to an older entry, starting only when `currentText` is empty.
+   * Returns null for an unsent draft, empty history, or the oldest entry.
+   * Once recalling, nonempty text is allowed until resetCursor is called.
    */
   recallPrevious: (currentText: string, replyDraft?: StoredReplyDraft) => ComposerDraft | null;
 
@@ -176,9 +175,8 @@ export function usePromptHistory(scope?: string | null): PromptHistory {
       if (history.length === 0) return null;
 
       if (cursorRef.current === null) {
-        // Entering recall mode: stash the in-progress text so ArrowDown can
-        // restore it. Captures the literal value (including whitespace) —
-        // we're not the source of truth for trim semantics here.
+        // Arrow keys in an unsent draft must remain caret navigation.
+        if (currentText !== "") return null;
         draftRef.current = readComposerDraft({ text: currentText, replyDraft })!;
         cursorRef.current = 0;
       } else if (cursorRef.current < history.length - 1) {

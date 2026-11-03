@@ -28,7 +28,9 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
+import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { Link, useParams } from "@/lib/routing";
 import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { Button } from "@/components/ui/button";
@@ -206,6 +208,22 @@ export function RearrangeableGrid({
     },
     [selectSession],
   );
+  const toggleWorkspace = () => {
+    setMaximized(false);
+    setWorkspace((previous) => ({ ...previous, open: !previous.open }));
+  };
+  useSidebarToggleHotkeys({ onToggleRight: toggleWorkspace });
+  // The cell a pane-cycle chord moved to; that cell then claims keyboard focus.
+  const [focusRequest, setFocusRequest] = useState<{ sessionId: string } | null>(null);
+  usePaneCycleHotkey({
+    enabled: !maximized,
+    paneKeys: sessionIds,
+    focusedKey: activeSessionId,
+    onFocusPane: (sessionId) => {
+      selectSession(sessionId);
+      setFocusRequest({ sessionId });
+    },
+  });
   const container = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
@@ -326,10 +344,7 @@ export function RearrangeableGrid({
               size="icon-xs"
               aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
               // aria-expanded={workspace.open}
-              onClick={() => {
-                setMaximized(false);
-                setWorkspace((previous) => ({ ...previous, open: !previous.open }));
-              }}
+              onClick={toggleWorkspace}
               className="text-muted-foreground hover:text-foreground border-none"
             >
               {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
@@ -345,6 +360,7 @@ export function RearrangeableGrid({
                 sessionId={sessionId}
                 area={area}
                 selected={sessionId === activeSessionId}
+                focusRequest={focusRequest?.sessionId === sessionId ? focusRequest : null}
                 onActivate={() => selectSession(sessionId)}
                 workspaceTarget={workspaceTarget}
                 workspacePanel={workspacePanel}

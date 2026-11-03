@@ -7,10 +7,15 @@ const TABLE = /^ {0,3}\|?(?:[:\- ]*\|)+[:\- ]*\n/;
 const UNDERLINE = /^ {0,3}(=+|-+) *$/;
 const LINE_TERMINATOR = /[\r\u2028\u2029]/;
 
+/** Whether *line* (with its newline) would start a new block after a paragraph line. */
+export function interruptsParagraph(line: string, gfm = true): boolean {
+  return INTERRUPT.test(line) || (gfm && TABLE.test(line));
+}
+
 export function scanSetextHeading(source: string, gfm: boolean) {
   let end = source.indexOf("\n");
   if (end === -1) return undefined;
-  const interrupted = (line: string) => INTERRUPT.test(line) || (gfm && TABLE.test(line));
+  const interrupted = (line: string) => interruptsParagraph(line, gfm);
   if (interrupted(source.slice(0, end + 1))) return undefined;
   if (LINE_TERMINATOR.test(source.slice(0, end))) return undefined;
 
