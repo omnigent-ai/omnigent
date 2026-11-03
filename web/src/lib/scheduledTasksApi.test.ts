@@ -5,6 +5,8 @@
 // Mirrors the `sessionsApi.test.ts` pattern: one fetchMock per test,
 // vi.stubGlobal/unstubAllGlobals around it.
 
+import { setOmnigentHostConfig } from "./host";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ScheduledTaskApiError,
@@ -13,6 +15,7 @@ import {
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
+  listAutomationFailures,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -46,14 +49,18 @@ const TASK_WIRE = {
 };
 
 const fetchMock = vi.fn();
+const analytics = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
+  analytics.mockReset();
+  setOmnigentHostConfig({ analytics });
   vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  setOmnigentHostConfig({});
 });
 
 describe("listScheduledTasks", () => {
@@ -132,6 +139,7 @@ describe("listScheduledTaskRuns", () => {
       conversationStatus: null,
       viewerLastSeen: null,
       viewerUnread: null,
+      sessionCostUsd: null,
     });
   });
 
@@ -152,6 +160,7 @@ describe("listScheduledTaskRuns", () => {
             conversation_status: "idle",
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
+            session_cost_usd: 0,
           },
         ],
       }),
@@ -162,6 +171,7 @@ describe("listScheduledTaskRuns", () => {
       conversationStatus: "idle",
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
+      sessionCostUsd: 0,
     });
   });
 });
@@ -178,6 +188,15 @@ describe("createScheduledTask", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks");
     expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("x-omnigent-automation-template")).toBe("custom");
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        interactionKind: "create_scheduled_task",
+        phase: "complete",
+        status: "success",
+        name: "custom",
+      }),
+    );
     const body = JSON.parse(init.body);
     expect(body).toEqual({
       name: "Nightly triage",
@@ -191,6 +210,26 @@ describe("createScheduledTask", () => {
     expect(body).not.toHaveProperty("timezone");
   });
 
+  it("attributes template creation without including prompt text in analytics", async () => {
+    const templateId = "jira";
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "private name",
+      prompt: "private prompt",
+      rrule: "FREQ=DAILY",
+      agentId: "agent",
+      templateId,
+    });
+    const [, init] = fetchMock.mock.calls[0];
+    expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
+    expect(new Headers(init.headers).get("x-omnigent-automation-template")).toBe(templateId);
+    expect(JSON.parse(init.body)).not.toHaveProperty("template_id");
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "success", name: templateId }),
+    );
+    expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
+  });
+
   it("includes the host/workspace pair and timezone when provided", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -201,11 +240,13 @@ describe("createScheduledTask", () => {
       timezone: "UTC",
       hostId: "host_1",
       workspace: "/home/me/repo",
+      baseBranch: "HEAD",
     });
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.timezone).toBe("UTC");
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe("/home/me/repo");
+    expect(body.base_branch).toBe("HEAD");
   });
 
   it("sends a project id and omits a null one", async () => {
@@ -251,6 +292,17 @@ describe("deleteScheduledTask", () => {
 });
 
 describe("error path", () => {
+  it("records a failed creation on network failure", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    await expect(
+      createScheduledTask({ name: "n", prompt: "p", rrule: "bad", agentId: "agent" }),
+    ).rejects.toThrow();
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "failure" }),
+    );
+    expect(analytics.mock.calls).toHaveLength(2);
+  });
+
   it("throws a ScheduledTaskApiError carrying the server code + message", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse(
@@ -266,6 +318,10 @@ describe("error path", () => {
       code: "invalid_input",
       message: "invalid rrule: fires only once",
     });
+    expect(analytics).toHaveBeenLastCalledWith(
+      expect.objectContaining({ phase: "complete", status: "failure" }),
+    );
+    expect(analytics.mock.calls).toHaveLength(2);
   });
 
   it("falls back to the status line on a non-error-shaped body", async () => {
@@ -274,5 +330,51 @@ describe("error path", () => {
     expect(err).toBeInstanceOf(ScheduledTaskApiError);
     expect(err.status).toBe(500);
     expect(err.code).toBeNull();
+  });
+});
+
+it("requests bounded automation Inbox pages and preserves empty continuations", async () => {
+  fetchMock.mockResolvedValue(mockResponse({ data: [], next_cursor: "100:task" }));
+  expect(await listAutomationFailures(null)).toEqual({ data: [], nextCursor: "100:task" });
+  expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/scheduled-tasks/inbox?limit=50");
+  fetchMock.mockResolvedValue(
+    mockResponse({
+      data: [
+        {
+          task_id: "task",
+          task_name: "Report",
+          run_id: "run",
+          scheduled_at: 100,
+          finished_at: null,
+          error_code: "host_offline",
+        },
+      ],
+      next_cursor: null,
+    }),
+  );
+  expect(await listAutomationFailures("100:task")).toEqual({
+    data: [
+      {
+        taskId: "task",
+        taskName: "Report",
+        runId: "run",
+        scheduledAt: 100,
+        finishedAt: null,
+        errorCode: "host_offline",
+      },
+    ],
+    nextCursor: null,
+  });
+  expect(String(fetchMock.mock.calls[1]![0])).toBe(
+    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask",
+  );
+});
+
+describe("random worktree setting", () => {
+  it.each([null, "HEAD"])("round trips an explicit %s update", async (baseBranch) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, base_branch: baseBranch }));
+    const task = await updateScheduledTask("st_1", { baseBranch });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
+    expect(task.baseBranch).toBe(baseBranch);
   });
 });

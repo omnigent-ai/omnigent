@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -274,6 +275,7 @@ export interface BackgroundTaskInfo {
 }
 
 export interface Session {
+  sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
   id: string;
   agentId: string;

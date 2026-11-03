@@ -66,7 +66,7 @@ export function SidebarOpenButton({
             onOpenSidebar(false);
           }}
           // macOS uses the persistent titlebar cluster in place of this button.
-          className={`chat-header-sidebar-toggle pointer-events-auto border-none text-muted-foreground hover:text-foreground ${size === "icon-xs" ? "max-md:size-11" : ""}`}
+          className={`chat-header-sidebar-toggle mobile-touch-target pointer-events-auto border-none text-muted-foreground hover:text-foreground ${size === "icon-xs" ? "max-md:size-11" : ""}`}
           onPointerEnter={onPeekSidebar}
           onPointerDown={cancelPeek}
           onPointerLeave={cancelPeek}
