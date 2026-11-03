@@ -16,7 +16,8 @@
 //    "Worked" row, sub-agent notices included. Pending elicitations,
 //    routing cards, the newest notices and assistant messages stay
 //    visible; opt-in `foldNarration` folds narration too (Codex
-//    commentary, else all but the last message).
+//    commentary, else all but the last message). A message that points
+//    back ("printed above") keeps narration and the latest output in view.
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -24,6 +25,7 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -313,8 +315,25 @@ export function BlockRenderer({
 
   if (showFold) {
     const rendered: ReactNode[] = [];
-    for (const segment of partition.segments) {
+    for (const [segmentIndex, segment] of partition.segments.entries()) {
       if (segment.kind === "text") {
+        const referenced = referencedOutputTool(partition.segments[segmentIndex - 1], segment);
+        // A copy, so the fold still holds the full trace in order.
+        if (referenced) {
+          rendered.push(
+            <TooltipProvider key={`referenced-output:${keyFor(referenced, segment.startIndex)}`}>
+              <ToolCard
+                name={referenced.execution.name}
+                arguments={referenced.execution.arguments}
+                output={referenced.output}
+                state={referenced.state}
+                startedAt={referenced.startedAt}
+                duration={referenced.duration}
+                defaultOpen
+              />
+            </TooltipProvider>,
+          );
+        }
         rendered.push(
           ...renderSequence(segment.items, {
             liveEdge: false,
@@ -571,13 +590,54 @@ function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
  */
 function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) => boolean {
   const hasAnswerPhase = items.some((item) => hasMessagePhase(item) && item.phase !== "commentary");
-  if (hasAnswerPhase) return (item) => item.kind === "text" && item.phase === "commentary";
   // Keep the last non-blank message visible, even in a continued bubble; blank
   // text after it stays with it rather than opening a second fold.
   const answerIndex = items.findLastIndex(
     (item) => item.kind === "text" && item.text.trim() !== "",
   );
-  return (_item, index) => index < answerIndex;
+  const folds = hasAnswerPhase
+    ? (item: RenderItem) => item.kind === "text" && item.phase === "commentary"
+    : (_item: RenderItem, index: number) => index < answerIndex;
+  // "Above" can mean any earlier message, so none of them folds.
+  const pointsBack = items.some(
+    (item, index) => item.kind === "text" && !folds(item, index) && pointsBackward(item.text),
+  );
+  return pointsBack ? () => false : folds;
+}
+
+// "Above" as a place (clause-final, after "shown"/"see", or naming output),
+// not a comparison ("above 90%", "above the threshold", "above all").
+// A miss keeps the default fold; a false match only shows more.
+const BACKWARD_REFERENCE = new RegExp(
+  [
+    String.raw`\babove(?=\s*(?:[.,;:!?)]|$))`,
+    String.raw`\b(?:shown|printed|displayed|listed|posted|noted|mentioned|described|see)\s+above\b`,
+    String.raw`\b(?:output|report|results?|logs?|summary|update|message)\s+above\b(?!\s*(?:[\d$%-]|(?:a|an|the|all|average|baseline|threshold|normal|expectations?)\b))`,
+    String.raw`(?:^|[.!?]\s+|\n\s*)above(?:\s+(?:is|are)\b|\s*:)`,
+    String.raw`\bscroll(?:ing)?\s+up\b`,
+  ].join("|"),
+  "i",
+);
+
+function pointsBackward(text: string): boolean {
+  return BACKWARD_REFERENCE.test(text);
+}
+
+type ToolItem = Extract<RenderItem, { kind: "tool" }>;
+
+/** The latest output in the work run just before a message that points back to it. */
+function referencedOutputTool(
+  previous: TurnSegment | undefined,
+  segment: TurnSegment,
+): ToolItem | undefined {
+  if (previous?.kind !== "work" || segment.kind !== "text") return undefined;
+  if (!segment.items.some((item) => item.kind === "text" && pointsBackward(item.text))) {
+    return undefined;
+  }
+  return previous.items.findLast(
+    (item): item is ToolItem =>
+      item.kind === "tool" && !isTrailingWrapup(item) && !!item.output?.trim(),
+  );
 }
 
 function hasMessagePhase(item: RenderItem): item is Extract<RenderItem, { kind: "text" }> {
