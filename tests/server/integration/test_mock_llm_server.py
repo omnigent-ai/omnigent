@@ -18,6 +18,11 @@ from tests.server.integration.mock_llm_server import (
     truncate_sse,
 )
 
+_FUNCTION_CALL_FORMATS = [
+    pytest.param("tool_calls", {}, id="tool-calls"),
+    pytest.param("native_items", {"type": "function_call"}, id="native-function-call"),
+]
+
 
 def test_user_input_text_accepts_responses_string_input() -> None:
     assert MockState._user_input_text({"input": "route-native-codex"}) == ("route-native-codex")
@@ -345,7 +350,10 @@ def test_same_implicit_selector_replaces_and_different_purpose_coexists(monkeypa
 
 
 @pytest.mark.parametrize("routing", [{}, {"key": "native-model"}, {"match": "user-nonce"}])
-def test_unspecified_guard_preserves_next_tool_call_for_capable_request(monkeypatch, routing):
+@pytest.mark.parametrize("call_field, call_fields", _FUNCTION_CALL_FORMATS)
+def test_unspecified_guard_preserves_next_tool_call_for_capable_request(
+    monkeypatch, routing, call_field, call_fields
+):
     monkeypatch.setattr(mock_llm_server, "_state", MockState())
     with TestClient(mock_llm_server.app) as client:
         key = client.post(
@@ -354,8 +362,13 @@ def test_unspecified_guard_preserves_next_tool_call_for_capable_request(monkeypa
                 **routing,
                 "responses": [
                     {
-                        "tool_calls": [
-                            {"call_id": "skill-call", "name": "Skill", "arguments": "{}"}
+                        call_field: [
+                            {
+                                **call_fields,
+                                "call_id": "skill-call",
+                                "name": "Skill",
+                                "arguments": "{}",
+                            }
                         ]
                     },
                     {"text": "after skill"},
@@ -376,7 +389,10 @@ def test_unspecified_guard_preserves_next_tool_call_for_capable_request(monkeypa
 
 
 @pytest.mark.parametrize("required_tools", [[], ["Read"]])
-def test_explicit_guard_allows_intentionally_unadvertised_tool(monkeypatch, required_tools):
+@pytest.mark.parametrize("call_field, call_fields", _FUNCTION_CALL_FORMATS)
+def test_explicit_guard_allows_intentionally_unadvertised_tool(
+    monkeypatch, required_tools, call_field, call_fields
+):
     monkeypatch.setattr(mock_llm_server, "_state", MockState())
     with TestClient(mock_llm_server.app) as client:
         client.post(
@@ -384,7 +400,16 @@ def test_explicit_guard_allows_intentionally_unadvertised_tool(monkeypatch, requ
             json={
                 "required_tools": required_tools,
                 "responses": [
-                    {"tool_calls": [{"call_id": "bad-call", "name": "Unknown", "arguments": "{}"}]}
+                    {
+                        call_field: [
+                            {
+                                **call_fields,
+                                "call_id": "bad-call",
+                                "name": "Unknown",
+                                "arguments": "{}",
+                            }
+                        ]
+                    }
                 ],
             },
         ).raise_for_status()
