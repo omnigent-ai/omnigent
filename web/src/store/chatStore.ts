@@ -1467,6 +1467,15 @@ function sideChatSettingsPending(conversationId: string): boolean {
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 
+// Live status edges carry the current parked reason, so a snapshot fetched
+// before one must not overwrite the reason it set or cleared.
+const sessionStatusRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => sessionStatusRevisions.delete(id));
+
+function sessionStatusChangedSince(id: string, revisionBeforeFetch: number): boolean {
+  return (sessionStatusRevisions.get(id) ?? 0) !== revisionBeforeFetch;
+}
+
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
@@ -4943,6 +4952,7 @@ async function bindStream(
   }
   const stateBeforeFetch = get();
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
+  const statusRevisionBeforeFetch = sessionStatusRevisions.get(id) ?? 0;
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -5141,7 +5151,9 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
-        blockedOn: session.blockedOn ?? null,
+        blockedOn: sessionStatusChangedSince(id, statusRevisionBeforeFetch)
+          ? state.blockedOn
+          : (session.blockedOn ?? null),
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
@@ -5377,6 +5389,7 @@ function reconnectStatusPatch(
   session: Session,
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  statusRevisionBeforeFetch: number,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
@@ -5386,11 +5399,17 @@ function reconnectStatusPatch(
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
   };
-  // Recover the background-shell tally and parked-dialog reason across the gap too,
-  // so the spinner keeps saying what it waits on rather than vanishing on reconnect.
+  // Recover the background-shell tally across the gap too, so the spinner
+  // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
-  patch.blockedOn = session.blockedOn ?? null;
+  // An older server omits the parked reason; a live edge during the fetch is newer.
+  if (
+    session.blockedOn !== undefined &&
+    !sessionStatusChangedSince(session.id, statusRevisionBeforeFetch)
+  ) {
+    patch.blockedOn = session.blockedOn;
+  }
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -5483,6 +5502,7 @@ async function reconcileActiveSessionStatus(
   }
   const stateBeforeFetch = get();
   const revisionBeforeFetch = streamEventRevisions.get(id) ?? 0;
+  const statusRevisionBeforeFetch = sessionStatusRevisions.get(id) ?? 0;
   const snapshotController = new AbortController();
   const abortSnapshot = () => snapshotController.abort();
   controller.signal.addEventListener("abort", abortSnapshot, { once: true });
@@ -5523,7 +5543,12 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => {
-    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
+    const patch = reconnectStatusPatch(
+      session,
+      s,
+      stateBeforeFetch.mcpStartupLaunch,
+      statusRevisionBeforeFetch,
+    );
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     return blocks === null ? patch : { ...patch, blocks };
   });
@@ -5761,6 +5786,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  statusRevisionBeforeFetch: number,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -5801,7 +5827,12 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
-    const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const statusPatch = reconnectStatusPatch(
+      session,
+      s,
+      launchBeforeFetch,
+      statusRevisionBeforeFetch,
+    );
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -5863,6 +5894,7 @@ async function reconcileOnReconnect(
 ): Promise<void> {
   if (queryClient === null) return;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  const statusRevisionBeforeFetch = sessionStatusRevisions.get(id) ?? 0;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -5940,6 +5972,7 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       launchBeforeFetch,
+      statusRevisionBeforeFetch,
     );
     return;
   }
@@ -5958,7 +5991,7 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...reconnectStatusPatch(session, s, launchBeforeFetch, statusRevisionBeforeFetch),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
@@ -8364,6 +8397,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
+      if (event.conversationId === sourceConversationId) {
+        sessionStatusRevisions.set(
+          event.conversationId,
+          (sessionStatusRevisions.get(event.conversationId) ?? 0) + 1,
+        );
+      }
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).

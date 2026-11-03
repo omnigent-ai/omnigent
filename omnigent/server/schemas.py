@@ -2197,7 +2197,8 @@ class SessionResponse(BaseModel):
     :param blocked_on: What a ``"running"`` session is parked on as of the
         last status edge, e.g. ``"permission prompt"`` (see
         :class:`SessionStatusEvent`), so a reload can still route the user to
-        the waiting terminal dialog. ``None`` when the session is not parked.
+        the waiting terminal dialog. ``None`` when the session is not parked,
+        or when this replica has not seen that edge (e.g. after a restart).
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.

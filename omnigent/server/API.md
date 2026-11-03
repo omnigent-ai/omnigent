@@ -450,7 +450,9 @@ Fields:
   blocked_on (string or null)
     What a `"running"` session is parked on as of its last
     `session.status` edge, e.g. `"permission prompt"` or
-    `"dialog open"`. `null` when the session is not parked.
+    `"dialog open"`. `null` when the session is not parked, or when
+    this server replica has not seen that edge (e.g. after a restart),
+    so `null` alone does not prove a terminal prompt was answered.
 
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.

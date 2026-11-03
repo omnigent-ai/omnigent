@@ -2394,6 +2394,47 @@ describe("chatStore — switchTo", () => {
     expect(streamCall).toBeDefined();
   });
 
+  it("keeps a parked reason that a live edge cleared during the bind snapshot", async () => {
+    seedSession("conv_blocked_bind");
+    let resolveSnapshot: ((response: Response) => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_blocked_bind" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return new Promise<Response>((resolve) => {
+          resolveSnapshot = resolve;
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switchPromise = useChatStore.getState().switchTo("conv_blocked_bind");
+    await tick();
+    expect(resolveSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_blocked_bind",
+      status: "running",
+    });
+    resolveSnapshot!(
+      mockResponse({
+        id: "conv_blocked_bind",
+        agent_id: "agent_xyz",
+        status: "running",
+        blocked_on: "permission prompt",
+        created_at: 0,
+        items: [],
+        labels: {},
+      }),
+    );
+    await switchPromise;
+
+    expect(useChatStore.getState()).toMatchObject({ sessionStatus: "running", blockedOn: null });
+  });
+
   it("switching to the same conversation is a no-op (blocks preserved, no stream re-open)", async () => {
     const block: AnyBlock = {
       type: "user_message",
@@ -15027,6 +15068,94 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(bound.get().blockedOn).toBeNull();
 
     controller.abort();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a live parked reason when an older server's snapshot omits it", async () => {
+    seedSession("conv_blocked_old_server", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_blocked_old_server", {
+      abortController: controller,
+      sessionStatus: "running",
+    });
+    const loop = startStreamPump("conv_blocked_old_server", controller, bound.set, bound.get);
+    await drainAsync();
+    sinks[0]!.push(
+      sse("session.status", {
+        conversation_id: "conv_blocked_old_server",
+        status: "running",
+        blocked_on: "permission prompt",
+      }),
+    );
+    await drainAsync();
+    const snapshotReads = () =>
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).startsWith("/v1/sessions/conv_blocked_old_server?"),
+      ).length;
+    const readsBeforeReconcile = snapshotReads();
+
+    await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(snapshotReads()).toBeGreaterThan(readsBeforeReconcile);
+    expect(bound.get().blockedOn).toBe("permission prompt");
+
+    sinks[0]!.push("data: [DONE]\n\n");
+    sinks[0]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a parked reason that a live edge cleared during the reconnect snapshot", async () => {
+    seedSession("conv_blocked_reconnect", []);
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    let releaseSnapshot: (() => void) | null = null;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.startsWith("/v1/sessions/conv_blocked_reconnect?") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        await new Promise<void>((resolve) => {
+          releaseSnapshot = resolve;
+        });
+        return mockResponse({
+          id: "conv_blocked_reconnect",
+          agent_id: "agent_xyz",
+          status: "running",
+          blocked_on: "permission prompt",
+          created_at: 0,
+          items: [],
+          labels: {},
+        });
+      }
+      return route(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_blocked_reconnect", {
+      abortController: controller,
+      sessionStatus: "running",
+      blockedOn: "permission prompt",
+    });
+    const loop = startStreamPump("conv_blocked_reconnect", controller, bound.set, bound.get);
+    await drainAsync();
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(releaseSnapshot).not.toBeNull();
+
+    sinks[1]!.push(
+      sse("session.status", { conversation_id: "conv_blocked_reconnect", status: "running" }),
+    );
+    await drainAsync();
+    releaseSnapshot!();
+    await drainAsync();
+    expect(bound.get().blockedOn).toBeNull();
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
     await drainAsync(2);
     await loop;
   });

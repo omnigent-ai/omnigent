@@ -167,6 +167,7 @@ async def test_get_session_reports_what_a_running_session_is_blocked_on(
         assert await status_and_blocked_on() == ("idle", None)
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_blocked_on_cache.pop(session_id, None)
 
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:

@@ -74,6 +74,24 @@ def _publish_status(
     resp.raise_for_status()
 
 
+def _assert_routes_user_to_terminal(page: Page) -> None:
+    """Assert chat tells the user the parked dialog needs the terminal view.
+
+    :param page: Playwright page showing the parked chat.
+    :returns: None.
+    """
+    indicator_text = page.locator(_WORKING).inner_text()
+    mentions_terminal = re.search(r"terminal", indicator_text, re.IGNORECASE) is not None
+    inline_elicitation = page.locator(_BOTTOM_ELICITATION).count() > 0
+    assert mentions_terminal or inline_elicitation, (
+        "Chat is parked on a terminal dialog but gives the user no signal that "
+        "the response is needed in the terminal view: the blocked indicator "
+        f"says only {indicator_text!r} (no mention of the terminal) and no "
+        "inline elicitation card is shown. A user staying in chat mode has no "
+        "way to know the session is waiting for them and will conclude it hung."
+    )
+
+
 def test_chat_blocked_on_terminal_dialog_routes_user_to_terminal(
     page: Page,
     seeded_session: tuple[str, str],
@@ -110,19 +128,10 @@ def test_chat_blocked_on_terminal_dialog_routes_user_to_terminal(
     # the blocked indicator itself names the terminal (e.g. "open the
     # terminal to respond"), or the dialog is surfaced as an inline chat
     # elicitation.
-    indicator_text = working.inner_text()
-    mentions_terminal = re.search(r"terminal", indicator_text, re.IGNORECASE) is not None
-    inline_elicitation = page.locator(_BOTTOM_ELICITATION).count() > 0
-    assert mentions_terminal or inline_elicitation, (
-        "Chat is parked on a terminal dialog but gives the user no signal that "
-        "the response is needed in the terminal view: the blocked indicator "
-        f"says only {indicator_text!r} (no mention of the terminal) and no "
-        "inline elicitation card is shown. A user staying in chat mode has no "
-        "way to know the session is waiting for them and will conclude it hung."
-    )
+    _assert_routes_user_to_terminal(page)
 
     # Step 5 — a reload loses the live status edge; the session snapshot must
     # keep chat parked on the dialog instead of a bare working spinner.
     page.reload()
     expect(working).to_contain_text(_BLOCKED_ON_DIALOG, timeout=15_000)
-    expect(working).to_contain_text(re.compile(r"terminal", re.IGNORECASE))
+    _assert_routes_user_to_terminal(page)
