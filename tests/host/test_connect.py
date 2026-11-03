@@ -11120,7 +11120,7 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
 
 
-async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch, tmp_path):
+async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch):
     from omnigent.host.mcp_inventory import ConfiguredMcpServer
 
     server = ConfiguredMcpServer(

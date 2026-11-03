@@ -1,9 +1,14 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { isSafeSignInUrl, type McpLogin } from "@/hooks/useMcpLogin";
+import { cancelMcpLogin, isSafeSignInUrl, type McpLogin } from "@/hooks/useMcpLogin";
 import { authenticatedFetch } from "@/lib/identity";
-import { MCP_LOGIN_POLL_MS, McpSignInDialog, type McpSignInDialogProps } from "./McpSignInDialog";
+import {
+  MAX_POLL_FAILURES,
+  MCP_LOGIN_POLL_MS,
+  McpSignInDialog,
+  type McpSignInDialogProps,
+} from "./McpSignInDialog";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn().mockResolvedValue(undefined) }));
@@ -227,15 +232,53 @@ describe("McpSignInDialog", () => {
     expect(screen.getByRole("alert").textContent).toBe("This sign-in ended on the host.");
   });
 
-  it("refuses to link an unsafe sign-in page", async () => {
+  it("keeps polling through a brief outage and gives up after repeated failures", async () => {
+    on("POST", BASE, () => json(login()));
+    on(
+      "GET",
+      `${BASE}/L1`,
+      () => json({ detail: "bad gateway" }, 502),
+      () => json(login()),
+      ...Array.from({ length: MAX_POLL_FAILURES }, () => () => json({ detail: "x" }, 502)),
+    );
+    await renderDialog();
+    await tick();
+    await tick();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("link", { name: /Open sign-in page/ })).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(MCP_LOGIN_POLL_MS * (MAX_POLL_FAILURES - 1));
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    await tick();
+    expect(screen.getByRole("alert").textContent).toBe("Couldn't reach my-laptop.");
+    const polls = calls("GET", `${BASE}/L1`).length;
+    await tick();
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(polls);
+  });
+
+  it("refuses to link an unsafe sign-in page and stops that sign-in", async () => {
     on("POST", BASE, () =>
       json(login({ authorization_url: "http://auth.example.test/authorize" })),
     );
-    await renderDialog();
+    on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
+    const view = await renderDialog();
     expect(screen.getByRole("alert").textContent).toBe(
       "The host returned an invalid sign-in link.",
     );
     expect(screen.queryByRole("link")).toBeNull();
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
+    await tick();
+    expect(calls("GET", `${BASE}/L1`)).toHaveLength(0);
+    view.unmount();
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(1);
+  });
+});
+
+describe("cancelMcpLogin", () => {
+  it("reports a cancel the server refused", async () => {
+    on("DELETE", `${BASE}/L1`, () => json({ detail: "Host is offline" }, 503));
+    await expect(cancelMcpLogin("host/1", "L1")).rejects.toMatchObject({ status: 503 });
   });
 });
 

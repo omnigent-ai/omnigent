@@ -152,12 +152,12 @@ def oauth_mcp_server(title: str = "Demo Issues") -> Iterator[OAuthMcpServer]:
     )
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
-    deadline = time.monotonic() + 10
-    while not server.started:
-        if time.monotonic() > deadline or not thread.is_alive():
-            raise RuntimeError("OAuth MCP server did not start")
-        time.sleep(0.05)
     try:
+        deadline = time.monotonic() + 10
+        while not server.started:
+            if time.monotonic() > deadline or not thread.is_alive():
+                raise RuntimeError("OAuth MCP server did not start")
+            time.sleep(0.05)
         yield OAuthMcpServer(f"{base}/mcp", provider)
     finally:
         server.should_exit = True

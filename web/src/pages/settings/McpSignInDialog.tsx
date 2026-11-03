@@ -23,6 +23,8 @@ import {
 import { ApiError } from "@/lib/sessionsApi";
 
 export const MCP_LOGIN_POLL_MS = 1500;
+/** Consecutive failed polls tolerated before the dialog gives up. */
+export const MAX_POLL_FAILURES = 3;
 
 type Phase =
   { kind: "starting" } | { kind: "pending"; login: McpLogin } | { kind: "error"; message: string };
@@ -79,11 +81,18 @@ export function McpSignInDialog({
     let active = true;
     let loginId: string | null = null;
     let timer: number | undefined;
+    let pollFailures = 0;
     const controller = new AbortController();
     setPhase({ kind: "starting" });
 
     const settle = (login: McpLogin) => {
       if (login.state === "pending") {
+        if (!login.authorization_url || !isSafeSignInUrl(login.authorization_url)) {
+          void cancelMcpLogin(hostId, login.login_id).catch(() => {});
+          loginId = null;
+          setPhase({ kind: "error", message: "The host returned an invalid sign-in link." });
+          return;
+        }
         setPhase({ kind: "pending", login });
         timer = window.setTimeout(poll, MCP_LOGIN_POLL_MS);
         return;
@@ -96,16 +105,26 @@ export function McpSignInDialog({
       if (!active || controller.signal.aborted) return;
       setPhase({ kind: "error", message: requestErrorMessage(error, hostName) });
     };
-    const lost = (error: unknown) => {
+    const pollFailed = (error: unknown) => {
+      if (!active || controller.signal.aborted) return;
       if (error instanceof ApiError && error.status === 404) {
-        if (active) setPhase({ kind: "error", message: "This sign-in ended on the host." });
-      } else fail(error);
+        setPhase({ kind: "error", message: "This sign-in ended on the host." });
+        return;
+      }
+      // The sign-in keeps running on the host, so ride out a brief outage.
+      pollFailures += 1;
+      if (pollFailures < MAX_POLL_FAILURES) timer = window.setTimeout(poll, MCP_LOGIN_POLL_MS);
+      else fail(error);
     };
     const poll = () => {
       if (!active || loginId === null) return;
       fetchMcpLogin(hostId, loginId, controller.signal)
-        .then((login) => active && settle(login))
-        .catch(lost);
+        .then((login) => {
+          if (!active) return;
+          pollFailures = 0;
+          settle(login);
+        })
+        .catch(pollFailed);
     };
 
     startMcpLogin({ hostId, harness, server, plugin, sourceId })
@@ -138,26 +157,7 @@ export function McpSignInDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-5 px-6 pb-2">
-          {phase.kind === "starting" ? (
-            <div role="status" className="flex items-center gap-3 text-sm">
-              <Loader2Icon aria-hidden="true" className="size-4 animate-spin" />
-              Starting sign-in on {hostName}…
-            </div>
-          ) : phase.kind === "error" ? (
-            <div
-              role="alert"
-              className="rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-sm text-destructive"
-            >
-              {phase.message}
-            </div>
-          ) : (
-            <PendingSteps
-              key={phase.login.login_id}
-              hostId={hostId}
-              hostName={hostName}
-              login={phase.login}
-            />
-          )}
+          <PhaseBody phase={phase} hostId={hostId} hostName={hostName} />
         </div>
         <DialogFooter className="mx-0 -mb-0 mt-4 rounded-none border-t border-border px-6 py-4">
           <Button
@@ -173,6 +173,43 @@ export function McpSignInDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function PhaseBody({
+  phase,
+  hostId,
+  hostName,
+}: {
+  phase: Phase;
+  hostId: string;
+  hostName: string;
+}) {
+  if (phase.kind === "starting") {
+    return (
+      <div role="status" className="flex items-center gap-3 text-sm">
+        <Loader2Icon aria-hidden="true" className="size-4 animate-spin" />
+        Starting sign-in on {hostName}…
+      </div>
+    );
+  }
+  if (phase.kind === "error") {
+    return (
+      <div
+        role="alert"
+        className="rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-sm text-destructive"
+      >
+        {phase.message}
+      </div>
+    );
+  }
+  return (
+    <PendingSteps
+      key={phase.login.login_id}
+      hostId={hostId}
+      hostName={hostName}
+      login={phase.login}
+    />
   );
 }
 

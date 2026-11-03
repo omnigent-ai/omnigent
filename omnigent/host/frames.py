@@ -1333,7 +1333,6 @@ class HostMcpToolsResultFrame:
 
 
 MCP_HARNESS_SIGN_IN_STATES = ("available", "signed_in")
-MCP_LOGIN_ACTIONS = ("start", "status", "submit", "cancel")
 MCP_LOGIN_STATES = ("pending", "succeeded", "failed", "expired", "cancelled")
 
 

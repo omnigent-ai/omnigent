@@ -158,7 +158,10 @@ def test_harness_server_name(server: ConfiguredMcpServer, expected: str | None) 
 
 async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
     completed = []
-    logins = HostMcpLogins(on_success=lambda: completed.append(True))
+    logins = HostMcpLogins(
+        # Caches clear before a poll can observe the success.
+        on_success=lambda: completed.append(logins.status(started["login_id"])["state"])
+    )
     started = await logins.start(_server(plugin="tools"))
     assert started["state"] == "pending"
     assert started["authorization_url"] == _AUTH_URL
@@ -179,7 +182,7 @@ async def test_pasted_redirect_completes_sign_in(fake_cli: Path) -> None:
         "error": None,
     }
     assert fake_cli.with_suffix(".pasted").read_text() == callback
-    assert completed == [True]
+    assert completed == ["pending"]
     with pytest.raises(LoginError):
         await logins.submit(started["login_id"], callback)
     await logins.close()
@@ -247,6 +250,12 @@ async def test_concurrent_sign_ins_are_bounded(
         await logins.start(_server(name="two"))
     assert busy.value.status == "busy"
     await logins.close()
+    # Simultaneous starts for one server, e.g. a double-click, leave one CLI running.
+    racing = HostMcpLogins()
+    first, second = await asyncio.gather(racing.start(_server()), racing.start(_server()))
+    states = sorted(racing.status(started["login_id"])["state"] for started in (first, second))
+    assert states == ["cancelled", "pending"]
+    await racing.close()
 
 
 async def test_unsupported_servers_never_spawn(fake_cli: Path) -> None:

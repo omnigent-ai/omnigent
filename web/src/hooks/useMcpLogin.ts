@@ -65,7 +65,8 @@ export async function submitMcpLoginCallback(
 }
 
 export async function cancelMcpLogin(hostId: string, loginId: string): Promise<void> {
-  await authenticatedFetch(loginPath(hostId, loginId), { method: "DELETE" });
+  const response = await authenticatedFetch(loginPath(hostId, loginId), { method: "DELETE" });
+  if (!response.ok) throw await apiErrorFromResponse(response);
 }
 
 /** Sign-in pages may be https anywhere, or http only on the user's own machine. */

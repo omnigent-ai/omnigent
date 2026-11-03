@@ -272,6 +272,9 @@ class HostMcpLogins:
     def __init__(self, on_success: Callable[[], None] | None = None) -> None:
         self._logins: dict[str, _Login] = {}
         self._on_success = on_success
+        # Start requests arrive on separate frame tasks; one at a time keeps a
+        # double-click from spawning two CLIs that race for the same redirect.
+        self._start_lock = asyncio.Lock()
 
     def _prune(self) -> None:
         cutoff = time.monotonic() - FINISHED_RETENTION_SECONDS
@@ -293,13 +296,15 @@ class HostMcpLogins:
             raise LoginError("invalid", "This harness can't sign in to this MCP server")
         executable, name = target
         key = (server.summary["harness"], name)
-        self._prune()
-        for earlier in [login for login in self._logins.values() if login.key == key]:
-            await self._finish(earlier, "cancelled")
-        if sum(login.state == "pending" for login in self._logins.values()) >= MAX_ACTIVE_LOGINS:
-            raise LoginError("busy", "Too many sign-ins in progress")
-        login = await self._spawn(executable, name, key)
-        self._logins[login.login_id] = login
+        async with self._start_lock:
+            self._prune()
+            for earlier in [login for login in self._logins.values() if login.key == key]:
+                await self._finish(earlier, "cancelled")
+            pending = sum(login.state == "pending" for login in self._logins.values())
+            if pending >= MAX_ACTIVE_LOGINS:
+                raise LoginError("busy", "Too many sign-ins in progress")
+            login = await self._spawn(executable, name, key)
+            self._logins[login.login_id] = login
         try:
             async with asyncio.timeout(URL_WAIT_SECONDS):
                 while login.url is None and login.state == "pending":
@@ -372,9 +377,10 @@ class HostMcpLogins:
         if login.state != "pending":
             return
         if code == 0:
-            await self._finish(login, "succeeded")
+            # Drop stale probe results before anyone can observe the success.
             if self._on_success is not None:
                 self._on_success()
+            await self._finish(login, "succeeded")
         else:
             _logger.info("MCP sign-in for %s exited with status %s", login.key[0], code)
             await self._finish(login, "failed", "The harness couldn't finish signing in")

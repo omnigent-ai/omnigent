@@ -197,10 +197,16 @@ async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, cap
         monkeypatch.setattr(mcp_tools, "harness_sign_in_state", sign_in_state)
         discovery = HostMcpTools()
         result = await discovery.probe("claude", "docs")
-        # A cached 401 still reports the harness's current sign-in state.
+        cached = await discovery.probe("claude", "docs")
+        # Clearing after a sign-in reports the harness's new state.
+        discovery.clear_cache()
         again = await discovery.probe("claude", "docs")
     assert result["connection"] == "needs_auth"
-    assert (result["harness_sign_in"], again["harness_sign_in"]) == ("available", "signed_in")
+    assert [result["harness_sign_in"], cached["harness_sign_in"], again["harness_sign_in"]] == [
+        "available",
+        "available",
+        "signed_in",
+    ]
     assert checked == [entry, entry]
     assert all("harness_sign_in" not in cached for cached in discovery._cache.values())
     output = json.dumps(result) + caplog.text + str(capfd.readouterr())
