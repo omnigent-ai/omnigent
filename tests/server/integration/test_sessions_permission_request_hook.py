@@ -1801,7 +1801,7 @@ async def test_permission_request_hook_surfaces_file_edit_input(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> None:
-    """Edit-tool prompts carry the untruncated tool name and input for the diff view."""
+    """Edit-tool prompts carry the full tool call, live and through the approval link."""
     agent = await create_test_agent(client, "test-permission-file-edit")
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload(tool_name=tool_name)
@@ -1818,7 +1818,11 @@ async def test_permission_request_hook_surfaces_file_edit_input(
 
     event = await drain_task
     params = event["params"]
-    assert params["file_edit"] == {"tool_name": tool_name, "tool_input": tool_input}, params
+    file_edit = {"tool_name": tool_name, "tool_input": tool_input}
+    assert params["file_edit"] == file_edit, params
+    pending = await client.get(f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}")
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["file_edit"] == file_edit
 
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202, verdict.text

@@ -2021,7 +2021,7 @@ describe("ApprovalCard — file edit diff", () => {
 
   it("shows a write over a file as its full content", () => {
     const content = "# Notes\n";
-    render(
+    const { container } = render(
       <TooltipProvider>
         <ApprovalCard
           {...props}
@@ -2034,6 +2034,72 @@ describe("ApprovalCard — file edit diff", () => {
 
     expect(screen.getByText("/repo/notes.md (whole file written)")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy file" })).toBeInTheDocument();
+    expect(container.textContent).toContain("# Notes");
+  });
+
+  it("says when an edit in a batch replaces every occurrence", () => {
+    // WHY: the diff renders a replace-all edit the same as a single replacement.
+    const edits = [
+      { old_string: "a", new_string: "b" },
+      { old_string: "c", new_string: "d" },
+    ];
+    const note = /replaces every occurrence/i;
+    const renderBatch = (batch: Record<string, unknown>[]) =>
+      render(
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            message="Claude wants to call **MultiEdit**"
+            contentPreview="MultiEdit({...})"
+            fileEdit={{
+              toolName: "MultiEdit",
+              toolInput: { file_path: "/repo/a.py", edits: batch },
+            }}
+          />
+        </TooltipProvider>,
+      );
+
+    renderBatch(edits);
+    expect(screen.queryByText(note)).toBeNull();
+    cleanup();
+    renderBatch([edits[0]!, { ...edits[1]!, replace_all: true }]);
+    expect(screen.getByText(note)).toBeVisible();
+  });
+
+  it("shows the full request on demand", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} fileEdit={{ toolName: "Edit", toolInput: editInput }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.queryByTestId("tool-value-view")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show request" }));
+    expect(screen.getByTestId("tool-value-view")).toHaveTextContent("Replace allNo");
+  });
+
+  it("previews a long diff and expands it in full", () => {
+    const oldLines = Array.from({ length: 120 }, (_, i) => `old ${i}`);
+    const newLines = Array.from({ length: 120 }, (_, i) => `new ${i}`);
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          fileEdit={{
+            toolName: "Edit",
+            toolInput: {
+              file_path: "/repo/big.py",
+              old_string: oldLines.join("\n"),
+              new_string: newLines.join("\n"),
+            },
+          }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(container.textContent).not.toContain("+new 119");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("+new 119");
   });
 
   it.each([
