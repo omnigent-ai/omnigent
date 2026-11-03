@@ -7,7 +7,6 @@ import { testAgent } from "@/test/agentFixtures";
 // The agent/host hooks and the create mutation are mocked; WorkspacePicker is
 // stubbed (its filesystem browsing is out of scope here).
 
-import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
 import type React from "react";
@@ -27,6 +26,8 @@ import {
   shouldGuardDialogDismiss,
 } from "./CreateScheduledTaskDialog";
 import * as agentsHook from "@/hooks/useAvailableAgents";
+import * as identity from "@/lib/identity";
+import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -40,6 +41,10 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: undefined })),
+}));
+vi.mock("@/hooks/useSandboxModelOptions", async (original) => ({
+  ...(await original<typeof sandboxModelsHook>()),
+  useSandboxModelOptions: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
@@ -108,6 +113,14 @@ vi.mock("@/shell/NewChatDialog", () => ({
       data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
     >
       <span>{agentLabel}</span>
+      {harnessEntries
+        .filter((agent) => agent.name !== "claude-native-ui")
+        .map((agent) => (
+          <button key={agent.id} type="button" onClick={() => onSelectAgent(agent)}>
+            pick {agent.harness}
+          </button>
+        ))}
+
       <button
         type="button"
         data-testid="pick-harness-claude"
@@ -143,18 +156,6 @@ vi.mock("@/shell/NewChatDialog", () => ({
   ),
 }));
 
-// nativeAgentHasCapability(claude-native, "permissionMode") must be true so the
-// model/effort knobs map onto the payload; polly (claude-sdk) has no knobs.
-vi.mock("@/lib/nativeCodingAgents", async (orig) => {
-  const actual = await orig<typeof NativeCodingAgentsModule>();
-  return {
-    ...actual,
-    isNativeCodingAgent: (a: AvailableAgent) => a?.name === "claude-native-ui",
-    nativeAgentHasCapability: (a: AvailableAgent | undefined | null, cap: string) =>
-      a?.name === "claude-native-ui" && cap === "permissionMode",
-  };
-});
-
 const AGENTS: AvailableAgent[] = [
   testAgent("ag_1", "polly", { display_name: "Polly", harness: "claude-sdk" }),
   testAgent("ag_claude_native", "claude-native-ui", {
@@ -167,6 +168,12 @@ const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
+  vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+    typeof hostsHook.useHostModelOptions
+  >);
+  vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+    data: undefined,
+  } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
   projectsQuery.current = { data: PROJECTS, isPending: false, isSuccess: true, isError: false };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
@@ -189,6 +196,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
+  localStorage.clear();
   vi.useRealTimers();
 });
 
@@ -196,7 +205,11 @@ function render(ui: Parameters<typeof renderBase>[0]) {
   return renderBase(ui, {
     wrapper: ({ children }) => (
       <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: true } }}
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_harness_settings: true,
+        }}
       >
         {children}
       </CapabilitiesProvider>
@@ -1476,8 +1489,8 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const { input } = updateMutateAsync.mock.calls[0][0];
       expect(input).toMatchObject({
-        modelOverride: "opus",
-        reasoningEffort: "high",
+        modelOverride: change === "host" ? null : "opus",
+        reasoningEffort: change === "host" ? null : "high",
         permissionMode: "auto",
       });
       expect(input).not.toHaveProperty("sessionId");
@@ -2281,6 +2294,458 @@ describe("scheduler capabilities", () => {
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
+    },
+  );
+});
+
+describe("automation harness settings", () => {
+  const models = [
+    {
+      id: "model-a",
+      displayName: "Model A",
+      isDefault: true,
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "low" }],
+    },
+    {
+      id: "model-b",
+      displayName: "Model B",
+      supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+    },
+  ];
+  function mockHarness(harness: string) {
+    const agent = testAgent("selected-agent", `${harness}-ui`, { harness });
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({ data: [agent] } as ReturnType<
+      typeof agentsHook.useAvailableAgents
+    >);
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: models } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    return agent;
+  }
+  async function choose(field: string, option: string) {
+    fireEvent.keyDown(screen.getByTestId(`task-${field}-trigger`), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: option }));
+  }
+
+  it.each([
+    ["codex-native", true, true, true],
+    ["pi-native", true, true, false],
+    ["devin-native", true, true, true],
+    ["cursor-native", false, false, true],
+    ["antigravity-native", false, false, true],
+    ["opencode-native", false, false, false],
+  ])("shows independent settings for %s", (harness, model, effort, permission) => {
+    mockHarness(harness);
+    renderDialog();
+    expect(!!screen.queryByTestId("task-model-trigger")).toBe(model);
+    expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
+    expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
+    expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
+  });
+
+  it("creates Codex settings and resets an effort the next model cannot support", async () => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialName="Review"
+        initialPrompt="Review changes"
+      />,
+    );
+    await choose("model", "Model A");
+    await choose("effort", "High");
+    await choose("model", "Model B");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
+    await choose("effort", "Low");
+    await choose("permission", "Read only");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({
+      modelOverride: "model-b",
+      reasoningEffort: "low",
+      permissionMode: "read-only",
+    });
+  });
+
+  it("preserves saved Codex settings while offline, and can clear them", async () => {
+    const agent = mockHarness("codex-native");
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "offline host", status: "offline" }],
+    } as ReturnType<typeof hostsHook.useHosts>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: agent.id,
+          modelOverride: "saved-model",
+          reasoningEffort: "high",
+          permissionMode: "read-only",
+          hostId: "host_1",
+        })}
+      />,
+    );
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("high");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read only");
+    expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", "codex-native", false);
+    await choose("model", "Default");
+    await choose("permission", "Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: null,
+      reasoningEffort: null,
+      permissionMode: null,
+    });
+  });
+
+  it("clears Codex overrides when switching to a permission-only harness", async () => {
+    const codex = mockHarness("codex-native");
+    const cursor = testAgent("cursor-agent", "cursor-native-ui", { harness: "cursor-native" });
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [codex, cursor],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: codex.id,
+          modelOverride: "model-a",
+          reasoningEffort: "high",
+          permissionMode: "read-only",
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "pick cursor-native" }));
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    await choose("permission", "Auto-review");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      agentId: cursor.id,
+      permissionMode: "auto-review",
+    });
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("modelOverride");
+  });
+
+  it.each(["codex-native", "cursor-native", "claude-native", "pi-native"])(
+    "uses the sandbox catalog for %s instead of the connected host's",
+    async (harness) => {
+      const agent = mockHarness(harness);
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data: {
+          models: [
+            {
+              ...models[0],
+              id: "sandbox-model",
+              displayName: "Sandbox model",
+              supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+            },
+          ],
+          configured: false,
+          status: "ready",
+        },
+      } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      render(sandboxDialog(agent.id, true));
+      expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith(null, harness, false);
+      await choose("model", "Sandbox model");
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sandbox model");
+      fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+      expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+      expect(sandboxModelsHook.useSandboxModelOptions).toHaveBeenLastCalledWith(
+        "company",
+        harness,
+        agent.id,
+        null,
+        true,
+      );
+    },
+  );
+
+  function sandboxDialog(
+    agentId: string,
+    editing = false,
+    overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {},
+  ) {
+    return (
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "company",
+          sandbox_provider_capabilities: { company: { default_models: true } },
+          scheduled_task_harness_settings: true,
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          initialName="Sandbox review"
+          initialPrompt="Review work"
+          editingTask={
+            editing
+              ? scheduledTask({
+                  agentId,
+                  executionTarget: "managed_sandbox",
+                  hostId: null,
+                  ...overrides,
+                })
+              : null
+          }
+        />
+      </CapabilitiesProvider>
+    );
+  }
+
+  it.each(["claude-native", "pi-native"])(
+    "uses provider effort support for %s sandbox models",
+    (harness) => {
+      const agent = mockHarness(harness);
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data: {
+          models: [{ id: "provider-model", isDefault: true }],
+          configured: false,
+          status: "ready",
+        },
+      } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      render(sandboxDialog(agent.id, true));
+      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["host", "sandbox"])(
+    "clears target-specific overrides when moving to another %s",
+    async (target) => {
+      const agent = mockHarness("codex-native");
+      vi.mocked(hostsHook.useHosts).mockReturnValue({
+        data: [
+          { host_id: "host_1", name: "laptop", status: "online" },
+          { host_id: "host_2", name: "desktop", status: "online" },
+        ],
+      } as ReturnType<typeof hostsHook.useHosts>);
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: agent.id,
+              hostId: "host_1",
+              modelOverride: "saved-model",
+              reasoningEffort: "high",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      const changeTarget = async () => {
+        if (target === "host") await choose("host", "desktop");
+        else {
+          fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+          fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+        }
+      };
+      await changeTarget();
+      fireEvent.click(screen.getByRole("button", { name: "pick codex-native" }));
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Default");
+      fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+      expect(screen.queryByRole("option", { name: "saved-model" })).not.toBeInTheDocument();
+      fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+      await choose("host", "laptop");
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
+      await changeTarget();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+        modelOverride: null,
+        reasoningEffort: null,
+      });
+    },
+  );
+
+  it("clears sandbox model settings when the connected-host harness has no model controls", async () => {
+    const agent = mockHarness("cursor-native");
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    render(sandboxDialog(agent.id, true, { modelOverride: "model-a", reasoningEffort: "high" }));
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+    await choose("host", "laptop");
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      modelOverride: null,
+      reasoningEffort: null,
+    });
+  });
+
+  it.each([
+    ["codex-native", null],
+    ["claude-native", "default"],
+  ])("normalizes a saved default permission for %s", async (harness, expected) => {
+    const agent = mockHarness(harness!);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: agent.id, permissionMode: "default" })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBe(expected);
+  });
+
+  it.each([false, true])(
+    "blocks an explicitly unsupported sandbox in edit=%s, but recovers after a failed preview",
+    async (editing) => {
+      const agent = mockHarness("codex-native");
+      const data = {
+        models: [],
+        configured: false,
+        status: "unsupported" as const,
+        error: "This sandbox cannot run Codex.",
+      };
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data,
+        isError: false,
+      } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      const { rerender } = render(sandboxDialog(agent.id, editing));
+      if (!editing) {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+      }
+      expect(screen.getByTestId("task-harness-unsupported")).toHaveTextContent(data.error);
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      expect(mutateAsync).not.toHaveBeenCalled();
+      expect(updateMutateAsync).not.toHaveBeenCalled();
+      // React Query retains data after a refetch error; it must no longer block.
+      vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+        data,
+        isError: true,
+        error: new Error("Network unavailable"),
+      } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+      rerender(sandboxDialog(agent.id, editing));
+      expect(screen.queryByTestId("task-harness-unsupported")).not.toBeInTheDocument();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    },
+  );
+
+  it("restores host models and efforts across reopening while offline, and respects a fresh empty catalog", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
+    mockHarness("codex-native");
+    const first = renderDialog();
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    first.unmount();
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "Offline host", status: "offline" }],
+    } as ReturnType<typeof hostsHook.useHosts>);
+    const { rerender } = renderDialog();
+    await choose("host", "Offline host (offline)");
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    await choose("model", "Model A");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: [] } as unknown as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    // Clear the explicit selection; cached choices must not resurrect the old list.
+    await choose("model", "Default");
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(screen.queryByRole("option", { name: "Model A" })).not.toBeInTheDocument();
+  });
+
+  it("does not renew expired host choices just by reopening the dialog", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
+    mockHarness("codex-native");
+    const fetchedAt = Date.now() - 23 * 60 * 60 * 1000;
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({
+      data: models,
+      dataUpdatedAt: fetchedAt,
+    } as ReturnType<typeof hostsHook.useHostModelOptions>);
+    const first = renderDialog();
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    first.unmount();
+    vi.spyOn(Date, "now").mockReturnValue(fetchedAt + 25 * 60 * 60 * 1000);
+    vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof hostsHook.useHostModelOptions
+    >);
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Default" })).toBeVisible();
+    expect(screen.queryByRole("option", { name: "Model A" })).not.toBeInTheDocument();
+  });
+
+  it("restores a provider catalog during an outage but discards it when the provider reports unsupported", async () => {
+    vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
+    const agent = mockHarness("codex-native");
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const first = render(sandboxDialog(agent.id, true));
+    first.unmount();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "unavailable" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const { rerender } = render(sandboxDialog(agent.id, true));
+    await choose("model", "Model A");
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "unsupported" },
+      isError: false,
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    rerender(sandboxDialog(agent.id, true));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models, configured: false, status: "ready" },
+      isError: false,
+    } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    rerender(sandboxDialog(agent.id, true));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
+  });
+
+  it.each([
+    ["codex-native", false],
+    ["claude-native", true],
+  ] as const)(
+    "preserves older-server permission support for %s",
+    (harness, supportsPermissions) => {
+      mockHarness(harness);
+      render(
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-model-trigger")).toBeVisible();
+      if (supportsPermissions) {
+        expect(screen.getByTestId("task-permission-trigger")).toBeVisible();
+      } else {
+        expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+      }
     },
   );
 });

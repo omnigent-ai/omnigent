@@ -890,23 +890,63 @@ def _claude_agent_deps(
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_becomes_terminal_launch_args() -> None:
-    """A Claude task's permission_mode fires as the runner's --permission-mode args."""
+@pytest.mark.parametrize(
+    ("harness", "mode", "args", "bypass"),
+    [
+        ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
+        (
+            "codex-native",
+            "full-access",
+            ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+            False,
+        ),
+        (
+            "codex-native",
+            "read-only",
+            ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+            False,
+        ),
+        ("codex-native", "default", None, False),
+        ("codex-native", "bypass", None, True),
+        ("cursor-native", "auto-review", ["--auto-review"], False),
+        ("cursor-native", "plan", ["--mode", "plan"], False),
+        ("cursor-native", "ask", ["--mode", "ask"], False),
+        ("cursor-native", "yolo", ["--yolo"], False),
+        ("antigravity-native", "skip", ["--dangerously-skip-permissions"], False),
+        ("devin-native", "normal", None, False),
+        ("devin-native", "accept-edits", ["--permission-mode", "accept-edits"], False),
+        ("devin-native", "smart", ["--permission-mode", "smart"], False),
+        ("devin-native", "dangerous", ["--permission-mode", "dangerous"], False),
+    ],
+)
+async def test_permission_mode_becomes_terminal_launch_args(
+    harness: str,
+    mode: str,
+    args: list[str] | None,
+    bypass: bool,
+) -> None:
+    """Each saved permission choice reaches its native launch representation."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _claude_agent_deps(store, conv_store, harness="claude-native"),
+        _claude_agent_deps(store, conv_store, harness=harness),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
     await _drain()
 
     assert len(conv_store.created) == 1
-    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "acceptEdits"]
+    assert conv_store.created[0]["terminal_launch_args"] == args
+
+    from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+
+    assert conv_store.created[0]["labels"].get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == (
+        "1" if bypass else None
+    )
 
 
 @pytest.mark.asyncio
@@ -930,13 +970,8 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 
 @pytest.mark.asyncio
-async def test_permission_mode_omitted_for_non_claude_agent() -> None:
-    """A mis-stamped non-Claude row degrades to no --permission-mode flag.
-
-    The injection is harness-gated fail-safe: even if a permission_mode somehow
-    persisted on a codex/cursor task, the fire must NOT inject the unknown flag
-    (which would break the launch) — it launches with the agent's own default.
-    """
+async def test_incompatible_permission_mode_fails_without_session() -> None:
+    """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
 
@@ -950,8 +985,10 @@ async def test_permission_mode_omitted_for_non_claude_agent() -> None:
     await on_fire(0, "task_1")
     await _drain()
 
-    assert len(conv_store.created) == 1
-    assert conv_store.created[0]["terminal_launch_args"] is None
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "session_create_failed"
 
 
 def _effort_agent_deps(
@@ -1879,6 +1916,43 @@ async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
     assert len(launched) == 1
     assert perm.grants and perm.grants[0][2] == LEVEL_OWNER
     assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["read-only", "plan"])
+async def test_managed_sandbox_permission_resolution_failure_prevents_launch(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(execution_target="managed_sandbox", permission_mode=mode)}
+    )
+    cache = FakeAgentCache()
+
+    def fail_load(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError("agent cache directory is inaccessible")
+
+    monkeypatch.setattr(cache, "load", fail_load)
+    launch = AsyncMock()
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+            agent_cache=cache,
+            sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+        ),
+        launch_dispatch=launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    launch.assert_not_awaited()
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "session_create_failed"
+    assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
