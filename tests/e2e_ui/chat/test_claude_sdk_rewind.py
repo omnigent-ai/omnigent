@@ -18,7 +18,6 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.chat.test_claude_sdk_clear import (
     COMPOSER,
     USER,
-    run_slash_command,
     send_and_wait,
     session_mentions,
 )
@@ -51,7 +50,8 @@ def test_claude_sdk_rewind_follows_the_truncated_session(
     send_and_wait(page, f"Say ack. {first}", "ack one")
     send_and_wait(page, f"Say ack. {second}", "ack two")
 
-    run_slash_command(page, "/rew", "rewind")
+    page.get_by_placeholder(COMPOSER).fill("/rew")
+    page.get_by_test_id("slash-menu-item-rewind").click()
     rows = page.get_by_test_id("rewind-prompt")
     expect(rows).to_have_count(2)
     expect(rows.first).to_contain_text(second)
