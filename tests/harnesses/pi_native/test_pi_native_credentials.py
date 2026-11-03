@@ -1017,8 +1017,12 @@ def test_to_models_config_shape() -> None:
     ]
 
 
-def test_to_models_config_attributes_unity_gateway_providers() -> None:
+def test_to_models_config_attributes_unity_gateway_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     ug_provider: creds._PiProviderPayload = {
         "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
         "apiKey": "!get-token",
@@ -1731,6 +1735,26 @@ def test_cli_config_databricks_respects_model_override(
     assert (
         provider.base_url == "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
     )
+
+
+def test_cli_config_preserves_auth_refresh_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG + "refresh_interval_ms = 900000\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(creds, "_run_auth_command", lambda _: None)
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+    assert provider is not None
+    assert provider.auth_refresh_interval_ms == 900_000
+    assert provider.auth_timeout_ms == 5_000
+    agent_dir = tmp_path / "managed-pi"
+    creds.write_pi_models_config(agent_dir, provider)
+    configs = list((agent_dir / auth_command.AUTH_DIR_NAME).glob("auth-*.json"))
+    assert configs
+    for path in configs:
+        configured = json.loads(path.read_text())
+        assert configured["refreshIntervalMs"] == 900_000
+        assert configured["refreshTimeoutMs"] == 5_000
 
 
 def test_cli_config_missing_codex_table_returns_none(

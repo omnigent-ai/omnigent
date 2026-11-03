@@ -59,10 +59,21 @@ def sandbox_host_id(task_id: str, workspace_id: int, trigger_key: str) -> str:
     return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:{trigger_key}").hex
 
 
+def continued_sandbox_host_id(task_id: str, workspace_id: int) -> str:
+    """The one sandbox identity every run of a task that continues a session uses.
+
+    Derived only from fields no task edit changes, so every run routes to the
+    replica holding that sandbox's connection, and a session reset keeps it.
+    """
+    return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:continue").hex
+
+
 def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
-    """Pin a host, or derive a fresh sandbox identity from tenant, task and occurrence."""
+    """Pin a host, or derive the occurrence's sandbox identity from tenant and task."""
     if task.execution_target != "managed_sandbox":
         return task.host_id
+    if task.session_mode == "continue":
+        return continued_sandbox_host_id(task.id, task.workspace_id)
     return sandbox_host_id(task.id, task.workspace_id, trigger_key)
 
 

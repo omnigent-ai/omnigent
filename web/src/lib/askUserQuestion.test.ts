@@ -78,6 +78,14 @@ describe("parseAskUserQuestionPreview", () => {
     expect(startTime.options[1]!.description).toBe("12-1 PM");
   });
 
+  it("keeps the secret flag on a question", () => {
+    const parsed = parseAskUserQuestionPreview(
+      'AskUserQuestion({"questions": [{"question": "Paste the token", ' +
+        '"options": [{"label": "Use the saved token"}], "isSecret": true}]})',
+    );
+    expect(parsed!.questions[0]!.isSecret).toBe(true);
+  });
+
   it("returns null for previews that don't match the AskUserQuestion shape", () => {
     // Other policy ASKs / PermissionRequests for non-AskUserQuestion
     // tools must NOT trigger the form rendering — the parser is the

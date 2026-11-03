@@ -9,7 +9,7 @@ name with `rg 'def test_name' tests/harnesses/claude_native/forwarder`.
 | Clear, fork, resume and native session identity | `test_session_lifecycle.py` |
 | Visible and web-injected transcript items | `test_transcript_delivery.py` |
 | Byte cursors, relocation, fingerprints and state writes | `test_transcript_cursors.py` |
-| Pending settlement and scheduled wake turns | `test_settlement.py` |
+| Pending settlement, hook acknowledgement, restart recovery and scheduled wake turns | `test_settlement.py` |
 | Parent status, stop failures and short turns | `test_status.py` |
 | API-error evidence, turn ownership and hook retries after restart | `test_failure_telemetry.py` |
 | Compaction hook edges and spinner dismissal | `test_compaction_hooks.py` |

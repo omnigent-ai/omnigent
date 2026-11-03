@@ -178,6 +178,19 @@ but records each one on the claimed run instead of inserting a new run:
      prompt fails, the launch is cancelled, the sandbox is torn down, and the run
      fails with `sandbox_registration_timeout`.
 
+A task that continues a session replaces steps 2 to 4 once it has a
+`session_id`: it checks the session, wakes its runner the way a user message
+would, and sends the prompt, also while the session is busy with an earlier turn.
+It records `succeeded` once the prompt is delivered, without waiting for the turn.
+If the replica stops before recording, recovery finds no session on the run and
+records `failed`; it never resends. A first run of such a task records its
+session on the task once the session exists and its owner is granted, so a run
+never finds a recorded session it cannot continue. Of two first runs, the one that records
+second deletes its unused session and records `skipped`.
+A sandbox task's first run starts its sandbox under the task's host ID. If that
+host already exists, left by a reset session, the new session joins it in that
+session's workspace, or replaces its sandbox when that session is unknown.
+
 Known failures record `failed` with the same `error_code` as legacy fires, such as
 `host_offline` or `launch_failed`. A managed launch records where it failed instead:
 `sandbox_create_failed` before the host connects, or `runner_start_failed` after.
@@ -212,11 +225,15 @@ The built-in recovery decides from the saved session, as shown in
 wrong:
 
 - A run counts as a managed sandbox run when its `host_id` is the sandbox ID
-  derived from its task and trigger key. This uses the run, not the task's current
+  derived from its task and trigger key, or, for a task that continues a
+  session, from its task alone. This uses the run, not the task's current
   target, which may have been edited since the claim.
 - An `idle` session alone does not mean the turn finished: a session can be idle
   with its prompt saved but never run. Runner bookkeeping such as `resource_event`
   items does not count as evidence either.
+- Recovery never tears down a continue task's sandbox: other sessions of the task,
+  such as one started after a reset, may be using it, and the task's next run
+  reuses it. The provider's lifetime cap still applies.
 - Teardown only applies to server-managed sandbox hosts, and is safe to repeat, so
   two replicas can recover the same run.
 
@@ -260,6 +277,7 @@ stateDiagram-v2
     }
 
     Starting --> Running : prompt sent, or sandbox bound
+    Starting --> Succeeded : prompt delivered into a continued session
     Starting --> Failed : known error, e.g. host_offline
     Starting --> Skipped : unsupported target
     Starting --> Recovering : lease expired
@@ -394,6 +412,8 @@ it leaves out use the defaults:
 | `on_expired(run)` | Inspects an interrupted startup, keeps delivered work, and cleans up abandoned resources. | The built-in executor |
 | `owned_hosts(keys)` | Returns the host keys this replica owns, so it only starts or recovers that work. | Every key |
 | `fire_identity(task)` | An async context manager the built-in executor enters to act as the task's owner, for example by assuming a stored delegation. | None |
+| `dispatch_enabled()` | Whether this replica may dispatch. Checked at the start of each poll and before Run now starts a run here. See [Pausing dispatch](#pausing-dispatch). | Always on |
+| `poll_interval()` | Seconds to wait before the next poll, read before each wait. Overrides `poll_seconds` without a restart. | `poll_seconds` |
 
 Replace `on_fire` and `on_expired` together or not at all. `fire_identity` only
 works with the built-in executor; a replacement executor acts as the owner itself.
@@ -408,6 +428,12 @@ same mode.
 - A key is the occurrence's host ID, or, for a task with no host, the workspace ID
   as a decimal string. Host IDs are bare lowercase 32-character hex, the same
   string a host or sandbox sends as its routing key.
+- A task that continues a session keys every run, its first included, by one
+  host: its pinned connected host, or for a sandbox task a host ID derived from
+  the task alone, so the replica holding that sandbox's connection runs it. A
+  connected-host task without a pin is pinned to its session's host when the
+  session is recorded or picked, so only its first run, before any session
+  exists, keys by the workspace ID.
 - The scheduler calls `owned_hosts` once per page of due tasks, of Run now
   requests, and of expired startups, listing each key once.
 - If the call raises, or takes longer than `recovery_seconds` during recovery,
@@ -416,6 +442,27 @@ same mode.
   over.
 - Polling waits for `owned_hosts`, so it must return quickly and respect
   cancellation.
+
+### Pausing dispatch
+
+When `dispatch_enabled()` returns false, a poll does nothing: it reads no tasks,
+claims nothing and starts no recovery pass. Run now records the request but
+leaves it pending. The loop keeps waking at the poll interval and resumes on the
+first poll after the check returns true again.
+
+- Tasks, runs and pending requests are kept. Startups already in progress keep
+  renewing their leases and finish; a run left `starting` is recovered once
+  dispatch resumes.
+- When dispatch resumes, an overdue task runs once and then moves to its next
+  future time, as after downtime. Pending Run now requests start on that poll or a
+  later one.
+- A check that raises is logged and counts as on, so a failing flag lookup does
+  not stop every automation.
+- The routes stay available. To hide them too, also turn off
+  [the automations gate](#turning-automations-off-for-some-callers).
+
+A `poll_interval()` that raises, or returns a value that is not a positive
+finite number, is logged and the scheduler waits `poll_seconds` instead.
 
 ### Writing an executor
 
@@ -475,11 +522,23 @@ scheduled_task_scheduler:
   file named by `OMNIGENT_CONFIG`. A wrapper can also pass
   `scheduled_task_scheduler_config=ScheduledTaskSchedulerConfig(...)` to replace
   the YAML settings.
-- Settings are read at startup. Values must be positive and finite, lease seconds
+- Settings are read at startup; the `poll_interval` hook can change the poll
+  interval while running. Values must be positive and finite, lease seconds
   and capacities must be whole numbers, and `renewal_seconds` must be less than
   `lease_seconds`.
 - With the flag on, an invalid setting stops the server from starting. With the
   flag off, only `startup_retry_seconds` is read and checked.
+
+## Turning automations off for some callers
+
+A deployment can pass `create_app(automations=...)`: a bool, or a zero-arg
+callable checked on each request, for example a per-workspace flag. When it is
+off for a request, every `/v1/scheduled-tasks` route returns 404, including the
+agent tools that call them, and `GET /v1/info` reports `automations_enabled`
+false so clients can hide the feature. A callable that raises counts as off. The
+gate does not stop the scheduler: tasks created while it was on keep running,
+and can be paused or deleted only once it is on again. Omitting it enables
+automations.
 
 ## Switching schedulers
 
@@ -529,68 +588,193 @@ together.
 
 ## Debug-log events
 
-The scheduler writes structured events with `debug_event`, like the rest of the
-server. When the debug-log sink is on, they land in the same table as session
-lifecycle events, so dashboards can compute scheduler metrics with SQL.
+Persistent dispatch (`automations_v2`) writes structured `debug_event` records to
+normal server logs and, when enabled, the shared debug-log table. Delivery and
+startup results, including failures, are INFO events: dashboards need INFO
+capture. The sink is best-effort, so missing events are not proof that a prompt
+was never sent.
 
-- Claims, sessions, startup results (including failures), and recovery results are
-  logged at INFO. Only operation failures, recovery timeouts, and recovery errors
-  are WARNING or higher, so the metrics need the INFO log level.
-- Every run event includes `task_id`, `run_id`, `task_workspace_id`, and
-  `scheduled_at`. `claim_skipped` has no `run_id`, because no run was created.
-- Once a session exists, the row's `session_id` links the run to that session's
-  events.
+Run events carry `task_id`, `run_id`, `task_workspace_id`, `scheduled_at`, and
+`trigger_key`. Due-occurrence observations, claim attempts, and skipped claims have no run ID. Use
+`(task_workspace_id, task_id, trigger_key)` for occurrence identity: manual runs
+can share a timestamp with a scheduled run without being duplicates.
+
+The executor scopes ordinary server logs and child tasks with occurrence IDs,
+`target`, and `session_mode`. Managed startup inputs persist these fields in
+`startup_options` and restore them on the delivering replica, including after a
+restart. They are not forwarded as prompt content. Host launch frames and runner HTTP requests carry the same context. The host
+scopes launch logs and the runner scopes request logs; shared clients stamp each
+request separately, and interactive requests clear the occurrence fields. Buffered inputs
+retain their own occurrence (or explicit absence) through queue drains and sign-in
+retries. Telemetry does not change live steering or SDK queue coalescing. An
+interactive correction can still steer an active automation turn. Ordinary execution
+logs retain the initiating turn's context. A batch combining different input
+contexts has no single turn occurrence. These logs do not divide model output or
+execution cost among inputs.
+Session-wide relays and prompt/sign-in watchers clear occurrence context. Host
+exit watchers retain launch attribution only for confirmed pre-connect failures. No
+process-wide run ID is installed: continued sessions can serve multiple runs and
+interactive turns. Unrelated host heartbeats and process-lifecycle logs still
+join by host, runner, or session ID. Legacy timers and saved inputs created before this instrumentation do
+not have the new delivery correlation.
 
 | Event | Logged when | Extra attributes |
 | --- | --- | --- |
-| `scheduled_run_claimed` | This server claimed a due occurrence or a Run now request. | `target`, `host_id`, `claim_delay_seconds` |
-| `scheduled_run_claim_skipped` | The claim did not apply: the occurrence was already claimed, or the task was edited, paused, or deleted after it was listed. | `target` |
-| `scheduled_run_session_attached` | The executor attached the session with `lease.attach_session()`, or replaced it. | `target`, `session_delay_seconds` |
-| `scheduled_run_startup_ended` | Startup ended on the server doing it. | `target`, `outcome`, `error_code`, `prompt_delay_seconds` |
+| `scheduled_run_occurrence_observed` | A replica reads a due occurrence, before schedule validation or host ownership lookup. Repeated polls are suppressed by a per-replica LRU cache of 4,096 tasks. May repeat across replicas, restarts, or cache eviction. | `target`, `observed_at`, `rrule`, `timezone`, `schedule_anchor` |
+| `scheduled_run_claim_attempted` | The owning replica tries a due schedule occurrence, before the DB claim. May repeat on later polls. | `target` |
+| `scheduled_run_claimed` | A due occurrence or Run now request was claimed. | `target`, `host_id`, `claim_delay_seconds` |
+| `scheduled_run_claim_skipped` | The occurrence was already claimed, or the task changed, paused, or was deleted. | `target` |
+| `scheduled_run_session_created` | A new session was created, before owner grants and host/sandbox startup. Continued-session sends do not emit this event. | `session_id`, `session_delay_seconds` |
+| `scheduled_run_session_attached` | The executor attached or replaced its session. | `target`, `session_delay_seconds` |
+| `scheduled_run_startup_ended` | Startup ended on its executing server. | `target`, `outcome`, `error_code`, known `failure_stage`, `startup_delay_seconds` |
+| `scheduled_run_prompt_dispatch_started` | The server begins a direct send or processes a saved input through normal dispatch. A competing saved-input worker may lose the claim and send nothing. | `session_id`, `dispatch_id`, saved `input_id` when applicable |
+| `scheduled_run_prompt_sent` | Dispatch returned explicit runner acceptance, before saved-input housekeeping. Failures inside dispatch after acceptance can suppress this event (see below). Handled native startup refusals do not count. | `session_id`, `dispatch_id`, `input_id` when saved, `prompt_delay_seconds`, `target`, `session_mode` |
+| `scheduled_run_prompt_not_accepted` | Direct dispatch returns a handled refusal. Logs the non-delivery without raising or changing the existing run-status flow. | `session_id`, `dispatch_id`, `failure_stage=prompt_send`, `outcome=not_sent` |
+| `scheduled_run_stage_started` | A fire enters a new stage, before potentially blocking/failing work. Consecutive nested entries into the same stage are suppressed per run. Gives the last observed boundary when a process dies. | `fire_stage` |
+| `scheduled_run_stage_failed` | Runner startup, prompt dispatch, managed launch, or post-delivery bookkeeping failed. | `failure_stage`, `exception_type` or `error_code`; saved-input failures also include `input_id`, `dispatch_id`, `outcome` |
+| `scheduled_run_stage_interrupted` | A direct runner startup or prompt send was cancelled. | `failure_stage`, `outcome=uncertain` |
+| `scheduled_run_prompt_dispatch_interrupted` | A saved-input delivery was cancelled. | `input_id`, `dispatch_id`, `outcome` |
 | `scheduled_run_recovered` | Recovery inspected an expired startup. | `outcome` |
-| `scheduled_task_operation_failed` | An operation failed and will be retried. | `operation` |
+| `scheduled_task_operation_failed` | An operation failed and will be retried. | `operation`; a single-occurrence claim failure also includes occurrence identity and `failure_stage=claim` |
 
-Values:
+`session_id` is a top-level log field; other dimensions are attributes. Attribute
+values in the sink are strings; cast delays before computing percentiles.
 
-- **`startup_ended` outcome:** `running`, `failed`, or `skipped` from the executor;
-  or `lease_lost`, `interrupted`, `unfinished`, or `cancelled` when startup ended
-  without a result.
-- **`recovered` outcome:** `running`, `succeeded`, `failed`, `uncertain`,
-  `superseded` (the run had already changed when recovery tried to save its
-  result), `timeout`, or `error`.
-- **`operation`:** `poll`, `initialize`, `claim`, `recovery`, `cleanup`, or
-  `lease_renewal`. `claim` failures and single-task `initialize` failures include
-  `task_id` and `task_workspace_id`; a failed scan or ownership lookup has neither.
-- **Delays** are seconds from the scheduled time to when the scheduler was asked to
-  record the step, so they leave out database write time.
+`prompt_sent` observes a successful dispatch return, which includes work after
+runner acceptance. If that work fails (for example, publishing input consumption
+or writing a smart-routing label), the prompt may already be running without a
+`prompt_sent` event. Direct delivery records a `prompt_send` stage failure;
+saved-input delivery reports `outcome=uncertain`. Existing exception propagation,
+run statuses, and retry behavior remain unchanged. Thus accepted-delivery counts
+are a lower bound, and missing sent events cannot establish non-delivery or zero
+duplicates. Delivery latency also includes dispatch bookkeeping time. Correlate
+`turn_dispatched` or `native_input_forward_finished` and runner records when
+investigating these cases; they do not replace a durable delivery ledger.
 
-Things to know when reading the events:
+`startup_ended` outcomes are `running`, `succeeded` (continued-session delivery),
+`failed`, or `skipped`; unresolved startup paths report `lease_lost`,
+`interrupted`, `unfinished`, or `cancelled`. `recovered` outcomes are `running`,
+`succeeded`, `failed`, `uncertain`, `superseded`, `timeout`, or `error`.
 
-- Results are logged when the database write commits, so a write that finishes
-  after its caller was cancelled or timed out still logs its real result. A run can
-  log `timeout` and later `running` or `error`.
-- Recovery logs `uncertain` on every pass that cannot decide, so expect several per
-  run.
-- During shutdown, the scheduler does not wait for writes in progress. A run whose
-  `running` write committed then may never log `running`, which slightly
-  understates fire success.
-- A startup cancelled before its first step logs no `startup_ended`; recovery logs
-  it later.
-- The sink stores attribute values as strings, so cast delays before computing
-  percentiles. Attributes whose value is `None`, such as `error_code` or
-  `prompt_delay_seconds` on a result other than `running`, are left out.
+`scheduled_task_operation_failed.operation` is `poll`, `initialize`, `claim`,
+`recovery`, `cleanup`, or `lease_renewal`. Claim failures and single-task
+initialization failures include `task_id` and `task_workspace_id`; failed scans
+and ownership lookups have neither.
 
-The design's success metrics come from these events:
+Scheduler claim, session-attachment, and startup delays measure from the scheduled
+time to when recording the step was requested, excluding the corresponding
+database write time. The newer prompt-delivery delay measures the successful
+dispatch return described above. A startup cancelled before its first step emits
+no `startup_ended`; recovery records its outcome later.
 
-| Success metric | How to calculate it |
+Startup and delivery are separate boundaries. A managed startup ends when the
+sandbox binds, before its prompt is sent. The older `prompt_delay_seconds` field
+on `startup_ended` remains for compatibility; it measures that startup boundary.
+Use **only `scheduled_run_prompt_sent.prompt_delay_seconds`** for time to prompt.
+A sent prompt can still fail during agent execution; native runner acceptance
+also precedes the harness's transcript receipt.
+
+Saved-input failure/interruption outcomes distinguish `not_sent` (no dispatch
+claim), `uncertain` (claimed but dispatch did not return success), and `sent`
+(dispatch succeeded, subsequent bookkeeping failed or was interrupted). A claim
+alone is never reported as successful delivery. Interrupted work is not retried
+by this telemetry.
+
+Known startup error codes identify owner identity/grant, session creation/record,
+sandbox creation/registration, and runner startup failures. Direct runner-start
+and prompt-send exceptions have separate stage events even though the persisted
+run still uses `launch_failed`. Saved-input failures distinguish `owner_authorization`, `input_validation`,
+`input_policy`, `runner_start`, `prompt_prepare`, `input_claim`, `prompt_send`, and
+`post_delivery`. Startup failures also identify host/session/budget validation.
+For a crash, inspect the last `stage_started` (or `sandbox_launch_stage`) for the
+run. It is the last observed boundary, not proof of the exact crash location;
+`startup_expired` remains explicitly unknown when recovery has no such evidence.
+
+| Metric | How to calculate it |
 | --- | --- |
-| Fire success rate | Distinct `run_id`s whose `startup_ended` outcome is `running`, or whose `recovered` outcome is `running` or `succeeded`, divided by distinct claimed `run_id`s, leaving out runs the executor `skipped`. Occurrences missed during downtime are never claimed, so they are not counted. For a managed sandbox, `running` means the sandbox connected, so a saved prompt that later fails to deliver still counts as a successful fire. |
-| Duplicate fires | Claimed `run_id`s per `(task_workspace_id, task_id, scheduled_at)`. A unique key in the database keeps this at one, so the query only confirms it. `claim_skipped` also counts edited, paused, and deleted tasks, so it is not a duplicate count. |
-| Fire delay | p90 of `session_delay_seconds`. An executor must call `lease.attach_session()`; a session passed only to `finish()` logs no fire-delay event. To leave out sandbox boot time, it must attach the session before waiting for the sandbox, as the built-in executor does. |
-| Time to prompt | `prompt_delay_seconds` on `running` results, by `target`. For a connected host this is when the prompt was sent. For a managed sandbox it is when the sandbox connected, before the saved prompt is delivered. |
-| Fires per day, Arclet vs. pinned host | Claimed runs by `target`. Active tasks and owners come from `scheduled_tasks`. |
+| Observed fire success | Distinct occurrence keys with `prompt_sent` divided by distinct observed schedule keys from `occurrence_observed`/`claim_attempted`/`claimed`, excluding intentionally skipped occurrences. Due observations retain visibility of ownership and validation failures; claim attempts retain DB claim failures that created no run. Filter `trigger_key` to `schedule:` for scheduled-only metrics; report manual runs separately. |
+| Duplicate fires | Occurrences with more than one distinct `run_id` in `prompt_sent`. Failed attempts with no accepted prompt do not count as duplicate fires. |
+| Duplicate sends | Occurrences with more than one distinct `dispatch_id` in `prompt_sent`, after deduplicating ingested rows by `log_id`. This also detects repeated delivery within one run; duplicate claims remain separately protected by the DB constraint. |
+| Session creation count | Count distinct `session_id` values on `session_created`, grouped by occurrence or run. Useful for diagnosing repeated creation; a created session does not prove a prompt was sent. |
+| Fire delay | p90 of `session_created.session_delay_seconds`, before owner grants or sandbox boot. The older `session_attached` delay remains for compatibility. Continued-session runs do not create another session. |
+| Time to prompt | p90 of `prompt_sent.prompt_delay_seconds`, split by `target` and optionally `session_mode`. Includes sandbox boot and runner readiness. |
+| Fires per day and target split | Distinct delivered run IDs by `target`; use `claimed` for attempted fires. Active tasks and distinct active owners come from `scheduled_tasks`. |
 
-Failure stages come from the executor's `error_code`.
+The due-observation schedule snapshot can reconstruct recurrence times between
+`scheduled_at` and `observed_at`, including intervals the scheduler skips during
+delay. Deduplicate by occurrence and exclude known outage windows from separate
+availability telemetry. This remains a best-effort observation stream, not a
+durable ledger: no logs can count an occurrence whose schedule was never
+observed, or recover records dropped by the sink.
+Recovery evidence and transcripts can help investigate missing delivery events,
+but `recovered=running` alone is not a replacement for a prompt-sent event.
+
+Startup results are emitted after the DB write commits, including writes whose
+callers were cancelled. Recovery can log `timeout` and later a committed result,
+and can log `uncertain` on multiple passes. Shutdown can drop pending log writes.
+
+To verify in a deployment with INFO capture, trigger a pinned-host automation and
+a sandbox automation, then filter the debug table by `attributes['run_id']`.
+Check that the sandbox's `startup_ended` can precede `prompt_sent`, and that only
+`prompt_sent` reports delivery latency. Repeat with a continued-session automation,
+then a refused input: continuation should emit a sent event; refusal should emit
+a stage failure (raised errors) or `prompt_not_accepted` (handled direct refusal),
+with no sent event for that dispatch. Handled native refusals preserve the
+existing normal-return path and session failure persistence; telemetry does not
+force a new scheduled-run status. The automated restart and
+competing-worker scenarios live in `test_managed_startup_inputs.py`.
+
+### Adoption and creation funnel
+
+`scheduled_task_created` is an INFO server event emitted after task persistence,
+for UI, API, and agent-tool creates. Its top-level `user_id` is the authenticated
+owner (`local` for auth-disabled servers); attributes are `task_id`,
+`task_workspace_id`, `creation_source` (`ui`, `agent`, or `api`), `template_id`,
+`target`, and `session_mode`. Rejected creates emit no creation event. As with
+run logs, delivery is best-effort; reconcile current inventory against the store.
+
+Requests without a recognized source header are classified as `api`, including
+older web and agent clients. During a mixed-version rollout, `creation_source`
+therefore does not precisely distinguish direct API usage from those clients.
+
+UI events use the host-provided `OmnigentHostConfig.analytics` sink:
+
+| Metric | Measurement |
+| --- | --- |
+| Feature visitors | Distinct host-identified users on `page_view` with `pageId=tasks`, `tasks.templates`, or `tasks.detail`. |
+| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` in the reporting window. |
+| Automations created per person | Distinct `task_id` per owner on `scheduled_task_created`, including tasks later deleted while events remain retained. |
+| Active tasks and active owners | Use `scheduled_tasks` filtered to `state=active`; group by workspace and owner. This is a current snapshot, not historical daily activity. |
+| Template selections | `click` with `componentId=tasks.template.<id>`, from both the empty-state preview and Templates tab. |
+| Successful template use | `scheduled_task_created` grouped by `template_id`; distinct owners gives template users. |
+| UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
+| UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
+
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`,
+`follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
+unattributed/older clients. The current gallery offers Jira, Slack, and GitHub;
+the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
+its prompt is edited. No task name, prompt, Jira query, channel, or repository
+text is recorded in these events. Attribution headers are diagnostic client claims;
+they never determine ownership or authorization.
+
+The host sink supplies user/workspace identity for UI analytics. Without that
+sink (for example standalone web), UI events are no-ops; server creation logging
+still works when INFO capture is enabled. A browser failure can follow a
+committed server creation if the response is lost: use server task IDs for
+creation counts, and UI outcomes for the browser funnel. Do not add both streams
+together. Page visits, creators, and owners of active tasks answer different
+questions; report them separately. Existing owners are not retroactively
+counted as new creators.
+
+To verify, configure a host analytics capture, visit Automations and its Templates
+tab, create one custom task and one template task, then cancel another form.
+Expect page views, one template click per selection, successful creation
+interactions and one server creation event per saved task, and no creation event
+for the cancelled form. Check task ID and owner against the store; delete the
+probe tasks afterward. Run `tests/server/integration/test_scheduled_tasks_routes.py`
+and `web/src/lib/scheduledTasksApi.test.ts` for rejected-create and attribution
+coverage.
 
 ## Code
 
