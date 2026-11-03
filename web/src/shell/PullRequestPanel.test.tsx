@@ -1291,6 +1291,101 @@ describe("PullRequestPanel", () => {
     assertColors();
   });
 
+  it("interleaves commits and force pushes with comments without inflating their count", () => {
+    const keyWarnings = watchKeyWarnings();
+    state.info!.data!.pr!.comments = [
+      { author: "reviewer", body: "Please update", created_at: "2026-09-05T08:00:00Z", url: null },
+      { author: "reviewer", body: "Looks good", created_at: "2026-09-05T10:00:00Z", url: null },
+      { author: null, body: "Undated comment", created_at: null, url: null },
+    ];
+    state.info!.data!.pr!.timeline_events = [
+      {
+        id: "push-1",
+        kind: "force_push",
+        author: "octocat",
+        created_at: "2026-09-05T09:00:00Z",
+        sha: "bbbbbbb222222",
+        previous_sha: "aaaaaaa111111",
+        url: "https://github.com/acme/app/commit/bbbbbbb222222",
+      },
+      {
+        id: "commit-1",
+        kind: "commit",
+        author: "octocat",
+        created_at: "2026-09-05T07:00:00Z",
+        sha: "aaaaaaa111111",
+        url: "https://github.com/acme/app/pull/6000/commits/aaaaaaa111111",
+        message: "Add the feature",
+      },
+    ];
+    const view = renderComments();
+    const rows = screen.getAllByRole("listitem");
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toHaveTextContent("octocatcommittedaaaaaaa");
+    expect(rows[0]).toHaveTextContent("Add the feature");
+    expect(rows[1]).toHaveTextContent("Please update");
+    expect(rows[2]).toHaveTextContent("octocatforce-pushedfrom aaaaaaatobbbbbbb");
+    expect(rows[3]).toHaveTextContent("Looks good");
+    expect(rows[4]).toHaveTextContent("Undated comment");
+    expect(rows[2]!.querySelector("time")).toHaveAttribute("dateTime", "2026-09-05T09:00:00Z");
+    expect(rows[2]!.querySelector("time")).toHaveAttribute(
+      "title",
+      expect.stringContaining("2026"),
+    );
+    expect(screen.getByRole("link", { name: "Open commit aaaaaaa on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/6000/commits/aaaaaaa111111",
+    );
+    expect(screen.getByRole("link", { name: "Open commit bbbbbbb on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/commit/bbbbbbb222222",
+    );
+    expect(screen.getByRole("tab", { name: "Comments 3" })).toBeInTheDocument();
+    state.info!.data!.pr!.timeline_events.push({
+      id: "commit-2",
+      kind: "commit",
+      author: "octocat",
+      created_at: "2026-09-05T08:30:00Z",
+      sha: "ccccccc333333",
+      url: null,
+      message: "Address review",
+    });
+    view.rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText("Looks good").closest("li")).toBe(rows[3]);
+    expect(screen.getByText("Address review")).toBeInTheDocument();
+    expect(keyWarnings()).toEqual([]);
+  });
+
+  it.each(["https://example.com/pr/6000", "javascript:alert(1)", "data:text/html,unsafe"])(
+    "keeps incomplete history visible and validates its link: %s",
+    (prUrl) => {
+      state.info!.data!.pr!.url = prUrl;
+      state.info!.data!.pr!.timeline_events = [
+        {
+          id: "push-1",
+          kind: "force_push",
+          author: null,
+          created_at: null,
+          sha: null,
+          url: null,
+        },
+      ];
+      state.info!.data!.pr!.timeline_partial = true;
+      renderComments();
+      expect(screen.getByRole("listitem")).toHaveTextContent("unknownforce-pushedthe branch");
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Some commit and push history is unavailable.",
+      );
+      if (prUrl.startsWith("https://")) {
+        expect(screen.getByRole("link", { name: "View on GitHub" })).toHaveAttribute("href", prUrl);
+      } else {
+        expect(screen.queryByRole("link", { name: "View on GitHub" })).toBeNull();
+      }
+      expect(screen.queryByText("No comments yet.")).toBeNull();
+      expect(screen.getByRole("tab", { name: "Comments" })).toBeInTheDocument();
+    },
+  );
+
   it("shows empty states when the PR has no body or comments", () => {
     // The default fixture carries neither a body nor comments.
     renderPanel();
