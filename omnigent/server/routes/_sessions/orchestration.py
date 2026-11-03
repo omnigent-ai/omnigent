@@ -4020,6 +4020,9 @@ async def _recover_subagent_missing_parent_inbox(
         await _ensure_runner_relay_ready(
             parent_id, runner_id, client, conversation_store, conversation=current_parent
         )
+        current_parent = await asyncio.to_thread(eligible_parent)
+        if current_parent is None or current_parent.agent_id != parent.agent_id:
+            return None
         initializer.require_generation(runner_id, client, generation)
         response = await client.post(
             f"/v1/sessions/{child_conv.id}/events", json=forward_body, timeout=5.0

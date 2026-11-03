@@ -129,7 +129,7 @@ async def test_other_rejections_do_not_initialize_parent(recovery: Any, response
     assert recovery.requests == []
 
 
-@pytest.mark.parametrize("phase", ["before_init", "after_init"])
+@pytest.mark.parametrize("phase", ["before_init", "after_init", "after_relay"])
 @pytest.mark.parametrize(
     "guard",
     [
