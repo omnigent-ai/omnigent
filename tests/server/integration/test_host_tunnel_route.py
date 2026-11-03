@@ -720,10 +720,11 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
             f"host-ping:{_HOST_ID}",
             f"host-receive:{_HOST_ID}",
             f"host-heartbeat:{_HOST_ID}",
+            f"host-readiness:{_HOST_ID}",
             "tunnel-diagnostics",
         }
     ]
-    assert len(helpers) == 5
+    assert len(helpers) == 6
     replacement = None
     try:
         if cancellation == "task":
@@ -968,7 +969,11 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     async def _wait_until_ready() -> None:
         while True:
             host = store.get_host(_HOST_ID)
-            if host is not None and host.configured_harnesses == {"pi": True}:
+            if (
+                host is not None
+                and host.configured_harnesses == {"pi": True}
+                and updates == [_HOST_ID]
+            ):
                 return
             await asyncio.sleep(0.01)
 
@@ -978,6 +983,229 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     assert conn is not None
     assert conn.hello.configured_harnesses == {"pi": True}
     assert updates == [_HOST_ID]
+
+
+@pytest.mark.parametrize("blocked_at", ["store", "callback"])
+async def test_host_readiness_does_not_block_results_or_pongs(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, blocked_at: str
+) -> None:
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    entered = threading.Event()
+    release = threading.Event()
+    callback_release = asyncio.Event()
+    notifications: list[dict[str, object]] = []
+    writes: list[dict[str, object]] = []
+    original_update = store.update_harness_readiness
+
+    def update_readiness(host_id, configured_harnesses, **kwargs):
+        writes.append(dict(configured_harnesses))
+        if blocked_at == "store" and len(writes) == 1:
+            entered.set()
+            assert release.wait(timeout=budget(5.0))
+        original_update(host_id, configured_harnesses, **kwargs)
+
+    async def on_update(host_id: str, _owner: str | None) -> None:
+        if blocked_at == "callback" and not notifications:
+            entered.set()
+            await callback_release.wait()
+        persisted = store.get_host(host_id)
+        assert persisted is not None
+        notifications.append(dict(persisted.configured_harnesses or {}))
+
+    monkeypatch.setattr(store, "update_harness_readiness", update_readiness)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, on_host_update=on_update), prefix="/v1"
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    latest = {"pi": True, "codex": True}
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"pi": True})
+                ),
+            }
+        )
+        assert await asyncio.to_thread(entered.wait, budget(1.0))
+        for readiness in ({"pi": False}, latest):
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostHarnessReadinessFrame(configured_harnesses=readiness)
+                    ),
+                }
+            )
+        result = asyncio.get_running_loop().create_future()
+        conn.pending_launches["launch-during-readiness"] = result
+        await comm.send_input(
+            {"type": "websocket.receive", "text": encode_frame(PongFrame(ts=123))}
+        )
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostLaunchRunnerResultFrame(
+                        request_id="launch-during-readiness", status="launched", runner_id="runner"
+                    )
+                ),
+            }
+        )
+        assert (await asyncio.wait_for(asyncio.shield(result), timeout=budget(0.5)))[
+            "status"
+        ] == "launched"
+        assert conn.diagnostics.snapshot()["last_app_pong_received_age_s"] is not None
+        assert conn.hello.configured_harnesses == latest
+        assert writes == [{"pi": True}]
+        release.set()
+        callback_release.set()
+
+        async def wait_latest() -> None:
+            while not notifications or notifications[-1] != latest:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_latest(), timeout=budget(1.0))
+        assert writes == [{"pi": True}, latest]
+    finally:
+        release.set()
+        callback_release.set()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2.0))
+
+
+@pytest.mark.parametrize("disconnect_first", [True, False])
+async def test_retired_readiness_write_cannot_overwrite_reconnect(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect_first: bool,
+) -> None:
+    app, registry, store = host_app
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_update = store.update_harness_readiness
+
+    def blocked_update(host_id, configured_harnesses, **kwargs):
+        entered.set()
+        try:
+            assert release.wait(timeout=budget(5.0))
+            original_update(host_id, configured_harnesses, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(store, "update_harness_readiness", blocked_update)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    old_conn = registry.get(_HOST_ID)
+    assert old_conn is not None
+    replacement = None
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"pi": False})
+                ),
+            }
+        )
+        assert await asyncio.to_thread(entered.wait, budget(1.0))
+        if disconnect_first:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=budget(1.0))
+            assert registry.get(_HOST_ID) is None
+        replacement = await _connect_route(app, _TUNNEL_PATH)
+        await replacement.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHelloFrame(
+                        version="0.1.0-test",
+                        frame_protocol_version=1,
+                        name="test-laptop",
+                        configured_harnesses={"codex": True},
+                    )
+                ),
+            }
+        )
+
+        async def wait_replaced() -> None:
+            while registry.get(_HOST_ID) in (None, old_conn):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_replaced(), timeout=budget(1.0))
+        await comm.wait(timeout=budget(1.0))
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(1.0))
+        persisted = store.get_host(_HOST_ID)
+        assert persisted is not None
+        assert persisted.status == "online"
+        assert persisted.configured_harnesses == {"codex": True}
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, budget(2.0))
+        comm.stop(exceptions=False)
+        if replacement is not None:
+            await replacement.send_input({"type": "websocket.disconnect", "code": 1000})
+            await replacement.wait(timeout=budget(2.0))
+
+
+@pytest.mark.parametrize("failed_at", ["store", "callback"])
+async def test_host_readiness_failure_does_not_disconnect(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, failed_at: str
+) -> None:
+    from omnigent.server.routes import host_tunnel
+
+    monkeypatch.setattr(host_tunnel, "PING_INTERVAL_S", budget(0.02))
+    monkeypatch.setattr(host_tunnel, "PING_MISS_THRESHOLD", 100_000)
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    original_update = store.update_harness_readiness
+    writes = 0
+    notified = asyncio.Event()
+
+    def update_readiness(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if failed_at == "store" and writes == 1:
+            raise RuntimeError("test readiness persistence failure")
+        original_update(*args, **kwargs)
+
+    async def on_update(_host_id: str, _owner: str | None) -> None:
+        notified.set()
+        if failed_at == "callback":
+            raise RuntimeError("test readiness callback failure")
+
+    monkeypatch.setattr(store, "update_harness_readiness", update_readiness)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, on_host_update=on_update), prefix="/v1"
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    try:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"pi": True})
+                ),
+            }
+        )
+        await asyncio.wait_for(notified.wait(), timeout=budget(1.0))
+        assert writes == (2 if failed_at == "store" else 1)
+        persisted = store.get_host(_HOST_ID)
+        assert persisted is not None and persisted.configured_harnesses == {"pi": True}
+        await _receive_ping_and_pong(comm)
+        assert registry.get(_HOST_ID) is not None
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2.0))
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(

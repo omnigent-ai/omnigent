@@ -18,6 +18,7 @@ happy-path and validation cases can run, and one test asserts the route is 404
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
@@ -41,6 +42,7 @@ from omnigent.host.frames import (
     HostHarnessLoginResultFrame,
     HostHarnessLogoutFrame,
     HostHarnessLogoutResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
@@ -66,6 +68,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake guard as test_hosts_create_directory.py: the
@@ -650,6 +653,88 @@ async def test_refresh_harnesses_returns_fresh_host_maps(
             "codex-native": False,
         },
     }
+
+
+@pytest.mark.parametrize("first_update", ["notification", "refresh"])
+async def test_refresh_and_readiness_keep_the_newest_snapshot(
+    install_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    first_update: str,
+) -> None:
+    app, registry, comm, replies, _drain = install_setup
+    store = install_app[2]
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    newest_written = threading.Event()
+    original_update = store.update_harness_readiness
+    older, newest = {"codex": False}, {"codex": True}
+
+    def delayed_update(host_id, configured_harnesses, **kwargs):
+        if configured_harnesses == older:
+            entered.set()
+            assert release.wait(timeout=budget(5.0))
+        try:
+            original_update(host_id, configured_harnesses, **kwargs)
+            if configured_harnesses == newest:
+                newest_written.set()
+        finally:
+            if configured_harnesses == older:
+                finished.set()
+
+    monkeypatch.setattr(store, "update_harness_readiness", delayed_update)
+    replies["__refresh__"] = {
+        "configured_harnesses": newest if first_update == "notification" else older
+    }
+    refresh_task = None
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            if first_update == "refresh":
+                refresh_task = asyncio.create_task(
+                    client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+                )
+                assert await asyncio.to_thread(entered.wait, budget(1.0))
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostHarnessReadinessFrame(
+                            configured_harnesses=older
+                            if first_update == "notification"
+                            else newest
+                        )
+                    ),
+                }
+            )
+            if first_update == "notification":
+                assert await asyncio.to_thread(entered.wait, budget(1.0))
+                refresh_task = asyncio.create_task(
+                    client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+                )
+            assert await asyncio.to_thread(newest_written.wait, budget(1.0))
+            release.set()
+            assert await asyncio.to_thread(finished.wait, budget(1.0))
+            assert refresh_task is not None
+            response = await asyncio.wait_for(refresh_task, timeout=budget(1.0))
+            assert response.status_code == 200
+        persisted = store.get_host(_HOST_ID)
+        conn = registry.get(_HOST_ID)
+        assert persisted is not None and persisted.configured_harnesses == newest
+        assert conn is not None and conn.hello.configured_harnesses == newest
+    finally:
+        release.set()
+        if refresh_task is not None and not refresh_task.done():
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
+        if entered.is_set():
+            assert await asyncio.to_thread(finished.wait, budget(2.0))
 
 
 async def test_refresh_harness_accounts_updates_hosts_and_throttles(

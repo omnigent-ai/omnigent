@@ -652,28 +652,32 @@ class HostStore:
         self,
         host_id: str,
         configured_harnesses: dict[str, HarnessAvailability],
+        *,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         """Replace a connected host's live per-harness readiness map.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param configured_harnesses: Current readiness keyed by harness spelling.
+        :param cancelled: Optional abandonment check after acquiring the row lock.
         """
         harnesses_json = json.dumps(configured_harnesses)
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
-            session.execute(
-                update(SqlHost)
+            row = session.execute(
+                select(SqlHost)
                 .where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                     SqlHost.deleted_at.is_(None),
                 )
-                .values(
-                    configured_harnesses=harnesses_json,
-                    updated_at=updated_at,
-                )
-            )
+                .with_for_update()
+            ).scalar_one_or_none()
+            # A cancelled worker can outlive its tunnel while waiting for the database.
+            if row is not None and not (cancelled is not None and cancelled()):
+                row.configured_harnesses = harnesses_json
+                row.updated_at = updated_at
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
