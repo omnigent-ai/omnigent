@@ -877,9 +877,11 @@ async def _stop_host_runner_intentionally(
             if handle is not None and handle.runner_id != runner_id:
                 continue
             live_status = _session_status_cache.get(related_id, persisted_status)
-            # Completed work and earlier task failures keep their existing outcome.
+            # Earlier task failures keep their outcome. An idle session without a
+            # relay is covered too: the exiting runner can still publish its activity.
             if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
-                continue
+                if live_status != "idle" or handle is not None:
+                    continue
             stop_targets.add(related_id)
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)
@@ -13426,8 +13428,8 @@ async def _probe_runner_live_status(
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
     Concurrent snapshots of one session await the same in-flight probe. A 200
-    records the status in ``_session_status_cache``; a probe that timed out,
-    failed in transport, or answered slowly without a status puts the session
+    fills ``_session_status_cache`` only if no live event has filled it meanwhile.
+    A timeout, transport failure, or slow reply without a status puts the session
     in a skip window that doubles per consecutive slow probe.
 
     :param runner_client: HTTP client pointed at the session's runner.
@@ -13435,8 +13437,9 @@ async def _probe_runner_live_status(
     :param runner_id: The session's bound runner, e.g.
         ``"runner_0123456789abcdef"``. A skip window recorded against a
         different runner is discarded so a rebound session is probed at once.
-    :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
-        probe is in backoff, timed out, failed, or returned a non-200.
+    :returns: The newer cached status or the runner's raw status, e.g.
+        ``"running"``, or ``None`` when the probe is in backoff, timed out,
+        failed, or returned a non-200.
     """
     probe = _runner_status_probe_inflight.get(session_id)
     if probe is None:
@@ -13461,7 +13464,8 @@ async def _run_runner_status_probe(
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param runner_id: The session's bound runner, recorded with any skip window.
-    :returns: The runner's raw status on a 200, else ``None``.
+    :returns: The newer cached status or the runner's raw status on a 200,
+        else ``None``.
     """
     started = time.monotonic()
     try:
@@ -13484,6 +13488,12 @@ async def _run_runner_status_probe(
                 except ValueError:
                     payload = None
                 if isinstance(payload, dict):
+                    # Probes fill a cold cache; a turn edge received while the
+                    # request waited takes precedence over its sampled status.
+                    published_status = _session_status_cache.get(session_id)
+                    if published_status is not None:
+                        _runner_status_probe_backoff.pop(session_id, None)
+                        return published_status
                     raw = str(payload.get("status", "idle"))
                     _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
@@ -13664,11 +13674,8 @@ async def _get_session_snapshot(
             and _session_status_cache.get(session_id) is None
             and runner_client is not None
         ):
-            if (
-                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
-                is not None
-            ):
-                status = _session_status_from_cache(session_id)
+            await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+            status = _session_status_from_cache(session_id, conv.live_status)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

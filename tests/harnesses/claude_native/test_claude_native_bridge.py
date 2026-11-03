@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import io
 import itertools
 import json
@@ -21,7 +22,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -4786,6 +4787,51 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+    assert not list(bridge_dir.glob("paste_*.bin"))
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "close"])
+def test_paste_file_is_removed_when_payload_write_fails(
+    failure_phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write or buffered close must not leave the prompt on disk."""
+    original_temporary_file = tempfile.NamedTemporaryFile
+    failure = OSError(errno.ENOSPC, "synthetic disk full")
+    created_paths: list[Path] = []
+
+    @contextmanager
+    def failing_temporary_file(**kwargs: Any) -> Iterator[Any]:
+        with original_temporary_file(**kwargs) as paste_file:
+            created_paths.append(Path(paste_file.name))
+            if failure_phase == "write":
+
+                def partial_write(payload: bytes) -> None:
+                    paste_file.file.write(payload[:3])
+                    paste_file.file.flush()
+                    raise failure
+
+                monkeypatch.setattr(paste_file, "write", partial_write)
+            yield paste_file
+        if failure_phase == "close":
+            raise failure
+
+    run_tmux = Mock()
+    monkeypatch.setattr(
+        claude_native_bridge.tempfile, "NamedTemporaryFile", failing_temporary_file
+    )
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: False)
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+
+    with pytest.raises(OSError) as caught:
+        claude_native_bridge._paste_and_submit(
+            tmp_path, "synthetic.sock", "claude:0.0", text="synthetic prompt", needle="synthetic"
+        )
+
+    assert caught.value is failure
+    assert len(created_paths) == 1
+    assert not created_paths[0].exists()
+    run_tmux.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -7306,6 +7352,47 @@ def test_call_relay_tool_returns_mcp_error_on_read_timeout(
     assert result["isError"] is True
     error_text = json.loads(result["content"][0]["text"])["error"]
     assert "failed to call Omnigent tool relay" in error_text
+
+
+@pytest.mark.parametrize(
+    ("payload", "heartbeat", "reason"),
+    [
+        (b"", True, "closed before delivering its result"),
+        (b"\n \n", True, "closed before delivering its result"),
+        (b'{"content":', True, "malformed JSON"),
+        (b"[]", True, "non-object JSON"),
+        (b'{"content":[{"type":"text","text":"created"}]}', False, None),
+    ],
+)
+def test_call_relay_tool_decodes_complete_or_uncertain_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    heartbeat: bool,
+    reason: str | None,
+) -> None:
+    """Legacy success is preserved; missing or invalid results stay uncertain."""
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"X-Omnigent-Relay-Heartbeat": "1"} if heartbeat else {}
+
+    claude_native_bridge._write_json_file(
+        tmp_path / claude_native_bridge._TOOL_RELAY_FILE,
+        {"url": "http://127.0.0.1:12345", "token": "test-token"},
+    )
+    monkeypatch.setattr(
+        claude_native_bridge.request, "urlopen", lambda *_args, **_kwargs: Response(payload)
+    )
+    result = claude_native_bridge._call_relay_tool(tmp_path, "sys_scheduled_task_create", {})
+    if reason is None:
+        assert result == {"content": [{"type": "text", "text": "created"}]}
+        return
+    assert result["isError"]
+    message = json.loads(result["content"][0]["text"])["error"]
+    assert "Completion is unknown" in message
+    assert "check the affected state before retrying" in message
+    assert reason in message
 
 
 @pytest.mark.asyncio
@@ -13059,6 +13146,17 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     ]
 
 
+_WRAPPED_BTW_PANE = "\n".join(
+    [
+        "▔" * 50,
+        "    /btw do the checks pass?",
+        "      Yes, the checks pass.",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to",
+        "    close",
+    ]
+)
+
+
 @pytest.mark.parametrize(
     ("occupied_pane", "after_preflight"),
     [
@@ -13071,6 +13169,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         (_TASK_DETAILS_PANE, False),
         (_SETTINGS_PANEL_PANE, True),
         (_TASK_DETAILS_PANE, True),
+        (_WRAPPED_BTW_PANE, False),
+        (_WRAPPED_BTW_PANE, True),
     ],
     ids=[
         "reverse-search",
@@ -13082,6 +13182,8 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "task-details-panel",
         "settings-after-preflight",
         "task-details-after-preflight",
+        "wrapped-quick-answer",
+        "wrapped-quick-answer-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -13185,9 +13287,13 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
     )
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by shell mode"):
+    with pytest.raises(
+        claude_native_bridge.ClaudeInputBoxOccupied, match="occupied by shell mode"
+    ) as refused:
         inject_user_message(bridge_dir, content="hello from the web")
 
+    # Nothing was typed, so the executor can hold the message until the box frees.
+    assert refused.value.surface == "shell mode"
     tails = [args[-1] for args in sends]
     assert tails and all(
         not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
@@ -13676,9 +13782,15 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
     assert min(gaps) >= 1.0, f"Escapes {gaps} apart can open Claude Code's rewind dialog"
 
 
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BTW_PANE],
+    ids=["search", "wrapped-quick-answer"],
+)
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    occupied_pane: str,
 ) -> None:
     """
     The same reclaim guards slash commands (e.g. a routed model switch).
@@ -13693,8 +13805,8 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         # re-confirmation, idle after the Escape, then the typed command
         # renders and the submit clears it.
         [
-            _REVERSE_SEARCH_PANE,
-            _REVERSE_SEARCH_PANE,
+            occupied_pane,
+            occupied_pane,
             _IDLE_PANE,
             _composer_pane("/effort high"),
             _IDLE_PANE,
@@ -14202,8 +14314,12 @@ def test_inject_slash_command_refuses_an_input_mode_that_survives_the_restore(
     sends = _fake_tmux(monkeypatch, [pane])
     clock = claude_native_bridge.time
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match=f"occupied by {surface}"):
+    with pytest.raises(
+        claude_native_bridge.ClaudeInputBoxOccupied, match=f"occupied by {surface}"
+    ) as refused:
         claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert refused.value.surface == surface
 
     tails = [args[-1] for args in sends]
     assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
@@ -14566,6 +14682,68 @@ async def test_relay_tool_update_preserves_cached_policy_endpoint(
             assert policy_client.bodies == [_PRE_TOOL_USE_PAYLOAD, _PRE_TOOL_USE_PAYLOAD]
     finally:
         relay.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_relay_runs_only_advertised_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/tool`` refuses names the relay does not currently advertise.
+
+    Any process running as the session user can read the relay token, so the
+    token cannot tell the MCP bridge from other callers. The relay's own
+    advertised set bounds what either can run, and rewriting
+    ``tool_relay.json`` does not widen it.
+    """
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_relay_surface")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+    dispatched: list[str] = []
+
+    async def _executor(name: str, arguments: dict[str, object]) -> str:
+        """Record each dispatched tool name."""
+        del arguments
+        dispatched.append(name)
+        return "ok"
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "list_comments", "parameters": {"type": "object"}}],
+        tool_executor=_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    shell_call = {"name": "sys_os_shell", "arguments": {"command": "id"}}
+    try:
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        tampered = {**info, "tools": [*info["tools"], {"name": "sys_os_shell"}]}
+        relay_file.write_text(json.dumps(tampered), encoding="utf-8")
+        async with httpx.AsyncClient(
+            base_url=info["url"],
+            headers={"Authorization": f"Bearer {info['token']}"},
+            trust_env=False,
+        ) as client:
+            advertised = await client.post(
+                "/tool", json={"name": "list_comments", "arguments": {}}
+            )
+            refused = await client.post("/tool", json=shell_call)
+            relay.update_tools(
+                [{"name": "sys_os_shell", "parameters": {"type": "object"}}], _executor
+            )
+            updated = await client.post("/tool", json=shell_call)
+            withdrawn = await client.post("/tool", json={"name": "list_comments", "arguments": {}})
+    finally:
+        relay.close()
+
+    assert "isError" not in advertised.json()
+    assert refused.json()["isError"] is True
+    assert json.loads(refused.json()["content"][0]["text"]) == {
+        "error": "unknown tool: 'sys_os_shell'"
+    }
+    assert "isError" not in updated.json()
+    assert withdrawn.json()["isError"] is True
+    assert dispatched == ["list_comments", "sys_os_shell"]
 
 
 @pytest.mark.asyncio
@@ -15591,6 +15769,7 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
 # ── /btw side-chat overlay parsing ─────────────────────────────────
 
 _BTW_BORDER = "▔" * 120
+_BTW_COMPLETE_FOOTER = "    ↑/↓ to scroll · c to copy · f to fork · Esc to close"
 
 
 def _btw_pane(*body_lines: str) -> str:
@@ -15608,7 +15787,28 @@ def _btw_pane(*body_lines: str) -> str:
     return "\n".join([*prefix, *body_lines])
 
 
-def test_btw_overlay_parses_completed_single_turn() -> None:
+@pytest.mark.parametrize(
+    "footer",
+    [
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to\n    close",
+        "    ↑/↓ to scroll · c to copy · f to\n    fork · Esc to close",
+        *[
+            "\n".join(
+                _BTW_COMPLETE_FOOTER[start : start + width]
+                for start in range(0, len(_BTW_COMPLETE_FOOTER), width)
+            )
+            for width in range(20, len(_BTW_COMPLETE_FOOTER))
+        ],
+    ],
+    ids=[
+        "one-row",
+        "wrapped-close",
+        "wrapped-fork",
+        *[f"columns-{width}" for width in range(20, len(_BTW_COMPLETE_FOOTER))],
+    ],
+)
+def test_btw_overlay_parses_completed_single_turn(footer: str) -> None:
     """A settled single-turn overlay yields its question and answer."""
     pane = _btw_pane(
         "",
@@ -15616,7 +15816,7 @@ def test_btw_overlay_parses_completed_single_turn() -> None:
         "",
         "      Yes, the public API is unchanged.",
         "",
-        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        footer,
     )
     overlay = claude_native_bridge._btw_overlay_from_pane(pane)
     assert overlay is not None
@@ -15686,33 +15886,35 @@ def test_btw_overlay_preserves_relative_indentation() -> None:
     assert overlay.answer == "- top\n  - nested"
 
 
-def test_btw_overlay_present_matches_settled_multiturn_and_generating() -> None:
+@pytest.mark.parametrize("close_hint", ["Esc to close", "Esc to\n    close"])
+def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint: str) -> None:
     """The dismiss guard matches every /btw overlay state, settled or not."""
     settled = _btw_pane(
         "    /btw q",
         "",
         "      A",
         "",
-        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        f"    ↑/↓ to scroll · c to copy · f to fork · {close_hint}",
     )
     multiturn = _btw_pane(
         "    /btw q1",
         "    /btw q2",
         "",
         "      A",
-        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+        f"    ←/→ to switch · c to copy · f to fork · x to clear history · {close_hint}",
     )
     generating = _btw_pane(
         "    /btw q",
         "      ✻ Answering…",
-        "    ←/→ to switch · x to clear history · Esc to close",
+        f"    ←/→ to switch · x to clear history · {close_hint}",
     )
     assert claude_native_bridge._btw_overlay_present(settled) is True
     assert claude_native_bridge._btw_overlay_present(multiturn) is True
     assert claude_native_bridge._btw_overlay_present(generating) is True
 
 
-def test_btw_overlay_present_false_on_bare_composer() -> None:
+@pytest.mark.parametrize("quoted_overlay", ["none", "one-row", "wrapped"])
+def test_btw_overlay_present_false_on_bare_composer(quoted_overlay: str) -> None:
     """No /btw footer → no Escape (a blind Escape would cancel a turn)."""
     pane = "\n".join(
         [
@@ -15723,7 +15925,24 @@ def test_btw_overlay_present_false_on_bare_composer() -> None:
             "  Opus 4.8 (1M) │ high │ 0/1M $0.00 │ git:main",
         ]
     )
+    if quoted_overlay != "none":
+        overlay = _WRAPPED_BTW_PANE
+        if quoted_overlay == "one-row":
+            overlay = overlay.replace("Esc to\n    close", "Esc to close")
+        pane = overlay + "\n" + pane
     assert claude_native_bridge._btw_overlay_present(pane) is False
+    assert claude_native_bridge._btw_overlay_from_pane(pane) is None
+
+
+def test_dismiss_btw_overlay_closes_a_wrapped_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing Quick Answer in Chat also closes the narrow terminal panel."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [_WRAPPED_BTW_PANE])
+
+    assert claude_native_bridge.dismiss_btw_overlay(bridge_dir) is True
+    assert sends == [["send-keys", "-t", "claude:0.0", "Escape"]]
 
 
 # ---------------------------------------------------------------------------
@@ -16378,3 +16597,334 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
             pytest.fail("delivery continued after a failed resize")
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [True, False])
+async def test_relay_approval_outlives_execution_and_http_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved: bool
+) -> None:
+    """The real HTTP relay stays pending until its own approval is answered."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_POST_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_HEARTBEAT_S", 0.02, raising=False)
+    bridge_dir = prepare_bridge_dir("conv_approval_timeout", workspace=tmp_path)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+
+    async def executor(name: str, arguments: dict[str, object]) -> object:
+        waiting.set()
+        try:
+            allowed = await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_relay_timeout",
+                conversation_id="conv_approval_timeout",
+                publish_event=lambda *_: None,
+                timeout_seconds=5,
+            )
+            if allowed:
+                effects.append(name)
+            return {"approved": allowed}
+        finally:
+            finished.set()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_scheduled_task_create"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    call = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._call_relay_tool,
+            bridge_dir,
+            "sys_scheduled_task_create",
+            {},
+        )
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(call), 0.4)
+        assert effects == []
+        assert pending_approvals.has_pending("conv_approval_timeout")
+        assert pending_approvals.resolve("elicit_relay_timeout", approved)
+        result = await asyncio.wait_for(call, 2)
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"approved": approved}
+        assert effects == (["sys_scheduled_task_create"] if approved else [])
+        assert not pending_approvals.has_pending("conv_approval_timeout")
+    finally:
+        pending_approvals.resolve("elicit_relay_timeout", False)
+        await asyncio.wait_for(finished.wait(), 2)
+        await asyncio.wait_for(call, 2)
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_approval_does_not_extend_another_calls_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked create cannot keep an unrelated stuck shell call alive."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
+    waiting, shell_cancelled = asyncio.Event(), asyncio.Event()
+
+    async def executor(name, arguments):
+        if name == "sys_scheduled_task_create":
+            waiting.set()
+            return {
+                "approved": await pending_approvals.wait_for_user_approval(
+                    elicitation_id="elicit_concurrent",
+                    conversation_id="conv_concurrent",
+                    publish_event=lambda *_: None,
+                    timeout_seconds=3,
+                )
+            }
+        try:
+            await asyncio.Future()
+        finally:
+            shell_cancelled.set()
+
+    loop = asyncio.get_running_loop()
+    approval = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool, executor, loop, "sys_scheduled_task_create", {}
+        )
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_shell", {}
+            ),
+            1,
+        )
+        assert result["isError"]
+        assert "active work" in result["content"][0]["text"]
+        await asyncio.wait_for(shell_cancelled.wait(), 1)
+        assert not approval.done()
+        assert pending_approvals.resolve("elicit_concurrent", False)
+        assert not (await asyncio.wait_for(approval, 1)).get("isError")
+    finally:
+        pending_approvals.resolve("elicit_concurrent", False)
+        await asyncio.wait_for(approval, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["expiry", "approved_then_stuck", "callback_timeout"])
+async def test_relay_reports_approval_expiry_and_execution_outcomes(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Approval expiry denies; after approval a timed-out write stays uncertain."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.05)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        try:
+            if outcome == "callback_timeout":
+                raise TimeoutError()
+            waiting.set()
+            approved = await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_outcome",
+                conversation_id="conv_outcome",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=0.2,
+            )
+            if approved:
+                effects.append("saved")
+                await asyncio.Future()
+            return {"approved": approved}
+        finally:
+            finished.set()
+
+    call = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool,
+            executor,
+            asyncio.get_running_loop(),
+            "sys_scheduled_task_update",
+            {},
+        )
+    )
+    if outcome == "approved_then_stuck":
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert pending_approvals.resolve("elicit_outcome", True)
+    result = await asyncio.wait_for(call, 2)
+    await asyncio.wait_for(finished.wait(), 1)
+    if outcome == "expiry":
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"approved": False}
+        assert events[-1]["reason"] == "unanswered"
+    else:
+        error = json.loads(result["content"][0]["text"])["error"]
+        assert result["isError"]
+        assert "unknown" in error
+        assert ("TimeoutError" if outcome == "callback_timeout" else "timed out") in error
+    assert effects == (["saved"] if outcome == "approved_then_stuck" else [])
+    assert not pending_approvals.has_pending("conv_outcome")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["notification", "eof", "relay_close"])
+async def test_relay_mcp_cancellation_releases_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subprocess_bridge_root: Path, stop: str
+) -> None:
+    """A real stdio bridge releases the approval when its caller cancels or leaves."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", Path(tempfile.gettempdir()))
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_HEARTBEAT_S", 0.02)
+    bridge_dir = prepare_bridge_dir("conv_cancel_relay", workspace=tmp_path)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        waiting.set()
+        try:
+            if await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_cancel_relay",
+                conversation_id="conv_cancel_relay",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=10,
+            ):
+                effects.append("saved")
+            return {}
+        finally:
+            finished.set()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_scheduled_task_create"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdin is not None
+        _write_json_line(
+            proc.stdin,
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "sys_scheduled_task_create", "arguments": {}},
+            },
+        )
+        await asyncio.wait_for(waiting.wait(), 8)
+        if stop == "notification":
+            _write_json_line(
+                proc.stdin,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 51},
+                },
+            )
+        elif stop == "eof":
+            proc.stdin.close()
+        else:
+            relay.close()
+        await asyncio.wait_for(finished.wait(), 3)
+        assert effects == []
+        assert events[-1]["reason"] == "unanswered"
+        assert not pending_approvals.has_pending("conv_cancel_relay")
+        assert not pending_approvals.resolve("elicit_cancel_relay", True)
+        if stop == "notification":
+            assert proc.stdout is not None
+            cancelled_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            assert cancelled_result["id"] == 51
+            assert cancelled_result["result"]["isError"]
+            _write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
+            ping_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            assert ping_result == {"jsonrpc": "2.0", "id": 52, "result": {}}
+    finally:
+        pending_approvals.resolve("elicit_cancel_relay", False)
+        if stop != "relay_close":
+            relay.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_relay_keeps_high_descriptor_connections_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid connection above select's fd limit stays pending and completes."""
+    fcntl = pytest.importorskip("fcntl")
+    resource = pytest.importorskip("resource")
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        pytest.skip("requires an available descriptor above 1023")
+    original_get_request = ThreadingHTTPServer.get_request
+    descriptors: list[int] = []
+
+    def high_descriptor_request(server):
+        connection, address = original_get_request(server)
+        try:
+            descriptor = fcntl.fcntl(connection, fcntl.F_DUPFD, 1024)
+        finally:
+            connection.close()
+        descriptors.append(descriptor)
+        return socket.socket(fileno=descriptor), address
+
+    monkeypatch.setattr(ThreadingHTTPServer, "get_request", high_descriptor_request)
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def executor(name, arguments):
+        started.set()
+        try:
+            await release.wait()
+            return {"completed": True}
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    bridge_dir = prepare_bridge_dir("conv_high_descriptor", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_custom"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    call = asyncio.create_task(
+        asyncio.to_thread(claude_native_bridge._call_relay_tool, bridge_dir, "sys_custom", {})
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(call), 0.15)
+        assert descriptors and descriptors[0] >= 1024
+        assert not cancelled.is_set()
+        release.set()
+        result = await asyncio.wait_for(call, 2)
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"completed": True}
+    finally:
+        release.set()
+        await asyncio.wait_for(call, 2)
+        relay.close()
