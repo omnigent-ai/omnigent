@@ -88,6 +88,39 @@ def test_classifies_rejected_arguments(command: str, exit_status: int, output: s
     assert diagnosis.category is ErrorCategory.CONFIG
 
 
+@pytest.mark.parametrize("exit_status", [0, 1, None])
+def test_classifies_background_session_refusal_even_when_wrapper_exits_zero(
+    exit_status: int | None,
+) -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=exit_status,
+        output=(
+            "That session is running in the\nbackground (abcd1234). "
+            "Run `claude attach abcd1234` to open it, or `claude stop abcd1234` "
+            "first to resume it here.\nAdd --fork-session to branch off a copy instead.\n"
+            "Claude Code exited with code 1\nPane is dead (status 0)"
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude session is already running in the background"
+    assert diagnosis.remediation is not None
+    assert "claude attach <session-id>" in diagnosis.remediation
+    assert "claude stop <session-id>" in diagnosis.remediation
+    assert "abcd1234" not in str(diagnosis)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Background task running; use claude attach or claude stop to manage sessions.",
+        "That session is running in the background; waiting for tool results.",
+    ],
+)
+def test_background_work_alone_does_not_diagnose_a_resume_refusal(output: str) -> None:
+    assert classify_terminal_failure(command="claude", exit_status=None, output=output) is None
+
+
 @pytest.mark.parametrize(
     "output",
     [
@@ -505,6 +538,7 @@ def test_codex_provider_auth_diagnosis_ignores_unrelated_errors(message: str) ->
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        "Selected model is at capacity. Please try a different model.",
         # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
         _GATEWAY_499_OUTPUT,
         "API Error: 499",
@@ -557,6 +591,12 @@ def test_transient_messages_do_not_override_specific_failure_codes(code: str) ->
         classify_native_turn_error(
             code,
             "API Error: The response stopped arriving. The response above may be incomplete.",
+        )
+        == code
+    )
+    assert (
+        classify_native_turn_error(
+            code, "Selected model is at capacity. Please try a different model."
         )
         == code
     )

@@ -146,6 +146,11 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, and a broken install like a missing binary, so they must win
@@ -175,6 +180,23 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             remediation=(
                 "Send your message again. If it fails again, reinstall Claude Code on the "
                 "host with the installer you used, then retry."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
+        FailureDiagnosis(
+            title="Claude session is already running in the background",
+            cause=(
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
+            ),
+            remediation=(
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
             ),
         ),
     ),
@@ -313,6 +335,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
