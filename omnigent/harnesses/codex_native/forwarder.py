@@ -6418,16 +6418,16 @@ async def _post_collab_agent_statuses(
     for thread_id, state in states.items():
         if not isinstance(thread_id, str) or not isinstance(state, dict):
             continue
-        child_session_id = forwarder_state.session_for_child_thread(thread_id)
-        if child_session_id is None:
-            continue
         ap_status = _omnigent_status_from_collab_state(state)
-        if ap_status is not None:
-            if forwarder_state.child_activity is not None:
-                forwarder_state.child_activity.note(
-                    thread_id, active=ap_status == "running", authoritative=False
-                )
-            await _post_status(client, child_session_id, ap_status)
+        # Liveness follows the snapshot even before the child has an AP session.
+        if ap_status is not None and forwarder_state.child_activity is not None:
+            forwarder_state.child_activity.note(
+                thread_id, active=ap_status == "running", authoritative=False
+            )
+        child_session_id = forwarder_state.session_for_child_thread(thread_id)
+        if child_session_id is None or ap_status is None:
+            continue
+        await _post_status(client, child_session_id, ap_status)
 
 
 def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:

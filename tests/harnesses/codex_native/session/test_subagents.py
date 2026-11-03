@@ -842,6 +842,49 @@ def test_rotated_parent_releases_a_held_child_that_never_registered(
         activity.close()
 
 
+def test_completed_collab_snapshot_releases_a_child_that_never_registered() -> None:
+    """
+    A completed collab snapshot releases a discovered child that has no AP session.
+
+    Registration can fail after discovery, so the snapshot is then the only
+    terminal evidence the forwarder receives for that child.
+    """
+    from omnigent.native._native_forwarder_health import (
+        NativeSubagentActivity,
+        has_active_subagents,
+    )
+
+    activity = NativeSubagentActivity("conv_parent")
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        child_activity=activity,
+    )
+    state.note_pending_child_thread("thread_child", "thread_parent")
+
+    async def run() -> None:
+        """
+        Deliver a completed snapshot for the unregistered child.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler([])),
+        ) as client:
+            await codex_native_forwarder._post_collab_agent_statuses(
+                client,
+                item={"agentsStates": {"thread_child": {"status": "completed"}}},
+                forwarder_state=state,
+            )
+
+    try:
+        assert has_active_subagents("conv_parent")
+        asyncio.run(run())
+        assert not has_active_subagents("conv_parent")
+    finally:
+        activity.close()
+
+
 def test_completed_item_key_is_total_never_empty() -> None:
     """
     ``_completed_item_key`` returns a non-empty string for every item shape.
