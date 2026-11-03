@@ -218,7 +218,7 @@
   // or the zoom shortcut; reports stay off so clamps can't overwrite the offset.
   const USER_SCROLL_EVENTS = ["wheel", "touchstart", "keydown"];
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
-  let scrollRestore = null; // { top, deadline, y, height } while restoring
+  let scrollRestore = null; // { top, deadline, y, layout } while restoring
   let scrollRestoreFrame = 0;
   let restoreHide = null; // the injected style hiding the page until the restore ends
 
@@ -237,15 +237,28 @@
     }
   }
 
-  function onRestoreInput(e) {
-    if (e.type !== "keydown" || SCROLL_KEYS.indexOf(e.key) !== -1) settleScrollRestore();
+  // Keys typed into a form field or editable text move its caret or value, not the page.
+  function isEditableTarget(target) {
+    return (
+      !!target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+    );
   }
 
-  // Scrollbar drags fire no input events, so treat any move that the layout
-  // didn't cause (the document height is unchanged) as the reader's.
+  function onRestoreInput(e) {
+    const scrollKey = SCROLL_KEYS.indexOf(e.key) !== -1 && !isEditableTarget(e.target);
+    if (e.type !== "keydown" || scrollKey) settleScrollRestore();
+  }
+
+  // The document and viewport sizes, which bound the offset the page can reach.
+  function layoutSize() {
+    return [document.documentElement.scrollHeight, window.innerWidth, window.innerHeight].join();
+  }
+
+  // Scrollbar drags fire no input events, so treat any move that the layout didn't
+  // cause (the document and viewport keep their sizes) as the reader's.
   function readerMovedDuringRestore() {
-    const height = document.documentElement.scrollHeight;
-    return height === scrollRestore.height && Math.abs(window.scrollY - scrollRestore.y) >= 1;
+    const moved = Math.abs(window.scrollY - scrollRestore.y) >= 1;
+    return moved && layoutSize() === scrollRestore.layout;
   }
 
   function applyScrollRestore() {
@@ -258,7 +271,7 @@
     window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
     scrollRestore.y = window.scrollY;
     if (Math.abs(scrollRestore.y - scrollRestore.top) <= 1) revealPage();
-    scrollRestore.height = document.documentElement.scrollHeight;
+    scrollRestore.layout = layoutSize();
     scrollRestoreFrame = requestAnimationFrame(applyScrollRestore);
   }
 
@@ -287,7 +300,7 @@
       top: saved.top,
       deadline: performance.now() + saved.budgetMs,
       y: window.scrollY,
-      height: document.documentElement.scrollHeight,
+      layout: layoutSize(),
     };
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
       window.addEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, {

@@ -131,7 +131,7 @@ describe("injectCommentBridge", () => {
     const hide = new DOMParser().parseFromString(out, "text/html").head.firstElementChild;
     expect(hide?.getAttribute("data-omni-restore-hide")).toBe(NONCE);
     expect(hide?.textContent).toBe(
-      `html{animation:omni-restore-hide ${SCROLL_RESTORE_BUDGET_MS}ms!important}` +
+      `html{animation:omni-restore-hide ${2 * SCROLL_RESTORE_BUDGET_MS}ms!important}` +
         "@keyframes omni-restore-hide{from,to{opacity:0}}",
     );
   });
@@ -336,8 +336,10 @@ describe("bridge runtime scroll position", () => {
     });
     let scrollY = 0;
     let height = pageHeight;
-    const clamp = (top: number) => Math.max(0, Math.min(top, height - window.innerHeight));
+    let viewportHeight = window.innerHeight;
+    const clamp = (top: number) => Math.max(0, Math.min(top, height - viewportHeight));
     vi.spyOn(window, "scrollY", "get").mockImplementation(() => scrollY);
+    vi.spyOn(window, "innerHeight", "get").mockImplementation(() => viewportHeight);
     vi.spyOn(document.documentElement, "scrollHeight", "get").mockImplementation(() => height);
     const scrollTo = vi
       .spyOn(window, "scrollTo")
@@ -350,14 +352,22 @@ describe("bridge runtime scroll position", () => {
       scrollY = clamp(top);
       window.dispatchEvent(new Event("scroll"));
     };
-    /** Resize the page as late content does; the browser may move the offset with it. */
-    const setPageHeight = (nextHeight: number, nextScrollY = scrollY) => {
-      height = nextHeight;
+    const relayout = (nextScrollY: number) => {
       const previous = scrollY;
       scrollY = clamp(nextScrollY);
       if (scrollY !== previous) window.dispatchEvent(new Event("scroll"));
     };
-    return { scrollTo, userScrollTo, setPageHeight };
+    /** Resize the page as late content does; the browser may move the offset with it. */
+    const setPageHeight = (nextHeight: number, nextScrollY = scrollY) => {
+      height = nextHeight;
+      relayout(nextScrollY);
+    };
+    /** Resize the viewport, as zooming the preview does; the browser clamps the offset to fit. */
+    const setViewportHeight = (nextHeight: number) => {
+      viewportHeight = nextHeight;
+      relayout(scrollY);
+    };
+    return { scrollTo, userScrollTo, setPageHeight, setViewportHeight };
   }
 
   function sentScrollOffsets(port: { postMessage: ReturnType<typeof vi.fn> }) {
@@ -468,6 +478,20 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port)).toEqual([]);
   });
 
+  it("keeps restoring when a taller viewport clamps the offset", () => {
+    const { setPageHeight, setViewportHeight } = fakeScrolling({ pageHeight: 1_500 });
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
+    expect(window.scrollY).toBe(640);
+    // Zooming the preview out makes its viewport taller, so the page can scroll less.
+    setViewportHeight(1_000);
+    expect(window.scrollY).toBe(500);
+    vi.advanceTimersToNextFrame();
+    setPageHeight(3_000);
+    vi.advanceTimersToNextFrame();
+    expect(window.scrollY).toBe(640);
+    expect(sentScrollOffsets(port)).toEqual([]);
+  });
+
   const dispatchToPage = (event: Event) => document.body.dispatchEvent(event);
 
   it.each<[string, (userScrollTo: (top: number) => void) => void]>([
@@ -493,18 +517,38 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port).at(-1)).toBe(200);
   });
 
-  it.each<[string, Event]>([
-    ["a click", new Event("pointerdown", { bubbles: true })],
-    ["a modifier key", new KeyboardEvent("keydown", { key: "Control", bubbles: true })],
+  /** Press `key` in an editable element of the page, as a reader typing into it would. */
+  function pressIn(editable: HTMLElement, key: string) {
+    document.body.append(editable);
+    editable.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+    editable.remove();
+  }
+
+  function editableText() {
+    const text = document.createElement("div");
+    // jsdom doesn't implement isContentEditable.
+    Object.defineProperty(text, "isContentEditable", { value: true });
+    return text;
+  }
+
+  it.each<[string, () => void]>([
+    ["a click", () => dispatchToPage(new Event("pointerdown", { bubbles: true }))],
+    [
+      "a modifier key",
+      () => dispatchToPage(new KeyboardEvent("keydown", { key: "Control", bubbles: true })),
+    ],
     [
       "the preview zoom shortcut",
-      new KeyboardEvent("keydown", { key: "=", ctrlKey: true, bubbles: true }),
+      () =>
+        dispatchToPage(new KeyboardEvent("keydown", { key: "=", ctrlKey: true, bubbles: true })),
     ],
-  ])("keeps restoring through %s", (_label, event) => {
+    ["a space typed into a form field", () => pressIn(document.createElement("input"), " ")],
+    ["an arrow key in editable text", () => pressIn(editableText(), "ArrowDown")],
+  ])("keeps restoring through %s", (_label, interact) => {
     const { scrollTo } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const hide = addRestoreHide();
     startRuntime({ restoreScroll: restoreTo(640) });
-    dispatchToPage(event);
+    interact();
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(2);
     expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));

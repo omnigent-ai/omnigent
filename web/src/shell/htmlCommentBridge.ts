@@ -314,13 +314,15 @@ const BRIDGE_HIGHLIGHT_STYLE =
 
 /**
  * Hides the page while a scroll restore is pending, so clamped offsets never paint. The
- * runtime removes it once the restore settles; as an animation it also ends by itself after
- * the budget, so the page still shows if the runtime never runs.
+ * runtime removes it once the restore settles; as an animation it also ends by itself, so
+ * the page still shows if the runtime never runs.
  */
 function restoreHideStyle(nonce: string): string {
+  // The runtime's budget starts only when the bridge script at the end of the body runs.
+  const fallbackMs = 2 * SCROLL_RESTORE_BUDGET_MS;
   return (
     `<style data-omni-restore-hide="${escapeHtmlAttr(nonce)}">` +
-    `html{animation:omni-restore-hide ${SCROLL_RESTORE_BUDGET_MS}ms!important}` +
+    `html{animation:omni-restore-hide ${fallbackMs}ms!important}` +
     "@keyframes omni-restore-hide{from,to{opacity:0}}</style>"
   );
 }

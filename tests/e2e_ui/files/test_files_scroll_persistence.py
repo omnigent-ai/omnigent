@@ -30,7 +30,10 @@ _FILE_COUNT = 80
 def _seed_file(base_url: str, session_id: str, path: str, content: str | None = None) -> None:
     resp = httpx.put(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-        json={"content": content or f"contents of {path}\n", "encoding": "utf-8"},
+        json={
+            "content": f"contents of {path}\n" if content is None else content,
+            "encoding": "utf-8",
+        },
         timeout=10.0,
     )
     resp.raise_for_status()
