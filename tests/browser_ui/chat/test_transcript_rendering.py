@@ -617,6 +617,25 @@ def _open_and_assert_laid_out(page: Page, trigger: Locator, marker: str) -> None
     assert first["tokens"] == samples[-1]["tokens"], f"code below {marker!r} re-highlighted"
 
 
+# Closes the section, reopens it two frames later while its close animation still runs,
+# and reports whether it was closing then and how tall it is two frames after reopening.
+_REOPEN_WHILE_CLOSING = """
+async (trigger) => {
+  const content = trigger.closest('[data-slot="collapsible"]')
+    .querySelector('[data-slot="collapsible-content"]');
+  const frames = () => new Promise((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  trigger.click();
+  await frames();
+  const closing = content.dataset.state === "closed" && content.getAnimations().length > 0;
+  trigger.click();
+  await frames();
+  return {closing, height: content.getBoundingClientRect().height,
+    fullHeight: content.scrollHeight};
+}
+"""
+
+
 def test_folded_markdown_is_laid_out_when_opened(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -678,43 +697,68 @@ def test_folded_markdown_is_laid_out_when_opened(
     assert hidden_height < 1, f"the closed thought still spans {hidden_height:.1f}px"
     _open_and_assert_laid_out(page, reasoning, "Reasoning marker.")
 
+    # The opened thought grew Worked since it opened; a reopen mid-close shows all of it.
+    reopened = worked.first.evaluate(_REOPEN_WHILE_CLOSING)
+    assert reopened["closing"], "Worked finished closing before it was reopened"
+    assert reopened["height"] == pytest.approx(reopened["fullHeight"], abs=1), reopened
+    expect(bubble.get_by_text("Reasoning marker.")).to_be_visible()
+    worked.first.click()
+    hidden_narration = bubble.get_by_text("Narration marker.")
+    expect(hidden_narration).to_be_hidden()
+    hidden_height = hidden_narration.evaluate("(p) => p.getBoundingClientRect().height")
+    assert hidden_height < 1, f"the closed Worked section still spans {hidden_height:.1f}px"
+    _open_and_assert_laid_out(page, worked.first, "Narration marker.")
+
 
 def test_folded_reasoning_keeps_a_short_reply_narrow(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """A long thought kept rendered while folded does not widen its short reply."""
+    """A long thought kept rendered while folded does not widen its short reply.
+
+    An identical turn with a one-word thought gives the width the reply should keep.
+    """
     chat = chat_session_contract
-    response_id = "narrow-reply"
     thought = " ".join(["Checking every workspace file before replying."] * 12)
-    chronological = [
-        message_item("narrow-user", "user", "Check the workspace.", response_id=response_id),
-        {
-            "id": "narrow-reasoning",
-            "response_id": response_id,
-            "type": "reasoning",
-            "status": "completed",
-            "model": "browser-model",
-            "summary": [{"type": "summary_text", "text": thought}],
-        },
-        message_item("narrow-answer", "assistant", "Done.", response_id=response_id),
-    ]
+    chronological: list[dict] = []
+    for turn, turn_thought in (("narrow", thought), ("baseline", "Checking.")):
+        response_id = f"{turn}-reply"
+        chronological += [
+            message_item(f"{turn}-user", "user", "Check the workspace.", response_id=response_id),
+            {
+                "id": f"{turn}-reasoning",
+                "response_id": response_id,
+                "type": "reasoning",
+                "status": "completed",
+                "model": "browser-model",
+                "summary": [{"type": "summary_text", "text": turn_thought}],
+            },
+            message_item(f"{turn}-answer", "assistant", "Done.", response_id=response_id),
+        ]
     chat.set_items(list(reversed(chronological)))
     page.goto(chat.url)
 
-    bubble = page.locator('[data-testid="message-bubble"]', has=page.get_by_text("Done.")).first
+    bubbles = page.locator('[data-testid="message-bubble"]', has=page.get_by_text("Done."))
+    expect(bubbles).to_have_count(2, timeout=20_000)
+    bubble = bubbles.first
     fold = bubble.get_by_test_id("turn-worked-fold")
-    expect(fold).to_be_visible(timeout=20_000)
-    folded_width = box(fold)["width"]
+    baseline = bubbles.last.get_by_test_id("turn-worked-fold")
+    expect(fold).to_be_visible()
+    expect(baseline).to_be_visible()
+    assert box(fold)["width"] == pytest.approx(box(baseline)["width"], abs=1), (
+        "the folded Worked section widened the reply"
+    )
     fold.locator('[data-slot="collapsible-trigger"]').first.click()
+    baseline.locator('[data-slot="collapsible-trigger"]').first.click()
     reasoning = bubble.get_by_role("button", name="Thought for a few seconds")
     reasoning.click()
     expect(bubble.get_by_text(thought)).to_be_visible()
-    opened_width = box(fold)["width"]
+    assert box(fold)["width"] > box(baseline)["width"] + 1, "the opened thought did not widen"
     reasoning.click()
     expect(bubble.get_by_text(thought)).to_be_hidden()
-    assert folded_width < opened_width, "the folded Worked section widened the reply"
-    assert box(fold)["width"] < opened_width, "the folded thought widened the reply"
+    assert box(fold)["width"] == pytest.approx(box(baseline)["width"], abs=1), (
+        "the folded thought widened the reply"
+    )
 
 
 _ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"

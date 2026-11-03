@@ -84,6 +84,26 @@ describe("Reasoning — auto-expand", () => {
     expect(screen.getByRole("button").getAttribute("data-state")).toBe("closed");
     expect(screen.getByText("Some reasoning text")).not.toBeVisible();
   });
+
+  it("follows the caller's open prop as it changes", () => {
+    const section = (open: boolean, text: string) => (
+      <Reasoning isStreaming={false} open={open}>
+        <ReasoningTrigger />
+        <ReasoningContent>{text}</ReasoningContent>
+      </Reasoning>
+    );
+    const { rerender } = render(section(false, "First thought"));
+    rerender(section(false, "Revised thought"));
+    expect(screen.getByText("Revised thought")).not.toBeVisible();
+
+    rerender(section(true, "Revised thought"));
+    expect(screen.getByRole("button").getAttribute("data-state")).toBe("open");
+    expect(screen.getByText("Revised thought")).toBeVisible();
+
+    rerender(section(false, "Revised thought"));
+    expect(screen.getByRole("button").getAttribute("data-state")).toBe("closed");
+    expect(screen.getByText("Revised thought")).not.toBeVisible();
+  });
 });
 
 describe("Reasoning — non-expandable (nothing to show)", () => {
