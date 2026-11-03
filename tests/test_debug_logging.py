@@ -455,8 +455,11 @@ async def test_log_attributes_follow_task_and_thread_without_leaking() -> None:
     ]
     assert dl.record_to_row(record, "server")["attributes"] == {}
     record.attributes = {"run_id": "explicit", "secret": "Bearer test-secret-token"}
-    with dl.log_attributes_scope(run_id="ambient"):
-        assert dl.record_to_row(record, "server")["attributes"]["run_id"] == "explicit"
+    with dl.log_attributes_scope(run_id="ambient", token="Bearer ambient-secret-token"):
+        attributes = dl.record_to_row(record, "server")["attributes"]
+    assert attributes["run_id"] == "explicit"
+    assert "test-secret-token" not in attributes["secret"]
+    assert "ambient-secret-token" not in attributes["token"]
 
 
 def test_record_to_row_captures_stack_trace() -> None:

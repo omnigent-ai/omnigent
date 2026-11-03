@@ -190,6 +190,8 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
             "runner_start",
             "prompt_prepare",
             "prompt_send",
+            "runner_start_cancelled",
+            "prompt_send_cancelled",
             "native_refusal",
             "dispatch_bookkeeping",
         ]
@@ -215,16 +217,23 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         else _ConversationStore()
     )
     post_acceptance = failed_stage == "dispatch_bookkeeping"
+    cancelled = failed_stage in {"runner_start_cancelled", "prompt_send_cancelled"}
+    reported_stage = (
+        "prompt_send" if post_acceptance else (failed_stage or "").removesuffix("_cancelled")
+    )
+    failure = (
+        asyncio.CancelledError("delivery cancelled")
+        if cancelled
+        else RuntimeError("delivery failed")
+    )
     if post_acceptance:
         conversations = SqlAlchemyConversationStore(db_uri)
     deps = _deps(store, conversation_store=conversations)
     monkeypatch.setattr(telemetry, "time", SimpleNamespace(time=lambda: claimed.clock.now() + 15))
-    initialize = AsyncMock(
-        side_effect=RuntimeError("startup failed") if failed_stage == "runner_start" else None
-    )
+    initialize = AsyncMock(side_effect=failure if reported_stage == "runner_start" else None)
     send = AsyncMock(
         return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None),
-        side_effect=RuntimeError("send failed") if failed_stage == "prompt_send" else None,
+        side_effect=failure if reported_stage == "prompt_send" else None,
     )
     monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", initialize)
     native_refusal = failed_stage == "native_refusal"
@@ -280,10 +289,14 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         accepted.append(request)
         return httpx.Response(202, json={"queued": True})
 
-    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+    executor = ClaimedRunExecutor(deps, launch_dispatch=dispatch)
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError, match="delivery cancelled"):
+            await executor.fire(claimed.task, claimed.lease)
+    else:
+        await executor.fire(claimed.task, claimed.lease)
     if post_acceptance:
         assert len(accepted) == 1
-    reported_stage = "prompt_send" if post_acceptance else failed_stage
     sent = [
         r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
     ]
@@ -315,12 +328,48 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
         assert _runs(store, claimed.task)[0].status == (
             "running" if session_mode == "new" else "succeeded"
         )
-    if failed_stage in {"runner_start", "prompt_prepare"}:
+    started = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+    ]
+    interrupted = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_stage_interrupted"
+    ]
+    assert len(interrupted) == int(cancelled)
+    if reported_stage in {"runner_start", "prompt_prepare"}:
+        assert not started
+    else:
+        assert len(started) == 1
+        assert started[0].attributes["dispatch_id"]
+    if cancelled:
+        assert not sent
+        assert not failed
+        assert interrupted[0].attributes["failure_stage"] == reported_stage
+        assert interrupted[0].attributes["run_id"] == claimed.lease.run.id
+        assert interrupted[0].attributes["outcome"] == "uncertain"
         assert not any(
-            getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
-            for r in caplog.records
+            getattr(r, "event_name", None) == "scheduled_run_startup_ended" for r in caplog.records
         )
-    if failed_stage and not native_refusal:
+        [run] = _runs(store, claimed.task)
+        assert (run.status, run.error_code, run.finished_at) == ("starting", None, None)
+        assert run.lease_expires_at == claimed.clock.now() + _LEASE_SECONDS
+        assert run.conversation_id is not None
+        claimed.clock.advance(_LEASE_SECONDS)
+        recovery = ClaimedRunExecutor(
+            _deps(
+                store,
+                conversation_store=_RecoveryConversationStore(
+                    conversations.get_conversation(run.conversation_id)
+                ),
+            )
+        )
+        assert await recovery.recover(run) == "failed"
+        initialize.assert_awaited_once()
+        assert send.await_count == int(reported_stage == "prompt_send")
+    elif failed_stage and not native_refusal:
         assert not sent
         assert len(failed) == 1
         assert failed[0].attributes["failure_stage"] == reported_stage
@@ -340,6 +389,7 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
     elif not native_refusal:
         assert not failed
         assert len(sent) == 1
+        assert sent[0].attributes["dispatch_id"] == started[0].attributes["dispatch_id"]
         assert sent[0].attributes["prompt_delay_seconds"] == 15
         assert sent[0].attributes["run_id"] == claimed.lease.run.id
         assert sent[0].attributes["trigger_key"] == claimed.lease.run.trigger_key

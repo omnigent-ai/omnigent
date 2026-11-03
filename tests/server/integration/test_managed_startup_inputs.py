@@ -268,6 +268,16 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         assert failure.attributes["run_id"] == scheduled_run_context.run_id
         assert failure.attributes["outcome"] == "not_sent"
         assert failure.attributes["failure_stage"] == "input_policy"
+        assert failure.attributes["input_id"] == entry.id
+        [refused_attempt] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+        ]
+        refused_dispatch_id = failure.attributes["dispatch_id"]
+        assert refused_dispatch_id
+        assert refused_attempt.attributes["dispatch_id"] == refused_dispatch_id
+        assert refused_attempt.attributes["input_id"] == entry.id
         [row] = [
             row
             for row in debug_log_rows
@@ -291,6 +301,22 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         )
         assert env.conv_store.list_pending_inputs(session_id) == []
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        [sent] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        [first_attempt, retry_attempt] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+        ]
+        assert first_attempt is refused_attempt
+        assert retry_attempt.attributes["input_id"] == sent.attributes["input_id"] == entry.id
+        retry_dispatch_id = retry_attempt.attributes["dispatch_id"]
+        assert retry_dispatch_id and retry_dispatch_id != refused_dispatch_id
+        assert sent.attributes["dispatch_id"] == retry_dispatch_id
+        assert sent.attributes["run_id"] == scheduled_run_context.run_id
     finally:
         await runner.aclose()
 
