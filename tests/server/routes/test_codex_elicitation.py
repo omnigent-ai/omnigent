@@ -5,11 +5,16 @@ These are pure-function tests — no HTTP or runtime needed.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
 from omnigent.errors import OmnigentError
 from omnigent.server.routes._codex_elicitation import (
+    _codex_apply_patch_approval_response,
     _codex_command_preview,
+    _codex_file_change_approval_response,
     _codex_mcp_elicitation_response,
     _codex_mcp_persist_modes,
     _execpolicy_amendment,
@@ -128,6 +133,234 @@ class TestCodexMcpApprovalPersistence:
         }
 
         assert _codex_mcp_persist_modes(params) == {"session"}
+
+
+# ── Codex file-change approval persistence ─────────────────────────────
+
+
+_FILE_CHANGE_METHOD = "item/fileChange/requestApproval"
+_APPLY_PATCH_METHOD = "applyPatchApproval"
+
+
+class TestCodexFileChangeApprovalPersistence:
+    """Tests for Codex's session-scoped file-change approval choice."""
+
+    @pytest.mark.parametrize("method", [_FILE_CHANGE_METHOD, _APPLY_PATCH_METHOD])
+    def test_params_advertise_session_scope(self, method: str) -> None:
+        req = parse_codex_elicitation_request(
+            {
+                "id": 21,
+                "method": method,
+                "params": {"threadId": "thread_1", "turnId": "turn_1", "itemId": "item_1"},
+            }
+        )
+
+        assert req.params.model_dump()["codex_persist_modes"] == ["session"]
+
+    def test_session_accept_returns_accept_for_session(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_file_change_approval_response(result, _FILE_CHANGE_METHOD, {})
+
+        assert response == {"decision": "acceptForSession"}
+
+    def test_legacy_session_accept_returns_approved_for_session(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_apply_patch_approval_response(result, _APPLY_PATCH_METHOD, {})
+
+        assert response == {"decision": "approved_for_session"}
+
+    @pytest.mark.parametrize(
+        ("build_response", "method", "action", "decision"),
+        [
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "accept", "accept"),
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "decline", "decline"),
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "cancel", "cancel"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "accept", "approved"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "decline", "denied"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "cancel", "abort"),
+        ],
+    )
+    def test_one_time_verdicts_keep_plain_decisions(
+        self,
+        build_response: Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]],
+        method: str,
+        action: str,
+        decision: str,
+    ) -> None:
+        result = ElicitationResult.model_validate({"action": action})
+
+        assert build_response(result, method, {}) == {"decision": decision}
+
+    @pytest.mark.parametrize(
+        ("build_response", "method", "decline", "accept"),
+        [
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "decline", "accept"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "denied", "approved"),
+        ],
+    )
+    def test_non_session_verdicts_ignore_persistence_meta(
+        self,
+        build_response: Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]],
+        method: str,
+        decline: str,
+        accept: str,
+    ) -> None:
+        declined = ElicitationResult.model_validate(
+            {"action": "decline", "_meta": {"persist": "session"}}
+        )
+        unadvertised = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+
+        assert build_response(declined, method, {}) == {"decision": decline}
+        assert build_response(unadvertised, method, {}) == {"decision": accept}
+
+
+# ── Codex MCP tool approval asked as requestUserInput ─────────────────
+
+
+_APPROVAL_QUESTION_ID = "mcp_tool_call_approval_call_1"
+_APPROVAL_QUESTION = 'Allow the omnigent MCP server to run tool "sys_read_inbox"?'
+_ALLOW_OPTION = {"label": "Allow", "description": "Run the tool and continue."}
+_SESSION_OPTION = {
+    "label": "Allow for this session",
+    "description": "Run the tool and remember this choice for this session.",
+}
+_ALWAYS_OPTION = {
+    "label": "Allow and don't ask me again",
+    "description": "Run the tool and remember this choice for future tool calls.",
+}
+_CANCEL_OPTION = {"label": "Cancel", "description": "Cancel this tool call."}
+
+
+def _request_user_input(questions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "id": 0,
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "itemId": "call_1",
+            "questions": questions,
+        },
+    }
+
+
+def _approval_question(options: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "id": _APPROVAL_QUESTION_ID,
+        "header": "Approve app tool call?",
+        "question": _APPROVAL_QUESTION,
+        "isOther": False,
+        "isSecret": False,
+        "options": options,
+    }
+
+
+class TestCodexMcpToolApprovalQuestion:
+    """Tests for Codex's question-shaped MCP tool approval."""
+
+    @pytest.mark.parametrize(
+        ("options", "persist_modes"),
+        [
+            ([_ALLOW_OPTION, _SESSION_OPTION, _CANCEL_OPTION], ["session"]),
+            (
+                [_ALLOW_OPTION, _SESSION_OPTION, _ALWAYS_OPTION, _CANCEL_OPTION],
+                ["session", "always"],
+            ),
+            ([_ALLOW_OPTION, _CANCEL_OPTION], []),
+        ],
+        ids=["session", "session-and-always", "one-time-only"],
+    )
+    def test_params_render_an_approval_card_with_offered_scopes(
+        self, options: list[dict[str, str]], persist_modes: list[str]
+    ) -> None:
+        req = parse_codex_elicitation_request(_request_user_input([_approval_question(options)]))
+
+        params = req.params.model_dump()
+        assert "ask_user_question" not in params
+        assert params["message"] == _APPROVAL_QUESTION
+        assert params["policy_name"] == "codex_native_mcp_tool_approval"
+        assert params["codex_persist_modes"] == persist_modes
+        assert params["item_id"] == "call_1"
+
+    @pytest.mark.parametrize(
+        "questions",
+        [
+            [_approval_question([{"label": "Yes"}, {"label": "No"}])],
+            [
+                _approval_question([_ALLOW_OPTION, _CANCEL_OPTION]),
+                {"id": "q2", "question": "Why?"},
+            ],
+            [{**_approval_question([_ALLOW_OPTION, _CANCEL_OPTION]), "id": "framework"}],
+        ],
+        ids=["no-allow-option", "several-questions", "other-question-id"],
+    )
+    def test_other_questions_keep_the_question_form(self, questions: list[dict[str, Any]]) -> None:
+        req = parse_codex_elicitation_request(_request_user_input(questions))
+
+        params = req.params.model_dump()
+        assert params["message"] == "Codex needs input"
+        assert "codex_persist_modes" not in params
+        assert params["ask_user_question"]["questions"][0]["question"] == _APPROVAL_QUESTION
+
+    @pytest.mark.parametrize(
+        ("verdict", "answers"),
+        [
+            ({"action": "accept"}, ["Allow"]),
+            ({"action": "accept", "_meta": {"persist": "session"}}, ["Allow for this session"]),
+            (
+                {"action": "accept", "_meta": {"persist": "always"}},
+                ["Allow and don't ask me again"],
+            ),
+        ],
+        ids=["once", "session", "always"],
+    )
+    def test_accept_answers_with_the_matching_option(
+        self, verdict: dict[str, Any], answers: list[str]
+    ) -> None:
+        req = parse_codex_elicitation_request(
+            _request_user_input(
+                [
+                    _approval_question(
+                        [_ALLOW_OPTION, _SESSION_OPTION, _ALWAYS_OPTION, _CANCEL_OPTION]
+                    )
+                ]
+            )
+        )
+
+        response = req.build_response(ElicitationResult.model_validate(verdict))
+
+        assert response == {"answers": {_APPROVAL_QUESTION_ID: {"answers": answers}}}
+
+    def test_unoffered_scope_stays_one_time(self) -> None:
+        req = parse_codex_elicitation_request(
+            _request_user_input([_approval_question([_ALLOW_OPTION, _SESSION_OPTION])])
+        )
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+
+        assert req.build_response(result) == {
+            "answers": {_APPROVAL_QUESTION_ID: {"answers": ["Allow"]}}
+        }
+
+    @pytest.mark.parametrize("action", ["decline", "cancel"])
+    def test_rejection_sends_no_allow_answer(self, action: str) -> None:
+        req = parse_codex_elicitation_request(
+            _request_user_input([_approval_question([_ALLOW_OPTION, _SESSION_OPTION])])
+        )
+        result = ElicitationResult.model_validate(
+            {"action": action, "_meta": {"persist": "session"}}
+        )
+
+        assert req.build_response(result) == {"answers": {}}
 
 
 # ── _string_list_answer ──────────────────────────────────────────────

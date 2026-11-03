@@ -194,7 +194,9 @@ before entering the harness menu. Then start a new CLI or web session.
 
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
-the advertised session and saved-rule choices.
+the advertised session and saved-rule choices. Codex file-change cards on both
+surfaces offer **Approve for this session**, as do Codex MCP tool approvals
+asked as a question.
 
 **Devin questions:** start Devin from the CLI or the new-session picker and ask
 it to use `ask_user_question` with selectable options. Answer in Chat or open Inbox
@@ -623,6 +625,15 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`approvals`, Codex remembered approvals in "Read only" (Chat):**
+  `tests/e2e_ui/approvals/test_codex_permission_prompt_remember.py` runs real
+  Codex against a scripted mock model. After **Approve for this session**, a
+  second edit to the same file needs no card; the one-time **Approve** control
+  is asked again. With `--disable tool_call_mcp_elicitation`, Codex asks MCP
+  tool approvals as a `requestUserInput` question; that question must render
+  as an approval card, not a question form, and a session approval must cover
+  the next call to the same tool. For Inbox, answer the first card there
+  instead and check the same outcome.
 - **`approvals`, Claude directory access:**
   `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
   checks Chat (including reload), Inbox, and standalone approval links against

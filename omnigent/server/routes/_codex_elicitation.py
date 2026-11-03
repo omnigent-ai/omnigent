@@ -19,6 +19,20 @@ _CODEX_PERMISSIONS_REQUEST_APPROVAL_METHOD = "item/permissions/requestApproval"
 _CODEX_EXEC_COMMAND_APPROVAL_METHOD = "execCommandApproval"
 _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
 
+# Codex always accepts a session-scoped file-change approval
+# (``acceptForSession`` / ``approved_for_session``); its own TUI offers
+# "Yes, and don't ask again for these files".
+_CODEX_FILE_CHANGE_PERSIST_MODES: tuple[str, ...] = ("session",)
+
+# With MCP elicitation disabled, Codex asks MCP tool approvals as a
+# ``requestUserInput`` question and matches these option labels exactly.
+_CODEX_MCP_TOOL_APPROVAL_QUESTION_PREFIX = "mcp_tool_call_approval"
+_CODEX_MCP_TOOL_APPROVAL_ALLOW = "Allow"
+_CODEX_MCP_TOOL_APPROVAL_PERSIST_LABELS: dict[str, str] = {
+    "session": "Allow for this session",
+    "always": "Allow and don't ask me again",
+}
+
 _CodexParamsBuilder = Callable[[Any, str, dict[str, Any]], ElicitationRequestParams]
 _CodexResponseBuilder = Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]]
 
@@ -179,6 +193,80 @@ def _structured_codex_request_user_input(
     return {"questions": questions}
 
 
+def _codex_mcp_tool_approval_question(params: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Return the question when ``requestUserInput`` is Codex's MCP tool approval.
+
+    :param params: Codex ``item/tool/requestUserInput`` params, e.g.
+        ``{"questions": [{"id": "mcp_tool_call_approval_call_1",
+        "question": "Allow the omnigent MCP server to run tool ...?",
+        "options": [{"label": "Allow"}, {"label": "Cancel"}]}]}``.
+    :returns: The single approval question, or ``None`` for any other
+        question set.
+    """
+    questions = params.get("questions")
+    if not isinstance(questions, list) or len(questions) != 1:
+        return None
+    question = questions[0]
+    if not isinstance(question, dict):
+        return None
+    question_id = question.get("id")
+    question_text = question.get("question")
+    if not isinstance(question_id, str) or not question_id.startswith(
+        _CODEX_MCP_TOOL_APPROVAL_QUESTION_PREFIX
+    ):
+        return None
+    if not isinstance(question_text, str) or not question_text:
+        return None
+    if _CODEX_MCP_TOOL_APPROVAL_ALLOW not in _codex_question_option_labels(question):
+        return None
+    return question
+
+
+def _codex_question_option_labels(question: dict[str, Any]) -> set[str]:
+    """Return the option labels offered by one Codex ``requestUserInput`` question."""
+    options = question.get("options")
+    if not isinstance(options, list):
+        return set()
+    return {
+        option["label"]
+        for option in options
+        if isinstance(option, dict) and isinstance(option.get("label"), str)
+    }
+
+
+def _codex_mcp_tool_approval_persist_modes(question: dict[str, Any]) -> list[str]:
+    """Return the persistence modes an MCP tool approval question offers."""
+    labels = _codex_question_option_labels(question)
+    return [
+        mode for mode, label in _CODEX_MCP_TOOL_APPROVAL_PERSIST_LABELS.items() if label in labels
+    ]
+
+
+def _codex_mcp_tool_approval_answer(
+    result: ElicitationResult,
+    question: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Answer Codex's MCP tool approval question with the matching option label.
+
+    A declined approval sends no answer, so Codex does not run the tool. An
+    accept whose persistence mode the question did not offer stays one-time.
+
+    :param result: Web-submitted approval verdict.
+    :param question: Approval question from
+        :func:`_codex_mcp_tool_approval_question`.
+    :returns: Codex ``ToolRequestUserInputResponse`` payload.
+    """
+    if result.action != "accept":
+        return {"answers": {}}
+    label = _CODEX_MCP_TOOL_APPROVAL_ALLOW
+    persist = result.meta.get("persist") if result.meta is not None else None
+    if isinstance(persist, str) and persist in _codex_mcp_tool_approval_persist_modes(question):
+        label = _CODEX_MCP_TOOL_APPROVAL_PERSIST_LABELS[persist]
+    return {"answers": {question["id"]: {"answers": [label]}}}
+
+
 def _string_list_answer(value: Any) -> list[str]:
     """
     Normalize one web-submitted answer to Codex's ``answers`` list.
@@ -210,6 +298,9 @@ def _codex_request_user_input_response(
     :param params: Original Codex ``item/tool/requestUserInput`` params.
     :returns: Codex ``ToolRequestUserInputResponse`` payload.
     """
+    approval_question = _codex_mcp_tool_approval_question(params)
+    if approval_question is not None:
+        return _codex_mcp_tool_approval_answer(result, approval_question)
     response: dict[str, Any] = {"answers": {}}
     if result.action != "accept" or not isinstance(result.content, dict):
         return response
@@ -277,6 +368,20 @@ def _codex_mcp_persist_modes(params: dict[str, Any]) -> set[str]:
     persist = meta.get("persist")
     values = persist if isinstance(persist, list) else [persist]
     return {value for value in values if isinstance(value, str) and value in {"session", "always"}}
+
+
+def _is_session_accept(result: ElicitationResult) -> bool:
+    """
+    Return whether a web verdict accepts a Codex file change for the session.
+
+    Codex file changes support only the ``session`` scope; any other
+    requested mode stays a one-time accept so Codex still gets an answer.
+
+    :param result: Web-submitted elicitation result.
+    :returns: ``True`` for an accept whose ``_meta.persist`` is ``"session"``.
+    """
+    persist = result.meta.get("persist") if result.meta is not None else None
+    return result.action == "accept" and persist == "session"
 
 
 def _execpolicy_amendment(value: Any) -> list[str] | None:
@@ -434,6 +539,10 @@ def _codex_file_change_approval_response(
     """
     Convert a web verdict into Codex file-change approval output.
 
+    A session-scoped accept (``_meta.persist == "session"``) becomes
+    ``acceptForSession`` so Codex stops prompting for later changes to
+    the same files.
+
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because this
         response shape is unique to file-change approvals.
@@ -441,6 +550,8 @@ def _codex_file_change_approval_response(
         response depends only on the web verdict.
     :returns: Codex ``FileChangeRequestApprovalResponse`` payload.
     """
+    if _is_session_accept(result):
+        return {"decision": "acceptForSession"}
     return {
         "decision": {
             "accept": "accept",
@@ -458,6 +569,9 @@ def _codex_apply_patch_approval_response(
     """
     Convert a web verdict into legacy Codex patch approval output.
 
+    A session-scoped accept becomes ``approved_for_session``, the legacy
+    ``ReviewDecision`` spelling of ``acceptForSession``.
+
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because this
         response shape is unique to legacy patch approvals.
@@ -465,6 +579,8 @@ def _codex_apply_patch_approval_response(
         response depends only on the web verdict.
     :returns: Codex ``ApplyPatchApprovalResponse`` payload.
     """
+    if _is_session_accept(result):
+        return {"decision": "approved_for_session"}
     return {
         "decision": {
             "accept": "approved",
@@ -590,6 +706,10 @@ def _codex_tool_request_user_input_params(
     """
     Build Omnigent params for Codex ``item/tool/requestUserInput``.
 
+    Codex's MCP tool approval question becomes an approval card offering
+    the persistence choices its options advertise; other questions render
+    as a question form.
+
     :param request_id: Codex JSON-RPC request id, e.g. ``12``.
     :param method: Codex app-server method, e.g.
         ``"item/tool/requestUserInput"``.
@@ -597,19 +717,12 @@ def _codex_tool_request_user_input_params(
     :returns: AP/MCP-shaped elicitation params.
     :raises OmnigentError: If no usable questions are present.
     """
-    ask_payload = _structured_codex_request_user_input(params)
-    if ask_payload is None:
-        raise OmnigentError(
-            "Codex requestUserInput requires at least one usable question.",
-            code=ErrorCode.INVALID_INPUT,
-        )
     thread_id = params.get("threadId")
     turn_id = params.get("turnId")
     item_id = params.get("itemId")
     extras: dict[str, Any] = {
         "codex_method": method,
         "codex_request_id": request_id,
-        "ask_user_question": ask_payload,
     }
     if isinstance(thread_id, str) and thread_id:
         extras["thread_id"] = thread_id
@@ -617,6 +730,25 @@ def _codex_tool_request_user_input_params(
         extras["turn_id"] = turn_id
     if isinstance(item_id, str) and item_id:
         extras["item_id"] = item_id
+    approval_question = _codex_mcp_tool_approval_question(params)
+    if approval_question is not None:
+        extras["codex_persist_modes"] = _codex_mcp_tool_approval_persist_modes(approval_question)
+        return ElicitationRequestParams(
+            mode="form",
+            message=approval_question["question"],
+            requestedSchema=None,
+            url=None,
+            phase="codex_mcp_tool_approval",
+            policy_name="codex_native_mcp_tool_approval",
+            **extras,
+        )
+    ask_payload = _structured_codex_request_user_input(params)
+    if ask_payload is None:
+        raise OmnigentError(
+            "Codex requestUserInput requires at least one usable question.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    extras["ask_user_question"] = ask_payload
     return ElicitationRequestParams(
         mode="form",
         message="Codex needs input",
@@ -722,6 +854,7 @@ def _codex_file_change_approval_params(
         extras["turn_id"] = turn_id
     if isinstance(item_id, str) and item_id:
         extras["item_id"] = item_id
+    extras["codex_persist_modes"] = list(_CODEX_FILE_CHANGE_PERSIST_MODES)
     message = "Codex wants to modify files"
     if grant_root:
         message = f"Codex wants write access under **{grant_root}**"
@@ -818,6 +951,7 @@ def _codex_apply_patch_approval_params(
         extras["call_id"] = call_id
     if isinstance(files, dict) and files:
         extras["files"] = sorted(str(key) for key in files)
+    extras["codex_persist_modes"] = list(_CODEX_FILE_CHANGE_PERSIST_MODES)
     return ElicitationRequestParams(
         mode="form",
         message="Codex wants to apply a patch",
