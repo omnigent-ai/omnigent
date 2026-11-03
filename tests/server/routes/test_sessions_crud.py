@@ -167,6 +167,9 @@ async def test_get_session_reports_what_a_running_session_is_blocked_on(
         assert await status_and_blocked_on() == ("running", "<omitted>")
 
         sessions_module._publish_status(session_id, "running", blocked_on="dialog open")
+        sessions_module._publish_status(session_id, "waiting")
+        assert await status_and_blocked_on() == ("running", None)
+
         sessions_module._publish_status(session_id, "idle")
         assert await status_and_blocked_on() == ("idle", None)
     finally:

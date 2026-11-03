@@ -5112,7 +5112,8 @@ def _publish_status(
     elif status == "failed":
         _session_background_task_count_cache.pop(session_id, None)
         _session_background_tasks_cache.pop(session_id, None)
-    if status == "running":
+    # Snapshots report ``waiting`` as ``running``, so it is an observed edge too.
+    if status in ("running", "waiting"):
         _session_blocked_on_cache[session_id] = blocked_on or None
     else:
         _session_blocked_on_cache.pop(session_id, None)

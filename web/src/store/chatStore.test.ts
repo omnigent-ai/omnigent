@@ -2394,7 +2394,20 @@ describe("chatStore — switchTo", () => {
     expect(streamCall).toBeDefined();
   });
 
-  it("keeps a parked reason that a live edge cleared during the bind snapshot", async () => {
+  it.each([
+    {
+      outcome: "its clear wins over the snapshot",
+      liveBlockedOn: undefined,
+      snapshot: { status: "running", blocked_on: "permission prompt" },
+      expected: { sessionStatus: "running", blockedOn: null },
+    },
+    {
+      outcome: "an idle snapshot drops its reason",
+      liveBlockedOn: "permission prompt",
+      snapshot: { status: "idle", blocked_on: null },
+      expected: { sessionStatus: "idle", blockedOn: null },
+    },
+  ])("resolves a live status edge during the bind snapshot: $outcome", async (race) => {
     seedSession("conv_blocked_bind");
     let resolveSnapshot: ((response: Response) => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -2418,13 +2431,13 @@ describe("chatStore — switchTo", () => {
       type: "session_status",
       conversationId: "conv_blocked_bind",
       status: "running",
+      blockedOn: race.liveBlockedOn,
     });
     resolveSnapshot!(
       mockResponse({
         id: "conv_blocked_bind",
         agent_id: "agent_xyz",
-        status: "running",
-        blocked_on: "permission prompt",
+        ...race.snapshot,
         created_at: 0,
         items: [],
         labels: {},
@@ -2432,7 +2445,7 @@ describe("chatStore — switchTo", () => {
     );
     await switchPromise;
 
-    expect(useChatStore.getState()).toMatchObject({ sessionStatus: "running", blockedOn: null });
+    expect(useChatStore.getState()).toMatchObject(race.expected);
   });
 
   it("switching to the same conversation is a no-op (blocks preserved, no stream re-open)", async () => {
@@ -15028,16 +15041,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   it("recovers a missed parked-dialog reason from the status snapshot", async () => {
     seedSession("conv_blocked_gap", []);
-    const sink = pushableStream();
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
     let blockedOnSnapshot: string | null = "permission prompt";
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_blocked_gap/stream") {
-        init?.signal?.addEventListener("abort", () =>
-          sink.error(new DOMException("aborted", "AbortError")),
-        );
-        return mockResponse(null, { bodyStream: sink.stream });
-      }
       if (url.startsWith("/v1/sessions/conv_blocked_gap?") && (init?.method ?? "GET") === "GET") {
         return mockResponse({
           id: "conv_blocked_gap",
@@ -15049,7 +15057,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           labels: {},
         });
       }
-      return defaultFetchHandler(input, init);
+      return route(input, init);
     });
     const controller = new AbortController();
     const bound = bindConversationForTest("conv_blocked_gap", {
@@ -15060,16 +15068,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const loop = startStreamPump("conv_blocked_gap", controller, bound.set, bound.get);
     await drainAsync();
 
-    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
     expect(bound.get().blockedOn).toBe("permission prompt");
 
     blockedOnSnapshot = null;
-    await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await advanceWithHeartbeats(sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
     expect(bound.get().blockedOn).toBeNull();
 
-    controller.abort();
+    sinks[0]!.push("data: [DONE]\n\n");
+    sinks[0]!.close();
     await drainAsync(2);
     await loop;
   });
@@ -15145,7 +15154,20 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("keeps a parked reason that a live edge cleared during the reconnect snapshot", async () => {
+  it.each([
+    {
+      outcome: "its clear wins over the snapshot",
+      liveEdge: { status: "running" },
+      snapshot: { status: "running", blocked_on: "permission prompt" },
+      expected: { sessionStatus: "running", blockedOn: null },
+    },
+    {
+      outcome: "an idle snapshot drops its reason",
+      liveEdge: { status: "running", blocked_on: "permission prompt" },
+      snapshot: { status: "idle", blocked_on: null },
+      expected: { sessionStatus: "idle", blockedOn: null },
+    },
+  ])("resolves a live status edge during the reconnect snapshot: $outcome", async (race) => {
     seedSession("conv_blocked_reconnect", []);
     const sinks = routeStreamOpens();
     const route = fetchMock.getMockImplementation()!;
@@ -15162,8 +15184,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         return mockResponse({
           id: "conv_blocked_reconnect",
           agent_id: "agent_xyz",
-          status: "running",
-          blocked_on: "permission prompt",
+          ...race.snapshot,
           created_at: 0,
           items: [],
           labels: {},
@@ -15185,12 +15206,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(releaseSnapshot).not.toBeNull();
 
     sinks[1]!.push(
-      sse("session.status", { conversation_id: "conv_blocked_reconnect", status: "running" }),
+      sse("session.status", { conversation_id: "conv_blocked_reconnect", ...race.liveEdge }),
     );
     await drainAsync();
     releaseSnapshot!();
     await drainAsync();
-    expect(bound.get().blockedOn).toBeNull();
+    expect(bound.get()).toMatchObject(race.expected);
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it.each([
+    { outcome: "stale restoration", olderReason: "permission prompt", newerReason: null },
+    { outcome: "stale clearance", olderReason: null, newerReason: "permission prompt" },
+  ])("keeps a newer snapshot's parked reason over an older one: $outcome", async (race) => {
+    seedSession("conv_blocked_overlap", []);
+    const sinks = routeStreamOpens();
+    const route = fetchMock.getMockImplementation()!;
+    const releaseSnapshots: ((blockedOn: string | null) => void)[] = [];
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.startsWith("/v1/sessions/conv_blocked_overlap?") &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        const blockedOn = await new Promise<string | null>((resolve) => {
+          releaseSnapshots.push(resolve);
+        });
+        return mockResponse({
+          id: "conv_blocked_overlap",
+          agent_id: "agent_xyz",
+          status: "running",
+          blocked_on: blockedOn,
+          created_at: 0,
+          items: [],
+          labels: {},
+        });
+      }
+      return route(input, init);
+    });
+    const controller = new AbortController();
+    const bound = bindConversationForTest("conv_blocked_overlap", {
+      abortController: controller,
+      sessionStatus: "running",
+      blockedOn: race.olderReason,
+    });
+    const loop = startStreamPump("conv_blocked_overlap", controller, bound.set, bound.get);
+    await drainAsync();
+    sinks[0]!.error();
+    await drainAsync();
+    expect(releaseSnapshots).toHaveLength(1);
+
+    // The reason changes with its edge missed; the periodic read sees it first.
+    await advanceWithHeartbeats(sinks[1]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    expect(releaseSnapshots).toHaveLength(2);
+    releaseSnapshots[1]!(race.newerReason);
+    await drainAsync();
+    expect(bound.get().blockedOn).toBe(race.newerReason);
+
+    releaseSnapshots[0]!(race.olderReason);
+    await drainAsync();
+    expect(bound.get().blockedOn).toBe(race.newerReason);
 
     sinks[1]!.push("data: [DONE]\n\n");
     sinks[1]!.close();
