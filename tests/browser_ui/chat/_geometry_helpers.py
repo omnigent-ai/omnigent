@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from itertools import pairwise
 
 import pytest
-from playwright.sync_api import FloatRect, Locator, Page, expect
+from playwright.sync_api import CDPSession, FloatRect, Locator, Page, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
@@ -191,8 +193,26 @@ def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
     )
 
 
-def scroll_with_native_touch(page: Page) -> dict:
+@contextmanager
+def native_touch_emulation(page: Page) -> Iterator[CDPSession]:
+    """Emulate touch input until the block exits.
+
+    Ending emulation re-evaluates pointer/hover media, which resizes touch-sized
+    targets; measurements that must share one layout belong inside the block.
+    """
     session = page.context.new_cdp_session(page)
+    try:
+        session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 1})
+        yield session
+    finally:
+        session.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+        session.detach()
+
+
+def scroll_with_native_touch(page: Page, session: CDPSession | None = None) -> dict:
+    owned = session is None
+    if session is None:
+        session = page.context.new_cdp_session(page)
     try:
         session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 1})
         target = page.evaluate(
@@ -239,8 +259,9 @@ def scroll_with_native_touch(page: Page) -> dict:
             target["initialScrollTop"],
         )
     finally:
-        session.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
-        session.detach()
+        if owned:
+            session.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+            session.detach()
 
 
 def append_streamed_output(page: Page, height: int) -> dict:
