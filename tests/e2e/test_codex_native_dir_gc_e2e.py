@@ -59,6 +59,7 @@ def _spawn_host_daemon(
     env = os.environ.copy()
     codex_home_source = env.get("CODEX_HOME") or str(Path.home() / ".codex")
     env["HOME"] = str(home_dir)
+    env["OMNIGENT_DATA_DIR"] = str(home_dir / ".omnigent")
     env["CODEX_HOME"] = codex_home_source
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
     with open(log_path, "w") as log_fh:
