@@ -155,7 +155,8 @@ _HOST_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
 class LiveRunner:
     """What the fake live runner received, and how it answers ``clear``."""
 
-    clear_status: int = 200
+    # ``None`` times the ``clear`` out at the transport.
+    clear_status: int | None = 200
     posts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     superseded: list[tuple[str, str, str]] = field(default_factory=list)
     on_clear: Callable[[], None] | None = None
@@ -174,6 +175,8 @@ async def install_live_runner(
         if body.get("type") == "clear":
             if state.on_clear is not None:
                 state.on_clear()
+            if state.clear_status is None:
+                raise httpx.ReadTimeout("runner did not answer", request=request)
             return httpx.Response(state.clear_status, json={"error": "busy"})
         return httpx.Response(201 if request.url.path == "/v1/sessions" else 200, json={})
 
@@ -442,6 +445,7 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     [
         (409, "runner", 400, "Stop the current turn"),
         (503, "runner", 500, "Clear failed: runner returned 503"),
+        (None, "runner", 503, "Couldn't reach this session's runner"),
         (200, "running", 400, "Stop the current turn"),
         (200, "none", 503, "runner is offline"),
         (200, "editor", 403, ""),
@@ -453,14 +457,14 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     db_uri: str,
     auth_live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
-    clear_status: int,
+    clear_status: int | None,
     placement: str,
     status: int,
     message: str,
 ) -> None:
     """A refused ``clear`` creates, initializes and supersedes nothing.
 
-    A busy or failing runner, a running turn, no placement, a non-owner or a
+    A busy, failing or unreachable runner, a running turn, no placement, a non-owner or a
     sub-agent refuses it. The caller and session checks run before the runner
     frees the client, so only a runner refusal reaches the runner.
     """

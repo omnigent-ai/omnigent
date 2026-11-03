@@ -2231,6 +2231,16 @@ def register_events_routes(
                         await _raise_if_runner_on_another_replica(
                             source, request.app.state, conversation_store
                         )
+                        # A still-registered runner that could not be reached
+                        # may hold the client or a turn; only an offline one
+                        # continues without the release.
+                        if runner_router is not None and runner_router.runner_is_online(
+                            source.runner_id
+                        ):
+                            raise OmnigentError(
+                                "Couldn't reach this session's runner to run /clear. Try again.",
+                                code=ErrorCode.RUNNER_UNAVAILABLE,
+                            )
                     if release is not None and release.status_code == 409:
                         raise OmnigentError(
                             "Stop the current turn before running /clear.",
