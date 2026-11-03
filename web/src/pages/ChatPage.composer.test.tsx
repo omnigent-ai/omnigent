@@ -5477,6 +5477,40 @@ describe("Composer reply quotes", () => {
     }
   });
 
+  it.each([false, true])(
+    "on a native terminal, retracts a restored send once its mirror commits (edited: %s)",
+    (edited) => {
+      // The mirror carries its own item id, never the send's stable id.
+      useChatStore.setState({ isNativeTerminalSession: true });
+      render(<Composer {...composerProps()} />);
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "file a single PR",
+            files: [],
+            stableId: "e".repeat(32),
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("file a single PR");
+      if (edited) fireEvent.change(textarea(), { target: { value: "file two PRs" } });
+
+      act(() =>
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "f".repeat(32),
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "file a single PR" }] },
+        }),
+      );
+
+      expect(textarea()).toHaveValue(edited ? "file two PRs" : "");
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    },
+  );
+
   it("keeps the user's edits when the delivered retraction lands", () => {
     const stableId = "d".repeat(32);
     render(<Composer {...composerProps()} />);
