@@ -250,10 +250,8 @@ _PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX = (
 _CODEX_ASYNC_QUESTION_TOOL = "request_user_input_async"
 _CODEX_ASYNC_QUESTION_REQUEST_PREFIX = "async_question:"
 _CODEX_ASYNC_QUESTION_REPLY_TAG = "send_user_message_question_reply"
-_CODEX_ASYNC_QUESTION_REPLY_PATTERN = re.compile(
-    rf"<{_CODEX_ASYNC_QUESTION_REPLY_TAG}>\s*(.*?)\s*</{_CODEX_ASYNC_QUESTION_REPLY_TAG}>",
-    re.DOTALL,
-)
+_CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN = re.compile(rf"<{_CODEX_ASYNC_QUESTION_REPLY_TAG}>\s*")
+_CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN = re.compile(rf"\s*</{_CODEX_ASYNC_QUESTION_REPLY_TAG}>")
 _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     {
         _CODEX_MCP_ELICITATION_REQUEST_METHOD,
@@ -5630,12 +5628,19 @@ def _async_question_reply_item_ids(text: str) -> list[str]:
     :param text: Codex ``userMessage`` text.
     :returns: Answered ``agentMessage`` item ids, e.g. ``["call_abc"]``.
     """
+    decoder = json.JSONDecoder()
     item_ids: list[str] = []
-    for match in _CODEX_ASYNC_QUESTION_REPLY_PATTERN.finditer(text):
+    position = 0
+    while opening := _CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN.search(text, position):
+        position = opening.end()
+        # Decode before finding the closing tag, which an answer string may contain.
         try:
-            entries = json.loads(match.group(1))
+            entries, end = decoder.raw_decode(text, position)
         except ValueError:
             continue
+        if not _CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN.match(text, end):
+            continue
+        position = end
         for entry in entries if isinstance(entries, list) else []:
             question_item_id = entry.get("questionItemId") if isinstance(entry, dict) else None
             try:

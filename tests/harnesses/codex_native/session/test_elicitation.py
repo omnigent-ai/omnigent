@@ -1077,8 +1077,21 @@ def test_forwarder_sends_nothing_for_unanswered_codex_async_question(
     assert fake_client.requests == []
 
 
+@pytest.mark.parametrize(
+    "reply_text",
+    [
+        _TUI_ASYNC_QUESTION_REPLY,
+        "<send_user_message_question_reply>\n"
+        '[{"answer":"</send_user_message_question_reply>",'
+        '"question":"Which option do you choose?",'
+        '"questionItemId":"[\\"request_user_input_async\\",\\"call-async-1\\",0]"}]\n'
+        "</send_user_message_question_reply>",
+    ],
+    ids=["option", "answer_contains_closing_tag"],
+)
 def test_forwarder_clears_codex_async_question_answered_in_native_tui(
     tmp_path: Path,
+    reply_text: str,
 ) -> None:
     """
     A Codex TUI answer closes the Omnigent card without sending a second reply.
@@ -1086,6 +1099,8 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
     The TUI answers with a tagged ``userMessage``. The forwarder must
     resolve the card and abandon its hook wait; a repeated ``item/completed``
     for the question must not publish a second card.
+
+    :param reply_text: Tagged reply text the Codex TUI sends.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
     fake_client = _FakeCodexAppServerClient()
@@ -1101,9 +1116,7 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
             "item": {
                 "type": "userMessage",
                 "id": "item_reply",
-                "content": [
-                    {"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY, "text_elements": []}
-                ],
+                "content": [{"type": "text", "text": reply_text, "text_elements": []}],
             },
         },
     }
@@ -1163,12 +1176,30 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
     assert fake_client.requests == []
 
 
+@pytest.mark.parametrize(
+    ("newer_turn_id", "retry_method", "retry_params", "final_turn_id"),
+    [
+        (None, "turn/start", {}, "turn_reply"),
+        ("turn_next", "turn/steer", {"expectedTurnId": "turn_next"}, "turn_next"),
+    ],
+    ids=["idle", "active"],
+)
 def test_forwarder_delivers_codex_async_question_answer_after_compaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    newer_turn_id: str | None,
+    retry_method: str,
+    retry_params: dict[str, str],
+    final_turn_id: str,
 ) -> None:
     """
     An answer Codex refuses during compaction is delivered once compaction ends.
+
+    :param newer_turn_id: Turn that becomes active when compaction ends, or
+        ``None`` when Codex goes idle.
+    :param retry_method: JSON-RPC method expected to carry the retried answer.
+    :param retry_params: Turn targeting expected on the retry.
+    :param final_turn_id: Active turn recorded after delivery.
     """
     monkeypatch.setattr(codex_native_executor, "_BRIDGE_STATE_SLOW_POLL_SECONDS", 0.01)
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_compact")
@@ -1178,7 +1209,7 @@ def test_forwarder_delivers_codex_async_question_answer_after_compaction(
 
     async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Refuse steering the compaction turn and start a new one.
+        Refuse steering the compaction turn and accept the retry.
 
         :param method: JSON-RPC method.
         :param params: JSON-RPC params.
@@ -1186,7 +1217,9 @@ def test_forwarder_delivers_codex_async_question_answer_after_compaction(
         :raises CodexAppServerResponseError: For ``turn/steer``.
         """
         fake_client.requests.append((method, params))
-        if method == "turn/steer":
+        if method == "turn/steer" and params["expectedTurnId"] == "turn_compact":
+            if newer_turn_id is not None:
+                _write_forwarder_bridge(tmp_path, active_turn_id=newer_turn_id)
             steer_refused.set()
             raise _compact_steer_refusal()
         return {"result": {"turn": {"id": "turn_reply"}}}
@@ -1237,11 +1270,11 @@ def test_forwarder_delivers_codex_async_question_answer_after_compaction(
             "turn/steer",
             {"threadId": "thread_123", "expectedTurnId": "turn_compact", "input": reply_input},
         ),
-        ("turn/start", {"threadId": "thread_123", "input": reply_input}),
+        (retry_method, {"threadId": "thread_123", **retry_params, "input": reply_input}),
     ]
     state = read_bridge_state(tmp_path)
     assert state is not None
-    assert state.active_turn_id == "turn_reply"
+    assert state.active_turn_id == final_turn_id
     assert _undelivered_answer_notices(posted_events) == []
 
 
