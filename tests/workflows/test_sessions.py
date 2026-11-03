@@ -10,7 +10,6 @@ import httpx
 import pytest
 from omnigent_client import SessionsNamespace
 
-from omnigent.workflows.arclet import ArcletExecutor
 from omnigent.workflows.engine import WorkflowRunner
 from omnigent.workflows.execution import open_executor
 from omnigent.workflows.models import Workflow
@@ -24,7 +23,7 @@ from omnigent.workflows.state import ExecutionBinding, FeedbackEvent
         (
             {
                 "kind": "sandbox",
-                "provider": "arclet",
+                "provider": "test-provider",
                 "workspace": "https://github.com/example/repo",
             },
             SessionExecutor,
@@ -32,15 +31,7 @@ from omnigent.workflows.state import ExecutionBinding, FeedbackEvent
         (
             {
                 "kind": "sandbox",
-                "provider": "arclet",
-                "workspace": "https://github.com/example/repo",
-            },
-            ArcletExecutor,
-        ),
-        (
-            {
-                "kind": "sandbox",
-                "provider": "arclet",
+                "provider": "test-provider",
                 "workspace": "https://github.com/example/repo",
             },
             None,
@@ -74,7 +65,9 @@ async def test_sessions_are_isolated_per_member_and_lead_reuses_session(
     if owner:
         data["teams"][0]["strategy"] = "owner"
     for member in data["teams"][0]["members"]:
-        member["placement"] = placement
+        member["placement"] = dict(placement)
+        if placement["kind"] == "sandbox" and member["id"] == "reviewer":
+            member["placement"]["provider"] = "another-provider"
     workflow = Workflow.model_validate(data)
     creates: list[dict] = []
     messages: list[tuple[str, dict]] = []
@@ -87,7 +80,6 @@ async def test_sessions_are_isolated_per_member_and_lead_reuses_session(
     clock = 1000.0
     monkeypatch.delenv("OMNIGENT_WORKFLOW_DATABRICKS_PROFILE", raising=False)
     if executor is None:
-        monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_PROVIDER", "Databricks")
         monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
         monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_caller")
         monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
@@ -292,7 +284,7 @@ async def test_sessions_are_isolated_per_member_and_lead_reuses_session(
                 *args, **kwargs, transport=httpx.MockTransport(respond)
             ),
         )
-        async with open_executor(ExecutionBinding(mode="arclet", server="http://test")) as execute:
+        async with open_executor(ExecutionBinding(mode="server", server="http://test")) as execute:
             runner = await run(execute)
         if execution == "profile":
             assert len(tokens) == 2, "Members must share cached credentials and their refresh"
@@ -313,7 +305,12 @@ async def test_sessions_are_isolated_per_member_and_lead_reuses_session(
     if placement["kind"] == "sandbox":
         assert all(
             body["host_type"] == "managed"
-            and body["sandbox_provider"] == ("Databricks" if executor is None else "arclet")
+            and body["sandbox_provider"]
+            == (
+                "another-provider"
+                if body["labels"]["omnigent.workflow.member"] == "reviewer"
+                else placement["provider"]
+            )
             for body in creates
         )
         assert all("host_id" not in body for body in creates)
@@ -448,7 +445,7 @@ async def test_unsuccessful_streams_never_release_dependants(
                     "agent_id": "ag_test",
                     "status": "idle",
                     "created_at": 1,
-                    "sandbox_status": {"stage": "failed", "error": "Arclet provisioning failed"},
+                    "sandbox_status": {"stage": "failed", "error": "Sandbox provisioning failed"},
                 },
             )
         if request.url.path.endswith("/stream"):
@@ -489,7 +486,7 @@ async def test_unsuccessful_streams_never_release_dependants(
     elif outcome in {"timeout", "launch_timeout"}:
         assert "TimeoutError" in runner.nodes["root"].error
     elif outcome == "launch_failed":
-        assert "Arclet provisioning failed" in runner.nodes["root"].error
+        assert "Sandbox provisioning failed" in runner.nodes["root"].error
     elif outcome == "empty_output":
         assert "no text in stream or transcript" in runner.nodes["root"].error
     elif outcome == "interrupt_failed":

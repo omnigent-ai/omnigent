@@ -21,9 +21,8 @@ from omnigent.workflows.state import ExecutionBinding
 
 
 @pytest.mark.parametrize("known_session", [True, False])
-@pytest.mark.parametrize("mode", ["server", "arclet"])
 async def test_uncertain_turn_waits_for_reconciliation_without_resubmission(
-    owner_workflow: Workflow, tmp_path: Path, known_session: bool, mode: str
+    owner_workflow: Workflow, tmp_path: Path, known_session: bool
 ) -> None:
     store = RunStore(tmp_path)
     started = asyncio.Event()
@@ -42,7 +41,7 @@ async def test_uncertain_turn_waits_for_reconciliation_without_resubmission(
         owner_workflow,
         execute,
         store=store,
-        binding=ExecutionBinding.model_validate({"mode": mode, "server": "http://test"}),
+        binding=ExecutionBinding(mode="server", server="http://test"),
     )
     task = asyncio.create_task(runner.run())
     await started.wait()

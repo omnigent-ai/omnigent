@@ -10,7 +10,7 @@ teams:
     agent_id: replace-with-registered-agent-id
     placement:
       kind: sandbox
-      provider: arclet
+      provider: replace-with-sandbox-provider
 nodes:
 - id: investigate
   team: delivery

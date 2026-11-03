@@ -12,13 +12,13 @@ teams:
         agent_id: replace-with-registered-agent-id
         placement:
           kind: sandbox
-          provider: arclet
+          provider: replace-with-sandbox-provider
       - id: reviewer
         role: Challenge assumptions and identify missing evidence or risks.
         agent_id: replace-with-registered-agent-id
         placement:
           kind: sandbox
-          provider: arclet
+          provider: replace-with-sandbox-provider
 nodes:
   - id: investigate
     goal: Examine the supplied latency evidence and identify hypotheses to validate.

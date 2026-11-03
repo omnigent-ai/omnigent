@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.workflows.engine import MemberExecutor, WorkflowRunner
-from omnigent.workflows.execution import open_executor, validate_backend
+from omnigent.workflows.execution import open_executor
 from omnigent.workflows.gates import execute_command_gate
 from omnigent.workflows.models import Workflow
 from omnigent.workflows.simulation import simulate_gate
@@ -30,11 +30,6 @@ from omnigent.workflows.store import RunStore
 )
 @click.option("--validate", "validate_only", is_flag=True, help="Validate without executing.")
 @click.option("--server", help="Omnigent server URL.")
-@click.option(
-    "--backend",
-    type=click.Choice(["sessions", "arclet"]),
-    help="Execution library (default: sessions).",
-)
 @click.option(
     "--output", type=click.Path(dir_okay=False, path_type=Path), help="Write a diagnostic report."
 )
@@ -60,7 +55,6 @@ def main(
     validate_only: bool,
     server: str | None,
     output: Path | None,
-    backend: str | None,
     state: Path | None,
     resume: bool,
     inspect_only: bool,
@@ -74,7 +68,7 @@ def main(
         )
     if sum((validate_only, resume, inspect_only, event is not None)) > 1:
         raise click.UsageError("Choose one of --validate, --resume, --inspect, or --event")
-    if simulate and (server or backend):
+    if simulate and server:
         raise click.UsageError("Use either --simulate or --server")
     if (resume or inspect_only or event) and (
         state is None or not (state / "state.json").is_file()
@@ -82,7 +76,7 @@ def main(
         raise click.UsageError("This operation requires --state with an existing checkpoint")
     if definition and (resume or inspect_only or event):
         raise click.UsageError("Saved runs use their checkpoint definition; omit DEFINITION")
-    if (inspect_only or event) and (simulate or server or output or backend):
+    if (inspect_only or event) and (simulate or server or output):
         raise click.UsageError("Inspection and event submission do not take execution options")
     if (
         output
@@ -113,16 +107,13 @@ def main(
             click.echo(f"Queued event {incoming.id}; resume the run to process it.")
             return
         saved = store.load() if resume and store else None
-        selected_mode = "server" if backend in {None, "sessions"} else backend
         if saved:
             checkpoint = Checkpoint.model_validate(saved)
             workflow, binding = checkpoint.workflow, checkpoint.binding
             if binding.mode == "custom":
                 raise click.UsageError("Resume custom executors through the Python API")
-            if (
-                (simulate and binding.mode != "simulation")
-                or (server and server != binding.server)
-                or (backend and selected_mode != binding.mode)
+            if (simulate and binding.mode != "simulation") or (
+                server and server != binding.server
             ):
                 raise click.UsageError("Execution mode and server must match the checkpoint")
         else:
@@ -131,7 +122,7 @@ def main(
             workflow = Workflow.model_validate(yaml.safe_load(definition.read_text()))
             binding = ExecutionBinding.model_validate(
                 {
-                    "mode": "simulation" if simulate else selected_mode,
+                    "mode": "simulation" if simulate else "server",
                     "server": server,
                 }
             )
@@ -140,8 +131,6 @@ def main(
             return
         if binding.mode != "simulation" and not binding.server:
             raise click.UsageError("Choose --simulate or an explicit --server URL")
-
-        validate_backend(workflow, binding)
 
         async def drive(execute: MemberExecutor) -> None:
             nonlocal runner

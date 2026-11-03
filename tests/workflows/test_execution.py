@@ -1,27 +1,19 @@
-"""Backend selection validates placement before contacting either runtime."""
+"""Server execution persists its connection and shares one login across agents."""
 
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
 import pytest
 from click.testing import CliRunner
-from omnigent_client import SessionsNamespace
 
 from omnigent.workflows.__main__ import main
-from omnigent.workflows.arclet import ArcletExecutor
 from omnigent.workflows.connection import open_workflow_server_client
-from omnigent.workflows.engine import WorkflowRunner
-from omnigent.workflows.execution import open_executor, validate_backend
-from omnigent.workflows.models import Workflow
+from omnigent.workflows.execution import open_executor
 from omnigent.workflows.simulation import simulate_member
 from omnigent.workflows.state import ExecutionBinding
 
 
-@pytest.mark.parametrize("backend", ["sessions", "arclet"])
-def test_cli_selects_and_persists_backend_without_changing_it_on_resume(
-    tmp_path, monkeypatch, backend
-):
+def test_cli_persists_server_connection_and_refuses_changes_on_resume(tmp_path, monkeypatch):
     bindings = []
 
     @asynccontextmanager
@@ -32,7 +24,7 @@ def test_cli_selects_and_persists_backend_without_changing_it_on_resume(
     monkeypatch.setattr("omnigent.workflows.__main__.open_executor", executor)
     definition = tmp_path / "workflow.yaml"
     example = (
-        Path(__file__).resolve().parents[2] / "examples/dynamic-workflows/arclet-workflow.yaml"
+        Path(__file__).resolve().parents[2] / "examples/dynamic-workflows/sandbox-workflow.yaml"
     )
     definition.write_text(example.read_text())
     state = tmp_path / "state"
@@ -41,8 +33,6 @@ def test_cli_selects_and_persists_backend_without_changing_it_on_resume(
         main,
         [
             str(definition),
-            "--backend",
-            backend,
             "--server",
             "https://test.example",
             "--state",
@@ -50,40 +40,13 @@ def test_cli_selects_and_persists_backend_without_changing_it_on_resume(
         ],
     )
     assert result.exit_code == 3, result.output
-    assert bindings == [
-        ExecutionBinding(
-            mode="server" if backend == "sessions" else backend, server="https://test.example"
-        )
-    ]
+    assert bindings == [ExecutionBinding(mode="server", server="https://test.example")]
     assert cli.invoke(main, ["--resume", "--state", str(state)]).exit_code == 3
     assert bindings[1] == bindings[0]
-    wrong = "arclet" if backend == "sessions" else "sessions"
-    result = cli.invoke(main, ["--resume", "--state", str(state), "--backend", wrong])
-    assert result.exit_code == 2 and "must match" in result.output
-
-
-@pytest.mark.parametrize(
-    "placement",
-    [
-        {"kind": "host", "host_id": "host", "workspace": "/workspace"},
-        {"kind": "sandbox", "provider": "other"},
-    ],
-)
-async def test_arclet_library_rejects_other_placements_before_any_http_call(
-    owner_workflow, placement
-):
-    definition = owner_workflow.model_dump()
-    definition["teams"][0]["members"][0]["placement"] = placement
-    workflow = Workflow.model_validate(definition)
-    with pytest.raises(ValueError, match="Arclet"):
-        validate_backend(workflow, ExecutionBinding(mode="arclet"))
-    async with httpx.AsyncClient() as client:
-        runner = WorkflowRunner(
-            workflow, ArcletExecutor(SessionsNamespace(client, "http://unused"))
-        )
-        await runner.run()
-    assert runner.status == "failed"
-    assert "provider: arclet" in runner.nodes["root"].error
+    for changed in (["--simulate"], ["--server", "https://other.example"]):
+        result = cli.invoke(main, ["--resume", "--state", str(state), *changed])
+        assert result.exit_code == 2 and "must match" in result.output
+    assert len(bindings) == 2
 
 
 @pytest.mark.parametrize(
@@ -97,7 +60,7 @@ async def test_arclet_library_rejects_other_placements_before_any_http_call(
 )
 async def test_connection_rejects_non_http_or_embedded_credentials(url):
     with pytest.raises(ValueError, match="HTTP"):
-        async with open_executor(ExecutionBinding(mode="arclet", server=url)):
+        async with open_executor(ExecutionBinding(mode="server", server=url)):
             pytest.fail("invalid connection must not open")
 
 

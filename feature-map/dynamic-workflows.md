@@ -18,8 +18,8 @@ to downstream tasks with checkpoints for restart and reconciliation.
 - Enable `OMNIGENT_FEATURES=dynamic_workflows` in the CLI shell.
 - Validate: `python -m omnigent.workflows FILE --validate`.
 - Simulate: `python -m omnigent.workflows FILE --simulate --state DIRECTORY`.
-- Execute: `python -m omnigent.workflows FILE --backend arclet --server URL --state DIRECTORY`.
-- Connected hosts or other managed providers: use `--backend sessions`.
+- Execute: `python -m omnigent.workflows FILE --server URL --state DIRECTORY`.
+- Choose a connected host or a managed sandbox provider in each member's placement.
 - Inspect/resume: `python -m omnigent.workflows --inspect|--resume --state DIRECTORY`.
 - Review: `python -m omnigent.workflows --event FILE --state DIRECTORY`, then resume.
 - Python: import `WorkflowRunner` and `RunStore` from `omnigent.workflows`; supply an executor.
@@ -41,9 +41,10 @@ need no environment; the process scenario owns its isolated server and host. Rea
   `test_run_launches_a_runner_on_this_machines_host`, variants `workflow`,
   `workflow-parallel` and `workflow-consult`. They verify concurrency, owner reuse,
   repair after restart and downstream release using existing process primitives.
-- Explicit live provisioning check: `tests/e2e_live/test_workflow_arclets_live.py`.
-  It needs an authenticated server, registered agent and Arclet CLI. It proves
-  three distinct cloud environments, multi-agent synthesis, output handoff and cleanup.
+- Explicit live provisioning check: `tests/e2e_live/test_workflow_sandboxes_live.py`.
+  It needs an authenticated server, registered agent and configured sandbox provider.
+  It verifies three distinct managed hosts, synthesis, output handoff and host removal.
+  It does not independently inspect cloud resource termination.
 
 ## Gotchas
 

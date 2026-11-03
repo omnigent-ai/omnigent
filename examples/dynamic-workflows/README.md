@@ -50,18 +50,22 @@ Exit code 1 means execution failed; 2 means invalid CLI usage.
 
 ## Real agent execution
 
-Copy `arclet-workflow.yaml`, replace the registered agent ID and set the server URL:
+Copy `sandbox-workflow.yaml`, replace the registered agent ID and sandbox provider
+name, and set the server URL:
 
 ```sh
 uv run --no-sync python -m omnigent.workflows /path/to/workflow.yaml \
-  --backend arclet --server https://your-server.example --state /tmp/new-workflow-run
+  --server https://your-server.example --state /tmp/new-workflow-run
 ```
 
-The Arclet adapter uses the server's existing managed sandbox provider and creates
-one sandbox per task member. `OMNIGENT_WORKFLOW_ARCLET_PROVIDER` can override the
-provider name advertised by a deployment. Generic `--backend sessions` also supports
-other managed providers and connected hosts with an explicit `host_id` and absolute
-workspace path. Managed workspaces are repository URLs cloned separately for each member.
+All live workflows use Omnigent's Sessions API. Each member's `placement` selects
+an existing connected host or a managed sandbox. For a sandbox, `provider` is the
+provider name configured on that server; the workflow passes it through unchanged.
+Different members may use different providers. Provisioning, teardown and provider
+validation belong to the server's sandbox layer.
+
+Connected hosts use an explicit `host_id` and absolute workspace path. Managed
+workspaces are repository URLs cloned separately for each member.
 
 Authentication reuses the existing login for that URL or `OMNIGENT_REMOTE_AUTH_TOKEN`.
 For a Databricks deployment, explicitly set `OMNIGENT_WORKFLOW_DATABRICKS_PROFILE`
@@ -86,11 +90,11 @@ Named outputs contain JSON values up to 64 KiB per candidate. After all review g
 pass, dependants receive `dependency_results.<task_id>` with `status`, `summary`,
 `outputs` and `artifacts`. Rejected outputs remain withheld. Accepted outputs survive
 restart. Files/code must be published where other agents can fetch them: a local
-Arclet path is not shared. Git artifacts use a repository URL and full published
+sandbox path is not shared. Git artifacts use a repository URL and full published
 commit SHA; consumers must verify the exact revision. References do not transfer
 files or merge branches, and the controller does not verify remote content.
 
-External review events name the exact node, candidate and gate. For the Arclet example:
+External review events name the exact node, candidate and gate. For the sandbox example:
 
 ```json
 {"id":"review-1","kind":"gate_result","node_id":"propose","candidate_id":"propose-1","gate_id":"review","outcome":{"passed":true,"detail":"Inspected the stated revision"}}
@@ -133,14 +137,17 @@ model replies, covering owner-only, parallel and specialist-on-request execution
 repair in the same session across CLI restarts and downstream release.
 
 The opt-in live test checks two contributing agents and a downstream consumer on
-three distinct Arclets, verifies outputs and cleans up only its own compute:
+three distinct managed hosts, verifies outputs and deletes only its own sessions:
 
 ```sh
-OMNIGENT_WORKFLOW_ARCLET_URL=https://your-server.example \
+OMNIGENT_WORKFLOW_SERVER_URL=https://your-server.example \
+OMNIGENT_WORKFLOW_SANDBOX_PROVIDER=your-provider \
 OMNIGENT_WORKFLOW_LIVE_AGENT_ID=your-registered-agent-id \
-uv run --no-sync pytest tests/e2e_live/test_workflow_arclets_live.py --reruns 0 -q -s
+uv run --no-sync pytest tests/e2e_live/test_workflow_sandboxes_live.py --reruns 0 -q -s
 ```
 
-It requires a valid server login and an authenticated `arclet list --json` for the
-same user. It allocates compute and calls models, so it is excluded from normal CI.
+It requires a valid server login and a configured sandbox provider. It verifies
+that the server removes the managed hosts after session deletion; actual cloud
+resource termination remains the provider's responsibility and is not independently
+verified. It allocates compute and calls models, so it is excluded from normal CI.
 A passing mocked test does not establish compatibility with a live deployment.

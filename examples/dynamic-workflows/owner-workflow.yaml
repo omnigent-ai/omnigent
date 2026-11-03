@@ -11,13 +11,13 @@ teams:
         agent_id: replace-with-registered-agent-id
         placement:
           kind: sandbox
-          provider: arclet
+          provider: replace-with-sandbox-provider
       - id: reviewer
         role: Review the owner's candidate and return concrete evidence.
         agent_id: replace-with-registered-agent-id
         placement:
           kind: sandbox
-          provider: arclet
+          provider: replace-with-sandbox-provider
 nodes:
   - id: implement
     goal: Produce a result artifact with an immutable revision and satisfy the tests gate.
