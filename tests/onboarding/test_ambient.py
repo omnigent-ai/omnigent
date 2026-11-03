@@ -14,6 +14,7 @@ count, so a wrong field turns the test red.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1029,6 +1030,68 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
+
+
+def _claude_code_managed_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    managed_dir = tmp_path / "claude-code"
+    managed_dir.mkdir()
+    monkeypatch.setattr(
+        ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_dir / "managed-settings.json",)
+    )
+    return managed_dir
+
+
+def test_claude_code_managed_mcp_presence_counts_unparseable_file(tmp_path, monkeypatch) -> None:
+    """An unparseable file still counts as deployed, as it does for Claude Code."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    assert not ambient.claude_code_managed_mcp_present()
+
+    (managed_dir / "managed-mcp.json").write_text("not json")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.parametrize(
+    ("platform", "own_dir", "other_dir"),
+    [("darwin", "macos", "linux"), ("linux", "linux", "macos")],
+)
+def test_claude_code_managed_mcp_reads_only_this_platforms_directory(
+    tmp_path, monkeypatch, platform: str, own_dir: str, other_dir: str
+) -> None:
+    managed_dirs = {"macos": tmp_path / "macos", "linux": tmp_path / "linux"}
+    for managed_dir in managed_dirs.values():
+        managed_dir.mkdir()
+    monkeypatch.setattr(ambient, "_CLAUDE_CODE_MACOS_MANAGED_DIR", managed_dirs["macos"])
+    monkeypatch.setattr(ambient, "_CLAUDE_CODE_LINUX_MANAGED_DIR", managed_dirs["linux"])
+    monkeypatch.setattr(
+        ambient,
+        "CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        tuple(managed_dir / "managed-settings.json" for managed_dir in managed_dirs.values()),
+    )
+    monkeypatch.setattr(ambient.sys, "platform", platform)
+
+    assert ambient.claude_code_managed_mcp_paths() == (managed_dirs[own_dir] / "managed-mcp.json",)
+    (managed_dirs[other_dir] / "managed-mcp.json").write_text("{}")
+    assert not ambient.claude_code_managed_mcp_present()
+    (managed_dirs[own_dir] / "managed-mcp.json").write_text("{}")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs file permissions"
+)
+def test_claude_code_managed_mcp_presence_follows_permission_errors(tmp_path, monkeypatch) -> None:
+    """An unreadable file still counts, but one in an unsearchable directory does not."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    managed_mcp = managed_dir / "managed-mcp.json"
+    managed_mcp.write_text("{}")
+    managed_mcp.chmod(0)
+    assert ambient.claude_code_managed_mcp_present()
+
+    managed_dir.chmod(0)
+    try:
+        assert not ambient.claude_code_managed_mcp_present()
+    finally:
+        managed_dir.chmod(0o700)
 
 
 def test_claude_managed_model_picker_reads_replacement_options(tmp_path: Path) -> None:

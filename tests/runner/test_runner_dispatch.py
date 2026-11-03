@@ -1482,6 +1482,34 @@ async def test_runner_post_reports_a_removed_agent_with_fork_guidance() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("exc", "cause"),
+    [
+        (httpx.ConnectError("connect failed to internal-host:6767"), "ConnectError"),
+        (
+            RuntimeError(
+                "spec_resolver: GET /v1/sessions/conv_x/agent/contents failed with HTTP 503"
+            ),
+            "RuntimeError HTTP 503",
+        ),
+    ],
+    ids=["connection-error", "server-status"],
+)
+def test_spec_resolve_error_detail_names_structured_cause(
+    exc: BaseException, cause: str, pinned_runner_log: Path
+) -> None:
+    """The client detail names the cause type and status, never the raw text."""
+    from omnigent.runner.app import _spec_resolve_error_detail
+
+    detail = _spec_resolve_error_detail(exc)
+
+    assert detail == (
+        f"Could not load the agent spec ({cause}). "
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert "internal-host" not in detail and "conv_x" not in detail
+
+
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
@@ -1533,6 +1561,7 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
     # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
     assert body["detail"] == (
+        "Could not load the agent spec (RuntimeError). "
         f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
     )
     assert "spec resolver unavailable" not in body["detail"]
