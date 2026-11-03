@@ -1559,6 +1559,47 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["openai-agents", { session_rewind: true, session_claude_sdk_clear: true }],
+    ["claude-sdk", {}],
+  ] as const)(
+    "%s runs a custom /rewind or /clear when the built-in is off (server info %o)",
+    (harness, advertised) => {
+      useChatStore.setState({ sessionHarness: harness });
+      setComposerState({
+        conversationId: "conv_test",
+        skills: [
+          { name: "rewind", description: "Project rewind helper" },
+          { name: "clear", description: "Project clear helper" },
+        ],
+      });
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      render(
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...advertised }}>
+          <Composer {...composerProps({ onSend, onSendSlashCommand })} />
+        </CapabilitiesProvider>,
+      );
+      // A typed command, then the menu's selection (which fills "/rewind ").
+      fireEvent.change(textarea(), { target: { value: "/rewind " } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.change(textarea(), { target: { value: "/rew" } });
+      fireEvent.click(screen.getByTestId("slash-menu-item-rewind"));
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.change(textarea(), { target: { value: "/clear " } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(onSendSlashCommand.mock.calls).toEqual([
+        ["rewind", ""],
+        ["rewind", ""],
+        ["clear", ""],
+      ]);
+      expect(screen.queryByTestId("rewind-picker")).toBeNull();
+      expect(screen.queryByText(/is not supported for this agent type/)).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
   it("prefers a multi-word skill over a built-in matching only its first word", () => {
     const name = "Help Desk";
     setComposerState({
