@@ -1419,6 +1419,7 @@ def _seed_same_workspace_daemon(
     *,
     vanity_org_id: str = "1",
     age_s: int = 0,
+    legacy: bool = False,
 ) -> None:
     """
     Record a live daemon on the workspace host and log both URLs in.
@@ -1429,6 +1430,7 @@ def _seed_same_workspace_daemon(
         ``"1"`` for the daemon's own workspace.
     :param age_s: How long ago the daemon started, e.g. ``60``. ``0`` is
         within the startup grace, so its host status isn't checked.
+    :param legacy: Omit the routing pin to represent an older running host.
     """
     from omnigent.cli_auth import store_databricks_auth
 
@@ -1451,7 +1453,7 @@ def _seed_same_workspace_daemon(
             log_path=str(tmp_path / "existing.log"),
             started_at=int(time.time()) - age_s,
             host_id="a" * 32,
-            org_pin=f"{_WORKSPACE_API}?o=1",
+            org_pin=None if legacy else f"{_WORKSPACE_API}?o=1",
         )
     )
 
@@ -1628,12 +1630,14 @@ def _same_workspace_sibling(*, age_s: int = 60) -> cli_module._HostDaemonRecord:
         (_HOST_REJECTED, _HOST_ONLINE, None),
     ],
 )
+@pytest.mark.parametrize("legacy", [False, True])
 def test_host_background_reuses_same_workspace_daemon_only_when_online(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     via_requested_url: cli_module._HostHttpResult,
     via_own_url: cli_module._HostHttpResult,
     refusal: str | None,
+    legacy: bool,
 ) -> None:
     """
     A same-workspace daemon whose host is offline is neither reused nor joined.
@@ -1646,7 +1650,7 @@ def test_host_background_reuses_same_workspace_daemon_only_when_online(
     monkeypatch.setattr(
         "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
     )
-    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60)
+    _seed_same_workspace_daemon(monkeypatch, tmp_path, age_s=60, legacy=legacy)
     _stub_host_status_by_url(
         monkeypatch, {_VANITY_API: via_requested_url, _WORKSPACE_API: via_own_url}
     )

@@ -4292,7 +4292,7 @@ def test_mixed_case_server_gets_the_same_workspace_key_and_pin() -> None:
     )
 
 
-@pytest.mark.parametrize("bound_org", [None, "111", "222"])
+@pytest.mark.parametrize("bound_org", [None, "111", "222", "legacy"])
 @pytest.mark.parametrize("background", [False, True])
 def test_reuse_checks_the_recorded_workspace_binding(monkeypatch, bound_org, background):
     from omnigent.cli_auth import databricks_org_pin
@@ -4305,7 +4305,7 @@ def test_reuse_checks_the_recorded_workspace_binding(monkeypatch, bound_org, bac
         server_url=_ACCOUNT_SERVER,
         log_path="/tmp/synthetic-host.log" if background else None,
         started_at=1,
-        org_pin=databricks_org_pin(_ACCOUNT_SERVER, bound_org),
+        org_pin=None if bound_org == "legacy" else databricks_org_pin(_ACCOUNT_SERVER, bound_org),
     )
     monkeypatch.setattr(cli, "_find_daemon_record", lambda target: record)
     monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda existing: True)
@@ -4314,14 +4314,58 @@ def test_reuse_checks_the_recorded_workspace_binding(monkeypatch, bound_org, bac
     monkeypatch.setattr(
         cli, "_terminate_host_unit", lambda existing, **kwargs: stopped.append(existing)
     )
-    if not background and bound_org != "111":
-        with pytest.raises(click.ClickException, match="foreground host"):
+    if bound_org not in {"111", "legacy"}:
+        with pytest.raises(click.ClickException, match="left running"):
             cli._reuse_existing_daemon_record(_ACCOUNT_SERVER)
-        assert stopped == []
     else:
         decision = cli._reuse_existing_daemon_record(_ACCOUNT_SERVER)
-        assert decision.reuse == (bound_org == "111")
-        assert stopped == ([] if decision.reuse else [record])
+        assert decision.reuse
+    assert stopped == []
+
+
+@pytest.mark.parametrize("workspace_id", [None, "111", "222"])
+def test_legacy_binding_uses_recorded_workspace_without_stopping_host(monkeypatch, workspace_id):
+    _select_workspace(monkeypatch, "111")
+    record = cli._HostDaemonRecord(
+        pid=12345,
+        target=_ACCOUNT_SERVER,
+        mode="server",
+        server_url=_ACCOUNT_SERVER,
+        log_path="/tmp/synthetic-host.log",
+        started_at=1,
+        workspace_id=workspace_id,
+    )
+    monkeypatch.setattr(cli, "_terminate_host_unit", lambda *args, **kwargs: pytest.fail("stop"))
+    if workspace_id == "222":
+        with pytest.raises(click.ClickException, match="left running"):
+            cli._require_compatible_daemon(record, _ACCOUNT_SERVER)
+    else:
+        cli._require_compatible_daemon(record, _ACCOUNT_SERVER)
+
+
+@pytest.mark.parametrize("bound_org", [None, "111", "222"])
+@pytest.mark.parametrize("identity_changed", [False, True])
+def test_warm_reuse_does_not_restart_a_running_host(monkeypatch, bound_org, identity_changed):
+    from omnigent.cli_auth import databricks_org_pin
+
+    _select_workspace(monkeypatch, "111")
+    record = cli._HostDaemonRecord(
+        pid=12345,
+        target=_ACCOUNT_SERVER,
+        mode="server",
+        server_url=_ACCOUNT_SERVER,
+        log_path="/tmp/synthetic-host.log",
+        started_at=1,
+        org_pin=databricks_org_pin(_ACCOUNT_SERVER, bound_org),
+    )
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: record)
+    monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda existing: True)
+    monkeypatch.setattr(cli, "_daemon_host_identity_changed", lambda existing: identity_changed)
+    monkeypatch.setattr(cli, "_terminate_host_unit", lambda *args, **kwargs: pytest.fail("stop"))
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", lambda **kwargs: pytest.fail("spawn"))
+    assert cli._reuse_host_daemon_if_compatible(_ACCOUNT_SERVER) == (
+        bound_org == "111" and not identity_changed
+    )
 
 
 def test_warm_reuse_never_starts_a_missing_host(monkeypatch):
