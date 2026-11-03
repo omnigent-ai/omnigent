@@ -24,8 +24,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner import subagent_work
+from omnigent.runner import subagent_work, tool_dispatch
 from omnigent.runner.tool_dispatch import _execute_file_tool, execute_tool
+from omnigent.tools.builtins.upload_file import safe_resolve
 
 _CONVERSATION_ID = "conv_sec20870"
 
@@ -157,6 +158,110 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
         "upload_file POSTed despite a symlink whose target escapes the "
         "workspace; the host secret would have been exfiltrated"
     )
+
+
+@pytest.mark.posix_only
+@pytest.mark.asyncio
+async def test_upload_refuses_directory_swapped_for_symlink_after_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A directory swapped for an escaping symlink between the containment
+    check and the read is refused, and no upload POST is made.
+
+    The real ``safe_resolve`` accepts ``gate/file.txt`` while ``gate`` is
+    an in-workspace directory; the swap then lands before the read, as a
+    concurrent writer in the workspace could arrange.
+
+    :param tmp_path: Pytest-provided directory holding the workspace.
+    :param monkeypatch: Runs the swap right after the containment check.
+    """
+    workspace = tmp_path / "workspace"
+    gate = workspace / "gate"
+    gate.mkdir(parents=True)
+    (gate / "file.txt").write_text("benign")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file.txt").write_text("TOP SECRET")
+
+    checked: list[Path] = []
+
+    def _check_then_swap(path: str, root: Path) -> Path:
+        resolved = safe_resolve(path, root)
+        checked.append(resolved)
+        gate.rename(workspace / "gate.orig")
+        gate.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(tool_dispatch, "safe_resolve", _check_then_swap)
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        result = await _execute_file_tool(
+            "upload_file",
+            {"path": "gate/file.txt"},
+            client,
+            conversation_id=_CONVERSATION_ID,
+            agent_spec=None,
+            runner_workspace=workspace,
+        )
+    finally:
+        await client.aclose()
+
+    assert checked == [workspace.resolve() / "gate" / "file.txt"]
+    assert result.startswith("Error: sys_upload_file failed:"), result
+    assert captured == [], (
+        "upload_file followed a directory swapped for a symlink after the "
+        "containment check and uploaded a file outside the workspace"
+    )
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(
+    ("link", "target", "path"),
+    [
+        ("latest.txt", "output/chart.png", "latest.txt"),
+        ("current", "output", "current/chart.png"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upload_follows_symlinks_resolved_inside_workspace(
+    tmp_path: Path,
+    link: str,
+    target: str,
+    path: str,
+) -> None:
+    """
+    A file or directory symlink whose target stays in the workspace still
+    uploads the target's bytes.
+
+    :param tmp_path: Pytest-provided workspace root for the session.
+    :param link: Symlink created in the workspace, e.g. ``"current"``.
+    :param target: Workspace-relative symlink target, e.g. ``"output"``.
+    :param path: Upload path that goes through the symlink.
+    """
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output" / "chart.png").write_bytes(b"chart-bytes")
+    (tmp_path / link).symlink_to(tmp_path / target)
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        result = await _execute_file_tool(
+            "upload_file",
+            {"path": path},
+            client,
+            conversation_id=_CONVERSATION_ID,
+            agent_spec=None,
+            runner_workspace=tmp_path,
+        )
+    finally:
+        await client.aclose()
+
+    assert result == '{"file_id": "file_abc123", "filename": "chart.png"}', result
+    assert len(captured) == 1
+    assert b"chart-bytes" in captured[0].content
 
 
 @pytest.mark.asyncio

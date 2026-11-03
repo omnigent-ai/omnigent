@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
+import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -59,6 +61,59 @@ def safe_resolve(path: str, workspace: Path) -> Path:
         if not target.is_relative_to(workspace.resolve()):
             raise ValueError(f"Symlink escapes workspace: {path}")
     return resolved
+
+
+_OPEN_BENEATH_SUPPORTED = (
+    os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+)
+
+
+def safe_open(resolved: Path, workspace: Path) -> BinaryIO:
+    """
+    Open a path :func:`safe_resolve` accepted, keeping it confined at open time.
+
+    A component swapped for a symlink after the check would redirect a plain
+    ``open``, so each component below the workspace root is reopened with
+    ``O_NOFOLLOW``. Platforms without ``dir_fd`` support open by path.
+
+    :param resolved: Path returned by :func:`safe_resolve` for ``workspace``.
+    :param workspace: The workspace root directory.
+    :returns: The file opened for binary reading.
+    :raises ValueError: If the path is outside the workspace or is not a
+        regular file.
+    :raises OSError: If a component is missing or is now a symlink.
+    """
+    root = workspace.resolve()
+    parts = resolved.relative_to(root).parts
+    if _OPEN_BENEATH_SUPPORTED and parts:
+        fd = _open_beneath(root, parts)
+    else:
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(f"Not a regular file: {resolved.name}")
+    return os.fdopen(fd, "rb")
+
+
+def _open_beneath(root: Path, parts: tuple[str, ...]) -> int:
+    """
+    Open ``root/parts`` for reading without following a symlink below ``root``.
+
+    :param root: Resolved directory the walk starts from.
+    :param parts: Path components below ``root``; the last names the file.
+    :returns: A read-only descriptor for the file.
+    :raises OSError: If a component is missing, not a directory, or a symlink.
+    """
+    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        # O_NONBLOCK keeps a FIFO planted at the leaf from hanging the open.
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 class UploadFileTool(Tool):
@@ -125,14 +180,20 @@ class UploadFileTool(Tool):
         if not resolved.is_file():
             return f"Error: file not found: {rel_path}"
 
-        return _upload(resolved, session_id=ctx.conversation_id)
+        try:
+            file = safe_open(resolved, ctx.workspace)
+        except (OSError, ValueError) as exc:
+            return f"Error: {exc}"
+        with file:
+            return _upload(file, resolved.name, session_id=ctx.conversation_id)
 
 
-def _upload(resolved: Path, *, session_id: str | None) -> str:
+def _upload(file: BinaryIO, filename: str, *, session_id: str | None) -> str:
     """
     Read a file and upload it to the file store.
 
-    :param resolved: Absolute path to the file.
+    :param file: Open workspace file to read.
+    :param filename: Name to store the file under, e.g. ``"chart.png"``.
     :param session_id: Owning conversation/session id,
         e.g. ``"conv_abc123"``.
     :returns: JSON result string with file_id.
@@ -147,9 +208,8 @@ def _upload(resolved: Path, *, session_id: str | None) -> str:
     if session_id is None:
         return "Error: upload_file requires a session id"
 
-    filename = resolved.name
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    data = resolved.read_bytes()
+    data = file.read()
 
     file_record = file_store.create(
         filename=filename,
