@@ -6387,7 +6387,8 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
 
     The fork keeps everything before the item, drops the item and the turns
     after it, and never resumes the source's full native transcript. The
-    first item leaves nothing to copy; unknown or combined cutoffs fail.
+    first item leaves nothing to copy; unknown or combined cutoffs fail. A
+    fork that copies no items behaves the same and accepts no cutoff.
     """
     from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
 
@@ -6424,6 +6425,15 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
         conversation_store.fork_conversation(
             source.id, up_to_response_id="resp_001", before_item_id=second_prompt.id
         )
+
+    # ``copy_items=False`` copies nothing and, as a truncation, never resumes
+    # the source's native transcript; it takes no cutoff.
+    empty = conversation_store.fork_conversation(source.id, copy_items=False)
+    assert fork_texts(empty.id) == []
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in empty.labels
+    for cutoff in ({"before_item_id": second_prompt.id}, {"up_to_response_id": "resp_001"}):
+        with pytest.raises(ValueError, match="copy_items=False"):
+            conversation_store.fork_conversation(source.id, copy_items=False, **cutoff)
 
 
 def test_fork_clone_agent_is_session_scoped(
