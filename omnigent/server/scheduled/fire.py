@@ -360,9 +360,10 @@ UNATTENDED_RUN_NOTE = (
     "assumption, its basis and how easily it can be changed. For decisions that are "
     "hard to reverse, involve significant trade-offs or would likely surprise the user, "
     "record the options and your recommendation, and defer the affected work. Continue "
-    "independent work that does not depend on those decisions. If an action needs "
-    "approval or is denied, skip it and explain what was blocked and why; do not bypass "
-    "permission rules. Lead your final reply with unresolved decisions and assumptions, "
+    "independent work that does not depend on those decisions. If an action is denied or "
+    "requires unavailable approval, skip that action and explain the blocker. Continue "
+    "independent work and permitted alternatives. Do not change permission settings to "
+    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
     "prioritizing those the user is most likely to want to change, then summarize what "
     "you did and anything you couldn't do."
 )
