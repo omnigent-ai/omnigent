@@ -185,13 +185,13 @@ function assertLoginFailure(res, { errorMessage, errorAction, failure }) {
 // fixture CLIs, so each process-level failure is observed rather than simulated.
 describe("ensureServerAuth with a real login subprocess", () => {
   const SECRET_TICKET_URL = "https://example.test/auth/login?ticket=SECRET123";
-  const SECRET_TOKEN = "dapiSECRETTOKEN0123456789";
+  const FAKE_TOKEN = "example-token";
   const FIXTURE_SCRIPTS = {
     "succeeds.js": 'console.log("Logged in.");',
     "exits-3.js": "process.exit(3);",
     "prints-secrets.js": [
       `console.log("Opening browser for login: ${SECRET_TICKET_URL}");`,
-      `console.error("Authorization: Bearer ${SECRET_TOKEN}");`,
+      `console.error("Authorization: Bearer ${FAKE_TOKEN}");`,
       "process.exit(1);",
     ].join("\n"),
     "hangs.js": "setTimeout(() => {}, 20000);",
@@ -261,7 +261,7 @@ describe("ensureServerAuth with a real login subprocess", () => {
       failure: { kind: "exited", exitCode: 1 },
     });
     for (const field of [res.errorMessage, res.errorAction, res.error, JSON.stringify(res)]) {
-      assert.doesNotMatch(field, /ticket=|SECRET123|dapiSECRET|Bearer|example\.test/);
+      assert.doesNotMatch(field, /ticket=|SECRET123|example-token|Bearer|example\.test/);
       assert.ok(!field.includes(fixtureDir));
     }
   });
