@@ -631,7 +631,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
-  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
+  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
+  Manually, in a claude-sdk session with one finished turn, type `/cle` and
+  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
+  Enter. Each time the view moves to an empty chat on the same machine, and the
+  original chat ends with a notice linking to it. Menu and typed entry, and the
+  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under
