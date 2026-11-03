@@ -261,7 +261,7 @@ async def record_subagent_activity(
                     turn_id=child.labels.get("omnigent.claude_native.tool_use_id") or child.id,
                     status=completion_status,
                 )
-    except Exception:  # noqa: BLE001 — display metadata must not interrupt child delivery
+    except Exception:  # display metadata must not interrupt child delivery
         _logger.warning("Could not record subagent activity for %s", child_id, exc_info=True)
 
 
@@ -273,7 +273,7 @@ async def record_claude_subagent_return(
     """Match an actual Claude result to its child; launch handles are not results."""
     try:
         await _record_claude_subagent_return(parent_id, item, store)
-    except Exception:  # noqa: BLE001 — optional correlation must not interrupt transcript delivery
+    except Exception:  # optional correlation must not interrupt transcript delivery
         _logger.warning("Could not match Claude subagent result in %s", parent_id, exc_info=True)
 
 

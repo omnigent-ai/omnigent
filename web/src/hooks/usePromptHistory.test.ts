@@ -165,15 +165,15 @@ describe("usePromptHistory — per-conversation recall", () => {
     expect(storedHistory("conv_a")).toHaveLength(2);
 
     const { result } = renderHook(() => usePromptHistory("conv_a"));
-    expect(result.current.recallPrevious("in progress")).toEqual({ text });
+    expect(result.current.recallPrevious("")).toEqual({ text });
     expect(result.current.recallPrevious("unused")).toEqual({ text, replyDraft });
     expect(result.current.recallPrevious("unused")).toBeNull();
     expect(result.current.recallNext()).toEqual({ text });
-    expect(result.current.recallNext()).toEqual({ text: "in progress" });
+    expect(result.current.recallNext()).toEqual({ text: "" });
     expect(result.current.recallNext()).toBeNull();
   });
 
-  it("captures the structured current draft literally while navigating history", () => {
+  it("does not start recall over a structured draft", () => {
     const replyDraft: StoredReplyDraft = {
       version: 1,
       quotes: [{ before: "\n> authored\ncontinued\n\n", text: "A real quote" }],
@@ -182,8 +182,37 @@ describe("usePromptHistory — per-conversation recall", () => {
     const text = serializeReplyDraft(replyDraft);
     appendPromptHistoryEntry("earlier", "conv_a");
     const { result } = renderHook(() => usePromptHistory("conv_a"));
-    expect(result.current.recallPrevious(text, replyDraft)).toEqual({ text: "earlier" });
-    expect(result.current.recallNext()).toEqual({ text, replyDraft });
+    expect(result.current.recallPrevious(text, replyDraft)).toBeNull();
+    expect(result.current.recallNext()).toBeNull();
+  });
+
+  it.each(["unfinished draft", "line one\nline two", " \n "])(
+    "does not start recall over %j",
+    (draft) => {
+      appendPromptHistoryEntry("earlier", "conv_a");
+      const { result } = renderHook(() => usePromptHistory("conv_a"));
+      expect(result.current.recallPrevious(draft)).toBeNull();
+      expect(result.current.recallNext()).toBeNull();
+      expect(result.current.recallPrevious("")).toEqual({ text: "earlier" });
+    },
+  );
+
+  it("browses from an empty composer and protects edits after leaving recall", () => {
+    appendPromptHistoryEntry("older", "conv_a");
+    appendPromptHistoryEntry("newer", "conv_a");
+    const { result } = renderHook(() => usePromptHistory("conv_a"));
+
+    expect(result.current.recallPrevious("")).toEqual({ text: "newer" });
+    expect(result.current.recallPrevious("newer")).toEqual({ text: "older" });
+    expect(result.current.recallPrevious("older")).toBeNull();
+    expect(result.current.recallNext()).toEqual({ text: "newer" });
+    expect(result.current.recallNext()).toEqual({ text: "" });
+    expect(result.current.recallNext()).toBeNull();
+
+    expect(result.current.recallPrevious("")).toEqual({ text: "newer" });
+    result.current.resetCursor();
+    expect(result.current.recallPrevious("newer edited")).toBeNull();
+    expect(result.current.recallNext()).toBeNull();
   });
 
   it("keeps authored blockquotes literal in legacy and unsupported history entries", () => {
@@ -199,9 +228,9 @@ describe("usePromptHistory — per-conversation recall", () => {
       ]),
     );
     const { result } = renderHook(() => usePromptHistory("conv_a"));
-    expect(result.current.recallPrevious("\nunsent\n")).toEqual({ text: unsupported });
+    expect(result.current.recallPrevious("")).toEqual({ text: unsupported });
     expect(result.current.recallPrevious("")).toEqual({ text: legacy });
     expect(result.current.recallNext()).toEqual({ text: unsupported });
-    expect(result.current.recallNext()).toEqual({ text: "\nunsent\n" });
+    expect(result.current.recallNext()).toEqual({ text: "" });
   });
 });

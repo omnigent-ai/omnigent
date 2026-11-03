@@ -381,7 +381,9 @@ async def test_sigkill_signer_during_ucode_preflight_reaps_helper_tree(
     ucode.write_text(
         "#!/bin/sh\n"
         f"(trap '' TERM; while true; do sleep 1; done) >/dev/null 2>&1 &\n"
-        f"printf '%s' \"$!\" > {child_pid_path}\n"
+        # Publish atomically: the poll below must never read a created-but-empty file.
+        f"printf '%s' \"$!\" > {child_pid_path}.pending\n"
+        f"mv {child_pid_path}.pending {child_pid_path}\n"
         "trap '' TERM\n"
         "while true; do sleep 1; done\n",
         encoding="utf-8",

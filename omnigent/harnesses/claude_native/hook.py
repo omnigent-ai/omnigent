@@ -13,9 +13,9 @@ import sys
 import threading
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NoReturn, TextIO
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -224,13 +224,44 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(payload, dict):
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
-    bridge_dir = Path(args.bridge_dir)
+    output = record_hook_payload(
+        Path(args.bridge_dir), payload, conversation_url=args.conversation_url
+    )
+    if output is not None:
+        print(json.dumps(output))
+    return 0
+
+
+def record_hook_payload(
+    bridge_dir: Path,
+    payload: dict[str, object],
+    *,
+    conversation_url: str | None = None,
+    env: Mapping[str, str] | None = None,
+    diagnostics: TextIO | None = None,
+) -> dict[str, object] | None:
+    """
+    Record one Claude hook event for the forwarder.
+
+    The Python hook runs this, and so does the runner's relay for the hook
+    commands that post to it, passing the hook terminal's launch variables
+    as *env* and the session's hook stderr file as *diagnostics*.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param payload: Hook payload from Claude Code, e.g.
+        ``{"hook_event_name": "Stop", "session_id": "..."}``.
+    :param conversation_url: Legacy URL from old hook settings, used when no
+        active session URL can be built.
+    :param env: The hook terminal's environment; ``None`` reads this process's.
+    :param diagnostics: Where failure messages go; ``None`` is stderr.
+    :returns: The hook's output for Claude (the SessionStart banner), or ``None``.
+    """
     from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
 
-    record_hook_lifecycle(bridge_dir, payload, time.time())
+    record_hook_lifecycle(bridge_dir, payload, time.time(), env, diagnostics)
     if payload.get("hook_event_name") == "SessionEnd":
         # SessionEnd is diagnostic evidence, not a status or transcript change.
-        return 0
+        return None
     _annotate_resume_session_context(bridge_dir, payload)
     if payload.get("hook_event_name") == "SessionStart" and payload.get("source") == "clear":
         rotated_session_id = _rotate_session_on_clear(bridge_dir)
@@ -244,13 +275,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         record_hook_event(bridge_dir, payload)
     except Exception as exc:  # noqa: BLE001 - hook must not break Claude Code.
-        print(f"omnigent claude hook: failed to record hook: {exc}", file=sys.stderr)
-    conversation_url = _conversation_url_for_active_session(bridge_dir, args.conversation_url)
-    if conversation_url and payload.get("hook_event_name") == "SessionStart":
         print(
-            json.dumps({"systemMessage": (f"Open this session in Omnigent: {conversation_url}")})
+            f"omnigent claude hook: failed to record hook: {exc}",
+            file=sys.stderr if diagnostics is None else diagnostics,
         )
-    return 0
+    url = _conversation_url_for_active_session(bridge_dir, conversation_url)
+    if url and payload.get("hook_event_name") == "SessionStart":
+        return {"systemMessage": f"Open this session in Omnigent: {url}"}
+    return None
 
 
 def _annotate_resume_session_context(bridge_dir: Path, payload: dict[str, object]) -> None:
@@ -1074,6 +1106,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.native import policy_allow_cache
+
+    # Read before the session identity: a session switch picks a new
+    # generation, so an answer for the previous session opens no window.
+    cache_generation = policy_allow_cache.generation(bridge_dir)
     session_id = read_active_session_id(bridge_dir)
     if not session_id:
         return 0
@@ -1126,6 +1163,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
 
+    requested_at = time.time()
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -1146,6 +1184,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
         return _fail_closed()
 
+    # Through the relay the server evaluated the relay's session, which can
+    # trail a session switch.
+    if relay is None or relay[2] == session_id:
+        policy_allow_cache.record(bridge_dir, cache_generation, eval_response, requested_at)
     hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))

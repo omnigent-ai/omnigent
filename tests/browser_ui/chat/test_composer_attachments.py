@@ -27,6 +27,9 @@ _MEDIA_NAME = "clip.mp4"
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
+_TSV_NAME = "rows.tsv"
+_TSV_BODY = "a\tb\n1\t2\n"
+
 # A ZIP is a common input, such as an iCloud Photos export.
 _ZIP_NAME = "photos.zip"
 
@@ -130,6 +133,35 @@ def test_reject_unsupported_type(
     expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
 
 
+def test_attach_tsv_the_server_accepts(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Accept .tsv through the file input even when the OS reports a binary MIME."""
+    chat = chat_session_contract
+
+    page.goto(chat.url)
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    # Browsers that don't map .tsv to a text/* type grey the file out in the OS
+    # picker, so the extension has to be listed even though .csv rides text/*.
+    accept = file_input.get_attribute("accept")
+    assert accept is not None and ".tsv" in accept, (
+        f"composer file input should accept .tsv; got {accept!r}"
+    )
+    # A binary MIME forces classification to use the extension allowlist.
+    file_input.set_input_files(
+        {
+            "name": _TSV_NAME,
+            "mimeType": "application/octet-stream",
+            "buffer": _TSV_BODY.encode(),
+        }
+    )
+
+    expect(page.get_by_role("button", name=f"Remove {_TSV_NAME}")).to_be_visible(timeout=10_000)
+    expect(page.get_by_text("can't be attached", exact=False)).to_have_count(0)
+
+
 def test_landing_rejects_unsupported_type_and_keeps_message(
     page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path
 ) -> None:
@@ -162,7 +194,14 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
     expect(composer).to_be_visible(timeout=30_000)
 
     composer.fill("summarize these photos")
-    page.get_by_test_id("new-chat-landing-file-input").set_input_files(str(sample))
+    landing_input = page.get_by_test_id("new-chat-landing-file-input")
+    # This screen carries its own picker filter, so a .tsv dropped from the
+    # chat composer's list would still be greyed out here.
+    landing_accept = landing_input.get_attribute("accept")
+    assert landing_accept is not None and ".tsv" in landing_accept, (
+        f"landing file input should accept .tsv; got {landing_accept!r}"
+    )
+    landing_input.set_input_files(str(sample))
 
     # Rejected: no chip, and the reason names the file.
     expect(page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")).to_have_count(0)
