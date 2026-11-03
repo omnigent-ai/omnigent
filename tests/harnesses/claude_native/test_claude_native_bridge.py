@@ -13241,9 +13241,13 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=True),
     )
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="occupied by shell mode"):
+    with pytest.raises(
+        claude_native_bridge.ClaudeInputBoxOccupied, match="occupied by shell mode"
+    ) as refused:
         inject_user_message(bridge_dir, content="hello from the web")
 
+    # Nothing was typed, so the executor can hold the message until the box frees.
+    assert refused.value.surface == "shell mode"
     tails = [args[-1] for args in sends]
     assert tails and all(
         not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
@@ -14264,8 +14268,12 @@ def test_inject_slash_command_refuses_an_input_mode_that_survives_the_restore(
     sends = _fake_tmux(monkeypatch, [pane])
     clock = claude_native_bridge.time
 
-    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match=f"occupied by {surface}"):
+    with pytest.raises(
+        claude_native_bridge.ClaudeInputBoxOccupied, match=f"occupied by {surface}"
+    ) as refused:
         claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    assert refused.value.surface == surface
 
     tails = [args[-1] for args in sends]
     assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
