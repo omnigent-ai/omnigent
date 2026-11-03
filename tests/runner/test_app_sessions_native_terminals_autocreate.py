@@ -2639,6 +2639,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         **gateway_env,
         "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ENABLE_TOOL_SEARCH": "true",
+        "UG_NONINTERACTIVE": "1",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),

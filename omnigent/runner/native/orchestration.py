@@ -9871,11 +9871,11 @@ async def _auto_create_claude_terminal(
         ),
         command=launch_command,
         args=launch_args,
-        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
-        # etc.) when derived. Empty provider config still forces
-        # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
+        # Keep provider/tool routing and usage attribution without prompting
+        # in a pane that has no attached CLI client.
         env=build_native_claude_terminal_env(
             claude_config,
+            unattended=True,
             client_surface=resource_registry.client_surface(session_id),
         ),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
