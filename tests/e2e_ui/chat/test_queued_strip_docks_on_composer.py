@@ -59,6 +59,8 @@ def test_queued_strip_attaches_to_composer(
         record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
     )
     page = context.new_page()
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
 
     # Every message text POSTed to the /events endpoint, in arrival order.
     # Each is acked immediately; no session.status event ever follows, so

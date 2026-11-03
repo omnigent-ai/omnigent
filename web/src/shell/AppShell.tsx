@@ -1,4 +1,5 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
@@ -138,7 +139,6 @@ import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import { workspaceRecoveryDisabledReason } from "@/lib/sessionCapabilities";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -841,10 +841,7 @@ function AppShellImpl() {
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
-  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
-    serverConversationId,
-    activeConv,
-  );
+  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -2458,7 +2455,6 @@ function AppShellImpl() {
       currentSessionId: serverConversationId ?? null,
       canFork: canClone,
       disabledReason: forkDisabledReason,
-      workspaceRecoveryDisabledReason: workspaceRecoveryDisabledReason(forkSandboxProvider),
       openForkDialog: (opts) => {
         const sourceSessionId =
           opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
@@ -2480,7 +2476,7 @@ function AppShellImpl() {
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, forkSandboxProvider, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2702,7 +2698,9 @@ function AppShellImpl() {
                   data-session-id={conversationId}
                 >
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
-                    <Outlet />
+                    <RenderErrorBoundary name="this page" resetKey={location.pathname}>
+                      <Outlet />
+                    </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
 
@@ -2864,7 +2862,9 @@ function AppShellImpl() {
                   onClose={() => setGithubPanelOpen(false)}
                   testId="github-panel-drawer"
                 >
-                  <PullRequestPanel conversationId={conversationId} />
+                  <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                    <PullRequestPanel conversationId={conversationId} />
+                  </RenderErrorBoundary>
                 </MobilePanelDrawer>
               )}
               <div ref={setMobileFileTarget} className="md:hidden" />
