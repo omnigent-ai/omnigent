@@ -844,30 +844,49 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
 
 @pytest.mark.asyncio
-async def test_events_codex_native_approval_mode_change_during_a_turn_types_nothing(
+@pytest.mark.parametrize("active_turn_id", ["turn_running", None], ids=["busy", "idle"])
+async def test_events_codex_native_approval_mode_change_types_only_when_idle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    active_turn_id: str | None,
 ) -> None:
     """
     An approval-mode switch while Codex runs a turn is refused, not keyed in.
 
     Codex disables /permissions during a turn, and the Escape that opens it
     interrupts the turn and drops the message it carries. The 409 detail tells
-    the person why the mode did not change.
+    the person why the mode did not change. Once the session is idle the same
+    request drives the /permissions popup and reports the confirmed mode.
     """
     from tests.runner.helpers import make_test_terminal_instance
 
+    popup = (
+        "  Update Model Permissions\n\n"
+        "› 1. Ask for approval  Read and edit workspace files and run commands\n"
+        "  2. Full Access       Use with caution: Codex can edit files outside\n\n"
+        "  enter select · esc back\n"
+    )
     tmux_calls: list[tuple[str, ...]] = []
 
     def _recording_run_tmux(socket_path: str, *args: str) -> None:
         del socket_path
         tmux_calls.append(args)
 
+    def _fake_capture_pane(socket_path: str, target: str, **kwargs: Any) -> str:
+        del socket_path, target, kwargs
+        # The popup stays up until its Full Access row is picked; Codex then
+        # prints the confirmation line.
+        if any(call[-1] == "2" for call in tmux_calls):
+            return "• Permissions updated to Full Access\n"
+        return popup
+
     async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
         # Session creation would otherwise rewrite the bridge state below.
         del args, kwargs
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
     )
@@ -880,7 +899,7 @@ async def test_events_codex_native_approval_mode_change_during_a_turn_types_noth
             socket_path="ws://127.0.0.1:43210",
             thread_id="thread_codex",
             codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_running",
+            active_turn_id=active_turn_id,
         ),
     )
     terminal_registry = TerminalRegistry()
@@ -903,8 +922,26 @@ async def test_events_codex_native_approval_mode_change_during_a_turn_types_noth
             json={"type": "codex_approval_mode_change", "approval_mode": "full-access"},
         )
 
+    if active_turn_id is None:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"approval_mode": "full-access"}
+        target = instance.tmux_target
+        assert tmux_calls == [
+            ("send-keys", "-t", target, "Escape"),
+            ("send-keys", "-t", target, "C-u"),
+            ("send-keys", "-l", "-t", target, "/permissions"),
+            ("send-keys", "-t", target, "Enter"),
+            ("send-keys", "-l", "-t", target, "2"),
+            ("send-keys", "-l", "-t", target, "1"),
+        ]
+        return
     assert resp.status_code == 409, resp.text
-    assert resp.json()["error"] == "codex_native_approval_mode_busy"
+    body = resp.json()
+    assert body["error"] == "codex_native_approval_mode_busy"
+    assert body["detail"] == (
+        "Codex is working on a turn. Change the approval mode after it finishes, "
+        "or stop the turn first."
+    )
     assert tmux_calls == []
 
 
