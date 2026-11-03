@@ -1226,7 +1226,7 @@ def test_daemon_entry_keys_by_workspace_but_connects_to_the_bare_url(
     monkeypatch.setattr(
         connect,
         "run_host_process",
-        lambda *, server_url, daemon_target, lifecycle_lock: seen.update(
+        lambda *, server_url, daemon_target, lifecycle_lock, server_still_ours: seen.update(
             server_url=server_url, daemon_target=daemon_target
         ),
     )
