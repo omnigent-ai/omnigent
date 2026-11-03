@@ -16,6 +16,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
+from omnigent.runtime import workflow
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
@@ -12658,10 +12660,37 @@ def _isolate_to_connect_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         lambda *a, **k: None,
     )
-    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
     monkeypatch.setattr(
         "omnigent.onboarding.detected.effective_config_with_detected", lambda cfg: cfg
     )
+
+
+def test_connect_fallback_isolation_does_not_leak_provider_stub() -> None:
+    """A fresh interpreter must restore provider aliases imported during isolation."""
+    program = """
+import pytest
+from omnigent.onboarding import provider_config
+
+original = provider_config.default_provider_for_harness
+from tests.harnesses.claude_native.test_claude_native import _isolate_to_connect_fallback
+
+with pytest.MonkeyPatch.context() as monkeypatch:
+    _isolate_to_connect_fallback(monkeypatch)
+
+from omnigent.runtime import workflow
+assert provider_config.default_provider_for_harness is original
+assert workflow.default_provider_for_harness is original
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_resolve_native_claude_config_connect_broker_fallback(

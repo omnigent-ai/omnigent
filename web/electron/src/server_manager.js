@@ -342,10 +342,15 @@ async function ensureServerAuth(cliCommand, serverUrl, { onLogin } = {}) {
   // (`…/auth/login?ticket=…`), which is auth material; threading it to the
   // renderer would leak it. The server URL alone is safe (the renderer already
   // knows it).
+  const displayName = cli.cliCommandParts(cliCommand).displayName;
+  const errorMessage = `Sign-in to ${serverUrl} didn't complete. A browser window should have opened.`;
+  const errorAction = `Finish signing in and try again (or run \`${displayName} login ${serverUrl}\` in a terminal).`;
   return {
     ok: false,
     authError: true,
-    error: `Sign-in to ${serverUrl} didn't complete. A browser window should have opened. Finish signing in and try again (or run \`${cli.cliCommandParts(cliCommand).displayName} login ${serverUrl}\` in a terminal).`,
+    error: `${errorMessage} ${errorAction}`,
+    errorMessage,
+    errorAction,
   };
 }
 
