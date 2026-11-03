@@ -49,7 +49,7 @@ requirement that the permanent origin label alone cannot change approval behavio
 | Boundary | Current behavior | Required change |
 | --- | --- | --- |
 | Scheduler dispatch | `_prompt_event` sends ordinary user text plus a note. New and continued runs use it. | Issue an immutable dispatch identity and unattended origin separately from prompt text. |
-| Managed startup | `SessionStartupInputs` persists and reconstructs the message before forwarding. | Persist provenance with the input and replay it unchanged on another replica. |
+| Managed startup | `ManagedStartupInputs` persists and reconstructs the message before forwarding. | Persist provenance with the input and replay it unchanged on another replica. |
 | Runner queue | Native messages drain separately; SDK messages may be combined. Mid-turn SDK messages may be injected. | Bind provenance when a turn starts; do not combine different origins or change an active turn's origin. |
 | Recovery | Runner cold-start and native reconnect paths reconstruct work from history or existing harness state. | Restore the original dispatch context; missing context for known unattended work must not become interactive. |
 | Policy endpoint | Evaluation carries phase, data and session identity. `turn_actor` is written before the runner queues input. | Carry an authenticated dispatch/turn reference on each evaluation, including retries. |
