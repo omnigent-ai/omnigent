@@ -520,14 +520,18 @@ def register_core_routes(
         except Exception:
             # The create fails, so leave no session (or uploaded file) for a retry
             # to duplicate.
-            if file_store is not None:
-                blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
-                if artifact_store is not None:
-                    for blob_key in blob_keys:
-                        with contextlib.suppress(Exception):
-                            await asyncio.to_thread(artifact_store.delete, blob_key)
-            await conversation_store.delete_conversation(session_id)
+            await _delete_unreturned_session(session_id)
             raise
+
+    async def _delete_unreturned_session(session_id: str) -> None:
+        """Delete a session whose creating request failed, with its unshared files."""
+        if file_store is not None:
+            blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+            if artifact_store is not None:
+                for blob_key in blob_keys:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(artifact_store.delete, blob_key)
+        await conversation_store.delete_conversation(session_id)
 
     async def _schedule_managed_launch(
         request: Request,
@@ -4579,7 +4583,8 @@ def register_core_routes(
         included) and run settings and only the history before
         *before_item_id*. It is bound to the source's host and workspace and
         to its live runner, and the source gets a notice linking to it plus a
-        ``session.superseded`` redirect for live viewers.
+        ``session.superseded`` redirect for live viewers. A fork that cannot
+        be placed is deleted again.
 
         :param request: The incoming request, whose caller must own *source*.
         :param source: Session to supersede.
@@ -4626,12 +4631,13 @@ def register_core_routes(
                 source, request.app.state, conversation_store
             )
         host_bound = source.host_id is not None and source.workspace is not None
+        runner_offline = OmnigentError(
+            f"Can't run {command} while this session's runner is offline. "
+            "Reconnect the session (send a message to wake it), then try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
         if not runner_online and not host_bound:
-            raise OmnigentError(
-                f"Can't run {command} while this session's runner is offline. "
-                "Reconnect the session (send a message to wake it), then try again.",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
+            raise runner_offline
         if prepare is not None:
             await prepare()
 
@@ -4642,22 +4648,38 @@ def register_core_routes(
             before_item_id=before_item_id,
             keep_sandbox_labels=True,
         )
-        if source.host_id is not None and source.workspace is not None:
-            await asyncio.to_thread(
-                conversation_store.set_host_id,
-                fork.id,
-                source.host_id,
-                source.workspace,
-                source.git_branch,
-            )
-        if runner_online:
-            assert source.runner_id is not None
-            await _update_session(
-                request,
-                fork.id,
-                UpdateSessionRequest(runner_id=source.runner_id),
-                include_usage=False,
-            )
+        runner_bound = runner_online
+        try:
+            if host_bound:
+                assert source.host_id is not None and source.workspace is not None
+                await asyncio.to_thread(
+                    conversation_store.set_host_id,
+                    fork.id,
+                    source.host_id,
+                    source.workspace,
+                    source.git_branch,
+                )
+            if runner_online:
+                assert source.runner_id is not None and runner_router is not None
+                try:
+                    await _update_session(
+                        request,
+                        fork.id,
+                        UpdateSessionRequest(runner_id=source.runner_id),
+                        include_usage=False,
+                    )
+                except Exception:
+                    if runner_router.runner_is_online(source.runner_id):
+                        raise
+                    # The runner left after the check: a host-bound fork
+                    # relaunches on its host, as with an offline runner.
+                    if not host_bound:
+                        raise runner_offline from None
+                    runner_bound = False
+        except Exception:
+            # Leave no announced fork for a retry to duplicate.
+            await _delete_unreturned_session(fork.id)
+            raise
 
         await _persist_external_conversation_item(
             source.id,
@@ -4684,7 +4706,7 @@ def register_core_routes(
                 session_id=source.id,
                 target_session_id=fork.id,
                 command=command,
-                runner_bound=runner_online,
+                runner_bound=runner_bound,
             ),
         )
         return fork.id

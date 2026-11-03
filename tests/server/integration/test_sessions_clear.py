@@ -12,7 +12,7 @@ SDK client.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -158,6 +158,7 @@ class LiveRunner:
     clear_status: int = 200
     posts: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     superseded: list[tuple[str, str, str]] = field(default_factory=list)
+    on_clear: Callable[[], None] | None = None
 
 
 @asynccontextmanager
@@ -171,6 +172,8 @@ async def install_live_runner(
         body = json.loads(request.content) if request.content else {}
         state.posts.append((request.url.path, body))
         if body.get("type") == "clear":
+            if state.on_clear is not None:
+                state.on_clear()
             return httpx.Response(state.clear_status, json={"error": "busy"})
         return httpx.Response(201 if request.url.path == "/v1/sessions" else 200, json={})
 
@@ -394,6 +397,44 @@ async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_repl
     fork = store.get_conversation(resp.json()["session_id"])
     assert fork is not None
     assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
+
+
+@pytest.mark.parametrize("host", [True, False], ids=["host-bound", "runner-only"])
+async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    host: bool,
+) -> None:
+    """A runner that disconnects after the check leaves no half-made session.
+
+    A host-bound session still continues on the host alone; otherwise the new
+    session is removed, so a retry does not leave a second copy.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(client, store, host=host)
+    live_runner.on_clear = lambda: app.state.tunnel_registry.deregister(_RUNNER_ID)
+    before = len((await client.get("/v1/sessions")).json()["data"])
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    if host:
+        assert resp.status_code == 202, resp.text
+        new_id = resp.json()["session_id"]
+        fork = store.get_conversation(new_id)
+        assert fork is not None
+        assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
+        assert live_runner.superseded == [(source_id, new_id, "clear")]
+        return
+    assert resp.status_code == 503, resp.text
+    assert "runner is offline" in resp.text
+    assert len((await client.get("/v1/sessions")).json()["data"]) == before
+    assert live_runner.superseded == []
 
 
 @pytest.mark.parametrize(
