@@ -238,7 +238,7 @@ def test_transcript_and_agents_tab_reuse_one_tab_and_close_keeps_child_running(
 
     page.goto(f"{sub.base_url}/c/{sub.parent_id}")
     notice = page.get_by_test_id("subagent-activity")
-    expect(notice).to_contain_text(f"Started {_CHILD_NAME}", timeout=30_000)
+    expect(notice).to_contain_text(f"{_CHILD_NAME} started working", timeout=30_000)
     _hold_for_recording(page, 800)
     notice.get_by_role("link", name=_CHILD_NAME, exact=True).click()
 
