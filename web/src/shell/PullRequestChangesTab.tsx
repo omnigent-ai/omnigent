@@ -640,7 +640,11 @@ export function PullRequestChangesTab({
     const file = files.find(
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
-    if (file) jumpTo(file.path);
+    if (file) {
+      // A thread on a filtered-out file has no mounted section, so show it first.
+      if (!visibleFiles.includes(file)) view.setPathFilter("");
+      jumpTo(file.path);
+    }
     setFocusedThread({ id: next.id });
   };
 

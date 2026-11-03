@@ -16,7 +16,7 @@ export function filterChangedPaths(
   );
 }
 
-/** The files the Changes tab shows: those matching the path filter and not hidden by current path. */
+/** Files matching the path filter, excluding those whose current `path` is in `hiddenPaths`. */
 export function selectVisibleFiles(
   files: PullRequestChangedFile[],
   opts: { pathFilter: string; hiddenPaths: ReadonlySet<string> },
