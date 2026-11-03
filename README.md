@@ -470,8 +470,9 @@ Each user can also add personal requirements under Settings → General →
 them per user and adds them after the server's `session_title_instructions`
 when titling that user's sessions; where the two conflict, the personal ones
 win. Leave the field blank to use only the server setting or the default
-prompt. Runners older than this server reject combined instructions over 4,000
-characters, which leaves the first-message title in place.
+prompt. Runners older than this server accept at most 4,000 characters, so for
+them the server shortens longer guidance: it drops the language rule first,
+then the server's instructions, and keeps the personal ones.
 
 Claude Code sessions generate titles with the `haiku` model alias. If that
 model answers the message instead of returning a title, set

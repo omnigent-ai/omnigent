@@ -6,7 +6,11 @@ import uuid
 
 import pytest
 
-from omnigent.runner.background_titles.service import FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+from omnigent.runner.background_titles.service import (
+    CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
+    FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
+    LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS,
+)
 from omnigent.server.background_session_titles import (
     BACKGROUND_SESSION_TITLES_HEADER,
     BACKGROUND_TITLE_MAX_CHARS,
@@ -18,6 +22,7 @@ from omnigent.server.background_session_titles import (
     compose_session_title_instructions,
     normalize_background_title,
     prepare_background_session_title,
+    runner_title_instructions,
 )
 from omnigent.server.schemas import BackgroundSessionTitleRequest, SessionEventInput
 from omnigent.server.server_config import SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
@@ -510,17 +515,27 @@ class _FakeRunnerClient:
 
 class _FakeRoutedRunner:
     def __init__(self, client: _FakeRunnerClient) -> None:
+        self.runner_id = "runner_test"
         self.client = client
 
 
 class _FakeRunnerRouter:
-    def __init__(self, client: _FakeRunnerClient) -> None:
+    def __init__(
+        self,
+        client: _FakeRunnerClient,
+        capabilities: tuple[str, ...] = (CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,),
+    ) -> None:
         self.client = client
+        self.capabilities = capabilities
         self.session_ids: list[str] = []
 
     def client_for_existing_conversation(self, session_id: str) -> _FakeRoutedRunner:
         self.session_ids.append(session_id)
         return _FakeRoutedRunner(self.client)
+
+    def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+        assert runner_id == "runner_test"
+        return capability in self.capabilities
 
 
 async def test_runner_generator_posts_session_configuration() -> None:
@@ -587,6 +602,89 @@ async def test_runner_accepts_combined_server_and_owner_instructions_at_their_li
     body = BackgroundSessionTitleRequest.model_validate(client.requests[0][1])
     assert body.additional_instructions is not None
     assert body.additional_instructions.endswith(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
+
+
+_LIMIT = LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS
+_SERVER_RULE = "s" * 3000
+_OWNER_RULE = "u" * 900
+
+
+@pytest.mark.parametrize(
+    ("combined", "owner", "expected"),
+    [
+        pytest.param("Short rule.", "Short rule.", "Short rule.\n{language}", id="fits"),
+        pytest.param("u" * _LIMIT, "u" * _LIMIT, "u" * _LIMIT, id="drops-language-rule"),
+        pytest.param(
+            compose_session_title_instructions(_SERVER_RULE, _OWNER_RULE),
+            _OWNER_RULE,
+            _OWNER_RULE + "\n{language}",
+            id="drops-server-guidance",
+        ),
+        pytest.param(
+            compose_session_title_instructions("s" * _LIMIT, "u" * _LIMIT),
+            "u" * _LIMIT,
+            "u" * _LIMIT,
+            id="keeps-owner-guidance-only",
+        ),
+    ],
+)
+async def test_legacy_runner_instructions_fit_the_old_limit(
+    combined: str, owner: str, expected: str
+) -> None:
+    request = BackgroundTitleRequest(
+        session_id="conv_test",
+        prompt="hello",
+        additional_instructions=combined,
+        owner_instructions=owner,
+    )
+
+    fitted = runner_title_instructions(request, long_supported=False)
+
+    assert fitted == expected.format(language=FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
+    assert len(fitted) <= _LIMIT
+
+
+async def test_capable_runner_receives_full_instructions() -> None:
+    combined = compose_session_title_instructions("s" * _LIMIT, "u" * _LIMIT)
+    request = BackgroundTitleRequest(
+        session_id="conv_test",
+        prompt="hello",
+        additional_instructions=combined,
+        owner_instructions="u" * _LIMIT,
+    )
+
+    assert runner_title_instructions(request, long_supported=True) == (
+        f"{combined}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
+    )
+
+
+async def test_old_runner_still_titles_with_owner_instructions_at_the_limit(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Investigate authentication timeout")
+    client = _FakeRunnerClient()
+    owner_rule = "u" * SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client, capabilities=())),  # type: ignore[arg-type]
+        user_instructions=lambda _session_id: owner_rule,
+    )
+
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="please investigate the authentication timeout",
+        expected_seed_title="Investigate authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+    renamed = await coordinator.format_agent_title(
+        BackgroundTitleRequest(session_id=session_id, prompt="Auth timeout")
+    )
+
+    assert store.get_conversation(session_id).title == "Debug authentication timeout"
+    assert renamed == "Debug authentication timeout"
+    assert [body["additional_instructions"] for _url, body in client.requests] == [
+        owner_rule,
+        owner_rule,
+    ]
 
 
 async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:
@@ -795,21 +893,4 @@ async def test_agent_title_uses_owner_instructions_without_server_default(db_uri
 
     assert title == "🔐 Auth timeout"
     assert [request.additional_instructions for request in seen] == ["Start titles with an emoji."]
-
-
-async def test_agent_title_without_any_instructions_keeps_proposal(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-
-    async def generator(_request: BackgroundTitleRequest) -> str:
-        raise AssertionError("no generation without instructions")
-
-    coordinator = BackgroundSessionTitleCoordinator(
-        store, generator, user_instructions=lambda _session_id: None
-    )
-
-    assert (
-        await coordinator.format_agent_title(
-            BackgroundTitleRequest(session_id="conv_owner", prompt="Auth timeout")
-        )
-        == "Auth timeout"
-    )
+    assert [request.owner_instructions for request in seen] == ["Start titles with an emoji."]

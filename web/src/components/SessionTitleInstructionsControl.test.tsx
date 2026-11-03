@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
 import { SessionTitleInstructionsControl } from "./SessionTitleInstructionsControl";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   getSessionTitleInstructions,
   saveSessionTitleInstructions,
@@ -19,11 +18,7 @@ const getMock = vi.mocked(getSessionTitleInstructions);
 const saveMock = vi.mocked(saveSessionTitleInstructions);
 
 function renderControl() {
-  return render(
-    <TooltipProvider>
-      <SessionTitleInstructionsControl />
-    </TooltipProvider>,
-  );
+  return render(<SessionTitleInstructionsControl />);
 }
 
 async function loadedInput(): Promise<HTMLTextAreaElement> {

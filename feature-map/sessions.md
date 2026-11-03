@@ -28,7 +28,8 @@ the header menu), and each place is a separate entry point.
 - `title-instructions`: Settings → General → Sessions → **Title instructions**
   saves personal guidance (up to 4,000 characters) for automatic titles of
   sessions you own. The server adds it after any operator
-  `session_title_instructions`; Clear restores the default prompt.
+  `session_title_instructions`; Clear removes only the personal guidance, so
+  titles fall back to the operator setting or, without one, the default prompt.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
