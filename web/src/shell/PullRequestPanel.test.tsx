@@ -387,6 +387,98 @@ afterEach(() => {
 });
 
 describe("PullRequestPanel", () => {
+  it.each([
+    { mobile: false, multiple: false },
+    { mobile: true, multiple: false },
+    { mobile: false, multiple: true },
+    { mobile: true, multiple: true },
+  ])(
+    "restores cached PR details after session switches and remounts ($mobile, $multiple)",
+    async ({ mobile, multiple }) => {
+      state.realPrHooks = true;
+      const url = state.info!.data!.pr!.url;
+      const payload = {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "acme/app",
+            number: 6000,
+            relationship: "attached",
+          },
+        ],
+      };
+      if (multiple) {
+        payload.prs.push({ ...payload.prs[0]!, url: `${url}1`, number: 60001 });
+      }
+      let refreshing = false;
+      const fetchMock = vi.fn(() =>
+        refreshing
+          ? new Promise<Response>(() => {})
+          : Promise.resolve(new Response(JSON.stringify(payload))),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const user = userEvent.setup();
+      const { client, rerender } = renderPanel(mobile);
+      if (multiple) {
+        await user.click(
+          await screen.findByRole("button", { name: "acme/app #6000 — chore: dummy PR" }),
+        );
+      }
+      await waitFor(() => {
+        expect(client.getQueryData(["github-info", "conv_1", url])).toBeDefined();
+      });
+      await user.click(await screen.findByRole("tab", { name: "Comments" }));
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      // A subsequent poll replaces the original response in the shared cache.
+      payload.pr = { ...payload.pr!, title: "Updated by polling" };
+      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      expect(await screen.findByText("Updated by polling")).toBeVisible();
+
+      expect(client.getQueryData(["pull-request-panel-view", "conv_1"])).toMatchObject({
+        subtab: "comments",
+      });
+      rerender(<PullRequestPanel conversationId="conv_other" />);
+      if (multiple) {
+        expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+      } else {
+        expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      }
+      fetchMock.mockClear();
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Updated by polling")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // Even a stale response remains visible while the return refresh is pending.
+      rerender(<div />);
+      await act(() =>
+        client.invalidateQueries({ queryKey: ["github-info", "conv_1"], refetchType: "none" }),
+      );
+      refreshing = true;
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Updated by polling")).toBeVisible();
+      expect(screen.getByRole("tab", { name: "Comments" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByText("Loading pull requests…")).toBeNull();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    },
+  );
+
   it.each(["UNKNOWN", "BLOCKED", "error"])(
     "keeps compact confirmation and pending refusal through a polling transition: %s",
     async (transition) => {
@@ -1321,6 +1413,23 @@ describe("PullRequestPanel", () => {
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
+  it("collapses a jumped-to file from its header and keeps collapse across tabs", async () => {
+    renderChanges();
+    await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Collapse all diffs" })).toBeInTheDocument();
+    // The jump expanded the file only temporarily; one header click closes it again.
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: false })).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    await screen.findAllByTestId("diff");
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: false })).toBeInTheDocument();
+  });
+
   it("collapses a file's diff when its section header is clicked", async () => {
     renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
@@ -1340,6 +1449,14 @@ describe("PullRequestPanel", () => {
     // The same button now offers the inverse action.
     fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
+
+    // A file revealed by a jump counts as expanded, and collapse all closes it.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(screen.queryAllByTestId("diff")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Expand all diffs" })).toBeInTheDocument();
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {

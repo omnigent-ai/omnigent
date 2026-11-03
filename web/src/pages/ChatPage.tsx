@@ -854,23 +854,18 @@ export function ChatPage() {
     launchedAt: runnerLaunchedAt,
   });
 
-  // Browser tab title: "● Title" while the main session is working so
-  // background tabs signal parent activity without duplicating child-session
-  // badges from the sidebar/Agents rail. An open-but-untitled session
-  // (no synthesized title yet) reads as "New session" to match its
-  // sidebar row; the landing page (no active session) stays "Omnigent".
-  // Sub-agent (child) sessions are absent from the sidebar list, so
-  // ``activeConv`` is null and the title would otherwise read "New session";
-  // name the tab after the sub-agent instead, mirroring the header.
-  const subAgentTabTitle =
+  // Browser tab title mirrors the header; "● " flags main-session work in background tabs.
+  // Sessions missing from the loaded sidebar rows use their snapshot (sub-agent name for
+  // children), and untitled sessions read "New session" to match their sidebar row.
+  const sessionTabTitle =
     activeSession?.parentSessionId != null
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
-      : null;
+      : (activeSession?.title ?? null);
   useEffect(() => {
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
-    const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
+    const base = truncateTitle(activeConv?.title || sessionTabTitle || fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, sessionTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const llmModel = useChatStore((s) => s.llmModel);
@@ -961,14 +956,23 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
-  const { reconnect, reconnectsArca, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
-    useSessionReconnect({
-      sessionId: urlConvId ?? null,
-      hostId: reconnectHostId,
-      hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
-      hostResumable: activeSession?.hostResumable ?? false,
-      isOwner: isOwnerLevel(permissionLevel),
-    });
+  const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
+  const {
+    reconnect,
+    reconnectsArca,
+    sandboxStarting,
+    dialogOpen,
+    setDialogOpen,
+    localReconnect,
+    arcaReconnect,
+  } = useSessionReconnect({
+    sessionId: urlConvId ?? null,
+    hostId: reconnectHostId,
+    hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
+    hostResumable: activeSession?.hostResumable ?? false,
+    hostOnline: reconnectHostOnline,
+    isOwner: isOwnerLevel(permissionLevel),
+  });
   // A message to an offline Arca host reconnects it from the desktop and waits
   // in the queue until the host is back.
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
@@ -1226,6 +1230,7 @@ export function ChatPage() {
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
       sendReconnectsArca={sendReconnectsArca}
+      sandboxStarting={sandboxStarting}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1381,6 +1386,8 @@ interface MainAgentSurfaceProps {
   onShowReconnectHelp: () => void;
   /** Sending reconnects the offline Arca host, so the composer stays enabled. */
   sendReconnectsArca: boolean;
+  /** Reconnect host is waking this session's sandbox; the composer host dot spins. */
+  sandboxStarting: boolean;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   /** Whether older messages exist that haven't been loaded yet. */
@@ -1557,6 +1564,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   onStop,
   onShowReconnectHelp,
   sendReconnectsArca,
+  sandboxStarting,
   agents,
   selectedAgentId,
   hasMoreHistory,
@@ -1908,6 +1916,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
             }
             sendReconnectsArca={sendReconnectsArca}
+            sandboxStarting={sandboxStarting}
             onShowReconnectHelp={onShowReconnectHelp}
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
@@ -2060,6 +2069,8 @@ interface ComposerProps {
    * enabled while `unreachable`, and the placeholder says so.
    */
   sendReconnectsArca?: boolean;
+  /** Reconnect host is waking this session's sandbox; the host badge's dot spins. */
+  sandboxStarting?: boolean;
   /**
    * Open the reconnect help dialog. Always wired to the status line's host
    * badge, which turns itself into a clickable reconnect affordance whenever
@@ -2359,6 +2370,7 @@ function ComposerImpl(
     isNativeWrapper = false,
     unreachable = false,
     sendReconnectsArca = false,
+    sandboxStarting = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
     subAgentLabel = null,
@@ -3989,6 +4001,7 @@ function ComposerImpl(
             prs={composerGit.prs}
             prStatus={composerGit.prStatus}
             onOpen={openComposerGithubTab}
+            conversationId={composerSessionId ?? undefined}
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
             <div
@@ -4264,6 +4277,7 @@ function ComposerImpl(
                   appearance="composer"
                   readOnly={isReadOnly}
                   onReconnect={onShowReconnectHelp}
+                  starting={sandboxStarting}
                 />
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (

@@ -393,6 +393,8 @@ _SCHEDULED_TASK_SETTINGS = (
 _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
+_SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+
 
 def _clip(value: str) -> str:
     """Bound a preview value, marking the cut so it cannot pass for the whole value."""
@@ -405,15 +407,11 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
     """``key=value`` pairs for every argument but ``skip``, each value bounded.
 
     Known settings come first and are never dropped; other arguments follow and
-    are capped as a group. The free-text prompt can be long enough to push the
-    settings out of the card's truncated argument preview, so it is reported by
-    length only.
+    are capped as a group. The free-text prompt is rendered separately in full.
     """
 
     def pair(key: str) -> str:
         value = str(args[key])
-        if key == "prompt":
-            return f"prompt={len(value)} chars"
         return f"{key}={_clip(value)}"
 
     known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
@@ -430,6 +428,66 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
         extra.append(item)
         remaining -= size
     return ", ".join([*known, *extra])
+
+
+def scheduled_task_review_error(
+    args: dict[str, object], *, action: str, require_complete: bool = True
+) -> str | None:
+    """Validate review values, allowing omitted fields only for legacy callers."""
+    missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
+    if require_complete and missing:
+        hint = (
+            "List the task and retry with its full prompt and permission_mode."
+            if action == "update"
+            else "Retry with prompt and permission_mode (null for the agent default)."
+        )
+        return f"Missing review fields ({', '.join(missing)}). {hint}"
+    if "prompt" in args or action == "create":
+        prompt = args.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return "The automation prompt must be a non-empty string."
+    if "permission_mode" in args:
+        mode = args["permission_mode"]
+        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
+            return "permission_mode must be a non-empty string or null for the agent default."
+    if action == "update" and not args.get("scheduled_task_id"):
+        return "Provide the scheduled_task_id of the automation to update."
+    return None
+
+
+def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
+    """Render supplied instructions in full and identify legacy omissions."""
+    prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    raw_permission_mode = args.get("permission_mode")
+    permission_mode = (
+        "agent default (no task override)"
+        if raw_permission_mode is None
+        else str(raw_permission_mode)
+    )
+    legacy_notice = ""
+    if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
+        legacy_notice = (
+            "Legacy partial update: some review values were not supplied. "
+            "Inspect the existing automation before approving.\n"
+        )
+        if "permission_mode" not in args:
+            permission_mode = (
+                "existing override retained if agent_id is unchanged; "
+                "cleared to agent default (no task override) if agent_id changes "
+                "(not supplied by legacy caller)"
+                if "agent_id" in args
+                else "unchanged (not supplied by legacy caller)"
+            )
+    settings = _scheduled_task_settings(args, skip="prompt")
+    return (
+        f"Agent wants to {action} {subject}.\n"
+        f"{legacy_notice}"
+        f"Effective task permission mode: {permission_mode}\n"
+        f"Settings: {settings or '(none)'}\n"
+        "Full automation instructions:\n"
+        f"{prompt}\n"
+        "Approve?"
+    )
 
 
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
@@ -454,19 +512,28 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     if not isinstance(args, dict):
         args = {}
     action = "create" if tool == "sys_scheduled_task_create" else "update"
-    if not args:
-        preview = f"{action} a scheduled task (details unavailable)"
-    elif action == "create":
+    # Older runners expose optional review fields. Current runners enforce the
+    # complete contract before dispatch, including when paired with an old server.
+    error = scheduled_task_review_error(args, action=action, require_complete=False)
+    if error:
+        return {"result": "DENY", "reason": f"Cannot {action} a scheduled task. {error}"}
+    if action == "create":
         name = _clip(str(args.get("name") or "(unnamed)"))
-        settings = _scheduled_task_settings(args, skip="name")
-        preview = f"create scheduled task {name!r} ({settings or 'no settings'})"
+        review = _scheduled_task_review(
+            args,
+            action="create",
+            subject=f"scheduled task {name!r}",
+        )
     else:
         task_id = _clip(str(args.get("scheduled_task_id") or "(no id)"))
-        settings = _scheduled_task_settings(args, skip="scheduled_task_id")
-        preview = f"update scheduled task {task_id} ({settings or 'no fields'})"
+        review = _scheduled_task_review(
+            args,
+            action="update",
+            subject=f"scheduled task {task_id}",
+        )
     return {
         "result": "ASK",
-        "reason": f"Agent wants to {preview}. Approve?",
+        "reason": review,
     }
 
 
