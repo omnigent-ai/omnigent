@@ -5679,16 +5679,8 @@ function failureKey(block: ErrorBlock): string {
 }
 
 /**
- * Drop status-only error cards whose failure a persisted error item now carries.
- *
- * A `failed` status can deliver a failure before its transcript item reaches
- * this client. The status card has no item id, so an id-based history merge
- * keeps both, and once other content lands between them they render as two
- * cards. The persisted item is the durable copy, so it wins.
- *
- * @param liveBlocks - Blocks the live pump produced.
- * @param historyBlocks - Blocks translated from persisted items.
- * @returns `liveBlocks` without the status cards history now carries.
+ * Status cards lack item ids, so history merges cannot deduplicate them by id.
+ * Prefer persisted errors matching response id, code, and message.
  */
 function withoutPersistedStatusErrors(
   liveBlocks: AnyBlock[],
