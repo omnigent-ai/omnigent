@@ -3168,7 +3168,9 @@ def _patch_auth_preflight(
     )
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(probe_status))
     # Scripted unauthenticated probes must not discover real SDK/CLI credentials.
-    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
+    monkeypatch.setattr(
+        cli, "_databricks_workspace_auth_info", lambda workspace, org_id=None: None
+    )
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
@@ -3262,7 +3264,9 @@ def test_databricks_preflight_rejects_workspace_mismatch(
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
-        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh", profile_name=None),
+        lambda workspace, org_id=None: cli._DatabricksWorkspaceAuthInfo(
+            token="fresh", profile_name=None
+        ),
     )
     monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
 
@@ -3462,7 +3466,9 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
-        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+        lambda workspace, org_id=None: cli._DatabricksWorkspaceAuthInfo(
+            token="fresh-token", profile_name=None
+        ),
     )
     monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: "123")
@@ -3515,7 +3521,7 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
-        lambda workspace: cli._DatabricksWorkspaceAuthInfo(
+        lambda workspace, org_id=None: cli._DatabricksWorkspaceAuthInfo(
             token="fresh-token", profile_name="fresh"
         ),
     )
@@ -3752,7 +3758,9 @@ def _patch_rejected_credential_preflight(
         "omnigent.cli_auth.load_databricks_workspace_host", lambda server: pointer_workspace
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
-    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
+    monkeypatch.setattr(
+        cli, "_databricks_workspace_auth_info", lambda workspace, org_id=None: None
+    )
     monkeypatch.setattr(
         cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
     )
@@ -3865,7 +3873,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
-        lambda workspace: cli._DatabricksWorkspaceAuthInfo(
+        lambda workspace, org_id=None: cli._DatabricksWorkspaceAuthInfo(
             token="fresh-token", profile_name=None, auth=fresh_auth
         ),
     )
