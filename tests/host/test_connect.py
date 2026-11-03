@@ -98,7 +98,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
-from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -1252,6 +1252,10 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     tmp_path: Path,
 ) -> None:
     """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from omnigent.host.frames import decode_host_frame, encode_host_frame
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
 
     def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
@@ -1264,10 +1268,24 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
         binding_token="token_disk_full",
         workspace=str(tmp_path),
         session_id="session_disk_full",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="new",
+        ),
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        result = await host._handle_launch(frame)
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    with capture_debug_rows("host") as rows:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            result = await host._handle_launch(decoded)
+    row = next(row for row in rows if row["event_name"] == "runner_launch_failed")
+    assert row["attributes"]["run_id"] == "run"
+    assert row["attributes"]["task_id"] == "task"
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed"
@@ -2043,6 +2061,9 @@ async def test_watch_runner_reports_unexpected_exit(
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
     maintenance_reasons: list[str] = []
     host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
@@ -2076,24 +2097,34 @@ async def test_watch_runner_reports_unexpected_exit(
         request_id="req_watch",
         binding_token="tok_watch",
         workspace=str(workspace),
+        session_id="watched-session",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task-A",
+            run_id="A",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        ),
     )
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-        result = await host._handle_launch(frame)
-    assert result.status == "launched", result.error
+    with capture_debug_rows("host") as rows:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
 
-    handle = host._runners[token_bound_runner_id("tok_watch")]
-    assert handle.connect_marker is not None
-    if marker_state == "connected":
-        handle.connect_marker.touch()
-    elif marker_state == "unavailable":
-        handle.connect_marker = None
-    elif marker_state == "unreadable":
-        handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
-            exists=Mock(side_effect=[OSError("marker unavailable"), False])
-        )
+        handle = host._runners[token_bound_runner_id("tok_watch")]
+        assert handle.connect_marker is not None
+        if marker_state == "connected":
+            handle.connect_marker.touch()
+        elif marker_state == "unavailable":
+            handle.connect_marker = None
+        elif marker_state == "unreadable":
+            handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
+                exists=Mock(side_effect=[OSError("marker unavailable"), False])
+            )
 
-    # Wait for the watcher to observe the death and send its report.
-    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+        # Wait for the watcher to observe the death and send its report.
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # Exactly one report; a second would double-record server-side.
     assert len(tunnel.sent) == 1
@@ -2106,6 +2137,20 @@ async def test_watch_runner_reports_unexpected_exit(
     expected = {"connected": True, "not_connected": False}.get(marker_state)
     assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
+
+    [spawned] = [row for row in rows if row["event_name"] == "runner_spawned"]
+    assert spawned["attributes"]["run_id"] == "A"
+    [died] = [row for row in rows if row["event_name"] == "runner_died"]
+    assert died["session_id"] == "watched-session"
+    assert died["attributes"]["runner_id"] == report.runner_id
+    assert died["hostname"] == spawned["hostname"]
+    assert died["hostname"]
+    if marker_state == "not_connected":
+        assert died["attributes"]["run_id"] == "A"
+        assert died["attributes"]["task_id"] == "task-A"
+    else:
+        assert "run_id" not in died["attributes"]
+        assert "task_id" not in died["attributes"]
 
 
 @pytest.mark.parametrize("connected", [False, True])
@@ -4500,6 +4545,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "KUBECONFIG": "/home/alice/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
+        "GIT_SSL_CAINFO": "/etc/openshell-tls/ca-bundle.pem",
+        "GIT_SSL_CAPATH": "/etc/openshell-tls/certs",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
         "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL": "sonnet",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
@@ -4564,6 +4611,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # BROWSER names the user's URL opener; dropping it sends CLI logins in the
     # runner to a local browser instead of the one the user configured.
     assert env["BROWSER"] == "www-browser"
+    # git's CA paths are trust stores, not secrets; git ignores SSL_CERT_FILE.
+    assert env["GIT_SSL_CAINFO"] == "/etc/openshell-tls/ca-bundle.pem"
+    assert env["GIT_SSL_CAPATH"] == "/etc/openshell-tls/certs"
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
@@ -9163,7 +9213,147 @@ async def test_stop_frame_never_overtakes_launch(
     assert order == ["launch:start", "launch:end", "stop"]
 
 
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_filesystem_frame_keeps_host_control_responsive(
+    operation: str,
+    disconnect: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stalled filesystem request must not hold heartbeats or runner probes."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+
+    class _QueuedTunnel(_CollectingWs):
+        def __init__(self) -> None:
+            super().__init__()
+            self.incoming: asyncio.Queue[str] = asyncio.Queue()
+            self.outgoing: asyncio.Queue[str] = asyncio.Queue()
+
+        async def recv(self) -> str:
+            return await self.incoming.get()
+
+        async def send(self, data: str) -> None:
+            await super().send(data)
+            self.outgoing.put_nowait(data)
+
+    host = _make_host_process()
+    host._capabilities_initialized = True
+    host._configured_harnesses = {}
+    host._gateway_inference = {}
+    ws = _QueuedTunnel()
+    target = tmp_path / "project"
+    request: HostStatFrame | HostCreateDirFrame
+    expected: HostStatResultFrame | HostCreateDirResultFrame
+    if operation == "stat":
+        target.mkdir()
+        request = HostStatFrame(request_id="filesystem", path=str(target))
+        expected = HostStatResultFrame(
+            request_id="filesystem",
+            status="ok",
+            exists=True,
+            type="directory",
+            canonical_path=str(target.resolve()),
+        )
+    else:
+        request = HostCreateDirFrame(request_id="filesystem", path=str(target))
+        expected = HostCreateDirResultFrame(request_id="filesystem", status="ok", path=str(target))
+    handle = getattr(host, f"_handle_{operation}")
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_filesystem(frame: HostStatFrame | HostCreateDirFrame) -> object:
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(timeout=5), "filesystem request blocked the host event loop"
+            return handle(frame)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(host, f"_handle_{operation}", blocked_filesystem)
+    serving = asyncio.create_task(host._serve_frames(ws))  # type: ignore[arg-type]
+    replacement = _CollectingWs()
+    try:
+        hello = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        assert isinstance(decode_host_frame(hello), HostHelloFrame)
+        ws.incoming.put_nowait(encode_host_frame(request))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        ws.incoming.put_nowait(encode_frame(PingFrame(ts=123)))
+        ws.incoming.put_nowait(encode_host_frame(HostRunnerStatusFrame("status", "runner_absent")))
+        pong = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        status = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        assert not finished.is_set(), "control replies must arrive while filesystem I/O waits"
+        assert decode_frame(pong) == PongFrame(ts=123)
+        assert decode_host_frame(status) == HostRunnerStatusResultFrame("status", "unknown")
+        if disconnect:
+            await _cancel(serving)
+            await host._quiesce_frame_tasks()
+            host._ws = replacement  # type: ignore[assignment]
+    finally:
+        release.set()
+        await _drain_frame_tasks(host)
+        await _cancel(serving)
+        assert await asyncio.to_thread(finished.wait, 5), "filesystem worker did not finish"
+    if disconnect:
+        assert len(ws.sent) == 3
+        assert replacement.sent == []
+    else:
+        assert decode_host_frame(ws.sent[-1]) == expected
+    assert target.is_dir()
+
+
+@pytest.mark.posix_only
+async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unrelated queued launch can proceed after the stopped runner exits."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    manager = ZygoteManager()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    proc = ZygoteRunnerProc(child.pid, manager)
+    host._runners["runner_old"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    launched = asyncio.Event()
+
+    async def _record_launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        launched.set()
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id, status="launched", runner_id="runner_new"
+        )
+
+    monkeypatch.setattr(host, "_handle_launch", _record_launch)
+    try:
+        with manager._lock:
+            for frame in (
+                HostStopRunnerFrame(request_id="stop", runner_id="runner_old"),
+                HostLaunchRunnerFrame(request_id="launch", binding_token="tok", workspace="/w"),
+            ):
+                host._start_frame_task(ws, encode_host_frame(frame))  # type: ignore[arg-type]
+            await asyncio.wait_for(launched.wait(), timeout=2)
+            await _drain_frame_tasks(host)
+            assert child.poll() is not None
+            assert "runner_old" not in host._runners
+            replies = [decode_host_frame(raw) for raw in ws.sent]
+            assert [(reply.request_id, reply.status) for reply in replies] == [
+                ("stop", "stopped"),
+                ("launch", "launched"),
+            ]
+    finally:
+        await _drain_frame_tasks(host)
+        child.kill()
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
 async def test_frame_handler_failure_is_contained(
+    operation: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -9176,14 +9366,19 @@ async def test_frame_handler_failure_is_contained(
     host = _make_host_process()
     ws = _CollectingWs()
 
-    def _boom(self_: HostProcess, frame: HostStatFrame) -> HostStatResultFrame:
-        raise RuntimeError("scripted stat failure")
+    def _boom(self_: HostProcess, frame: HostStatFrame | HostCreateDirFrame) -> None:
+        raise RuntimeError("scripted filesystem failure")
 
-    monkeypatch.setattr(HostProcess, "_handle_stat", _boom)
+    monkeypatch.setattr(HostProcess, f"_handle_{operation}", _boom)
+    frame = (
+        HostStatFrame(request_id="req_boom", path=str(tmp_path))
+        if operation == "stat"
+        else HostCreateDirFrame(request_id="req_boom", path=str(tmp_path / "project"))
+    )
     with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
         host._start_frame_task(
             ws,  # type: ignore[arg-type] — duck-typed ws
-            encode_host_frame(HostStatFrame(request_id="req_boom", path=str(tmp_path))),
+            encode_host_frame(frame),
         )
         await _drain_frame_tasks(host)
 
