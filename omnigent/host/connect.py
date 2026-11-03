@@ -2423,6 +2423,9 @@ class HostProcess:
         )
         try:
             await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
+            if isinstance(proc, ZygoteRunnerProc):
+                # No watcher owns an abandoned spawn's retained exit status.
+                await asyncio.to_thread(proc.wait, timeout=5.0)
         except Exception:  # detached cleanup must be observed
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
@@ -2525,12 +2528,14 @@ class HostProcess:
     def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
         """Terminate a runner: SIGTERM, brief wait, then SIGKILL. Blocking.
 
-        Runs on a worker thread (see :meth:`_handle_stop`) because for a
-        zygote-forked runner these are blocking control-socket round-trips, not
-        lock-free waitpid calls.
+        Runs on a worker thread (see :meth:`_handle_stop`). Forked runners
+        use OS liveness so a stalled control exchange cannot postpone a stop.
 
         :param proc: The runner process handle (Popen or zygote shim).
         """
+        if isinstance(proc, ZygoteRunnerProc):
+            proc.stop()
+            return
         if proc.poll() is not None:
             return
         proc.terminate()
@@ -4252,7 +4257,12 @@ class HostProcess:
                 str(params.get("after", "")),
             )
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),

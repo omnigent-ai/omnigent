@@ -33,7 +33,7 @@ _MEASURE_JS = """
     (h) => h.shadowRoot?.querySelector('[data-line]'));
   const lines = Array.from(host.shadowRoot.querySelectorAll('[data-line]'));
   const tops = lines.map((l) => l.getBoundingClientRect().top);
-  const header = rail.querySelector('button.sticky span.text-ui');
+  const header = rail.querySelector('[data-github-file] > .sticky button span.text-ui');
   return {
     diffFontSize: px(lines[0], 'fontSize'),
     diffLineHeight: px(lines[0], 'lineHeight'),

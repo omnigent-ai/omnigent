@@ -26,6 +26,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useCloseTabShortcut } from "@/hooks/useCloseTabShortcut";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
@@ -2491,6 +2492,13 @@ function AppShellImpl() {
     focusWorkspaceTabsOnOpenRef.current = false;
     focusWorkspaceTabs();
   }, [workspacePanelVisible, focusWorkspaceTabs]);
+  // Desktop Close Tab closes the rail's selected tab only while the rail is on
+  // screen; otherwise it leaves the session (or closes the window off one).
+  const closeSelectedRailTabRef = useRef<(() => boolean) | null>(null);
+  useCloseTabShortcut(
+    () => workspacePanelVisible && (closeSelectedRailTabRef.current?.() ?? false),
+    conversationId !== undefined,
+  );
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
@@ -2743,6 +2751,7 @@ function AppShellImpl() {
                     onRightRailTabChange={handleRightRailTabChange}
                     openPanels={openPanels}
                     onClosePanel={closeWorkspacePanel}
+                    closeSelectedTabRef={closeSelectedRailTabRef}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
                     showContentSearch={railTabsAvailable["content-search"]}

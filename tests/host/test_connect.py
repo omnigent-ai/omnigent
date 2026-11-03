@@ -98,7 +98,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
-from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -9302,6 +9302,48 @@ async def test_filesystem_frame_keeps_host_control_responsive(
     else:
         assert decode_host_frame(ws.sent[-1]) == expected
     assert target.is_dir()
+
+
+@pytest.mark.posix_only
+async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unrelated queued launch can proceed after the stopped runner exits."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    manager = ZygoteManager()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    proc = ZygoteRunnerProc(child.pid, manager)
+    host._runners["runner_old"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    launched = asyncio.Event()
+
+    async def _record_launch(frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        launched.set()
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id, status="launched", runner_id="runner_new"
+        )
+
+    monkeypatch.setattr(host, "_handle_launch", _record_launch)
+    try:
+        with manager._lock:
+            for frame in (
+                HostStopRunnerFrame(request_id="stop", runner_id="runner_old"),
+                HostLaunchRunnerFrame(request_id="launch", binding_token="tok", workspace="/w"),
+            ):
+                host._start_frame_task(ws, encode_host_frame(frame))  # type: ignore[arg-type]
+            await asyncio.wait_for(launched.wait(), timeout=2)
+            await _drain_frame_tasks(host)
+            assert child.poll() is not None
+            assert "runner_old" not in host._runners
+            replies = [decode_host_frame(raw) for raw in ws.sent]
+            assert [(reply.request_id, reply.status) for reply in replies] == [
+                ("stop", "stopped"),
+                ("launch", "launched"),
+            ]
+    finally:
+        await _drain_frame_tasks(host)
+        child.kill()
+        child.wait(timeout=5)
 
 
 @pytest.mark.parametrize("operation", ["stat", "create_dir"])
