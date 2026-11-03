@@ -1086,14 +1086,28 @@ describe("Composer slash-command menu", () => {
   }
 
   it.each([
-    ["claude-native", { session_event_types: ["message", "clear"] }],
-    ["codex-native", { session_event_types: ["message", "clear"] }],
-    ["claude-sdk", { session_event_types: ["message", "clear"], session_claude_sdk_clear: true }],
+    ["claude-native", "the menu", { session_event_types: ["message", "clear"] }],
+    ["codex-native", "the menu", { session_event_types: ["message", "clear"] }],
+    [
+      "claude-sdk",
+      "the menu",
+      { session_event_types: ["message", "clear"], session_claude_sdk_clear: true },
+    ],
+    [
+      "claude-sdk",
+      "a typed command",
+      { session_event_types: ["message", "clear"], session_claude_sdk_clear: true },
+    ],
   ] as const)(
-    "%s /clear runs the clear control when the server accepts it",
-    (harness, advertised) => {
+    "%s /clear from %s runs the clear control when the server accepts it",
+    (harness, entry, advertised) => {
       const { clearContext, onSend } = renderClearComposer(harness, advertised);
-      fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
+      if (entry === "the menu") {
+        fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
+      } else {
+        fireEvent.change(textarea(), { target: { value: "/clear" } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+      }
       expect(clearContext).toHaveBeenCalledOnce();
       expect(onSend).not.toHaveBeenCalled();
     },
