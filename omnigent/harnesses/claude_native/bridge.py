@@ -672,6 +672,23 @@ class ClaudeTerminalDialog(RuntimeError):
     """
 
 
+class ClaudeInputBoxOccupied(ClaudeTerminalDialog):
+    """
+    Claude Code's input box stayed in a mode the reclaim could not leave.
+
+    Shell mode, the prompt-history search and a draft taller than the pane
+    keep the box until the person leaves them in the embedded terminal.
+    Nothing was typed, so the input can still go once the box is free.
+
+    :param message: Human-readable failure text.
+    :param surface: What kept the box, e.g. ``"shell mode"``.
+    """
+
+    def __init__(self, message: str, *, surface: str) -> None:
+        super().__init__(message)
+        self.surface = surface
+
+
 class ClaudeSignInPending(RuntimeError):
     """
     Claude Code's terminal is parked on a launcher sign-in prompt.
@@ -4385,7 +4402,7 @@ def inject_user_message(
         if Claude's input prompt never renders, if a ``tmux send-keys``
         invocation fails, or if the draft never leaves the input box
         after repeated submit Enters (message not delivered).
-    :raises ClaudeTerminalDialog: If the input box stays in shell mode or the
+    :raises ClaudeInputBoxOccupied: If the input box stays in shell mode or the
         prompt-history search after the reclaim; nothing was typed.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
@@ -4400,9 +4417,10 @@ def inject_user_message(
     if surface is not None and surface != _OVERLAY_SURFACE:
         # An overlay may be launcher output the readiness gate waits through; a
         # box held in another mode never frees itself, and timing out reaps the pane.
-        raise ClaudeTerminalDialog(
+        raise ClaudeInputBoxOccupied(
             f"Claude Code's input box is occupied by {surface}, so the message was not "
-            "delivered. Open the terminal, dismiss it, then resend your message."
+            "delivered. Open the terminal, dismiss it, then resend your message.",
+            surface=surface,
         )
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
@@ -7363,9 +7381,10 @@ def _reclaim_and_wait_for_prompt(
         like a message delivery: *timeout_s* as the base budget, extended
         while a live pane is still booting.
     :returns: None.
-    :raises ClaudeTerminalDialog: If shell mode, the prompt-history search or a
-        footer-less dialog still covers the input box after the restore; no
-        keystroke was sent.
+    :raises ClaudeInputBoxOccupied: If shell mode or the prompt-history search
+        still holds the input box after the restore; no keystroke was sent.
+    :raises ClaudeTerminalDialog: If a footer-less dialog still covers the
+        input box after the restore; no keystroke was sent.
     :raises RuntimeError: As :func:`_wait_for_claude_prompt_ready` and
         :func:`_restore_occupied_input` raise.
     """
@@ -7387,9 +7406,10 @@ def _reclaim_and_wait_for_prompt(
     if surface is not None and surface != _OVERLAY_SURFACE:
         # Typing into these would run bash or filter history, and the wait below
         # could only poll out its whole budget on them.
-        raise ClaudeTerminalDialog(
+        raise ClaudeInputBoxOccupied(
             f"Claude Code's input box is occupied by {surface}, so the command was "
-            "not sent. Open the terminal, dismiss it, then retry."
+            "not sent. Open the terminal, dismiss it, then retry.",
+            surface=surface,
         )
     # Launcher output is waited out below, but a footer-less dialog would only be
     # waited on until the budget lapses, then the pane reaped; the reclaim may

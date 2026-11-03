@@ -850,6 +850,22 @@ def build_native_controls(
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="approval mode change", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None and state.active_turn_id is not None:
+            # Codex disables /permissions while a turn runs, and the Escape that
+            # opens it would interrupt that turn and drop the message it carries.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "codex_native_approval_mode_busy",
+                    "detail": (
+                        "Codex is working on a turn. Change the approval mode after "
+                        "it finishes, or stop the turn first."
+                    ),
+                },
+            )
         try:
             offered = await asyncio.to_thread(
                 _inject_codex_permission_mode,
