@@ -600,8 +600,7 @@ async def test_runner_accepts_combined_server_and_owner_instructions_at_their_li
     )
 
     body = BackgroundSessionTitleRequest.model_validate(client.requests[0][1])
-    assert body.additional_instructions is not None
-    assert body.additional_instructions.endswith(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
+    assert body.additional_instructions == f"{combined}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
 
 
 _LIMIT = LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS
@@ -642,20 +641,6 @@ async def test_legacy_runner_instructions_fit_the_old_limit(
 
     assert fitted == expected.format(language=FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
     assert len(fitted) <= _LIMIT
-
-
-async def test_capable_runner_receives_full_instructions() -> None:
-    combined = compose_session_title_instructions("s" * _LIMIT, "u" * _LIMIT)
-    request = BackgroundTitleRequest(
-        session_id="conv_test",
-        prompt="hello",
-        additional_instructions=combined,
-        owner_instructions="u" * _LIMIT,
-    )
-
-    assert runner_title_instructions(request, long_supported=True) == (
-        f"{combined}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
-    )
 
 
 async def test_old_runner_still_titles_with_owner_instructions_at_the_limit(db_uri: str) -> None:

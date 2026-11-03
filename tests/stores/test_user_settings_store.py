@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import column, insert, table
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.server.server_config import SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
 from omnigent.stores.user_settings_store import (
@@ -74,6 +75,21 @@ def test_instructions_are_isolated_per_user(store: UserSettingsStore) -> None:
     assert store.get_session_title_instructions(user_id=ALICE) == "Alice rule."
     assert store.get_session_title_instructions(user_id=BOB) is None
     assert store.get_session_title_instructions(user_id=None) == "Local rule."
+
+
+def test_instructions_are_isolated_per_workspace(store: UserSettingsStore) -> None:
+    with workspace_scope(101):
+        store.save_session_title_instructions("Workspace one rule.", user_id=ALICE)
+    with workspace_scope(102):
+        assert store.get_session_title_instructions(user_id=ALICE) is None
+        store.save_session_title_instructions("Workspace two rule.", user_id=ALICE)
+    with workspace_scope(101):
+        assert store.get_session_title_instructions(user_id=ALICE) == "Workspace one rule."
+    with workspace_scope(102):
+        store.save_session_title_instructions(None, user_id=ALICE)
+        assert store.get_session_title_instructions(user_id=ALICE) is None
+    with workspace_scope(101):
+        assert store.get_session_title_instructions(user_id=ALICE) == "Workspace one rule."
 
 
 def test_save_accepts_limit_and_rejects_longer(store: UserSettingsStore) -> None:

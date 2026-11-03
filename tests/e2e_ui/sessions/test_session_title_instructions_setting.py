@@ -18,7 +18,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.chat.test_claude_sdk_terminated_cli_recovery import _create_claude_sdk_session
+from tests.e2e_ui._claude_sdk_session import create_claude_sdk_session
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 _AGENT_REPLY = "Looking into the login timeout now."
@@ -36,8 +36,11 @@ def claude_sdk_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     session_id: str | None = None
     try:
-        session_id, _agent_name = _create_claude_sdk_session(
-            live_server, str(_server_state["runner_id"]), mock_llm_server_url
+        session_id, _agent_name = create_claude_sdk_session(
+            live_server,
+            str(_server_state["runner_id"]),
+            mock_llm_server_url,
+            name_prefix="title-settings",
         )
         yield live_server, session_id
     finally:
