@@ -904,6 +904,14 @@ function SupportedForkSessionForm({
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
+  // Pickers omit sandbox hosts, so read the source's provider from the full
+  // list (the query the action-restrictions lookup already shares).
+  const { data: hostsWithSandboxes, isLoading: sourceHostLoading } = useHosts({
+    includeSandbox: true,
+    enabled: isCodingSource && Boolean(sourceHostId),
+  });
+  const sourceSandboxProvider =
+    hostsWithSandboxes?.find((h) => h.host_id === sourceHostId)?.sandbox_provider ?? null;
   const serverUrl = getCliServerUrl();
 
   // Gates the sandbox rows in the host picker: only servers whose sandbox
@@ -919,6 +927,17 @@ function SupportedForkSessionForm({
     () => (info !== "loading" ? sandboxProviderOptions(info) : []),
     [info],
   );
+  // The picker row for a fresh sandbox from the source's own provider, when
+  // the server offers it. `null` is the single default-provider row.
+  const sourceProviderRow = useMemo((): string | null | undefined => {
+    if (sourceSandboxProvider === null || info === "loading") return undefined;
+    if (sandboxProviderRows.includes(sourceSandboxProvider)) return sourceSandboxProvider;
+    const defaultRowIsSource =
+      sandboxProviderRows.length === 1 &&
+      sandboxProviderRows[0] === null &&
+      info.sandbox_provider === sourceSandboxProvider;
+    return defaultRowIsSource ? null : undefined;
+  }, [info, sandboxProviderRows, sourceSandboxProvider]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1062,15 +1081,21 @@ function SupportedForkSessionForm({
 
   // Default the host = source host (when online) else the first online
   // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden. A clone defaults to reproducing the source,
-  // so a sandbox is not the default while any host is online — it costs a
-  // fresh provision, and the user asks for it explicitly. But with no host
-  // online a sandbox-only deployment has nothing to reproduce the source
-  // on, so default to the sandbox rather than strand the picker empty and
-  // unsubmittable.
+  // pick is never overridden. A clone defaults to reproducing the source:
+  // a sandbox source on a fresh sandbox from its own provider, any other
+  // source on its host. A sandbox is otherwise not the default while any
+  // host is online — it costs a fresh provision, and the user asks for it
+  // explicitly. But with no host online a sandbox-only deployment has
+  // nothing to reproduce the source on, so default to the sandbox rather
+  // than strand the picker empty and unsubmittable.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
-    if (sourceHostId && sourceHostOnline) {
+    // Wait for the source's provider so a connected host isn't chosen first.
+    if (sourceHostId && sourceHostLoading) return;
+    if (managedSandboxesEnabled && sourceProviderRow !== undefined) {
+      setSandboxSelected(true);
+      setSandboxProvider(sourceProviderRow);
+    } else if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
@@ -1084,6 +1109,8 @@ function SupportedForkSessionForm({
     selectedHostId,
     sourceHostId,
     sourceHostOnline,
+    sourceHostLoading,
+    sourceProviderRow,
     onlineHosts,
     managedSandboxesEnabled,
     sandboxProviderRows,

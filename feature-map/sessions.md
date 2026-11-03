@@ -416,7 +416,9 @@ devices fold some row controls into the menu.
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
 labelled `omnigent.host_type: managed` fork the same way. The source's own
-sandbox host is never listed, since pickers show connected hosts only.
+sandbox host is never listed, since pickers show connected hosts only. A fork
+of any sandbox session defaults to a fresh sandbox from the source's provider
+when the server offers it, and otherwise to a connected host.
 **Continue in another directory…** on these sessions continues on a connected
 host; like any recovery, it never offers a new sandbox. The composer's host
 menu shows a disabled **Switch host…** item when you have write access.

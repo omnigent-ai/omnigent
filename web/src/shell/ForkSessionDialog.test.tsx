@@ -2163,8 +2163,12 @@ describe("ForkSessionDialog", () => {
         info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox"] },
       });
 
-      // The source sandbox isn't a connected host, so the laptop is the default target.
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("laptop");
+      // A fresh sandbox from the source's provider is the default; pick the laptop instead.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(
+        "Databricks Sandbox",
+      );
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
       fireEvent.change(screen.getByTestId("workspace-path-input"), {
         target: { value: "/Users/a/project" },
       });
@@ -2178,6 +2182,53 @@ describe("ForkSessionDialog", () => {
         "/Users/a/project",
         undefined,
       );
+    });
+
+    it.each([
+      [
+        "defaults a sandbox source to a fresh sandbox from its own provider",
+        "arclet",
+        "Arclet Sandbox",
+      ],
+      [
+        "falls back to a connected host when the server doesn't offer that provider",
+        "modal",
+        "laptop",
+      ],
+    ])("%s", async (_name, sourceProvider, expected) => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_1", labels: {} },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      setHosts([
+        host({ sandbox_provider: sourceProvider }),
+        host({ host_id: "host_2", name: "laptop" }),
+      ]);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      });
+
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(expected);
+    });
+
+    it("defaults to the server's single sandbox row when it is the source's provider", async () => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_1", labels: {} },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      setHosts([host({ sandbox_provider: "modal" }), host({ host_id: "host_2", name: "laptop" })]);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-host-select")).not.toHaveTextContent("laptop");
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Modal Sandbox");
     });
 
     it("forks an Arclet source onto another sandbox provider", async () => {

@@ -239,6 +239,8 @@ def test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet(
     expect(dialog).to_be_visible()
     expect(page.get_by_test_id("fork-session-unavailable")).to_have_count(0)
     host_select = page.get_by_test_id("fork-session-host-select")
+    # A fork of a sandbox session defaults to a fresh sandbox from its provider.
+    expect(host_select).to_contain_text("Arclet Sandbox")
     host_select.click()
     expect(page.get_by_test_id("fork-session-host-option-host_laptop")).to_be_visible()
     sandbox_row = page.get_by_test_id("fork-session-sandbox-option")
