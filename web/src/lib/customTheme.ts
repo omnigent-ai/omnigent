@@ -24,10 +24,10 @@ export interface CustomTheme {
 
 export const DEFAULT_CUSTOM_THEME: CustomTheme = {
   basePalette: "omni",
-  accent: "#11171c",
-  darkAccent: "#e8ecf0",
+  accent: "#df3c85",
+  darkAccent: "#df3c85",
   tint: "#ffffff",
-  darkTint: "#0e1013",
+  darkTint: "#0e0b19",
   contrast: 50,
   translucentSidebar: false,
 };
@@ -278,7 +278,7 @@ function generateCustomTheme(theme: CustomTheme): GeneratedCustomTheme {
   const lightCard = mix(lightBackground, "#ffffff", 0.72 + contrast * 0.16);
   const darkCard = mix(darkBackground, "#ffffff", 0.05 + contrast * 0.08);
   const lightForeground = mix(normalized.tint, "#111318", 0.91 + contrast * 0.05);
-  const darkForeground = mix(normalized.tint, "#ffffff", 0.86 + contrast * 0.08);
+  const darkForeground = mix(normalized.darkTint, "#ffffff", 0.86 + contrast * 0.08);
   const lightBorder = mix(lightBackground, lightForeground, 0.08 + contrast * 0.08);
   const darkBorder = mix(darkBackground, darkForeground, 0.1 + contrast * 0.08);
   const lightMuted = mix(lightBackground, lightForeground, 0.04 + contrast * 0.05);
@@ -382,6 +382,17 @@ function rebaseVariant(
     const color = parseCssColor(surface);
     return color?.alpha === 1 ? [rgbToHex(color)] : [];
   });
+  const mutedForeground = rebaseColor(
+    base.mutedForeground,
+    reference.mutedForeground,
+    current.mutedForeground,
+  );
+  const mutedContrastChanged =
+    current.mutedForeground !== reference.mutedForeground ||
+    current.background !== reference.background ||
+    current.cardSolid !== reference.cardSolid ||
+    current.muted !== reference.muted ||
+    current.codeBackground !== reference.codeBackground;
 
   return {
     background,
@@ -411,11 +422,10 @@ function rebaseVariant(
       current.foreground,
     ),
     muted,
-    mutedForeground: rebaseColor(
-      base.mutedForeground,
-      reference.mutedForeground,
-      current.mutedForeground,
-    ),
+    mutedForeground:
+      mutedContrastChanged && isHexColor(mutedForeground) && isHexColor(foreground)
+        ? ensureContrast(mutedForeground, linkSurfaces, foreground)
+        : mutedForeground,
     codeBackground,
     accent,
     accentForeground,
@@ -445,14 +455,12 @@ function rebaseVariant(
     sidebarRing: primaryChanged ? primary : base.sidebarRing,
     // Tint the active-row highlight with the accent so it tracks a custom
     // accent color; keep the hand-tuned base tint when the accent is unchanged.
-    // The rebased sidebar foreground stays legible on the low-alpha tint and
-    // mirrors the default token model's `var(--sidebar-foreground)`.
+    // The foreground uses the same accent so selected sidebar text and icons
+    // track the color picker along with the low-alpha row background.
     sidebarActive: primaryChanged ? setAlpha(primary, 0.12) : base.sidebarActive,
-    sidebarActiveForeground: primaryChanged
-      ? rebaseColor(base.sidebarForeground, reference.foreground, current.foreground)
-      : base.sidebarActiveForeground,
-    sidebarBackground: base.sidebarBackground,
-    shellBackground: base.shellBackground,
+    sidebarActiveForeground: primaryChanged ? primary : base.sidebarActiveForeground,
+    sidebarBackground: sidebar === base.sidebar ? base.sidebarBackground : sidebar,
+    shellBackground: background === base.background ? base.shellBackground : background,
   };
 }
 

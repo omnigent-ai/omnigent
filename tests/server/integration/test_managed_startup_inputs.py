@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
@@ -18,6 +19,7 @@ from fastapi import FastAPI
 from starlette.datastructures import Headers
 
 from omnigent.entities.conversation import ErrorData
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
@@ -26,6 +28,7 @@ from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
+from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
@@ -60,7 +63,31 @@ _INPUT = {
 
 
 @pytest.fixture
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def scheduled_run_context() -> ScheduledRunLogContext:
+    return ScheduledRunLogContext(
+        task_id=uuid4().hex,
+        run_id=uuid4().hex,
+        task_workspace_id=0,
+        scheduled_at=1000,
+        trigger_key="schedule:1000",
+        target="managed_sandbox",
+        session_mode="new",
+    )
+
+
+@pytest.fixture
+def startup_permissions(db_uri: str) -> SqlAlchemyPermissionStore:
+    return SqlAlchemyPermissionStore(db_uri)
+
+
+@pytest.fixture
+def auth_app(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    startup_permissions: SqlAlchemyPermissionStore,
+) -> FastAPI:
     """The shared auth-enabled app, with managed sandboxes configured."""
     from omnigent.server.auth import UnifiedAuthProvider
 
@@ -71,8 +98,10 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
+        permission_store=startup_permissions,
+        auth_provider=UnifiedAuthProvider(
+            source="header", local_single_user=getattr(request, "param", False)
+        ),
         host_store=HostStore(db_uri),
         sandbox_config=parse_sandbox_config(
             {
@@ -129,17 +158,34 @@ def _bind(env: _Env, session_id: str):
         (CODEX_NATIVE_CODING_AGENT.agent_name, True),
     ],
 )
+@pytest.mark.parametrize("scheduled", [False, True])
 async def test_saved_input_survives_service_recreation_and_dispatches_once(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, native: bool
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    native: bool,
+    scheduled,
+    scheduled_run_context,
+    caplog,
 ) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
     try:
-        session_id = await _create(env, name=name)
+        with scheduled_run_scope(scheduled_run_context if scheduled else None):
+            session_id = await _create(env, name=name)
         original = env.app.state.startup_inputs
         entry = env.conv_store.list_pending_inputs(session_id)[0]
         assert entry.status == "in_progress"
+        assert entry.data.startup_options.scheduled_run == (
+            scheduled_run_context if scheduled else None
+        )
+        assert not [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         assert snapshot["items"] == [], "accepted input must not be seeded as history"
         assert snapshot["pending_inputs"][0]["content"] == _INPUT["data"]["content"]
@@ -157,6 +203,17 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         assert len(turns) == 1 and _TEXT in json.dumps(turns[0])
         await restarted._deliver(env.app, session_id, entry)
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        sent = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        assert len(sent) == int(scheduled)
+        if scheduled:
+            assert sent[0].attributes.items() >= scheduled_run_context.model_dump().items()
+            assert sent[0].attributes["input_id"] == entry.id
+            assert sent[0].session_id == session_id
+            assert scheduled_run_context.run_id not in json.dumps(turns)
 
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         if native:
@@ -172,10 +229,16 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
 
 
 async def test_refused_delivery_retains_input_until_explicit_retry(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled_run_context,
+    caplog,
+    debug_log_rows,
 ) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
-    session_id = await _create(env)
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env)
     entry = _bind(env, session_id)
     startup = env.app.state.startup_inputs
     denied = True
@@ -192,6 +255,36 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         await startup._deliver(env.app, session_id, entry)
         assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
         assert not [event for event in forwarded if event.get("type") == "message"]
+        assert not [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        [failure] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+        ]
+        assert failure.attributes["run_id"] == scheduled_run_context.run_id
+        assert failure.attributes["outcome"] == "not_sent"
+        assert failure.attributes["failure_stage"] == "input_policy"
+        assert failure.attributes["input_id"] == entry.id
+        [refused_attempt] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+        ]
+        refused_dispatch_id = failure.attributes["dispatch_id"]
+        assert refused_dispatch_id
+        assert refused_attempt.attributes["dispatch_id"] == refused_dispatch_id
+        assert refused_attempt.attributes["input_id"] == entry.id
+        [row] = [
+            row
+            for row in debug_log_rows
+            if row["message"].startswith("Unable to deliver saved message")
+        ]
+        assert row["session_id"] == session_id
+        assert row["attributes"]["run_id"] == scheduled_run_context.run_id
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         assert any(
             item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
@@ -208,6 +301,22 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         )
         assert env.conv_store.list_pending_inputs(session_id) == []
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        [sent] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+        [first_attempt, retry_attempt] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+        ]
+        assert first_attempt is refused_attempt
+        assert retry_attempt.attributes["input_id"] == sent.attributes["input_id"] == entry.id
+        retry_dispatch_id = retry_attempt.attributes["dispatch_id"]
+        assert retry_dispatch_id and retry_dispatch_id != refused_dispatch_id
+        assert sent.attributes["dispatch_id"] == retry_dispatch_id
+        assert sent.attributes["run_id"] == scheduled_run_context.run_id
     finally:
         await runner.aclose()
 
@@ -335,9 +444,13 @@ async def test_stop_before_host_ready_cancels_all_saved_inputs(
     assert forwarded == []
 
 
-async def test_stop_cancels_local_dispatch_and_clears_saved_input(startup_env: _Env) -> None:
+async def test_stop_cancels_local_dispatch_and_clears_saved_input(
+    startup_env: _Env, scheduled_run_context, caplog
+) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
-    session_id = await _create(env)
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env)
     startup = env.app.state.startup_inputs
     entry = _bind(env, session_id)
     entered = asyncio.Event()
@@ -361,10 +474,26 @@ async def test_stop_cancels_local_dispatch_and_clears_saved_input(startup_env: _
     assert stopped.is_set() and delivery.cancelled()
     assert env.conv_store.list_pending_inputs(session_id) == []
 
+    [interrupted] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_interrupted"
+    ]
+    assert interrupted.attributes["run_id"] == scheduled_run_context.run_id
+    assert interrupted.attributes["input_id"] == entry.id
+    assert interrupted.attributes["outcome"] == "not_sent"
+    assert not any(
+        getattr(r, "event_name", None) == "scheduled_run_prompt_sent" for r in caplog.records
+    )
 
-async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env: _Env) -> None:
+
+async def test_uncertain_native_submission_is_not_retried_on_restart(
+    startup_env: _Env, scheduled_run_context, caplog
+) -> None:
+    caplog.set_level(logging.INFO)
     env = startup_env
-    session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
     entry = _bind(env, session_id)
     startup = env.app.state.startup_inputs
     entered = asyncio.Event()
@@ -382,6 +511,16 @@ async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env
     with pytest.raises(asyncio.CancelledError):
         await delivery
     assert env.conv_store.list_pending_inputs(session_id)[0].status == "incomplete"
+    assert not [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+    ]
+    [interrupted] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_interrupted"
+    ]
+    assert interrupted.attributes["run_id"] == scheduled_run_context.run_id
+    assert interrupted.attributes["outcome"] == "uncertain"
     entered.clear()
     await startup._deliver(env.app, session_id, entry)
     assert not entered.is_set()
@@ -391,28 +530,50 @@ async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env
     assert env.conv_store.list_pending_inputs(session_id) == []
 
 
-async def test_dispatch_rechecks_saved_creators_access(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "auth_app,user_id,revoke_access",
+    [(False, "alice", False), (False, "alice", True), (True, "local", False)],
+    indirect=["auth_app"],
+    ids=["named-user", "revoked-user", "local-user"],
+)
+async def test_queued_input_preserves_identity_and_rechecks_access(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    startup_permissions: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+    user_id: str,
+    revoke_access: bool,
 ) -> None:
-    agent = await create_test_agent(auth_client, user="alice")
-    response = await auth_client.post(
-        "/v1/sessions", json={"agent_id": agent["id"]}, headers={"X-Forwarded-Email": "alice"}
-    )
+    if user_id != "local":
+        auth_client.headers["X-Forwarded-Email"] = user_id
+    agent = await create_test_agent(auth_client)
+    response = await auth_client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert response.status_code == 201, response.text
     session_id = response.json()["id"]
     startup = auth_app.state.startup_inputs
-    entry = await startup.enqueue(
-        session_id, SessionEventInput.model_validate(_INPUT), user_id="alice", headers=Headers()
-    )
-    SqlAlchemyPermissionStore(db_uri).revoke("alice", session_id)
+    startup.conversations.set_labels(session_id, {STARTUP_LABEL: "pending"})
+    response = await auth_client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+    assert response.status_code == 202, response.text
+    [entry] = startup.conversations.list_pending_inputs(session_id)
+    if revoke_access:
+        startup_permissions.revoke(user_id, session_id)
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
     try:
         await startup._deliver(auth_app, session_id, entry)
     finally:
         await runner.aclose()
-    assert not forwarded
-    assert startup.conversations.list_pending_inputs(session_id)[0].status == "failed"
+    if revoke_access:
+        assert not forwarded
+        assert startup.conversations.list_pending_inputs(session_id)[0].status == "failed"
+    else:
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1 and _TEXT in json.dumps(turns[0])
+        assert startup.conversations.list_pending_inputs(session_id) == []
+        history = (await auth_client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        [message] = [item for item in history if item["type"] == "message"]
+        assert message.get("created_by") == (None if user_id == "local" else user_id)
+    assert entry.created_by == user_id
 
 
 @pytest.mark.parametrize("with_first", [True, False])
@@ -872,6 +1033,26 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     assert isinstance(error.data, ErrorData) and "store unavailable" in error.data.message
 
 
+async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(
+    startup_env: _Env,
+) -> None:
+    """A launch shutdown gives up on before it binds a host leaves no replica to deliver
+    the saved first message, so the session reports that instead of waiting forever."""
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = startup_env
+    session_id = await _create(env)
+
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
+    [pending] = env.conv_store.list_pending_inputs(session_id)
+    assert pending.status == "failed"
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData) and "shut down" in error.data.message
+
+
 async def test_refused_input_does_not_hold_back_the_next_one(
     startup_env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -978,3 +1159,105 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "failed_stage",
+    [
+        "runner_start",
+        "input_claim",
+        "prompt_send",
+        "dispatch_bookkeeping",
+        "post_delivery",
+        "post_delivery_cancelled",
+    ],
+)
+async def test_saved_delivery_identifies_failed_boundary(
+    startup_env, monkeypatch, scheduled_run_context, caplog, failed_stage
+):
+    caplog.set_level(logging.INFO)
+    cancelled = failed_stage == "post_delivery_cancelled"
+    reported_stage = failed_stage.removesuffix("_cancelled")
+    env = startup_env
+    with scheduled_run_scope(scheduled_run_context):
+        session_id = await _create(env)
+    entry = _bind(env, session_id)
+    forwarded = []
+    runner = _stub_runner(
+        monkeypatch, forwarded, status=503 if failed_stage == "prompt_send" else 202
+    )
+    if failed_stage == "runner_start":
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._get_runner_client",
+            AsyncMock(side_effect=ConnectionError("runner unavailable")),
+        )
+    elif failed_stage == "input_claim":
+        original = env.conv_store.transition_pending_input
+
+        def fail_claim(*args, **kwargs):
+            if kwargs.get("status") == "incomplete":
+                raise RuntimeError("claim unavailable")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(env.conv_store, "transition_pending_input", fail_claim)
+    elif failed_stage == "dispatch_bookkeeping":
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(
+            orchestration,
+            "_publish_input_consumed",
+            Mock(side_effect=RuntimeError("bookkeeping failed after acceptance")),
+        )
+    elif reported_stage == "post_delivery":
+        monkeypatch.setattr(
+            env.conv_store,
+            "set_labels",
+            Mock(
+                side_effect=(
+                    asyncio.CancelledError("bookkeeping cancelled")
+                    if cancelled
+                    else RuntimeError("bookkeeping failed")
+                )
+            ),
+        )
+    try:
+        startup = env.app.state.startup_inputs
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError, match="bookkeeping cancelled"):
+                await startup._deliver(env.app, session_id, entry)
+            assert env.conv_store.list_pending_inputs(session_id) == []
+            assert not await startup.retry(session_id)
+            await startup._deliver(env.app, session_id, entry)
+            assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        else:
+            await startup._deliver(env.app, session_id, entry)
+    finally:
+        await runner.aclose()
+    failure_event = (
+        "scheduled_run_prompt_dispatch_interrupted" if cancelled else "scheduled_run_stage_failed"
+    )
+    failures = [r for r in caplog.records if getattr(r, "event_name", None) == failure_event]
+    if cancelled:
+        assert not any(
+            getattr(r, "event_name", None) == "scheduled_run_stage_failed" for r in caplog.records
+        )
+    assert len(failures) == 1
+    assert failures[0].attributes["failure_stage"] == (
+        "prompt_send" if failed_stage == "dispatch_bookkeeping" else reported_stage
+    )
+    if failed_stage == "dispatch_bookkeeping":
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    assert failures[0].attributes["outcome"] == (
+        "sent"
+        if reported_stage == "post_delivery"
+        else "uncertain"
+        if failed_stage in {"prompt_send", "dispatch_bookkeeping"}
+        else "not_sent"
+    )
+    assert len(
+        [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+        ]
+    ) == int(reported_stage == "post_delivery")

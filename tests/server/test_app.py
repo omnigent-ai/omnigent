@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -26,6 +27,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
+from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -477,6 +479,7 @@ def _build_branding_app(
     label: str,
     *,
     server_config: dict[str, object] | None = None,
+    **create_app_kwargs: Any,
 ) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
@@ -491,7 +494,146 @@ def _build_branding_app(
             cache_dir=tmp_path / f"cache-{label}",
         ),
         server_config=server_config,
+        **create_app_kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_info_harness_install_gate_overrides_feature_snapshot(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static and callable gates keep both info fields synchronized."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
+    env_app = _build_branding_app(db_uri, tmp_path, "install-env")
+    static_off_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "install-off",
+        harness_install=False,
+    )
+    monkeypatch.setenv("OMNIGENT_FEATURES", "")
+    static_on_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "install-on",
+        harness_install=True,
+    )
+    values = iter([False, True])
+    callable_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "install-callable",
+        harness_install=lambda: next(values),
+    )
+
+    async def info(app: FastAPI) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return (await client.get("/v1/info")).json()
+
+    env_info = await info(env_app)
+    assert env_info["features"]["harness_install"] is True
+    assert env_info["harness_install_enabled"] is True
+
+    off_info = await info(static_off_app)
+    assert off_info["features"]["harness_install"] is False
+    assert off_info["harness_install_enabled"] is False
+    assert off_info["installable_harnesses"] == []
+
+    on_info = await info(static_on_app)
+    assert on_info["features"]["harness_install"] is True
+    assert on_info["harness_install_enabled"] is True
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=callable_app), base_url="http://test"
+    ) as client:
+        first = (await client.get("/v1/info")).json()
+        second = (await client.get("/v1/info")).json()
+    assert first["features"]["harness_install"] is first["harness_install_enabled"] is False
+    assert second["features"]["harness_install"] is second["harness_install_enabled"] is True
+    assert second["installable_harnesses"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_config", "create_app_kwargs", "expected"),
+    [
+        (
+            {},
+            {},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": False,
+            },
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {},
+            {"extensions": [".gz"], "all_types": False},
+        ),
+        # A deployment-supplied value or callable takes precedence over the config file.
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": [".har"]},
+            {"extensions": [".har"], "all_types": False},
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": lambda: ["*"]},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": True,
+            },
+        ),
+    ],
+)
+async def test_info_reports_the_filesystem_attachment_policy(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    create_app_kwargs: dict[str, Any],
+    expected: dict[str, object],
+) -> None:
+    """Clients read which uploads become files from /v1/info."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        server_config=server_config,
+        **create_app_kwargs,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        info = (await client.get("/v1/info")).json()
+
+    assert info["filesystem_attachments"] == expected
+
+
+async def test_info_evaluates_a_callable_policy_per_request(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """A callable policy can change while the server runs, e.g. behind a feature flag."""
+    policies = iter([[".gz"], ["*"]])
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        filesystem_attachment_allowed_extensions=lambda: next(policies),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = (await client.get("/v1/info")).json()["filesystem_attachments"]
+        second = (await client.get("/v1/info")).json()["filesystem_attachments"]
+
+    assert first == {"extensions": [".gz"], "all_types": False}
+    assert second["all_types"] is True
 
 
 def test_session_title_instructions_are_wired_into_coordinator(
@@ -1202,14 +1344,19 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
         assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+@pytest.mark.parametrize("allowlist", [None, frozenset()], ids=["unset", "empty-allowlist"])
 def test_ensure_default_acp_agents_seeds_configured_agent(
-    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+    seed_stores: _SeedStores,
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: frozenset[str] | None,
 ) -> None:
     """A configured ``acp:<slug>`` agent becomes a picker-renderable built-in.
 
     This is the ACP analogue of the native seeding: the New-Session picker reads
     built-ins from ``GET /v1/agents``, so a configured ACP agent must seed to
-    appear — the same way ``opencode-native-ui`` etc. do.
+    appear — the same way ``opencode-native-ui`` etc. do. It is the operator's
+    own agent, so an ``OMNIGENT_SEEDED_AGENTS`` allowlist never trims it; the
+    packaged ACP rows do obey the allowlist.
 
     **What breaks if this fails**: a user with Devin (or any ``acp:`` agent) set
     up on their machine never sees it in the web picker.
@@ -1226,8 +1373,8 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     # No builtin ACP CLI installed, so only the configured agent seeds.
     monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
 
-    server_app._ensure_default_acp_agents(
-        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    owned = server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache, allowlist
     )
 
     # Keyed by the slug, not the label.
@@ -1239,6 +1386,9 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert seeded.id == builtin_agent_id("gemini-cli")
     assert seeded.session_id is None, "built-ins must be session-scope NULL"
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+    assert "gemini-cli" not in owned
+    assert "grok" in owned
+    assert (seed_stores.agent_store.get_by_name("grok") is not None) == (allowlist is None)
 
 
 def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
@@ -1900,6 +2050,98 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
 
 
+@pytest.mark.parametrize(
+    "seeder",
+    [server_app._ensure_default_polly_agent, server_app._ensure_default_debby_agent],
+    ids=["polly", "debby"],
+)
+def test_bundle_agent_seeders_skip_when_not_allowlisted(
+    seed_stores: _SeedStores, seeder: Callable[..., frozenset[str]]
+) -> None:
+    """Polly and Debby are gated like the native rows and still return their name."""
+    (name,) = seeder(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache, frozenset()
+    )
+
+    assert seed_stores.agent_store.get_by_name(name) is None
+
+
+def test_ensure_default_agents_hides_trimmed_rows_without_deleting_them(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trimmed boot still seeds native rows; unset hides nothing; trimming again keeps rows."""
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    suppressed = server_app._ensure_default_agents(*stores)
+    # Imports and smart routing bind native rows by id, so trimming only hides them.
+    assert seed_stores.agent_store.get_by_name("codex-native-ui") is not None
+    assert "codex-native-ui" in suppressed
+
+    monkeypatch.delenv(SEEDED_AGENTS_ENV, raising=False)
+    assert server_app._ensure_default_agents(*stores) == frozenset()
+    polly = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert polly is not None
+
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    suppressed = server_app._ensure_default_agents(*stores)
+
+    assert {server_app._POLLY_AGENT_NAME, "codex-native-ui"} <= suppressed
+    assert "claude-native-ui" not in suppressed
+    kept = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert kept is not None and kept.id == polly.id
+
+
+@pytest.mark.parametrize("name", ["house-agent", "polly"], ids=["own-name", "packaged-name"])
+def test_ensure_default_agents_never_suppresses_operator_extras(
+    seed_stores: _SeedStores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Operator extras survive an empty allowlist, even under a packaged name."""
+    spec = tmp_path / f"{name}.yaml"
+    spec.write_text(f"name: {name}\nexecutor:\n  harness: claude-sdk\nprompt: hi\n")
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(spec))
+
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert seed_stores.agent_store.get_by_name(name) is not None
+    assert name not in suppressed
+    assert server_app._DEBBY_AGENT_NAME in suppressed
+
+
+def test_ensure_default_agents_warns_on_unknown_allowlist_names(
+    seed_stores: _SeedStores,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo hides every packaged agent, so the warning names it and the real roster."""
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native")
+    with caplog.at_level("WARNING", logger=server_app.__name__):
+        server_app._ensure_default_agents(
+            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+        )
+
+    warning = next(r.getMessage() for r in caplog.records if SEEDED_AGENTS_ENV in r.getMessage())
+    assert "built-in: claude-native (" in warning
+    assert "claude-native-ui" in warning
+
+
+def test_ensure_default_agents_allowlist_recognizes_every_packaged_name(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty allowlist hides every packaged row; naming them all hides none."""
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+    packaged = server_app._ensure_default_agents(*stores)
+    assert {a.name for a in seed_stores.agent_store.list(limit=200).data} <= packaged
+
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, ",".join(sorted(packaged)))
+    assert server_app._ensure_default_agents(*stores) == frozenset()
+    assert {a.name for a in seed_stores.agent_store.list(limit=200).data} == packaged
+
+
 def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
     """Build an app with the web UI bundle ABSENT (the API-only branch).
 
@@ -2512,6 +2754,87 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
 
 
 @pytest.mark.asyncio
+async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reconnect logs runner_session_init_deferred event with reason for idle/archived sessions."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_deferred_event_test"
+    idle_id, archived_id, active_id = _bind_sessions(db_uri, runner_id, count=3)
+    store = SqlAlchemyConversationStore(db_uri)
+    idle = store.get_conversation(idle_id)
+    archived = store.get_conversation(archived_id)
+    active = store.get_conversation(active_id)
+    assert idle is not None and archived is not None and active is not None
+    store.set_session_live_status(idle.id, "idle")
+    store.set_session_live_status(archived.id, "running")
+    store.update_conversation(archived.id, archived=True)
+    store.set_session_live_status(active.id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    with caplog.at_level(logging.INFO):
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    deferred_events = [
+        r
+        for r in caplog.records
+        if r.name == "omnigent.server.app"
+        and getattr(r, "event_name", "") == "runner_session_init_deferred"
+    ]
+    # Check we have events for idle and archived sessions, but not active
+    assert len(deferred_events) == 2
+    messages = {r.getMessage() for r in deferred_events}
+    # Verify both idle and archived session IDs appear in the logs with the right reason
+    assert any(f"session={idle.id}" in msg and "reason=idle" in msg for msg in messages)
+    assert any(f"session={archived.id}" in msg and "reason=archived" in msg for msg in messages)
+    # Verify active session does not have a deferred event
+    assert not any(f"session={active.id}" in msg for msg in messages)
+    decisions = {
+        record.session_id: record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_session_init_decision"
+    }
+    assert decisions[idle.id]["decision"] == "defer"
+    assert decisions[idle.id]["reason"] == "idle"
+    assert decisions[idle.id]["live_status"] == "idle"
+    assert decisions[idle.id]["pending_elicitation_count"] == 0
+    assert decisions[idle.id]["has_last_task_error"] is False
+    assert decisions[archived.id]["reason"] == "archived"
+    assert decisions[archived.id]["archived"] is True
+    assert decisions[active.id]["decision"] == "initialize_now"
+    for attrs in decisions.values():
+        assert attrs["runner_generation"] == 1
+        assert attrs["runner_id"] == runner_id
+        assert attrs["init_trigger"] == "runner_connect"
+        assert "server_commit_sha" in attrs
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
 async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
     db_uri: str,
@@ -2651,3 +2974,79 @@ async def test_on_runner_connect_reassign_http_status_levels(
     assert row.levelno == level
     assert row.exc_info is None
     assert f"HTTP {status}: runner said no" in row.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_info_publishes_the_picker_curation(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` carries both keys as configured, so the web picker can act on them."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "picker",
+        server_config={
+            "restrict_to_agent_names": ["polly", "claude-native-ui"],
+            "default_agent_name": "polly",
+        },
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/v1/info")
+
+    assert resp.status_code == 200
+    assert resp.json()["picker"] == {
+        "restrict_to_agent_names": ["polly", "claude-native-ui"],
+        "default_agent_name": "polly",
+    }
+
+
+@pytest.mark.parametrize(
+    ("names", "expected", "absent"),
+    [
+        # A mistyped name is called out; the real one next to it is not.
+        (("polly", "pollly"), ["matching no server agent: pollly"], ["matches no agent"]),
+        # A user's own agent can still match, so the picker is not promised empty.
+        (("nope",), ["matches no agent this server offers (nope)"], ["will be empty"]),
+        # OMNIGENT_SEEDED_AGENTS wins: a suppressed agent is seeded but never offered.
+        (
+            ("polly", "debby"),
+            ["OMNIGENT_SEEDED_AGENTS leaves out", ": debby"],
+            ["matches no agent"],
+        ),
+        (
+            ("debby", "nope"),
+            ["leaves out, so New Chat will not offer them: debby", "(debby, nope)"],
+            ["matching no server agent"],
+        ),
+    ],
+    ids=["typo", "unknown only", "suppressed", "nothing offered"],
+)
+def test_picker_restriction_warning_names_the_agents_new_chat_cannot_offer(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+    names: tuple[str, ...],
+    expected: list[str],
+    absent: list[str],
+) -> None:
+    """Startup names the restricted agents that are unknown or hidden by the env var."""
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.server.server_config import PickerCuration
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    for name in ("polly", "debby"):
+        agent_store.create(builtin_agent_id(name), name=name, bundle_location=f"test:///{name}")
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        server_app._warn_on_empty_picker_restriction(
+            agent_store,
+            PickerCuration(restrict_to_agent_names=names),
+            suppressed_agent_names=frozenset({"debby"}),
+        )
+
+    for text in expected:
+        assert text in caplog.text
+    for text in absent:
+        assert text not in caplog.text

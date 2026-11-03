@@ -57,6 +57,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  OMNIGENT_CI_PIPELINE: draft-release-notes
   SOURCE_REPO: omnigent-ai/omnigent
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
@@ -69,7 +70,7 @@ jobs:
       github.repository == 'omnigent-ai/omnigent' &&
       (github.event_name == 'workflow_dispatch' ||
        github.event.workflow_run.conclusion == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       # --- Resolve the tag and decide whether to proceed (no code run yet) ---
@@ -238,6 +239,7 @@ jobs:
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         uses: ./.github/actions/run-omnigent-agent
         with:
+          pipeline: draft-release-notes
           agent: release-notes-drafter
           prompt-file: /tmp/draft_prompt.txt
           output-file: /tmp/draft_out.txt

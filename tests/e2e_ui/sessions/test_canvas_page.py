@@ -7,14 +7,21 @@ import re
 from pathlib import Path
 
 import httpx
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
-def _stub_server_info(page: Page, *, canvas: bool, usage: bool = False) -> None:
-    """Advertise one deterministic ``canvas`` release-feature value."""
+def _stub_server_info(
+    page: Page, *, canvas: bool, usage: bool = False, session_pull_requests: bool = False
+) -> None:
+    """Advertise one deterministic ``canvas`` release-feature value.
+
+    :param session_pull_requests: Whether the server stores session PRs, so
+        Canvas cards read them from the session list rather than each runner.
+    """
     body = json.dumps(
         {
             "accounts_enabled": False,
@@ -24,12 +31,28 @@ def _stub_server_info(page: Page, *, canvas: bool, usage: bool = False) -> None:
             "features": {"canvas": canvas, "usage_page": usage, "harness_install": False},
             "harness_install_enabled": False,
             "installable_harnesses": [],
+            "session_pull_requests": session_pull_requests,
         }
     )
     page.route(
         "**/v1/info",
         lambda route: route.fulfill(status=200, content_type="application/json", body=body),
     )
+
+
+def _refuse_live_pull_requests(page: Page) -> list[str]:
+    """Fail every live PR lookup, so a card can only show the session list's PR.
+
+    :returns: The refused lookups' URLs, which the test can assert stay empty.
+    """
+    refused: list[str] = []
+
+    def refuse(route: Route) -> None:
+        refused.append(route.request.url)
+        route.abort()
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), refuse)
+    return refused
 
 
 def _session(
@@ -82,12 +105,15 @@ def test_canvas_page_is_absent_while_the_feature_is_off(page: Page, live_server:
     expect(page.get_by_test_id("canvas-workspace")).to_have_count(0)
 
 
+@pytest.mark.parametrize("width", [1280, 390])
 def test_canvas_page_groups_sessions_by_project_and_opens_them(
     page: Page,
     live_server: str,
     tmp_path: Path,
+    width: int,
 ) -> None:
-    """Main holds unfiled sessions; a project tab holds its own; a card opens its session."""
+    """Main and projects show only the viewer's sessions, including after reload."""
+    page.set_viewport_size({"width": width, "height": 900})
     projects = [{"id": "project-release", "name": "Release", "icon": None}]
     sessions = [
         _session(f"main-{index}", f"Main session {index}", 20 - index) for index in range(3)
@@ -95,11 +121,28 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     sessions.append(
         _session("project-session", "Review the release", 1, project_id="project-release")
     )
+    for session in sessions:
+        session["owner"] = "local"
+    sessions.extend(
+        [
+            _session("shared-main", "Shared main", 30, owner="someone-else", permission_level=4),
+            _session(
+                "shared-project",
+                "Shared project",
+                29,
+                owner="someone-else",
+                project_id="project-release",
+            ),
+            _session("shared-grant", "Shared grant", 28, permission_level=1),
+        ]
+    )
     _stub_server_info(page, canvas=True)
     page.route("**/v1/sessions?*", _serve_list(sessions))
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=projects))
 
     page.goto(live_server)
+    if width < 768:
+        page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
     page.get_by_test_id("canvas-nav").click()
 
@@ -130,6 +173,8 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
 
     # Leaving and coming back through the sidebar reopens the last selected canvas.
     page.goto(live_server)
+    if width < 768:
+        page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
     page.get_by_test_id("canvas-nav").click()
     expect(page).to_have_url(re.compile(r"/canvas\?canvas=project-release$"))
@@ -140,6 +185,9 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
 
     cards.click()
     expect(page).to_have_url(re.compile(r"/canvas/c/project-session\?canvas=project-release$"))
+    if width < 768:
+        page.get_by_role("button", name="Back to canvas", exact=True).click()
+        expect(cards).to_have_count(1)
     expect(page.get_by_role("region", name="Canvas pane", exact=True)).to_be_visible()
     expect(page.get_by_role("tab", name="Release", exact=True)).to_be_visible()
 

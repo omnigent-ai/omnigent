@@ -62,6 +62,15 @@ class _FakeCodexAppServerClient:
             raise self.error
         return self.response
 
+    def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+        """
+        Report that the connection already receives the thread's notifications.
+
+        :param _thread_id: Codex thread id.
+        :returns: ``True``.
+        """
+        return True
+
     async def iter_events(self) -> Any:
         """
         Yield the configured event stream.

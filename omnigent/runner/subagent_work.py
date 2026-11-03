@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -595,7 +596,8 @@ async def _recover_subagent_results_from_server(
         interrupted = status == "in_progress" or (
             status == "failed"
             and isinstance(error, dict)
-            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+            and error.get("code")
+            in {"runner_disconnected", "runner_failed_to_start", RUNNER_PROCESS_CRASH}
         )
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
@@ -886,7 +888,7 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+        except Exception:  # the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 
@@ -987,7 +989,7 @@ async def _deliver_subagent_wake_post(
             # failure — httpx does not raise on status by itself.
             resp.raise_for_status()
             return True
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, httpx.HTTPError) as exc:
             if (
                 attribution_created_by is not None
                 and isinstance(exc, httpx.HTTPStatusError)

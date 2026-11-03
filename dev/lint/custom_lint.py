@@ -25,7 +25,13 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from dev.lint import lint_session_list_visibility, lint_workspace_scoped_cache
+from dev.lint import (
+    lint_floating_runner_image,
+    lint_session_list_visibility,
+    lint_sleep_then_assert,
+    lint_workspace_scoped_cache,
+    lint_young_dependency_floor,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,21 @@ RULES: list[Rule] = [
         name=lint_session_list_visibility.RULE_NAME,
         check=lint_session_list_visibility.check,
         hint=lint_session_list_visibility.HINT,
+    ),
+    Rule(
+        name=lint_young_dependency_floor.RULE_NAME,
+        check=lint_young_dependency_floor.check,
+        hint=lint_young_dependency_floor.HINT,
+    ),
+    Rule(
+        name=lint_floating_runner_image.RULE_NAME,
+        check=lint_floating_runner_image.check,
+        hint=lint_floating_runner_image.HINT,
+    ),
+    Rule(
+        name=lint_sleep_then_assert.RULE_NAME,
+        check=lint_sleep_then_assert.check,
+        hint=lint_sleep_then_assert.HINT,
     ),
 ]
 

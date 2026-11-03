@@ -1,3 +1,5 @@
+import type { SandboxStatus } from "@/lib/types";
+
 /**
  * Copy for each in-flight managed-sandbox launch stage, in pipeline
  * order: provisioning → cloning (repo workspaces only) → starting →
@@ -9,7 +11,14 @@
  */
 export const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
   provisioning: "Provisioning sandbox",
+  // Still provisioning; `SandboxActionBanner` says what the user needs to do.
+  action_required: "Provisioning sandbox",
   cloning: "Cloning repository",
   starting: "Connecting host",
   connecting: "Starting agent",
 };
+
+/** A launch that failed or waits on the user is no longer making progress. */
+export function isSandboxLaunchStopped(launch: SandboxStatus | null): boolean {
+  return launch?.stage === "failed" || launch?.stage === "action_required";
+}

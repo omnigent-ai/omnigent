@@ -12,8 +12,8 @@
  * - Projects come from `useProjects`; the **+** tab reuses the sidebar's
  *   `NewProjectButton`, so creating a project here is the same
  *   `POST /v1/projects` the sidebar performs.
- * - Pull requests come through the GitHub panel's query cache
- *   (`fetchPullRequestInfo`), throttled per session by `usePullRequests`.
+ * - Each card's pull request is the session's first linked PR as the server
+ *   stores it (`Conversation.pull_request`), mapped by `usePullRequests`.
  * - Card positions live in localStorage (`canvasStorage.ts`), keyed by server
  *   identity and viewer; the server never learns the layout. Every card's spot
  *   is saved once the full list is known — grid slots included — so nothing
@@ -90,9 +90,9 @@ const RESIZE_REFIT_DELAY_MS = 100;
 const EMPTY_PROJECTS: ProjectSummary[] = [];
 
 const TAB_CLASS =
-  "flex h-7 max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
+  "flex h-7 mobile-touch-target mobile-app:h-auto max-w-[200px] shrink-0 items-center gap-1.5 rounded-md px-2.5 text-ui text-muted-foreground transition-colors hover:bg-muted hover:text-foreground aria-selected:bg-brand-accent/10 aria-selected:text-foreground";
 const CONTROL_CLASS =
-  "flex size-7 items-center justify-center rounded-md border bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground";
+  "flex size-7 mobile-touch-target items-center justify-center rounded-md border bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground";
 
 function sessionCountLabel(count: number): string {
   return count === 1 ? "1 session" : `${count} sessions`;
