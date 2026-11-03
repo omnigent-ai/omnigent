@@ -147,6 +147,8 @@ export interface PullRequest {
   checks_supported?: boolean;
   head_sha?: string;
   base_sha?: string;
+  /** HTTPS web URL of the source (possibly fork) repository; null when unknown or deleted. */
+  head_repository_url?: string | null;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
    *  host predating the Summary tab omits it, so treat undefined as none. */
   body?: string | null;
