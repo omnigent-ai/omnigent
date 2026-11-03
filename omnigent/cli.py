@@ -2709,33 +2709,34 @@ def _daemon_binding_matches(record: _HostDaemonRecord, server_url: str) -> bool:
     desired = _host_databricks_org_pin(server_url)
     if desired is None or ServerUrl(api_base=desired).org_id is None:
         # Without a requested selector, an existing daemon for this URL or
-        # proven workspace remains compatible. Repair a legacy binding once
+        # proven workspace remains compatible. Check for a conflict once
         # authentication establishes which selector this launch needs.
         return True
-    # Legacy daemons with an explicit target selector already inherited a pin.
-    # Bare legacy targets cannot prove their binding or freeze its absence.
+    # Legacy daemons may record only their target or server-reported workspace.
+    # Missing pin metadata alone must not interrupt their existing sessions.
     actual = record.org_pin
     if actual is None:
         selected = ServerUrl(api_base=record.target).org_id
         if selected is None:
-            return False
+            return (
+                record.workspace_id is None
+                or record.workspace_id == ServerUrl(api_base=desired).org_id
+            )
         from omnigent.cli_auth import databricks_org_pin
 
         actual = databricks_org_pin(record.target, selected)
     return ServerUrl(api_base=actual).org_id == ServerUrl(api_base=desired).org_id
 
 
-def _restart_incompatible_daemon(record: _HostDaemonRecord, server_url: str) -> bool:
-    """Repair background bindings; leave interactive hosts under their owner's control."""
+def _require_compatible_daemon(record: _HostDaemonRecord, server_url: str) -> None:
+    """Refuse a conflicting binding without interrupting the running host."""
     if _daemon_binding_matches(record, server_url):
-        return False
-    if record.log_path is None:
-        raise click.ClickException(
-            "The running foreground host has a different workspace binding. "
-            f"Stop it with `{_host_stop_command(record.server_url)}` and retry."
-        )
-    _terminate_host_unit(record, reason="workspace binding changed")
-    return True
+        return
+    raise click.ClickException(
+        "The running host has a different workspace binding. It was left running "
+        "to preserve its sessions. When its work is finished, stop it with "
+        f"`{_host_stop_command(record.server_url)}` and retry."
+    )
 
 
 def _daemon_host_status_probe(
@@ -3140,8 +3141,7 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         return _DaemonReuseDecision(reuse=False, config_changed=False)
 
     if target != _LOCAL_DAEMON_MARKER:
-        if _restart_incompatible_daemon(existing, target):
-            return _DaemonReuseDecision(reuse=False, config_changed=False)
+        _require_compatible_daemon(existing, target)
         # Remote / explicit ``--server`` mode: the daemon connects to a server
         # we don't own and can't restart, so the config-signature / heal /
         # "re-run" semantics below don't apply (auth posture is the remote's
@@ -3794,8 +3794,8 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         _record_host_state("reused_local_daemon", running_before=True)
         return False
     sibling = _same_workspace_daemon(server_url)
-    if sibling is not None and server_url and _restart_incompatible_daemon(sibling, server_url):
-        sibling = None
+    if sibling is not None and server_url:
+        _require_compatible_daemon(sibling, server_url)
     if sibling is not None:
         reason = _same_workspace_daemon_offline_reason(sibling, server_url)
         if reason is not None:
@@ -3863,13 +3863,16 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
 
 
 def _reuse_host_daemon_if_compatible(server_url: str) -> bool:
-    """Reuse a warm remote host without ever spawning an unauthenticated replacement."""
+    """Check for a compatible warm host without spawning or stopping a process."""
     from omnigent.util.server_url import is_workspace_hosted_url
 
     if is_workspace_hosted_url(server_url) and _selected_org_id(server_url) is None:
         return False
-    if _reuse_existing_daemon_record(_normalize_daemon_target(server_url)).reuse:
-        return True
+    existing = _find_daemon_record(_normalize_daemon_target(server_url))
+    if existing is not None and _daemon_owner_is_live(existing):
+        return not (
+            existing.log_path is not None and _daemon_host_identity_changed(existing)
+        ) and _daemon_binding_matches(existing, server_url)
     sibling = _same_workspace_daemon(server_url)
     return (
         sibling is not None
