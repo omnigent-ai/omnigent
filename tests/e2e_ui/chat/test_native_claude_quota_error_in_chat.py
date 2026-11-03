@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -24,6 +25,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.runner.launch_failure import _CONTENT_POLICY_REFUSAL
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
@@ -206,7 +208,7 @@ def _screenshot(page: Page, name: str) -> None:
 @pytest.mark.parametrize(
     (
         "provider_response",
-        "transcript_fragment",
+        "transcript_pattern",
         "expanded_fragments",
         "headline",
         "retry_buttons",
@@ -214,7 +216,7 @@ def _screenshot(page: Page, name: str) -> None:
     [
         pytest.param(
             {"error": _QUOTA_ERROR, "status_code": 429},
-            "429",
+            re.compile("429"),
             ("429", "Quota exceeded"),
             _RATE_LIMIT_HEADLINE,
             1,
@@ -222,7 +224,7 @@ def _screenshot(page: Page, name: str) -> None:
         ),
         pytest.param(
             {"refusal_category": ""},
-            "can't help with this",
+            _CONTENT_POLICY_REFUSAL,
             ("stays in this session's history", "Start a new session"),
             _REFUSAL_HEADLINE,
             0,
@@ -235,7 +237,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
     provider_response: dict[str, object],
-    transcript_fragment: str,
+    transcript_pattern: re.Pattern[str],
     expanded_fragments: tuple[str, ...],
     headline: str,
     retry_buttons: int,
@@ -248,7 +250,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
         claude-native wrapper, backed by the mock LLM.
     :param mock_llm_server_url: The mock LLM server base URL.
     :param provider_response: Mock LLM response returned for every request.
-    :param transcript_fragment: Text Claude Code's API error must carry in the transcript.
+    :param transcript_pattern: Pattern Claude Code's API error must match in the transcript.
     :param expanded_fragments: Text the expanded error pill must show.
     :param headline: Expected error-pill headline, live and after reload.
     :param retry_buttons: Expected number of Retry buttons on the pill.
@@ -335,7 +337,7 @@ def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     assert api_error_texts, (
         f"Claude Code's API error never reached the session transcript; pane:\n{failed_pane}"
     )
-    assert any(transcript_fragment in text for text in api_error_texts), api_error_texts
+    assert any(transcript_pattern.search(text) for text in api_error_texts), api_error_texts
     if failed_pane:
         assert "API Error" in failed_pane, failed_pane
 
