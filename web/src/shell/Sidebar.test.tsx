@@ -2673,6 +2673,28 @@ describe("Sidebar project Show more", () => {
     );
   }
 
+  it("keeps a folder's own members in Custom order across Show more", () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ ordering: "custom", custom: { base: "updated", since: 1000, ids: [] } }),
+    );
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    projectSessionsMock.current["Customer X"] = filedSessions(7);
+    renderGroupingSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+
+    // The keyboard path: the row menu opens with Enter.
+    const first = screen.getByRole("link", { name: "conv_filed_0" }).closest("li")!;
+    fireEvent.keyDown(within(first).getByTestId("conversation-actions"), { key: "Enter" });
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    const moved = ["conv_filed_1", "conv_filed_0", ...filedIds(7).slice(2)];
+    expect(folderRowIds()).toEqual(moved.slice(0, 5));
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(moved);
+  });
+
   it("lists five more sessions per click until none remain", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
