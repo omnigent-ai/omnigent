@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
+from operator import ge, gt, le, lt
 from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
@@ -731,12 +732,17 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.created_at,
                 SqlScheduledTask.state,
                 SqlScheduledTask.account_generation,
+                SqlScheduledTask.user_id,
             ).where(
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
             )
             if after is not None:
-                stmt = stmt.where(tuple_(SqlScheduledTask.created_at, SqlScheduledTask.id) < after)
+                stmt = stmt.where(
+                    self._cursor_after(
+                        (SqlScheduledTask.created_at, SqlScheduledTask.id), after, descending=True
+                    )
+                )
             tasks = session.execute(
                 stmt.order_by(
                     SqlScheduledTask.created_at.desc(), SqlScheduledTask.id.desc()
@@ -747,8 +753,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             failures = []
             for task in page:
                 # Filter after paging to bound scans even through deleted/rotated owners.
-                if task.state == encode_scheduled_task_state("deleted") or (
-                    check_generation and task.account_generation != generation
+                if (
+                    task.user_id != owner_user_id
+                    or task.state == encode_scheduled_task_state("deleted")
+                    or (check_generation and task.account_generation != generation)
                 ):
                     continue
                 run = session.execute(
@@ -974,18 +982,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     # ── Database scheduler ───────────────────────────────────────
 
     def _cursor_after(
-        self, columns: tuple[Any, ...], cursor: tuple[Any, ...], *, inclusive: bool = False
+        self,
+        columns: tuple[Any, ...],
+        cursor: tuple[Any, ...],
+        *,
+        inclusive: bool = False,
+        descending: bool = False,
     ) -> ColumnElement[bool]:
         """MySQL needs scalar ranges to seek past a composite cursor."""
+        compare = lt if descending else gt
+        compare_inclusive = le if descending else ge
         if self._engine.dialect.name != "mysql":
-            return tuple_(*columns) >= cursor if inclusive else tuple_(*columns) > cursor
+            return (compare_inclusive if inclusive else compare)(tuple_(*columns), cursor)
         return or_(
             *(
                 and_(
                     *(columns[previous] == cursor[previous] for previous in range(index)),
-                    column >= cursor[index]
-                    if inclusive and index == len(columns) - 1
-                    else column > cursor[index],
+                    (compare_inclusive if inclusive and index == len(columns) - 1 else compare)(
+                        column, cursor[index]
+                    ),
                 )
                 for index, column in enumerate(columns)
             )

@@ -57,8 +57,9 @@ no connected host so Run now fails naturally without touching a real host.
   alert for every historical failure. A later run replaces the previous item.
   Full run history remains on the automation detail page when enabled.
 - The feed examines 50 owned automations per page, newest-created first. The
-  Inbox badge counts unread failures in loaded pages. Use Check more automations
-  to inspect older jobs; an empty page can still have a continuation.
+  Inbox badge counts unread failures in loaded pages and adds a “+” while older
+  automations remain unchecked (just “+” when none are loaded). Use Check more
+  automations to inspect older jobs; an empty page can still have a continuation.
 - Opening Inbox refreshes the feed. The app-wide summary refreshes every five
   minutes while mounted; the Automations list retains its existing polling.
 - Read state is browser-local and scoped to server, mount path and user. It keeps

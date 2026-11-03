@@ -2999,6 +2999,30 @@ async def test_automation_inbox_owner_scope_and_cursor(auth_client, db_uri):
         ],
         "next_cursor": None,
     }
+    second = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    second_task_id = second.json()["id"]
+    store.create_run(
+        run_id=uuid.uuid4().hex,
+        scheduled_task_id=second_task_id,
+        status="failed",
+        scheduled_at=200,
+    )
+    first_page = (
+        await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers(), params={"limit": 1})
+    ).json()
+    assert len(first_page["data"]) == 1 and first_page["next_cursor"] is not None
+    second_page = (
+        await auth_client.get(
+            "/v1/scheduled-tasks/inbox",
+            headers=_headers(),
+            params={"limit": 1, "after": first_page["next_cursor"]},
+        )
+    ).json()
+    assert len(second_page["data"]) == 1 and second_page["next_cursor"] is None
+    assert {item["task_id"] for item in first_page["data"] + second_page["data"]} == {
+        task_id,
+        second_task_id,
+    }
     other = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers("bob@example.com"))
     assert other.status_code == 200 and other.json()["data"] == []
     for params in ({"limit": 0}, {"limit": 101}, {"after": "bad"}, {"after": "-1:" + task_id}):

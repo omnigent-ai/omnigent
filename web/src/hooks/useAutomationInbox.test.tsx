@@ -13,12 +13,12 @@ vi.mock("./useViewerId", () => ({ useViewerId: () => viewer }));
 let client: QueryClient;
 let supported = true;
 const failure = {
-  task_id: "task",
-  task_name: "Report",
-  run_id: "run",
-  scheduled_at: 10,
-  finished_at: 11,
-  error_code: "host_offline",
+  taskId: "task",
+  taskName: "Report",
+  runId: "run",
+  scheduledAt: 10,
+  finishedAt: 11,
+  errorCode: "host_offline",
 };
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
@@ -32,7 +32,7 @@ beforeEach(() => {
   localStorage.clear();
   viewer = "alice";
   supported = true;
-  vi.mocked(listAutomationFailures).mockReset().mockResolvedValue({ data: [], next_cursor: null });
+  vi.mocked(listAutomationFailures).mockReset().mockResolvedValue({ data: [], nextCursor: null });
 });
 afterEach(() => {
   cleanup();
@@ -41,8 +41,8 @@ afterEach(() => {
 
 it("continues across empty task pages and hides only the read occurrence", async () => {
   vi.mocked(listAutomationFailures)
-    .mockResolvedValueOnce({ data: [], next_cursor: "next" })
-    .mockResolvedValueOnce({ data: [failure], next_cursor: null });
+    .mockResolvedValueOnce({ data: [], nextCursor: "next" })
+    .mockResolvedValueOnce({ data: [failure], nextCursor: null });
   const { result } = renderHook(() => useAutomationInbox(true), { wrapper });
   await waitFor(() => expect(result.current.hasNextPage).toBe(true));
   await act(() => result.current.fetchNextPage());
@@ -51,32 +51,31 @@ it("continues across empty task pages and hides only the read occurrence", async
   act(() => result.current.markRead("run"));
   expect(result.current.items).toEqual([]);
   vi.mocked(listAutomationFailures).mockResolvedValue({
-    data: [{ ...failure, run_id: "new-run" }],
-    next_cursor: null,
+    data: [{ ...failure, runId: "new-run" }],
+    nextCursor: null,
   });
   await act(() => result.current.refetch());
-  await waitFor(() => expect(result.current.items[0]?.run_id).toBe("new-run"));
-  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [], next_cursor: null });
+  await waitFor(() => expect(result.current.items[0]?.runId).toBe("new-run"));
+  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [], nextCursor: null });
   await act(() => result.current.refetch());
   await waitFor(() => expect(result.current.items).toEqual([]));
 });
 
-it("never fetches on an older server or before identity is ready", async () => {
-  supported = false;
-  const { rerender } = renderHook(() => useAutomationInbox(false), { wrapper });
-  await act(async () => {});
-  expect(listAutomationFailures).not.toHaveBeenCalled();
-  supported = true;
-  rerender();
+it.each([
+  { supported: false, identityReady: true },
+  { supported: true, identityReady: false },
+])("does not fetch with support=$supported and identityReady=$identityReady", async (inputs) => {
+  supported = inputs.supported;
+  renderHook(() => useAutomationInbox(inputs.identityReady), { wrapper });
   await act(async () => {});
   expect(listAutomationFailures).not.toHaveBeenCalled();
 });
 
 it("does not display the previous viewer's cached failures", async () => {
-  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [failure], next_cursor: null });
+  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [failure], nextCursor: null });
   const { result, rerender } = renderHook(() => useAutomationInbox(true), { wrapper });
   await waitFor(() => expect(result.current.items).toHaveLength(1));
-  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [], next_cursor: null });
+  vi.mocked(listAutomationFailures).mockResolvedValue({ data: [], nextCursor: null });
   viewer = "bob";
   rerender();
   expect(result.current.items).toEqual([]);

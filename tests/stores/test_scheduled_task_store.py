@@ -2380,6 +2380,16 @@ def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generati
     assert final is None
     assert store.list_inbox_failures(owner_user_id="someone-else") == ([], None)
     assert store.list_inbox_failures(owner_user_id=None) == ([], None)
+    with store._session("test_matching_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[2].id)).account_generation = "current"
+        session.get(SqlScheduledTask, (0, ordered[3].id)).user_id = None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        matching, _ = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id, generation="current", check_generation=True
+        )
+    assert [item.task_id for item in matching] == [ordered[2].id]
+    local, _ = store.list_inbox_failures(owner_user_id=None)
+    assert [item.task_id for item in local] == [ordered[3].id]
     with workspace_scope(99):
         assert store.list_inbox_failures(owner_user_id=tasks[0].user_id) == ([], None)
 
@@ -2406,6 +2416,9 @@ def test_inbox_query_plans_use_bounded_task_and_run_indexes(store):
     finally:
         event.remove(store._engine, "before_cursor_execute", capture)
     assert len(queries) == 4
+    assert all("LIMIT" in statement for statement, _ in queries)
+    if store._engine.dialect.name != "sqlite":
+        return
     with store._engine.connect() as connection:
         for statement, parameters in queries:
             plan = str(
@@ -2419,3 +2432,73 @@ def test_inbox_query_plans_use_bounded_task_and_run_indexes(store):
             assert index in plan
             assert "SEARCH" in plan and "TEMP B-TREE" not in plan
             assert "LIMIT" in statement
+
+
+@pytest.mark.parametrize("returned_owner", ["OWNER", "owner ", "ownér"])
+def test_inbox_rechecks_exact_owner_before_reading_runs(store, monkeypatch, returned_owner):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    # Simulate rows already matched by a case/accent-insensitive SQL collation.
+    candidate = SimpleNamespace(id=_uid("candidate"), created_at=100, user_id=returned_owner)
+    session = MagicMock()
+    session.execute.return_value.all.return_value = [candidate, candidate]
+    session_context = MagicMock()
+    session_context.return_value.__enter__.return_value = session
+    monkeypatch.setattr(store, "_session", session_context)
+    assert store.list_inbox_failures(owner_user_id="owner", limit=1) == (
+        [],
+        (candidate.created_at, candidate.id),
+    )
+    assert session.execute.call_count == 1  # Rejected owners never trigger run reads.
+
+
+def test_inbox_mysql_deep_page_seeks_to_cursor(store):
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTask),
+            [
+                {
+                    "id": f"{index:032x}",
+                    "workspace_id": 0,
+                    "user_id": "plan-owner",
+                    "name": "Report",
+                    "prompt": "Report",
+                    "rrule": "FREQ=DAILY",
+                    "agent_id": _uid("agent"),
+                    "created_at": index // 10,
+                }
+                for index in range(10_000)
+            ],
+        )
+        connection.exec_driver_sql("ANALYZE TABLE scheduled_tasks").all()
+    plans = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT scheduled_tasks."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        failures, cursor = store.list_inbox_failures(
+            owner_user_id="plan-owner", after=(100, f"{1005:032x}"), limit=50
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert failures == [] and cursor == (95, f"{955:032x}")
+    assert len(plans) == 1
+    assert "Index range scan" in plans[0] and "ix_scheduled_tasks_user_scope" in plans[0]
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= 51, plans[0]

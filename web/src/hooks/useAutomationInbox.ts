@@ -24,7 +24,7 @@ export function useAutomationInbox(identityReady: boolean) {
     queryKey: ["automation-inbox", scope],
     queryFn: ({ pageParam }) => listAutomationFailures(pageParam),
     initialPageParam: null as string | null,
-    getNextPageParam: (page) => page.next_cursor ?? undefined,
+    getNextPageParam: (page) => page.nextCursor ?? undefined,
     enabled,
     staleTime: 60_000,
     // A small summary feed; keep global polling slower than the Automations page.
@@ -32,13 +32,13 @@ export function useAutomationInbox(identityReady: boolean) {
     retry: 1,
   });
   const failures = enabled ? (query.data?.pages.flatMap((page) => page.data) ?? []) : [];
-  const unique = new Map(failures.map((item) => [item.task_id, item]));
+  const unique = new Map(failures.map((item) => [item.taskId, item]));
   return {
     ...query,
     isLoading: enabled && query.isLoading,
     isError: enabled && query.isError,
     hasNextPage: enabled && query.hasNextPage,
-    items: [...unique.values()].filter((item) => !seen.has(item.run_id)),
+    items: [...unique.values()].filter((item) => !seen.has(item.runId)),
     markRead,
   };
 }

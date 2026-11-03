@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -1053,6 +1054,37 @@ describe("Sidebar session list", () => {
     );
     expect(badge.className).not.toContain("brand-accent");
   });
+
+  it.each([0, 2])(
+    "marks an incomplete Inbox count of %s until all task pages are checked",
+    (count) => {
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      const state = { items: [], hasNextPage: true } as unknown as ReturnType<
+        typeof automationInboxHook.useAutomationInbox
+      >;
+      automationInbox.mockReturnValue(state);
+      try {
+        mockConversations([
+          conv("conv_awaiting", "Claude Code", { pending_elicitations_count: count }),
+        ]);
+        const first = renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            `${count} inbox items waiting; more automations not yet checked`,
+          ),
+        ).toHaveTextContent(count ? `${count}+` : "+");
+        first.unmount();
+        automationInbox.mockReturnValue({ ...state, hasNextPage: false });
+        renderSidebar();
+        const inbox = within(screen.getByTestId("inbox-button"));
+        expect(inbox.queryByLabelText(/more automations/)).toBeNull();
+        if (count) expect(inbox.getByLabelText("2 inbox items waiting")).toHaveTextContent("2");
+        else expect(inbox.queryByText("+")).toBeNull();
+      } finally {
+        automationInbox.mockRestore();
+      }
+    },
+  );
 
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.

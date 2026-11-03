@@ -342,8 +342,8 @@ export function InboxPage() {
   const groups = groupInboxEntries<InboxEntry>([
     ...visibleAutomations.map((item) => ({
       kind: "automation" as const,
-      key: `automation:${item.run_id}`,
-      at: item.finished_at ?? item.scheduled_at,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
       item,
     })),
     ...visibleApprovals.map((item) => ({
@@ -467,7 +467,7 @@ export function InboxPage() {
     };
     if (entry.kind === "automation") {
       const { item } = entry;
-      const failure = describeRunFailure(item.error_code, "failed");
+      const failure = describeRunFailure(item.errorCode, "failed");
       const reason = failure.stage ? `${failure.stage} · ${failure.reason}` : failure.reason;
       return (
         <InboxCard
@@ -475,19 +475,19 @@ export function InboxPage() {
           testId="inbox-automation-item"
           tile={<KindTile icon={AlertTriangleIcon} tone="red" />}
           kindLabel="Automation failed"
-          title={item.task_name}
+          title={item.taskName}
           preview={reason}
           at={entry.at}
           unread
           expanded={expanded}
           onToggle={onToggle}
         >
-          <p className="text-ui font-medium">{item.task_name}</p>
+          <p className="text-ui font-medium">{item.taskName}</p>
           <p className="mt-2 text-ui text-muted-foreground">{reason}</p>
           <InboxActions>
             <Button asChild size="xs" className={PRIMARY_ACTION}>
               <Link
-                to={taskDetailsEnabled ? `/tasks/${item.task_id}` : "/tasks"}
+                to={taskDetailsEnabled ? `/tasks/${item.taskId}` : "/tasks"}
                 componentId="inbox.automation.open"
               >
                 Open automation <ArrowRightIcon className="size-3.5" />
@@ -497,7 +497,7 @@ export function InboxPage() {
               variant="outline"
               size="xs"
               className={OUTLINE_ACTION}
-              onClick={() => automationInbox.markRead(item.run_id)}
+              onClick={() => automationInbox.markRead(item.runId)}
               componentId="inbox.automation.mark_read"
             >
               <CheckIcon className="size-3.5" /> Mark as read
@@ -910,7 +910,12 @@ export function InboxPage() {
       {showUnread && automationInbox.isError && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load automation failures.
-          <Button variant="outline" size="sm" onClick={() => void automationInbox.refetch()}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void automationInbox.refetch()}
+            componentId="inbox.retry_automations"
+          >
             Retry automations
           </Button>
         </div>

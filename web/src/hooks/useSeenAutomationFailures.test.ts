@@ -13,6 +13,9 @@ it("shares dismissal in the same tab, persists on remount, and isolates identiti
   const second = renderHook(() => useSeenAutomationFailures("server-a/alice", true));
   act(() => first.result.current.markRead("run-1"));
   expect(second.result.current.seen.has("run-1")).toBe(true);
+  expect(
+    JSON.parse(localStorage.getItem("omnigent:seen-automation-failures:v1:server-a/alice")!),
+  ).toEqual(["run-1"]);
   first.unmount();
   second.unmount();
   const remount = renderHook(() => useSeenAutomationFailures("server-a/alice", true));

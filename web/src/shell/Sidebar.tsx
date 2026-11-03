@@ -808,6 +808,7 @@ function SidebarImpl({
           ? sidebarData.shared
           : sidebarData.all;
   const inboxCount = sidebarData.inboxCount;
+  const inboxCountIncomplete = sidebarData.inboxCountIncomplete;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -1306,12 +1307,17 @@ function SidebarImpl({
                     )}
                   />
                   Inbox
-                  {inboxCount > 0 && (
+                  {(inboxCount > 0 || inboxCountIncomplete) && (
                     <span
+                      title={
+                        inboxCountIncomplete ? "Open Inbox to check older automations." : undefined
+                      }
                       aria-label={
-                        inboxCount === 1
-                          ? "1 inbox item waiting"
-                          : `${inboxCount} inbox items waiting`
+                        inboxCountIncomplete
+                          ? `${inboxCount} inbox items waiting; more automations not yet checked`
+                          : inboxCount === 1
+                            ? "1 inbox item waiting"
+                            : `${inboxCount} inbox items waiting`
                       }
                       className={cn(
                         "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
@@ -1321,7 +1327,8 @@ function SidebarImpl({
                         isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
                       )}
                     >
-                      {inboxCount}
+                      {inboxCount > 0 ? inboxCount : ""}
+                      {inboxCountIncomplete ? "+" : ""}
                     </span>
                   )}
                 </Link>

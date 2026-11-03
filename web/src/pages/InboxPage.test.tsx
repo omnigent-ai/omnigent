@@ -18,6 +18,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as approvalCard from "@/components/blocks/ApprovalCard";
 import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
@@ -146,15 +148,20 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
 
 function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  taskDetailsEnabled = false,
 ) {
   // Fresh client per render so cached queries never leak between tests.
   return render(
     <QueryClientProvider client={queryClient}>
-      <SidebarDataProvider>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
-      </SidebarDataProvider>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
+      >
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
 }
@@ -1580,34 +1587,40 @@ it("recovers a native request after an empty snapshot without reloading", async 
 });
 
 describe("automation failures", () => {
-  it("renders reason, links to automations, dismisses only the run, and excludes Awaiting response", () => {
-    const markRead = vi.fn();
-    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
-      automationInboxStub({
-        markRead,
-        items: [
-          {
-            task_id: "task",
-            task_name: "Daily report",
-            run_id: "run",
-            scheduled_at: 1_700_000_000,
-            finished_at: 1_700_000_010,
-            error_code: "host_offline",
-          },
-        ],
-      }),
-    );
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: "Automation failed: Daily report" }));
-    expect(screen.getByText("Host · The host was offline.")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /Open automation/ })).toHaveAttribute("href", "/tasks");
-    fireEvent.click(screen.getByRole("button", { name: "Mark as read" }));
-    expect(markRead).toHaveBeenCalledWith("run");
-    selectTab("Awaiting response");
-    expect(screen.queryByTestId("inbox-automation-item")).toBeNull();
-    selectTab("Unread");
-    expect(screen.getByTestId("inbox-automation-item")).toBeInTheDocument();
-  });
+  it.each([false, true])(
+    "renders and dismisses failures with task details enabled=%s",
+    (taskDetailsEnabled) => {
+      const markRead = vi.fn();
+      vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+        automationInboxStub({
+          markRead,
+          items: [
+            {
+              taskId: "task",
+              taskName: "Daily report",
+              runId: "run",
+              scheduledAt: 1_700_000_000,
+              finishedAt: 1_700_000_010,
+              errorCode: "host_offline",
+            },
+          ],
+        }),
+      );
+      renderPage(undefined, taskDetailsEnabled);
+      fireEvent.click(screen.getByRole("button", { name: "Automation failed: Daily report" }));
+      expect(screen.getByText("Host · The host was offline.")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /Open automation/ })).toHaveAttribute(
+        "href",
+        taskDetailsEnabled ? "/tasks/task" : "/tasks",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Mark as read" }));
+      expect(markRead).toHaveBeenCalledWith("run");
+      selectTab("Awaiting response");
+      expect(screen.queryByTestId("inbox-automation-item")).toBeNull();
+      selectTab("Unread");
+      expect(screen.getByTestId("inbox-automation-item")).toBeInTheDocument();
+    },
+  );
 
   it("offers continuation for an empty task page and retries feed failures", () => {
     const fetchNextPage = vi.fn();

@@ -242,6 +242,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     loadedData,
     inboxRows,
     inboxCount,
+    inboxCountIncomplete: automationInbox.hasNextPage,
     comments,
     automationInbox,
     watchedIds,
