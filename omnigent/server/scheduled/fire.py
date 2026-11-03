@@ -1488,11 +1488,8 @@ async def _create_session(
             )
             if updated is not None:
                 conv = updated
-        # Stamp terminal-first presentation labels the interactive create path would
-        # have set, so a fired session on a terminal harness exposes the
-        # Chat/Terminal switcher instead of rendering Chat-only. Stamped last (after
-        # the override reload above) so the labels land on the conversation returned
-        # to the launch/dispatch caller, not a stale pre-label reload of it.
+        # Mirror the interactive path's terminal labels after reloading overrides
+        # so the returned conversation carries the Chat/Terminal presentation.
         labels = await _presentation_labels(deps, task)
         if labels:
             await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)

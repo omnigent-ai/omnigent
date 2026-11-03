@@ -12,6 +12,8 @@
 import { authenticatedFetch } from "./identity";
 import { startTimedInteraction } from "./analyticsEmit";
 
+export const RANDOM_WORKTREE_BASE_REF = "HEAD";
+
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
 

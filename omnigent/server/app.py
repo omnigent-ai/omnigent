@@ -264,8 +264,9 @@ class ServerInfoResponse(BaseModel):
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
     dictation_available: bool
-    # The archive PATCH accepts ``delete_worktree``; older servers reject it.
+    # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
+    # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True

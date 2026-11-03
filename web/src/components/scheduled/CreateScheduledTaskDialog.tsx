@@ -68,6 +68,7 @@ import {
 } from "@/lib/scheduleBuilder";
 import {
   ScheduledTaskApiError,
+  RANDOM_WORKTREE_BASE_REF,
   type ScheduledTask,
   type AutomationTemplateId,
   type ScheduledTaskExecutionTarget,
@@ -435,13 +436,20 @@ export function CreateScheduledTaskDialog({
   }
 
   const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
-  const { data: worktrees } = useHostWorktrees(
+  const { data: worktrees, isFetching: worktreesChecking } = useHostWorktrees(
     open && worktreesSupported && !sandboxMode && !workspaceHostOffline && hostId !== ""
       ? hostId
       : null,
     workspace || null,
   );
   const isGitWorkspace = (worktrees?.length ?? 0) > 0;
+  const worktreeStatus = workspaceHostOffline
+    ? "Connect your host to verify this directory."
+    : worktreesChecking
+      ? "Checking whether this directory is a Git repository."
+      : worktrees === undefined
+        ? "Repository verification is unavailable."
+        : "The selected directory is not a Git repository.";
   useEffect(() => {
     if (workspaceHostOffline) setWorkspaceBrowserOpen(false);
   }, [workspaceHostOffline]);
@@ -911,10 +919,7 @@ export function CreateScheduledTaskDialog({
                   <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
                   {worktreesSupported && !isGitWorkspace && baseBranch !== null && (
                     <div className="mt-2 text-sm text-muted-foreground">
-                      <p>
-                        Random worktree is enabled, but this directory could not be verified as a
-                        Git repository.
-                      </p>
+                      <p>Random worktree is enabled. {worktreeStatus}</p>
                       <Button type="button" variant="link" onClick={() => setBaseBranch(null)}>
                         Turn off random worktree
                       </Button>
@@ -927,7 +932,7 @@ export function CreateScheduledTaskDialog({
                           id="task-random-worktree"
                           checked={baseBranch !== null}
                           onCheckedChange={(checked) =>
-                            setBaseBranch(checked === true ? "HEAD" : null)
+                            setBaseBranch(checked === true ? RANDOM_WORKTREE_BASE_REF : null)
                           }
                           componentId="tasks.scheduled.random_worktree"
                         />

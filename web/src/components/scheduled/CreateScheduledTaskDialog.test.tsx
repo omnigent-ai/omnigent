@@ -34,17 +34,23 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
-const gitWorkspace = vi.hoisted(() => ({ available: true, path: "/home/me/repo", query: vi.fn() }));
+const gitWorkspace = vi.hoisted(() => ({
+  available: true as boolean | undefined,
+  checking: false,
+  path: "/home/me/repo",
+  query: vi.fn(),
+}));
 vi.mock("@/hooks/useHostWorktrees", () => ({
   useHostWorktrees: (hostId: string | null, path: string | null) => {
     gitWorkspace.query(hostId, path);
     return {
       data:
-        hostId && path
+        hostId && path && gitWorkspace.available !== undefined
           ? gitWorkspace.available
             ? [{ path, branch: "main", is_main: true }]
             : []
           : undefined,
+      isFetching: gitWorkspace.checking,
     };
   },
 }));
@@ -183,6 +189,7 @@ const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
   gitWorkspace.available = true;
+  gitWorkspace.checking = false;
   gitWorkspace.path = "/home/me/repo";
   gitWorkspace.query.mockClear();
   vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
@@ -3057,8 +3064,19 @@ describe("automation random worktree", () => {
     },
   );
 
-  it("can turn off a saved worktree when Git discovery is unavailable", async () => {
-    gitWorkspace.available = false;
+  it.each([
+    ["loading", "Checking whether this directory is a Git repository."],
+    ["error", "Repository verification is unavailable."],
+    ["offline", "Connect your host to verify this directory."],
+    ["non-git", "The selected directory is not a Git repository."],
+  ])("can turn off a saved worktree when Git discovery reports %s", async (state, message) => {
+    gitWorkspace.available = state === "non-git" ? false : undefined;
+    gitWorkspace.checking = state === "loading";
+    if (state === "offline") {
+      vi.mocked(hostsHook.useHosts).mockReturnValue({
+        data: [{ host_id: "host_1", name: "laptop", status: "offline" }],
+      } as ReturnType<typeof hostsHook.useHosts>);
+    }
     render(
       <CreateScheduledTaskDialog
         open
@@ -3070,6 +3088,8 @@ describe("automation random worktree", () => {
         })}
       />,
     );
+    expect(screen.getByText(`Random worktree is enabled. ${message}`)).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Turn off random worktree" }));
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
