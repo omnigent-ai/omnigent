@@ -42,7 +42,10 @@ function RetainedCollapsibleContent({
   open,
   style,
   ...props
-}: Omit<React.ComponentProps<typeof CollapsiblePrimitive.CollapsibleContent>, "forceMount" | "ref"> & {
+}: Omit<
+  React.ComponentProps<typeof CollapsiblePrimitive.CollapsibleContent>,
+  "forceMount" | "ref"
+> & {
   open: boolean;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
