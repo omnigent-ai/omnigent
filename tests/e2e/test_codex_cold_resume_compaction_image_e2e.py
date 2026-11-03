@@ -421,10 +421,16 @@ async def test_codex_cold_resume_survives_compaction_omitted_screenshot(
         f"stderr={proc.stderr[-2000:]!r}"
     )
 
-    # Codex versions that reject remote images replace the preserved URL with a notice.
+    # The valid image reference must survive the replay untouched. Codex versions
+    # that reject remote images in tool results replace that URL with a notice.
     outgoing = json.dumps(provider.requests)
     (tmp_path / "provider-requests.json").write_text(outgoing)
-    assert (
-        _VALID_IMAGE_URL in outgoing
-        or "image content omitted because remote image URLs are not supported" in outgoing
-    ), "the native request lost both the preserved image URL and its unsupported-image notice"
+    if item_type == "message":
+        assert _VALID_IMAGE_URL in outgoing, (
+            "the replay dropped a valid image URL from the compacted history"
+        )
+    else:
+        assert (
+            _VALID_IMAGE_URL in outgoing
+            or "image content omitted because remote image URLs are not supported" in outgoing
+        ), "the native request lost both the preserved image URL and its unsupported-image notice"

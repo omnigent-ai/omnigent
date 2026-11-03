@@ -1,7 +1,9 @@
+import { arrayMove } from "@dnd-kit/sortable";
 import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -211,6 +213,16 @@ export function filterConversations(
   });
 }
 
+/** A saved Custom order indexed for sorting. */
+export interface CustomSortOrder {
+  since: number;
+  positions: ReadonlyMap<string, number>;
+}
+
+export function customSortOrder(order: SidebarCustomOrder): CustomSortOrder {
+  return { since: order.since, positions: new Map(order.ids.map((id, index) => [id, index])) };
+}
+
 // Newest first; equal timestamps fall back to id, so arrival order never shows.
 // Freeze update timestamps for the active chat and hovered list; creation
 // timestamps stay immutable, including when the selected order changes.
@@ -219,6 +231,7 @@ export function sortConversations(
   activeOverride: ActiveChatOverride | null,
   frozenKeys?: Map<string, number> | null,
   sortBy: SessionSortBy = "updated_at",
+  custom?: CustomSortOrder | null,
 ): Conversation[] {
   const effective = (c: Conversation): number => {
     const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
@@ -226,7 +239,71 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
+  // Custom: saved rows by position, later-created sessions above, history (ties too) below.
+  const rank = (c: Conversation): number =>
+    custom ? (custom.positions.get(c.id) ?? (c.created_at > custom.since ? -1 : Infinity)) : 0;
+  return [...conversations].sort((a, b) => {
+    const aRank = rank(a);
+    const bRank = rank(b);
+    if (aRank !== bRank) return aRank - bRank;
+    const byTime = aRank === -1 ? b.created_at - a.created_at : effective(b) - effective(a);
+    return byTime || b.id.localeCompare(a.id);
+  });
+}
+
+export function sidebarSortBy(base: SidebarCustomOrder["base"]): SessionSortBy {
+  return base === "created" ? "created_at" : "updated_at";
+}
+
+/** Start Custom from the automatic order on screen: every loaded row keeps its slot. */
+export function startCustomOrder(
+  base: SidebarCustomOrder["base"],
+  rows: Conversation[],
+  activeOverride: ActiveChatOverride | null,
+  frozenKeys: Map<string, number> | null,
+): SidebarCustomOrder {
+  return {
+    base,
+    // Server timestamps, so a skewed device clock can't misfile new sessions.
+    since: rows.reduce((latest, row) => Math.max(latest, row.created_at, row.updated_at), 0),
+    ids: sortConversations(rows, activeOverride, frozenKeys, sidebarSortBy(base)).map(
+      (row) => row.id,
+    ),
+  };
+}
+
+/**
+ * Move `fromId` into `toId`'s slot, or return null for a no-op. Unloaded saved
+ * rows keep their slots. Positions are saved through the deepest row the move
+ * touches, so the history below it keeps following the base order.
+ */
+export function moveCustomOrder(
+  order: SidebarCustomOrder,
+  rows: Conversation[],
+  fromId: string,
+  toId: string,
+  activeOverride: ActiveChatOverride | null,
+  frozenKeys: Map<string, number> | null,
+): SidebarCustomOrder | null {
+  const custom = customSortOrder(order);
+  const unsaved = sortConversations(
+    rows.filter((row) => !custom.positions.has(row.id)),
+    activeOverride,
+    frozenKeys,
+    sidebarSortBy(order.base),
+    custom,
+  );
+  const newIds = unsaved.filter((row) => row.created_at > order.since).map((row) => row.id);
+  const sequence = [
+    ...newIds,
+    ...order.ids,
+    ...unsaved.filter((row) => row.created_at <= order.since).map((row) => row.id),
+  ];
+  const from = sequence.indexOf(fromId);
+  const to = sequence.indexOf(toId);
+  if (from < 0 || to < 0 || from === to) return null;
+  const savedEnd = Math.max(newIds.length + order.ids.length, from + 1, to + 1);
+  return { ...order, ids: arrayMove(sequence, from, to).slice(0, savedEnd) };
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

@@ -78,7 +78,7 @@ def _wait_for_catalog(client: httpx.Client, session_id: str, selection: str) -> 
         (None, None, [], False),
         (False, "replace", ["--append-system-prompt", _USER_ADDITION], False),
         (None, None, ["--no-approve"], False),
-        (False, "replace", ["--append-system-prompt", _USER_ADDITION], True),
+        (None, "replace", ["--append-system-prompt", _USER_ADDITION], True),
     ],
     ids=["default", "replace-no-context", "untrusted-project", "managed-relative-root"],
 )

@@ -1203,8 +1203,9 @@ async def _prepare_codex_terminal(
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
         _codex_launch = resolve_native_codex_launch(model=model, terminal_launch_args=codex_args)
+        resume_rollout: Path | None = None
         if thread_id is not None:
-            await _ensure_local_codex_resume_rollout(
+            resume_rollout = await _ensure_local_codex_resume_rollout(
                 client,
                 session_id=session_id,
                 external_session_id=thread_id,
@@ -1264,6 +1265,7 @@ async def _prepare_codex_terminal(
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
+                    rollout_path=resume_rollout,
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -2263,6 +2265,7 @@ def _codex_rollout_records_from_session_items(
     ]
     seen_turn_ids: set[str] = set()
     open_function_calls: dict[str, _JsonObject] = {}
+    emitted_call_ids: set[str] = set()
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
     remaining_function_outputs = _codex_function_output_counts(
         items,
@@ -2287,7 +2290,6 @@ def _codex_rollout_records_from_session_items(
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
             if isinstance(compacted_msgs, list) and compacted_msgs:
-                compacted_msgs = _codex_items_with_outputs_in_call_order(compacted_msgs)
                 replacement_history: list[object] = []
                 for message in compacted_msgs:
                     if isinstance(message, dict):
@@ -2305,10 +2307,7 @@ def _codex_rollout_records_from_session_items(
                             }
                         elif (
                             message.get("type")
-                            in (
-                                "function_call_output",
-                                "custom_tool_call_output",
-                            )
+                            in ("function_call_output", "custom_tool_call_output")
                             and "output" in message
                         ):
                             message = {
@@ -2316,6 +2315,7 @@ def _codex_rollout_records_from_session_items(
                                 "output": sanitize_replayed_image_blocks(message["output"]),
                             }
                     replacement_history.append(message)
+                replacement_history = _codex_history_without_orphan_outputs(replacement_history)
                 replacement_call_ids = {
                     message.get("call_id")
                     for message in replacement_history
@@ -2331,10 +2331,7 @@ def _codex_rollout_records_from_session_items(
                     if call_id in remaining_function_outputs
                     and call_id not in replacement_call_ids
                 )
-                # Later results can belong to calls retained only in this snapshot.
-                items[index + 1 :] = _codex_items_with_outputs_in_call_order(
-                    items[index + 1 :], call_history=replacement_history
-                )
+                emitted_call_ids = _codex_function_call_ids(replacement_history)
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
                     "replacement_history": replacement_history,
@@ -2362,7 +2359,15 @@ def _codex_rollout_records_from_session_items(
         if isinstance(call_id, str) and call_id:
             if payload.get("type") == "function_call":
                 open_function_calls[call_id] = payload
+                emitted_call_ids.add(call_id)
             elif payload.get("type") == "function_call_output":
+                if call_id not in emitted_call_ids:
+                    # Providers pair tool results with the preceding call by position.
+                    _logger.warning(
+                        "Dropping Codex resume tool output without a preceding call: call_id=%s",
+                        call_id,
+                    )
+                    continue
                 open_function_calls.pop(call_id, None)
         turn_id = _codex_turn_id_for_session_item(
             session_id=session_id,
@@ -2398,8 +2403,6 @@ def _codex_rollout_records_from_session_items(
 
 def _codex_items_with_outputs_in_call_order(
     items: list[_JsonObject],
-    *,
-    call_history: Sequence[object] = (),
 ) -> list[_JsonObject]:
     """
     Reorder tool outputs separated only by metadata to match their calls' order.
@@ -2408,15 +2411,12 @@ def _codex_items_with_outputs_in_call_order(
     in call order, and providers that pair outputs by position reject the swap.
 
     :param items: Flat Omnigent item dicts in chronological order.
-    :param call_history: Prior replacement history containing calls still awaiting results.
     :returns: Items with output slots sorted by their calls' positions, preserving
         metadata positions and all content or compaction boundaries. Unmatched
         outputs keep their relative order at the end of the run.
     """
     call_positions: dict[str, int] = {}
-    for position, item in enumerate([*call_history, *items]):
-        if not isinstance(item, dict):
-            continue
+    for position, item in enumerate(items):
         call_id = item.get("call_id")
         if item.get("type") == "function_call" and isinstance(call_id, str):
             call_positions.setdefault(call_id, position)
@@ -2437,17 +2437,10 @@ def _codex_items_with_outputs_in_call_order(
         output_positions.clear()
 
     for position, item in enumerate(items):
-        if not isinstance(item, dict):
-            flush_run()
-            continue
         item_type = item.get("type")
         if item_type == "function_call_output":
             output_positions.append(position)
-        elif (
-            not isinstance(item_type, str)
-            or item_type not in NON_CONTENT_ITEM_TYPES
-            or item_type == "compaction"
-        ):
+        elif item_type == "compaction" or item_type not in NON_CONTENT_ITEM_TYPES:
             flush_run()
     flush_run()
     return ordered
@@ -2467,6 +2460,37 @@ def _codex_function_output_counts(
         if item.get("type") == "function_call_output" and isinstance(call_id, str) and call_id:
             counts[call_id] += 1
     return counts
+
+
+def _codex_function_call_ids(items: Sequence[object]) -> set[str]:
+    """Return the call ids of function calls in Responses history."""
+    return {
+        item["call_id"]
+        for item in items
+        if isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and isinstance(item.get("call_id"), str)
+    }
+
+
+def _codex_history_without_orphan_outputs(history: list[object]) -> list[object]:
+    """Drop function outputs whose call does not precede them in a history snapshot."""
+    call_ids: set[str] = set()
+    kept: list[object] = []
+    for item in history:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            if item.get("call_id") not in call_ids:
+                _logger.warning(
+                    "Dropping compacted Codex tool output without a preceding call: call_id=%s",
+                    item.get("call_id"),
+                )
+                continue
+        elif isinstance(item, dict) and item.get("type") == "function_call":
+            call_id = item.get("call_id")
+            if isinstance(call_id, str):
+                call_ids.add(call_id)
+        kept.append(item)
+    return kept
 
 
 def _codex_open_function_calls(items: Sequence[object]) -> dict[str, _JsonObject]:

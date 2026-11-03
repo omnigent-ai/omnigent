@@ -432,12 +432,25 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage(item_typ
         },
     ]
     content_field = "content" if item_type == "message" else "output"
+    output_index = 0 if item_type == "message" else 1
     if item_type != "message":
         messages[0] = {
             "type": item_type,
             "call_id": "call_image",
             "output": messages[0]["content"],
         }
+        # A snapshot tool output is replayed only behind its call.
+        call_type = item_type.removesuffix("_output")
+        arguments_field = "arguments" if call_type == "function_call" else "input"
+        messages.insert(
+            0,
+            {
+                "type": call_type,
+                "call_id": "call_image",
+                "name": "view_image",
+                arguments_field: "{}",
+            },
+        )
     stored = CompactionData(
         summary="summary",
         last_item_id="msg_before",
@@ -445,7 +458,7 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage(item_typ
         compacted_messages=messages,
     )
     assert stored.compacted_messages is not None
-    stored_content = stored.compacted_messages[0][content_field]
+    stored_content = stored.compacted_messages[output_index][content_field]
     assert stored_content[1]["image_url"] == (
         "[image/png content omitted from the compaction snapshot]"
     )
@@ -462,11 +475,13 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage(item_typ
     history = next(record for record in records if record["type"] == "compacted")["payload"][
         "replacement_history"
     ]
-    assert history[0]["type"] == item_type
-    assert history[1] == messages[1]
+    assert len(history) == len(messages)
+    assert history[:output_index] == messages[:output_index]
+    assert history[output_index]["type"] == item_type
+    assert history[output_index + 1] == messages[output_index + 1]
     if item_type != "message":
-        assert history[0]["call_id"] == "call_image"
-    replayed_content = history[0][content_field]
+        assert history[output_index]["call_id"] == "call_image"
+    replayed_content = history[output_index][content_field]
     assert [block["type"] for block in replayed_content] == [
         "input_text",
         "input_text",
@@ -476,95 +491,33 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage(item_typ
     ]
     assert "image/png" in replayed_content[1]["text"]
     assert replayed_content[2:] == stored_content[2:]
-    assert messages[0][content_field][1]["image_url"] == data_uri
-
-
-def test_compacted_tool_images_preserve_snapshot_and_late_output_order() -> None:
-    """Sanitizing a snapshot preserves ordered results and calls with late outputs."""
-    call_ids = ["call_image", "call_text", "call_late_a", "call_late_b"]
-    calls = [
-        {
-            "type": "function_call",
-            "call_id": call_id,
-            "name": "exec_command",
-            "arguments": "{}",
-        }
-        for call_id in call_ids
-    ]
-    image_output = {
-        "type": "function_call_output",
-        "call_id": "call_image",
-        "output": [
-            {
-                "type": "input_image",
-                "image_url": "[image/png content omitted from the compaction snapshot]",
-            }
-        ],
-    }
-    text_output = {
-        "type": "function_call_output",
-        "call_id": "call_text",
-        "output": "text result",
-    }
-    late_outputs = [
-        {"type": "function_call_output", "call_id": call_id, "output": call_id}
-        for call_id in ["call_late_b", "call_late_a"]
-    ]
-    records = codex_native._codex_rollout_records_from_session_items(
-        [
-            {
-                "type": "compaction",
-                "compacted_messages": [*calls, text_output, image_output],
-            },
-            *late_outputs,
-        ],
-        session_id="conv_test",
-        external_session_id="019f-thread",
-        cwd=Path("/tmp/test"),
-        model_provider="openai",
-        cli_version="0.154.0",
-    )
-
-    history = next(record for record in records if record["type"] == "compacted")["payload"][
-        "replacement_history"
-    ]
-    assert history[:4] == calls
-    assert [item["call_id"] for item in history[4:]] == ["call_image", "call_text"]
-    assert history[4]["output"][0]["type"] == "input_text"
-    assert "image/png" in history[4]["output"][0]["text"]
-    assert history[5] == text_output
-    assert image_output["output"][0]["type"] == "input_image"
-    replayed_outputs = [
-        record["payload"]
-        for record in records
-        if record["type"] == "response_item"
-        and record["payload"].get("type") == "function_call_output"
-    ]
-    assert [item["call_id"] for item in replayed_outputs] == ["call_late_a", "call_late_b"]
-    assert [item["output"] for item in replayed_outputs] == ["call_late_a", "call_late_b"]
+    assert messages[output_index][content_field][1]["image_url"] == data_uri
 
 
 @pytest.mark.parametrize(
-    "item",
+    "messages",
     [
-        {"type": "function_call_output", "output": "literal output"},
-        {"type": "function_call", "arguments": '{"type":"input_image","image_url":"text"}'},
-        {"type": "custom_tool_call", "input": [{"type": "input_image", "image_url": "text"}]},
-        {"type": []},
-        None,
+        [
+            {"type": "function_call", "call_id": "call_plain", "name": "exec", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_plain", "output": "literal output"},
+        ],
+        [{"type": "function_call", "arguments": '{"type":"input_image","image_url":"text"}'}],
+        [{"type": "custom_tool_call", "input": [{"type": "input_image", "image_url": "text"}]}],
+        [{"type": []}],
+        [None],
     ],
 )
-def test_compacted_image_sanitization_preserves_non_content_values(item: object) -> None:
+def test_compacted_image_sanitization_preserves_non_content_values(messages: list[object]) -> None:
     """Tool arguments, plain outputs, and unknown records are left intact."""
     records = codex_native._codex_rollout_records_from_session_items(
-        [{"type": "compaction", "compacted_messages": [item]}],
+        [{"type": "compaction", "compacted_messages": messages}],
         session_id="conv_test",
         external_session_id="019f-thread",
         cwd=Path("/tmp/test"),
         model_provider="openai",
         cli_version="0.154.0",
     )
-    assert records[1]["payload"]["replacement_history"] == [item]
+    assert records[1]["payload"]["replacement_history"] == messages
 
 
 def test_codex_event_msg_record_ignores_non_list_content() -> None:

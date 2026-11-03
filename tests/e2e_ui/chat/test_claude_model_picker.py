@@ -28,7 +28,7 @@ from omnigent.harnesses.claude_native.main import (
 from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
-from tests.e2e.conftest import get_mock_requests
+from tests.e2e.conftest import get_mock_message_requests
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
     reset_mock_llm,
@@ -1078,18 +1078,31 @@ def _open_live_claude_model_menu(page: Page, entry: str = "gear") -> None:
 
 
 def _assert_mock_claude_turn(mock_url: str, marker: str, model: str) -> None:
+    """Check the request Claude sent for this turn: its wire model and, for ``[1m]``, the beta."""
     wire_model = model.removesuffix("[1m]")
-    requests = get_mock_requests(mock_url, key=wire_model)
-    assert any(
-        marker in json.dumps(message.get("content"))
+    requests = get_mock_message_requests(mock_url, key=wire_model)
+    turn_requests = [
+        request
         for request in requests
-        for message in request.get("messages", [])
-        if message.get("role") == "user"
-    ), f"The mock received no {wire_model!r} request containing {marker!r}: {requests!r}"
+        if any(
+            marker in json.dumps(message.get("content"))
+            for message in request["body"].get("messages", [])
+            if message.get("role") == "user"
+        )
+    ]
+    assert turn_requests, (
+        f"The mock received no {wire_model!r} request containing {marker!r}: {requests!r}"
+    )
+    if model.endswith("[1m]"):
+        assert any(
+            beta.startswith("context-1m-")
+            for request in turn_requests
+            for beta in request["betas"]
+        ), f"No {wire_model!r} request for {marker!r} sent the 1M-context beta: {turn_requests!r}"
 
 
 def _assert_native_claude_turn(base_url: str, session_id: str, reply: str, model: str) -> None:
-    """Read Claude's own correlated request and reply, including the context beta."""
+    """Read Claude's own record of the reply: the alias it requested and the wire model."""
     snapshot = _live_claude_snapshot(base_url, session_id)
     bridge_id = snapshot["labels"].get(BRIDGE_ID_LABEL_KEY) or session_id
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
@@ -1106,14 +1119,6 @@ def _assert_native_claude_turn(base_url: str, session_id: str, reply: str, model
     wire_model = model.removesuffix("[1m]")
     assert assistant["requestedModel"] == model
     assert assistant["message"]["model"] == wire_model
-    request = next(
-        record
-        for record in records
-        if record.get("type") == "api-request" and record.get("id") == assistant["requestRef"]
-    )
-    assert request["params"]["model"] == wire_model
-    if model.endswith("[1m]"):
-        assert any(beta.startswith("context-1m-") for beta in request["params"]["betas"])
 
 
 @pytest.mark.nightly
