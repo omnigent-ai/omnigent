@@ -8212,9 +8212,8 @@ def _claude_terminal_env_unset(
     resolve auth against the wrong workspace.
 
     Always drops ``CLAUDECODE`` because Claude Code rejects any child launch
-    carrying that nested-session marker, regardless of its auth mode. When the
-    launch config carries an ``apiKeyHelper``, also drops ambient credentials
-    that override the helper or open Claude Code's custom-API-key menu.
+    carrying that nested-session marker, regardless of its auth mode. Also
+    drops ambient credentials that conflict with the selected authentication.
 
     :param claude_config: The resolved native launch config, or ``None``
         (Claude's own login) — which still strips the nested-session marker.
