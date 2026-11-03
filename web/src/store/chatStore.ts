@@ -1092,6 +1092,8 @@ export interface ConversationState {
   sandboxActionDismissed: string | null;
   /** Managed startup accepts sends durably before its first harness dispatch. */
   startupPending: boolean;
+  /** Pending ids of failed startup inputs already handed back to the composer. */
+  returnedStartupInputs: string[];
   /**
    * Native MCP startup progress, cleared when startup settles or live
    * assistant text arrives. Failures/cancellations stay in host diagnostics,
@@ -2197,6 +2199,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sandboxStatus: null,
   sandboxActionDismissed: null,
   startupPending: false,
+  returnedStartupInputs: [],
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
@@ -4794,14 +4797,19 @@ function sessionBindingPatch(
     // A reload that shows the launch moved on ends the dismissal of its last warning.
     sandboxActionDismissed:
       session.sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null,
-    // "ready" with saved inputs left: a native first input awaits its transcript
-    // receipt, and the server still saves new messages behind it.
-    startupPending:
-      session.labels?.["omnigent.startup"] === "pending" ||
-      (session.labels?.["omnigent.startup"] === "ready" &&
-        (session.pendingInputs ?? []).length > 0),
+    startupPending: startupPendingIn(session),
     ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
+}
+
+/** Whether a snapshot's managed startup still accepts sends durably. */
+function startupPendingIn(session: Session): boolean {
+  // "ready" with saved inputs left: a native first input awaits its transcript
+  // receipt, and the server still saves new messages behind it.
+  return (
+    session.labels?.["omnigent.startup"] === "pending" ||
+    (session.labels?.["omnigent.startup"] === "ready" && (session.pendingInputs ?? []).length > 0)
+  );
 }
 
 /**
@@ -5085,20 +5093,17 @@ async function bindStream(
       const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
       const countEndsWith = (texts: string[], suffix: string): number =>
         texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
-      const dedupedPending: PendingUserMessage[] = dedupePending
+      const snapshotPending: PendingUserMessage[] = dedupePending
         ? candidatePending.filter((p) => {
             const text = messageContentText(p.content);
             if (text === "") return true;
             return countEndsWith(committedUserTexts, text) === 0;
           })
         : candidatePending;
-      // A rebind restores failed startup inputs only while a bubble still shows one.
-      const snapshotPending = withoutFailedStartupBubbles(dedupedPending, session);
-      const restoredDraft =
-        unsentDraft ??
-        (hydratePending || snapshotPending.length !== dedupedPending.length
-          ? failedStartupDraft(id, session)
-          : null);
+      const unsentDraftPatch =
+        unsentDraft !== null && state.failedSendDraft === null
+          ? { failedSendDraft: unsentDraft }
+          : {};
       const syntheticError: ErrorBlock | null =
         session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
           ? {
@@ -5114,9 +5119,12 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
-        ...(restoredDraft !== null && state.failedSendDraft === null
-          ? { failedSendDraft: restoredDraft }
-          : {}),
+        ...unsentDraftPatch,
+        ...returnFailedStartupInputs(
+          id,
+          { ...state, ...unsentDraftPatch, pendingUserMessages: snapshotPending },
+          session,
+        ),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -5401,14 +5409,10 @@ function reconnectStatusPatch(
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
-  // A launch that failed while the stream was down left its first messages showing as sending.
-  const pending = withoutFailedStartupBubbles(s.pendingUserMessages, session);
-  if (pending.length !== s.pendingUserMessages.length && s.conversationId !== null) {
-    patch.pendingUserMessages = pending;
+  // A failed launch ends startup; the live failure may not have handed its first messages back.
+  if (session.labels?.["omnigent.startup"] === "failed" && s.conversationId !== null) {
     patch.startupPending = false;
-    if (s.failedSendDraft === null) {
-      patch.failedSendDraft = failedStartupDraft(s.conversationId, session);
-    }
+    Object.assign(patch, returnFailedStartupInputs(s.conversationId, s, session));
   }
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
   // outlives it), so it settles the local send lifecycle like `idle` — it must
@@ -7702,19 +7706,54 @@ function restoreUnsentSendOnceIdentified(
 }
 
 /**
- * The viewer's startup messages a failed managed launch left undelivered, as a
- * failed-send draft. They carry no stable id: the server already holds them as
- * failed inputs, so a resend must go out as a new message.
+ * Hand the viewer's startup messages a failed managed launch left undelivered
+ * back to the composer: drop the bubbles still showing them as sending and
+ * restore their text. Each is handed back once per conversation, so a later
+ * resend of the same text is not taken for it.
  *
- * @param conversationId - The session whose snapshot is read.
+ * @param conversationId - The session whose launch failed.
+ * @param state - The conversation's state.
  * @param session - That session's snapshot.
+ * @returns The state patch, empty when nothing is left to hand back.
+ */
+function returnFailedStartupInputs(
+  conversationId: string,
+  state: Pick<
+    ConversationState,
+    "pendingUserMessages" | "failedSendDraft" | "returnedStartupInputs"
+  >,
+  session: Session,
+): Partial<
+  Pick<ConversationState, "pendingUserMessages" | "failedSendDraft" | "returnedStartupInputs">
+> {
+  const inputs = (session.failedInputs ?? []).filter(
+    (input) => !state.returnedStartupInputs.includes(input.pendingId),
+  );
+  if (inputs.length === 0) return {};
+  const draft = failedStartupDraft(conversationId, inputs);
+  return {
+    pendingUserMessages: withoutFailedStartupBubbles(state.pendingUserMessages, inputs),
+    returnedStartupInputs: [
+      ...state.returnedStartupInputs,
+      ...inputs.map((input) => input.pendingId),
+    ],
+    ...(draft !== null && state.failedSendDraft === null ? { failedSendDraft: draft } : {}),
+  };
+}
+
+/**
+ * Failed startup inputs as a failed-send draft. It carries no stable id: the
+ * server already holds them as failed inputs, so a resend must go out as a new message.
+ *
+ * @param conversationId - The session the inputs belong to.
+ * @param inputs - The failed inputs.
  * @returns The draft to restore, or `null`.
  */
 function failedStartupDraft(
   conversationId: string,
-  session: Session,
+  inputs: PendingInput[],
 ): ConversationState["failedSendDraft"] {
-  const text = (session.failedInputs ?? [])
+  const text = inputs
     .map((input) =>
       input.content.flatMap((block) => (block.type === "input_text" ? [block.text] : [])).join(""),
     )
@@ -7724,18 +7763,18 @@ function failedStartupDraft(
 }
 
 /**
- * Drop the bubbles still showing a session's failed startup inputs as sending.
+ * Drop the bubbles still showing failed startup inputs as sending.
  * Matched by text, one bubble per input, since a bubble's attachments carry local ids.
  *
  * @param pending - The bubbles to filter.
- * @param session - A snapshot listing the failed inputs.
+ * @param inputs - The failed inputs.
  * @returns The remaining bubbles.
  */
 function withoutFailedStartupBubbles(
   pending: PendingUserMessage[],
-  session: Session,
+  inputs: PendingInput[],
 ): PendingUserMessage[] {
-  const failedTexts = (session.failedInputs ?? [])
+  const failedTexts = inputs
     .map((input) => messageContentText(input.content))
     .filter((text) => text !== "");
   return pending.filter((message) => {
@@ -7747,22 +7786,25 @@ function withoutFailedStartupBubbles(
 }
 
 /**
- * Return a failed launch's undelivered startup messages to the composer.
+ * Settle a failed launch's startup state and return its undelivered startup
+ * messages to the composer.
  *
  * @param conversationId - The session whose launch failed.
  */
 function restoreFailedStartupInputs(conversationId: string): void {
   void getSessionSlim(conversationId)
     .then((session) => {
-      const draft = failedStartupDraft(conversationId, session);
-      if (draft === null || isConversationDisposed(conversationId)) return;
+      if (isConversationDisposed(conversationId)) return;
       setterFor(conversationId)((state) => ({
-        startupPending: false,
-        pendingUserMessages: withoutFailedStartupBubbles(state.pendingUserMessages, session),
-        ...(state.failedSendDraft === null ? { failedSendDraft: draft } : {}),
+        startupPending: startupPendingIn(session),
+        ...returnFailedStartupInputs(conversationId, state, session),
       }));
     })
-    .catch(() => {});
+    .catch(() => {
+      if (!isConversationDisposed(conversationId)) {
+        setterFor(conversationId)({ startupPending: false });
+      }
+    });
 }
 
 /**
