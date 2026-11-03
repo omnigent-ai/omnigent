@@ -680,6 +680,20 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent(TAIL);
   });
 
+  it("keeps message typography when expanding a prompt over 50K characters", () => {
+    const text = "Long user prose. ".repeat(3_000) + TAIL;
+    render(<BubbleView bubble={userBubble(text)} isLastAssistant={false} />);
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble.querySelector(".break-all")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+
+    const fallback = bubble.querySelector(".break-all");
+    expect(fallback).toHaveClass("text-message", "font-mono", "whitespace-pre-wrap");
+    expect(fallback).not.toHaveClass("text-sm");
+    expect(fallback!.textContent).toBe(text);
+  });
+
   it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
     const writtenTexts: string[] = [];
     vi.stubGlobal("navigator", {
