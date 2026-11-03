@@ -265,6 +265,7 @@ class ServerInfoResponse(BaseModel):
     automations_enabled: bool = False
     dictation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
+    scheduled_task_worktrees: bool = True
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
@@ -3627,6 +3628,7 @@ def create_app(
                 "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
+                "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,

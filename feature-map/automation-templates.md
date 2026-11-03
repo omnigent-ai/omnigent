@@ -22,7 +22,9 @@ the creation modal with its integration settings ready to customize.
   leaves the repository unpinned; choosing it on edit clears an existing pin.
   Switching between a connected host and a sandbox clears incompatible selections.
   Selecting a Git repository shows the optional Random worktree checkbox. Other
-  directories hide the checkbox and its help text. It defaults off;
+  directories hide the checkbox and its help text. Older servers do not offer the
+  option. If an enabled setting cannot be verified, its status and a turn-off
+  action remain visible. It defaults off;
   when on, each new session starts in a fresh worktree from HEAD, and continuing
   runs reuse that session's worktree. Editing can turn it off again.
 - `harness-settings`: model, effort, and permission controls follow the selected

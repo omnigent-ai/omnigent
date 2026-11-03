@@ -2335,8 +2335,11 @@ async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> N
     assert row.status == "succeeded"
 
 
+@pytest.mark.parametrize(
+    "patch", [{"host_id": "4b653f6031f35d168cc0b37caa1306d1"}, {"base_branch": "HEAD"}]
+)
 async def test_patch_pinning_host_on_managed_task_is_rejected(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, patch: dict[str, str]
 ) -> None:
     """Pinning host_id on an already-managed task is rejected, not silently dropped."""
     _make_user(db_uri)
@@ -2355,7 +2358,7 @@ async def test_patch_pinning_host_on_managed_task_is_rejected(
         # the handler must reject against the effective (managed) target.
         resp = await auth_client.patch(
             f"/v1/scheduled-tasks/{tid}",
-            json={"host_id": "4b653f6031f35d168cc0b37caa1306d1"},
+            json=patch,
             headers=_headers(),
         )
         assert resp.status_code == 400, resp.text
@@ -3086,18 +3089,22 @@ async def test_random_worktree_can_be_enabled_preserved_and_disabled(
     task = response.json()
     assert task["base_branch"] == "HEAD"
     store = SqlAlchemyScheduledTaskStore(db_uri)
-    store.update(task["id"], session_id=_owned_session(db_uri))
+    session_id = _owned_session(db_uri)
+    store.update(task["id"], session_id=session_id)
     url = f"/v1/scheduled-tasks/{task['id']}"
     for patch, expected in [
         ({"name": "renamed"}, "HEAD"),
         ({"base_branch": None}, None),
         ({"base_branch": "HEAD"}, "HEAD"),
     ]:
+        store.update(task["id"], session_id=session_id)
         response = await auth_client.patch(url, json=patch, headers=_headers())
         assert response.status_code == 200, response.text
         assert response.json()["base_branch"] == expected
         if "base_branch" in patch:
             assert response.json()["session_id"] is None
+        else:
+            assert response.json()["session_id"] == session_id
         stored = SqlAlchemyScheduledTaskStore(db_uri).get(task["id"])
         assert stored is not None and stored.base_branch == expected
 

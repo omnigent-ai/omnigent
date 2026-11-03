@@ -225,6 +225,8 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /** True when scheduled tasks accept the optional random-worktree base ref. */
+  scheduled_task_worktrees?: boolean;
   /**
    * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
    * ignore it, so the palette lists one mixed search group there. Fails to
@@ -407,6 +409,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
@@ -566,6 +569,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,

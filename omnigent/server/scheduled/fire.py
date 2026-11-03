@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
+_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source"
 
 # How long to wait for a freshly launched runner to connect before giving up on
 # dispatching the prompt this fire. The session + grant are already persisted, so
@@ -684,9 +685,9 @@ async def _run_fire_for_task(
             task.id,
             conv.id,
         )
+        await _discard_session(deps, conv)
         await recorder.finish(
             "failed",
-            conversation_id=conv.id,
             error="owner grant failed",
             error_code="owner_grant_failed",
         )
@@ -901,13 +902,15 @@ async def continued_session_problem(
         recorded_worktree_root,
     )
 
+    fingerprint = conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
     own_worktree = (
         task.base_branch is not None
         and conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) == task.id
+        and conv.labels.get(_WORKTREE_SOURCE_LABEL_KEY) == task.workspace
         and conv.git_branch is not None
         and conv.workspace is not None
-        and recorded_worktree_root(conv.workspace, conv.labels.get(WORKTREE_ROOT_LABEL_KEY))
-        is not None
+        and fingerprint is not None
+        and recorded_worktree_root(conv.workspace, fingerprint) is not None
     )
     if task.base_branch is not None and not own_worktree:
         return (
@@ -1035,7 +1038,7 @@ async def _discard_session(deps: FireDeps, conv: Conversation) -> None:
         if conv.host_id and conv.workspace and conv.git_branch:
             fingerprint = conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
             root = recorded_worktree_root(conv.workspace, fingerprint)
-            if root is not None:
+            if fingerprint is not None and root is not None:
                 await _remove_session_worktree_best_effort(
                     host_id=conv.host_id,
                     worktree_path=root,
@@ -1424,6 +1427,8 @@ async def _create_session(
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     from omnigent.server.routes._host_worktree import (
         WORKTREE_ROOT_LABEL_KEY,
+        WorktreeHostUnavailableError,
+        WorktreeProxyError,
         create_worktree_on_host,
         worktree_root_fingerprint,
     )
@@ -1437,19 +1442,30 @@ async def _create_session(
             raise ValueError("random worktree requires a connected host and repository workspace")
         host_conn = deps.host_registry.get(task.host_id) if deps.host_registry else None
         if host_conn is None:
-            raise RuntimeError("connected host is not online")
+            raise _CannotLaunchScheduledFire(
+                "connected host is not online", error_code="host_offline"
+            )
         assert deps.host_registry is not None
-        worktree = await create_worktree_on_host(
-            host_registry=deps.host_registry,
-            host_conn=host_conn,
-            repo_path=workspace,
-            branch_name=f"worktree-{uuid.uuid4().hex[:12]}",
-            base_branch=task.base_branch,
-        )
+        try:
+            worktree = await create_worktree_on_host(
+                host_registry=deps.host_registry,
+                host_conn=host_conn,
+                repo_path=workspace,
+                branch_name=f"worktree-{uuid.uuid4().hex[:12]}",
+                base_branch=task.base_branch,
+            )
+        except WorktreeHostUnavailableError as exc:
+            raise _CannotLaunchScheduledFire(str(exc), error_code="host_offline") from exc
+        except WorktreeProxyError as exc:
+            raise _CannotLaunchScheduledFire(
+                str(exc), error_code="worktree_create_failed"
+            ) from exc
+        labels[_WORKTREE_SOURCE_LABEL_KEY] = workspace
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
+    conv: Conversation | None = None
     try:
-        conv: Conversation = await asyncio.to_thread(
+        conv = await asyncio.to_thread(
             deps.conversation_store.create_conversation,
             agent_id=task.agent_id,
             title=task.name,
@@ -1460,8 +1476,32 @@ async def _create_session(
             labels=labels,
             project_id=await _fire_project_id(deps, task),
         )
+        reasoning_effort = task.reasoning_effort
+        if reasoning_effort is None:
+            reasoning_effort = await _spec_reasoning_effort(deps, task)
+        if task.model_override is not None or reasoning_effort is not None:
+            updated: Conversation | None = await asyncio.to_thread(
+                deps.conversation_store.update_conversation,
+                conv.id,
+                model_override=task.model_override,
+                reasoning_effort=reasoning_effort,
+            )
+            if updated is not None:
+                conv = updated
+        # Stamp terminal-first presentation labels the interactive create path would
+        # have set, so a fired session on a terminal harness exposes the
+        # Chat/Terminal switcher instead of rendering Chat-only. Stamped last (after
+        # the override reload above) so the labels land on the conversation returned
+        # to the launch/dispatch caller, not a stale pre-label reload of it.
+        labels = await _presentation_labels(deps, task)
+        if labels:
+            await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
+            conv.labels.update(labels)
+        return conv
     except Exception:
-        if worktree is not None:
+        if conv is not None:
+            await _discard_session(deps, conv)
+        elif worktree is not None:
             from omnigent.server.routes._sessions.helpers import (
                 _remove_session_worktree_best_effort,
             )
@@ -1476,28 +1516,6 @@ async def _create_session(
                 reason="scheduled-create-rollback",
             )
         raise
-    reasoning_effort = task.reasoning_effort
-    if reasoning_effort is None:
-        reasoning_effort = await _spec_reasoning_effort(deps, task)
-    if task.model_override is not None or reasoning_effort is not None:
-        updated: Conversation | None = await asyncio.to_thread(
-            deps.conversation_store.update_conversation,
-            conv.id,
-            model_override=task.model_override,
-            reasoning_effort=reasoning_effort,
-        )
-        if updated is not None:
-            conv = updated
-    # Stamp terminal-first presentation labels the interactive create path would
-    # have set, so a fired session on a terminal harness exposes the
-    # Chat/Terminal switcher instead of rendering Chat-only. Stamped last (after
-    # the override reload above) so the labels land on the conversation returned
-    # to the launch/dispatch caller, not a stale pre-label reload of it.
-    labels = await _presentation_labels(deps, task)
-    if labels:
-        await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
-        conv.labels.update(labels)
-    return conv
 
 
 _COST_BUDGET_HANDLER = "omnigent.policies.builtins.cost.cost_budget"

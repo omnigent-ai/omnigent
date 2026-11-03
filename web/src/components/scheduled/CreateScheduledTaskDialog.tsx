@@ -121,6 +121,7 @@ export function CreateScheduledTaskDialog({
     isError: projectsFailed,
   } = useProjects({ enabled: open && projectsSupported });
   const resolveProjectId = useResolveOrCreateProjectId();
+  const worktreesSupported = info !== "loading" && info.scheduled_task_worktrees === true;
   const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
@@ -409,7 +410,11 @@ export function CreateScheduledTaskDialog({
     const restore = isEdit && effectiveAgentId === editingTask?.agentId && originalTarget;
     setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
     setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
-    setBaseBranch(restore && !nextSandbox ? (editingTask?.baseBranch ?? null) : null);
+    setBaseBranch(
+      restore && !nextSandbox && workspace === editingTask?.workspace
+        ? (editingTask?.baseBranch ?? null)
+        : null,
+    );
     setSandboxMode(nextSandbox);
     setHostId(nextHostId);
     // Host directories and sandbox repository URLs are different workspace inputs.
@@ -431,7 +436,9 @@ export function CreateScheduledTaskDialog({
 
   const workspaceHostOffline = !sandboxMode && selectedHost?.status === "offline";
   const { data: worktrees } = useHostWorktrees(
-    open && !sandboxMode && !workspaceHostOffline && hostId !== "" ? hostId : null,
+    open && worktreesSupported && !sandboxMode && !workspaceHostOffline && hostId !== ""
+      ? hostId
+      : null,
     workspace || null,
   );
   const isGitWorkspace = (worktrees?.length ?? 0) > 0;
@@ -536,7 +543,9 @@ export function CreateScheduledTaskDialog({
         rrule: buildRRule(schedule),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
-        ...(baseBranch !== (editingTask?.baseBranch ?? null) ? { baseBranch } : {}),
+        ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
+          ? { baseBranch }
+          : {}),
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
@@ -900,7 +909,18 @@ export function CreateScheduledTaskDialog({
               {workspace && (
                 <>
                   <p className="truncate font-mono text-sm text-muted-foreground">{workspace}</p>
-                  {isGitWorkspace && (
+                  {worktreesSupported && !isGitWorkspace && baseBranch !== null && (
+                    <div className="mt-2 text-sm text-muted-foreground">
+                      <p>
+                        Random worktree is enabled, but this directory could not be verified as a
+                        Git repository.
+                      </p>
+                      <Button type="button" variant="link" onClick={() => setBaseBranch(null)}>
+                        Turn off random worktree
+                      </Button>
+                    </div>
+                  )}
+                  {worktreesSupported && isGitWorkspace && (
                     <>
                       <div className="mt-2 flex items-center gap-2">
                         <Checkbox

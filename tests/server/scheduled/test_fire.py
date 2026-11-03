@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +34,10 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
+from omnigent.server.routes._host_worktree import (
+    WORKTREE_ROOT_LABEL_KEY,
+    worktree_root_fingerprint,
+)
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
@@ -283,6 +287,7 @@ class FakeConversationStore:
             workspace=kwargs.get("workspace"),
             host_id=kwargs.get("host_id"),
             git_branch=kwargs.get("git_branch"),
+            labels=dict(kwargs.get("labels", {})),
         )
         self.created.append(kwargs)
         return conv
@@ -1461,7 +1466,7 @@ async def test_create_failure_records_failed_without_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_grant_failure_records_failed_with_session() -> None:
+async def test_grant_failure_records_failed_without_a_deleted_session() -> None:
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     perm = FakePermissionStore(fail_grant=True)
 
@@ -1475,7 +1480,7 @@ async def test_grant_failure_records_failed_with_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_grant_failed"
-    assert store.runs[0]["conversation_id"] == "conv_1"
+    assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
@@ -2585,6 +2590,7 @@ async def test_continue_sends_the_prompt_into_the_session(worktree: bool) -> Non
         session.labels = {
             fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
             WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(session.workspace),
+            fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/repo",
         }
     conv_store = _ExistingConversationStore(session)
     perm = FakePermissionStore()
@@ -2712,11 +2718,38 @@ async def test_a_first_run_that_cannot_create_its_session_records_none() -> None
 
 
 @pytest.mark.asyncio
-async def test_a_first_run_whose_owner_grant_fails_records_no_session() -> None:
+@pytest.mark.parametrize("worktree", [False, True])
+async def test_a_first_run_whose_owner_grant_fails_records_no_session(
+    monkeypatch: pytest.MonkeyPatch, worktree: bool
+) -> None:
     """A session is recorded only once its owner can use it, so the next run starts another."""
-    store = FakeScheduledTaskStore(rows={"task_1": _task(session_mode="continue")})
+    from omnigent.server.routes import _host_worktree
+    from omnigent.server.routes._sessions import helpers
 
-    await _fire_once(_deps(store, permission_store=FakePermissionStore(fail_grant=True)))
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(session_mode="continue", base_branch="HEAD" if worktree else None)}
+    )
+    conv_store = FakeConversationStore()
+    monkeypatch.setattr(
+        _host_worktree,
+        "create_worktree_on_host",
+        AsyncMock(return_value=_host_worktree.CreatedWorktree("/repo-worktrees/new", "new")),
+    )
+    remove = AsyncMock()
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    await _fire_once(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_registry=FakeHostRegistry({"host_1"}),
+            permission_store=FakePermissionStore(fail_grant=True),
+        )
+    )
+    assert conv_store.deleted == ["conv_1"]
+    assert remove.await_count == int(worktree)
+    if worktree:
+        assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/new"
+        assert remove.call_args.kwargs["delete_branch"] is True
 
     assert store.adopted == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
@@ -2746,6 +2779,45 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             "continued_session_incompatible",
         ),
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
+        (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
+        (
+            _continued_session(
+                git_branch="main",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/repo",
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
+        (
+            _continued_session(
+                git_branch="worktree-test",
+                workspace="/repo-worktrees/test",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/other",
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
+        (
+            _continued_session(
+                git_branch="worktree-test",
+                workspace="/repo-worktrees/test",
+                host_id="host_2",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/repo",
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
         (_continued_session(host_id="host_2"), {}, "continued_session_incompatible"),
         (_continued_session(workspace="/elsewhere"), {}, "continued_session_incompatible"),
         (
@@ -3330,8 +3402,10 @@ async def test_random_worktree_is_created_per_new_session(
     assert task.workspace == "/repo"
 
 
+@pytest.mark.parametrize("failure", ["create", "update", "labels", "reasoning", "presentation"])
 async def test_random_worktree_rolls_back_when_session_creation_fails(
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     from omnigent.server.routes import _host_worktree
     from omnigent.server.routes._sessions import helpers
@@ -3339,8 +3413,20 @@ async def test_random_worktree_rolls_back_when_session_creation_fails(
     deps = _deps(
         FakeScheduledTaskStore(),
         host_registry=FakeHostRegistry({"host_1"}),
-        conversation_store=FakeConversationStore(fail_create=True),
+        conversation_store=FakeConversationStore(fail_create=failure == "create"),
     )
+    if failure in ("update", "labels"):
+        method = "update_conversation" if failure == "update" else "set_labels"
+        monkeypatch.setattr(
+            deps.conversation_store, method, Mock(side_effect=RuntimeError("create failed"))
+        )
+    if failure in ("reasoning", "presentation"):
+        method = "_spec_reasoning_effort" if failure == "reasoning" else "_presentation_labels"
+        monkeypatch.setattr(fire_mod, method, AsyncMock(side_effect=RuntimeError("create failed")))
+    elif failure == "labels":
+        monkeypatch.setattr(
+            fire_mod, "_presentation_labels", AsyncMock(return_value={"presentation": "terminal"})
+        )
     monkeypatch.setattr(
         _host_worktree,
         "create_worktree_on_host",
@@ -3349,7 +3435,11 @@ async def test_random_worktree_rolls_back_when_session_creation_fails(
     remove = AsyncMock()
     monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
     with pytest.raises(RuntimeError, match="create failed"):
-        await fire_mod._create_session(deps, _task(base_branch="HEAD"))
+        await fire_mod._create_session(
+            deps,
+            _task(base_branch="HEAD", model_override="custom" if failure == "update" else None),
+        )
+    assert deps.conversation_store.deleted == ([] if failure == "create" else ["conv_1"])
     assert remove.await_count == 1
     assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/new"
     assert remove.call_args.kwargs["delete_branch"] is True
@@ -3377,3 +3467,29 @@ async def test_unused_session_discards_its_random_worktree(
     assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/unused"
     assert remove.call_args.kwargs["branch"] == "unused"
     assert deps.conversation_store.deleted == [conv.id]
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_random_worktree_failure_preserves_host_error(
+    monkeypatch: pytest.MonkeyPatch, unavailable: bool
+) -> None:
+    from omnigent.server.routes import _host_worktree
+
+    error_type = (
+        _host_worktree.WorktreeHostUnavailableError
+        if unavailable
+        else _host_worktree.WorktreeProxyError
+    )
+    monkeypatch.setattr(
+        _host_worktree,
+        "create_worktree_on_host",
+        AsyncMock(side_effect=error_type("repository unavailable")),
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(base_branch="HEAD")})
+    deps = _deps(store, host_registry=FakeHostRegistry({"host_1"}))
+    assert await _fire_once(deps) == []
+    assert deps.conversation_store.created == []
+    assert store.runs[0]["error"] == "repository unavailable"
+    assert store.runs[0]["error_code"] == (
+        "host_offline" if unavailable else "worktree_create_failed"
+    )
