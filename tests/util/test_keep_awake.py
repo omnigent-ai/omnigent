@@ -72,7 +72,7 @@ async def test_holds_assertion_only_while_turn_runs(fake_caffeinate: tuple[Path,
     assert not log.exists()
 
     busy = True
-    await _wait_for(log.exists)
+    await _wait_for(lambda: log.exists() and log.read_text().endswith("\n"))
     pid_str, args = log.read_text().split(" ", 1)
     pid = int(pid_str)
     assert args.split() == ["-i", "-w", str(os.getpid())]
@@ -114,18 +114,26 @@ async def test_cancel_during_release_still_reaps_caffeinate(
     script.write_text(f"#!/bin/sh\ntrap '' TERM\necho \"$$\" >> {log}\nexec sleep 60\n")
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setattr(keep_awake, "_STOP_TIMEOUT_S", 0.3)
+    stop_entered = asyncio.Event()
+    original_stop = keep_awake._Caffeinate.stop
+
+    async def _observed_stop(self: keep_awake._Caffeinate) -> None:
+        stop_entered.set()
+        await original_stop(self)
+
+    monkeypatch.setattr(keep_awake._Caffeinate, "stop", _observed_stop)
     busy = True
     task = asyncio.create_task(
         run_keep_awake_monitor(
             lambda: busy, runner_id="runner_t", poll_interval_s=0.01, caffeinate_binary=str(script)
         )
     )
-    await _wait_for(log.exists)
-    await asyncio.sleep(0.05)
+    await _wait_for(lambda: log.exists() and log.read_text().endswith("\n"))
     pid = int(log.read_text().split()[0])
 
     busy = False
-    await asyncio.sleep(0.1)
+    # The release is in progress: TERM is ignored, so the child outlives the stop timeout.
+    await asyncio.wait_for(stop_entered.wait(), timeout=5)
     assert _pid_alive(pid)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
