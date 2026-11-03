@@ -202,6 +202,7 @@ import {
 } from "@/lib/foldNarrationPreferences";
 import {
   DEFAULT_PROJECT_FOLDER_PAGINATION,
+  PROJECT_FOLDER_PAGE_SIZE,
   PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
   useProjectFolderPagination,
   writeProjectFolderPagination,
@@ -972,16 +973,16 @@ function FoldAssistantNarrationControl() {
   );
 }
 
-/** On by default: expanded project folders list five sessions behind "Show more". */
+/** On by default: expanded project folders list a page of sessions behind "Show more". */
 function ProjectFolderPaginationControl() {
   const enabled = useProjectFolderPagination();
   const labelId = useId();
   return (
     <div className="flex items-start justify-between gap-6">
       <SettingsLabel
-        label="Show project sessions five at a time"
+        label={`Show project sessions ${PROJECT_FOLDER_PAGE_SIZE} at a time`}
         labelId={labelId}
-        description="An expanded project folder lists its 5 newest sessions and a Show more row for the rest. Turn this off to list every session in the folder, loading more as you scroll."
+        description={`An expanded project folder lists its ${PROJECT_FOLDER_PAGE_SIZE} newest sessions and a Show more row for the rest. Turn this off to list every session in the folder, loading more as you scroll.`}
       />
       <Switch
         aria-labelledby={labelId}

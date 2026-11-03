@@ -69,7 +69,7 @@ the header menu), and each place is a separate entry point.
   loaded it, and Show more carries the badge of a hidden session that needs
   attention or is unread. Filing a session into the folder leaves its listed
   rows as they are, so an older one lands behind Show more. Settings →
-  Appearance → Sidebar → "Show project sessions five at a time" (on by
+  Appearance → Sidebar → "Show project sessions 5 at a time" (on by
   default, per device) turns this off: folders then list every loaded session
   and load more as the sidebar scrolls, with no Show more row.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,

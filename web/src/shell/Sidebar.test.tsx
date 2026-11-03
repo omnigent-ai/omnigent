@@ -2778,9 +2778,11 @@ describe("Sidebar project Show more", () => {
 
   it("lists every session and auto-loads more pages when pagination is turned off", () => {
     let observerCallback: IntersectionObserverCallback | undefined;
+    let observerOptions: IntersectionObserverInit | undefined;
     class TestObserver {
-      constructor(cb: IntersectionObserverCallback) {
+      constructor(cb: IntersectionObserverCallback, options?: IntersectionObserverInit) {
         observerCallback = cb;
+        observerOptions = options;
       }
       observe = vi.fn();
       unobserve = vi.fn();
@@ -2801,6 +2803,10 @@ describe("Sidebar project Show more", () => {
 
     expect(folderRowIds()).toEqual(filedIds(12));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
+    // The folder's end is watched within the sidebar's own scroll container.
+    const scrollContainer = screen.getByText("Customer X").closest("nav");
+    expect(scrollContainer).not.toBeNull();
+    expect(observerOptions?.root).toBe(scrollContainer);
     // Scrolling the folder's end into view fetches its next server page.
     act(() => {
       observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);

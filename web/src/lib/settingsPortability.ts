@@ -8,7 +8,10 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  notifyFoldAssistantNarrationChanged,
+} from "./foldNarrationPreferences";
 import {
   notifyProjectFolderPaginationChanged,
   PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
@@ -169,6 +172,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   // have to be told; otherwise an open picker keeps the pre-import set.
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
+  notifyFoldAssistantNarrationChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

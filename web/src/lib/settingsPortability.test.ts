@@ -1,7 +1,10 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+} from "./foldNarrationPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   readHiddenPickerAgents,
@@ -151,19 +154,32 @@ it("carries hidden picker entries through export and import and tells an open pi
   unsubscribe();
 });
 
-it("carries project folder pagination through export and import and tells a mounted sidebar", () => {
-  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "false");
+it.each([
+  {
+    preference: "project folder pagination",
+    key: PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
+    stored: "false",
+    useValue: useProjectFolderPagination,
+  },
+  {
+    preference: "final-answer fold",
+    key: FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+    stored: "true",
+    useValue: useFoldAssistantNarration,
+  },
+])("carries $preference through export and import and updates mounted readers", (row) => {
+  localStorage.setItem(row.key, row.stored);
   const exported = collectSettings()!;
-  expect(exported.settings[PROJECT_FOLDER_PAGINATION_STORAGE_KEY]).toBe("false");
-  const { result } = renderHook(() => useProjectFolderPagination());
-  expect(result.current).toBe(false);
+  expect(exported.settings[row.key]).toBe(row.stored);
+  const { result } = renderHook(() => row.useValue());
+  expect(String(result.current)).toBe(row.stored);
 
   act(() => {
     applyImportedSettings({ version: 1, settings: {} });
   });
-  expect(result.current).toBe(true);
+  expect(String(result.current)).not.toBe(row.stored);
   act(() => {
     applyImportedSettings(exported);
   });
-  expect(result.current).toBe(false);
+  expect(String(result.current)).toBe(row.stored);
 });

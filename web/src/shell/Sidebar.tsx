@@ -5,7 +5,10 @@ import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDr
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
-import { useProjectFolderPagination } from "@/lib/projectFolderPaginationPreferences";
+import {
+  PROJECT_FOLDER_PAGE_SIZE,
+  useProjectFolderPagination,
+} from "@/lib/projectFolderPaginationPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -1430,9 +1433,6 @@ export const Sidebar = memo(SidebarImpl);
 const projectDragId = (name: string) => `project-order:${name}`;
 type ProjectHeaderDrag = ReturnType<typeof useSortable>;
 
-// Sessions an expanded project folder lists before, and adds per, "Show more".
-const PROJECT_FOLDER_PAGE_SIZE = 5;
-
 /**
  * One project folder. Fetches its own sessions server-side (`?project=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
@@ -1561,9 +1561,11 @@ function ProjectFolder({
   ]);
   // Each expansion starts at one page; the open session is never left hidden.
   const paginated = useProjectFolderPagination();
+  // Changing the listed sessions restarts both the page count and the auto-load budget.
+  const listScope = JSON.stringify([expanded, archived, sortBy]);
   const display = useSidebarDisplayPagination(
     conversations,
-    JSON.stringify([expanded, archived, sortBy]),
+    listScope,
     paginated ? PROJECT_FOLDER_PAGE_SIZE : undefined,
     query.hasNextPage,
     query.fetchNextPage,
@@ -1742,7 +1744,7 @@ function ProjectFolder({
               isFetching={query.isFetchingNextPage}
               fetchMore={query.fetchNextPage}
               scrollRoot={scrollRoot}
-              scopeKey={name}
+              scopeKey={listScope}
               indent
             />
           ) : display.hasMore ? (

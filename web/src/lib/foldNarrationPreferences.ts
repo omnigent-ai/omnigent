@@ -15,6 +15,7 @@ const preference = createStoredBooleanPreference(
 
 export const readFoldAssistantNarration = preference.read;
 export const writeFoldAssistantNarration = preference.write;
+export const notifyFoldAssistantNarrationChanged = preference.notifyChanged;
 
 /** Live value of the preference, including changes made in other windows. */
 export function useFoldAssistantNarration(): boolean {
