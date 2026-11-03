@@ -28,7 +28,7 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 }
 ```
 
-`permission_mode` is available only for Claude Code (`claude-native`) agents. It accepts `default`, `auto`, `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`; omitting it uses the agent default. Automations are unattended, so prompting modes such as `default` and `plan` can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
+`permission_mode` uses the selected native harness's vocabulary: Claude Code (for example, `acceptEdits`), Codex (`default`, `read-only`, `full-access`, `bypass`), Cursor (`default`, `auto-review`, `plan`, `ask`, `yolo`), Antigravity (`default`, `skip`), or Devin (`normal`, `accept-edits`, `smart`, `dangerous`). Omitting it uses the agent default. Saving an explicit override requires the server to resolve the agent's harness; if the bundle is unavailable, the save is rejected and can be retried once it is available. Automations are unattended, so prompting modes can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 
@@ -116,7 +116,7 @@ Two timing caveats are worth knowing:
 
 1. **The row is re-read.** The armed timer is never trusted. A task deleted or paused between arming and firing is a no-op.
 2. **The launch target is resolved.** A `managed_sandbox` task checks that managed launches are available; its fresh sandbox is provisioned during launch. For `connected_host`, a task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a **failed** run rather than a running one (`error_code` `host_offline`, `host_not_found`, or `no_online_host`).
-3. **A session is created**, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If the task has a project, the session is filed into it; a project deleted since the task was saved leaves the session unfiled instead of failing the run, and is cleared from the task. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched.
+3. **A session is created**, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If the task has a project, the session is filed into it; a project deleted since the task was saved leaves the session unfiled instead of failing the run, and is cleared from the task. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched. An explicit permission override fails the run before creating a session if its harness cannot be resolved (`permission_harness_unresolved`) or the harness does not support the saved mode (`permission_mode_unsupported`).
 4. **Ownership is granted.** The new session gets a `LEVEL_OWNER` grant for the task's owner (a reserved local user in single-user and OSS deployments). Without the grant the run would be invisible.
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history. A `managed_sandbox` fire saves the prompt in the session first, records the run, and then provisions the sandbox in the background. The prompt is delivered when the sandbox host connects, even after a server restart or on another replica. A launch failure fails the run with `error_code` `launch_failed`.
 
@@ -174,6 +174,17 @@ The scheduler is the timing engine only, and its behavior is deliberately simple
 - **Late ticks are skipped.** A tick arriving more than 30 seconds after its scheduled time (a blocked event loop, for instance) is skipped rather than fired late.
 - **One scheduler per server process.** Timers are in-process with no distributed leasing, so a multi-replica deployment would fire each task once per replica. Shared session-create orchestration is the intended path for that.
 - **Execution targets.** Runs use either a connected host with an existing workspace or a fresh managed sandbox. Reusing an existing managed sandbox is not supported. Git branch selection at fire time is not available: `base_branch` is rejected as an unknown API field. A stored row with an unsupported `execution_target` records a `skipped` run with `error_code` `unsupported_target`.
+
+## Scheduler compatibility and rollback
+
+After upgrading, an existing automation with an unresolved harness or an incompatible
+saved permission override fails before creating a session; older schedulers could
+silently omit the override. Run history identifies the permission failure. Restore
+access to the agent if its harness cannot be resolved, or edit the automation to
+clear or correct an incompatible permission setting. Review the resulting permissions
+before running the automation again.
+
+All scheduler backends must support `scheduled_task_harness_settings` before using non-Claude permission overrides. The UI capability fallback supports older servers, but cannot make already-saved overrides compatible with an older scheduler. Before rolling back, pause affected automations and clear or convert their permission overrides to settings supported by the older backend; review the resulting permissions before resuming. Older schedulers may reject these modes or lose their harness-specific behavior even when a mode's spelling is accepted.
 
 ## Related
 

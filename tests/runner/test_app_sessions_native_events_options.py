@@ -1947,9 +1947,11 @@ async def test_events_model_change_confirms_against_the_status_file(
         ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
         ("opus[1m]", "system.ai.claude-opus-4-7[1M]", "claude-opus-4-7[1m]", 204),
         ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6[1m]", 503),
-        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 503),
-        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
-        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6", 503),
+        ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 204),
+        ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 204),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 204),
+        ("opus", "system.ai.claude-opus-4-7", "system.ai.claude-opus-4-7[1m]", 503),
         ("opus", None, "claude-opus-4-7", 503),
     ],
     ids=[
@@ -1959,9 +1961,11 @@ async def test_events_model_change_confirms_against_the_status_file(
         "uppercase-bracket-alias",
         "uppercase-pin-marker",
         "different-generation",
-        "different-context",
-        "bracket-alias-different-context",
-        "uppercase-bracket-alias-different-context",
+        "unmarked-different-generation",
+        "unmarked-status-for-1m-pin",
+        "unmarked-status-for-bracket-alias",
+        "unmarked-status-for-uppercase-bracket-alias",
+        "marked-status-for-plain-pin",
         "unpinned-alias",
     ],
 )
@@ -1972,7 +1976,12 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
     status_model: str,
     status_code: int,
 ) -> None:
-    """An unchanged model confirms only the pin's exact generation and context."""
+    """An unchanged model confirms only the pin's exact generation and context.
+
+    Claude Code's statusLine names a 1M model without its ``[1m]`` marker, so
+    an unmarked status confirms a pick whose marker reached the pane; a marked
+    status still has to match the pick's context.
+    """
 
     async def _skip_terminal_creation(**_kwargs: Any) -> None:
         pass
@@ -1989,6 +1998,35 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
         model_env={"ANTHROPIC_DEFAULT_OPUS_MODEL": pin_model} if pin_model else {},
     )
     assert resp.status_code == status_code, resp.text
+
+
+@pytest.mark.parametrize(
+    "status_values",
+    [
+        ["system.ai.claude-sonnet-5-5"],
+        [None, "system.ai.claude-sonnet-5-5"],
+        ["system.ai.claude-haiku-5-5", "system.ai.claude-sonnet-5-5"],
+    ],
+    ids=["already-on-the-model", "status-not-written-yet", "switched-from-another-model"],
+)
+async def test_events_model_change_confirms_a_typed_1m_pick_by_its_unmarked_name(
+    monkeypatch: pytest.MonkeyPatch,
+    status_values: list[str | None],
+) -> None:
+    """A typed 1M pick confirms once the status names its model without the marker.
+
+    After ``/model system.ai.claude-sonnet-5-5[1m]`` Claude Code's statusLine
+    reads ``system.ai.claude-sonnet-5-5``, so a pane already on that model, or
+    one whose status was not written before the switch, still confirms it.
+    """
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        status_values,
+        model="system.ai.claude-sonnet-5-5[1m]",
+        picker_values=("system.ai.claude-sonnet-5-5[1m]",),
+        model_env={},
+    )
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])

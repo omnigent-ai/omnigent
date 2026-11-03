@@ -4,12 +4,12 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setOmnigentHostConfig } from "@/lib/host";
 import { TasksPage } from "./TasksPage";
 import { useViewerId } from "@/hooks/useViewerId";
 import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { setOmnigentHostConfig } from "@/lib/host";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -32,6 +32,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialName,
     initialPrompt,
     initialTrigger,
+    initialTemplateId,
     sessionLink,
     editingTask,
   }: {
@@ -40,6 +41,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialName?: string;
     initialPrompt?: string;
     initialTrigger?: string | null;
+    initialTemplateId?: string;
     sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
@@ -49,6 +51,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
         data-initial-trigger={initialTrigger ?? ""}
+        data-initial-template={initialTemplateId ?? ""}
         data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
@@ -105,7 +108,10 @@ function setTasks(
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
 }
 
+const analytics = vi.fn();
 beforeEach(() => {
+  analytics.mockReset();
+  setOmnigentHostConfig({ analytics });
   localStorage.clear();
   vi.mocked(useViewerId).mockReturnValue(null);
   mutate.mockReset();
@@ -432,22 +438,31 @@ describe("New automation entry", () => {
 
 describe("automation view navigation", () => {
   it("reports one analytics event per tab change, including pointer focus activation", () => {
-    const analytics = vi.fn();
-    setOmnigentHostConfig({ analytics });
     setTasks([]);
     renderPage();
+    expect(analytics).toHaveBeenCalledWith({ type: "page_view", pageId: "tasks" });
     selectView("Templates");
-    expect(analytics).toHaveBeenCalledExactlyOnceWith({
+    expect(analytics).toHaveBeenCalledWith({ type: "page_view", pageId: "tasks.templates" });
+    expect(analytics).toHaveBeenCalledWith({
       type: "value_change",
       componentId: "tasks.view",
       componentKind: "tabs",
       value: "templates",
     });
     selectView("Templates");
-    expect(analytics).toHaveBeenCalledTimes(1);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(1);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+    ]);
     selectView("Your automations");
-    expect(analytics).toHaveBeenCalledTimes(2);
-    expect(analytics).toHaveBeenLastCalledWith({
+    expect(analytics.mock.calls.filter(([event]) => event.type === "page_view")).toEqual([
+      [{ type: "page_view", pageId: "tasks" }],
+      [{ type: "page_view", pageId: "tasks.templates" }],
+      [{ type: "page_view", pageId: "tasks" }],
+    ]);
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toHaveLength(2);
+    expect(analytics).toHaveBeenCalledWith({
       type: "value_change",
       componentId: "tasks.view",
       componentKind: "tabs",
@@ -495,6 +510,12 @@ describe("template prefill", () => {
     expect(dialog.getAttribute("data-initial-name")).toBe("Jira tickets");
     expect(dialog.getAttribute("data-initial-trigger")).toBe("jira");
     expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+    expect(dialog).toHaveAttribute("data-initial-template", "jira");
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "tasks.template.jira",
+      componentKind: "button",
+    });
   });
 
   it("reseeds from another card after closing, and starts manual creation empty", () => {
@@ -506,6 +527,10 @@ describe("template prefill", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
       "Jira tickets",
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "jira",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     expect(screen.queryByTestId("manual-dialog-open")).not.toBeInTheDocument();
@@ -513,11 +538,16 @@ describe("template prefill", () => {
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe(
       "Slack messages",
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      "slack",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     // Manual creation must not inherit the previous template.
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-name")).toBe("");
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-template", "");
   });
 });
 
@@ -582,6 +612,15 @@ describe("trigger templates", () => {
       "data-initial-trigger",
       source,
     );
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-template",
+      source,
+    );
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: `tasks.template.${source}`,
+      componentKind: "button",
+    });
   });
 
   it.each([
