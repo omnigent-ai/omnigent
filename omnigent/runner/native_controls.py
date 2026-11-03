@@ -454,8 +454,22 @@ def build_native_controls(
 
     async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
         """Bound cold terminal creation separately from its thread-discovery wait."""
+        from omnigent.entities.session_resources import terminal_resource_id
+
         terminal_registry = resource_registry.terminal_registry
         if terminal_registry is not None:
+            # A picker change is client activity. Serialize with reaping before
+            # ensuring so an in-flight reap finishes before we recover its pane.
+            lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+            async with asyncio.timeout(_CODEX_SETTINGS_READY_TIMEOUT_S), lock:
+                terminal = terminal_registry.get(conv_id, "codex", "main")
+                if terminal is not None and (
+                    resource_registry.terminal_resource_role(
+                        conv_id, terminal_resource_id("codex", "main")
+                    )
+                    == CODEX_NATIVE_TERMINAL_ROLE
+                ):
+                    terminal.note_client_interaction()
             await asyncio.wait_for(
                 _ensure_native_terminal_for_turn(conv_id, "codex-native"),
                 timeout=_CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
