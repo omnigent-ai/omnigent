@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -240,6 +241,7 @@ async def test_redirect_written_to_a_busy_terminal_arrives_whole(
     read_fd, write_fd = os.pipe()
     real_write = os.write
     calls = []
+    terminal = write_fd
 
     def short_write(fd: int, data: bytes) -> int:
         calls.append(len(data))
@@ -249,12 +251,27 @@ async def test_redirect_written_to_a_busy_terminal_arrives_whole(
 
     monkeypatch.setattr(mcp_login.os, "write", short_write)
     try:
-        await mcp_login._write_all(write_fd, b"x" * 25)
+        await mcp_login._write_all(lambda: terminal, b"x" * 25)
         assert os.read(read_fd, 100) == b"x" * 25
+
+        # A sign-in that ends mid-write gets no more of the address.
+        def write_then_end(fd: int, data: bytes) -> int:
+            nonlocal terminal
+            terminal = -1
+            return real_write(fd, data[:10])
+
+        monkeypatch.setattr(mcp_login.os, "write", write_then_end)
+        with pytest.raises(LoginError) as ended:
+            await mcp_login._write_all(lambda: terminal, b"y" * 25)
+        assert ended.value.status == "invalid"
+        assert os.read(read_fd, 100) == b"y" * 10
+
+        monkeypatch.setattr(mcp_login.os, "write", short_write)
+        terminal = write_fd
         os.close(read_fd)
         calls.clear()
         with pytest.raises(LoginError) as failed:
-            await mcp_login._write_all(write_fd, b"x")
+            await mcp_login._write_all(lambda: terminal, b"x")
         assert failed.value.status == "failed"
     finally:
         os.close(write_fd)
@@ -272,7 +289,7 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
         monkeypatch.setattr(mcp_login, "CALLBACK_TIMEOUT_SECONDS", 0.3)
     typed: list[bytes] = []
 
-    async def type_into_terminal(master_fd: int, data: bytes) -> None:
+    async def type_into_terminal(terminal: Callable[[], int], data: bytes) -> None:
         typed.append(data)
 
     monkeypatch.setattr(mcp_login, "_write_all", type_into_terminal)
@@ -284,7 +301,17 @@ async def test_older_cli_gets_the_redirect_on_its_listener(
     # The flag check runs once per installed CLI build.
     assert Path(f"{fake_cli}.help").read_text().count("probe") == 1
     redirect = parse_qs(urlsplit(started["authorization_url"]).query)["redirect_uri"][0]
-    await logins.submit(started["login_id"], f"{redirect}?code=abc&state=s")
+    callback = f"{redirect}?code=abc&state=s"
+    if slow_listener:
+        # A second Finish while the first is delivering must not resend the code.
+        first, second = await asyncio.gather(
+            logins.submit(started["login_id"], callback),
+            logins.submit(started["login_id"], callback),
+            return_exceptions=True,
+        )
+        assert isinstance(second, LoginError) and second.status == "invalid", (first, second)
+    else:
+        await logins.submit(started["login_id"], callback)
     finished = await _settled(logins, started["login_id"])
     assert finished["state"] == "succeeded"
     received = fake_cli.with_suffix(".received").read_text().splitlines()

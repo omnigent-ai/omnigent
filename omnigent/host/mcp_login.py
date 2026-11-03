@@ -255,7 +255,7 @@ def valid_callback(callback_url: str, redirect: SplitResult) -> bool:
         return False
 
 
-async def _deliver_callback(master_fd: int, callback_url: str) -> None:
+async def _deliver_callback(terminal: Callable[[], int], callback_url: str) -> None:
     """Send a pasted redirect to the CLI, as a browser on the host would have."""
     import httpx
 
@@ -270,13 +270,17 @@ async def _deliver_callback(master_fd: int, callback_url: str) -> None:
         # The listener has the request; sending it again would reuse the code.
         return
     # No listener: newer CLIs read the redirect from their terminal instead.
-    await _write_all(master_fd, callback_url.encode() + b"\r")
+    await _write_all(terminal, callback_url.encode() + b"\r")
 
 
-async def _write_all(master_fd: int, data: bytes) -> None:
+async def _write_all(terminal: Callable[[], int], data: bytes) -> None:
+    """Write *data* to ``terminal()``, which is -1 once the sign-in has ended."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + CALLBACK_TIMEOUT_SECONDS
     while data:
+        # A finished sign-in closes its terminal, and the OS may reuse the number.
+        if (master_fd := terminal()) < 0:
+            raise LoginError("invalid", "This sign-in is no longer waiting")
         try:
             data = data[os.write(master_fd, data) :]
         except BlockingIOError:
@@ -301,6 +305,11 @@ class _Login:
     finished_at: float | None = None
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     watcher: asyncio.Task[None] | None = None
+    delivering: bool = False
+
+    def terminal(self) -> int:
+        """The CLI's terminal, or -1 once this sign-in has ended."""
+        return self.master_fd if self.state == "pending" else -1
 
     def status(self) -> LoginStatus:
         return {
@@ -520,7 +529,14 @@ class HostMcpLogins:
             raise LoginError("invalid", "This sign-in is no longer waiting")
         if not valid_callback(callback_url, login.redirect):
             raise LoginError("invalid", "That isn't the address the sign-in page redirected to")
-        await _deliver_callback(login.master_fd, callback_url)
+        if login.delivering:
+            raise LoginError("invalid", "This sign-in is already finishing")
+        # A second delivery would reuse the address's one-time code.
+        login.delivering = True
+        try:
+            await _deliver_callback(login.terminal, callback_url)
+        finally:
+            login.delivering = False
         return login.status()
 
     async def cancel(self, login_id: str) -> LoginStatus:

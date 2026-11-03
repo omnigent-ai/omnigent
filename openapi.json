@@ -3910,7 +3910,7 @@
       "McpLoginCallbackRequest": {
         "properties": {
           "callback_url": {
-            "maxLength": 4096,
+            "maxLength": 4000,
             "minLength": 1,
             "title": "Callback Url",
             "type": "string"
