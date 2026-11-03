@@ -16,11 +16,23 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
-@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
 
-/* CSS-pixel floor, independent of viewport width and pointer capability. */
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  @media (pointer: coarse) and (hover: none) {
     min-width: 44px;
     min-height: 44px;
   }
