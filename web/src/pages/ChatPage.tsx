@@ -2168,10 +2168,8 @@ export function buildSlashCommandMap(
 /**
  * Whether the composer offers ``/clear`` for a session on *harness*.
  *
- * Native terminals run the harness's own /clear, which moves the terminal onto
- * a fresh session; servers that list ``clear`` support it. claude-sdk sessions
- * continue in a fresh session on the same machine, which only servers reporting
- * ``session_claude_sdk_clear`` do. Elsewhere a typed /clear stays plaintext.
+ * SDK clear requires its capability flag; native clear uses
+ * ``session_event_types``. Elsewhere a typed /clear stays plaintext.
  */
 export function composerOffersClear(harness: string | null, info: ServerInfo | "loading"): boolean {
   if (info === "loading") return false;
