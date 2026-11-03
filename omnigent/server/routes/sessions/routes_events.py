@@ -754,6 +754,26 @@ def note_host_sign_in_rejection(host_id: str, cause: str) -> None:
     _host_sign_in_rejections[host_id] = cause
 
 
+def forget_host_sign_in_rejection(host_id: str) -> None:
+    """Let a reconnected host's next held send launch a runner again.
+
+    :param host_id: The host that connected, which may have signed in again.
+    """
+    _host_sign_in_rejections.pop(host_id, None)
+
+
+def _host_sign_in_retry_message(cause: str) -> str:
+    """Return the host's sign-in instruction for a recovery that found no runner.
+
+    :param cause: The host's report for its refused runner.
+    :returns: The instruction up to "then retry.", without the details.
+    """
+    instruction, sep, _ = cause.partition(", then retry.")
+    if not sep:
+        return "This host's sign-in has expired. Sign in again on the host, then retry."
+    return f"{instruction}, then retry."
+
+
 def _host_sign_in_hold_message(cause: str) -> str:
     """Return the refusal text for a send held until the host signs in again.
 
@@ -850,6 +870,14 @@ async def _recover_retry_session(
                 raise_host_refusal=True,
             )
         if runner_client is None:
+            rejected_sign_in = _host_sign_in_rejections.get(conv.host_id or "")
+            if rejected_sign_in is not None:
+                # The runner's exit no longer fails the session with the host's
+                # sign-in instruction, so the refused recovery has to name it.
+                raise OmnigentError(
+                    _host_sign_in_retry_message(rejected_sign_in),
+                    code=ErrorCode.HOST_SIGN_IN_REQUIRED,
+                )
             raise OmnigentError(
                 "No runner is available to recover this session.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
