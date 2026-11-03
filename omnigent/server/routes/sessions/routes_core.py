@@ -5128,9 +5128,22 @@ def register_core_routes(
             ),
             reason="rewind",
         )
-        attachments = await asyncio.to_thread(
-            _rewind_attachments, conv.id, new_session_id, prompt.content
-        )
+        # The rewound session already exists, so a failed lookup costs only
+        # the attachments the composer would have restored.
+        try:
+            attachments = await asyncio.to_thread(
+                _rewind_attachments, conv.id, new_session_id, prompt.content
+            )
+        except Exception:
+            _logger.warning(
+                "Failed to look up the rewound prompt's attachments; "
+                "old_session=%s new_session=%s",
+                conv.id,
+                new_session_id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+            attachments = []
         return SessionRewindResponse(
             session_id=new_session_id,
             prompt="\n".join(
