@@ -51,7 +51,7 @@ vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => sho
 
 // Agent / host catalogs — return simple lists so labels resolve.
 const defaultAgentCatalog = (_options?: { pinnedAgentIds?: string[] }) => ({
-  data: [{ id: "ag_1", name: "polly", display_name: "Polly" }],
+  data: [{ id: "ag_1", name: "polly", display_name: "Polly", harness: null as string | null }],
 });
 const useAvailableAgents = vi.fn(defaultAgentCatalog);
 vi.mock("@/hooks/useAvailableAgents", () => ({
@@ -59,6 +59,9 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h_1", name: "My Laptop" }] }),
+}));
+vi.mock("@/hooks/useConversations", () => ({
+  useProjects: () => ({ data: [{ id: "proj_1", name: "Inbox" }] }),
 }));
 
 // The real read-state mirror, so unread verdicts come from actual state. Only
@@ -123,6 +126,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
 
 function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
   return {
+    sessionCostUsd: null,
     id: "run_1",
     scheduledTaskId: "st_1",
     status: "succeeded",
@@ -218,6 +222,24 @@ function renderPage() {
 }
 
 describe("header, prompt, configuration", () => {
+  it("collapses and reopens configuration while keeping run history visible", () => {
+    setTask(task({ modelOverride: "opus" }));
+    setRuns([run({ sessionCostUsd: 1.23 })]);
+    renderPage();
+    const toggle = screen.getByRole("button", { name: "Configuration" });
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("task-detail-model")).toBeVisible();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("task-detail-model")).not.toBeInTheDocument();
+    expect(screen.getByTestId("run-cost")).toBeVisible();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("task-detail-model")).toHaveTextContent("Opus");
+  });
+
   it("renders the title, prompt, schedule, and agent/host config", () => {
     setTask(task());
     renderPage();
@@ -230,6 +252,81 @@ describe("header, prompt, configuration", () => {
     // Null hostId → resolve-at-fire label, not blank.
     expect(screen.getByTestId("task-detail-host")).toHaveTextContent("Most recently active host");
     expect(screen.getByTestId("task-detail-state-pill")).toHaveTextContent("Active");
+    for (const field of ["model", "effort", "permission"]) {
+      expect(screen.getByTestId(`task-detail-${field}`)).toHaveTextContent("Agent default");
+    }
+    expect(screen.getByTestId("task-detail-session-mode")).toHaveTextContent(
+      "New session each run",
+    );
+    expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Host home directory");
+    expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("UTC");
+  });
+
+  it("shows saved launch settings and the continued session configuration", () => {
+    useAvailableAgents.mockReturnValue({
+      data: [{ ...defaultAgentCatalog().data[0], harness: "claude-native" }],
+    });
+    setTask(
+      task({
+        modelOverride: "opus",
+        reasoningEffort: "high",
+        permissionMode: "acceptEdits",
+        sessionMode: "continue",
+        sessionId: "c_1",
+        workspace: "/work/inbox",
+        projectId: "proj_1",
+        timezone: "America/Los_Angeles",
+      }),
+    );
+    renderPage();
+    expect(screen.getByTestId("task-detail-model")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("task-detail-effort")).toHaveTextContent("High");
+    expect(screen.getByTestId("task-detail-permission")).toHaveTextContent("Accept edits");
+    expect(screen.getByTestId("task-detail-session-mode")).toHaveTextContent(
+      "Continue in the same session",
+    );
+    expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("/work/inbox");
+    expect(screen.getByTestId("task-detail-project")).toHaveTextContent("Inbox");
+    expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("America/Los_Angeles");
+    expect(screen.getByText(/saved launch settings/)).toBeInTheDocument();
+  });
+
+  it("preserves unknown settings and distinguishes Manual from an unset permission mode", () => {
+    useAvailableAgents.mockReturnValue({
+      data: [{ ...defaultAgentCatalog().data[0], harness: "claude-native" }],
+    });
+    setTask(
+      task({
+        modelOverride: "custom-model",
+        reasoningEffort: "xhigh",
+        permissionMode: "default",
+        projectId: "missing-project",
+      }),
+    );
+    renderPage();
+    expect(screen.getByTestId("task-detail-model")).toHaveTextContent("custom-model");
+    expect(screen.getByTestId("task-detail-effort")).toHaveTextContent("xHigh");
+    expect(screen.getByTestId("task-detail-permission")).toHaveTextContent("Manual");
+    expect(screen.getByTestId("task-detail-project")).toHaveTextContent("missing-project");
+  });
+
+  it.each([
+    ["codex-native", "default", "Agent default"],
+    ["cursor-native", "default", "Agent default"],
+    ["antigravity-native", "default", "Agent default"],
+    ["native-codex", "read-only", "Read only"],
+    ["cursor-native", "auto-review", "Auto-review"],
+    ["antigravity-native", "skip", "Skip permissions"],
+    ["codex-native", "future-mode", "future-mode"],
+    [null, "default", "default"],
+    [null, "acceptEdits", "acceptEdits"],
+  ])("uses %s permission semantics for %s", (harness, permissionMode, label) => {
+    useAvailableAgents.mockReturnValue({
+      data: [{ ...defaultAgentCatalog().data[0], harness }],
+    });
+    setTask(task({ permissionMode }));
+    renderPage();
+    expect(screen.getByTestId("task-detail-permission").textContent).toBe(label);
   });
 
   it("keeps the task's agent in the catalog when another agent shares its name", () => {
@@ -237,8 +334,15 @@ describe("header, prompt, configuration", () => {
     // a session's same-named copy wins and the task's own agent drops out.
     useAvailableAgents.mockImplementation((options) => ({
       data: options?.pinnedAgentIds?.includes("ag_1")
-        ? [{ id: "ag_1", name: "polly", display_name: "Polly" }]
-        : [{ id: "ag_session_copy", name: "polly", display_name: "Polly (session copy)" }],
+        ? [{ id: "ag_1", name: "polly", display_name: "Polly", harness: null }]
+        : [
+            {
+              id: "ag_session_copy",
+              name: "polly",
+              display_name: "Polly (session copy)",
+              harness: null,
+            },
+          ],
     }));
     setTask(task({ agentId: "ag_1" }));
     renderPage();
@@ -249,6 +353,7 @@ describe("header, prompt, configuration", () => {
     setTask(task({ executionTarget: "managed_sandbox" }));
     renderPage();
     expect(screen.getByTestId("task-detail-host")).toHaveTextContent("New Sandbox");
+    expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Sandbox default");
   });
 
   it("resolves a pinned host id to its name", () => {
@@ -476,6 +581,36 @@ describe("header actions", () => {
 });
 
 describe("run history", () => {
+  it.each([
+    [1.234, "$1.23"],
+    [0, "$0.00"],
+    [0.001, "<$0.01"],
+    [null, null],
+  ])("renders reported session cost %s without inventing missing costs", (cost, label) => {
+    setTask(task());
+    setRuns([run({ conversationId: "c_1", sessionCostUsd: cost })]);
+    renderPage();
+    expect(screen.getByTestId("run-duration")).toHaveTextContent("1m 42s");
+    if (label === null) expect(screen.queryByTestId("run-cost")).toBeNull();
+    else expect(screen.getByTestId("run-cost")).toHaveTextContent(`Session cost ${label}`);
+  });
+
+  it("explains shared totals while preserving costs for different sessions", () => {
+    setTask(task({ sessionMode: "continue" }));
+    setRuns([
+      run({ conversationId: "c_1", sessionCostUsd: 2 }),
+      run({ id: "run_2", conversationId: "c_1", sessionCostUsd: 2 }),
+      run({ id: "run_3", conversationId: "c_2", sessionCostUsd: 3 }),
+    ]);
+    renderPage();
+    expect(screen.getAllByTestId("run-cost").map((element) => element.textContent)).toEqual([
+      "Session cost $2.00",
+      "Session cost $2.00",
+      "Session cost $3.00",
+    ]);
+    expect(screen.getByText(/Runs sharing a session show the same total/)).toBeInTheDocument();
+    expect(screen.getByText(/Separate sub-agent sessions are excluded/)).toBeInTheDocument();
+  });
   it("renders the empty state when there are no runs", () => {
     setTask(task());
     setRuns([]);
