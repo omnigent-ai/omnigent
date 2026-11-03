@@ -1360,13 +1360,14 @@ def test_fully_visible_transcript_paints_no_scrollbar(
 ) -> None:
     chat = chat_session_contract
     _single_reply(chat, 140)
-    open_live(page, chat, {"width": 1400, "height": 800})
+    open_live(page, chat, {"width": 1400, "height": 900})
     page.get_by_role("button", name="Expand right panel").click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
     expect(page.get_by_text("word0000", exact=False)).to_be_visible()
     page.wait_for_timeout(1200)
     state = _fully_visible_state(page)
     assert state["first"] >= state["top"] and state["last"] <= state["bottom"] - 32
+    assert state["max"] <= TOLERANCE, state
     assert not state["thumb"], state
 
 

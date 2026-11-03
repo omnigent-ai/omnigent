@@ -103,7 +103,7 @@ def test_message_font_size_survives_rotation_and_reload(
     saved_size: int | None,
     touch: bool,
 ) -> None:
-    """Built message CSS keeps touch prose stable while interface defaults follow layout."""
+    """Built message CSS preserves touch sizing and explicit preferences through rotation."""
     chat = chat_session_contract
     chat.set_items(
         [
@@ -138,7 +138,7 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (14 if width < 768 else 13)
+            interface_px = saved_size if saved_size is not None else 14
             message_px = (
                 (saved_size if saved_size is not None else 14) + 2
                 if touch or width < 768
@@ -182,7 +182,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expect(fallback).to_have_css("font-size", "16px" if touch else "11.7px")
+            expect(fallback).to_have_css("font-size", "16px" if touch else "12.6px")
 
 
 @pytest.mark.only_browser("chromium")
