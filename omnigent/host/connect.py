@@ -1284,6 +1284,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        server_still_ours: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1294,9 +1295,13 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param server_still_ours: For a local-mode host, reports whether the
+            local server it started is still the one on ``server_url``; while
+            it is ``False`` each attempt is treated as refused instead of dialing.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._server_still_ours = server_still_ours
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
         # files). Each entry remembers the repository root it was built for.
@@ -5223,6 +5228,12 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        if self._server_still_ours is not None and not self._server_still_ours():
+            # Our local server exited; another data dir's server may now own the
+            # port, and registering there steals that host's same-name row.
+            raise ConnectionRefusedError(
+                errno.ECONNREFUSED, f"the local server at {self._server_url} is no longer running"
+            )
         url = self._tunnel_url()
         # Credential discovery may invoke the Databricks CLI. Keep it off the
         # event loop so startup capability discovery can make progress at the
@@ -6075,6 +6086,7 @@ def run_host_process(
     daemon_target: str | None = None,
     lifecycle_lock: DaemonLifecycleLock | None = None,
     interactive_shells: list[str] | None = None,
+    server_still_ours: Callable[[], bool] | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -6094,6 +6106,7 @@ def run_host_process(
         for the host process lifetime instead of acquiring another handle.
     :param interactive_shells: Optional shell inventory override for tests.
         By default the host discovers its installed shells once at startup.
+    :param server_still_ours: Local-mode ownership check; see :class:`HostProcess`.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
@@ -6128,6 +6141,7 @@ def run_host_process(
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
             interactive_shells=interactive_shells,
+            server_still_ours=server_still_ours,
         )
     except BaseException as exc:
         # A stop signal already being handled owns the exit: never returns then.
@@ -6177,6 +6191,7 @@ def _serve_host_until_exit(
     daemon_target: str | None,
     lifecycle_lock: DaemonLifecycleLock | None,
     interactive_shells: list[str] | None,
+    server_still_ours: Callable[[], bool] | None = None,
 ) -> bool:
     """Run the host until it exits; see :func:`run_host_process`.
 
@@ -6268,6 +6283,7 @@ def _serve_host_until_exit(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        server_still_ours=server_still_ours,
     )
     crash_reporting.set_hangup_callback(host.signal_runners_finish_work)
     try:

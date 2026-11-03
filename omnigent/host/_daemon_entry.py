@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import logging
 import os
 import time
@@ -124,11 +125,16 @@ def main() -> None:
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 
+        server_still_ours = None
         if args.local:
             # The daemon owns the local server: start/reuse it, then connect.
-            from omnigent.host.local_server import ensure_local_omnigent_server
+            from omnigent.host.local_server import (
+                ensure_local_omnigent_server,
+                local_server_still_serves,
+            )
 
             server_url = ensure_local_omnigent_server().url
+            server_still_ours = functools.partial(local_server_still_serves, server_url)
         else:
             server_url = args.server
 
@@ -138,6 +144,7 @@ def main() -> None:
             server_url=server_url,
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
+            server_still_ours=server_still_ours,
         )
     finally:
         if workspace_lock is not None:
