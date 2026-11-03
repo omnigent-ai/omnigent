@@ -2994,9 +2994,10 @@ describe("automation harness settings", () => {
 });
 
 describe("automation random worktree", () => {
-  it.each([false, true])(
-    "clears a saved worktree choice when switching hosts (round trip %s)",
-    async (roundTrip) => {
+  it.each(["host", "host-roundtrip", "directory-roundtrip"])(
+    "clears a saved worktree choice when switching hosts (%s)",
+    async (transition) => {
+      const roundTrip = transition !== "host";
       vi.mocked(hostsHook.useHosts).mockReturnValue({
         data: [
           { host_id: "host_1", name: "laptop", status: "online" },
@@ -3019,20 +3020,33 @@ describe("automation random worktree", () => {
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
-      fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
       gitWorkspace.available = false;
-      fireEvent.click(screen.getByRole("option", { name: "desktop" }));
+      if (transition !== "directory-roundtrip") {
+        fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+        fireEvent.click(screen.getByRole("option", { name: "desktop" }));
+      } else {
+        // Reselect the ordinary folder to render the negative discovery result.
+        fireEvent.click(screen.getByTestId("task-workspace-browse"));
+        fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+      }
       expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
-      if (roundTrip) {
+      if (transition === "host-roundtrip") {
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(screen.getByRole("option", { name: "laptop" }));
         expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
+      }
+      if (transition === "directory-roundtrip") {
+        gitWorkspace.available = true;
+        gitWorkspace.path = "/home/me/repo";
+        fireEvent.click(screen.getByTestId("task-workspace-browse"));
+        fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
+        expect(screen.getByRole("checkbox", { name: "Random worktree" })).not.toBeChecked();
       }
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
       expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
         hostId: roundTrip ? "host_1" : "host_2",
-        workspace: roundTrip ? "/ordinary-folder" : "/home/me/repo",
+        workspace: transition === "host-roundtrip" ? "/ordinary-folder" : "/home/me/repo",
         baseBranch: null,
       });
     },
@@ -3139,19 +3153,34 @@ describe("automation random worktree", () => {
     expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
   });
 
-  it.each([null, "HEAD"])("saves toggling the saved option from %s", async (baseBranch) => {
+  it.each([
+    [null, false],
+    ["HEAD", false],
+    [null, true],
+    ["HEAD", true],
+  ] as const)("saves toggling the saved option from %s (bound %s)", async (baseBranch, bound) => {
     render(
       <CreateScheduledTaskDialog
         open
         onOpenChange={vi.fn()}
-        editingTask={scheduledTask({ hostId: "host_1", workspace: "/home/me/repo", baseBranch })}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          hostId: "host_1",
+          workspace: "/home/me/repo",
+          baseBranch,
+          sessionMode: bound ? "continue" : "new",
+          sessionId: bound ? "conv_1" : null,
+        })}
       />,
     );
     const checkbox = screen.getByRole("checkbox", { name: "Random worktree" });
     expect(checkbox).toHaveAttribute("aria-checked", baseBranch === null ? "false" : "true");
+    if (bound) expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
     fireEvent.click(checkbox);
+    if (bound) expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
+    // Changing baseBranch requests the server-side binding reset.
     expect(updateMutateAsync.mock.calls[0][0].input.baseBranch).toBe(
       baseBranch === null ? "HEAD" : null,
     );

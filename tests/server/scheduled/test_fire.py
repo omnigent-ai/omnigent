@@ -2590,7 +2590,7 @@ async def test_continue_sends_the_prompt_into_the_session(worktree: bool) -> Non
         session.labels = {
             fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
             WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(session.workspace),
-            fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/repo",
+            fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
         }
     conv_store = _ExistingConversationStore(session)
     perm = FakePermissionStore()
@@ -2785,7 +2785,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
                 git_branch="main",
                 labels={
                     fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
-                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/repo",
+                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
                 },
             ),
             {"base_branch": "HEAD"},
@@ -2797,7 +2797,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
                 workspace="/repo-worktrees/test",
                 labels={
                     fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
-                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/other",
+                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/other"),
                     WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
                 },
             ),
@@ -2811,7 +2811,7 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
                 host_id="host_2",
                 labels={
                     fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
-                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: "/repo",
+                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
                     WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
                 },
             ),
@@ -3357,14 +3357,23 @@ async def test_continue_dispatch_failure_records_a_failed_run() -> None:
     ]
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("enabled", "source_length"), [(False, 5), (True, 5), (True, 256), (True, 257)]
+)
 async def test_random_worktree_is_created_per_new_session(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool
+    monkeypatch: pytest.MonkeyPatch, db_uri: str, enabled: bool, source_length: int
 ) -> None:
     from omnigent.server.routes import _host_worktree
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
-    task = _task(base_branch="HEAD" if enabled else None)
-    deps = _deps(FakeScheduledTaskStore(), host_registry=FakeHostRegistry({"host_1"}))
+    source = "/" + "r" * (source_length - 1)
+    task = _task(
+        base_branch="HEAD" if enabled else None,
+        workspace=source,
+        agent_id=generate_agent_id(),
+        host_id="a" * 32,
+    )
+    deps = _deps(FakeScheduledTaskStore(), host_registry=FakeHostRegistry({"a" * 32}))
     create = AsyncMock(
         side_effect=[
             _host_worktree.CreatedWorktree(
@@ -3377,14 +3386,20 @@ async def test_random_worktree_is_created_per_new_session(
     for i in range(2):
         conv = await fire_mod._create_session(deps, task)
         saved = deps.conversation_store.created[-1]
-        assert saved["workspace"] == (f"/repo-worktrees/run-{i}/src" if enabled else "/repo")
+        assert saved["workspace"] == (f"/repo-worktrees/run-{i}/src" if enabled else source)
         assert saved["git_branch"] == (f"run-{i}" if enabled else None)
         if enabled:
             assert saved["labels"][
                 _host_worktree.WORKTREE_ROOT_LABEL_KEY
             ] == _host_worktree.worktree_root_fingerprint(f"/repo-worktrees/run-{i}")
             # The next firing accepts the relocated directory and bypasses creation.
-            conv.labels = saved["labels"]
+            persisted = SqlAlchemyConversationStore(db_uri)
+            stored = persisted.create_conversation(**saved)
+            conv = persisted.get_conversation(stored.id)
+            assert conv is not None
+            assert conv.labels[fire_mod._WORKTREE_SOURCE_LABEL_KEY] == worktree_root_fingerprint(
+                source
+            )
             continuing = replace(task, session_mode="continue", session_id=conv.id)
             assert (
                 await fire_mod.continued_session_problem(
@@ -3396,10 +3411,8 @@ async def test_random_worktree_is_created_per_new_session(
     if enabled:
         calls = [call.kwargs for call in create.await_args_list]
         assert calls[0]["branch_name"] != calls[1]["branch_name"]
-        assert all(
-            call["repo_path"] == "/repo" and call["base_branch"] == "HEAD" for call in calls
-        )
-    assert task.workspace == "/repo"
+        assert all(call["repo_path"] == source and call["base_branch"] == "HEAD" for call in calls)
+    assert task.workspace == source
 
 
 @pytest.mark.parametrize("failure", ["create", "update", "labels", "reasoning", "presentation"])

@@ -126,7 +126,7 @@ if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
-_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source"
+_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
 
 # How long to wait for a freshly launched runner to connect before giving up on
 # dispatching the prompt this fire. The session + grant are already persisted, so
@@ -900,13 +900,16 @@ async def continued_session_problem(
     from omnigent.server.routes._host_worktree import (
         WORKTREE_ROOT_LABEL_KEY,
         recorded_worktree_root,
+        worktree_root_fingerprint,
     )
 
     fingerprint = conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
     own_worktree = (
         task.base_branch is not None
         and conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) == task.id
-        and conv.labels.get(_WORKTREE_SOURCE_LABEL_KEY) == task.workspace
+        and task.workspace is not None
+        and conv.labels.get(_WORKTREE_SOURCE_LABEL_KEY)
+        == worktree_root_fingerprint(task.workspace)
         and conv.git_branch is not None
         and conv.workspace is not None
         and fingerprint is not None
@@ -1460,7 +1463,7 @@ async def _create_session(
             raise _CannotLaunchScheduledFire(
                 str(exc), error_code="worktree_create_failed"
             ) from exc
-        labels[_WORKTREE_SOURCE_LABEL_KEY] = workspace
+        labels[_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
     conv: Conversation | None = None
