@@ -1466,7 +1466,7 @@ async def test_claude_sdk_title_can_finish_beyond_a_short_output_budget(
     [(_url, request)] = client.requests
     assert request["tools"] == []
     assert request["model_override"] == background_title_model("claude-sdk")
-    assert 80 <= request["max_output_tokens"] <= 1024
+    assert 256 <= request["max_output_tokens"] <= 1024
 
 
 @pytest.mark.asyncio
