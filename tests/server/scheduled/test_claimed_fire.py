@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import threading
 import time
 import uuid
@@ -23,6 +24,7 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import ManagedLaunchTracker
 from omnigent.server.scheduled import fire as fire_mod
+from omnigent.server.scheduled import telemetry
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentityRevoked,
     PersistentTaskScheduler,
@@ -1189,3 +1191,43 @@ async def test_scheduler_records_a_session_that_finished_during_startup(store) -
     [run] = _runs(store, task)
     assert (run.status, run.conversation_id, run.lease_expires_at) == ("succeeded", _CONV_ID, None)
     assert run.finished_at is not None
+
+
+@pytest.mark.parametrize(
+    "source,template,expected_source,expected_template",
+    [
+        (None, None, "api", "unknown"),
+        ("ui", "custom", "ui", "custom"),
+        ("ui", "jira", "ui", "jira"),
+        ("ui", "slack", "ui", "slack"),
+        ("ui", "github", "ui", "github"),
+        ("ui", "follow-up-monitor", "ui", "follow-up-monitor"),
+        ("ui", "pr-sweep", "ui", "pr-sweep"),
+        ("ui", "news-digest", "ui", "news-digest"),
+        ("agent", None, "agent", "unknown"),
+        ("private source", "private prompt", "api", "unknown"),
+    ],
+)
+def test_creation_telemetry_bounds_dimensions(
+    caplog, source, template, expected_source, expected_template
+):
+    caplog.set_level(logging.INFO)
+    task = ScheduledTask(
+        id="task",
+        name="name",
+        prompt="private prompt",
+        rrule="FREQ=HOURLY",
+        user_id=None,
+        agent_id=_AGENT_ID,
+        timezone="UTC",
+        created_at=0,
+    )
+    telemetry.log_task_created(task, owner="alice@example.com", source=source, template=template)
+    [event] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_task_created"
+    ]
+    assert event.user_id == "alice@example.com"
+    assert event.attributes["creation_source"] == expected_source
+    assert event.attributes["template_id"] == expected_template
+    assert "private" not in str(event.attributes)
+    assert task.prompt not in str(event.attributes)

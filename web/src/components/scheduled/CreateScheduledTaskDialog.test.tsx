@@ -2118,7 +2118,11 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 
     const prompt = await submittedPrompt();
     const arg = mutateAsync.mock.calls[0][0];
-    expect(arg).toMatchObject({ name: "Jira tickets", sessionMode: "continue" });
+    expect(arg).toMatchObject({
+      name: "Jira tickets",
+      sessionMode: "continue",
+      templateId: "jira",
+    });
     expect(arg.rrule).toMatch(/^FREQ=HOURLY/);
     expect(prompt).toContain(
       '(project = "ES" AND labels = "omnigent" AND issuetype != "Epic" AND (summary ~ "crash")) AND created >= <that time> ORDER BY created ASC',
@@ -2172,13 +2176,14 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     pick("task-trigger-then", "task-trigger-then-none");
 
     const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("slack");
     expect(prompt).toContain(
       'Watch: new Slack messages in #eng-support whose text contains "error"',
     );
     expect(prompt).not.toContain("Omnigent session:");
   });
 
-  it("hands the rendered prompt to the plain Prompt field on Edit as prompt", () => {
+  it("hands the rendered prompt to the plain Prompt field on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
     const warning = screen.getByTestId("task-trigger-untrusted-note");
@@ -2194,6 +2199,10 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
+    const editedPrompt = `${prompt.value}\nOnly act on pull requests labeled ready.`;
+    fireEvent.change(prompt, { target: { value: editedPrompt } });
+    expect(await submittedPrompt()).toBe(editedPrompt);
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("github");
   });
 });
 
