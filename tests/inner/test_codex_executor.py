@@ -62,6 +62,14 @@ from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 
 
+@pytest.fixture(autouse=True)
+def _isolate_codex_config_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no installed CLI in executor unit tests")),
+    )
+
+
 def _run(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -4635,8 +4643,11 @@ def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouc
     assert gateway["request_max_retries"] == RetryPolicy().max_retries
 
 
+@pytest.mark.parametrize("ci", [False, True])
 def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
 ) -> None:
     """Unity Gateway providers name Codex and Omnigent (plus ug for its own table)."""
     import tomllib
@@ -4645,6 +4656,11 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
         _databricks_codex_config_overrides,
         materialize_codex_provider_config,
     )
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
 
     gateway_url = "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1"
     codex_home = tmp_path / "codex-home"
@@ -4664,16 +4680,87 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     )
 
     providers = tomllib.loads((codex_home / "config.toml").read_text())["model_providers"]
+    tags = {}
+    if ci:
+        tags = {"Databricks-Ai-Gateway-Request-Tags": '{"pipeline":"polly-review","run_id":"123"}'}
     assert providers["Databricks"]["http_headers"] == {
+        **tags,
         "User-Agent": "ucode/0.1.0 codex/0.145.0",
         "Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
     assert providers["omnigent_databricks"]["http_headers"] == {
+        **tags,
         "Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent",
     }
     assert "http_headers" not in providers["other"]
+
+
+@pytest.mark.parametrize("include_effective_providers", [True, False])
+@pytest.mark.parametrize("inline_providers", [False, True])
+def test_materialize_attributes_effective_gateway_without_copying_credentials(
+    tmp_path: Path,
+    include_effective_providers: bool,
+    inline_providers: bool,
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    resolved_config = (
+        '[model_providers.Managed]\nname = "Managed Gateway"\n'
+        'base_url = "https://ws.cloud.databricks.com/ai-gateway/codex/v1"\n'
+        '[model_providers.Managed.auth]\ncommand = "secret-helper"\n'
+        "[model_providers.Managed.http_headers]\n"
+        'user-agent = "ucode/1 codex/1"\nAuthorization = "Bearer machine-secret"\n'
+        'Databricks-Custom-Client-Surfaces = "ug, inner"\n'
+    )
+    providers = tomllib.loads(resolved_config)["model_providers"]
+    private_home = tmp_path / "codex-home"
+    if inline_providers:
+        private_home.mkdir()
+        (private_home / "config.toml").write_text(
+            'model_providers = { other = { name = "Other", base_url = "https://example.test" } }\n'
+        )
+    materialize_codex_provider_config(
+        private_home, [], effective_providers=providers if include_effective_providers else None
+    )
+    config_path = private_home / "config.toml"
+    if include_effective_providers:
+        written = config_path.read_text()
+        provider = tomllib.loads(written)["model_providers"]["Managed"]
+        assert provider["http_headers"] == {
+            "Databricks-Custom-Coding-Agent": "codex",
+            "Databricks-Custom-Client-Surfaces": "omnigent, ug, inner",
+        }
+        assert "base_url" not in provider
+        assert "auth" not in provider
+        assert "machine-secret" not in written
+    elif inline_providers:
+        assert "Managed" not in tomllib.loads(config_path.read_text())["model_providers"]
+    else:
+        assert not config_path.exists()
+    assert providers == tomllib.loads(resolved_config)["model_providers"]
+
+
+def test_materialize_ignores_non_gateway_effective_providers(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private_home = tmp_path / "codex-home"
+    assert (
+        materialize_codex_provider_config(
+            private_home,
+            [],
+            effective_providers={
+                "Other": {"base_url": "https://ws.cloud.databricks.com/serving-endpoints"}
+            },
+        )
+        == []
+    )
+    assert not (private_home / "config.toml").exists()
 
 
 # ---------------------------------------------------------------------------

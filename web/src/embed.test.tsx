@@ -230,3 +230,29 @@ describe("embedded theme selection", () => {
     expect(setColorScheme).toHaveBeenLastCalledWith("system");
   });
 });
+
+describe("mobile app embed target scope", () => {
+  it.each(["ios", "android", "electron", "browser"])(
+    "contains portaled controls without marking the host in %s",
+    (kind) => {
+      vi.stubGlobal("omnigentNative", kind === "ios" || kind === "android" ? { kind } : undefined);
+      vi.stubGlobal("omnigentDesktop", kind === "electron" ? { kind } : undefined);
+      const { getByRole } = render(
+        <MemoryRouter>
+          <OmnigentApp fetcher={fetcher} />
+        </MemoryRouter>,
+      );
+      const root = getEmbedRoot()!;
+      render(createPortal(<button type="button">Portaled choice</button>, root));
+      const expected = kind === "ios" || kind === "android";
+      expect(
+        getByRole("button", { name: "Portaled choice" }).closest('[data-mobile-app="true"]') !==
+          null,
+      ).toBe(expected);
+      expect(
+        getByRole("button", { name: "Header action" }).closest('[data-mobile-app="true"]') !== null,
+      ).toBe(expected);
+      expect(document.documentElement).not.toHaveAttribute("data-mobile-app");
+    },
+  );
+});
