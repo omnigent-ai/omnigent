@@ -3783,9 +3783,12 @@ describe("HTTP error status fallback (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
   });
 
-  it("keeps the plain fallback for a Databricks 404 and other servers' 503", async (t) => {
+  it("keeps the plain fallback for a Databricks 404, a 403 without a session, and other servers' 503", async (t) => {
     const notFound = workspaceHarness(t, [20]);
     notFound.emit("did-navigate", page, 404, "Not Found");
+    // No renewable session is attached to this window, so there is nothing to check.
+    const forbidden = workspaceHarness(t, [20]);
+    forbidden.emit("did-navigate", page, 403, "Forbidden");
     const other = loadNavigationHarness();
     t.after(other.cleanup);
     other.api.setReconnectDelaysMs([20]);
@@ -3793,6 +3796,7 @@ describe("HTTP error status fallback (src/main.js)", () => {
     await wait(60);
     for (const [h, error] of [
       [notFound, "404 Not Found"],
+      [forbidden, "403 Forbidden"],
       [other, "503 Service Unavailable"],
     ]) {
       assert.equal(h.calls.loadFile.length, 1);
@@ -4276,6 +4280,49 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.equal(network.browserSignIns, 0);
     });
   }
+
+  it("reconnects by itself when the VPN returns after a reload is refused off the VPN", async (t) => {
+    const { h, network } = await connected(t, Array(6).fill(40));
+    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+    network.verdict = "blocked";
+    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+    await until(
+      () => h.overlay.hint !== null || h.calls.loadFile.length > 0,
+      "the reconnecting overlay or the setup page",
+    );
+    assert.deepEqual(h.calls.loadFile, []);
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  it("shows a reload's 403 on the setup page when the session still renews", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    const sessionCreates = network.sessionCreates;
+    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.deepEqual(shown(h), { error: "403 Forbidden", url: workspace });
+    assert.equal(network.sessionCreates, sessionCreates + 1);
+    assert.deepEqual(h.overlay.shows, []);
+    await wait(60);
+    assert.equal(network.sessionCreates, sessionCreates + 1);
+    assert.equal(h.calls.loadURL.length, 1);
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  it("leaves a reload's 403 alone once a newer page load replaced it", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    const sessionCreates = network.sessionCreates;
+    h.emit("did-navigate", `${workspace}/c/456`, 403, "Forbidden");
+    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+    await until(() => network.sessionCreates === sessionCreates + 1, "the session check");
+    await wait(60);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+  });
 
   it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
     const { h, network } = await connected(t, [20]);

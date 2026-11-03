@@ -206,6 +206,17 @@ function createDatabricksAuth({
     return ctx.pending;
   }
 
+  /**
+   * Renew `win`'s session without reloading. Resolves whether the window is still
+   * connected afterwards (a failed renewal goes to `onAuthRequired`), or returns
+   * null when the window has no live connection.
+   */
+  function checkSession(win, reason) {
+    const ctx = connections.get(win);
+    if (!ctx || !current(ctx)) return null;
+    return renew(ctx, { reason }).then(() => current(ctx));
+  }
+
   function recover(win) {
     const ctx = connections.get(win);
     if (!ctx || !current(ctx)) return;
@@ -326,6 +337,7 @@ function createDatabricksAuth({
     detach,
     rejectConnection,
     reset,
+    checkSession,
     recover,
     /** Resolves once any renewal already running for `origin` has finished. */
     async whenSettled(origin) {

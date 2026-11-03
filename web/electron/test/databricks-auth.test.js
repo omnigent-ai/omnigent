@@ -256,6 +256,30 @@ describe("Databricks browser session lifecycle", () => {
     assert.deepEqual(h.calls.load, []);
     assert.equal(h.timers.size, 0);
   });
+  it("checks a window's session in place and reports a refused renewal", async (t) => {
+    let blocked = false;
+    const h = harness({
+      ensureSession: async () => {
+        if (blocked) {
+          throw Object.assign(new Error("blocked"), { status: 403, errorCode: IP_ACL_BLOCKED });
+        }
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    assert.equal(h.auth.checkSession(win, "test"), null);
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    assert.equal(await h.auth.checkSession(win, "test"), true);
+    blocked = true;
+    assert.equal(await h.auth.checkSession(win, "test"), false);
+    assert.equal(h.calls.renew.length, 2);
+    assert.deepEqual(h.calls.load, []);
+    assert.deepEqual(
+      h.calls.errors.map(({ url, error }) => [url, error.errorCode]),
+      [[`${ORIGIN}/omnigent`, IP_ACL_BLOCKED]],
+    );
+  });
   it("keeps a rejected window blocked after unpinning until a new connection begins", async (t) => {
     const h = harness({
       ensureSession: async () => {
