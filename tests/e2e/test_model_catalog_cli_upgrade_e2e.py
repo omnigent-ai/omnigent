@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -36,6 +35,8 @@ from typing import Any
 
 import httpx
 import pytest
+
+from tests._helpers.live_server import find_free_port
 
 pytestmark = pytest.mark.skipif(
     os.name != "posix", reason="boots POSIX server/host daemons with fake CLIs"
@@ -152,6 +153,9 @@ async def _serve(listen_url):
 
 
 args = sys.argv[1:]
+# Like Codex, accept -c overrides before the subcommand.
+while args[:1] == ["-c"]:
+    args = args[2:]
 if "--version" in args:
     print("codex-cli 0.0.0+{marker}")
 elif args and args[0] == "app-server" and "--listen" in args:
@@ -196,13 +200,6 @@ def _write_fake_codex(path: Path, *, marker: str, legacy: bool = False) -> None:
         _FAKE_CODEX_TEMPLATE.format(python=sys.executable, marker=marker, legacy=legacy)
     )
     path.chmod(0o755)
-
-
-def _free_port() -> int:
-    """Return an ephemeral loopback TCP port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 class _CatalogRig:
@@ -251,7 +248,7 @@ class _CatalogRig:
 
     def start_server(self) -> None:
         """Boot the rig server and wait for ``/health``."""
-        port = _free_port()
+        port = find_free_port()
         self.base_url = f"http://127.0.0.1:{port}"
         for sub in ("home", "config-home", "data"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)

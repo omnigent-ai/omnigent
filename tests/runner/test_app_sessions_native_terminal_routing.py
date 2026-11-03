@@ -31,7 +31,7 @@ from tests.runner.conftest import (
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 @dataclass
@@ -952,10 +952,12 @@ async def test_create_session_repl_terminal_dispatch(
     assert created_sessions == (["5eef02d60f39cba3fbd0ae188348643f"] if expect_created else [])
 
 
+@pytest.mark.parametrize("cached_predecessor", [False, True])
 @pytest.mark.asyncio
 async def test_ensure_terminal_route_recreates_dead_registered_pane(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    cached_predecessor: bool,
 ) -> None:
     """Ensure route detects a dead-but-registered pane and auto-creates.
 
@@ -963,6 +965,7 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     registry retains a stale entry whose tmux pane is dead.
     ``get_terminal_resource`` probes ``is_alive()`` and returns ``None``,
     so the ensure route falls through to ``_auto_create_claude_terminal``.
+    A predecessor's cached liveness must not hide the replacement's death.
     The turn-time self-heal (``_ensure_native_terminal_for_turn``) delegates
     to this same ensure route after closing the stale registry entry.
 
@@ -1020,6 +1023,18 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     )
 
     async with _runner_client(app) as client:
+        if cached_predecessor:
+            predecessor = make_test_terminal_instance("claude", "main", tmp_path / "old")
+            with registry._lock:
+                registry._by_conversation[sid][("claude", "main")] = predecessor
+            assert (
+                await app.state.session_resource_registry.get_terminal_resource(
+                    sid, "terminal_claude_main"
+                )
+                is not None
+            )
+            with registry._lock:
+                registry._by_conversation[sid][("claude", "main")] = dead_instance
         resp = await client.post(
             f"/v1/sessions/{sid}/resources/terminals",
             json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},

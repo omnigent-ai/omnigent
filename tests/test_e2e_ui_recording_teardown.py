@@ -12,8 +12,6 @@ pytest_plugins = ["pytester"]
 _PLAYWRIGHT_PLUGINS = (
     "-p",
     "pytest_playwright.pytest_playwright",
-    "-p",
-    "pytest_base_url.plugin",
 )
 
 _FAKE_CONTEXT = '''

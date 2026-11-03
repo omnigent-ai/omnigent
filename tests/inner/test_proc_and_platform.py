@@ -292,6 +292,51 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_pipe_supervisor_preserves_command_io_and_status(tmp_path: Path, exit_code: int) -> None:
+    """Both output pipes can exceed capacity without deadlocking the supervisor."""
+    script = (
+        "import os, sys; "
+        "data = sys.stdin.buffer.read(); "
+        "sys.stdout.buffer.write(data + b'o' * 200000); "
+        "sys.stderr.buffer.write(b'e' * 200000); "
+        "print(os.getcwd(), sys.argv[1], os.environ['PROBE_TEST_VALUE'], flush=True); "
+        "sys.exit(int(sys.argv[2]))"
+    )
+    literal_arg = "spaces; $literal `argument`"
+    result = subprocess.run(
+        _proc.pipe_supervised_command(sys.executable, "-c", script, literal_arg, str(exit_code)),
+        input=b"probe input\n",
+        capture_output=True,
+        cwd=tmp_path,
+        env={**os.environ, "PROBE_TEST_VALUE": "inherited"},
+        timeout=5,
+        check=False,
+        **_proc.spawn_kwargs(),
+    )
+    assert result.returncode == exit_code
+    assert result.stdout == (
+        b"probe input\n" + b"o" * 200000 + f"{tmp_path} {literal_arg} inherited\n".encode()
+    )
+    assert result.stderr == b"e" * 200000
+
+
+@pytest.mark.posix_only
+def test_pipe_supervisor_reports_missing_command(tmp_path: Path) -> None:
+    missing = str(tmp_path / "missing-command")
+    result = subprocess.run(
+        _proc.pipe_supervised_command(missing), capture_output=True, timeout=5, check=False
+    )
+    assert result.returncode == 127
+    assert missing.encode() in result.stderr
+
+
+def test_pipe_supervisor_keeps_windows_direct_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    assert _proc.pipe_supervised_command("claude", "-p", "/model") == ("claude", "-p", "/model")
+
+
 def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
     """A target pgid of 1 must never be signalled.
 
@@ -371,7 +416,10 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
         "path = pathlib.Path(os.environ['CHILD_PID_PATH'])\n"
         "if os.fork() == 0:\n"
         "    os.setsid()\n"
-        "    path.write_text(str(os.getpid()))\n"
+        # Publish atomically: the poll below must never read a created-but-empty file.
+        "    pending = path.with_suffix('.pending')\n"
+        "    pending.write_text(str(os.getpid()))\n"
+        "    pending.replace(path)\n"
         "    while True: time.sleep(1)\n"
         "while True: time.sleep(1)\n"
     )
@@ -404,6 +452,53 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
         if child_pid is not None and _proc.process_alive(child_pid):
             with contextlib.suppress(psutil.Error):
                 psutil.Process(child_pid).kill()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/stat btime is Linux-only")
+@pytest.mark.parametrize("step", [-1.0, 1.0])
+def test_kill_tree_survives_a_wall_clock_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: float
+) -> None:
+    """An NTP/hypervisor clock step moves btime; kill_tree must still reap the tree."""
+    import psutil._pslinux as pslinux
+
+    child_pid_path = tmp_path / "setsid-child.pid"
+    script = (
+        "import os, pathlib, time\n"
+        "path = pathlib.Path(os.environ['CHILD_PID_PATH'])\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    pending = path.with_suffix('.pending')\n"
+        "    pending.write_text(str(os.getpid()))\n"
+        "    pending.replace(path)\n"
+        "    while True: time.sleep(1)\n"
+        "while True: time.sleep(1)\n"
+    )
+    env = {**os.environ, "CHILD_PID_PATH": str(child_pid_path)}
+    proc = subprocess.Popen([sys.executable, "-c", script], env=env, **_proc.spawn_kwargs())
+    _proc.remember_process_group(proc)
+    child: psutil.Process | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not child_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        child = psutil.Process(int(child_pid_path.read_text()))
+        _proc.refresh_process_tree(proc)
+        real_boot_time = pslinux.boot_time
+        monkeypatch.setattr(pslinux, "boot_time", lambda: real_boot_time() + step)
+
+        _proc.kill_tree(proc)
+
+        proc.wait(timeout=5)
+        child.wait(timeout=5)
+    finally:
+        monkeypatch.undo()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if child is not None:
+            with contextlib.suppress(psutil.Error):
+                child.kill()
 
 
 # --------------------------------------------------------------------------
