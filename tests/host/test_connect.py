@@ -9208,6 +9208,102 @@ async def test_stop_frame_never_overtakes_launch(
     assert order == ["launch:start", "launch:end", "stop"]
 
 
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_filesystem_frame_keeps_host_control_responsive(
+    operation: str,
+    disconnect: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stalled filesystem request must not hold heartbeats or runner probes."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+
+    class _QueuedTunnel(_CollectingWs):
+        def __init__(self) -> None:
+            super().__init__()
+            self.incoming: asyncio.Queue[str] = asyncio.Queue()
+            self.outgoing: asyncio.Queue[str] = asyncio.Queue()
+
+        async def recv(self) -> str:
+            return await self.incoming.get()
+
+        async def send(self, data: str) -> None:
+            await super().send(data)
+            self.outgoing.put_nowait(data)
+
+    host = _make_host_process()
+    host._capabilities_initialized = True
+    host._configured_harnesses = {}
+    host._gateway_inference = {}
+    ws = _QueuedTunnel()
+    target = tmp_path / "project"
+    request: HostStatFrame | HostCreateDirFrame
+    expected: HostStatResultFrame | HostCreateDirResultFrame
+    if operation == "stat":
+        target.mkdir()
+        request = HostStatFrame(request_id="filesystem", path=str(target))
+        expected = HostStatResultFrame(
+            request_id="filesystem",
+            status="ok",
+            exists=True,
+            type="directory",
+            canonical_path=str(target.resolve()),
+        )
+    else:
+        request = HostCreateDirFrame(request_id="filesystem", path=str(target))
+        expected = HostCreateDirResultFrame(request_id="filesystem", status="ok", path=str(target))
+    handle = getattr(host, f"_handle_{operation}")
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked_filesystem(frame: HostStatFrame | HostCreateDirFrame) -> object:
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(timeout=5), "filesystem request blocked the host event loop"
+            return handle(frame)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(host, f"_handle_{operation}", blocked_filesystem)
+    serving = asyncio.create_task(host._serve_frames(ws))  # type: ignore[arg-type]
+    replacement = _CollectingWs()
+    try:
+        hello = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        assert isinstance(decode_host_frame(hello), HostHelloFrame)
+        ws.incoming.put_nowait(encode_host_frame(request))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        ws.incoming.put_nowait(encode_frame(PingFrame(ts=123)))
+        ws.incoming.put_nowait(encode_host_frame(HostRunnerStatusFrame("status", "runner_absent")))
+        pong = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        status = await asyncio.wait_for(ws.outgoing.get(), timeout=5)
+        assert not finished.is_set(), "control replies must arrive while filesystem I/O waits"
+        assert decode_frame(pong) == PongFrame(ts=123)
+        assert decode_host_frame(status) == HostRunnerStatusResultFrame("status", "unknown")
+        if disconnect:
+            await _cancel(serving)
+            await host._quiesce_frame_tasks()
+            host._ws = replacement  # type: ignore[assignment]
+    finally:
+        release.set()
+        await _drain_frame_tasks(host)
+        await _cancel(serving)
+        assert await asyncio.to_thread(finished.wait, 5), "filesystem worker did not finish"
+    if disconnect:
+        assert len(ws.sent) == 3
+        assert replacement.sent == []
+    else:
+        assert decode_host_frame(ws.sent[-1]) == expected
+    assert target.is_dir()
+
+
 @pytest.mark.posix_only
 async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -9250,7 +9346,9 @@ async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
         child.wait(timeout=5)
 
 
+@pytest.mark.parametrize("operation", ["stat", "create_dir"])
 async def test_frame_handler_failure_is_contained(
+    operation: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -9263,14 +9361,19 @@ async def test_frame_handler_failure_is_contained(
     host = _make_host_process()
     ws = _CollectingWs()
 
-    def _boom(self_: HostProcess, frame: HostStatFrame) -> HostStatResultFrame:
-        raise RuntimeError("scripted stat failure")
+    def _boom(self_: HostProcess, frame: HostStatFrame | HostCreateDirFrame) -> None:
+        raise RuntimeError("scripted filesystem failure")
 
-    monkeypatch.setattr(HostProcess, "_handle_stat", _boom)
+    monkeypatch.setattr(HostProcess, f"_handle_{operation}", _boom)
+    frame = (
+        HostStatFrame(request_id="req_boom", path=str(tmp_path))
+        if operation == "stat"
+        else HostCreateDirFrame(request_id="req_boom", path=str(tmp_path / "project"))
+    )
     with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
         host._start_frame_task(
             ws,  # type: ignore[arg-type] — duck-typed ws
-            encode_host_frame(HostStatFrame(request_id="req_boom", path=str(tmp_path))),
+            encode_host_frame(frame),
         )
         await _drain_frame_tasks(host)
 
