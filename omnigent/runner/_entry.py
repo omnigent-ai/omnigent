@@ -1607,6 +1607,7 @@ def create_app(
     # Out-of-process runner owns its own TerminalRegistry.
     from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.pane_reaper import resolve_native_pane_idle_timeout_s
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
     if not host_owns_global_cleanup:
@@ -1627,7 +1628,7 @@ def create_app(
                     "Reaped %d orphaned native bridge dir(s) from prior runs",
                     _reaped_bridge_dirs,
                 )
-        except Exception:  # noqa: BLE001 — housekeeping must never block startup
+        except Exception:
             _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
@@ -1645,6 +1646,9 @@ def create_app(
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
         auth_token_factory=auth_token_factory,
+        native_pane_idle_timeout_s=resolve_native_pane_idle_timeout_s(
+            _load_runner_idle_timeout_s_from_config()
+        ),
     )
 
     async def _start_pm() -> None:
@@ -1801,16 +1805,17 @@ async def _run_tunnel_from_env() -> None:
 
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
+    from omnigent.util.thread_pool_watchdog import watch_thread_pool
 
     # Bound the asyncio default executor before anything uses it (create_app,
     # telemetry, and every to_thread offload). Setting it here means Python's
     # lazy min(32, cpu+4)-thread default pool is never created.
-    asyncio.get_running_loop().set_default_executor(
-        ThreadPoolExecutor(
-            max_workers=_runner_threadpool_max_workers(),
-            thread_name_prefix="runner",
-        )
+    runner_executor = ThreadPoolExecutor(
+        max_workers=_runner_threadpool_max_workers(),
+        thread_name_prefix="runner",
     )
+    asyncio.get_running_loop().set_default_executor(runner_executor)
+    watch_thread_pool(runner_executor, thread_name_prefix="runner", process_role="runner")
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
@@ -1835,7 +1840,7 @@ async def _run_tunnel_from_env() -> None:
         from omnigent.runtime import telemetry
 
         telemetry.init("omni-runner")
-    except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
+    except Exception:
         _logger.debug(
             "telemetry init failed in runner",
             exc_info=True,
@@ -1956,7 +1961,7 @@ async def _run_tunnel_from_env() -> None:
                         allowed_origins=frozenset({allowed_origin}),
                     )
                 )
-        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+        except Exception:
             _logger.warning(
                 "direct-attach listener setup failed",
                 exc_info=True,

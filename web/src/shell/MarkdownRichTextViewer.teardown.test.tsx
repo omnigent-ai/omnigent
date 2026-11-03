@@ -127,7 +127,10 @@ vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({
   installMarkdownSerializerPatch: vi.fn(),
   installMarkdownParserPatch: vi.fn(),
+  // The fake editor has no source blocks, so a save serialises everything.
+  markdownKeepingSource: (editor: { getMarkdown: () => string }) => editor.getMarkdown(),
 }));
+vi.mock("./markdownSourceBlocks", () => ({ rememberSourceBlocks: vi.fn() }));
 vi.mock("./TipTapWorkspaceImage", () => ({
   createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
   ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },
