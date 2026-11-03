@@ -246,9 +246,10 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
     entry = _bind(env, session_id)
     startup = env.app.state.startup_inputs
     denied = True
+    deny_reason = "Blocked test input"
 
     async def evaluate(*_: Any, **__: Any):
-        return {"verdict": "deny", "reason": "Blocked test input"} if denied else None
+        return {"verdict": "deny", "reason": deny_reason} if denied else None
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.routes_events._evaluate_input_policy", evaluate
@@ -290,10 +291,34 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         assert row["session_id"] == session_id
         assert row["attributes"]["run_id"] == scheduled_run_context.run_id
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
-        assert any(
-            item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
+        [stored_error] = [
+            item
             for item in snapshot["items"]
+            if item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
+        ]
+        # A retry that is refused again, for another reason, keeps the first error
+        # item; its failed status must carry that stored error, not the new text.
+        deny_reason = "Blocked again for another reason"
+        env.conv_store.set_runner_id(session_id, uuid4().hex)
+        retried = await env.client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )
+        assert retried.status_code == 202, retried.text
+        collector = await start_session_stream_collector(session_id)
+        try:
+            await startup._deliver(
+                env.app, session_id, env.conv_store.list_pending_inputs(session_id)[0]
+            )
+            status = await collector.next_event()
+            while status.get("type") != "session.status" or status["status"] != "failed":
+                status = await collector.next_event()
+        finally:
+            await collector.stop()
+        assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
+        assert status["status"] == "failed"
+        assert status["error"]["code"] == stored_error["data"]["code"]
+        assert status["error"]["message"] == stored_error["data"]["message"]
+        assert status["response_id"] == stored_error["response_id"]
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
         retried = await env.client.post(
@@ -310,7 +335,7 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
             for r in caplog.records
             if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
         ]
-        [first_attempt, retry_attempt] = [
+        [first_attempt, _refused_again, retry_attempt] = [
             r
             for r in caplog.records
             if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"

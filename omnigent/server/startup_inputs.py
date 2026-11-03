@@ -580,14 +580,13 @@ class ManagedStartupInputs:
         if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
             return
 
-        response_id = f"startup_{failure_id}"
-        await asyncio.to_thread(
+        [stored] = await asyncio.to_thread(
             self.conversations.append,
             session_id,
             [
                 NewConversationItem(
                     type="error",
-                    response_id=response_id,
+                    response_id=f"startup_{failure_id}",
                     stable_id=uuid5(
                         NAMESPACE_URL, f"startup-failure:{session_id}:{failure_id}"
                     ).hex,
@@ -598,12 +597,17 @@ class ManagedStartupInputs:
             ],
         )
         _publish_sandbox_status(session_id, "failed", message)
-        # Match the persisted error so status consumers receive its cause and identity.
+        # Publish the stored error, not this attempt's text: a retried input that
+        # fails again keeps its first error item, and clients match the two copies
+        # by response id, code and message.
+        error = stored.data
         _publish_status(
             session_id,
             "failed",
-            ErrorDetail(code="startup_input_failed", message=message),
-            response_id=response_id,
+            ErrorDetail(code=error.code, message=error.message)
+            if isinstance(error, ErrorData)
+            else ErrorDetail(code="startup_input_failed", message=message),
+            response_id=stored.response_id,
             failure_origin="startup_input_failed",
         )
 
