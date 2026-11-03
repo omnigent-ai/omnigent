@@ -1,6 +1,6 @@
 import { authenticatedFetch } from "./identity";
 
-export type WorkflowBackend = "simulation" | "arclet";
+export type WorkflowBackend = "simulation" | "server";
 export interface WorkflowOptions {
   backends: { id: WorkflowBackend; enabled: boolean; reason: string | null; example: string }[];
 }
@@ -17,7 +17,7 @@ export interface WorkflowMember {
   id: string;
   role: string;
   agent_id: string;
-  placement: { kind: "sandbox"; provider: "arclet"; workspace?: string };
+  placement: { kind: "sandbox"; provider: string; workspace?: string };
 }
 export interface WorkflowTeam {
   id: string;

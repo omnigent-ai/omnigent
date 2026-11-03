@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -1053,6 +1054,51 @@ describe("Sidebar session list", () => {
     );
     expect(badge.className).not.toContain("brand-accent");
   });
+
+  it.each([
+    { approvals: 0, automations: 0, label: "0 inbox items waiting", badge: "+" },
+    { approvals: 0, automations: 1, label: "1 inbox item waiting", badge: "1+" },
+    { approvals: 2, automations: 1, label: "3 inbox items waiting", badge: "3+" },
+  ])(
+    "combines $approvals approvals and $automations failures until all task pages are checked",
+    ({ approvals, automations, label, badge }) => {
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      const failure = {
+        taskId: "task",
+        taskName: "Report",
+        runId: "run",
+        scheduledAt: 100,
+        finishedAt: 101,
+        errorCode: "host_offline",
+      };
+      const state = {
+        items: automations ? [failure] : [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
+      automationInbox.mockReturnValue(state);
+      try {
+        mockConversations([
+          conv("conv_awaiting", "Claude Code", { pending_elicitations_count: approvals }),
+        ]);
+        const first = renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            `${label}; more automations not yet checked`,
+          ),
+        ).toHaveTextContent(badge);
+        first.unmount();
+        automationInbox.mockReturnValue({ ...state, hasNextPage: false });
+        renderSidebar();
+        const inbox = within(screen.getByTestId("inbox-button"));
+        expect(inbox.queryByLabelText(/more automations/)).toBeNull();
+        if (approvals + automations) {
+          expect(inbox.getByLabelText(label)).toHaveTextContent(String(approvals + automations));
+        } else expect(inbox.queryByText("+")).toBeNull();
+      } finally {
+        automationInbox.mockRestore();
+      }
+    },
+  );
 
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.

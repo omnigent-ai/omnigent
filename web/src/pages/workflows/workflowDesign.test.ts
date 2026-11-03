@@ -73,7 +73,7 @@ it("routes around cards when dragging places a dependent above its prerequisite"
   );
 });
 
-it("binds task drafts to Arclet execution only for the API definition", () => {
+it("preserves per-task agent placement in the API definition", () => {
   const design = starterWorkflow();
   for (const task of design.nodes)
     expect(task).toMatchObject({ allow_expansion: true, max_rounds: 3 });
@@ -83,6 +83,10 @@ it("binds task drafts to Arclet execution only for the API definition", () => {
   delete design.nodes[1].max_rounds;
   design.nodes[0].execution.members[0].agent_id = "investigation-agent";
   expect(design.nodes[1].execution.members[0].agent_id).toBe("replace-with-registered-agent-id");
+  design.nodes[0].execution.members[0].placement.provider = "analysis-sandbox";
+  expect(design.nodes[1].execution.members[0].placement.provider).toBe(
+    "replace-with-sandbox-provider",
+  );
   const before = structuredClone(design);
   const definition = executionDefinition(design);
   expect(definition).toEqual({

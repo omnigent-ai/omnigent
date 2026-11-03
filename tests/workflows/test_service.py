@@ -20,7 +20,7 @@ from omnigent.workflows.state import ExecutionBinding
 
 @pytest.fixture
 async def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    for key in ("OWNER", "ARCLET_URL"):
+    for key in ("OWNER", "SERVER_URL"):
         monkeypatch.delenv(f"OMNIGENT_WORKFLOW_{key}", raising=False)
     service = WorkflowService(tmp_path)
     app = FastAPI()
@@ -95,22 +95,22 @@ async def test_backend_options_require_explicit_owner_and_configuration(api, mon
             for item in (await client.get("/v1/workflows/options")).json()["backends"]
         }
 
-    assert await enabled() == {"simulation": True, "arclet": False}
-    monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_URL", "https://agents.example")
-    assert await enabled() == {"simulation": True, "arclet": False}
+    assert await enabled() == {"simulation": True, "server": False}
+    monkeypatch.setenv("OMNIGENT_WORKFLOW_SERVER_URL", "https://agents.example")
+    assert await enabled() == {"simulation": True, "server": False}
     monkeypatch.setenv("OMNIGENT_WORKFLOW_OWNER", "owner@example.test")
-    assert await enabled() == {"simulation": True, "arclet": True}
+    assert await enabled() == {"simulation": True, "server": True}
     response = await client.post(
         "/v1/workflows",
         headers={"X-Forwarded-Email": "other@example.test"},
-        json={"backend": "arclet", "definition": example_definition()},
+        json={"backend": "server", "definition": example_definition()},
     )
     assert response.status_code == 400
 
-    monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_URL", "https://private-token@workspace.example")
-    assert (await enabled())["arclet"] is False
+    monkeypatch.setenv("OMNIGENT_WORKFLOW_SERVER_URL", "https://private-token@workspace.example")
+    assert (await enabled())["server"] is False
     response = await client.post(
-        "/v1/workflows", json={"backend": "arclet", "definition": example_definition()}
+        "/v1/workflows", json={"backend": "server", "definition": example_definition()}
     )
     assert response.status_code == 400
     assert "private-token" not in response.text
@@ -128,9 +128,9 @@ async def test_invalid_web_definition_starts_no_controller(api, monkeypatch, inv
         ]
     backend = "simulation"
     if invalid == "placement":
-        backend = "arclet"
-        definition["teams"][0]["members"][0]["placement"]["provider"] = "other"
-        monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_URL", "https://agents.example")
+        backend = "server"
+        definition["teams"][0]["members"][0]["placement"]["provider"] = ""
+        monkeypatch.setenv("OMNIGENT_WORKFLOW_SERVER_URL", "https://agents.example")
         monkeypatch.setenv("OMNIGENT_WORKFLOW_OWNER", "owner@example.test")
     response = await client.post(
         "/v1/workflows",
@@ -194,7 +194,7 @@ async def test_web_controller_never_executes_command_gates(tmp_path, monkeypatch
     ]
     service = WorkflowService(tmp_path)
     store = service.create(
-        "owner", Workflow.model_validate(definition), ExecutionBinding(mode="arclet")
+        "owner", Workflow.model_validate(definition), ExecutionBinding(mode="server")
     )
     await asyncio.gather(*service.tasks.values())
     state = store.load()
@@ -218,8 +218,20 @@ async def test_shutdown_before_controller_starts_releases_task(tmp_path):
 
 async def test_designer_exports_valid_yaml_without_live_configuration(api, tmp_path):
     client, service = api
-    backend = "arclet"
     definition = yaml.safe_load(example_definition())
+    members = definition["teams"][0]["members"]
+    members[0]["placement"]["provider"] = "primary-sandbox"
+    members.append(
+        {
+            **members[0],
+            "id": "reviewer",
+            "placement": {
+                "kind": "sandbox",
+                "provider": "review-sandbox",
+                "workspace": "https://github.com/example/review",
+            },
+        }
+    )
     definition["name"] = 'Workflow: "quoted"\nwith another line'
     definition["nodes"][0]["name"] = "Investigate: evidence"
     definition["nodes"].append(
@@ -232,9 +244,7 @@ async def test_designer_exports_valid_yaml_without_live_configuration(api, tmp_p
         }
     )
     definition["nodes"][2]["depends_on"].append("constraints")
-    response = await client.post(
-        "/v1/workflows/definition", json={"backend": backend, "workflow": definition}
-    )
+    response = await client.post("/v1/workflows/definition", json={"workflow": definition})
     assert response.status_code == 200, response.text
     exported = response.json()["definition"]
     assert Workflow.model_validate(yaml.safe_load(exported)) == Workflow.model_validate(definition)
@@ -255,7 +265,7 @@ async def test_designer_exports_valid_yaml_without_live_configuration(api, tmp_p
     assert saved["nodes"]["summarize"]["status"] == "pending"
 
 
-async def test_live_run_requires_arclet_connection_and_rechecks_it_on_resume(api, monkeypatch):
+async def test_live_run_requires_server_connection_and_rechecks_it_on_resume(api, monkeypatch):
     from omnigent.workflows.simulation import simulate_member
 
     client, service = api
@@ -268,10 +278,10 @@ async def test_live_run_requires_arclet_connection_and_rechecks_it_on_resume(api
 
     monkeypatch.setattr("omnigent.workflows.service.open_executor", executor)
     monkeypatch.setenv("OMNIGENT_WORKFLOW_OWNER", "owner@example.test")
-    request = {"backend": "arclet", "definition": example_definition()}
+    request = {"backend": "server", "definition": example_definition()}
     assert (await client.post("/v1/workflows", json=request)).status_code == 400
     assert not service.tasks
-    monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_URL", "https://agents.example")
+    monkeypatch.setenv("OMNIGENT_WORKFLOW_SERVER_URL", "https://agents.example")
     assert (
         await client.post(
             "/v1/workflows", json=request, headers={"X-Forwarded-Email": "other@example.test"}
@@ -281,12 +291,12 @@ async def test_live_run_requires_arclet_connection_and_rechecks_it_on_resume(api
     assert response.status_code == 201, response.text
     path = "/v1/workflows/" + response.json()["run_id"]
     await asyncio.gather(*service.tasks.values())
-    assert bindings == [ExecutionBinding(mode="arclet", server="https://agents.example")]
-    monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_URL", "https://changed.example")
+    assert bindings == [ExecutionBinding(mode="server", server="https://agents.example")]
+    monkeypatch.setenv("OMNIGENT_WORKFLOW_SERVER_URL", "https://changed.example")
     response = await client.post(path + "/resume")
     assert response.status_code == 409
     assert "connection changed" in response.text
-    monkeypatch.setenv("OMNIGENT_WORKFLOW_ARCLET_URL", "https://agents.example")
+    monkeypatch.setenv("OMNIGENT_WORKFLOW_SERVER_URL", "https://agents.example")
     assert (await client.post(path + "/resume")).status_code == 200
     await asyncio.gather(*service.tasks.values())
     assert bindings[1] == bindings[0]
@@ -301,7 +311,7 @@ async def test_designer_refuses_invalid_exports(api, fault):
     elif fault == "placement":
         definition["teams"][0]["members"][0]["placement"] = {
             "kind": "sandbox",
-            "provider": "other",
+            "provider": "",
         }
     elif fault == "command":
         definition["nodes"][0]["gates"] = [
@@ -311,9 +321,7 @@ async def test_designer_refuses_invalid_exports(api, fault):
         definition["nodes"][0]["name"] = " "
     else:
         definition["nodes"][0]["goal"] = "x" * 65536
-    response = await client.post(
-        "/v1/workflows/definition", json={"backend": "arclet", "workflow": definition}
-    )
+    response = await client.post("/v1/workflows/definition", json={"workflow": definition})
     assert response.status_code in {400, 422}, response.text
     if fault == "oversized":
         assert "65,536 characters" in response.json()["detail"]

@@ -84,9 +84,9 @@ beforeEach(() => {
         backends: [
           { id: "simulation", enabled: true, reason: null, example: "" },
           {
-            id: "arclet",
-            enabled: enabledBackends.includes("arclet"),
-            reason: "Configure Arclet",
+            id: "server",
+            enabled: enabledBackends.includes("server"),
+            reason: "Configure workflow server",
             example: "",
           },
         ],
@@ -189,6 +189,9 @@ it("creates a task with its own execution settings and exports them independentl
   ).not.toBeInTheDocument();
   fireEvent.click(screen.getByText("Execution settings"));
   fireEvent.change(screen.getByLabelText("owner agent ID"), { target: { value: "agent-own" } });
+  fireEvent.change(screen.getByLabelText("owner sandbox provider"), {
+    target: { value: "analysis-sandbox" },
+  });
   fireEvent.click(screen.getByText("Execution settings"));
   fireEvent.click(screen.getByRole("button", { name: "Add task" }));
   const modal = screen.getByRole("dialog", { name: "Add task" });
@@ -198,6 +201,12 @@ it("creates a task with its own execution settings and exports them independentl
   expect(dialog.getByLabelText("owner agent ID")).toHaveValue("replace-with-registered-agent-id");
   fireEvent.change(dialog.getByLabelText("owner agent ID"), {
     target: { value: "acceptance-agent" },
+  });
+  expect(dialog.getByLabelText("owner sandbox provider")).toHaveValue(
+    "replace-with-sandbox-provider",
+  );
+  fireEvent.change(dialog.getByLabelText("owner sandbox provider"), {
+    target: { value: "acceptance-sandbox" },
   });
   fireEvent.change(dialog.getByLabelText("owner repository (optional)"), {
     target: { value: "https://github.com/example/acceptance" },
@@ -237,16 +246,17 @@ it("creates a task with its own execution settings and exports them independentl
   });
   expect(definition.teams).toHaveLength(5);
   expect(definition.teams[0].members[0].agent_id).toBe("agent-own");
+  expect(definition.teams[0].members[0].placement.provider).toBe("analysis-sandbox");
   expect(definition.teams.at(-1)?.members[0]).toMatchObject({
     agent_id: "acceptance-agent",
     placement: {
       kind: "sandbox",
-      provider: "arclet",
+      provider: "acceptance-sandbox",
       workspace: "https://github.com/example/acceptance",
     },
   });
   expect(definition.nodes.every((task) => task.team === task.id)).toBe(true);
-  expect(posts[0].body.backend).toBe("arclet");
+  expect(posts[0].body).not.toHaveProperty("backend");
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
   fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
   expect(screen.queryByRole("button", { name: "Acceptance check" })).not.toBeInTheDocument();
@@ -262,6 +272,9 @@ it.each(["Cancel", "Close", "Escape"])("discards task changes on %s", async (act
   fireEvent.change(dialog.getByLabelText("owner agent ID"), {
     target: { value: "discarded-agent" },
   });
+  fireEvent.change(dialog.getByLabelText("owner sandbox provider"), {
+    target: { value: "discarded-sandbox" },
+  });
   fireEvent.click(dialog.getByRole("checkbox", { name: "Require review before continuing" }));
   if (action === "Escape") fireEvent.keyDown(document, { key: "Escape" });
   else fireEvent.click(dialog.getByRole("button", { name: action }));
@@ -272,6 +285,9 @@ it.each(["Cancel", "Close", "Escape"])("discards task changes on %s", async (act
   const reopened = within(screen.getByRole("dialog", { name: "Add task" }));
   fireEvent.click(reopened.getByText("Execution settings"));
   expect(reopened.getByLabelText("owner agent ID")).toHaveValue("replace-with-registered-agent-id");
+  expect(reopened.getByLabelText("owner sandbox provider")).toHaveValue(
+    "replace-with-sandbox-provider",
+  );
   expect(reopened.getByLabelText("Task name")).toHaveValue("");
   expect(
     reopened.getByRole("checkbox", { name: "Require review before continuing" }),
@@ -286,20 +302,37 @@ it("edits one task's execution and exports agent settings without live credentia
   fireEvent.change(screen.getByLabelText("specialist_1 agent ID"), {
     target: { value: "agent-review" },
   });
+  fireEvent.change(screen.getByLabelText("owner sandbox provider"), {
+    target: { value: "analysis-sandbox" },
+  });
+  fireEvent.change(screen.getByLabelText("specialist_1 sandbox provider"), {
+    target: { value: "review-sandbox" },
+  });
+  fireEvent.change(screen.getByLabelText("owner repository (optional)"), {
+    target: { value: "https://github.com/example/work" },
+  });
+  fireEvent.change(screen.getByLabelText("owner repository (optional)"), {
+    target: { value: "" },
+  });
   fireEvent.change(screen.getByLabelText("Execution mode"), { target: { value: "parallel" } });
   fireEvent.change(screen.getByLabelText("Lead agent"), { target: { value: "specialist_1" } });
   expect(screen.getByRole("button", { name: "Remove specialist_1" })).toBeDisabled();
   fireEvent.change(screen.getByLabelText("Test using"), { target: { value: "live" } });
-  expect(await screen.findByText("Configure Arclet")).toBeInTheDocument();
+  expect(await screen.findByText("Configure workflow server")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Test workflow" })).toBeDisabled();
   fireEvent.click(screen.getByRole("button", { name: "Export YAML" }));
   await screen.findByLabelText("Generated YAML");
   const team = (posts[0].body.workflow as WorkflowDefinition).teams[0];
   expect(team.members.map((member) => member.agent_id)).toEqual(["agent-own", "agent-review"]);
   expect(team.members.every((member) => member.placement.kind === "sandbox")).toBe(true);
+  expect(team.members.map((member) => member.placement.provider)).toEqual([
+    "analysis-sandbox",
+    "review-sandbox",
+  ]);
+  expect(team.members[0].placement).not.toHaveProperty("workspace");
   expect(team.strategy).toBe("parallel");
   expect(team.lead).toBe("specialist_1");
-  expect(posts[0].body.backend).toBe("arclet");
+  expect(posts[0].body).not.toHaveProperty("backend");
   const otherTeams = (posts[0].body.workflow as WorkflowDefinition).teams.slice(1);
   expect(
     otherTeams.every(
@@ -317,23 +350,23 @@ it("edits one task's execution and exports agent settings without live credentia
 });
 
 it.each([false, true])(
-  "requires a configured Arclet connection for a live test (enabled: %s)",
-  async (arcletEnabled) => {
-    enabledBackends = arcletEnabled ? ["simulation", "arclet"] : ["simulation"];
+  "requires a configured workflow server connection for a live test (enabled: %s)",
+  async (serverEnabled) => {
+    enabledBackends = serverEnabled ? ["simulation", "server"] : ["simulation"];
     renderPage();
     fireEvent.click(screen.getByText("Execution settings"));
     fireEvent.change(screen.getByLabelText("Test using"), { target: { value: "live" } });
     const test = screen.getByRole("button", { name: "Test workflow" });
-    if (!arcletEnabled) {
-      expect(await screen.findByText("Configure Arclet")).toBeInTheDocument();
+    if (!serverEnabled) {
+      expect(await screen.findByText("Configure workflow server")).toBeInTheDocument();
       expect(test).toBeDisabled();
       return;
     }
     await waitFor(() => expect(test).toBeEnabled());
     fireEvent.click(test);
     await screen.findByRole("heading", { name: "Test workflow" });
-    expect(posts[0].body.backend).toBe("arclet");
-    expect(posts[1].body.backend).toBe("arclet");
+    expect(posts[0].body).not.toHaveProperty("backend");
+    expect(posts[1].body.backend).toBe("server");
   },
 );
 

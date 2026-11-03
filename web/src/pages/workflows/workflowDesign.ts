@@ -29,7 +29,7 @@ export function newMember(id: string): WorkflowMember {
     id,
     role: "Own the outcome and repair failed candidates.",
     agent_id: "replace-with-registered-agent-id",
-    placement: { kind: "sandbox", provider: "arclet" },
+    placement: { kind: "sandbox", provider: "replace-with-sandbox-provider" },
   };
 }
 

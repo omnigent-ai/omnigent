@@ -8,7 +8,7 @@ to downstream tasks with checkpoints for restart and reconciliation.
 ## Sub-features
 
 - `opt-in`: CLI, API/service, sidebar and direct route require `OMNIGENT_FEATURES=dynamic_workflows`.
-- `design`: add task dialogs, per-task agents, branches/joins and removable arrows.
+- `design`: add task dialogs, per-task agents and sandbox providers, branches/joins and removable arrows.
 - `export`: validated YAML usable by the CLI and API.
 - `validate`: reject cyclic or invalid graphs and bounded expansions.
 - `execute`: isolated member sessions with parallel or owner-led execution.
@@ -26,8 +26,8 @@ to downstream tasks with checkpoints for restart and reconciliation.
 - API: `/v1/workflows` exposes options, definition compilation, create/inspect, events, stop and resume.
 - Validate: `python -m omnigent.workflows FILE --validate`.
 - Simulate: `python -m omnigent.workflows FILE --simulate --state DIRECTORY`.
-- Execute: `python -m omnigent.workflows FILE --backend arclet --server URL --state DIRECTORY`.
-- Connected hosts or other managed providers: use `--backend sessions`.
+- Execute: `python -m omnigent.workflows FILE --server URL --state DIRECTORY`.
+- Choose a connected host or a managed sandbox provider in each member's placement.
 - Inspect/resume: `python -m omnigent.workflows --inspect|--resume --state DIRECTORY`.
 - Review: `python -m omnigent.workflows --event FILE --state DIRECTORY`, then resume.
 - Python: import `WorkflowRunner` and `RunStore` from `omnigent.workflows`; supply an executor.
@@ -39,7 +39,8 @@ need no environment; the process scenario owns its isolated server and host. Rea
 `examples/dynamic-workflows/README.md` for manual inputs and expected exit codes.
 
 - Designer entry points (own environment): `tests/e2e_ui/scheduled/test_dynamic_workflows.py`
-  builds the graph, edits arrows, exports and downloads YAML, exercises review/repair
+  builds the graph, edits arrows and per-agent providers, exports and downloads YAML,
+  exercises review/repair
   and checks downstream outcomes. Desktop sidebar and direct mobile runs cover
   enabled and disabled servers. Run with `--ui-skip-build --video=on` after building.
 - Server-prefixed routing and loading/disabled gates: `web/src/App.test.tsx`.
@@ -59,9 +60,10 @@ need no environment; the process scenario owns its isolated server and host. Rea
   `test_run_launches_a_runner_on_this_machines_host`, variants `workflow`,
   `workflow-parallel` and `workflow-consult`. They verify concurrency, owner reuse,
   repair after restart and downstream release using existing process primitives.
-- Explicit live provisioning check: `tests/e2e_live/test_workflow_arclets_live.py`.
-  It needs an authenticated server, registered agent and Arclet CLI. It proves
-  three distinct cloud environments, multi-agent synthesis, output handoff and cleanup.
+- Explicit live provisioning check: `tests/e2e_live/test_workflow_sandboxes_live.py`.
+  It needs an authenticated server, registered agent and configured sandbox provider.
+  It verifies three distinct managed hosts, synthesis, output handoff and host removal.
+  It does not independently inspect cloud resource termination.
 
 ## Gotchas
 

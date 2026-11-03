@@ -26,11 +26,8 @@ class SessionExecutor:
     available in Omnigent and managed hosts follow their normal idle lifecycle.
     """
 
-    def __init__(
-        self, sessions: SessionsNamespace, *, sandbox_provider: str | None = None
-    ) -> None:
+    def __init__(self, sessions: SessionsNamespace) -> None:
         self._sessions = sessions
-        self._sandbox_provider = sandbox_provider
         self._created: dict[tuple[str, str, str], Session] = {}
 
     async def __call__(self, request: MemberRequest) -> str:
@@ -55,7 +52,7 @@ class SessionExecutor:
                 host_type="external" if isinstance(placement, ConnectedHost) else "managed",
                 sandbox_provider=None
                 if isinstance(placement, ConnectedHost)
-                else self._sandbox_provider or placement.provider,
+                else placement.provider,
             )
             self._created[key] = session
         request.record.session_id = session.id

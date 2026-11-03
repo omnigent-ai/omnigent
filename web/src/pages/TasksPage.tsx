@@ -342,12 +342,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               Loading automations…
             </div>
           ) : filtered.length === 0 ? (
-            <EmptyState
-              hasAny={hasAnyTasks}
-              showSuggestions={filter === "all"}
-              onPickTemplate={openFromTemplate}
-              triggersSupported={triggersSupported}
-            />
+            <EmptyState hasAny={hasAnyTasks} />
           ) : (
             <div className="flex flex-col gap-2" data-testid="tasks-list">
               {filtered.map((task) => (
@@ -364,6 +359,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               ))}
             </div>
           )}
+          {!isError && !isLoading && filter === "all" && !search.trim() && triggersSupported && (
+            <TemplateGallery onPick={openFromTemplate} preview />
+          )}
         </TabsContent>
         <TabsContent value="templates" className="mt-4">
           {triggersSupported ? (
@@ -379,34 +377,19 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   );
 }
 
-function EmptyState({
-  hasAny,
-  showSuggestions,
-  onPickTemplate,
-  triggersSupported,
-}: {
-  hasAny: boolean;
-  showSuggestions: boolean;
-  onPickTemplate: (id: string) => void;
-  triggersSupported: boolean;
-}) {
+function EmptyState({ hasAny }: { hasAny: boolean }) {
   return (
     <div className="py-8" data-testid="tasks-empty-state">
       {hasAny ? (
         <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
       ) : (
-        <>
-          <div className="flex flex-col items-center gap-2 py-8 text-center">
-            <ClockIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-ui font-medium">No automations yet</p>
-            <p className="max-w-sm text-sm text-muted-foreground">
-              Create an automation to run an agent session automatically on a recurring schedule.
-            </p>
-          </div>
-          {showSuggestions && triggersSupported && (
-            <TemplateGallery onPick={onPickTemplate} preview />
-          )}
-        </>
+        <div className="flex flex-col items-center gap-2 py-8 text-center">
+          <ClockIcon className="size-8 text-muted-foreground/50" />
+          <p className="text-ui font-medium">No automations yet</p>
+          <p className="max-w-sm text-sm text-muted-foreground">
+            Create an automation to run an agent session automatically on a recurring schedule.
+          </p>
+        </div>
       )}
     </div>
   );

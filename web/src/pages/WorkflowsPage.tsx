@@ -46,7 +46,7 @@ export function WorkflowsPage() {
     queryKey: ["workflows", "options"],
     queryFn: () => workflowRequest<WorkflowOptions>("/options"),
   });
-  const backend: WorkflowBackend = testLive ? "arclet" : "simulation";
+  const backend: WorkflowBackend = testLive ? "server" : "simulation";
   const testEnabled = options.data?.backends.some((item) => item.id === backend && item.enabled);
   const unavailable = options.data?.backends.filter((item) => item.id === backend && !item.enabled);
   const selected = workflow.nodes.find((node) => node.id === selectedId) ?? workflow.nodes[0];
@@ -67,7 +67,6 @@ export function WorkflowsPage() {
       testBackend: WorkflowBackend;
     }) => {
       const result = await workflowRequest<{ definition: string }>("/definition", {
-        backend: "arclet",
         workflow: executionDefinition(design),
       });
       if (action === "export") return { definition: result.definition };

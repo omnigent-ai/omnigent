@@ -16,11 +16,11 @@ export function ExecutionSettings({
     <details className="rounded-xl border bg-card p-4">
       <summary className="cursor-pointer text-sm font-medium">
         <span>Execution settings</span>
-        <span className="ml-2 text-xs font-normal text-muted-foreground">Arclet</span>
+        <span className="ml-2 text-xs font-normal text-muted-foreground">Managed sandbox</span>
       </summary>
       <div className="mt-4 space-y-4">
         <p className="text-xs text-muted-foreground">
-          Choose how this task runs. These settings apply only to this task.
+          Choose how this task runs. Each agent uses a sandbox provider configured on your server.
         </p>
         <Field label="Execution mode">
           <select
@@ -70,15 +70,24 @@ export function ExecutionSettings({
                   onChange={(event) => updateMember({ role: event.target.value })}
                 />
               </Field>
+              <Field label={`${member.id} sandbox provider`}>
+                <Input
+                  value={member.placement.provider}
+                  onChange={(event) =>
+                    updateMember({
+                      placement: { ...member.placement, provider: event.target.value },
+                    })
+                  }
+                />
+              </Field>
               <Field label={`${member.id} repository (optional)`}>
                 <Input
                   value={member.placement.workspace ?? ""}
                   onChange={(event) =>
                     updateMember({
                       placement: {
-                        kind: "sandbox",
-                        provider: "arclet",
-                        ...(event.target.value ? { workspace: event.target.value } : {}),
+                        ...member.placement,
+                        workspace: event.target.value || undefined,
                       },
                     })
                   }

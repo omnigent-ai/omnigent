@@ -1,27 +1,15 @@
-"""Select an execution library without coupling it to workflow scheduling."""
+"""Open simulated agents or the generic session executor."""
 
 from __future__ import annotations
 
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 
 from omnigent.workflows.engine import MemberExecutor
-from omnigent.workflows.models import ManagedSandbox, Workflow
 from omnigent.workflows.simulation import simulate_member
 from omnigent.workflows.state import ExecutionBinding
-
-
-def validate_backend(workflow: Workflow, binding: ExecutionBinding) -> None:
-    for team in workflow.teams:
-        for member in team.members:
-            placement = member.placement
-            if binding.mode == "arclet" and not (
-                isinstance(placement, ManagedSandbox) and placement.provider == "arclet"
-            ):
-                raise ValueError("Arclet requires sandbox placement with provider: arclet")
 
 
 def validate_connection_url(server: str | None) -> None:
@@ -52,16 +40,9 @@ async def open_executor(binding: ExecutionBinding) -> AsyncIterator[MemberExecut
     assert binding.server is not None
     from omnigent_client import SessionsNamespace
 
-    from omnigent.workflows.arclet import ArcletExecutor
     from omnigent.workflows.connection import open_workflow_server_client
     from omnigent.workflows.sessions import SessionExecutor
 
     async with open_workflow_server_client(binding.server) as client:
         sessions = SessionsNamespace(client, binding.server)
-        yield (
-            ArcletExecutor(
-                sessions, sandbox_provider=os.environ.get("OMNIGENT_WORKFLOW_ARCLET_PROVIDER")
-            )
-            if binding.mode == "arclet"
-            else SessionExecutor(sessions)
-        )
+        yield SessionExecutor(sessions)

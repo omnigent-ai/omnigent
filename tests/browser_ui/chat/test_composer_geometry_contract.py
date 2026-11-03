@@ -27,6 +27,7 @@ from tests.browser_ui.chat._geometry_helpers import (
     box,
     drag_thumb_with_mouse,
     drag_thumb_with_touch,
+    native_touch_emulation,
     open_landing,
     open_live,
     park_at_bottom,
@@ -144,10 +145,16 @@ def _agents(*, skills: bool = False, picker_navigation: bool = False) -> list[di
 
 
 @pytest.mark.parametrize("viewport", [PHONE, TABLET, DESKTOP], ids=["phone", "tablet", "desktop"])
+@pytest.mark.parametrize(
+    "touch",
+    [False, pytest.param(True, marks=pytest.mark.browser_context_args(has_touch=True))],
+    ids=["mouse", "touch"],
+)
 def test_landing_and_live_cards_share_the_geometry_contract(
     page: Page,
     chat_session_contract: ChatSessionContract,
     viewport: dict[str, int],
+    touch: bool,
 ) -> None:
     """Both composer surfaces remain centered, bounded, and aligned at every breakpoint."""
     chat = chat_session_contract
@@ -162,6 +169,25 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_action_row(page, surface)), viewport["width"])
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
+        submit = box(_submit(page, surface))
+        if touch:
+            assert submit["width"] >= 44 and submit["height"] >= 44
+        else:
+            assert submit["height"] < 44
+        attach = page.get_by_test_id(
+            "new-chat-landing-attach" if surface == "landing" else "composer-attach"
+        )
+        assert_no_overlap(box(attach), submit)
+        attach.click()
+        menu = page.get_by_role("menu", name="Add", exact=True)
+        expect(menu).to_be_visible()
+        _settle_menu(menu)
+        assert_within_viewport(box(menu), viewport["width"])
+        if touch:
+            for row in menu.get_by_role("menuitem").all():
+                bounds = box(row)
+                assert bounds["width"] >= 44 and bounds["height"] >= 44
+        page.keyboard.press("Escape")
         widths.append(card["width"])
     if viewport == DESKTOP:
         assert widths[0] == pytest.approx(widths[1], abs=TOLERANCE)
@@ -1146,19 +1172,29 @@ def test_composer_growth_reflows_without_covering_output(
     composer.click()
     touch_baseline = settled_geometry(page)
     assert_clearance(touch_baseline, "native touch baseline")
-    touch = scroll_with_native_touch(page)
-    assert touch["settledDistance"] > 100, touch
-    assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
-    assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
-    assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
-    touch_settled = settled_geometry(page)
-    assert touch_settled["distanceFromBottom"] == pytest.approx(touch["settledDistance"], abs=8)
-    composer.press("Shift+Enter")
-    touch_grown = settled_geometry(page)
-    assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
-    assert abs(touch_grown["overlap"]) <= TOLERANCE
+    # Keep touch input emulated while measuring: ending it resizes touch-sized targets.
+    with native_touch_emulation(page) as touch_session:
+        touch = scroll_with_native_touch(page, touch_session)
+        assert touch["settledDistance"] > 100, touch
+        assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
+        assert "pointercancel" in touch["events"] and "scroll" in touch["events"], touch
+        assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+        touch_settled = settled_geometry(page)
+        assert touch_settled["distanceFromBottom"] == pytest.approx(
+            touch["settledDistance"], abs=8
+        )
+        composer.press("Shift+Enter")
+        touch_grown = settled_geometry(page)
+        assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
+        assert abs(touch_grown["overlap"]) <= TOLERANCE
 
     page.set_viewport_size({"width": 1280, "height": 720})
+    # Rows measured under touch keep their larger message-font heights after
+    # unmounting; reload so the desktop checks start from desktop measurements.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    composer = page.get_by_label("Message the agent")
+    composer.click()
     composer.fill("")
     settled_geometry(page)
     scroll_to_distance_from_bottom(page, 180)

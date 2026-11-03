@@ -178,9 +178,7 @@ class WorkflowRunner:
         if event.session_id and member.session_id and member.session_id != event.session_id:
             record.status, record.error = "rejected", "Session ID does not match the saved member"
             return
-        if self.binding.mode in {"server", "arclet"} and not (
-            member.session_id or event.session_id
-        ):
+        if self.binding.mode == "server" and not (member.session_id or event.session_id):
             record.status, record.error = "rejected", "Locate the remote session before resolving"
             return
         member.session_id = member.session_id or event.session_id

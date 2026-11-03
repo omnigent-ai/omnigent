@@ -106,7 +106,7 @@ class EventRecord(State):
 
 
 class ExecutionBinding(Definition):
-    mode: Literal["custom", "simulation", "server", "arclet"] = "custom"
+    mode: Literal["custom", "simulation", "server"] = "custom"
     server: str | None = None
 
 

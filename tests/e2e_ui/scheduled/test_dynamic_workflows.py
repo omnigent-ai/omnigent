@@ -63,6 +63,7 @@ def test_dynamic_workflow_review_and_repair(
     )
     page.get_by_text("Execution settings", exact=True).click()
     page.get_by_label("owner agent ID", exact=True).fill("workflow-agent")
+    page.get_by_label("owner sandbox provider", exact=True).fill("analysis-sandbox")
     page.get_by_text("Execution settings", exact=True).click()
     graph = page.get_by_role("region", name="Workflow DAG")
     expect(graph.get_by_text("delivery", exact=True)).to_have_count(0)
@@ -129,6 +130,7 @@ def test_dynamic_workflow_review_and_repair(
     task_dialog.get_by_label("Task name", exact=True).fill("Discard this draft")
     task_dialog.get_by_text("Execution settings", exact=True).click()
     task_dialog.get_by_label("owner agent ID", exact=True).fill("discarded-agent")
+    task_dialog.get_by_label("owner sandbox provider", exact=True).fill("discarded-sandbox")
     task_dialog.get_by_role("button", name="Cancel", exact=True).click()
     expect(task_dialog).to_have_count(0)
     expect(graph.locator(".react-flow__node")).to_have_count(4)
@@ -139,12 +141,17 @@ def test_dynamic_workflow_review_and_repair(
     expect(task_dialog.get_by_label("owner agent ID", exact=True)).to_have_value(
         "replace-with-registered-agent-id"
     )
+    expect(task_dialog.get_by_label("owner sandbox provider", exact=True)).to_have_value(
+        "replace-with-sandbox-provider"
+    )
     task_dialog.get_by_label("owner agent ID", exact=True).fill("acceptance-agent")
+    task_dialog.get_by_label("owner sandbox provider", exact=True).fill("acceptance-sandbox")
     task_dialog.get_by_label("owner repository (optional)", exact=True).fill(
         "https://github.com/example/acceptance"
     )
     task_dialog.get_by_role("button", name="Add agent", exact=True).click()
     task_dialog.get_by_label("specialist_1 agent ID", exact=True).fill("review-agent")
+    task_dialog.get_by_label("specialist_1 sandbox provider", exact=True).fill("review-sandbox")
     task_dialog.get_by_role("combobox", name="Execution mode", exact=True).select_option(
         "parallel"
     )
@@ -182,6 +189,15 @@ def test_dynamic_workflow_review_and_repair(
     expect(page.get_by_role("combobox", name="Execution mode", exact=True)).to_have_value(
         "parallel"
     )
+    expect(page.get_by_label("owner sandbox provider", exact=True)).to_have_value(
+        "acceptance-sandbox"
+    )
+    expect(page.get_by_label("specialist_1 sandbox provider", exact=True)).to_have_value(
+        "review-sandbox"
+    )
+    page.get_by_label("owner repository (optional)", exact=True).fill(
+        "https://github.com/example/edited"
+    )
     page.get_by_label("owner agent ID", exact=True).fill("acceptance-agent-edited")
     graph.get_by_role("button", name="Summarize", exact=True).click()
     page.get_by_text("Execution settings", exact=True).click()
@@ -197,18 +213,19 @@ def test_dynamic_workflow_review_and_repair(
     definition = yaml.safe_load(generated.input_value())
     assert len(definition["teams"]) == 5
     assert definition["teams"][0]["members"][0]["agent_id"] == "workflow-agent"
+    assert definition["teams"][0]["members"][0]["placement"]["provider"] == "analysis-sandbox"
     assert all(node["team"] == node["id"] for node in definition["nodes"])
     assert definition["teams"][-1]["members"][0]["agent_id"] == "acceptance-agent-edited"
     assert definition["teams"][-1]["members"][0]["placement"] == {
         "kind": "sandbox",
-        "provider": "arclet",
-        "workspace": "https://github.com/example/acceptance",
+        "provider": "acceptance-sandbox",
+        "workspace": "https://github.com/example/edited",
     }
     assert definition["teams"][-1]["strategy"] == "parallel"
     assert definition["teams"][-1]["members"][1]["agent_id"] == "review-agent"
     assert definition["teams"][-1]["members"][1]["placement"] == {
         "kind": "sandbox",
-        "provider": "arclet",
+        "provider": "review-sandbox",
     }
     assert len(definition["nodes"]) == 5
     assert all(node["allow_expansion"] for node in definition["nodes"])

@@ -12,13 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.workflows.execution import validate_backend, validate_connection_url
+from omnigent.workflows.execution import validate_connection_url
 from omnigent.workflows.models import CommandGate, Workflow
 from omnigent.workflows.service import WorkflowService
 from omnigent.workflows.state import EVENT_ADAPTER, ExecutionBinding
 from omnigent.workflows.store import RunStore
 
-Backend = Literal["simulation", "arclet"]
+Backend = Literal["simulation", "server"]
 MAX_DEFINITION_LENGTH = 65536
 
 
@@ -30,18 +30,16 @@ class StartWorkflow(BaseModel):
 
 class CompileWorkflow(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    backend: Literal["arclet"]
     workflow: Workflow
 
 
-def validate_web_workflow(workflow: Workflow, binding: ExecutionBinding) -> None:
+def validate_web_workflow(workflow: Workflow) -> None:
     if any(isinstance(gate, CommandGate) for node in workflow.nodes for gate in node.gates):
         raise ValueError("Web workflows use external gates; use the local CLI for command gates")
-    validate_backend(workflow, binding)
 
 
 def example_definition() -> str:
-    placement = {"kind": "sandbox", "provider": "arclet"}
+    placement = {"kind": "sandbox", "provider": "replace-with-sandbox-provider"}
     return yaml.safe_dump(
         {
             "name": "Investigate and propose a change",
@@ -103,11 +101,9 @@ def create_workflows_router(
             allowed is None and user == "local" and local_single_user_enabled()
         ):
             raise ValueError("Live workflows are not configured for your account")
-        server = os.environ.get(f"OMNIGENT_WORKFLOW_{backend.upper()}_URL")
+        server = os.environ.get("OMNIGENT_WORKFLOW_SERVER_URL")
         if not server:
-            raise ValueError(
-                f"Configure the {backend.upper()} server connection to enable this backend"
-            )
+            raise ValueError("Configure the workflow server connection to enable task agents")
         validate_connection_url(server)
         return ExecutionBinding(mode=backend, server=server)
 
@@ -121,7 +117,7 @@ def create_workflows_router(
     async def options(request: Request) -> dict[str, Any]:
         user = owner(request)
         result = []
-        for backend in ("simulation", "arclet"):
+        for backend in ("simulation", "server"):
             reason = None
             try:
                 binding_for(user, backend)
@@ -145,7 +141,7 @@ def create_workflows_router(
     async def compile_definition(request: Request, body: CompileWorkflow) -> dict[str, str]:
         owner(request)
         try:
-            validate_web_workflow(body.workflow, ExecutionBinding(mode=body.backend))
+            validate_web_workflow(body.workflow)
             definition = yaml.safe_dump(
                 body.workflow.model_dump(mode="json", exclude_none=True), sort_keys=False
             )
@@ -161,7 +157,7 @@ def create_workflows_router(
         try:
             binding = binding_for(user, body.backend)
             workflow = Workflow.model_validate(yaml.safe_load(body.definition))
-            validate_web_workflow(workflow, binding)
+            validate_web_workflow(workflow)
             if sum(not task.done() for task in service.tasks.values()) >= 8:
                 raise HTTPException(429, "The workflow controller is at capacity")
             return service.inspect(service.create(user, workflow, binding))
@@ -191,7 +187,7 @@ def create_workflows_router(
         store = run_store(request, run_id)
         try:
             binding = ExecutionBinding.model_validate(store.load()["binding"])
-            if binding.mode not in {"simulation", "arclet"}:
+            if binding.mode not in {"simulation", "server"}:
                 raise ValueError("This backend is available through the CLI only")
             if binding_for(owner(request), binding.mode) != binding:
                 raise ValueError("The configured connection changed; restore it before resuming")

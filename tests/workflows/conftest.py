@@ -24,7 +24,7 @@ def workflow() -> Workflow:
                         id=member_id,
                         role=member_id,
                         agent_id="ag_test",
-                        placement=ManagedSandbox(provider="arclet"),
+                        placement=ManagedSandbox(provider="test-provider"),
                     )
                     for member_id in ("lead", "reviewer")
                 ),
