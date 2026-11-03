@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import sys
 import tempfile
 import time
@@ -42,7 +43,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
-from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -1155,7 +1156,9 @@ class _GatewayModelVocabulary(NamedTuple):
 _EMPTY_GATEWAY_VOCABULARY = _GatewayModelVocabulary(alias_pins={}, model_overrides={})
 
 
-def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _GatewayModelVocabulary:
+def _gateway_model_vocabulary(
+    base_url: str, auth_command: str | None, api_key: str | None = None
+) -> _GatewayModelVocabulary:
     """Read Claude Code's model vocabulary off a gateway's model listing.
 
     Claude Code resolves a family alias — ``opus`` / ``sonnet`` / ``haiku`` /
@@ -1180,6 +1183,8 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     :param base_url: The gateway's ``ANTHROPIC_BASE_URL``.
     :param auth_command: The gateway ``apiKeyHelper`` command; minted into the
         bearer the listing is fetched with.
+    :param api_key: Optional literal key from the Windows static-key helper.
+        When provided, gateway discovery uses it instead of the helper command.
     :returns: The pins and rewrites the listing supports. Empty — leaving
         today's behavior — when the gateway lists no Claude models or the
         listing cannot be fetched.
@@ -1190,7 +1195,8 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
         kind=GATEWAY_KIND,
         family=ANTHROPIC_FAMILY,
         base_url=base_url,
-        auth_command=auth_command,
+        api_key=api_key or None,
+        auth_command=None if api_key else auth_command,
         detail="claude-sdk gateway transport",
     )
     try:
@@ -1228,6 +1234,140 @@ def _claude_settings_payload(
     if model_overrides:
         settings["modelOverrides"] = model_overrides
     return json.dumps(settings, separators=(",", ":")) if settings else None
+
+
+# Some API-key-backed providers (including generic gateway / local providers)
+# encode a static key as the POSIX shell command
+# ``printf %s <shlex.quote(key)>``. Omnigent itself runs shell commands on
+# Windows through ``cmd.exe`` (see ``omnigent._platform.default_shell_argv``),
+# where ``printf`` is not a builtin and POSIX single quotes are not quote
+# characters, so the command either fails or prints a quoted (wrong) key.
+#
+# On Windows only, such a command is replaced by a helper that runs this
+# process's Python interpreter and prints the key from an environment variable
+# that is passed to the Claude CLI through ``ClaudeAgentOptions.env``. The key
+# therefore never appears in the ``--settings`` JSON / CLI argv, and the
+# helper's text contains only characters that cmd.exe and POSIX sh (Git Bash)
+# both treat literally inside double quotes. Dynamic auth commands (e.g.
+# ``databricks auth token ...``) are left untouched so their apiKeyHelper
+# refresh behavior is preserved, and non-Windows platforms are unchanged.
+_STATIC_API_KEY_HELPER_SECRET_ENV = "OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY"
+
+# Python code run by the Windows helper. Deliberately free of quote characters,
+# ``%``, ``!``, ``$``, ``^``, ``&``, ``|``, ``<``, ``>`` and backticks so it is
+# literal under both cmd.exe and POSIX sh when wrapped in double quotes. The
+# env var name is passed as argv[1]; a missing variable raises KeyError, so the
+# helper exits non-zero instead of printing an empty/wrong token.
+_STATIC_API_KEY_HELPER_CODE = "import os,sys;sys.stdout.write(os.environ[sys.argv[1]])"
+
+# Characters that would be reinterpreted by cmd.exe (``%`` / ``!`` expansion)
+# or by POSIX sh (``$`` / backtick / backslash-escape) inside double quotes.
+_UNSAFE_HELPER_PATH_CHARS = frozenset('"%!$`\n\r')
+
+
+def _static_printf_secret(command: str | None) -> str | None:
+    """Return the literal key iff *command* is Omnigent's static-key helper form.
+
+    Only an exact ``printf %s <shlex.quote(key)>`` round-trip is recognized,
+    so a user-supplied command that merely *looks* similar (e.g.
+    ``printf %s "$TOKEN"``, which a shell would expand, or anything with
+    trailing shell syntax) is never treated as a static key.
+
+    :param command: An apiKeyHelper command, e.g. ``"printf %s sk-dummy"``.
+    :returns: The literal key, or ``None`` when *command* is not that form.
+    """
+    if not command or not command.startswith("printf %s "):
+        return None
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(parts) != 3 or parts[0] != "printf" or parts[1] != "%s" or not parts[2]:
+        return None
+    secret = parts[2]
+    if command != f"printf %s {shlex.quote(secret)}":
+        return None
+    return secret
+
+
+def _windows_static_key_helper_command(python_executable: str | None) -> str | None:
+    """Build the Windows apiKeyHelper that prints the key from the environment.
+
+    :param python_executable: Absolute interpreter path, e.g.
+        ``"C:\\\\Program Files\\\\Python312\\\\python.exe"``.
+    :returns: ``"<python>" -I -S -c "<code>" <ENV_NAME>``, or ``None`` when
+        the interpreter path is empty or contains characters that cmd.exe or
+        POSIX sh would reinterpret inside double quotes (including a UNC
+        ``\\\\`` prefix, which sh collapses inside double quotes).
+    """
+    if not python_executable:
+        return None
+    if any(ch in _UNSAFE_HELPER_PATH_CHARS for ch in python_executable):
+        return None
+    if "\\\\" in python_executable:
+        return None
+    return (
+        f'"{python_executable}" -I -S -c "{_STATIC_API_KEY_HELPER_CODE}" '
+        f"{_STATIC_API_KEY_HELPER_SECRET_ENV}"
+    )
+
+
+def _platform_safe_api_key_helper(
+    command: str | None,
+    env: dict[str, str],
+    *,
+    is_windows: bool | None = None,
+    python_executable: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Make a static-key apiKeyHelper runnable by Claude Code on Windows.
+
+    On non-Windows platforms, or for any command that is not Omnigent's exact
+    static ``printf`` form, the command is returned unchanged and *env* is
+    not modified.
+
+    :param command: The apiKeyHelper command, or ``None``.
+    :param env: The Claude CLI child env (``ClaudeAgentOptions.env``); on the
+        Windows static-key path the key is stored under
+        :data:`_STATIC_API_KEY_HELPER_SECRET_ENV`.
+    :param is_windows: Platform override for tests; ``None`` uses
+        :data:`omnigent._platform.IS_WINDOWS`.
+    :param python_executable: Interpreter override for tests; ``None`` uses
+        :data:`sys.executable`.
+    :returns: ``(helper_command, static_key)``. ``static_key`` is the
+        resolved key only when the Windows rewrite was applied, else ``None``.
+    """
+    windows = IS_WINDOWS if is_windows is None else is_windows
+    if not windows or not command:
+        return command, None
+    secret = _static_printf_secret(command)
+    if secret is None:
+        return command, None
+    # Environment entries cannot contain NUL; avoid configuring a helper
+    # whose subprocess would fail to launch with an invalid environment.
+    if "\x00" in secret:
+        logger.warning("claude-sdk: static API key helper cannot use a NUL-containing key")
+        return command, None
+    # This environment variable is reserved for the rewritten helper. Never
+    # replace a pre-existing, different value (including an empty string).
+    existing = env.get(_STATIC_API_KEY_HELPER_SECRET_ENV)
+    if existing is not None and existing != secret:
+        logger.warning("claude-sdk: reserved static-key helper environment variable is already set")
+        return command, None
+    helper = _windows_static_key_helper_command(
+        sys.executable if python_executable is None else python_executable
+    )
+    if helper is None:
+        # Never log the command itself: it carries the key.
+        logger.warning(
+            "claude-sdk: static API key apiKeyHelper could not be made "
+            "Windows-safe (unusable Python interpreter path); leaving it unchanged"
+        )
+        return command, None
+    # The key is intentionally scoped to this invocation's child environment,
+    # not a process-global os.environ mutation. Claude CLI descendants may
+    # inherit the key; this is a documented limitation, not secret isolation.
+    env[_STATIC_API_KEY_HELPER_SECRET_ENV] = secret
+    return helper, secret
 
 
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
@@ -2314,7 +2454,11 @@ class ClaudeSDKExecutor(Executor):
         return "default"
 
     async def _apply_gateway_model_vocabulary(
-        self, env: dict[str, str], auth_command: str | None
+        self,
+        env: dict[str, str],
+        auth_command: str | None,
+        *,
+        static_api_key: str | None = None,
     ) -> dict[str, str]:
         """
         Pin the family aliases in *env* and report Claude Code's id rewrites.
@@ -2333,6 +2477,8 @@ class ClaudeSDKExecutor(Executor):
         :param env: The child-process env dict, mutated in place with the pins.
         :param auth_command: The gateway ``apiKeyHelper`` command used to mint
             a bearer for the model listing.
+        :param static_api_key: Literal key when Windows rewrites a static
+            helper; gateway listing then does not execute the child-only helper.
         :returns: Canonical-to-served rewrites for the ``modelOverrides``
             setting. Empty off the gateway or when discovery found nothing.
         """
@@ -2341,7 +2487,7 @@ class ClaudeSDKExecutor(Executor):
             return {}
         if self._gateway_vocabulary is None:
             self._gateway_vocabulary = await run_sync_on_thread(
-                _gateway_model_vocabulary, base_url, auth_command
+                _gateway_model_vocabulary, base_url, auth_command, static_api_key
             )
         for var, model_id in self._gateway_vocabulary.alias_pins.items():
             env.setdefault(var, model_id)
@@ -2862,11 +3008,15 @@ class ClaudeSDKExecutor(Executor):
         env = dict(self._extra_env)
         env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+        # Windows static keys use a child-env helper rather than POSIX printf.
+        api_key_helper, static_api_key = _platform_safe_api_key_helper(api_key_helper, env)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
-        model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        model_overrides = await self._apply_gateway_model_vocabulary(
+            env, api_key_helper, static_api_key=static_api_key
+        )
         settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
 
         # Capture stderr from the CLI subprocess for diagnostics
