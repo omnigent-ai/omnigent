@@ -557,6 +557,7 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_APPEND_SYSTEM_PROMPT_FILE = "append-system-prompt.md"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -2931,8 +2932,8 @@ def augment_claude_args(
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag, merged after a
-        caller-supplied value instead of replacing it.
+        Code's native ``--append-system-prompt[-file]`` flag, placed before a
+        caller-supplied prompt instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2975,7 +2976,12 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    args = _merge_append_system_prompt(args, append_system_prompt)
+    args = _merge_append_system_prompt(
+        args,
+        append_system_prompt,
+        bridge_dir=bridge_dir,
+        cwd=workspace if workspace is not None else Path.cwd(),
+    )
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3074,6 +3080,7 @@ _CLAUDE_VALUE_FLAGS = frozenset(
         "--allowed-tools",
         "--allowedTools",
         "--append-subagent-system-prompt",
+        "--append-subagent-system-prompt-file",
         "--append-system-prompt",
         "--append-system-prompt-file",
         "--autocompact",
@@ -3115,33 +3122,70 @@ _CLAUDE_VALUE_FLAGS = frozenset(
 )
 
 
-def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
-    """Append an ``--append-system-prompt`` carrying the caller's prompt and ``extra``.
+def _last_claude_option_values(args: list[str], flags: frozenset[str]) -> dict[str, str]:
+    """Return the last value Claude Code parses for each of ``flags``.
 
-    Claude Code keeps only the last ``--append-system-prompt``, so Omnigent's
-    flag repeats the caller's effective value before ``extra``. Caller tokens
-    are never rewritten.
+    Tokens owned by another required-value option are skipped, e.g. the
+    literal ``--append-system-prompt`` in ``--system-prompt --append-system-prompt``.
+
+    :param args: Claude CLI arguments, e.g. ``["--append-system-prompt=Be brief."]``.
+    :param flags: Required-value options to read, e.g. ``{"--append-system-prompt"}``.
+    :returns: Each present flag's last value, which may be empty.
+    """
+    values: dict[str, str] = {}
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        flag, joined, joined_value = arg.partition("=")
+        if joined and flag in flags:
+            values[flag] = joined_value
+        elif arg in _CLAUDE_VALUE_FLAGS:
+            if arg in flags and idx + 1 < len(args):
+                values[arg] = args[idx + 1]
+            idx += 1
+        idx += 1
+    return values
+
+
+def _merge_append_system_prompt(
+    args: list[str],
+    extra: str | None,
+    *,
+    bridge_dir: Path,
+    cwd: Path,
+) -> list[str]:
+    """Append a prompt flag that puts ``extra`` before the caller's appended prompt.
+
+    Claude Code keeps only the last value of each prompt flag, so Omnigent's
+    flag repeats the caller's value after ``extra``. A caller prompt file is
+    copied into Omnigent's own file, because older Claude Code rejects a file
+    combined with ``--append-system-prompt``. Caller tokens are never rewritten.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
+    :param bridge_dir: Owner-only bridge directory for Omnigent's prompt file.
+    :param cwd: Directory Claude resolves a relative prompt file against.
     :returns: ``args`` ending with a prompt flag whose value carries both prompts.
     """
     if not extra:
         return args
-    flag = "--append-system-prompt"
-    joined_prefix = f"{flag}="
-    existing = ""
-    idx = 0
-    while idx < len(args):
-        arg = args[idx]
-        if arg.startswith(joined_prefix):
-            existing = arg[len(joined_prefix) :]
-        elif arg in _CLAUDE_VALUE_FLAGS:
-            if arg == flag and idx + 1 < len(args):
-                existing = args[idx + 1]
-            idx += 1
-        idx += 1
-    args.extend([flag, f"{existing}\n\n{extra}" if existing else extra])
+    values = _last_claude_option_values(
+        args, frozenset({"--append-system-prompt", "--append-system-prompt-file"})
+    )
+    if caller_file := values.get("--append-system-prompt-file"):
+        try:
+            # Claude resolves the path from its cwd without expanding ``~``.
+            file_prompt = (cwd / caller_file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            file_prompt = None  # Claude reports the unreadable file at startup.
+        if file_prompt is not None:
+            # Claude places a caller's inline prompt after this file's text.
+            prompt_path = bridge_dir / _APPEND_SYSTEM_PROMPT_FILE
+            _write_private_file(prompt_path, f"{extra}\n\n{file_prompt}" if file_prompt else extra)
+            args.extend(["--append-system-prompt-file", str(prompt_path)])
+            return args
+    existing = values.get("--append-system-prompt")
+    args.extend(["--append-system-prompt", f"{extra}\n\n{existing}" if existing else extra])
     return args
 
 

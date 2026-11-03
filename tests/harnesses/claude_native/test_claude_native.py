@@ -282,7 +282,7 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     ]
     assert prompt_values == [
         "Review like a staff engineer.",
-        "Review like a staff engineer.\n\nClaude Code is running in the session terminal.",
+        "Claude Code is running in the session terminal.\n\nReview like a staff engineer.",
     ]
     # The bridge MCP + hook injection still rides along.
     assert "--mcp-config" in spec["args"]
