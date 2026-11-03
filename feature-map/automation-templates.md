@@ -17,6 +17,16 @@ the creation modal with its integration settings ready to customize.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
   browsing again; saved paths and sandbox setup are preserved.
+- `harness-settings`: model, effort, and permission controls follow the selected
+  harness. Codex and Devin efforts follow the selected model; Pi exposes thinking
+  levels. Connected hosts and sandboxes supply their own catalogs. Default keeps
+  agent settings, and switching harnesses clears incompatible overrides. Catalogs
+  are cached per server, user, target, and harness for reopening while offline.
+  Shared model queries also separate servers when an embedded workspace changes.
+  Persisted catalogs expire after 24 hours; an open dialog may retain its in-memory
+  query data, as New Chat does. Switching targets resets model and effort choices.
+  Explicitly unsupported sandbox harnesses cannot be saved; temporary catalog
+  failures still allow Default.
 - `capabilities`: Jira, Slack, and GitHub templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `responsive`: gallery items have icons, descriptions, hourly polling summaries,
@@ -55,6 +65,10 @@ creation round-trip test supplies its own isolated host. No agent turn is needed
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
+- In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
+  harness such as Cursor. Check that only supported settings appear, model changes
+  clear unsupported effort choices, and saved selections survive reopening. Repeat
+  with a sandbox and an offline connected host; saved overrides remain readable.
 - For managed, repeat in a deployment containing this UI version; local
   standalone evidence does not verify host styling or navigation integration.
 
