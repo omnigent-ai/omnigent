@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerResponseError,
     CodexMessage,
     client_for_transport,
+    is_compaction_steer_refusal,
     is_stale_active_turn_error,
 )
 from omnigent.harnesses.codex_native.bridge import (
@@ -2336,12 +2337,29 @@ class _CodexElicitationTaskTracker:
             answered_natively = self._unanswered_async_questions.pop(item_id, None) is None
             reply = _async_question_reply_text(question, result)
             if reply is not None and not answered_natively:
-                await _send_codex_async_question_reply(
-                    codex_client,
-                    bridge_dir=bridge_dir,
-                    question=question,
-                    text=reply,
-                )
+                try:
+                    await _send_codex_async_question_reply(
+                        codex_client,
+                        bridge_dir=bridge_dir,
+                        question=question,
+                        text=reply,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.warning(
+                        "Codex async question answer not delivered: item=%s",
+                        item_id,
+                        exc_info=True,
+                    )
+                    title = question.questions[0][1]
+                    await _post_assistant_notice(
+                        client,
+                        session_id,
+                        marker=f"async-question-undelivered-{item_id}",
+                        text=f'Couldn\'t confirm that Codex received your answer to "{title}". '
+                        "Check the terminal and send your answer again if Codex didn't get it.",
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:  # keep the long-lived forwarder alive.
@@ -2734,7 +2752,27 @@ async def _post_side_chat_failed_notice(
     :param request_key: Stable per-request id for idempotency.
     :returns: None.
     """
-    marker = f"side-chat-error-{request_key}"
+    await _post_assistant_notice(
+        client,
+        session_id,
+        marker=f"side-chat-error-{request_key}",
+        text="Couldn't open a side chat for that /side request. Try again.",
+    )
+
+
+async def _post_assistant_notice(
+    client: httpx.AsyncClient, session_id: str, *, marker: str, text: str
+) -> None:
+    """
+    Post a best-effort assistant notice to an Omnigent session.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param marker: Stable response and source id that makes the notice
+        idempotent, e.g. ``"side-chat-error-req_1"``.
+    :param text: Notice text shown to the user.
+    :returns: None.
+    """
     try:
         await _post_external_item(
             client,
@@ -2743,18 +2781,13 @@ async def _post_side_chat_failed_notice(
             item_data={
                 "role": "assistant",
                 "agent": _AGENT_NAME,
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": "Couldn't open a side chat for that /side request. Try again.",
-                    }
-                ],
+                "content": [{"type": "output_text", "text": text}],
             },
             response_id=marker,
             source_id=marker,
         )
     except Exception:  # the notice is best-effort.
-        _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
+        _logger.warning("Codex forwarder notice could not be posted: %s", marker, exc_info=True)
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -5628,7 +5661,7 @@ async def _send_codex_async_question_reply(
     text: str,
 ) -> None:
     """
-    Steer the active Codex turn with an async question reply, or start one.
+    Deliver an async question reply, retrying once after a compaction turn.
 
     :param codex_client: Connected Codex app-server client.
     :param bridge_dir: Parent native Codex bridge directory, or ``None`` for
@@ -5637,12 +5670,51 @@ async def _send_codex_async_question_reply(
     :param text: Tagged reply text from :func:`_async_question_reply_text`.
     :returns: None.
     """
+    state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
+    if state is not None and state.thread_id != question.thread_id:
+        state = None
+    try:
+        await _send_codex_async_question_reply_once(
+            codex_client, bridge_dir=bridge_dir, state=state, question=question, text=text
+        )
+        return
+    except CodexAppServerResponseError as error:
+        if bridge_dir is None or state is None or state.active_turn_id is None:
+            raise
+        if not is_compaction_steer_refusal(error):
+            raise
+    from omnigent.inner.codex_native_executor import _wait_for_compaction_turn
+
+    recovered_state = await _wait_for_compaction_turn(bridge_dir, state)
+    await _send_codex_async_question_reply_once(
+        codex_client, bridge_dir=bridge_dir, state=recovered_state, question=question, text=text
+    )
+
+
+async def _send_codex_async_question_reply_once(
+    codex_client: CodexAppServerClient,
+    *,
+    bridge_dir: Path | None,
+    state: CodexNativeBridgeState | None,
+    question: _CodexAsyncQuestion,
+    text: str,
+) -> None:
+    """
+    Steer the active Codex turn with an async question reply, or start one.
+
+    :param codex_client: Connected Codex app-server client.
+    :param bridge_dir: Parent native Codex bridge directory, or ``None``.
+    :param state: Bridge state for the asking thread, or ``None`` when the
+        bridge does not track it.
+    :param question: Answered Codex async question.
+    :param text: Tagged reply text from :func:`_async_question_reply_text`.
+    :returns: None.
+    """
     thread_id = question.thread_id
     input_items = [{"type": "text", "text": text}]
     tracked_bridge_dir: Path | None = None
     expected_turn_id = question.turn_id
-    state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
-    if state is not None and state.thread_id == thread_id:
+    if state is not None:
         tracked_bridge_dir, expected_turn_id = bridge_dir, state.active_turn_id
     if expected_turn_id:
         try:

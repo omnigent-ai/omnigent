@@ -14,6 +14,7 @@ from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.inner import codex_native_executor
 from tests.harnesses.codex_native.session._support import (
     _agent_message_event,
     _completed_event,
@@ -798,25 +799,27 @@ def _answer_async_question(
     bridge_dir: Path,
     fake_client: _FakeCodexAppServerClient,
     hook_response: httpx.Response,
-) -> None:
+) -> list[dict[str, Any]]:
     """
     Drive one async question whose Omnigent hook returns ``hook_response``.
 
     :param bridge_dir: Native Codex bridge directory.
     :param fake_client: Fake Codex app-server client.
     :param hook_response: Omnigent hook response for the question card.
-    :returns: None.
+    :returns: Session events the forwarder posted besides the hook.
     """
+    posted_events: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Answer the question card and accept other Omnigent posts.
+        Answer the question card and capture other Omnigent posts.
 
         :param request: HTTP request sent by the forwarder.
         :returns: Omnigent hook or event response.
         """
         if request.url.path.endswith("/hooks/codex-elicitation-request"):
             return hook_response
+        posted_events.append(json.loads(request.content))
         return httpx.Response(202, json={"queued": False})
 
     async def run() -> None:
@@ -839,6 +842,36 @@ def _answer_async_question(
             await context["elicitation_tracker"].drain()
 
     asyncio.run(run())
+    return posted_events
+
+
+def _compact_steer_refusal() -> CodexAppServerResponseError:
+    """
+    Build Codex's refusal to steer an active compaction turn.
+
+    :returns: App-server response error for a compact turn.
+    """
+    return CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "cannot steer a compact turn",
+            "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}}},
+        }
+    )
+
+
+def _undelivered_answer_notices(posted_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Select the forwarder's undelivered async question answer notices.
+
+    :param posted_events: Session events the forwarder posted.
+    :returns: Notice events, in post order.
+    """
+    return [
+        event
+        for event in posted_events
+        if str(event["data"].get("source_id", "")).startswith("async-question-undelivered-")
+    ]
 
 
 def test_forwarder_publishes_codex_async_question_and_steers_answer(
@@ -1124,3 +1157,143 @@ def test_forwarder_clears_codex_async_question_answered_in_native_tui(
         }
     ]
     assert fake_client.requests == []
+
+
+def test_forwarder_delivers_codex_async_question_answer_after_compaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An answer Codex refuses during compaction is delivered once compaction ends.
+    """
+    monkeypatch.setattr(codex_native_executor, "_BRIDGE_STATE_SLOW_POLL_SECONDS", 0.01)
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_compact")
+    fake_client = _FakeCodexAppServerClient()
+    posted_events: list[dict[str, Any]] = []
+    steer_refused = asyncio.Event()
+
+    async def fake_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Refuse steering the compaction turn and start a new one.
+
+        :param method: JSON-RPC method.
+        :param params: JSON-RPC params.
+        :returns: JSON-RPC response envelope.
+        :raises CodexAppServerResponseError: For ``turn/steer``.
+        """
+        fake_client.requests.append((method, params))
+        if method == "turn/steer":
+            steer_refused.set()
+            raise _compact_steer_refusal()
+        return {"result": {"turn": {"id": "turn_reply"}}}
+
+    fake_client.request = fake_request  # type: ignore[method-assign]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Answer the question card and capture other Omnigent posts.
+
+        :param request: HTTP request sent by the forwarder.
+        :returns: Omnigent hook or event response.
+        """
+        if request.url.path.endswith("/hooks/codex-elicitation-request"):
+            return httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}})
+        posted_events.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async def run() -> None:
+        """
+        Answer during compaction, then complete the compaction turn.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            context = _forwarder_context(client, tmp_path)
+            for event in (
+                _async_question_event(),
+                _completed_event("turn_compact", thread_id="thread_123"),
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **context,
+                    event=event,
+                    codex_client=fake_client,  # type: ignore[arg-type]
+                )
+                await asyncio.wait_for(steer_refused.wait(), timeout=1.0)
+            await asyncio.wait_for(context["elicitation_tracker"].drain(), timeout=5.0)
+
+    asyncio.run(run())
+
+    reply_input = [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}]
+    assert fake_client.requests == [
+        (
+            "turn/steer",
+            {"threadId": "thread_123", "expectedTurnId": "turn_compact", "input": reply_input},
+        ),
+        ("turn/start", {"threadId": "thread_123", "input": reply_input}),
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_reply"
+    assert _undelivered_answer_notices(posted_events) == []
+
+
+@pytest.mark.parametrize(
+    "steer_error",
+    [ConnectionResetError("app-server connection lost"), _compact_steer_refusal()],
+    ids=["disconnected", "compaction_timed_out"],
+)
+def test_forwarder_posts_notice_when_codex_async_question_answer_is_undelivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    steer_error: Exception,
+) -> None:
+    """
+    An answer Codex may not have received tells the user to check and resend.
+
+    :param steer_error: Failure from the steer that carries the answer.
+    """
+    monkeypatch.setattr(codex_native_executor, "_BRIDGE_STATE_SLOW_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(codex_native_executor, "_COMPACTION_WAIT_TIMEOUT_SECONDS", 0.05)
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient(error=steer_error)
+
+    posted_events = _answer_async_question(
+        tmp_path,
+        fake_client,
+        httpx.Response(200, json={"answers": {"0": {"answers": ["Alpha"]}}}),
+    )
+
+    reply_input = [{"type": "text", "text": _TUI_ASYNC_QUESTION_REPLY}]
+    assert fake_client.requests == [
+        (
+            "turn/steer",
+            {"threadId": "thread_123", "expectedTurnId": "turn_123", "input": reply_input},
+        )
+    ]
+    marker = "async-question-undelivered-call-async-1"
+    assert _undelivered_answer_notices(posted_events) == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Couldn't confirm that Codex received your answer to "
+                            '"Which option do you choose?". Check the terminal and send your '
+                            "answer again if Codex didn't get it.",
+                        }
+                    ],
+                },
+                "response_id": marker,
+                "source_id": marker,
+            },
+        }
+    ]

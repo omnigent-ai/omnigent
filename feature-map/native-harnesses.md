@@ -254,6 +254,12 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
 
+**Codex async question:** in Default mode, ask Codex to call
+`request_user_input_async`. The question card stays open after the turn ends;
+answer it in Chat and confirm Codex's next turn uses the answer. Answering in
+the terminal closes the card. An open question is not restored after the
+forwarder reconnects.
+
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
 columns name one journey test per harness; "—" means none exists yet.
