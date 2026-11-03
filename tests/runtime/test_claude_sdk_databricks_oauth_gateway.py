@@ -35,6 +35,7 @@ credential resolution to request time).
 from __future__ import annotations
 
 import configparser
+import os
 from pathlib import Path
 
 import pytest
@@ -54,12 +55,15 @@ WORKSPACE_HOST = "https://adb-12345.azuredatabricks.net"
 
 @pytest.fixture(autouse=True)
 def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Isolate OMNIGENT_CONFIG_HOME so the developer's real config is not read.
+    """Isolate the global config, exported Anthropic endpoint and harness env from the shell.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Temporary directory.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    ambient = [name for name in os.environ if name.startswith("HARNESS_CLAUDE_SDK_")]
+    for name in ("ANTHROPIC_BASE_URL", "OMNIGENT_ANTHROPIC_BASE_URL", *ambient):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_catalog_default_model",
         lambda provider_name, family, *, context: f"catalog-{provider_name}-{family}-default",
@@ -233,6 +237,74 @@ def test_executor_constructs_with_oauth_profile(
     assert executor._extra_env["ANTHROPIC_BASE_URL"] == (
         f"{WORKSPACE_HOST}/ai-gateway/anthropic"
     ), "The executor must route to the profile workspace's Unity Gateway"
+
+
+@pytest.fixture()
+def default_pat_databrickscfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Write a ``~/.databrickscfg`` whose ``[DEFAULT]`` section holds a PAT for the workspace.
+
+    The journey pins no profile: the ``databricks-*`` model alone selects the gateway
+    path and the executor resolves the default profile.
+    """
+    cfg_path = tmp_path / ".databrickscfg"
+    cfg_path.write_text(f"[DEFAULT]\nhost = {WORKSPACE_HOST}\ntoken = dapi-test-token\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    for ambient in ("DATABRICKS_CONFIG_PROFILE", "DATABRICKS_HOST", "DATABRICKS_TOKEN"):
+        monkeypatch.delenv(ambient, raising=False)
+
+    def _offline_host_metadata(host: str) -> None:
+        raise ConnectionError(f"offline test stub: refusing to probe {host}")
+
+    # The SDK's Config() probes /.well-known/databricks-config with retries; keep it offline.
+    monkeypatch.setattr(
+        "databricks.sdk.config.get_host_metadata", _offline_host_metadata, raising=False
+    )
+    return cfg_path
+
+
+def test_exported_same_workspace_base_url_reaches_claude_for_databricks_model(
+    default_pat_databrickscfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A databricks-* model must not replace an exported same-workspace ANTHROPIC_BASE_URL.
+
+    The default profile selects the gateway path; claude-agent-sdk launches the CLI
+    with ``{**os.environ, **options.env}``, so a derived URL in ``_extra_env`` would
+    silently win over the exported one.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    exported = f"{WORKSPACE_HOST}/serving-endpoints/anthropic"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", exported)
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-sdk-databricks-model",
+        instructions="You are a test agent.",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-sdk"},
+            model="databricks-claude-sonnet-5-5",
+        ),
+        llm=LLMConfig(model="databricks-claude-sonnet-5-5"),
+    )
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert env.get("HARNESS_CLAUDE_SDK_GATEWAY") == "true", (
+        "a databricks-* model must select the gateway transport"
+    )
+
+    executor = ClaudeSDKExecutor(
+        model=env.get("HARNESS_CLAUDE_SDK_MODEL"),
+        gateway=True,
+        databricks_profile=env.get("HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"),
+        gateway_host=env.get("HARNESS_CLAUDE_SDK_GATEWAY_HOST") or None,
+        base_url_override=env.get("HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL") or None,
+        gateway_auth_command=env.get("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND") or None,
+    )
+    cli_env = {**os.environ, **executor._extra_env}
+    assert cli_env["ANTHROPIC_BASE_URL"] == exported, (
+        f"the Claude CLI would be launched against {cli_env['ANTHROPIC_BASE_URL']!r} "
+        f"instead of the exported {exported!r}"
+    )
 
 
 def test_openai_agents_databricks_auth_works_for_contrast(
