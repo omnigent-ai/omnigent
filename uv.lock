@@ -2208,16 +2208,16 @@ wheels = [
 
 [[package]]
 name = "islo"
-version = "0.3.8"
+version = "0.3.20"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c5/ee/1fa948386e45772343664eee0a6f955787c2bfb9b4df1ca02d6d6edf8590/islo-0.3.8.tar.gz", hash = "sha256:50b5e0d8069a2c30e353d48afdf562baf5e567119bf150dd47e277a479a4135c", size = 89513, upload-time = "2026-06-24T13:06:30.488Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/ac/b43644a438b000962fb804ab4469e2b4ba05e57548c062391bbf8ff94212/islo-0.3.20.tar.gz", hash = "sha256:3be53e9664c198aa6461344a6aca0bf635bd6ef09061783b98828428f75a5881", size = 176000, upload-time = "2026-10-12T13:12:08.818Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/2d/b0194c60181f3dc2662ce7937759fafafbf2ff73e712f0df1ef9d200262c/islo-0.3.8-py3-none-any.whl", hash = "sha256:35965bb5bf715d1df1cc36f5553ee81eab3f87a8fcca4334a653defff1785460", size = 190684, upload-time = "2026-06-24T13:06:28.878Z" },
+    { url = "https://files.pythonhosted.org/packages/60/af/73ca203878c60d68a3f26268a625aeae366348e1816ade401ffff04e8dc7/islo-0.3.20-py3-none-any.whl", hash = "sha256:4527574bef271052a6e294a89c4a3c73d2886387a8836ec690b46e7957254cbe", size = 372443, upload-time = "2026-10-12T13:12:07.122Z" },
 ]
 
 [[package]]
