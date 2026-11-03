@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
@@ -37,6 +38,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_FILESYSTEM_ATTACHMENTS,
 )
+from omnigent.scheduled_context import parse_scheduled_run
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -335,6 +337,7 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    scheduled_run: ScheduledRunLogContext | None = None
 
 
 @dataclass
@@ -1093,7 +1096,8 @@ class HostFsRequestFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
-        ``"diff"``, ``"search"``.
+        ``"diff"``, ``"search"``, or PR resources including ``"github_info"``,
+        ``"github_review_threads"`` and ``"github_review_thread_comments"``.
     :param workspace: Absolute path to the session's workspace on the
         host, e.g. ``"/Users/alice/project"``.
     :param session_id: Session id, forwarded to the change registry.
@@ -1120,7 +1124,7 @@ class HostFsWriteFrame:
     (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
     reviewer edits (``op="github_reviewers_update"``), title and description edits
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
-    description attachment uploads
+    review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
     ``content_base64``), merges (``op="github_merge"``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
@@ -1133,8 +1137,8 @@ class HostFsWriteFrame:
     :param op: Write op name — ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or
-        ``"github_disable_auto_merge"``.
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1596,6 +1600,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.scheduled_run is not None:
+            payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2674,6 +2680,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))

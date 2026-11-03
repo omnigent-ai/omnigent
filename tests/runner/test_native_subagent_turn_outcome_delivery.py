@@ -185,8 +185,8 @@ def _accept_opencode_interrupt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     import omnigent.harnesses.opencode_native.app_server as opencode_app_server
     import omnigent.harnesses.opencode_native.bridge as opencode_bridge
 
-    class _AbortingClient:
-        async def abort(self, session_id: str) -> bool:
+    class _InterruptingClient:
+        async def interrupt(self, session_id: str) -> bool:
             return True
 
         async def aclose(self) -> None:
@@ -203,7 +203,7 @@ def _accept_opencode_interrupt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.setattr(opencode_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     monkeypatch.setattr(opencode_app_server, "find_opencode_cli", _no_cli)
     monkeypatch.setattr(opencode_bridge, "read_bridge_state", lambda bridge_dir: state)
-    monkeypatch.setattr(opencode_app_server, "client_for_state", lambda **_: _AbortingClient())
+    monkeypatch.setattr(opencode_app_server, "client_for_state", lambda **_: _InterruptingClient())
 
 
 @pytest.mark.asyncio
