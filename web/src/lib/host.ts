@@ -54,7 +54,8 @@ export type OmnigentInteractionKind =
   | "list_sessions"
   | "get_session"
   | "create_session_sandbox"
-  | "create_session_computer";
+  | "create_session_computer"
+  | "create_scheduled_task";
 
 /** Terminal outcome of an interaction, set on the `complete` phase. */
 export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
@@ -162,9 +163,8 @@ export interface OmnigentHostConfig {
    */
   cliServerUrlSuffix?: string;
   /**
-   * Optional URL to the host's own appearance/theme settings. When the host
-   * owns light/dark (the embed's own switcher is hidden), the settings screen
-   * links here so users can find where to change it. Omitted standalone.
+   * Optional URL to the host's appearance settings, linked beside the browser
+   * embed's automatic theme option. Omitted standalone and hidden in Electron.
    */
   themeSettingsUrl?: string;
   /**

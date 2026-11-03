@@ -90,6 +90,25 @@ def test_stopping_a_lab_releases_upstream_ports_before_processes_start(
             probe.bind(("127.0.0.1", port))
 
 
+@pytest.mark.timeout(60)
+def test_lab_client_retires_idle_connections_before_the_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lab = Lab(LabConfig(root=tmp_path / "lab"))
+    # Only the real HTTP server and client proxy own this connection lifetime.
+    monkeypatch.setattr(lab, "_start_host", lambda: None)
+    with lab:
+        assert lab.client is not None
+        for _ in range(2):
+            assert lab.client.get("/health").status_code == 200
+        assert len(lab.events.events(source="proxy:client", kind="connect")) == 1
+
+        # Retire the client socket before the server's five-second idle close.
+        time.sleep(2.0)
+        assert lab.client.get("/health").status_code == 200
+        assert len(lab.events.events(source="proxy:client", kind="connect")) == 2
+
+
 def _round_trip(lab: Lab, session_id: str) -> str:
     marker = f"LAB_{uuid.uuid4().hex[:10].upper()}"
     lab.script_turn(marker, [{"text": f"reply {marker}"}])
