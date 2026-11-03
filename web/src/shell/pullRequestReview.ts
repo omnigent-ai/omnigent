@@ -149,7 +149,8 @@ export function refreshedMatchIndex(matches: readonly Match[], previous: Match):
       match.target.path === target.path &&
       match.target.kind === target.kind &&
       match.target.side === target.side &&
-      match.target.line === target.line,
+      match.target.line === target.line &&
+      match.target.text === target.text,
   );
   if (same >= 0) return same;
   let nearest = 0;

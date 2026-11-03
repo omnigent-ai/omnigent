@@ -1,7 +1,7 @@
 // The pull request panel's Changes tab: a toolbar, a jump-to-file sidebar tree
 // and every changed file's diff stacked in one scroll view.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -591,9 +591,14 @@ export function PullRequestChangesTab({
     [reveal],
   );
 
-  // A filtered-out target is visible only after the filter clears, so wait for it.
+  // A filtered-out target is visible only after the filter clears. With no filter left to
+  // clear it can never show, so drop it rather than scroll to it when a filter changes later.
   useEffect(() => {
-    if (!pendingReveal || !visiblePaths.includes(pendingReveal.path)) return;
+    if (!pendingReveal) return;
+    if (!visiblePaths.includes(pendingReveal.path)) {
+      if (!view.pathFilter && !view.hideViewed) setPendingReveal(null);
+      return;
+    }
     let frame = 0;
     let frames = 0;
     const scrollToHeader = () => {
@@ -604,12 +609,14 @@ export function PullRequestChangesTab({
     };
     scrollToHeader();
     return () => cancelAnimationFrame(frame);
-  }, [pendingReveal, visiblePaths]);
+  }, [pendingReveal, visiblePaths, view.pathFilter, view.hideViewed]);
 
   // Find searches the visible files; the hidden count searches the rest, and no filter changes.
   // Corpora are built only while the bar is open.
   const { matchCase, regex } = find;
   const query = find.open ? find.query : "";
+  // Matches follow the query one render later, so typing stays responsive on large patches.
+  const deferredQuery = useDeferredValue(query);
   const searchCorpus = useMemo(
     () => (find.open ? buildSearchCorpus(filesByPath, visibleFiles) : []),
     [find.open, filesByPath, visibleFiles],
@@ -623,12 +630,12 @@ export function PullRequestChangesTab({
     );
   }, [find.open, filesByPath, files, visiblePaths]);
   const search = useMemo(
-    () => findMatches(searchCorpus, query, { matchCase, regex, limit: MATCH_LIMIT }),
-    [searchCorpus, query, matchCase, regex],
+    () => findMatches(searchCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
+    [searchCorpus, deferredQuery, matchCase, regex],
   );
   const hiddenSearch = useMemo(
-    () => findMatches(hiddenCorpus, query, { matchCase, regex, limit: MATCH_LIMIT }),
-    [hiddenCorpus, query, matchCase, regex],
+    () => findMatches(hiddenCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
+    [hiddenCorpus, deferredQuery, matchCase, regex],
   );
   const { matches } = search;
   const activeIndex = findTarget && matches.length ? refreshedMatchIndex(matches, findTarget) : -1;
@@ -652,11 +659,14 @@ export function PullRequestChangesTab({
     [highlightSide, highlightLine, highlightStart, highlightEnd],
   );
 
-  // Seed the match when the bar opens or its query changes: the first at or below the viewport top.
+  // Seed the match when the bar opens or its query changes: the first at or below the
+  // viewport top. A path match also scrolls its header, as stepping to it does.
   useEffect(() => {
-    if (!find.open || findTarget || !matches.length) return;
-    setFindTarget(matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)]);
-  }, [find.open, findTarget, matches, visiblePaths, activePath]);
+    if (!find.open || findTarget || !matches.length || deferredQuery !== query) return;
+    const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
+    setFindTarget(seeded);
+    if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
+  }, [find.open, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
 
   // The active match's file opens even if the reader collapsed it earlier.
   useEffect(() => {

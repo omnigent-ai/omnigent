@@ -228,6 +228,15 @@ describe("match positions after a refresh or a reseed", () => {
     expect(firstMatchAtOrBelow(matches, ["a.ts", "b.ts", "c.ts"], null)).toBe(0);
   });
 
+  it("tells the current and previous path of a rename apart", () => {
+    const corpus: PatchMatchTarget[] = [
+      { path: "y.ts", kind: "path", text: "y.ts" },
+      { path: "y.ts", kind: "path", text: "x.ts" },
+    ];
+    const { matches } = findMatches(corpus, "ts", { matchCase: false, regex: false, limit: 10 });
+    expect(refreshedMatchIndex(matches, matches[1])).toBe(1);
+  });
+
   it("keeps the same match when it is still present", () => {
     const previous = match("a.ts", 5, 4);
     expect(refreshedMatchIndex([match("a.ts", 2), match("a.ts", 5, 4)], previous)).toBe(1);

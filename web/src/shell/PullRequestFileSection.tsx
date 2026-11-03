@@ -362,11 +362,12 @@ export function PullRequestFileSection({
       clearFindMatch();
     };
   }, [highlight, collapsed, renderingDiff]);
-  const repaintHighlight = () => {
+  // Stable across selection drags: the diff re-renders when a callback option changes identity.
+  const repaintHighlight = useCallback(() => {
     const section = ref.current;
     const row = highlight && section ? findDiffRow(highlight, section) : null;
     if (highlight && row) paintFindMatch(row, highlight);
-  };
+  }, [highlight]);
   const newConversation = anchor && (
     <section
       aria-label="New review conversation"

@@ -305,6 +305,16 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByRole("button", { name: "Find in changes" })).toBeInTheDocument();
   });
 
+  it("scrolls to a file header when the first match is a path match", () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    renderTab({ conversationId: "find-path-seed" });
+
+    openFind("b.ts");
+
+    expect(screen.getByText("1 of 1")).toBeInTheDocument();
+    expect(scroll.mock.contexts).toContain(document.querySelector('[data-github-file="b.ts"]'));
+  });
+
   it("says which part of the list the fetched patch covers", () => {
     renderTab({
       conversationId: "find-coverage",
