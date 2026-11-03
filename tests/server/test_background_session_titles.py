@@ -15,10 +15,12 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
     RunnerBackgroundTitleGenerator,
     background_session_titles_enabled,
+    compose_session_title_instructions,
     normalize_background_title,
     prepare_background_session_title,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.schemas import BackgroundSessionTitleRequest, SessionEventInput
+from omnigent.server.server_config import SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 pytestmark = pytest.mark.asyncio
@@ -569,6 +571,24 @@ async def test_runner_generator_posts_language_rule_without_operator_customizati
     )
 
 
+async def test_runner_accepts_combined_server_and_owner_instructions_at_their_limits() -> None:
+    client = _FakeRunnerClient()
+    generator = RunnerBackgroundTitleGenerator(_FakeRunnerRouter(client))  # type: ignore[arg-type]
+    combined = compose_session_title_instructions(
+        "s" * SESSION_TITLE_INSTRUCTIONS_MAX_CHARS, "u" * SESSION_TITLE_INSTRUCTIONS_MAX_CHARS
+    )
+
+    await generator(
+        BackgroundTitleRequest(
+            session_id="conv_test", prompt="hello", additional_instructions=combined
+        )
+    )
+
+    body = BackgroundSessionTitleRequest.model_validate(client.requests[0][1])
+    assert body.additional_instructions is not None
+    assert body.additional_instructions.endswith(FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION)
+
+
 async def test_schedule_is_one_shot_per_session(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     session_id = _seed_session(store, "Investigate authentication timeout")
@@ -670,3 +690,126 @@ async def test_seed_polling_is_bounded_by_generation_slots(db_uri: str) -> None:
 
     release.set()
     await coordinator.wait_for_idle()
+
+
+@pytest.mark.parametrize(
+    ("server", "user", "expected"),
+    [
+        (None, None, None),
+        ("  ", "", None),
+        ("Server rule.", None, "Server rule."),
+        (None, " Owner rule. ", "Owner rule."),
+        (
+            "Server rule.",
+            "Owner rule.",
+            "Server rule.\n\nThe session owner's personal title requirements follow. "
+            "Where they conflict with the requirements above, follow these.\nOwner rule.",
+        ),
+    ],
+)
+async def test_compose_session_title_instructions(
+    server: str | None, user: str | None, expected: str | None
+) -> None:
+    assert compose_session_title_instructions(server, user) == expected
+
+
+async def test_background_title_uses_session_owner_instructions(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Investigate authentication timeout")
+    resolved: list[str] = []
+    seen: list[str | None] = []
+
+    def owner_instructions(requested_session_id: str) -> str:
+        resolved.append(requested_session_id)
+        return "Start titles with an emoji."
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        seen.append(request.additional_instructions)
+        return "🔐 Debug authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Prefix titles with the team name.",
+        user_instructions=owner_instructions,
+    )
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="please investigate the authentication timeout",
+        expected_seed_title="Investigate authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+
+    assert resolved == [session_id]
+    assert seen == [
+        compose_session_title_instructions(
+            "Prefix titles with the team name.", "Start titles with an emoji."
+        )
+    ]
+    assert store.get_conversation(session_id).title == "🔐 Debug authentication timeout"
+
+
+async def test_owner_lookup_failure_falls_back_to_server_instructions(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _seed_session(store, "Investigate authentication timeout")
+    seen: list[str | None] = []
+
+    def failing_lookup(_session_id: str) -> str:
+        raise RuntimeError("settings database unavailable")
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        seen.append(request.additional_instructions)
+        return "Debug authentication timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store,
+        generator,
+        additional_instructions="Prefix titles with the team name.",
+        user_instructions=failing_lookup,
+    )
+    coordinator.schedule(
+        session_id=session_id,
+        prompt="please investigate the authentication timeout",
+        expected_seed_title="Investigate authentication timeout",
+    )
+    await coordinator.wait_for_idle()
+
+    assert seen == ["Prefix titles with the team name."]
+    assert store.get_conversation(session_id).title == "Debug authentication timeout"
+
+
+async def test_agent_title_uses_owner_instructions_without_server_default(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    seen: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        seen.append(request)
+        return "🔐 Auth timeout"
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store, generator, user_instructions=lambda _session_id: "Start titles with an emoji."
+    )
+    title = await coordinator.format_agent_title(
+        BackgroundTitleRequest(session_id="conv_owner", prompt="Auth timeout")
+    )
+
+    assert title == "🔐 Auth timeout"
+    assert [request.additional_instructions for request in seen] == ["Start titles with an emoji."]
+
+
+async def test_agent_title_without_any_instructions_keeps_proposal(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        raise AssertionError("no generation without instructions")
+
+    coordinator = BackgroundSessionTitleCoordinator(
+        store, generator, user_instructions=lambda _session_id: None
+    )
+
+    assert (
+        await coordinator.format_agent_title(
+            BackgroundTitleRequest(session_id="conv_owner", prompt="Auth timeout")
+        )
+        == "Auth timeout"
+    )

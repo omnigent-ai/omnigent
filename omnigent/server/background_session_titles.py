@@ -56,6 +56,32 @@ class BackgroundTitleRequest:
 
 
 BackgroundTitleGenerator = Callable[[BackgroundTitleRequest], Awaitable[str | None]]
+#: Reads the session owner's saved title instructions from a session id.
+UserTitleInstructionsResolver = Callable[[str], str | None]
+
+_USER_TITLE_INSTRUCTIONS_PREAMBLE = (
+    "The session owner's personal title requirements follow. "
+    "Where they conflict with the requirements above, follow these."
+)
+
+
+def compose_session_title_instructions(
+    server_instructions: str | None, user_instructions: str | None
+) -> str | None:
+    """Combine the server's default title guidance with the owner's own guidance.
+
+    :param server_instructions: Validated server-config guidance, or ``None``.
+    :param user_instructions: Validated per-user guidance, or ``None``.
+    :returns: The guidance to send, or ``None`` for the default title prompt.
+    """
+    server = server_instructions.strip() if server_instructions else ""
+    user = user_instructions.strip() if user_instructions else ""
+    if not user:
+        return server or None
+    if not server:
+        return user
+    return f"{server}\n\n{_USER_TITLE_INSTRUCTIONS_PREAMBLE}\n{user}"
+
 
 _TITLE_WRAPPERS = "'\"`“”‘’"
 _TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
@@ -133,7 +159,13 @@ class BackgroundSessionTitleCoordinator:
         seed_wait_seconds: float = 15.0,
         max_concurrency: int = 4,
         additional_instructions: str | None = None,
+        user_instructions: UserTitleInstructionsResolver | None = None,
     ) -> None:
+        """
+        :param additional_instructions: Server-configured title guidance.
+        :param user_instructions: Optional lookup of the session owner's saved
+            guidance, called off the event loop with the session id.
+        """
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
         self._conversation_store = conversation_store
@@ -141,6 +173,7 @@ class BackgroundSessionTitleCoordinator:
         self._timeout_seconds = timeout_seconds
         self._seed_wait_seconds = seed_wait_seconds
         self._additional_instructions = additional_instructions
+        self._user_instructions = user_instructions
         self._generation_slots = asyncio.Semaphore(max_concurrency)
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
@@ -153,9 +186,10 @@ class BackgroundSessionTitleCoordinator:
         Generation failures leave the existing title intact rather than falling
         back to a proposal that may violate the configured format.
         """
-        if not self._additional_instructions or not self._additional_instructions.strip():
+        instructions = await self.instructions_for_session(request.session_id)
+        if instructions is None:
             return request.prompt
-        request = replace(request, additional_instructions=self._additional_instructions)
+        request = replace(request, additional_instructions=instructions)
         try:
             async with asyncio.timeout(self._timeout_seconds), self._generation_slots:
                 return await self._generate_title(request)
@@ -166,6 +200,24 @@ class BackgroundSessionTitleCoordinator:
                 exc_info=True,
             )
             return None
+
+    async def instructions_for_session(self, session_id: str) -> str | None:
+        """Return the server and session-owner title guidance for one session.
+
+        A failed owner lookup falls back to the server guidance alone so a
+        settings outage never blocks titles.
+        """
+        user_instructions = None
+        if self._user_instructions is not None:
+            try:
+                user_instructions = await asyncio.to_thread(self._user_instructions, session_id)
+            except Exception:
+                _logger.warning(
+                    "user session title instructions unavailable session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+        return compose_session_title_instructions(self._additional_instructions, user_instructions)
 
     async def _generate_title(self, request: BackgroundTitleRequest) -> str | None:
         generated = await asyncio.wait_for(
@@ -209,7 +261,6 @@ class BackgroundSessionTitleCoordinator:
                     harness_override=harness_override,
                     model_override=model_override,
                     sub_agent_name=sub_agent_name,
-                    additional_instructions=self._additional_instructions,
                 ),
                 expected_seed_title=expected_seed_title,
             ),
@@ -293,6 +344,12 @@ class BackgroundSessionTitleCoordinator:
                         extra={"session_id": request.session_id},
                     )
                     return
+                request = replace(
+                    request,
+                    additional_instructions=await self.instructions_for_session(
+                        request.session_id
+                    ),
+                )
                 title = await self._generate_title(request)
             if title is None:
                 _logger.info(

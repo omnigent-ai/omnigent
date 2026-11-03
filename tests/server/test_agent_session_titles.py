@@ -269,3 +269,38 @@ async def test_agent_rename_requires_edit_access(
     )
     assert response.status_code == expected_status, response.text
     assert generator.await_count == (1 if expected_status == 200 else 0)
+
+
+async def test_agent_rename_adds_session_owner_instructions(
+    title_app: FastAPI,
+    title_client: httpx.AsyncClient,
+    title_session: Conversation,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = await title_client.put(
+        "/v1/settings/session-title-instructions",
+        json={"instructions": "End every title with the ticket id."},
+    )
+    assert saved.status_code == 200, saved.text
+    # Another user's setting must not reach the owner's session.
+    other = await title_client.put(
+        "/v1/settings/session-title-instructions",
+        json={"instructions": "Write titles in French."},
+        headers={"X-Forwarded-Email": "someone-else@example.test"},
+    )
+    assert other.status_code == 200, other.text
+    generator = AsyncMock(return_value="sep-13-PR-123-resolve-conflict-OMNI-1")
+    monkeypatch.setattr(title_app.state.background_title_coordinator, "_generator", generator)
+
+    response = await title_client.post(
+        f"/v1/sessions/{title_session.id}/agent-title",
+        json={"title": "Resolve PR 123 conflict"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "sep-13-PR-123-resolve-conflict-OMNI-1"
+    instructions = generator.call_args.args[0].additional_instructions
+    assert instructions.startswith(_TITLE_INSTRUCTIONS)
+    assert instructions.endswith("\nEnd every title with the ticket id.")
+    assert "French" not in instructions
