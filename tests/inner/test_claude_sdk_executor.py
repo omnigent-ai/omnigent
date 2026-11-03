@@ -6112,28 +6112,29 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("started_with", "now", "rebuilt"),
+    ("granted", "started_with", "now", "rebuilt"),
     [
-        pytest.param((7, 100), (7, 200), True, id="replaced-under-bwrap"),
-        pytest.param((0, 0), (7, 200), True, id="signed-in-after-start"),
-        pytest.param((7, 100), (7, 100), False, id="unchanged"),
-        pytest.param(None, (7, 200), False, id="cli-not-bind-mounted"),
+        pytest.param(True, (7, 100), (7, 200), True, id="replaced-under-bwrap"),
+        pytest.param(True, (0, 0), (7, 200), True, id="granted-absent-at-start"),
+        pytest.param(True, (7, 100), (7, 100), False, id="unchanged"),
+        pytest.param(False, None, (7, 200), False, id="file-created-after-wrapper"),
     ],
 )
 async def test_sandboxed_cli_restarts_after_its_credentials_file_is_replaced(
     monkeypatch: pytest.MonkeyPatch,
+    granted: bool,
     started_with: tuple[int, int] | None,
     now: tuple[int, int],
     rebuilt: bool,
 ) -> None:
-    """A bwrap CLI that can no longer write its sign-in is replaced before the next turn."""
+    """A CLI whose wrapper granted the credentials file restarts once the file changes."""
     from omnigent.inner import claude_sdk_executor as module
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 
     fake_sdk = _make_recovery_fake_sdk()
     executor = ClaudeSDKExecutor()
     monkeypatch.setattr(module, "_claude_credentials_identity", lambda: now)
-    monkeypatch.setattr(executor, "_cli_bind_mounts_credentials", lambda: True)
+    monkeypatch.setattr(executor, "_cli_bind_mounts_credentials", lambda: granted)
 
     old_client = fake_sdk.ClaudeSDKClient(options=None)
     fake_sdk.created_clients.clear()
@@ -6198,24 +6199,48 @@ async def test_compact_runs_on_the_existing_cli_even_after_credentials_change(
 
 
 @pytest.mark.parametrize(
-    ("wrapper", "platform", "expected"),
+    ("wrapper", "platform", "granted", "expected"),
     [
-        pytest.param("/tmp/claude-wrapper", "linux", True, id="bwrap"),
-        pytest.param("/tmp/claude-wrapper", "darwin", False, id="seatbelt-is-path-based"),
-        pytest.param(None, "linux", False, id="unwrapped"),
+        pytest.param("/tmp/claude-wrapper", "linux", True, True, id="bwrap"),
+        pytest.param("/tmp/claude-wrapper", "linux", False, False, id="file-absent-at-build"),
+        pytest.param("/tmp/claude-wrapper", "darwin", True, False, id="seatbelt-is-path-based"),
+        pytest.param(None, "linux", True, False, id="unwrapped"),
     ],
 )
 def test_only_a_bwrap_wrapped_cli_bind_mounts_its_credentials(
-    monkeypatch: pytest.MonkeyPatch, wrapper: str | None, platform: str, expected: bool
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str | None,
+    platform: str,
+    granted: bool,
+    expected: bool,
 ) -> None:
-    """Only bwrap's file binds go stale on rename; other CLIs are never restarted for it."""
+    """Only a bwrap wrapper built while the credentials file existed binds it."""
     from omnigent.inner import claude_sdk_executor as module
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
     executor = ClaudeSDKExecutor()
     executor._cli_wrapper_path = wrapper
+    executor._wrapper_grants_credentials = granted
     monkeypatch.setattr(module.sys, "platform", platform)
     assert executor._cli_bind_mounts_credentials() is expected
+
+
+def test_wrapper_grant_is_decided_when_the_executor_is_built(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A credentials file created after the executor was built is not granted to its wrapper."""
+    from omnigent.inner import claude_sdk_executor as module
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(module, "_find_system_claude", lambda: None)
+    executor = ClaudeSDKExecutor()
+    credentials = tmp_path / ".claude" / ".credentials.json"
+    credentials.parent.mkdir()
+    credentials.write_text("{}")
+
+    assert executor._wrapper_grants_credentials is False
+    assert ClaudeSDKExecutor()._wrapper_grants_credentials is True
 
 
 def test_claude_credentials_identity_changes_when_the_file_is_replaced(

@@ -901,7 +901,7 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
-    # Set for a bwrap-sandboxed CLI: the credentials file it was started with.
+    # Set when the CLI's wrapper grants the credentials file: its identity at start.
     sandboxed_credentials: tuple[int, int] | None = None
 
 
@@ -1873,6 +1873,8 @@ class ClaudeSDKExecutor(Executor):
         # The bundled CLI may be older and send beta flags that the
         # Databricks gateway doesn't support.
         self._cli_wrapper_path: str | None = None
+        # The wrapper's bwrap grant covers the credentials file only if it exists now.
+        self._wrapper_grants_credentials = _claude_credentials_file().exists()
         self._cli_path: str | None = _find_system_claude()
         if self._cli_path:
             if self._os_env_spec is not None:
@@ -2015,7 +2017,7 @@ class ClaudeSDKExecutor(Executor):
 
             options.stderr = _tee_stderr
             client = sdk.ClaudeSDKClient(options)
-            # bwrap binds the credentials file as it is now; see _credentials_replaced.
+            # A restarted CLI binds the credentials file as it is now; see _credentials_replaced.
             sandboxed_credentials = (
                 _claude_credentials_identity() if self._cli_bind_mounts_credentials() else None
             )
@@ -2161,8 +2163,16 @@ class ClaudeSDKExecutor(Executor):
         task.add_done_callback(self._cancel_close_tasks.discard)
 
     def _cli_bind_mounts_credentials(self) -> bool:
-        """Whether the CLI runs under bwrap, which binds its credentials file by path."""
-        return self._cli_wrapper_path is not None and sys.platform == "linux"
+        """Whether this CLI's wrapper binds its credentials file, by path, under bwrap.
+
+        A file created after the wrapper was built is not granted to it, so a
+        restarted CLI could not bind it; only a granted file is tracked.
+        """
+        return (
+            self._cli_wrapper_path is not None
+            and self._wrapper_grants_credentials
+            and sys.platform == "linux"
+        )
 
     def _credentials_replaced(self, state: _ClaudeClientState) -> bool:
         """Whether a sandboxed CLI's credentials file was replaced after it started.
