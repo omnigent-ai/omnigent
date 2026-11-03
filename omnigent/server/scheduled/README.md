@@ -602,11 +602,21 @@ can share a timestamp with a scheduled run without being duplicates.
 The executor scopes ordinary server logs and child tasks with occurrence IDs,
 `target`, and `session_mode`. Managed startup inputs persist these fields in
 `startup_options` and restore them on the delivering replica, including after a
-restart. They are not forwarded as prompt content. Correlation is limited to
-server-side work; host and runner logs still join by their existing session and
-runner identifiers. Session-wide server relays clear occurrence context so later
-interactive traffic is not attributed to the automation. Legacy timers and saved
-inputs created before this instrumentation do not have the new delivery correlation.
+restart. They are not forwarded as prompt content. Host launch frames and runner HTTP requests carry the same context. The host
+scopes launch logs and the runner scopes request logs; shared clients stamp each
+request separately, and interactive requests clear the occurrence fields. Buffered inputs
+retain their own occurrence (or explicit absence) through queue drains and sign-in
+retries. Telemetry does not change live steering or SDK queue coalescing. An
+interactive correction can still steer an active automation turn. Ordinary execution
+logs retain the initiating turn's context. A batch combining different input
+contexts has no single turn occurrence. These logs do not divide model output or
+execution cost among inputs.
+Session-wide relays and prompt/sign-in watchers clear occurrence context. Host
+exit watchers retain launch attribution only for confirmed pre-connect failures. No
+process-wide run ID is installed: continued sessions can serve multiple runs and
+interactive turns. Unrelated host heartbeats and process-lifecycle logs still
+join by host, runner, or session ID. Legacy timers and saved inputs created before this instrumentation do
+not have the new delivery correlation.
 
 | Event | Logged when | Extra attributes |
 | --- | --- | --- |
