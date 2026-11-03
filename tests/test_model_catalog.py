@@ -1410,6 +1410,43 @@ def test_cli_config_listing_is_static_and_unverified(
     assert "cannot run here" not in listing.note
 
 
+def test_genie_lists_its_pinned_catalog_with_per_model_efforts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A genie worker lists genie's catalog slugs, not the provider's endpoints.
+
+    Genie silently swaps a model its catalog lacks, so the provider listing
+    (``databricks-*`` endpoint names) is not what the worker can run.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.models.genie_catalog import GENIE_CATALOG_VERSION
+
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    listing = list_models_for_worker(_worker_spec("genie"), "genie")
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert f"Genie {GENIE_CATALOG_VERSION}" in listing.note
+    assert [model.id for model in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
+    ]
+    efforts = {
+        model.id: model.metadata.reasoning.efforts
+        for model in listing.models
+        if model.metadata.reasoning is not None
+    }
+    assert efforts["gpt-5.6-sol"] == {"low", "medium", "high", "xhigh", "max", "ultra"}
+    assert efforts["gpt-5.5"] == {"low", "medium", "high", "xhigh"}
+    assert all(model.metadata.context_window == 272_000 for model in listing.models)
+
+
 _CLI_LOGIN_CLAUDE_IDS = ["claude-sonnet-5-5", "claude-opus-5-5"]
 _CLI_LOGIN_CODEX_IDS = ["gpt-6.1-sol", "gpt-6-astra"]
 _CODEX_SUBSCRIPTION_CONFIG = (

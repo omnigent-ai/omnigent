@@ -613,12 +613,13 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # Genie is Databricks' fork of the codex CLI, driven over the identical
-    # app-server protocol; same capabilities as codex.
+    # app-server protocol; same capabilities as codex except the effort
+    # vocabulary, which follows genie's bundled catalog.
     "genie": _C(
         _IM.CLI_SUBPROCESS,
         _EL.JSONRPC,
         _RS.WARM_REATTACH,
-        _EF.OPENAI,
+        _EF.GENIE,
         _MF.GPT,
         _AU.OMNIGENT_CREDENTIAL,
         subagents=False,

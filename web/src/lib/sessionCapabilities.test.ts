@@ -61,6 +61,8 @@ describe("effortLevelsForFamily", () => {
       "xhigh",
       "max",
     ]);
+    // Genie's pinned catalog never lists none/minimal; max/ultra are 5.6-only.
+    expect(effortLevelsForFamily("genie")).toEqual(["low", "medium", "high", "xhigh"]);
   });
 
   it("offers no ladder for none, codex-native (per-model), unknown, or absent", () => {

@@ -35,13 +35,17 @@ const DEVIN_NATIVE_WRAPPER = "devin-native-ui";
 // Reasoning-effort ladder per server ``EffortFamily`` (``/v1/harnesses`` →
 // ``capabilities.effort``). Mirrors ``omnigent/util/reasoning_effort.py``;
 // ``codex-native`` is per-model and ``none`` has no ladder, so neither is here.
-// ``ultra`` is omitted from ``pi`` as it aliases to ``max``.
+// ``ultra`` is omitted from ``pi`` as it aliases to ``max``. ``genie`` offers
+// only the rungs every model in its pinned catalog
+// (``omnigent/models/genie_catalog.py``) supports; ``max`` / ``ultra`` exist on
+// its 5.6 models alone.
 const EFFORT_FAMILY_LEVELS: Readonly<Record<string, readonly string[]>> = {
   anthropic: ["low", "medium", "high", "xhigh", "max"],
   openai: ["none", "minimal", "low", "medium", "high", "xhigh"],
   gemini: ["low", "medium", "high"],
   copilot: ["low", "medium", "high", "xhigh"],
   pi: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  genie: ["low", "medium", "high", "xhigh"],
 };
 
 /**

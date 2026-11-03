@@ -3005,6 +3005,48 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+def _model_list_entry(entries: list[CodexParams], model: str) -> CodexParams | None:
+    """Return the ``model/list`` entry whose ``model`` is exactly *model*, if any."""
+    return next((entry for entry in entries if entry.get("model") == model), None)
+
+
+def _model_catalog_error(
+    entries: list[CodexParams],
+    model: str,
+    effort: str | None,
+    *,
+    cli_name: str,
+) -> str | None:
+    """Explain why *model* or *effort* falls outside the app-server's ``model/list``.
+
+    :param entries: ``model/list`` entries, e.g. ``[{"model": "gpt-5.5",
+        "supportedReasoningEfforts": [{"reasoningEffort": "low"}, ...]}]``.
+    :param model: Requested model slug, e.g. ``"gpt-5.4-mini"``.
+    :param effort: Requested effort, e.g. ``"max"``; ``None`` keeps the default.
+    :param cli_name: CLI named in the message, e.g. ``"genie"``.
+    :returns: A user-facing error, or ``None`` when both are offered. A model
+        that lists no efforts accepts any effort.
+    """
+    entry = _model_list_entry(entries, model)
+    if entry is None:
+        offered = ", ".join(str(listed.get("model")) for listed in entries)
+        return (
+            f"{cli_name} does not offer model {model!r} and would silently run its "
+            f"default model instead. Choose one of: {offered}."
+        )
+    efforts = [
+        level.get("reasoningEffort")
+        for level in entry.get("supportedReasoningEfforts") or []
+        if isinstance(level, dict)
+    ]
+    if effort is None or not efforts or effort in efforts:
+        return None
+    return (
+        f"{cli_name} model {model!r} does not support reasoning effort {effort!r}. "
+        f"Choose one of: {', '.join(str(level) for level in efforts)}."
+    )
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -3027,6 +3069,8 @@ class _CodexAppServerSession:
         home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
         config_overrides_in_file: bool = False,
         brokered_catalog_probe: bool = True,
+        effort_vocabulary: frozenset[str] = CODEX_EFFORTS,
+        strict_model_catalog: bool = False,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -3057,8 +3101,14 @@ class _CodexAppServerSession:
         # Write overrides into the private config.toml instead of passing
         # ``-c``, for CLIs that deny ``-c`` (the genie fork).
         self._config_overrides_in_file = config_overrides_in_file
-        # The fork has no ``debug models`` command; its catalog is compiled in.
+        # The fork has no ``debug models`` command to write a brokered catalog.
         self._brokered_catalog_probe = brokered_catalog_probe
+        # Efforts a copied ``model_reasoning_effort`` may keep unchanged.
+        self._effort_vocabulary = effort_vocabulary
+        # Reject a thread model or effort the app-server's ``model/list`` does
+        # not offer, for a CLI that would otherwise swap the model silently.
+        self._strict_model_catalog = strict_model_catalog
+        self._model_list_entries: list[CodexParams] | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -3237,6 +3287,7 @@ class _CodexAppServerSession:
             minimal_config=True if self._signer is not None else None,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
+            supported_efforts=self._effort_vocabulary,
             include_credentials=self._signer is None,
             required_brokered_probe=(
                 (
@@ -3860,6 +3911,26 @@ class _CodexAppServerSession:
             if phase == "final_answer":
                 return final_response
 
+    async def _list_models(self) -> list[CodexParams]:
+        """Return every ``model/list`` entry, hidden ones included, fetched once per session."""
+        if self._model_list_entries is None:
+            entries: list[CodexParams] = []
+            params: CodexParams = {"includeHidden": True}
+            seen_cursors: set[str] = set()
+            while True:
+                response = await self._request("model/list", params.copy())
+                result = response.get("result", {})
+                entries.extend(
+                    entry for entry in result.get("data", []) if isinstance(entry, dict)
+                )
+                cursor = result.get("nextCursor")
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    break
+                seen_cursors.add(cursor)
+                params["cursor"] = cursor
+            self._model_list_entries = entries
+        return self._model_list_entries
+
     async def _resolve_default_effort(self) -> str:
         """Resolve the thread's original configured or model-default effort."""
         if self._default_effort is not None:
@@ -3867,22 +3938,13 @@ class _CodexAppServerSession:
         # Null is a no-op for both settings/update and legacy turn/start.
         # Resolve an explicit value without replacing the thread or its history.
         if self._thread_model is not None:
-            params: CodexParams = {"includeHidden": True}
-            seen_cursors: set[str] = set()
-            while True:
-                response = await self._request("model/list", params.copy())
-                result = response.get("result", {})
-                for entry in result.get("data", []):
-                    if entry.get("model") == self._thread_model:
-                        effort = entry.get("defaultReasoningEffort")
-                        if isinstance(effort, str) and effort:
-                            self._default_effort = effort
-                            return effort
-                cursor = result.get("nextCursor")
-                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
-                    break
-                seen_cursors.add(cursor)
-                params["cursor"] = cursor
+            entry = _model_list_entry(await self._list_models(), self._thread_model)
+            effort = entry.get("defaultReasoningEffort") if entry is not None else None
+            if isinstance(effort, str) and effort:
+                self._default_effort = effort
+                return effort
+            # Re-read the catalog on retry rather than replaying this miss.
+            self._model_list_entries = None
         raise RuntimeError(
             f"Cannot restore Codex default reasoning effort for {self._thread_model!r}: "
             "the app-server did not provide a default. Select an explicit effort or "
@@ -3917,6 +3979,17 @@ class _CodexAppServerSession:
         native_forwarder_health.note_post_success()
 
         is_new_thread = self.thread_id is None
+        catalog_model = model if is_new_thread else self._thread_model
+        if self._strict_model_catalog and catalog_model is not None:
+            catalog_error = _model_catalog_error(
+                await self._list_models(),
+                catalog_model,
+                reasoning_effort,
+                cli_name=Path(self._codex_path).name,
+            )
+            if catalog_error is not None:
+                yield ExecutorError(message=catalog_error, retryable=False)
+                return
         if is_new_thread:
             params: CodexParams = {
                 "approvalPolicy": "never",
@@ -3962,6 +4035,17 @@ class _CodexAppServerSession:
             self._thread_usage_total_raw = None
             self._thread_usage_baseline_raw = None
             self._last_turn_usage = None
+            if self._strict_model_catalog and model is not None and self._thread_model != model:
+                # Drop the thread so the next turn does not continue on the substitute.
+                self.thread_id = None
+                yield ExecutorError(
+                    message=(
+                        f"{Path(self._codex_path).name} replaced the requested model "
+                        f"{model!r} with {self._thread_model!r}. Choose a model it offers."
+                    ),
+                    retryable=False,
+                )
+                return
 
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
@@ -4817,6 +4901,8 @@ def _default_app_session_factory(
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
     brokered_catalog_probe: bool = True,
+    effort_vocabulary: frozenset[str] = CODEX_EFFORTS,
+    strict_model_catalog: bool = False,
     home_env_var: str,
     home_dir_name: str,
     config_overrides_in_file: bool,
@@ -4850,10 +4936,16 @@ def _default_app_session_factory(
         home_dir_name=home_dir_name,
         config_overrides_in_file=config_overrides_in_file,
         brokered_catalog_probe=brokered_catalog_probe,
+        effort_vocabulary=effort_vocabulary,
+        strict_model_catalog=strict_model_catalog,
     )
 
 
 class CodexExecutor(Executor):
+    # Harness name and effort vocabulary a requested reasoning effort is
+    # validated against. Overridden by the genie fork.
+    _effort_harness = "codex"
+    _effort_vocabulary = CODEX_EFFORTS
     # The ``--version`` CLI name and lowest release verified against the
     # brokered signer, and whether ``debug models --bundled`` can write the
     # brokered catalog. Overridden by the genie fork.
@@ -5002,7 +5094,11 @@ class CodexExecutor(Executor):
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._env.update(self._retry_policy.codex_cli.env())
         self._codex_config_overrides: list[str] = []
+        # Base URL of the provider Omnigent writes into the CLI config, when it
+        # writes one (brokered or gateway routing).
+        self._provider_base_url: str | None = None
         if signer_launch_config is not None:
+            self._provider_base_url = signer_launch_config.endpoint
             if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
                 raise OSError("signer-backed Codex worker requires an active sandbox")
             if os_env.sandbox.egress_rules:
@@ -5121,6 +5217,7 @@ class CodexExecutor(Executor):
             # token`` fallback auth command; harmless for a generic gateway
             # whose auth command is a static ``printf %s <key>``.
             self._env["DATABRICKS_HOST"] = host
+            self._provider_base_url = base_url
             self._codex_config_overrides.extend(
                 _databricks_codex_config_overrides(
                     model=self._cli_model_id(effective_model),
@@ -5146,8 +5243,18 @@ class CodexExecutor(Executor):
                     _default_app_session_factory,
                     signer_launch_config=signer_launch_config,
                     brokered_catalog_probe=self._brokered_catalog_probe,
+                    effort_vocabulary=self._effort_vocabulary,
+                    strict_model_catalog=self._requires_catalog_models(),
                 ),
             )
+
+    def _requires_catalog_models(self) -> bool:
+        """Whether a model or effort outside the CLI's ``model/list`` is rejected.
+
+        False for codex, whose backend answers for an unknown model itself.
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor`.
+        """
+        return False
 
     def _find_cli(self) -> str | None:
         """Resolve the wrapped CLI binary when no explicit path was given.
@@ -5162,7 +5269,7 @@ class CodexExecutor(Executor):
 
         Identity for codex. Overridden by
         :class:`~omnigent.inner.genie_executor.GenieExecutor`, whose CLI only
-        honors models in its bundled catalog.
+        honors models its catalog lists by slug.
         """
         return model
 
@@ -5387,7 +5494,7 @@ class CodexExecutor(Executor):
         )
         try:
             reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "codex", CODEX_EFFORTS
+                cfg.extra.get("reasoning_effort"), self._effort_harness, self._effort_vocabulary
             )
         except ValueError as exc:
             yield ExecutorError(message=describe_exception(exc), retryable=False)
