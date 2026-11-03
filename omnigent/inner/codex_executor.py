@@ -41,7 +41,10 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.databricks_ai_gateway import (
+    CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
+    CODING_AGENT_HEADER,
+    REQUEST_TAGS_HEADER,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
 )
@@ -69,6 +72,7 @@ from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, COD
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
@@ -1298,6 +1302,8 @@ def materialize_codex_provider_config(
     *,
     retry_policy: RetryPolicy | None = None,
     source_home: Path | None = None,
+    effective_providers: Mapping[str, object] | None = None,
+    client_surface: str | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1317,11 +1323,25 @@ def materialize_codex_provider_config(
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :param source_home: Optional host config source for a selected custom provider
         missing from a reused private home. Existing private provider tables win.
+    :param effective_providers: Provider tables resolved by Codex's ``config/read``.
+        Only attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
+    from omnigent.onboarding.codex_auth_readiness import (
+        CODEX_BUILTIN_PROVIDERS,
+        effective_codex_model_provider,
+    )
+
+    gateway_providers = {
+        name: provider
+        for name, provider in (effective_providers or {}).items()
+        if isinstance(provider, Mapping)
+        and isinstance(base_url := provider.get("base_url"), str)
+        and is_databricks_ai_gateway_url(base_url)
+    }
 
     provider_overrides: list[str] = []
     argv_overrides: list[str] = []
@@ -1330,7 +1350,12 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file() and source_home is None:
+    if (
+        not provider_overrides
+        and not config_path.is_file()
+        and source_home is None
+        and not gateway_providers
+    ):
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1357,11 +1382,6 @@ def materialize_codex_provider_config(
                 raise ValueError("Codex provider override must define model_providers")
             for provider_name, provider_config in generated.items():
                 providers[provider_name] = provider_config
-
-    from omnigent.onboarding.codex_auth_readiness import (
-        CODEX_BUILTIN_PROVIDERS,
-        effective_codex_model_provider,
-    )
 
     if source_home is not None:
         selected: object = effective_codex_model_provider(document.unwrap())
@@ -1407,10 +1427,20 @@ def materialize_codex_provider_config(
                 # ``model_providers`` parent still serializes as valid TOML.
                 providers[selected] = source_provider
 
+    if providers is None and gateway_providers:
+        providers = tomlkit.table()
+        document["model_providers"] = providers
+
     if providers is None:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
+
+    for provider_name in gateway_providers:
+        if provider_name in providers or provider_name in CODEX_BUILTIN_PROVIDERS:
+            continue
+        # A partial table adds metadata; Codex still owns routing and auth.
+        providers[provider_name] = tomlkit.inline_table()
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1428,12 +1458,38 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
-        base_url = provider_config.get("base_url")
+        resolved = (effective_providers or {}).get(provider_name)
+        effective = resolved if isinstance(resolved, Mapping) else provider_config
+        base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
             headers = provider_config.get("http_headers")
-            provider_config["http_headers"] = with_gateway_attribution(
-                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+            effective_headers = effective.get("http_headers")
+            attributed = with_gateway_attribution(
+                effective_headers if isinstance(effective_headers, Mapping) else None,
+                CODEX_AGENT,
+                base_url,
+                client_surface=client_surface,
             )
+            attribution_headers = {
+                name: value
+                for name, value in attributed.items()
+                if name.lower()
+                in (
+                    CODING_AGENT_HEADER.lower(),
+                    CLIENT_SURFACES_HEADER.lower(),
+                    REQUEST_TAGS_HEADER.lower(),
+                )
+            }
+            replaced_header_names = {name.lower() for name in attribution_headers}
+            # Codex retains inherited routing and credentials; write only attribution.
+            provider_config["http_headers"] = {
+                **{
+                    name: value
+                    for name, value in (headers.items() if isinstance(headers, Mapping) else ())
+                    if name.lower() not in replaced_header_names
+                },
+                **attribution_headers,
+            }
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -3064,11 +3120,25 @@ class _CodexAppServerSession:
                 else None
             ),
         )
-        self._codex_config_overrides = materialize_codex_provider_config(
-            self._codex_home_dir,
-            self._codex_config_overrides,
-            retry_policy=self._retry_policy,
-        )
+        if self._signer is None:
+            from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
+
+            self._codex_config_overrides = await prepare_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                codex_path=self._codex_path,
+                cwd=Path(self._cwd or os.getcwd()),
+                env=self._env,
+                retry_policy=self._retry_policy,
+                client_surface=harness_client_surface(),
+            )
+        else:
+            # The signer replaces gateway attribution from its own launch metadata.
+            self._codex_config_overrides = materialize_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                retry_policy=self._retry_policy,
+            )
         if self._signer is not None:
             self._codex_config_overrides.extend(
                 [

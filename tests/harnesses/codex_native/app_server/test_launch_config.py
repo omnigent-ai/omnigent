@@ -32,8 +32,20 @@ from tests.harnesses.codex_native.app_server._support import (
 
 
 @pytest.mark.parametrize("reused_home", [False, True], ids=["fresh", "resumed"])
+@pytest.mark.parametrize(
+    "source_url,expected_agent",
+    [
+        ("https://source.example.test/v1", None),
+        ("https://ws.cloud.databricks.com/ai-gateway/codex/v1", "codex"),
+    ],
+    ids=["generic", "gateway"],
+)
 async def test_start_keeps_selected_source_provider_available_in_private_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reused_home: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reused_home: bool,
+    source_url: str,
+    expected_agent: str | None,
 ) -> None:
     """A resumed private config can predate the host's selected provider."""
     source = tmp_path / "source"
@@ -41,7 +53,7 @@ async def test_start_keeps_selected_source_provider_available_in_private_home(
     original = (
         'model_provider = "gateway"\nmodel = "source-model"\n'
         '[model_providers.gateway]\nname = "Gateway"\n'
-        'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        f'base_url = "{source_url}"\nwire_api = "responses"\n'
         'env_key = "SYNTHETIC_PROVIDER_KEY"\n'
         '[model_providers.gateway.auth]\ncommand = "sh"\nargs = ["-c", "printf token"]\n'
     )
@@ -61,8 +73,12 @@ async def test_start_keeps_selected_source_provider_available_in_private_home(
     try:
         config = tomllib.loads((private / "config.toml").read_text())
         gateway = config["model_providers"]["gateway"]
-        assert gateway["base_url"] == "https://source.example.test/v1"
+        assert gateway["base_url"] == source_url
         assert gateway["auth"]["args"] == ["-c", "printf token"]
+        if expected_agent is not None:
+            assert gateway["http_headers"]["Databricks-Custom-Coding-Agent"] == expected_agent
+        else:
+            assert "http_headers" not in gateway
         assert config["model"] == ("private-model" if reused_home else "source-model")
         if reused_home:
             assert config["model_providers"]["existing"]["name"] == "Existing"
