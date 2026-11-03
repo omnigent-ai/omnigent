@@ -10,8 +10,9 @@ export function listedSideChatsQueryKey(conversationId: string) {
 
 /**
  * The ids of the user's generic side chats the server lists on a session,
- * oldest first, or null until they load. Refetched when the window regains
- * focus, so side chats opened or closed on another device show up on return.
+ * oldest first, or null until they load or when the server doesn't list side
+ * chats. Refetched when the window regains focus, so side chats opened or
+ * closed on another device show up on return.
  *
  * @param conversationId The parent session, e.g. "conv_abc123".
  */

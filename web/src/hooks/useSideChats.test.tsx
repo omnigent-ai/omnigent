@@ -174,15 +174,42 @@ describe("side chats the server lists", () => {
     expect(result.current.selected).toBe("conv_a");
   });
 
-  it("stay closed when a list fetched before the close still names them", () => {
-    const { result } = renderHook(() => useSideChats("session-a"));
-    act(() => result.current.sync(["conv_a"]));
-    act(() => result.current.close("conv_a"));
+  it.each([
+    [
+      "after a sync",
+      (hook: SideChatsHook) => {
+        hook.sync(["conv_a"]);
+        hook.close("conv_a");
+      },
+    ],
+    [
+      "before any sync",
+      (hook: SideChatsHook) => {
+        hook.open("conv_a");
+        hook.close("conv_a");
+        hook.sync([]);
+      },
+    ],
+    [
+      "on another device",
+      (hook: SideChatsHook) => {
+        hook.sync(["conv_a"]);
+        hook.sync([]);
+      },
+    ],
+  ])(
+    "stay closed when a list another window fetched before closing them %s arrives",
+    (_when, closeTab) => {
+      const first = renderHook(() => useSideChats("session-a"));
+      const second = renderHook(() => useSideChats("session-a"));
+      act(() => closeTab(first.result.current));
 
-    act(() => result.current.sync(["conv_a"]));
+      act(() => second.result.current.sync(["conv_a"]));
 
-    expect(result.current.tabs).toEqual([]);
-  });
+      expect(second.result.current.tabs).toEqual([]);
+      expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
+    },
+  );
 
   it("keep a side chat opened here before the list includes it, without duplicating it", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
@@ -314,11 +341,16 @@ describe("side-chat tabs when storage writes fail", () => {
   });
 
   it.each([
-    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"]],
-    ["opens a tab", (hook: SideChatsHook) => hook.open("conv_y"), ["conv_z", "conv_y", "conv_x"]],
+    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"], ["conv_z"]],
+    [
+      "opens a tab",
+      (hook: SideChatsHook) => hook.open("conv_y"),
+      ["conv_z", "conv_y", "conv_x"],
+      undefined,
+    ],
   ])(
     "replay an unsaved change on top of what another window then %s",
-    (_change, otherWindowChange, sideChats) => {
+    (_change, otherWindowChange, sideChats, closedSideChats) => {
       const subagentTab = subagentTabId("conv_child");
       const first = renderHook(() => useSideChats("session-a"));
       act(() => first.result.current.open("conv_z"));
@@ -337,6 +369,7 @@ describe("side-chat tabs when storage writes fail", () => {
         openSideChats: sideChats,
         openSubagentTabs: [subagentTab],
         selectedSideChatId: subagentTab,
+        closedSideChats,
       });
     },
   );

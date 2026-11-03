@@ -1310,7 +1310,9 @@ describe("history a generic side chat copied from its parent", () => {
         resolveOlder = resolve;
       }),
     );
+    // History opened elsewhere already loaded more than the fetched page.
     showChild([
+      message("item_parent_old", "user", "Older parent question"),
       message("item_parent_q", "user", "Parent question"),
       message("item_parent_a", "assistant", "Parent answer"),
       ...sideChatTurn,
@@ -1322,12 +1324,13 @@ describe("history a generic side chat copied from its parent", () => {
     await act(async () =>
       resolveOlder({
         items: [message("item_parent_q", "user", "Parent question")],
-        hasMore: false,
+        hasMore: true,
       }),
     );
 
     expect(await screen.findByText("Side question")).toBeInTheDocument();
     expect(screen.getByText("Side answer")).toBeInTheDocument();
+    expect(screen.queryByText("Older parent question")).toBeNull();
     expect(screen.queryByText("Parent question")).toBeNull();
     expect(screen.queryByText("Parent answer")).toBeNull();
     expect(fetchOlder).toHaveBeenCalledWith(childId, {
@@ -1337,6 +1340,7 @@ describe("history a generic side chat copied from its parent", () => {
     expect(JSON.parse(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)!)).toEqual([
       "item_parent_a",
       "item_parent_q",
+      "item_parent_old",
     ]);
   });
 

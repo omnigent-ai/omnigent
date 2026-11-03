@@ -168,6 +168,13 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_parent").openSubagentTabs).toEqual(tabs.slice(5));
   });
 
+  it("remembers the 20 side chats closed most recently", () => {
+    const closed = Array.from({ length: 25 }, (_, i) => `conv_${i}`);
+    writeSessionWorkspaceState("conv_parent", { closedSideChats: closed });
+
+    expect(readSessionWorkspaceState("conv_parent").closedSideChats).toEqual(closed.slice(5));
+  });
+
   it("reports whether storage accepted a save", () => {
     expect(saveSessionWorkspaceState("conv_a", { open: true })).toBe(true);
 
@@ -230,6 +237,7 @@ describe("sessionWorkspaceState", () => {
           state: {
             openSubagentTabs: ["subagent:a", "", 7, "subagent:a", "subagent:b"],
             syncedSideChats: ["conv_x", 7, "conv_x"],
+            closedSideChats: ["conv_y", null, "conv_y"],
           },
         },
       ]),
@@ -237,6 +245,7 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_c")).toEqual({
       openSubagentTabs: ["subagent:a", "subagent:b"],
       syncedSideChats: ["conv_x"],
+      closedSideChats: ["conv_y"],
     });
   });
 });

@@ -1494,6 +1494,31 @@ describe("WorkspacePanel side chats from the user's other devices", () => {
     }
   });
 
+  it("keeps listed side chats open when the server stops listing them", async () => {
+    vi.mocked(sessionsApi.listSideChats).mockResolvedValue([{ id: "conv_remote", createdAt: 1 }]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+    expect(await screen.findByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
+    vi.mocked(sessionsApi.listSideChats).mockResolvedValue(null);
+
+    try {
+      act(() => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+      });
+      await waitFor(() => expect(sessionsApi.listSideChats).toHaveBeenCalledTimes(2));
+      await act(async () => {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      });
+    } finally {
+      focusManager.setFocused(undefined);
+    }
+
+    expect(screen.getByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws")?.openSideChats).toEqual(["conv_remote"]);
+  });
+
   it("stops listing a side chat closed here, and keeps it open if that fails", async () => {
     writeSessionWorkspaceState("conv_ws", {
       openSideChats: ["conv_side_a", "conv_side_b"],

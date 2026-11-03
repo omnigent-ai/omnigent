@@ -12,6 +12,8 @@ interface SideChatTabsState {
   selected: string | null;
   /** The server's side-chat list at the last {@link useSideChats} `sync`. */
   synced: string[];
+  /** Side chats closed in this browser, so a list fetched before the close can't reopen them. */
+  closed: string[];
 }
 
 type TabsChange = (current: SideChatTabsState) => SideChatTabsState;
@@ -30,6 +32,7 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
     subagentTabs,
     selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
     synced: saved.syncedSideChats ?? [],
+    closed: saved.closedSideChats ?? [],
   };
 }
 
@@ -47,6 +50,13 @@ function withoutTab(current: SideChatTabsState, childId: string): SideChatTabsSt
     subagentTabs: current.subagentTabs.filter((id) => id !== childId),
     selected,
   };
+}
+
+/** {@link withoutTab}, remembering a closed side-chat tab so no list reopens it. */
+function withTabClosed(current: SideChatTabsState, childId: string): SideChatTabsState {
+  const next = withoutTab(current, childId);
+  if (!current.tabs.includes(childId)) return next;
+  return { ...next, closed: [...current.closed.filter((id) => id !== childId), childId] };
 }
 
 /**
@@ -93,6 +103,7 @@ export function useSideChats(conversationId: string) {
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
         syncedSideChats: next.synced.length > 0 ? next.synced : undefined,
+        closedSideChats: next.closed.length > 0 ? next.closed : undefined,
       });
       // Past the cap, keep only the result so a long storage outage can't grow the replay.
       const kept = changes.length > MAX_UNSAVED_CHANGES ? [() => next] : changes;
@@ -159,7 +170,7 @@ export function useSideChats(conversationId: string) {
    *  child and removes it from the server's side-chat list. A closed selected
    *  tab hands the selection to its left neighbour in the strip. */
   const close = useCallback(
-    (childId: string) => update((current) => withoutTab(current, childId)),
+    (childId: string) => update((current) => withTabClosed(current, childId)),
     [update],
   );
 
@@ -174,9 +185,12 @@ export function useSideChats(conversationId: string) {
         const listedSet = new Set(listed);
         let next = current;
         for (const id of current.synced) {
-          if (!listedSet.has(id)) next = withoutTab(next, id);
+          if (!listedSet.has(id)) next = withTabClosed(next, id);
         }
-        const added = listed.filter((id) => !synced.has(id) && !next.tabs.includes(id));
+        const closed = new Set(next.closed);
+        const added = listed.filter(
+          (id) => !synced.has(id) && !next.tabs.includes(id) && !closed.has(id),
+        );
         const sameList =
           listed.length === current.synced.length && listed.every((id) => synced.has(id));
         if (next === current && added.length === 0 && sameList) return current;

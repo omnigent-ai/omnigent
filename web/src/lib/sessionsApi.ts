@@ -977,9 +977,9 @@ export interface ListedSideChat {
  * `GET /v1/sessions/{id}/side_chats`, following every page.
  *
  * @param sessionId - The parent conversation, e.g. "conv_abc123".
- * @returns The side chats, or none when the server predates the endpoint.
+ * @returns The side chats, or null when the server predates the endpoint.
  */
-export async function listSideChats(sessionId: string): Promise<ListedSideChat[]> {
+export async function listSideChats(sessionId: string): Promise<ListedSideChat[] | null> {
   const sideChats: ListedSideChat[] = [];
   // Each page needs the previous page's last_id, so the fetches are sequential.
   /* oxlint-disable no-await-in-loop */
@@ -990,7 +990,7 @@ export async function listSideChats(sessionId: string): Promise<ListedSideChat[]
     const res = await authenticatedFetch(
       `/v1/sessions/${encodeURIComponent(sessionId)}/side_chats?${params}`,
     );
-    if (res.status === 404 && after === null) return [];
+    if (res.status === 404 && after === null) return null;
     const page = await readJsonOrThrow<{
       data: { id: string; created_at: number }[];
       has_more: boolean;

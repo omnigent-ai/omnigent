@@ -242,6 +242,10 @@ export function SideChatPane({
     const ids =
       historyItemId === "" ? new Set<string>() : copiedHistory.data && new Set(copiedHistory.data);
     if (ids) {
+      // History already loaded past the fetched page is copied too if it precedes the marker.
+      const loaded = blocks.map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId);
+      const markerIndex = loaded.findIndex((id) => id?.split(":")[0] === historyItemId);
+      for (const id of loaded.slice(0, Math.max(markerIndex, 0))) if (id) ids.add(id);
       boundaryRef.current.ids = ids;
       writeInheritedBoundary(childId, ids);
     }

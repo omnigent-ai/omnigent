@@ -47,6 +47,9 @@ export interface SessionWorkspaceState {
   /** The server's side-chat list at the last sync, so a side chat closed on
    *  another device can be told apart from one this browser opened itself. */
   syncedSideChats?: string[];
+  /** Side chats recently closed in this browser, oldest first, which a stale
+   *  server list must not reopen. */
+  closedSideChats?: string[];
   /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
   openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
@@ -136,6 +139,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
   if (Array.isArray(record.syncedSideChats))
     state.syncedSideChats = uniqueIds(record.syncedSideChats);
+  if (Array.isArray(record.closedSideChats))
+    state.closedSideChats = uniqueIds(record.closedSideChats);
   if (Array.isArray(record.openSubagentTabs))
     state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
@@ -212,6 +217,9 @@ export function saveSessionWorkspaceState(
   }
   if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_FILES) {
     next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_FILES);
+  }
+  if (next.closedSideChats && next.closedSideChats.length > MAX_OPEN_FILES) {
+    next.closedSideChats = next.closedSideChats.slice(-MAX_OPEN_FILES);
   }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).

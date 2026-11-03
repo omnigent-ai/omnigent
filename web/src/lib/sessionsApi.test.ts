@@ -1753,12 +1753,12 @@ describe("listSideChats", () => {
     ]);
   });
 
-  it("lists nothing when the server predates the endpoint", async () => {
+  it("reports no list when the server predates the endpoint", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({ detail: "Not Found" }, { ok: false, status: 404 }),
     );
 
-    await expect(listSideChats("conv_parent")).resolves.toEqual([]);
+    await expect(listSideChats("conv_parent")).resolves.toBeNull();
   });
 });
 
