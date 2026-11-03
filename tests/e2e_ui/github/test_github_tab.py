@@ -1201,7 +1201,6 @@ def test_changes_find_reveals_collapsed_and_filtered(
     if not mobile:
         # The highlight survives a diff re-render in the other layout.
         panel.get_by_role("button", name="Switch to split view", exact=True).click()
-        # The re-render detaches the old row; the highlight must be repainted on the new one.
         wait_for_highlight("4")
         assert highlighted() == [{"text": "added", "line": "4"}]
         panel.get_by_role("button", name="Switch to unified view", exact=True).click()

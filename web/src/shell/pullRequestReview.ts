@@ -154,6 +154,13 @@ export function refreshedMatchIndex(matches: readonly Match[], previous: Match):
       match.target.text === target.text,
   );
   if (same >= 0) return same;
+  // A path target has no line to measure from, so take its file's path match.
+  if (target.kind === "path") {
+    const pathMatch = matches.findIndex(
+      (match) => match.target.path === target.path && match.target.kind === "path",
+    );
+    return pathMatch >= 0 ? pathMatch : 0;
+  }
   // Line numbers only compare within a side: old and new numbering drift apart.
   const sameFile = (match: Match) => match.target.path === target.path;
   const sameSide = (match: Match) =>

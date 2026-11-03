@@ -648,8 +648,21 @@ export function PullRequestChangesTab({
     [hiddenCorpus, deferredQuery, matchCase, regex],
   );
   const { matches } = search;
-  const activeIndex = findTarget && matches.length ? refreshedMatchIndex(matches, findTarget) : -1;
+  // The match shown after the last render. A refresh measures from it, so repeated refreshes
+  // follow the occurrence the reader is on rather than the original target.
+  const shownMatch = useRef<{ target: Match; shown: Match } | null>(null);
+  const activeIndex =
+    findTarget && matches.length
+      ? refreshedMatchIndex(
+          matches,
+          shownMatch.current?.target === findTarget ? shownMatch.current.shown : findTarget,
+        )
+      : -1;
   const activeMatch = activeIndex >= 0 ? matches[activeIndex] : null;
+  useEffect(() => {
+    shownMatch.current =
+      findTarget && activeMatch ? { target: findTarget, shown: activeMatch } : null;
+  });
   const activeFilePath = activeMatch?.target.path ?? null;
   // A line match is painted by its section; split out the primitives so a refresh that
   // keeps the same match doesn't re-centre the row.

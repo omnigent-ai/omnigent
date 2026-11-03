@@ -305,6 +305,23 @@ describe("PullRequestChangesTab", () => {
     expect(findInput()).toHaveFocus();
   });
 
+  it("follows the shown match across consecutive refreshes", () => {
+    const { rerender } = renderTab({ conversationId: "find-consecutive" });
+    openFind("needle");
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+
+    // The match moves from line 2 to line 6 on the first refresh.
+    rerender(A + addedFile("b.ts", ["x1", "x2", "x3", "x4", "gamma", "needle here"]) + C);
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+
+    // A new occurrence at line 1 is nearer the original target (line 2) than the shown
+    // one (line 6); the shown match must still win.
+    rerender(
+      A + addedFile("b.ts", ["needle top", "x2", "x3", "x4", "x5", "gamma", "needle here"]) + C,
+    );
+    expect(screen.getByText("2 of 3")).toBeInTheDocument();
+  });
+
   it("keeps the query and the nearest match when the patch refreshes", () => {
     const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
     const { rerender } = renderTab({ conversationId: "find-refresh" });
