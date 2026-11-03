@@ -80,15 +80,10 @@ def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> 
 def _isolated_model_catalog_store(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Keep launch-path catalog consults off the developer's machine.
+    """Keep launch-path catalog reads off the developer's machine.
 
-    The native launch paths consult the shared model-catalog store and, on
-    a miss, probe the REAL harness CLIs (or a Databricks workspace listing)
-    — which a unit test must never do (a real ``claude`` boot takes ~6 s and
-    writes the developer's real ``~/.omnigent`` store). Redirect the store's
-    directory seam per test and stub the launch-catalog resolvers to "no
-    catalog" (the pre-catalog behavior); a test exercising catalogs
-    re-patches them explicitly.
+    Redirect the catalog store per test and stub CLI and workspace model
+    discovery; a test that exercises a resolver restores it explicitly.
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
     monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)

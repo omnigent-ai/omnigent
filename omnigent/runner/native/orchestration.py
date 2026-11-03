@@ -5376,12 +5376,9 @@ async def _auto_create_codex_terminal(
         )
     pick_to_reset: str | None = None
     model_reset_notice: str | None = None
-    # Explicit launches (model-flows design §4): validate an explicit request
-    # against the launch shape's model list, and give a Default launch on codex's
-    # own login the ACCOUNT's real default — so the ``model =`` line copied from
-    # the user's shared config can never govern a session (the stale-gpt-5.4
-    # 400 class). Profile-backed shapes already resolve their default at
-    # materialization time and are left alone.
+    # Validate an explicit pick against the launch's model list. A Default launch on
+    # codex's own login pins the account default, so a ``model =`` line copied from the
+    # shared config never governs it. Profile shapes resolve their default when built.
     if codex_binding is None and (
         launch_config.model_override
         or (_codex_launch.model is None and _codex_launch.profile is None)

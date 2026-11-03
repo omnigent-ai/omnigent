@@ -298,13 +298,12 @@ async def test_equivalent_gateway_pick_launches_without_reset(
             ("system.ai.gpt-5-6-sol", "system.ai.gpt-6-1-sol"), None, True, id="live-serves"
         ),
         pytest.param(
-            OSError("listing failed"), ["system.ai.gpt-6-1-sol"], True, id="cache-serves"
-        ),
-        pytest.param(
             ("system.ai.gpt-5-6-sol",), ["system.ai.gpt-6-1-sol"], False, id="live-lacks"
         ),
+        pytest.param(
+            OSError("listing failed"), ["system.ai.gpt-5-6-sol"], False, id="cache-lacks"
+        ),
         pytest.param(OSError("listing failed"), None, True, id="no-listing"),
-        pytest.param((), None, True, id="empty-listing"),
     ],
 )
 async def test_profile_launch_validates_the_pick_against_its_workspace_listing(
@@ -370,29 +369,6 @@ async def test_profile_fallback_prefers_the_agents_listed_model(
     assert harness.builds[0]["model"] == "gpt-5.5"
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
     assert harness.notices == [_unavailable_notice(_RETIRED_PICK, "gpt-5.5")]
-
-
-@pytest.mark.asyncio
-async def test_unresolvable_profile_host_keeps_the_pick(
-    codex_launch_harness: _LaunchHarness, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A profile whose host cannot resolve has no listing, so the pick launches unchanged."""
-    harness = codex_launch_harness
-    harness.routing["databricks_profile"] = True
-    pick = "gpt-6.1-sol"
-    harness.snapshot["model_override"] = pick
-    monkeypatch.setattr(
-        codex_app,
-        "_databricks_gateway_host",
-        Mock(side_effect=ConnectionError("token endpoint unreachable")),
-    )
-
-    await harness.launch()
-
-    assert harness.builds[0]["model"] == pick
-    assert harness.resets == []
-    assert harness.notices == []
-    harness.workspace_models.assert_not_called()
 
 
 @pytest.mark.asyncio

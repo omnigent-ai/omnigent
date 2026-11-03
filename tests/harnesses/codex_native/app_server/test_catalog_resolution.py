@@ -124,6 +124,84 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
     listing.assert_called_once_with("prof")
 
 
+@pytest.mark.parametrize(
+    ("live_listing", "cached_listing", "expected"),
+    [
+        pytest.param(
+            ("system.ai.gpt-6-1-sol",),
+            ["system.ai.gpt-5-6-sol"],
+            ("system.ai.gpt-6-1-sol",),
+            id="live",
+        ),
+        pytest.param((), ["system.ai.gpt-5-6-sol"], (), id="empty-live"),
+        pytest.param(
+            OSError("listing failed"),
+            ["system.ai.gpt-6-1-sol"],
+            ("system.ai.gpt-6-1-sol",),
+            id="cache",
+        ),
+        pytest.param(OSError("listing failed"), None, (), id="no-listing"),
+    ],
+)
+def test_databricks_profile_codex_models_reads_live_then_cached_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    live_listing: tuple[str, ...] | Exception,
+    cached_listing: list[str] | None,
+    expected: tuple[str, ...],
+) -> None:
+    """The live listing decides, even when empty; only a failed read uses ucode's copy."""
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server
+
+    monkeypatch.setattr(
+        app_server, "_databricks_gateway_host", Mock(return_value="https://h.example.com/")
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        Mock(return_value=SimpleNamespace(token="tok")),
+    )
+    discover = Mock(return_value=live_listing)
+    if isinstance(live_listing, Exception):
+        discover.side_effect = live_listing
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discover
+    )
+    cached_state = None if cached_listing is None else SimpleNamespace(codex_models=cached_listing)
+    read_cached_state = Mock(return_value=cached_state)
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cached_state)
+
+    assert app_server.databricks_profile_codex_models("prof") == expected
+    discover.assert_called_once_with("https://h.example.com", "tok")
+    if isinstance(live_listing, Exception):
+        read_cached_state.assert_called_once_with("https://h.example.com")
+    else:
+        read_cached_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "gateway_host",
+    [
+        pytest.param(Mock(side_effect=ConnectionError("token endpoint unreachable")), id="raises"),
+        pytest.param(Mock(return_value=None), id="no-host"),
+    ],
+)
+def test_databricks_profile_codex_models_is_empty_without_a_host(
+    monkeypatch: pytest.MonkeyPatch, gateway_host: Mock
+) -> None:
+    """A profile whose workspace host cannot resolve has no listing to read."""
+    from omnigent.harnesses.codex_native import app_server
+
+    monkeypatch.setattr(app_server, "_databricks_gateway_host", gateway_host)
+    discover = Mock(side_effect=AssertionError("no host means no listing"))
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discover
+    )
+
+    assert app_server.databricks_profile_codex_models("prof") == ()
+    discover.assert_not_called()
+
+
 def test_resolve_databricks_codex_model_matches_servable_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
