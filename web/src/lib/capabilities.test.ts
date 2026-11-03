@@ -95,6 +95,56 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([null, [], "invalid", { arclet: null }, { arclet: [] }, { arclet: "invalid" }])(
+    "ignores malformed provider capabilities (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_capabilities: value })).sandbox_provider_capabilities,
+      ).toEqual({});
+    },
+  );
+
+  it.each([null, "invalid", { name: "repo", url: "https://github.com/example/repo" }])(
+    "ignores a non-array repository catalog (%j)",
+    async (repo_catalog) => {
+      const result = await probe({
+        sandbox_provider_capabilities: { arclet: { multi_repo: true, repo_catalog } },
+      });
+      expect(result.sandbox_provider_capabilities?.arclet).toEqual({
+        multi_repo: true,
+        repo_catalog: [],
+      });
+    },
+  );
+
+  it("filters malformed catalog entries while preserving provider flags", async () => {
+    const valid = { name: "runtime", url: "https://github.com/example/runtime" };
+    const result = await probe({
+      sandbox_provider_capabilities: {
+        arclet: {
+          inference_models: true,
+          default_models: true,
+          repo_catalog: [
+            null,
+            "invalid",
+            {},
+            { name: "repo" },
+            { name: 1, url: valid.url },
+            { name: "repo", url: 42 },
+            { name: "", url: valid.url },
+            { name: "repo", url: "" },
+            valid,
+          ],
+        },
+      },
+    });
+    expect(result.sandbox_provider_capabilities?.arclet).toEqual({
+      inference_models: true,
+      default_models: true,
+      repo_catalog: [valid],
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {

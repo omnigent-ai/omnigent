@@ -585,12 +585,16 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         assert task["host_id"] is None
         path = f"/v1/scheduled-tasks/{task['id']}"
         renamed = await auth_client.patch(path, json={"name": "Renamed"}, headers=_headers())
+        assert renamed.status_code == 200, renamed.text
         assert renamed.json()["workspace"] == workspace
         changed = await auth_client.patch(
             path, json={"workspace": "https://github.com/example/universe"}, headers=_headers()
         )
         assert changed.status_code == 200, changed.text
         assert changed.json()["workspace"] == "https://github.com/example/universe"
+        cleared = await auth_client.patch(path, json={"workspace": None}, headers=_headers())
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["workspace"] is None
         invalid = await auth_client.patch(path, json={"workspace": "/repo"}, headers=_headers())
         assert invalid.status_code == 400, invalid.text
         back = await auth_client.patch(
@@ -600,6 +604,8 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         )
         assert back.status_code == 200, back.text
         assert back.json()["workspace"] is None
+        invalid_clear = await auth_client.patch(path, json={"workspace": None}, headers=_headers())
+        assert invalid_clear.status_code == 400, invalid_clear.text
         sandbox = await auth_client.patch(
             path,
             json={"execution_target": "managed_sandbox", "workspace": workspace},
@@ -608,6 +614,44 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         assert sandbox.status_code == 200, sandbox.text
         assert sandbox.json()["workspace"] == workspace
         assert sandbox.json()["host_id"] is None
+    finally:
+        auth_app.state.sandbox_config = None
+
+
+@pytest.mark.parametrize("edit", ["rename", "agent", "clear", "invalid"])
+async def test_edit_legacy_sandbox_workspace(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
+) -> None:
+    _make_user(db_uri)
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    try:
+        response = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(execution_target="managed_sandbox", host_id=None, workspace=None),
+            headers=_headers(),
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["id"]
+        store = SqlAlchemyScheduledTaskStore(db_uri)
+        session_id = uuid.uuid4().hex
+        store.update(task_id, workspace="/home/me", session_mode="continue", session_id=session_id)
+        changes = {
+            "rename": {"name": "Renamed"},
+            "agent": {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
+            "clear": {"workspace": None},
+            "invalid": {"workspace": "/another/directory"},
+        }
+        updated = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json=changes[edit], headers=_headers()
+        )
+        if edit == "invalid":
+            assert updated.status_code == 400, updated.text
+            assert store.get(task_id).workspace == "/home/me"
+        else:
+            assert updated.status_code == 200, updated.text
+            assert updated.json()["workspace"] is None
+            assert store.get(task_id).workspace is None
+            assert updated.json()["session_id"] == (None if edit == "agent" else session_id)
     finally:
         auth_app.state.sandbox_config = None
 

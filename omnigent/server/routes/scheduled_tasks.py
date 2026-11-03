@@ -34,7 +34,7 @@ from omnigent.runner.identity import (
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
-from omnigent.server.managed_hosts import parse_repo_workspace
+from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -94,13 +94,8 @@ class CreateScheduledTaskRequest(BaseModel):
     # given, else the session the first run creates.
     session_mode: Literal["new", "continue"] = "new"
     session_id: str | None = Field(default=None, min_length=1)
-    # Optional: no PINNED host/workspace. When both are unset the fire path
-    # resolves the owner's online host at fire time and defaults the workspace to
-    # that host's home directory (a failed run is recorded if none is online) —
-    # it does not run hostless. ``min_length=1`` still rejects an empty string
-    # (the field is unset via omission / null, not ""), mirroring the PATCH
-    # request. PATCH still cannot null an already-set workspace/host_id (see
-    # ``UpdateScheduledTaskRequest``).
+    # Unpinned connected-host tasks resolve an online host and its home at fire time.
+    # Omission or null selects the default; empty strings are invalid.
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     # ``managed_sandbox`` runs the task in a fresh server-provisioned sandbox
@@ -151,8 +146,6 @@ class UpdateScheduledTaskRequest(BaseModel):
         """Keep the public update surface to active/paused connected-host runs."""
         if self.state is not None and self.state not in {"active", "paused"}:
             raise ValueError("state must be 'active' or 'paused'; use DELETE to delete a task")
-        if "workspace" in self.model_fields_set and self.workspace is None:
-            raise ValueError("workspace cannot be null")
         if "host_id" in self.model_fields_set and self.host_id is None:
             raise ValueError("host_id cannot be null")
         if self.execution_target is not None and self.execution_target not in (
@@ -856,6 +849,14 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        legacy_workspace = (
+            existing.execution_target == "managed_sandbox"
+            and existing.workspace is not None
+            and not is_repo_workspace(existing.workspace)
+        )
+        if legacy_workspace:
+            # Legacy directory pins already run with the provider default.
+            existing = replace(existing, workspace=None)
         if body.rrule is not None:
             await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
@@ -907,11 +908,11 @@ def create_scheduled_tasks_router(
                 )
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
-        # Reject pinning a host on a managed-sandbox task rather than
-        # silently dropping it. The request model already rejects this when
-        # execution_target is explicitly in the PATCH; this also covers a PATCH
-        # that pins a field on an ALREADY-managed task (no execution_target sent),
-        # validating against the EFFECTIVE target.
+        if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
+            raise OmnigentError(
+                "workspace cannot be null for a connected-host task", code=ErrorCode.INVALID_INPUT
+            )
+        # Check the effective target even when the PATCH omits execution_target.
         if switching_to_managed and fields.get("host_id") is not None:
             raise OmnigentError(
                 _MANAGED_SANDBOX_WITH_HOST_MSG,
@@ -919,12 +920,7 @@ def create_scheduled_tasks_router(
             )
         target_changed = target_execution != existing.execution_target
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
-            # On a switch this runs the full create-time gauntlet against the NEW
-            # agent: existence + bindability, and the pinned workspace re-checked
-            # against that agent's os_env boundary (the boundary is per-agent, so
-            # a workspace valid for the old harness need not be valid here). A
-            # managed_sandbox target validates its repository URL and checks
-            # that the server can launch a sandbox.
+            # Revalidate placement against the selected agent and execution target.
             agent, workspace, _, _ = await _validate_launch_inputs(
                 request,
                 owner=owner,
@@ -948,6 +944,8 @@ def create_scheduled_tasks_router(
                 bound = await _bind_agent(agent, owner_id)
                 fields["agent_id"] = bound.id
                 new_copy = bound if bound.id != agent.id else None
+        if legacy_workspace:
+            fields.setdefault("workspace", None)
         if "session_id" not in fields and any(
             name in fields and fields[name] != getattr(existing, name)
             for name in _SESSION_BOUND_FIELDS

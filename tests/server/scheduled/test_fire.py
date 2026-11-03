@@ -2025,8 +2025,15 @@ async def _drain_managed_launches() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("launch_outcome", ["bound", "tracker_failed", "raised"])
-@pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
+@pytest.mark.parametrize(
+    ("launch_outcome", "repository"),
+    [
+        ("bound", None),
+        ("tracker_failed", None),
+        ("raised", None),
+        ("bound", "https://github.com/example/runtime"),
+    ],
+)
 async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     monkeypatch: pytest.MonkeyPatch, launch_outcome: str, repository: str | None
 ) -> None:
@@ -2054,10 +2061,12 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(execution_target="managed_sandbox", workspace=repository)}
     )
+    conversations = FakeConversationStore()
     on_fire = build_on_fire(
         _deps(
             store,
             sandbox_config=config,
+            conversation_store=conversations,
             managed_launches=ManagedLaunchTracker(),
             startup_inputs=startup,
         )
@@ -2081,6 +2090,11 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
         assert [repo.url for repo in call.kwargs["repos"]] == ([repository] if repository else [])
+    assert len(conversations.created) == 2
+    for created in conversations.created:
+        assert fire_mod.read_managed_repo_workspaces(created["labels"]) == (
+            [repository] if repository else []
+        )
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
     # The saved prompt is delivered by the host's replica, never directly here.
     direct_dispatch.assert_not_awaited()

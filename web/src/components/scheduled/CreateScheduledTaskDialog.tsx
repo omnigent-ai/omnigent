@@ -72,7 +72,10 @@ import {
   type ScheduledTaskExecutionTarget,
   type ScheduledTaskSessionMode,
 } from "@/lib/scheduledTasksApi";
+import { isValidSandboxRepoUrl, splitSandboxWorkspace } from "@/lib/sandboxRepositories";
 import { localTimezone } from "@/lib/timezones";
+
+const PROVIDER_DEFAULT = "provider-default";
 
 export function CreateScheduledTaskDialog({
   open,
@@ -235,10 +238,16 @@ export function CreateScheduledTaskDialog({
   // "managed_sandbox") instead of a connected host. Catalog-backed providers
   // offer repository selection instead of browsing a connected host.
   const [sandboxMode, setSandboxMode] = useState(false);
-  const sandboxWorkspace = sandboxMode
-    ? workspace ||
-      (editingTask?.executionTarget === "managed_sandbox" ? "" : sandboxRepoCatalog[0]?.url || "")
-    : "";
+  const sandboxWorkspace = sandboxMode ? workspace : "";
+  let savedWorkspace = editingTask?.workspace ?? "";
+  if (
+    editingTask?.executionTarget === "managed_sandbox" &&
+    !isValidSandboxRepoUrl(splitSandboxWorkspace(savedWorkspace).url)
+  ) {
+    savedWorkspace = "";
+  }
+  const savedSandboxWorkspace =
+    editingTask?.executionTarget === "managed_sandbox" ? savedWorkspace : "";
   // Project by name: null = unchanged; "" = no project.
   const [projectChoice, setProjectChoice] = useState<string | null>(null);
   // Id of the existing project picked, captured at pick time so a later rename
@@ -258,7 +267,7 @@ export function CreateScheduledTaskDialog({
     !startNewSession &&
     !agentChanged &&
     executionTarget === editingTask.executionTarget &&
-    (!sandboxMode || sandboxWorkspace === (editingTask.workspace ?? "")) &&
+    (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
     (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. Create-only: an edit always shows the prompt.
@@ -296,7 +305,7 @@ export function CreateScheduledTaskDialog({
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
-        setWorkspace(editingTask.workspace ?? "");
+        setWorkspace(savedWorkspace);
         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
         setProjectChoice(null);
         setPickedProjectId(null);
@@ -326,7 +335,15 @@ export function CreateScheduledTaskDialog({
       setError(null);
     }
     wasOpen.current = open;
-  }, [open, initialName, initialPrompt, initialTrigger, editingTask, savedSchedule]);
+  }, [
+    open,
+    initialName,
+    initialPrompt,
+    initialTrigger,
+    editingTask,
+    savedSchedule,
+    savedWorkspace,
+  ]);
 
   // A new task pins a host, starting on the first online one as New Chat does.
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
@@ -392,9 +409,7 @@ export function CreateScheduledTaskDialog({
     // Host directories and sandbox repository URLs are different workspace inputs.
     if (nextSandbox !== sandboxMode) {
       const nextTarget = nextSandbox ? "managed_sandbox" : "connected_host";
-      setWorkspace(
-        editingTask?.executionTarget === nextTarget ? (editingTask.workspace ?? "") : "",
-      );
+      setWorkspace(editingTask?.executionTarget === nextTarget ? savedWorkspace : "");
     }
     setWorkspaceBrowserOpen(false);
   }
@@ -489,13 +504,13 @@ export function CreateScheduledTaskDialog({
     setError(null);
     setSubmitting(true);
     try {
-      // A sandbox task runs hostless; its workspace can name a catalog repository.
-      // Only send executionTarget when it's meaningful: on create
-      // when sandbox is chosen (connected_host is the server default), and on
-      // edit only when it actually changed — mirroring how agentId is threaded.
+      // Send execution-target and sandbox repository fields only when changed.
       const executionTargetChanged = editingTask
         ? editingTask.executionTarget !== executionTarget
         : sandboxMode;
+      const selectedWorkspace = workspace.trim();
+      const workspaceChanged = editingTask && selectedWorkspace !== savedWorkspace;
+      const canSelectSandboxWorkspace = sandboxMode && sandboxRepoCatalog.length > 0;
       const input = {
         name: name.trim(),
         prompt: effectivePrompt.trim(),
@@ -503,11 +518,11 @@ export function CreateScheduledTaskDialog({
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
-        ...(sandboxMode && sandboxRepoCatalog.length > 0 && sandboxWorkspace !== ""
-          ? { workspace: sandboxWorkspace }
+        ...(canSelectSandboxWorkspace && (workspaceChanged || (!editingTask && selectedWorkspace))
+          ? { workspace: selectedWorkspace || null }
           : {}),
-        ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
-          ? { workspace: workspace.trim() }
+        ...(!sandboxMode && hostId !== "" && selectedWorkspace !== ""
+          ? { workspace: selectedWorkspace }
           : {}),
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
@@ -810,8 +825,8 @@ export function CreateScheduledTaskDialog({
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="task-sandbox-repository">Repository</Label>
               <Select
-                value={sandboxWorkspace}
-                onValueChange={setWorkspace}
+                value={sandboxWorkspace || PROVIDER_DEFAULT}
+                onValueChange={(value) => setWorkspace(value === PROVIDER_DEFAULT ? "" : value)}
                 onOpenChange={handleSelectOpenChange}
                 componentId="tasks.scheduled.sandbox_repository"
               >
@@ -819,9 +834,11 @@ export function CreateScheduledTaskDialog({
                   <SelectValue placeholder="Provider default" />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  {workspace && !sandboxRepoCatalog.some((repo) => repo.url === workspace) && (
-                    <SelectItem value={workspace}>{workspace}</SelectItem>
-                  )}
+                  <SelectItem value={PROVIDER_DEFAULT}>Provider default</SelectItem>
+                  {savedSandboxWorkspace &&
+                    !sandboxRepoCatalog.some((repo) => repo.url === savedSandboxWorkspace) && (
+                      <SelectItem value={savedSandboxWorkspace}>{savedSandboxWorkspace}</SelectItem>
+                    )}
                   {sandboxRepoCatalog.map((repo) => (
                     <SelectItem key={repo.url} value={repo.url}>
                       {repo.name}

@@ -468,6 +468,44 @@ export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boole
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
 
+function parseSandboxProviderCapabilities(
+  value: unknown,
+): NonNullable<ServerInfo["sandbox_provider_capabilities"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([provider, capabilities]) => {
+      if (
+        capabilities === null ||
+        typeof capabilities !== "object" ||
+        Array.isArray(capabilities)
+      ) {
+        return [];
+      }
+      return [
+        [
+          provider,
+          {
+            ...capabilities,
+            repo_catalog: Array.isArray(capabilities.repo_catalog)
+              ? capabilities.repo_catalog.filter(
+                  (repo: unknown): repo is { name: string; url: string } =>
+                    repo !== null &&
+                    typeof repo === "object" &&
+                    "name" in repo &&
+                    typeof repo.name === "string" &&
+                    repo.name.trim() !== "" &&
+                    "url" in repo &&
+                    typeof repo.url === "string" &&
+                    repo.url.trim() !== "",
+                )
+              : [],
+          },
+        ],
+      ];
+    }),
+  );
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -502,14 +540,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_providers: Array.isArray(data.sandbox_providers)
             ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
             : [],
-          // Plain-object guard only; consumers read `?.[p]?.multi_repo === true`,
-          // so any stray shape reads as "unset" (off) rather than throwing.
-          sandbox_provider_capabilities:
-            data.sandbox_provider_capabilities !== null &&
-            typeof data.sandbox_provider_capabilities === "object" &&
-            !Array.isArray(data.sandbox_provider_capabilities)
-              ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
-              : {},
+          sandbox_provider_capabilities: parseSandboxProviderCapabilities(
+            data.sandbox_provider_capabilities,
+          ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],

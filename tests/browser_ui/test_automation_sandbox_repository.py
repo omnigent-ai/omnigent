@@ -65,7 +65,9 @@ def test_automation_sandbox_repository(
 
         def update(request: Request) -> dict[str, Any]:
             body = request.post_data_json
-            assert body["workspace"] == catalog[3]["url"]
+            assert body["workspace"] == (
+                catalog[3]["url"] if tasks[0]["workspace"] == catalog[1]["url"] else None
+            )
             assert "host_id" not in body
             tasks[0].update(body)
             return tasks[0]
@@ -82,7 +84,7 @@ def test_automation_sandbox_repository(
         page.get_by_label("Host", exact=True).click()
         page.get_by_role("option", name="Arclet Sandbox", exact=True).click()
         repository = page.get_by_label("Repository", exact=True)
-        expect(repository).to_have_text("universe")
+        expect(repository).to_have_text("Provider default")
         repository.click()
         for entry in catalog:
             expect(page.get_by_role("option", name=entry["name"], exact=True)).to_be_visible()
@@ -92,9 +94,8 @@ def test_automation_sandbox_repository(
         page.get_by_test_id("create-scheduled-task-submit").click()
         expect(page.get_by_role("dialog")).to_have_count(0)
         page.get_by_role("tab", name="Your automations", exact=True).click()
-        introduction = page.get_by_role("button", name="Maybe later", exact=True)
-        if introduction.is_visible():
-            introduction.click()
+        # Standalone server identity persists the initial intro dismissal.
+        expect(page.get_by_role("dialog")).to_have_count(0)
         page.get_by_role("button", name="Actions for Repository maintenance").click()
         page.get_by_role("menuitem", name="Edit", exact=True).click()
         expect(repository).to_have_text("runtime")
@@ -103,3 +104,14 @@ def test_automation_sandbox_repository(
         page.get_by_test_id("create-scheduled-task-submit").click()
         expect(page.get_by_role("dialog")).to_have_count(0)
         assert tasks[0]["workspace"] == catalog[3]["url"]
+        page.get_by_role("button", name="Actions for Repository maintenance").click()
+        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        expect(repository).to_have_text("hadron")
+        repository.click()
+        page.get_by_role("option", name="Provider default", exact=True).click()
+        page.get_by_test_id("create-scheduled-task-submit").click()
+        expect(page.get_by_role("dialog")).to_have_count(0)
+        assert tasks[0]["workspace"] is None
+        page.get_by_role("button", name="Actions for Repository maintenance").click()
+        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        expect(repository).to_have_text("Provider default")

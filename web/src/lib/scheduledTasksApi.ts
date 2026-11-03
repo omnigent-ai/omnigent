@@ -182,7 +182,8 @@ export interface UpdateScheduledTaskInput {
   sessionMode?: ScheduledTaskSessionMode;
   /** `null` makes a `"continue"` task's next run start the session later runs continue. */
   sessionId?: string | null;
-  workspace?: string;
+  /** Host directory or sandbox repository; null restores a sandbox provider's default. */
+  workspace?: string | null;
   hostId?: string;
   /**
    * Switch where firings run. `managed_sandbox` clears any pinned host; do not

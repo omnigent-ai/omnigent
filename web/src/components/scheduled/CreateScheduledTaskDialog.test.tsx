@@ -640,11 +640,67 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
   });
 
-  it.each(["create", "edit", "edit-default"])(
-    "saves catalog selection without changing an implicit default (%s)",
-    async (mode) => {
-      const editing = mode !== "create";
-      const implicitDefault = mode === "edit-default";
+  it.each([
+    {
+      mode: "create",
+      saved: null,
+      label: "Provider default",
+      pick: "runtime",
+      expected: "https://github.com/example/runtime",
+    },
+    {
+      mode: "create-default",
+      saved: null,
+      label: "Provider default",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit",
+      saved: "https://github.com/example/runtime",
+      label: "runtime",
+      pick: "universe",
+      expected: "https://github.com/example/universe",
+    },
+    {
+      mode: "edit-default",
+      saved: null,
+      label: "Provider default",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-unchanged",
+      saved: "https://github.com/example/runtime",
+      label: "runtime",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-branch",
+      saved: "https://github.com/example/runtime#main",
+      label: "https://github.com/example/runtime#main",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-legacy",
+      saved: "/home/me",
+      label: "Provider default",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-clear",
+      saved: "https://github.com/example/runtime",
+      label: "runtime",
+      pick: "Provider default",
+      expected: null,
+    },
+  ])(
+    "saves only changed repository selections ($mode)",
+    async ({ mode, saved, label, pick, expected }) => {
+      const editing = mode.startsWith("edit");
       const runtime = "https://github.com/example/runtime";
       const universe = "https://github.com/example/universe";
       render(
@@ -652,6 +708,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
           info={{
             ...SERVER_INFO_OFFLINE_FALLBACK,
             managed_sandboxes_enabled: true,
+            scheduled_task_harness_settings: true,
             scheduled_task_sandbox_workspaces: true,
             sandbox_provider: "arclet",
             sandbox_provider_capabilities: {
@@ -672,8 +729,9 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
             editingTask={
               editing
                 ? scheduledTask({
+                    agentId: "ag_claude_native",
                     executionTarget: "managed_sandbox",
-                    workspace: implicitDefault ? null : runtime,
+                    workspace: saved,
                     sessionMode: "continue",
                     sessionId: "existing-session",
                   })
@@ -692,26 +750,40 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
         fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
       }
       expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
-      expect(screen.getByLabelText("Repository")).toHaveTextContent(
-        implicitDefault ? "Provider default" : editing ? "runtime" : "universe",
-      );
-      if (!implicitDefault) {
+      expect(screen.getByLabelText("Repository")).toHaveTextContent(label);
+      const sessionLock = /To change model, effort, or permission mode/;
+      if (editing) {
+        expect(screen.getByText(sessionLock)).toBeInTheDocument();
+        expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+        expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
-        fireEvent.click(
-          await screen.findByRole("option", { name: editing ? "universe" : "runtime" }),
-        );
+        fireEvent.click(await screen.findByRole("option", { name: "universe" }));
+        expect(screen.queryByText(sessionLock)).not.toBeInTheDocument();
+        expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+        expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: label }));
+        expect(screen.getByText(sessionLock)).toBeInTheDocument();
+        expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+        expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+      }
+      if (pick !== null) {
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: pick }));
       }
       expect(screen.getByRole("dialog")).toBeInTheDocument();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       const mutation = editing ? updateMutateAsync : mutateAsync;
       await waitFor(() => expect(mutation).toHaveBeenCalledTimes(1));
       const input = editing ? mutation.mock.calls[0][0].input : mutation.mock.calls[0][0];
-      if (implicitDefault) {
+      if (expected === undefined) {
         expect(input).not.toHaveProperty("workspace");
-        expect(input).not.toHaveProperty("sessionId");
-        expect(input).not.toHaveProperty("modelOverride");
+        if (editing) {
+          expect(input).not.toHaveProperty("sessionId");
+          expect(input).not.toHaveProperty("modelOverride");
+        }
       } else {
-        expect(input.workspace).toBe(editing ? universe : runtime);
+        expect(input.workspace).toBe(expected);
       }
       expect(input).not.toHaveProperty("hostId");
     },

@@ -192,6 +192,9 @@ the same repository grammar as a new sandbox session. The selected repository is
 passed to sandbox launch and recorded in the session's repository labels for
 relaunch. `host_id` remains forbidden. The API advertises this support as
 `scheduled_task_sandbox_workspaces`; older servers reject sandbox workspaces.
+Selecting Provider default clears a repository pin with `workspace: null`.
+Edits also clear legacy directory pins without resetting an unchanged continued
+session, since those pins already use the provider default.
 Switching execution targets clears the old workspace unless the request supplies
 a replacement, since connected-host paths and repository URLs are different inputs.
 
