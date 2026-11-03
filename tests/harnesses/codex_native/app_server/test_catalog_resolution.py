@@ -141,15 +141,18 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
             id="cache",
         ),
         pytest.param(OSError("listing failed"), None, (), id="no-listing"),
+        pytest.param(
+            OSError("listing failed"), ValueError("bad state"), (), id="cache-unreadable"
+        ),
     ],
 )
 def test_databricks_profile_codex_models_reads_live_then_cached_listing(
     monkeypatch: pytest.MonkeyPatch,
     live_listing: tuple[str, ...] | Exception,
-    cached_listing: list[str] | None,
+    cached_listing: list[str] | Exception | None,
     expected: tuple[str, ...],
 ) -> None:
-    """The live listing decides, even when empty; only a failed read uses ucode's copy."""
+    """The live listing decides, even when empty; a failed read uses ucode's copy, if readable."""
     from types import SimpleNamespace
 
     from omnigent.harnesses.codex_native import app_server
@@ -167,8 +170,11 @@ def test_databricks_profile_codex_models_reads_live_then_cached_listing(
     monkeypatch.setattr(
         "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discover
     )
-    cached_state = None if cached_listing is None else SimpleNamespace(codex_models=cached_listing)
-    read_cached_state = Mock(return_value=cached_state)
+    read_cached_state = Mock(return_value=None)
+    if isinstance(cached_listing, Exception):
+        read_cached_state.side_effect = cached_listing
+    elif cached_listing is not None:
+        read_cached_state.return_value = SimpleNamespace(codex_models=cached_listing)
     monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_cached_state)
 
     assert app_server.databricks_profile_codex_models("prof") == expected
