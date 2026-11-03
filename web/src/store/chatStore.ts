@@ -6632,11 +6632,37 @@ function committedInputAwaitsReply(blocks: AnyBlock[]): boolean {
   return false;
 }
 
-/** Input committed ahead of an idle send owns the next turn, so that send no longer claims it. */
-function withoutIdleClaims(pending: PendingUserMessage[]): Partial<ChatState> {
-  if (!pending.some((p) => p.sentWhileIdle)) return {};
+/** Input committed ahead of an idle send owns the next turn, including any reply that send already claimed. */
+function withTurnOwnedBy(
+  blocks: AnyBlock[],
+  pending: PendingUserMessage[],
+  input: AnyBlock[],
+): Partial<ChatState> {
+  const claims = new Set(pending.filter((p) => p.sentWhileIdle).map((p) => p.tempId));
+  if (claims.size === 0) return {};
+  const unclaimed = pending.map((p) => (p.sentWhileIdle ? { ...p, sentWhileIdle: false } : p));
+  const isClaimed = (block: AnyBlock) =>
+    block.type === "text_done" &&
+    block.answersPendingSend !== undefined &&
+    claims.has(block.answersPendingSend);
+  const replyAt = blocks.findIndex(isClaimed);
+  if (replyAt === -1) return { pendingUserMessages: unclaimed };
+  const inputAt = blocks.findIndex((block) => input.includes(block));
+  const ordered =
+    inputAt < replyAt
+      ? blocks
+      : [
+          ...blocks.slice(0, replyAt),
+          ...input,
+          ...blocks.slice(replyAt).filter((block) => !input.includes(block)),
+        ];
   return {
-    pendingUserMessages: pending.map((p) => (p.sentWhileIdle ? { ...p, sentWhileIdle: false } : p)),
+    pendingUserMessages: unclaimed,
+    blocks: ordered.map((block) =>
+      block.type === "text_done" && isClaimed(block)
+        ? { ...block, answersPendingSend: undefined }
+        : block,
+    ),
   };
 }
 
@@ -8795,7 +8821,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
             return eventContent !== null && opensTurn(eventContent)
-              ? withoutIdleClaims(s.pendingUserMessages)
+              ? withTurnOwnedBy(
+                  s.blocks,
+                  s.pendingUserMessages,
+                  s.blocks.filter((block) => block.ctx.itemId === event.itemId),
+                )
               : {};
           }
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
@@ -8872,14 +8902,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // 3. Nothing pending (or a marker that owns no bubble) — render the
         //    event payload fresh.
         if (eventContent === null) return {};
+        const input = committedUserBlock(event.itemId, eventContent, undefined, event.createdBy);
+        const blocks = [...s.blocks, input];
         return {
+          blocks,
           ...(settledShell || !opensTurn(eventContent)
             ? {}
-            : withoutIdleClaims(s.pendingUserMessages)),
-          blocks: [
-            ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
-          ],
+            : withTurnOwnedBy(blocks, s.pendingUserMessages, [input])),
         };
       });
       return;

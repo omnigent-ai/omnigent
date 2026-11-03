@@ -17255,22 +17255,22 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     });
   }
 
+  const laterTurnHistory = [
+    userMessage("resp_prev", "earlier question"),
+    assistantMessage("resp_prev", "earlier answer"),
+  ];
+  const renderedLaterTurnHistory = [
+    { role: "user", text: "earlier question" },
+    { role: "assistant", text: "earlier answer" },
+  ];
+
   it.each([
-    ["the first turn", [], []],
-    [
-      "a later turn",
-      [
-        userMessage("resp_prev", "earlier question"),
-        assistantMessage("resp_prev", "earlier answer"),
-      ],
-      [
-        { role: "user", text: "earlier question" },
-        { role: "assistant", text: "earlier answer" },
-      ],
-    ],
+    ["the first turn", [], [], false],
+    ["a later turn", laterTurnHistory, renderedLaterTurnHistory, false],
+    ["a later turn whose ack names the send", laterTurnHistory, renderedLaterTurnHistory, true],
   ])(
     "keeps the question above a reply preview that arrives before its ack on %s",
-    async (_label, history, renderedHistory) => {
+    async (_label, history, renderedHistory, namedAck) => {
       useChatStore.setState({
         conversationId: "conv_live_order",
         blocks: itemsToBlocks(history),
@@ -17279,6 +17279,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       });
       const { sink, controller } = startPump("conv_live_order");
       await useChatStore.getState().send("new question", "agent_xyz");
+      const sendTempId = useChatStore.getState().pendingUserMessages[0]!.tempId;
       const expected = [
         ...renderedHistory,
         { role: "user", text: "new question" },
@@ -17296,7 +17297,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       await tick();
       expect(renderedTranscript()).toEqual(expected);
 
-      sink.push(inputConsumed("item_new_user", "new question"));
+      sink.push(inputConsumed("item_new_user", "new question", namedAck ? sendTempId : undefined));
       await tick();
       expect(renderedTranscript()).toEqual(expected);
 
@@ -17563,59 +17564,90 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  it.each([
-    ["answers first", false, false],
-    ["calls a tool first", true, false],
-    ["is merged from a snapshot before its ack", false, true],
+  const wake = "[System: background task bt_1 completed]";
+  const wakeAnswer = { role: "assistant", text: "wake answer" };
+  const myQuestion = { role: "user", text: "my question" };
+  const wakeFrames = {
+    ack: inputConsumed("item_wake", wake),
+    tool: sse("response.output_item.done", {
+      item: {
+        id: "fc_wake",
+        type: "function_call",
+        response_id: "resp_wake",
+        call_id: "call_wake",
+        name: "shell",
+        arguments: "{}",
+        status: "completed",
+      },
+    }),
+    delta: nativeDelta("m_wake", 0, "wake answer", true),
+    done: messageDone("ci_wake", "resp_wake", "wake answer", "m_wake"),
+  };
+  type WakeStep = keyof typeof wakeFrames | "merge";
+
+  it.each<[string, WakeStep[], WakeStep[], { role: string; text: string }[]]>([
+    ["answers first", ["ack", "delta"], [], [wakeAnswer, myQuestion]],
+    ["calls a tool first", ["ack", "tool", "delta"], [], [wakeAnswer, myQuestion]],
+    [
+      "is merged from a snapshot before its ack",
+      ["merge", "ack", "delta"],
+      [],
+      [wakeAnswer, myQuestion],
+    ],
+    ["streams its answer before its ack", ["delta", "ack", "done"], [], [wakeAnswer, myQuestion]],
+    [
+      "streams before a snapshot merges it",
+      ["delta", "merge", "ack"],
+      [],
+      [wakeAnswer, myQuestion],
+    ],
+    // The server stores the send before the wake's answer, so the settled answer follows it.
+    [
+      "streams before its ack and settles after the send's ack",
+      ["delta", "ack"],
+      ["done"],
+      [myQuestion, wakeAnswer],
+    ],
   ])(
-    "keeps a background-task wake's reply above a send made just before the wake when the wake %s",
-    async (_label, toolFirst, mergedBeforeAck) => {
+    "orders a background-task wake's reply and a send made just before the wake when the wake %s",
+    async (_label, stepsBeforeSendAck, stepsAfterSendAck, settledTail) => {
       useChatStore.setState({
         conversationId: "conv_live_order_wake",
-        blocks: itemsToBlocks([
-          userMessage("resp_prev", "earlier question"),
-          assistantMessage("resp_prev", "earlier answer"),
-        ]),
+        blocks: itemsToBlocks(laterTurnHistory),
         isNativeTerminalSession: true,
         abortController: new AbortController(),
       });
       const { sink, controller } = startPump("conv_live_order_wake");
       await useChatStore.getState().send("my question", "agent_xyz");
-      const wake = "[System: background task bt_1 completed]";
-      if (mergedBeforeAck) {
-        const merged = itemsToBlocks([{ ...userMessage("resp_wake", wake), id: "item_wake" }]);
-        useChatStore.setState((s) => ({ blocks: [...s.blocks, ...merged] }));
-      }
-      sink.push(inputConsumed("item_wake", wake));
-      if (toolFirst) {
-        sink.push(
-          sse("response.output_item.done", {
-            item: {
-              id: "fc_wake",
-              type: "function_call",
-              response_id: "resp_wake",
-              call_id: "call_wake",
-              name: "shell",
-              arguments: "{}",
-              status: "completed",
-            },
-          }),
-        );
-      }
-      sink.push(nativeDelta("m_wake", 0, "wake answer", true));
-      await tick();
-      const expected = [
-        { role: "user", text: "earlier question" },
-        { role: "assistant", text: "earlier answer" },
+      const run = async (steps: WakeStep[]) => {
+        for (const step of steps) {
+          if (step === "merge") {
+            const merged = itemsToBlocks([{ ...userMessage("resp_wake", wake), id: "item_wake" }]);
+            useChatStore.setState((s) => ({ blocks: [...s.blocks, ...merged] }));
+          } else {
+            sink.push(wakeFrames[step]);
+            // oxlint-disable-next-line no-await-in-loop
+            await tick();
+          }
+        }
+      };
+
+      await run(stepsBeforeSendAck);
+      expect(renderedTranscript()).toEqual([
+        ...renderedLaterTurnHistory,
         { role: "user", text: wake },
-        { role: "assistant", text: "wake answer" },
-        { role: "user", text: "my question" },
-      ];
-      expect(renderedTranscript()).toEqual(expected);
+        wakeAnswer,
+        myQuestion,
+      ]);
 
       sink.push(inputConsumed("item_my_user", "my question"));
       await tick();
-      expect(renderedTranscript()).toEqual(expected);
+      await run(stepsAfterSendAck);
+      expect(renderedTranscript()).toEqual([
+        ...renderedLaterTurnHistory,
+        { role: "user", text: wake },
+        ...settledTail,
+      ]);
 
       controller.abort();
     },
