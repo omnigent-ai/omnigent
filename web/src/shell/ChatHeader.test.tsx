@@ -965,7 +965,8 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     );
     const fork = screen.getByRole("menuitem", { name: "Fork" });
     expect(fork).toHaveAttribute("aria-disabled", "true");
-    // Both layouts carry the app-scoped 44px floor; ordinary browsers are unaffected.
+    // Both layouts carry the 44px floor, which applies only in native shells and
+    // touch-primary browsers; mouse/keyboard browsers keep their dense rows.
     expect(fork).toHaveClass("mobile-touch-target");
     fireEvent.click(fork);
     fireEvent.keyDown(fork, { key: "Enter" });
