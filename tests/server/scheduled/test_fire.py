@@ -2826,15 +2826,21 @@ async def test_a_sandbox_task_continues_only_a_session_on_its_own_host(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_exists", [False, True])
+@pytest.mark.parametrize(
+    ("host_exists", "repository"),
+    [(False, None), (True, None), (True, "https://github.com/example/runtime")],
+)
 async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
-    monkeypatch: pytest.MonkeyPatch, host_exists: bool
+    monkeypatch: pytest.MonkeyPatch, host_exists: bool, repository: str | None
 ) -> None:
     """An existing host, left by a reset session, gets a new sandbox, not a second host row."""
     from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, ManagedLaunchTracker
     from omnigent.server.routes import sessions
 
-    task = _sandbox_continue_task()
+    task = _sandbox_continue_task(
+        workspace=repository,
+        last_run_conversation_id="conv_prev" if repository else None,
+    )
     own = continued_sandbox_host_id(task.id, task.workspace_id)
     existing = _FakeHost(own, "local", sandbox_provider="agent_sandbox")
 
@@ -2843,7 +2849,14 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
     managed_launch = AsyncMock(side_effect=launch)
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
-    conv_store = FakeConversationStore()
+    conv_store = _ExistingConversationStore()
+    if repository:
+        earlier = _continued_session(
+            host_id=own,
+            workspace="/sandbox/ws",
+            labels=fire_mod.managed_repo_labels(["https://github.com/example/universe"]),
+        )
+        conv_store.existing[earlier.id] = earlier
     store = FakeScheduledTaskStore(rows={"task_1": task})
     on_fire = build_on_fire(
         _deps(
@@ -2861,6 +2874,7 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
     await _drain_managed_launches()
 
     [call] = managed_launch.await_args_list
+    assert [repo.url for repo in call.kwargs["repos"]] == ([repository] if repository else [])
     assert call.kwargs["host_id"] == own
     assert call.kwargs["relaunch_host"] is (existing if host_exists else None)
     # A relaunch keeps routing the sandbox by the task's host id.

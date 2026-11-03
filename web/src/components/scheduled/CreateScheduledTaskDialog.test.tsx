@@ -701,6 +701,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     "saves only changed repository selections ($mode)",
     async ({ mode, saved, label, pick, expected }) => {
       const editing = mode.startsWith("edit");
+      const exercisesRestoration = mode === "edit-unchanged";
       const runtime = "https://github.com/example/runtime";
       const universe = "https://github.com/example/universe";
       render(
@@ -734,6 +735,9 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
                     workspace: saved,
                     sessionMode: "continue",
                     sessionId: "existing-session",
+                    modelOverride: "sonnet",
+                    reasoningEffort: "medium",
+                    permissionMode: "acceptEdits",
                   })
                 : null
             }
@@ -743,7 +747,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       if (!editing) {
         openHostSelect();
         fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
-      } else {
+      } else if (exercisesRestoration) {
         openHostSelect();
         fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
         openHostSelect();
@@ -756,6 +760,8 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
         expect(screen.getByText(sessionLock)).toBeInTheDocument();
         expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
         expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+      }
+      if (exercisesRestoration) {
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
         fireEvent.click(await screen.findByRole("option", { name: "universe" }));
         expect(screen.queryByText(sessionLock)).not.toBeInTheDocument();
@@ -766,6 +772,9 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
         expect(screen.getByText(sessionLock)).toBeInTheDocument();
         expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
         expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
+        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
       }
       if (pick !== null) {
         fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
