@@ -492,7 +492,16 @@ const onboardingArcaSetups = new Map();
  * @param {string} serverUrl
  * @param {(line: string) => void} log
  * @param {Electron.WebContents} sender The shell-owned setup page.
- * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string, authError?: boolean, errorKind?: import("./arca").ArcaErrorKind }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   canceled?: boolean,
+ *   alreadyRunning?: boolean,
+ *   error?: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
+ *   authError?: boolean,
+ *   errorKind?: import("./arca").ArcaErrorKind,
+ * }>}
  */
 async function connectOnboardingArca(serverUrl, log, sender) {
   const isClosed = () => sender.isDestroyed();
@@ -1783,9 +1792,21 @@ function resolvedCliPath() {
  * @returns {string}
  */
 function missingHostCliError(serverUrl) {
+  const { errorMessage, errorAction } = missingHostCliErrorParts(serverUrl);
+  return `${errorMessage} ${errorAction}`;
+}
+
+/** @param {string} serverUrl */
+function missingHostCliErrorParts(serverUrl) {
   return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
-    ? "The isaac CLI was not found. Install it before connecting this machine."
-    : "The omnigent CLI was not found. Install it or set its path.";
+    ? {
+        errorMessage: "The isaac CLI was not found.",
+        errorAction: "Install it before connecting this machine.",
+      }
+    : {
+        errorMessage: "The omnigent CLI was not found.",
+        errorAction: "Install it or set its path.",
+      };
 }
 
 /**
@@ -4361,13 +4382,27 @@ function registerIpc() {
       return result;
     }
     const cliCommand = hostCliCommand(target);
-    if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
+    if (!cliCommand) {
+      const missingCli = missingHostCliErrorParts(target);
+      return {
+        ok: false,
+        error: `${missingCli.errorMessage} ${missingCli.errorAction}`,
+        ...missingCli,
+      };
+    }
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
       onLogin: () => log("If a browser window opens, finish signing in there."),
     });
-    if (!auth.ok) return { ok: false, error: auth.error };
+    if (!auth.ok) {
+      return {
+        ok: false,
+        error: auth.error,
+        ...(auth.errorMessage ? { errorMessage: auth.errorMessage } : {}),
+        ...(auth.errorAction ? { errorAction: auth.errorAction } : {}),
+      };
+    }
     // Close out the sign-in lines so the log never ends on a stale prompt.
     log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
@@ -4692,7 +4727,9 @@ function registerIpc() {
     }
     const cliPath = resolvedCliPath();
     if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+      const errorMessage = "The omnigent CLI was not found.";
+      const errorAction = "Install it or set its path.";
+      return { ok: false, error: `${errorMessage} ${errorAction}`, errorMessage, errorAction };
     }
     // Stream the server's startup log lines to the setup page as it boots.
     const onLine = (line) => {

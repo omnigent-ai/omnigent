@@ -122,6 +122,15 @@ describe("ensureServerAuth", () => {
 
     assert.equal(res.ok, false);
     assert.equal(res.authError, true);
+    assert.equal(
+      res.errorMessage,
+      "Sign-in to https://app.example.com didn't complete. A browser window should have opened.",
+    );
+    assert.equal(
+      res.errorAction,
+      "Finish signing in and try again (or run `omnigent login https://app.example.com` in a terminal).",
+    );
+    assert.equal(res.error, `${res.errorMessage} ${res.errorAction}`);
     assert.doesNotMatch(res.error, /ticket=|SECRET123/);
     assert.match(res.error, /omnigent login https:\/\/app\.example\.com/);
   });
