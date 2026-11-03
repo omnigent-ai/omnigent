@@ -999,7 +999,7 @@ def create_scheduled_tasks_router(
                 fields.get("base_branch", existing.base_branch),
                 target_execution,
                 fields.get("host_id", existing.host_id),
-                fields.get("workspace", existing.workspace),
+                fields.get("workspace", None if target_changed else existing.workspace),
             )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc

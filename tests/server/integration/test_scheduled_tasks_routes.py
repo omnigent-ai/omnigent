@@ -596,6 +596,17 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         )
         assert changed.status_code == 200, changed.text
         assert changed.json()["workspace"] == "https://github.com/example/universe"
+        without_directory = await auth_client.patch(
+            path,
+            json={
+                "execution_target": "connected_host",
+                "host_id": _HOST_ID,
+                "base_branch": "HEAD",
+            },
+            headers=_headers(),
+        )
+        assert without_directory.status_code == 400, without_directory.text
+        assert "random worktree requires" in without_directory.text
         cleared = await auth_client.patch(path, json={"workspace": None}, headers=_headers())
         assert cleared.status_code == 200, cleared.text
         assert cleared.json()["workspace"] is None
