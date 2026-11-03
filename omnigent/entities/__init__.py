@@ -25,6 +25,7 @@ from omnigent.entities.conversation import (
     TerminalCommandData,
     parse_item_data,
     synthesize_conversation_title,
+    without_server_only_fields,
 )
 from omnigent.entities.databricks_connection import DatabricksConnection
 from omnigent.entities.device_grant import DeviceGrant
@@ -87,4 +88,5 @@ __all__ = [
     "parse_item_data",
     "resolve_terminal_entry_by_resource_id",
     "synthesize_conversation_title",
+    "without_server_only_fields",
 ]

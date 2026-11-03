@@ -323,6 +323,12 @@ class MessageData(BaseModel):
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
         Stored as given so clients can act on values added later; ``None``
         when unset, not a string, or longer than 64 characters.
+    :param web_stable_id: On a native terminal's mirrored user message, the
+        ``stable_id`` of the web send whose pending-input entry it drained by a
+        text match, e.g. ``"3f2a..."`` (32 hex). The mirror keeps its own item
+        id, so this is how a client learns that its send was delivered. Set
+        only by the server, which drops a client's value; ``None`` when nothing
+        was drained, the drain was positional, or the match was ambiguous.
     """
 
     role: Literal["user", "assistant"]
@@ -335,6 +341,7 @@ class MessageData(BaseModel):
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
     phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    web_stable_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -831,6 +838,23 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "terminal_command",
     }
 )
+
+
+#: Item-data fields only the server may set. Client payloads lose them before
+#: parsing: a forged ``web_stable_id`` would tell clients a send was delivered.
+SERVER_ONLY_MESSAGE_FIELDS: frozenset[str] = frozenset({"web_stable_id"})
+
+
+def without_server_only_fields(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Drop the fields only the server may set from a client's item data.
+
+    :param raw: Item data as received, e.g. ``{"role": "user", "content": [...]}``.
+    :returns: ``raw`` itself when it carries none of them, else a copy without them.
+    """
+    if SERVER_ONLY_MESSAGE_FIELDS.isdisjoint(raw):
+        return raw
+    return {key: value for key, value in raw.items() if key not in SERVER_ONLY_MESSAGE_FIELDS}
 
 
 def parse_item_data(item_type: str, raw: dict[str, Any]) -> ItemData:

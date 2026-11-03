@@ -2961,6 +2961,13 @@ def _drains_pending_inputs(item: NewConversationItem) -> bool:
     )
 
 
+#: ``pending_inputs.resolve_matching_text`` methods that tie a mirror to the
+#: entry carrying its text; ``"fifo_fallback"`` only takes the oldest entry.
+_TEXT_MATCH_METHODS: frozenset[str | None] = frozenset(
+    {"normalized_text", "attachment_normalized_text"}
+)
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -3114,6 +3121,7 @@ async def _persist_external_conversation_item_unlocked(
     cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
     match_method: str | None = None
+    matched_shared_text = False
     # Every drain below holds its entries in place (``hold=True``): they keep
     # their slot until the append settles, so a failed append restores the
     # queue exactly and a refill meanwhile cannot evict them. Older entries a
@@ -3140,6 +3148,7 @@ async def _persist_external_conversation_item_unlocked(
         )
         drained = matched.matched
         match_method = matched.match_method
+        matched_shared_text = matched.shared_text
         if agent_message_candidate:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
@@ -3209,6 +3218,23 @@ async def _persist_external_conversation_item_unlocked(
             cleared_pending_id = drained.pending_id
     if drained is not None:
         item = item.model_copy(update={"replaces_pending_id": drained.stable_id})
+    # A mirror kept under its own id names the web send it delivered, so the
+    # sender can retract that send's retry. Only a text match that picked one
+    # entry proves which send it was: a positional drain, a text shared by
+    # another queued entry, or an entry a positional drain may already have
+    # settled could name the wrong one.
+    if (
+        drained is not None
+        and drained.stable_id is not None
+        and drained.stable_id != item.stable_id
+        and isinstance(item.data, MessageData)
+        and match_method in _TEXT_MATCH_METHODS
+        and not matched_shared_text
+        and not drained.uncertain
+    ):
+        item = item.model_copy(
+            update={"data": item.data.model_copy(update={"web_stable_id": drained.stable_id})}
+        )
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable

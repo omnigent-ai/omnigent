@@ -267,12 +267,15 @@ class MatchedDrain:
         mirror may have been theirs, see :func:`mark_uncertain`), or the person
         interrupted the turn while they were queued and cancelled them (see
         :func:`mark_interrupted`).
+    :param shared_text: Another queued entry carries the matched text, so only
+        queue order picked ``matched``; the mirror may be the other's.
     """
 
     matched: DrainedInput | None
     skipped: list[DrainedInput]
     uncertain: list[DrainedInput] = field(default_factory=list)
     match_method: str | None = None
+    shared_text: bool = False
 
 
 @dataclass
@@ -890,6 +893,7 @@ def resolve_matching_text(
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
+        shared_text = texts.count(exact_needle) > 1
         if match_index is None:
             match_method = "attachment_normalized_text"
             marker_matches: list[int] = []
@@ -903,6 +907,7 @@ def resolve_matching_text(
                 ):
                     marker_matches.append(index)
             match_index = _prefer_live(marker_matches, interrupted)
+            shared_text = len(marker_matches) > 1
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped
@@ -938,6 +943,7 @@ def resolve_matching_text(
             match_method=match_method,
             skipped=lost,
             uncertain=uncertain,
+            shared_text=shared_text,
         )
 
 
