@@ -5424,10 +5424,14 @@ def _publish_sandbox_status_impl(
         ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for
         other stages.
     """
-    # "ready" evicts: from then on the session looks like any
-    # host-bound session and the snapshot carries no launch state.
-    # Failures stay cached (mirroring ManagedLaunchTracker retention)
-    # so a reload after a dead launch still shows the reason.
+    from omnigent.server.scheduled.telemetry import start_fire_stage
+
+    if stage in {"provisioning", "cloning", "action_required"}:
+        start_fire_stage("sandbox_create", session_id=session_id)
+    elif stage == "starting":
+        start_fire_stage("sandbox_registration", session_id=session_id)
+    elif stage == "connecting":
+        start_fire_stage("runner_start", session_id=session_id)
     previous = _session_sandbox_status_cache.get(session_id)
     status = SandboxStatus.model_validate(
         {
@@ -5449,6 +5453,8 @@ def _publish_sandbox_status_impl(
             provider=status.provider,
         ),
     )
+    # "ready" evicts launch state; failures stay cached (like ManagedLaunchTracker)
+    # so a reload after a dead launch still shows the reason.
     if status.stage == "ready":
         _session_sandbox_status_cache.pop(session_id, None)
     else:
@@ -6367,6 +6373,7 @@ async def _launch_runner_on_host_locked(
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.scheduled_context import current_scheduled_run
 
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
@@ -6430,6 +6437,7 @@ async def _launch_runner_on_host_locked(
             HostLaunchRunnerFrame(
                 request_id=request_id,
                 binding_token=binding_token,
+                scheduled_run=current_scheduled_run(),
                 workspace=conv.workspace,
                 session_id=conv.id,
                 # Canonical harness (see _resolve_harness) so the host runs the
@@ -8330,6 +8338,7 @@ class _SessionEventDispatchResult:
     :param item_id: Store-assigned id of the AP-persisted item, e.g.
         ``"item_abc123"``. ``None`` for the claude-native message
         bypass, which persists nothing AP-side.
+    :param accepted: False when dispatch was handled without runner acceptance.
     :param pending_id: Id of the :mod:`omnigent.runtime.pending_inputs`
         entry recorded for a native-terminal web message, e.g.
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
@@ -8339,6 +8348,7 @@ class _SessionEventDispatchResult:
 
     item_id: str | None
     pending_id: str | None
+    accepted: bool = True
 
 
 def _extract_persistent_item_from_sse(

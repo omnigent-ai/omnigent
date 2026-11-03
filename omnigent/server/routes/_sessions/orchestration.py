@@ -127,6 +127,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
+from omnigent.scheduled_context import scheduled_run_scope
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -8175,7 +8176,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 failure_context=ensure_outcome.failure_context,
             )
-            return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+            return _SessionEventDispatchResult(item_id=item_id, pending_id=None, accepted=False)
         if ensure_outcome.policy_notice is not None:
             # Terminal is up but policy enforcement is off (fail-open). Post
             # a durable, non-fatal banner; the user message still forwards.
@@ -8257,7 +8258,7 @@ async def _dispatch_session_event_to_runner_impl(
         if startup_input is not None and not await startup_input.claim(
             conversation_store, session_id
         ):
-            return _SessionEventDispatchResult(item_id=None, pending_id=None)
+            return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8474,7 +8475,7 @@ async def _dispatch_session_event_to_runner_impl(
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
-        return _SessionEventDispatchResult(item_id=None, pending_id=None)
+        return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -8514,7 +8515,8 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 _MID_TURN_STATUSES = ("running", "waiting")
 # A laptop that sleeps or loses its network takes its runner with it and often
 # resumes the turn hours later, so a turn interrupted that way waits this long.
-HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
+# Three days covers a laptop closed over a weekend.
+HOST_OFFLINE_HOLD_S: float = 72 * 3600.0
 # How often a host-offline hold re-checks whether the host came back.
 HOST_OFFLINE_RECHECK_S: float = 60.0
 
@@ -10096,7 +10098,7 @@ def _ensure_runner_relay(
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
-    with runner_log_scope(session_id, runner_id):
+    with scheduled_run_scope(None, session_id=session_id), runner_log_scope(session_id, runner_id):
         task = asyncio.create_task(
             _relay_runner_stream(
                 session_id,

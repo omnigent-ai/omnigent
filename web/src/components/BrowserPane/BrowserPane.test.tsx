@@ -417,7 +417,7 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
   });
 
   it.each(["host lookup", "navigation result"])(
-    "keeps the latest URL submission when the earlier %s finishes last",
+    "keeps the latest URL submission while the earlier %s is pending",
     async (pendingStage) => {
       let resolveFirstHost!: (host: unknown) => void;
       const firstHost = new Promise((resolve) => {
@@ -452,14 +452,25 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
       fireEvent.change(bar, { target: { value: "https://latest.example" } });
       fireEvent.keyDown(bar, { key: "Enter" });
       await waitFor(() => expect(bar).toHaveValue("https://latest.example"));
+      if (pendingStage === "host lookup") {
+        expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+        await act(async () => {
+          resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        });
+      }
       await waitFor(() =>
         expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
           "browser-tab:conv_preview:two",
           "https://latest.example",
           undefined,
-          { force: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+          {
+            force: true,
+            sourceHostId: pendingStage === "host lookup" ? "local-host" : "remote-host",
+            sessionHostProtocol: 1,
+          },
         ),
       );
+      expect(getSessionSlim).toHaveBeenCalledTimes(pendingStage === "host lookup" ? 1 : 2);
       await act(async () => {
         resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
         resolveFirstNavigation({ ok: false, error: "stale failure" });
