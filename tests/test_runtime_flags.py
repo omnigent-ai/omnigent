@@ -100,6 +100,9 @@ async def test_failed_refresh_keeps_last_values_and_old_server_backs_off(monkeyp
         httpx.Response(503),
         httpx.Response(200, content=b"not json"),
         httpx.Response(200, json=["not", "an", "object"]),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"values": None}),
+        httpx.Response(200, json={"values": []}),
         httpx.Response(404),
         httpx.Response(405),
         _served({}),
@@ -107,7 +110,7 @@ async def test_failed_refresh_keeps_last_values_and_old_server_backs_off(monkeyp
     refresher = RuntimeFlagRefresher(server.post, default_interval_s=30)
 
     assert await refresher.refresh_once() == 60
-    for _ in range(4):  # connection error, 503, invalid JSON, non-object body
+    for _ in range(7):  # connection error, 503, invalid JSON, and malformed bodies
         assert await refresher.refresh_once() == 30
         assert enabled.get_current_value() is True
     assert await refresher.refresh_once() == 3600  # 404
@@ -140,13 +143,17 @@ async def test_refresh_includes_all_declared_flags(monkeypatch) -> None:
         _served(everything, refresh_after_s=90),
         _served({}),
         httpx.Response(503),
+        _served({}),
+        httpx.Response(200, json={"refresh_after_s": 60}),
     )
     refresher = RuntimeFlagRefresher(server.post)
 
     assert await refresher.refresh_once() == 90  # the shortest suggested delay
     assert [len(body["flags"]) for _, body in server.requests] == [2, 1]
     assert all(flag.get_current_value() for flag in flags)
-    # A failed later batch leaves the previous complete answer in place.
+    # A failed or malformed later batch leaves the previous complete answer in place.
+    await refresher.refresh_once()
+    assert all(flag.get_current_value() for flag in flags)
     await refresher.refresh_once()
     assert all(flag.get_current_value() for flag in flags)
 
@@ -157,18 +164,29 @@ async def test_no_declared_flags_sends_no_request() -> None:
     assert server.requests == []
 
 
-async def test_background_refresh_runs_until_closed() -> None:
+async def test_background_refresh_runs_until_closed(monkeypatch) -> None:
     enabled = BoolFeatureFlag("test.enabled", False)
-    served = asyncio.Event()
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+    second_refresh = asyncio.Event()
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+        await real_sleep(0)
 
     async def post(path: str, *, json: object) -> httpx.Response:
-        served.set()
-        return _served({"test.enabled": True})
+        if delays:
+            second_refresh.set()
+        # No suggested delay, so the refresher waits its default interval.
+        return httpx.Response(200, json={"values": {"test.enabled": True}})
 
-    refresher = RuntimeFlagRefresher(post)
+    monkeypatch.setattr(runtime_flags.asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(runtime_flags.random, "uniform", lambda low, high: 0.0)
+    refresher = RuntimeFlagRefresher(post, default_interval_s=42)
     refresher.start()
     task = refresher._task
-    await asyncio.wait_for(served.wait(), timeout=5)
+    await asyncio.wait_for(second_refresh.wait(), timeout=5)
+    assert delays[0] == 42
     await refresher.aclose()
     assert enabled.get_current_value() is True
     assert task is not None and task.cancelled()
@@ -198,7 +216,12 @@ def test_declarations_validate_name_default_and_conflicts() -> None:
         StringFeatureFlag("test.mode_number", 1)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("value", [10**400, -(10**400), True, "1.5"])
+def test_float_matcher_rejects_values_a_float_cannot_hold(value) -> None:
+    assert runtime_flags.runtime_flag_value_matches("float", value) is False
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 10**400])
 async def test_non_finite_float_defaults_are_rejected(value) -> None:
     valid = BoolFeatureFlag("test.enabled", False)
     with pytest.raises(ValueError, match="wrong type"):

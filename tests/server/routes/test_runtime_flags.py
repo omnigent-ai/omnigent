@@ -68,7 +68,9 @@ def _request(*flags: tuple[str, str, object]) -> dict[str, object]:
 
 async def test_provider_values_are_filtered_by_query_and_type(db_uri, tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
-    provider = _RecordingProvider({"a.enabled": True, "a.limit": "not an int", "a.unasked": True})
+    provider = _RecordingProvider(
+        {"a.enabled": True, "a.limit": "not an int", "a.ratio": 10**400, "a.unasked": True}
+    )
     async with _client(_app(db_uri, tmp_path, provider)) as client:
         assert (
             await client.post(_PATH, json=_request(("a.enabled", "bool", False)))
@@ -76,7 +78,9 @@ async def test_provider_values_are_filtered_by_query_and_type(db_uri, tmp_path, 
         response = await client.post(
             _PATH,
             headers=_ALICE,
-            json=_request(("a.enabled", "bool", False), ("a.limit", "int", 3)),
+            json=_request(
+                ("a.enabled", "bool", False), ("a.limit", "int", 3), ("a.ratio", "float", 0.5)
+            ),
         )
         info = (await client.get("/v1/info")).json()
 
@@ -87,6 +91,7 @@ async def test_provider_values_are_filtered_by_query_and_type(db_uri, tmp_path, 
             (
                 RuntimeFlagQuery("a.enabled", "bool", False),
                 RuntimeFlagQuery("a.limit", "int", 3),
+                RuntimeFlagQuery("a.ratio", "float", 0.5),
             ),
             RuntimeFlagCaller(user_id="alice@example.test"),
         )
@@ -112,10 +117,22 @@ def test_invalid_request_bodies(body):
         RuntimeFlagsRequest.model_validate(body)
 
 
-async def test_invalid_request_is_422_without_calling_provider(db_uri, tmp_path):
+def _router_app(provider, host_store=None) -> FastAPI:
+    app = FastAPI()
+    app.include_router(
+        create_runtime_flags_router(provider, UnifiedAuthProvider(source="header"), host_store),
+        prefix="/v1",
+    )
+    return app
+
+
+@pytest.mark.parametrize(
+    "flag", [("a.limit", "int", True), ("a.ratio", "float", 10**400)], ids=["bool", "huge"]
+)
+async def test_invalid_request_is_422_without_calling_provider(flag):
     provider = _RecordingProvider({})
-    async with _client(_app(db_uri, tmp_path, provider, auth=False)) as client:
-        response = await client.post(_PATH, json=_request(("a.limit", "int", True)))
+    async with _client(_router_app(provider)) as client:
+        response = await client.post(_PATH, headers=_ALICE, json=_request(flag))
     assert response.status_code == 422
     assert provider.calls == []
 
@@ -145,15 +162,7 @@ class _FakeHostStore:
 )
 async def test_managed_host_launch_token_resolves_owner(token, host_id, status):
     provider = _RecordingProvider({"a.enabled": True})
-    app = FastAPI()
-    app.include_router(
-        create_runtime_flags_router(
-            provider,
-            UnifiedAuthProvider(source="header"),
-            _FakeHostStore(),  # type: ignore[arg-type]
-        ),
-        prefix="/v1",
-    )
+    app = _router_app(provider, _FakeHostStore())
     body = {**_request(("a.enabled", "bool", False)), "host_id": host_id}
     async with _client(app) as client:
         response = await client.post(_PATH, headers={MANAGED_HOST_TOKEN_HEADER: token}, json=body)
@@ -165,10 +174,12 @@ async def test_managed_host_launch_token_resolves_owner(token, host_id, status):
         assert provider.calls == []
 
 
-async def test_provider_failure_is_503(db_uri, tmp_path):
+async def test_provider_failure_is_503():
     provider = _RecordingProvider(RuntimeError("flag service down"))
-    async with _client(_app(db_uri, tmp_path, provider, auth=False)) as client:
-        response = await client.post(_PATH, json=_request(("a.enabled", "bool", False)))
+    async with _client(_router_app(provider)) as client:
+        response = await client.post(
+            _PATH, headers=_ALICE, json=_request(("a.enabled", "bool", False))
+        )
     assert response.status_code == 503
 
 

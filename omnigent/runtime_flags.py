@@ -67,10 +67,13 @@ def runtime_flag_value_matches(value_type: RuntimeFlagType, value: object) -> bo
         low, high = (_INT32_MIN, _INT32_MAX) if value_type == "int" else (_INT64_MIN, _INT64_MAX)
         return low <= value <= high
     if value_type == "float":
-        # JSON cannot carry NaN or infinity.
-        return (
-            isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
-        )
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return False
+        try:
+            # JSON cannot carry NaN or infinity; huge integers overflow a float.
+            return math.isfinite(value)
+        except OverflowError:
+            return False
     if value_type == "string":
         return isinstance(value, str)
     if value_type == "string_list":
@@ -168,13 +171,12 @@ def declared_runtime_flags() -> tuple[_FeatureFlag[Any], ...]:
 
 
 def _accepted_values(
-    flags: Sequence[_FeatureFlag[Any]], served: object
+    flags: Sequence[_FeatureFlag[Any]], served: Mapping[str, Any]
 ) -> dict[str, RuntimeFlagValue]:
     """Return the served values for *flags* whose type matches the declaration."""
-    served_values = served if isinstance(served, dict) else {}
     accepted: dict[str, RuntimeFlagValue] = {}
     for flag in flags:
-        value = served_values.get(flag.name)
+        value = served.get(flag.name)
         if value is not None and runtime_flag_value_matches(flag.value_type, value):
             accepted[flag.name] = value
     return accepted
@@ -231,7 +233,7 @@ class RuntimeFlagRefresher:
             for start in range(0, len(flags), MAX_RUNTIME_FLAGS_PER_REQUEST):
                 batch = flags[start : start + MAX_RUNTIME_FLAGS_PER_REQUEST]
                 body = await self._request(batch)
-                accepted.update(_accepted_values(batch, body.get("values")))
+                accepted.update(_accepted_values(batch, body["values"]))
                 delay = min(delay, self._suggested_delay(body.get("refresh_after_s")))
         except _RefreshFailed as failure:
             return failure.retry_after_s
@@ -269,7 +271,9 @@ class RuntimeFlagRefresher:
         except ValueError as exc:
             _logger.debug("runtime flag refresh returned invalid JSON")
             raise _RefreshFailed(self._default_interval_s) from exc
-        if not isinstance(body, dict):
+        # Only an explicit values object is an answer; {"values": {}} means "serve none".
+        if not isinstance(body, dict) or not isinstance(body.get("values"), dict):
+            _logger.debug("runtime flag refresh returned no values object")
             raise _RefreshFailed(self._default_interval_s)
         return body
 

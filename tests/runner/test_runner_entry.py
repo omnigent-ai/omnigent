@@ -153,6 +153,11 @@ class _TrackingAsyncClient:
 
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         self.closed = False
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+        self.posts.append((path, kwargs))
+        return httpx.Response(200, json={"values": {}})
 
     async def aclose(self) -> None:
         self.closed = True
@@ -2749,10 +2754,11 @@ async def test_runner_shutdown_closes_terminal_registry(
         return client
 
     flag_refresher_events: list[str] = []
+    flag_refresher_posts: list[Any] = []
 
     class _TrackingFlagRefresher:
         def __init__(self, post: Any) -> None:
-            del post
+            flag_refresher_posts.append(post)
 
         def start(self) -> None:
             flag_refresher_events.append("start")
@@ -2801,6 +2807,8 @@ async def test_runner_shutdown_closes_terminal_registry(
             record = stall_records.get(timeout=budget(2))
             assert watching
             assert flag_refresher_events == ["start"]
+            await flag_refresher_posts[0]("/v1/runtime-flags", json={"flags": []})
+            assert async_clients[0].posts == [("/v1/runtime-flags", {"json": {"flags": []}})]
             assert record.event_name == "runner_event_loop_stalled"
             assert "test_runner_shutdown_closes_terminal_registry" in record.captured_stack_trace
     finally:
