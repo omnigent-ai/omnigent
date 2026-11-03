@@ -1449,6 +1449,14 @@ describe("PullRequestPanel", () => {
     // The same button now offers the inverse action.
     fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
+
+    // A file revealed by a jump counts as expanded, and collapse all closes it.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(screen.queryAllByTestId("diff")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Expand all diffs" })).toBeInTheDocument();
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {

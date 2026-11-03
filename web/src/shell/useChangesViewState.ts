@@ -18,7 +18,7 @@ export interface ChangesViewState extends ChangesView {
 }
 
 const EMPTY_VIEW: ChangesView = { pathFilter: "", hideViewed: false, revealedPaths: new Set() };
-// ponytail: never evicted; a few small records per PR opened, add eviction if that grows.
+// Never evicted: records are small and per PR; add eviction if this grows.
 const views = new Map<string, ChangesView>();
 const listeners = new Set<() => void>();
 

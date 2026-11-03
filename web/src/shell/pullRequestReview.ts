@@ -10,11 +10,13 @@ export function filterChangedPaths(
   const needle = query.trim().replaceAll("\\", "/").toLowerCase();
   if (!needle) return files;
   return files.filter((file) =>
-    [file.path, file.previous_path].some((path) => path?.toLowerCase().includes(needle)),
+    [file.path, file.previous_path].some((path) =>
+      path?.replaceAll("\\", "/").toLowerCase().includes(needle),
+    ),
   );
 }
 
-/** The files the Changes tab shows: those matching the path filter and not hidden. */
+/** The files the Changes tab shows: those matching the path filter and not hidden by current path. */
 export function selectVisibleFiles(
   files: PullRequestChangedFile[],
   opts: { pathFilter: string; hiddenPaths: ReadonlySet<string> },
