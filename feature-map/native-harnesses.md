@@ -1107,7 +1107,11 @@ Cross-harness journeys:
 prompt and tool turn, then reload Chat: each persisted item appears once.
 Stall a history POST and confirm policy ALLOW/DENY still runs. A result must
 wait for its call to be accepted. Retries retain item IDs; repeated tool/message
-callbacks coalesce, while a repeated input callback is a separate prompt.
+callbacks coalesce, while separately consumed identical prompts each appear once.
+Queue multiple terminal messages during compaction, including steering and
+follow-ups, then let them run. Every consumed message must appear once in Chat
+after a reload, even when Pi skips its `input` hook. Discarded queued input must
+not create a committed user bubble.
 For a Pi child, stall final-answer delivery: idle may update, but the parent
 must receive no completion until the answer is saved. Exhaust delivery and
 expect a failed result instead of an old answer. A later prompt must not extend
