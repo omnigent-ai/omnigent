@@ -27,7 +27,7 @@ export function seedFilesystem(
   entries: HostFilesystemEntry[],
 ): void {
   queryClient.setQueryData(["host-filesystem", workspaceStoryHost, path], {
-    entries,
-    truncated: false,
+    pages: [{ object: "list", data: entries, has_more: false }],
+    pageParams: [null],
   });
 }

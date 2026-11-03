@@ -10259,6 +10259,47 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
   });
 
+  it.each(["README.md", "later-a.py"])(
+    "waits for all mention pages before handling Enter (first page: %s)",
+    async (firstName) => {
+      let hasNextPage = true;
+      useHostFilesystemMock.mockImplementation(
+        () =>
+          ({
+            data: {
+              entries: [
+                file(`${ROOT}/${firstName}`),
+                ...(!hasNextPage ? [file(`${ROOT}/later.py`)] : []),
+              ],
+              truncated: false,
+            },
+            isLoading: false,
+            isPlaceholderData: false,
+            hasNextPage,
+            error: null,
+          }) as unknown as ReturnType<typeof useHostFilesystem>,
+      );
+      const { rerenderWith } = renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      fireEvent.change(input(), { target: { value: "@later", selectionStart: 6 } });
+
+      expect(screen.getByText("Loading…")).toBeInTheDocument();
+      expect(screen.queryByTitle(`Attach ${firstName}`)).not.toBeInTheDocument();
+      fireEvent.keyDown(input(), { key: "Enter" });
+      expect((input() as HTMLTextAreaElement).value).toBe("@later");
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+
+      hasNextPage = false;
+      rerenderWith({});
+      expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTitle("Attach later.py"));
+      expect(screen.getByText("@later.py")).toBeInTheDocument();
+    },
+  );
+
   it("attaches a whole folder with a trailing-slash marker", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,

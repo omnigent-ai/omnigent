@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import functools
 import json
 import logging
 import os
@@ -5070,6 +5071,70 @@ def test_handle_list_dir_returns_sorted_entries(tmp_path: Path) -> None:
     assert by_name["README.md"].bytes == 5  # len("hello")
     assert by_name["src"].bytes is None
     assert by_name["build"].bytes is None
+
+
+@pytest.mark.parametrize(
+    ("limit", "after", "before", "expected_names", "expected_stats", "has_more"),
+    [
+        (1, None, None, ["a"], ["a", "b", "c"], True),
+        (2, "c", None, ["d", "e"], ["d", "e", "f"], True),
+        (2, None, "j", ["h", "i"], ["i", "h", "g"], True),
+        (2, "j", None, ["k", "l"], ["k", "l"], False),
+        (2, None, "d", ["a", "c"], ["c", "b", "a"], False),
+        (2, "h", "k", ["i", "j"], ["j", "i"], False),
+        (2, "missing", None, ["a", "c"], ["a", "b", "c", "d"], True),
+        (2, None, "missing", ["k", "l"], ["l", "k", "j"], True),
+        (2, "k", "d", [], [], False),
+    ],
+)
+def test_handle_list_dir_stats_only_the_requested_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+    after: str | None,
+    before: str | None,
+    expected_names: list[str],
+    expected_stats: list[str],
+    has_more: bool,
+) -> None:
+    """Pagination reads only its page and lookahead, filling past broken targets."""
+    for name in "abcdefghijkl":
+        (tmp_path / name).write_text(name)
+    with os.scandir(tmp_path) as scanner:
+        scanned = list(scanner)
+    stat_names: list[str] = []
+
+    def stat_entry(entry: os.DirEntry[str], *, follow_symlinks: bool) -> os.stat_result:
+        stat_names.append(entry.name)
+        assert follow_symlinks is True
+        if entry.name == "b":
+            raise FileNotFoundError(entry.path)
+        return entry.stat(follow_symlinks=follow_symlinks)
+
+    wrapped_entries = [
+        SimpleNamespace(
+            name=entry.name,
+            path=entry.path,
+            stat=functools.partial(stat_entry, entry),
+        )
+        for entry in reversed(scanned)
+    ]
+    monkeypatch.setattr("omnigent.host.connect.os.scandir", lambda _: iter(wrapped_entries))
+
+    result = _make_host_process()._handle_list_dir(
+        HostListDirFrame(
+            request_id="page",
+            path=str(tmp_path),
+            limit=limit,
+            after=str(tmp_path / after) if after is not None else None,
+            before=str(tmp_path / before) if before is not None else None,
+        )
+    )
+
+    assert result.status == "ok"
+    assert [entry.name for entry in result.entries] == expected_names
+    assert stat_names == expected_stats
+    assert result.has_more is has_more
 
 
 def test_handle_list_dir_missing_path_returns_error(tmp_path: Path) -> None:

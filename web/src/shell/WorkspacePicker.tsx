@@ -512,6 +512,8 @@ export function WorkspacePicker({
     data,
     isLoading,
     isFetching,
+    isFetchingNextPage,
+    hasNextPage,
     error,
     isPlaceholderData,
     refetch: refetchListing,
@@ -519,6 +521,7 @@ export function WorkspacePicker({
   // A background refetch of a cached listing keeps its rows on screen; only a
   // first load or a navigation still showing the previous folder is pending.
   const navigationPending = Boolean(isLoading || isPlaceholderData);
+  const listingPagesPending = Boolean(hasNextPage && !error);
 
   // Resolve the host's home dir independently of where the picker is
   // browsing, so a typed "~"-relative path can be expanded even when the
@@ -1163,11 +1166,14 @@ export function WorkspacePicker({
                 {error instanceof Error ? error.message : "Failed to load directory"}
               </div>
             )}
-            {!navigationPending && error === null && entries.length === 0 && (
-              <div className="px-5 py-3 text-sm text-muted-foreground">
-                {activeFilter !== null ? "No matching entries" : "(empty directory)"}
-              </div>
-            )}
+            {!navigationPending &&
+              !listingPagesPending &&
+              error === null &&
+              entries.length === 0 && (
+                <div className="px-5 py-3 text-sm text-muted-foreground">
+                  {activeFilter !== null ? "No matching entries" : "(empty directory)"}
+                </div>
+              )}
             {!navigationPending &&
               entries.map((entry, index) => (
                 <WorkspacePickerEntry
@@ -1179,6 +1185,12 @@ export function WorkspacePicker({
                   variant="compact"
                 />
               ))}
+            {!navigationPending && (isFetchingNextPage || listingPagesPending) && (
+              <div className="flex items-center gap-2 px-5 py-2 text-sm text-muted-foreground">
+                <Spinner className="size-4" />
+                Loading more entries…
+              </div>
+            )}
             {!navigationPending && data?.truncated && (
               <div
                 className="px-5 py-2 text-sm text-muted-foreground"

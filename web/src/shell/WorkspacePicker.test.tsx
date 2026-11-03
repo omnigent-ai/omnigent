@@ -76,6 +76,8 @@ interface FakeListing {
   data?: { entries: HostFilesystemEntry[]; truncated: boolean };
   isLoading: boolean;
   isFetching?: boolean;
+  isFetchingNextPage?: boolean;
+  hasNextPage?: boolean;
   isPlaceholderData: boolean;
   error?: Error | null;
 }
@@ -1552,6 +1554,49 @@ describe("WorkspacePicker navigation status", () => {
     expect(screen.getByTestId("workspace-picker-entry-src")).toBeInTheDocument();
     expect(screen.getByTestId("workspace-picker-select")).toBeEnabled();
     expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+
+  it("keeps loaded folders and selection usable while more entries load", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/repo/src")], truncated: false },
+        isLoading: false,
+        isFetching: true,
+        isFetchingNextPage: true,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+    const onSelect = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/repo" onSelect={onSelect} />);
+
+    expect(screen.getByTestId("workspace-picker-entry-src")).toBeEnabled();
+    expect(screen.queryByText("Loading folder…")).toBeNull();
+    expect(screen.getByText("Loading more entries…")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenCalledWith("/repo");
+  });
+
+  it.each(["", "later"])("waits before reporting an empty listing for filter '%s'", (filter) => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir(".hidden", "/repo/.hidden")], truncated: false },
+        isLoading: false,
+        isFetching: false,
+        isFetchingNextPage: false,
+        hasNextPage: true,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+    render(<WorkspacePicker hostId="host_1" initialPath="/repo" />);
+    fireEvent.change(screen.getByTestId("workspace-picker-search-input"), {
+      target: { value: filter },
+    });
+
+    expect(screen.getByText("Loading more entries…")).toBeInTheDocument();
+    expect(screen.queryByText("No matching entries")).not.toBeInTheDocument();
+    expect(screen.queryByText("(empty directory)")).not.toBeInTheDocument();
   });
 
   it("announces directory listing errors", () => {

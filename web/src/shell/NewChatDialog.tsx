@@ -4974,6 +4974,8 @@ export function NewChatLandingScreen() {
     mentionEnabled && mention ? selectedHostId : null,
     mentionAbsDir,
   );
+  // Rank the complete listing so Enter cannot send a token whose match is on a later page.
+  const mentionPagesPending = Boolean(mentionFsQuery.hasNextPage && !mentionFsQuery.error);
   // Map host entries (absolute paths) to workspace-relative WorkspaceFile rows,
   // then rank (folders-first, filtered, capped) via the shared helper.
   const mentionEntries: WorkspaceFile[] = useMemo(() => {
@@ -4985,7 +4987,7 @@ export function NewChatLandingScreen() {
     // here would show the parent's files while purporting to be inside the
     // child, so a click/Enter could attach the wrong entry. Suppress them until
     // the current directory's own listing arrives.
-    if (mentionFsQuery.isPlaceholderData) return [];
+    if (mentionFsQuery.isPlaceholderData || mentionPagesPending) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
       .map((e): WorkspaceFile => ({
@@ -5003,6 +5005,7 @@ export function NewChatLandingScreen() {
     mention,
     mentionFsQuery.data,
     mentionFsQuery.isPlaceholderData,
+    mentionPagesPending,
     mentionFilter,
     workspaceRoot,
   ]);
@@ -5013,7 +5016,7 @@ export function NewChatLandingScreen() {
   const mentionListingPending =
     mentionEnabled &&
     mention != null &&
-    (mentionFsQuery.isLoading || mentionFsQuery.isPlaceholderData);
+    (mentionFsQuery.isLoading || mentionFsQuery.isPlaceholderData || mentionPagesPending);
 
   // Shared selection/chip/keyboard glue — see useMentionBrowser. Only the
   // host-filesystem source + token state above are launcher-specific.

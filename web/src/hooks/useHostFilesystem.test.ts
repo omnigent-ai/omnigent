@@ -4,7 +4,7 @@
 // segments (resulting in literal "%2F" reaching the host).
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -83,7 +83,7 @@ describe("buildHostFilesystemUrl", () => {
 
 // ---------------------------------------------------------------------------
 // useHostFilesystem — pagination, truncation, error, and lazy-enable behavior.
-// Exercised through the hook since fetchHostFilesystem is module-private.
+// Exercised through the hook since fetchHostFilesystemPage is module-private.
 // authenticatedFetch ultimately calls the global fetch, so we stub that.
 // ---------------------------------------------------------------------------
 
@@ -99,10 +99,11 @@ function pageResponse(data: HostFilesystemEntry[], hasMore: boolean): Response {
   } as unknown as Response;
 }
 
-function wrapper() {
-  const qc = new QueryClient({
+function wrapper(
+  qc = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
-  });
+  }),
+) {
   return ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: qc }, children);
 }
@@ -160,8 +161,9 @@ describe("useHostFilesystem", () => {
       wrapper: wrapper(),
     });
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data?.entries.map((e) => e.name)).toEqual(["a", "b", "c"]);
+    await waitFor(() =>
+      expect(result.current.data?.entries.map((e) => e.name)).toEqual(["a", "b", "c"]),
+    );
     expect(result.current.data?.truncated).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     // The second request forwards the first page's last entry path.
@@ -179,10 +181,152 @@ describe("useHostFilesystem", () => {
       wrapper: wrapper(),
     });
 
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.hasNextPage).toBe(false);
+    });
     expect(result.current.data?.entries.map((e) => e.name)).toEqual(["a"]);
     expect(result.current.data?.truncated).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("publishes the first page while the next page is still loading", async () => {
+    let resolveNext!: (response: Response) => void;
+    fetchMock.mockResolvedValueOnce(pageResponse([entry("a")], true)).mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveNext = resolve;
+        }),
+    );
+
+    const { result } = renderHook(() => useHostFilesystem("host_1", "/d"), {
+      wrapper: wrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isFetchingNextPage).toBe(true));
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.data).toEqual({ entries: [entry("a")], truncated: false });
+
+    await act(async () => {
+      resolveNext(pageResponse([entry("b")], false));
+    });
+    await waitFor(() => expect(result.current.data?.entries).toEqual([entry("a"), entry("b")]));
+    expect(result.current.hasNextPage).toBe(false);
+  });
+
+  it("stops at the page cap and reports a truncated listing", async () => {
+    fetchMock.mockImplementation(async () =>
+      pageResponse([entry(`entry-${fetchMock.mock.calls.length}`)], true),
+    );
+
+    const { result } = renderHook(() => useHostFilesystem("host_1", "/d"), {
+      wrapper: wrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data?.truncated).toBe(true), { timeout: 5_000 });
+    expect(result.current.data?.entries).toHaveLength(50);
+    expect(result.current.hasNextPage).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(50);
+  });
+
+  it("shares each page request between observers of the same directory", async () => {
+    let resolveNext!: (response: Response) => void;
+    let nextSignal!: AbortSignal;
+    fetchMock
+      .mockResolvedValueOnce(pageResponse([entry("a")], true))
+      .mockImplementation((_url, init: RequestInit) => {
+        nextSignal = init.signal as AbortSignal;
+        return new Promise<Response>((resolve) => {
+          resolveNext = resolve;
+        });
+      });
+
+    const { result } = renderHook(
+      () => ({
+        listing: useHostFilesystem("host_1", ""),
+        home: useHostFilesystem("host_1", ""),
+      }),
+      { wrapper: wrapper() },
+    );
+
+    await waitFor(() => expect(result.current.home.isFetchingNextPage).toBe(true));
+    expect(result.current.listing.data?.entries).toEqual([entry("a")]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(nextSignal.aborted).toBe(false);
+
+    await act(async () => {
+      resolveNext(pageResponse([entry("b")], false));
+    });
+    await waitFor(() =>
+      expect(result.current.listing.data?.entries).toEqual([entry("a"), entry("b")]),
+    );
+    expect(result.current.home.data).toEqual(result.current.listing.data);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains loaded rows after a page failure and recovers on refresh", async () => {
+    fetchMock
+      .mockResolvedValueOnce(pageResponse([entry("a")], true))
+      .mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+
+    const { result } = renderHook(() => useHostFilesystem("host_1", "/d"), {
+      wrapper: wrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isFetchNextPageError).toBe(true));
+    expect(result.current.data?.entries).toEqual([entry("a")]);
+    expect(result.current.isFetching).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    fetchMock
+      .mockResolvedValueOnce(pageResponse([entry("a")], true))
+      .mockResolvedValueOnce(pageResponse([entry("b")], false));
+    await act(async () => {
+      await result.current.refetch();
+    });
+    await waitFor(() => expect(result.current.data?.entries).toEqual([entry("a"), entry("b")]));
+    expect(result.current.error).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("aborts an abandoned directory page when navigating elsewhere", async () => {
+    let abandonedSignal!: AbortSignal;
+    fetchMock
+      .mockResolvedValueOnce(pageResponse([entry("a")], true))
+      .mockImplementationOnce((_url, init: RequestInit) => {
+        abandonedSignal = init.signal as AbortSignal;
+        return new Promise<Response>((_resolve, reject) => {
+          abandonedSignal.addEventListener("abort", () => reject(abandonedSignal.reason));
+        });
+      })
+      .mockResolvedValueOnce(pageResponse([], false));
+
+    const { result, rerender } = renderHook(({ path }) => useHostFilesystem("host_1", path), {
+      initialProps: { path: "/d" },
+      wrapper: wrapper(),
+    });
+
+    await waitFor(() => expect(result.current.isFetchingNextPage).toBe(true));
+    rerender({ path: "/other" });
+    expect(abandonedSignal.aborted).toBe(true);
+    await waitFor(() => expect(result.current.data?.entries).toEqual([]));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not fetch more pages when the query is disabled", async () => {
+    const client = new QueryClient();
+    client.setQueryData(["host-filesystem", "host_1", null], {
+      pages: [{ object: "list", data: [entry("a")], has_more: true }],
+      pageParams: [null],
+    });
+    const { result } = renderHook(() => useHostFilesystem("host_1", null), {
+      wrapper: wrapper(client),
+    });
+
+    expect(result.current.hasNextPage).toBe(true);
+    await act(async () => {});
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("throws a friendly doesn't-exist error carrying the status on a 404", async () => {

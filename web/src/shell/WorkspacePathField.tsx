@@ -148,7 +148,10 @@ export function WorkspacePathField({
   const { dir, partial } = splitTypedPath(value);
 
   // List the parent directory only while the dropdown is open.
-  const { data, isLoading } = useHostFilesystem(hostId, dropdownOpen ? dir : null);
+  const { data, isLoading, hasNextPage, isFetchingNextPage, error } = useHostFilesystem(
+    hostId,
+    dropdownOpen ? dir : null,
+  );
 
   // Recent: unfiltered at the home shortcut, else filtered by the
   // typed text so a concrete path doesn't surface stale history.
@@ -178,7 +181,10 @@ export function WorkspacePathField({
 
   // Flat list for keyboard navigation across both groups.
   const items = [...filteredRecent, ...matches];
-  const showLoading = dropdownOpen && isLoading && matches.length === 0;
+  const showLoading =
+    dropdownOpen &&
+    matches.length === 0 &&
+    (isLoading || ((hasNextPage || isFetchingNextPage) && !error));
   const hasContent = filteredRecent.length > 0 || matches.length > 0 || showLoading;
 
   // DOM id of the highlighted row, for aria-activedescendant. The

@@ -1087,54 +1087,75 @@ def _is_utf8_encodable(text: str) -> bool:
 
 def _paginate_list_dir(
     *,
-    entries: list[HostListDirEntry],
+    entries: list[os.DirEntry[str]],
     request_id: str,
     limit: int,
     after: str | None,
     before: str | None,
 ) -> HostListDirResultFrame:
-    """
-    Slice a sorted directory listing into a page.
+    """Read metadata for one page of sorted directory entries.
 
-    Cursors (``after`` / ``before``) reference an entry's ``path``.
-    Forward pagination (``after``) returns up to ``limit`` entries
-    strictly after the cursor; backward pagination (``before``)
-    returns up to ``limit`` entries strictly before. Empty cursors
-    return the first page. ``has_more`` is set when more entries
-    remain in the pagination direction: forward of the page for
-    ``after``, before the page for ``before``.
+    Cursor bounds are applied before stat calls, so a small page does not
+    inspect every target in a large directory. Unreadable entries are skipped;
+    one readable entry beyond the page determines ``has_more``.
 
-    :param entries: Full sorted list of directory entries.
+    :param entries: Full directory listing, sorted by name.
     :param request_id: Request id to echo back on the result frame.
-    :param limit: Max entries per page, e.g. ``20``. Capped at
-        1000 by the route layer.
-    :param after: Cursor for forward pagination. ``None`` → start
-        at the first entry.
-    :param before: Cursor for backward pagination. ``None`` → no
-        upper bound.
+    :param limit: Max entries per page, e.g. ``20``.
+    :param after: Forward cursor referencing an entry path.
+    :param before: Backward cursor referencing an entry path.
     :returns: A list_dir result frame with the requested page.
     """
-    # Identify the cut points by entry path so cursors survive
-    # concurrent directory mutations between calls.
+    from stat import S_ISDIR, S_ISREG
+
     start = 0
     end = len(entries)
     if after is not None:
-        for idx, entry in enumerate(entries):
+        for index, entry in enumerate(entries):
             if entry.path == after:
-                start = idx + 1
+                start = index + 1
                 break
     if before is not None:
-        for idx, entry in enumerate(entries):
+        for index, entry in enumerate(entries):
             if entry.path == before:
-                end = idx
+                end = index
                 break
+    candidates = entries[start:end]
     if before is not None:
-        page_start = max(start, end - limit)
-        page = entries[page_start:end]
-        has_more = page_start > start
-    else:
-        page = entries[start:end][:limit]
-        has_more = end - start > limit
+        candidates.reverse()
+
+    page: list[HostListDirEntry] = []
+    has_more = False
+    for entry in candidates:
+        if not _is_utf8_encodable(entry.path):
+            continue
+        try:
+            metadata = entry.stat(follow_symlinks=True)
+        except OSError:
+            continue
+        if len(page) == limit:
+            has_more = True
+            break
+        if S_ISDIR(metadata.st_mode):
+            entry_type = "directory"
+            size: int | None = None
+        elif S_ISREG(metadata.st_mode):
+            entry_type = "file"
+            size = metadata.st_size
+        else:
+            entry_type = "other"
+            size = None
+        page.append(
+            HostListDirEntry(
+                name=entry.name,
+                path=entry.path,
+                type=entry_type,
+                bytes=size,
+                modified_at=int(metadata.st_mtime),
+            )
+        )
+    if before is not None:
+        page.reverse()
     return HostListDirResultFrame(
         request_id=request_id,
         status="ok",
@@ -3076,48 +3097,12 @@ class HostProcess:
                 error=f"scandir failed: {exc.strerror or str(exc)}",
             )
 
-        from stat import S_ISDIR, S_ISREG
-
-        # Walk every entry, classifying by target type. Per-entry
-        # OSError → skip (e.g. dangling symlink) so the listing
-        # surfaces real entries instead of failing wholesale.
-        entries: list[HostListDirEntry] = []
-        for de in scanned:
-            if not _is_utf8_encodable(de.path):
-                # A name that isn't valid UTF-8 comes back surrogate-escaped; it
-                # can't be sent as JSON or reopened by path, so skip it too.
-                continue
-            try:
-                # follow_symlinks=True so type reflects the target.
-                st = de.stat(follow_symlinks=True)
-            except OSError:
-                continue
-            if S_ISDIR(st.st_mode):
-                entry_type = "directory"
-                size: int | None = None
-            elif S_ISREG(st.st_mode):
-                entry_type = "file"
-                size = st.st_size
-            else:
-                entry_type = "other"
-                size = None
-            entries.append(
-                HostListDirEntry(
-                    name=de.name,
-                    path=de.path,
-                    type=entry_type,
-                    bytes=size,
-                    modified_at=int(st.st_mtime),
-                )
-            )
-
-        # Sort by name for stable pagination cursors. Cursors are
-        # entry paths so they survive concurrent directory writes
-        # better than an in-memory index.
-        entries.sort(key=lambda e: e.name)
+        # Name ordering needs no per-entry I/O; only the requested page's
+        # metadata is read, including one valid lookahead for has_more.
+        scanned.sort(key=lambda entry: entry.name)
 
         return _paginate_list_dir(
-            entries=entries,
+            entries=scanned,
             request_id=frame.request_id,
             limit=frame.limit,
             after=frame.after,

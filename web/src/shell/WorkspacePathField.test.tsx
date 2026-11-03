@@ -28,13 +28,13 @@ function dir(name: string, path: string): HostFilesystemEntry {
 /** Stub the hook with a fixed listing for every (host, path). */
 function mockListing(
   entries: HostFilesystemEntry[],
-  opts: { isLoading?: boolean; truncated?: boolean } = {},
+  opts: { isLoading?: boolean; hasNextPage?: boolean; truncated?: boolean } = {},
 ) {
   useHostFilesystemMock.mockReturnValue({
     data: { entries, truncated: opts.truncated ?? false },
     isLoading: opts.isLoading ?? false,
-    // The component only reads data/isLoading; the rest of the
-    // UseQueryResult surface is irrelevant here.
+    hasNextPage: opts.hasNextPage ?? false,
+    error: null,
   } as unknown as ReturnType<typeof useHostFilesystem>);
 }
 
@@ -171,6 +171,27 @@ describe("WorkspacePathField", () => {
     fireEvent.focus(screen.getByTestId("workspace-path-input"));
     fireEvent.mouseDown(screen.getByTestId("workspace-match-0"));
     expect(onChange).toHaveBeenCalledWith("/Users/corey/projects");
+  });
+
+  it("keeps the dropdown loading until a later-page directory matches", () => {
+    mockListing(ENTRIES, { hasNextPage: true });
+    const props = {
+      hostId: "host_1",
+      value: "/Users/corey/late",
+      onChange: vi.fn(),
+      onBrowse: vi.fn(),
+      recent: [],
+    };
+    const { rerender } = render(<WorkspacePathField {...props} />);
+    fireEvent.focus(screen.getByTestId("workspace-path-input"));
+    expect(screen.getByTestId("workspace-path-dropdown")).toBeInTheDocument();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+
+    mockListing([...ENTRIES, dir("later", "/Users/corey/later")]);
+    rerender(<WorkspacePathField {...props} />);
+    expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByTestId("workspace-match-0"));
+    expect(props.onChange).toHaveBeenCalledWith("/Users/corey/later");
   });
 
   it("calls onChange when a recent row is clicked", () => {

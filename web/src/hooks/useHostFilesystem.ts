@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type InfiniteData,
+  useInfiniteQuery,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useEffect } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 
@@ -149,7 +155,7 @@ export function shouldRetryHostFilesystem(failureCount: number, error: Error): b
  * incomplete rather than silently hiding entries.
  */
 export interface HostDirectoryListing {
-  /** Entries fetched so far (all of them unless ``truncated``). */
+  /** Entries fetched so far; more pages may still be loading. */
   entries: HostFilesystemEntry[];
   /**
    * ``true`` when the server still had more entries after
@@ -166,64 +172,51 @@ const PAGE_SIZE = 1000;
 const MAX_PAGES = 50;
 
 /**
- * Fetch every entry in a host directory, following the endpoint's
- * ``has_more`` / ``after`` pagination to completion.
- *
- * The host paginates by entry ``path`` (sorted by name), so each
- * subsequent page uses the previous page's last entry path as the
- * forward cursor. Stops when the server reports no more entries,
- * returns an empty page, or the page cap is hit.
+ * Fetch one page of a host directory, canceling when its query is abandoned.
  *
  * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
  * @param path Absolute path to list, or empty string for home.
- * @returns The directory's entries plus a ``truncated`` flag set
- *   when the page cap was hit with more entries still pending.
+ * @param after Previous page's last entry path, or null for the first page.
+ * @param signal Cancellation signal from the query.
+ * @returns Entries and whether the host has another page.
  * @throws FetchError carrying the HTTP status on a non-OK response.
  */
-async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDirectoryListing> {
+async function fetchHostFilesystemPage(
+  hostId: string,
+  path: string,
+  after: string | null,
+  signal: AbortSignal,
+): Promise<HostFilesystemResponse> {
   const baseUrl = buildHostFilesystemUrl(hostId, path);
-  const entries: HostFilesystemEntry[] = [];
-  let after: string | null = null;
-  let truncated = false;
-  // Sequential by necessity: each page's cursor is the previous
-  // page's last entry path, so the requests can't be parallelized.
-  /* oxlint-disable no-await-in-loop */
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
-    if (after !== null) {
-      params.set("after", after);
-    }
-    const sep = baseUrl.includes("?") ? "&" : "?";
-    const res = await authenticatedFetch(`${baseUrl}${sep}${params.toString()}`);
-    if (!res.ok) {
-      const err: FetchError = new Error(await describeListError(res, path));
-      err.status = res.status;
-      throw err;
-    }
-    const body = (await res.json()) as HostFilesystemResponse;
-    entries.push(...body.data);
-    // Empty-page guard is defensive: a bad cursor must not loop.
-    if (!body.has_more || body.data.length === 0) {
-      break;
-    }
-    after = body.data[body.data.length - 1].path;
-    // Loop is about to exit on the cap but the server has more —
-    // the listing is incomplete; let the UI say so.
-    if (page === MAX_PAGES - 1) {
-      truncated = true;
-    }
+  const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+  if (after !== null) params.set("after", after);
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  const res = await authenticatedFetch(`${baseUrl}${sep}${params.toString()}`, { signal });
+  if (!res.ok) {
+    const err: FetchError = new Error(await describeListError(res, path));
+    err.status = res.status;
+    throw err;
   }
-  /* oxlint-enable no-await-in-loop */
-  return { entries, truncated };
+  return (await res.json()) as HostFilesystemResponse;
+}
+
+function selectHostDirectoryListing(
+  data: InfiniteData<HostFilesystemResponse>,
+): HostDirectoryListing {
+  const lastPage = data.pages[data.pages.length - 1];
+  return {
+    entries: data.pages.flatMap((page) => page.data),
+    truncated: data.pages.length === MAX_PAGES && lastPage.has_more && lastPage.data.length > 0,
+  };
 }
 
 /**
  * React Query hook: list the contents of a directory on a host.
  *
  * Lazy — only fires when both ``hostId`` and ``path`` are set.
- * Paginates to completion under the hood (the picker shows a whole
- * directory at once), returning a ``truncated`` flag when the page
- * cap cuts the listing short. Cached per (host, path) so navigating
+ * Publishes the first page immediately, then loads remaining pages in the
+ * background. Returns a ``truncated`` flag when the page cap cuts the listing
+ * short. Cached per (host, path) so navigating
  * up/down the tree doesn't re-fetch already-seen directories. Stale
  * time is short (5s) so the picker reflects new files reasonably
  * quickly without thrashing during normal navigation.
@@ -235,10 +228,18 @@ async function fetchHostFilesystem(hostId: string, path: string): Promise<HostDi
  * @returns React Query result with ``data: HostDirectoryListing``.
  */
 export function useHostFilesystem(hostId: string | null, path: string | null) {
-  return useQuery({
+  const enabled = hostId !== null && path !== null;
+  const query = useInfiniteQuery({
     queryKey: ["host-filesystem", hostId, path],
-    queryFn: () => fetchHostFilesystem(hostId as string, path as string),
-    enabled: hostId !== null && path !== null,
+    queryFn: ({ pageParam, signal }) =>
+      fetchHostFilesystemPage(hostId as string, path as string, pageParam, signal),
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage, pages) =>
+      lastPage.has_more && lastPage.data.length > 0 && pages.length < MAX_PAGES
+        ? lastPage.data[lastPage.data.length - 1].path
+        : undefined,
+    select: selectHostDirectoryListing,
+    enabled,
     staleTime: 5_000,
     // Keep the current directory's rows on screen while the next one
     // loads, so navigating up/into a folder doesn't flicker through
@@ -250,6 +251,22 @@ export function useHostFilesystem(hostId: string | null, path: string | null) {
     // failures still retry.
     retry: shouldRetryHostFilesystem,
   });
+  const { data, hasNextPage, isFetching, isPlaceholderData, isFetchNextPageError, fetchNextPage } =
+    query;
+  useEffect(() => {
+    if (enabled && hasNextPage && !isFetching && !isPlaceholderData && !isFetchNextPageError) {
+      void fetchNextPage({ cancelRefetch: false });
+    }
+  }, [
+    enabled,
+    data,
+    hasNextPage,
+    isFetching,
+    isPlaceholderData,
+    isFetchNextPageError,
+    fetchNextPage,
+  ]);
+  return query;
 }
 
 /**
