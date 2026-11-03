@@ -15,6 +15,7 @@ import stat
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from omnigent.inner.os_env import _DIR_TRAVERSE_FLAGS
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
@@ -104,10 +105,10 @@ def _open_beneath(root: Path, parts: tuple[str, ...]) -> int:
     :returns: A read-only descriptor for the file.
     :raises OSError: If a component is missing, not a directory, or a symlink.
     """
-    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    dir_fd = os.open(root, _DIR_TRAVERSE_FLAGS)
     try:
         for part in parts[:-1]:
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            next_fd = os.open(part, _DIR_TRAVERSE_FLAGS | os.O_NOFOLLOW, dir_fd=dir_fd)
             os.close(dir_fd)
             dir_fd = next_fd
         # O_NONBLOCK keeps a FIFO planted at the leaf from hanging the open.

@@ -270,6 +270,22 @@ def test_safe_open_refuses_path_swapped_for_symlink_after_check(
 
 
 @pytest.mark.posix_only
+@pytest.mark.skipif(
+    not hasattr(os, "O_PATH") or os.geteuid() == 0,
+    reason="needs a search-only directory open and a user that file permissions apply to",
+)
+def test_safe_open_reads_file_beneath_search_only_directory(workspace: Path) -> None:
+    """A file under a directory with search but not read permission still opens."""
+    resolved = upload_file.safe_resolve("output/deep.txt", workspace)
+    (workspace / "output").chmod(0o111)
+    try:
+        with upload_file.safe_open(resolved, workspace) as handle:
+            assert handle.read() == b"deep file content"
+    finally:
+        (workspace / "output").chmod(0o755)
+
+
+@pytest.mark.posix_only
 @pytest.mark.timeout(10)
 def test_safe_open_refuses_fifo_without_blocking(workspace: Path) -> None:
     """A FIFO is refused as not a regular file instead of blocking the open."""

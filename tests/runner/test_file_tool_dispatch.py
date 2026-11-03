@@ -217,60 +217,37 @@ async def test_upload_refuses_directory_swapped_for_symlink_after_check(
     )
 
 
-@pytest.mark.posix_only
 @pytest.mark.parametrize(
-    ("link", "target", "path"),
+    ("link", "path"),
     [
-        ("latest.txt", "output/chart.png", "latest.txt"),
-        ("current", "output", "current/chart.png"),
+        pytest.param(None, "output/chart.png", id="direct"),
+        pytest.param(
+            ("latest.txt", "output/chart.png"),
+            "latest.txt",
+            id="file-link",
+            marks=pytest.mark.posix_only,
+        ),
+        pytest.param(
+            ("current", "output"),
+            "current/chart.png",
+            id="directory-link",
+            marks=pytest.mark.posix_only,
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_upload_follows_symlinks_resolved_inside_workspace(
-    tmp_path: Path,
-    link: str,
-    target: str,
-    path: str,
+async def test_upload_in_workspace_succeeds(
+    tmp_path: Path, link: tuple[str, str] | None, path: str
 ) -> None:
     """
-    A file or directory symlink whose target stays in the workspace still
-    uploads the target's bytes.
-
-    :param tmp_path: Pytest-provided workspace root for the session.
-    :param link: Symlink created in the workspace, e.g. ``"current"``.
-    :param target: Workspace-relative symlink target, e.g. ``"output"``.
-    :param path: Upload path that goes through the symlink.
-    """
-    (tmp_path / "output").mkdir()
-    (tmp_path / "output" / "chart.png").write_bytes(b"chart-bytes")
-    (tmp_path / link).symlink_to(tmp_path / target)
-
-    captured: list[httpx.Request] = []
-    client = _recording_client(captured)
-    try:
-        result = await _execute_file_tool(
-            "upload_file",
-            {"path": path},
-            client,
-            conversation_id=_CONVERSATION_ID,
-            agent_spec=None,
-            runner_workspace=tmp_path,
-        )
-    finally:
-        await client.aclose()
-
-    assert result == '{"file_id": "file_abc123", "filename": "chart.png"}', result
-    assert len(captured) == 1
-    assert b"chart-bytes" in captured[0].content
-
-
-@pytest.mark.asyncio
-async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
-    """
     An ``upload_file`` path inside the workspace uploads the file's raw
-    bytes and returns the store-issued ``file_id``.
+    bytes and returns the store-issued ``file_id``, including through a
+    file or directory symlink whose target stays in the workspace.
 
     :param tmp_path: Pytest-provided workspace root for the session.
+    :param link: Optional ``(name, target)`` workspace-relative symlink the
+        upload path goes through, e.g. ``("current", "output")``.
+    :param path: Workspace-relative upload path.
     """
     # Binary payload with a NUL byte proves the dispatch uploads raw
     # bytes (not a text/line-converted view): if the read path ever
@@ -280,13 +257,16 @@ async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
     target = tmp_path / "output" / "chart.png"
     target.parent.mkdir(parents=True)
     target.write_bytes(payload)
+    if link is not None:
+        link_name, link_target = link
+        (tmp_path / link_name).symlink_to(tmp_path / link_target)
 
     captured: list[httpx.Request] = []
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
             "upload_file",
-            {"path": "output/chart.png"},
+            {"path": path},
             client,
             conversation_id=_CONVERSATION_ID,
             agent_spec=None,
