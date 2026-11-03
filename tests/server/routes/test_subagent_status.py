@@ -752,3 +752,30 @@ async def test_native_child_completes_once_per_confirmed_turn(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+async def test_bare_external_failure_preserves_intake_presence_before_enrichment(
+    status_route: _StatusRoute,
+) -> None:
+    route = status_route
+    with capture_debug_rows("server") as rows:
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "response_id": "synthetic:signals"},
+            },
+        )
+    assert response.status_code == 202, response.text
+    [failure] = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    attributes = failure["attributes"]
+    assert attributes["failure_wire_error"] == "missing"
+    assert attributes["failure_wire_output"] == "missing"
+    assert attributes["failure_wire_context"] == "missing"
+    assert attributes["failure_connection_source"] == "bound_runner_at_intake"
+    assert attributes["failure_connection_state"] == "no_runner_binding"
+    assert attributes["detail_source"] == "missing"
+    assert attributes["response_id"] == "synthetic:signals"
+    assert attributes["active_response_id_at_failure"] == "resp_active"
+    assert route.store.get_conversation(route.child_id) is not None
+    assert common._session_status_cache[route.child_id] == "failed"

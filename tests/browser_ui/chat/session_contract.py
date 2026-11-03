@@ -72,6 +72,36 @@ def message_item(
     }
 
 
+def tool_call_items(
+    call_id: str,
+    name: str,
+    arguments: Mapping[str, Any],
+    output: str,
+    *,
+    response_id: str,
+) -> list[dict[str, Any]]:
+    """Build one persisted tool call and its output, oldest first."""
+    return [
+        {
+            "id": f"{call_id}-call",
+            "response_id": response_id,
+            "type": "function_call",
+            "status": "completed",
+            "name": name,
+            "arguments": json.dumps(dict(arguments)),
+            "call_id": call_id,
+        },
+        {
+            "id": f"{call_id}-output",
+            "response_id": response_id,
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": call_id,
+            "output": output,
+        },
+    ]
+
+
 def transcript_items(turns: int) -> list[dict[str, Any]]:
     """Build newest-first history with markdown and fenced code in every turn."""
     chronological: list[dict[str, Any]] = []
@@ -524,6 +554,12 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             {"error": {"message": "No browser-contract environment"}},
             status=404,
         )
+    # This ordinary host has no canonical Arca machine labels.
+    contract.json(
+        f"{session_api}/resources/environments/default/filesystem/etc/metric_proxy/labels/default?base=host",
+        {"detail": "File not found"},
+        status=404,
+    )
     contract.json(
         "/health",
         lambda _request: handle._health(),

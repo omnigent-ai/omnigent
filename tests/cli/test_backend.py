@@ -20,6 +20,7 @@ import textwrap
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -2025,7 +2026,11 @@ def test_host_stop_stops_sessions_before_daemon(
         path = str(kwargs["path"])
         events.append((method, path))
         if method == "GET" and path == "/v1/sessions":
-            assert kwargs["params"] == {
+            params = kwargs["params"]
+            assert isinstance(params, dict)
+            if params.get("kind") == "sub_agent":
+                return cli._HostHttpResult(status_code=200, body={"data": []})
+            assert params == {
                 "limit": 1000,
                 "include_archived": "true",
                 "visibility": "all",
@@ -2080,6 +2085,7 @@ def test_host_stop_stops_sessions_before_daemon(
     assert result.exit_code == 0, result.output
     assert events == [
         ("GET", "/v1/sessions"),
+        ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions/conv_owned"),
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
@@ -2094,10 +2100,14 @@ def test_host_stop_bounds_parallel_session_stops(monkeypatch: pytest.MonkeyPatch
     sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(12)]
 
     def _fake_sessions(
-        record: cli._HostDaemonRecord, *, connected_only: bool = False
+        record: cli._HostDaemonRecord,
+        *,
+        connected_only: bool = False,
+        include_sub_agents: bool = False,
     ) -> cli._DaemonSessionsResult:
         del record
         assert connected_only is False
+        assert include_sub_agents is True
         return cli._DaemonSessionsResult(
             base_url="https://server.example.com",
             sessions=sessions,
@@ -2160,13 +2170,15 @@ def test_host_stop_failure_leaves_daemon_running(
     monkeypatch.setattr(
         cli,
         "_sessions_for_daemon",
-        lambda record, *, connected_only=False: cli._DaemonSessionsResult(
-            base_url="https://server.example.com",
-            sessions=[
-                {"id": "conv_ok", "status": "waiting"},
-                {"id": "conv_failed", "status": "running"},
-            ],
-            error=None,
+        lambda record, *, connected_only=False, include_sub_agents=False: (
+            cli._DaemonSessionsResult(
+                base_url="https://server.example.com",
+                sessions=[
+                    {"id": "conv_ok", "status": "waiting"},
+                    {"id": "conv_failed", "status": "running"},
+                ],
+                error=None,
+            )
         ),
     )
 
@@ -3292,6 +3304,124 @@ def test_databricks_preflight_remembers_verified_workspace(
     assert saved["token"] == "saved-token"
 
 
+_TWO_PROFILE_WORKSPACE = "https://example.databricks.com"
+_TWO_PROFILE_SERVER = f"{_TWO_PROFILE_WORKSPACE}/api/2.0/omnigent"
+
+
+def _two_profile_databricks_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profiles: list[str],
+    signed_in: set[str],
+    accepted: str,
+) -> list[str]:
+    """Run the real pre-flight against two CLI profiles for one workspace.
+
+    :param profiles: Profile names, in ``~/.databrickscfg`` order.
+    :param signed_in: Profiles whose CLI login is live; the browser login adds ``profiles[0]``.
+    :param accepted: The profile whose token the server accepts.
+    :returns: The profiles ``databricks auth token`` was called for, in order.
+    """
+    import httpx
+
+    from omnigent import chat
+    from omnigent.cli_auth import pin_databricks_org_id, store_databricks_auth
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "".join(
+            f"[{name}]\nhost = {_TWO_PROFILE_WORKSPACE}\nauth_type = databricks-cli\n"
+            for name in profiles
+        )
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.delenv(chat._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    store_databricks_auth(_TWO_PROFILE_SERVER, _TWO_PROFILE_WORKSPACE, org_id="123")
+    pin_databricks_org_id(_TWO_PROFILE_SERVER, "123")
+    minted: list[str] = []
+
+    def _cli(args: list[str], **kwargs: object) -> SimpleNamespace:
+        profile = args[args.index("--profile") + 1]
+        minted.append(profile)
+        if profile not in signed_in:
+            return SimpleNamespace(returncode=1, stdout="", stderr="refresh token is invalid")
+        token = json.dumps({"access_token": f"{profile}-token"})
+        return SimpleNamespace(returncode=0, stdout=token, stderr="")
+
+    def _get(url: str, **kwargs: object) -> httpx.Response:
+        headers = kwargs.get("headers")
+        if (
+            isinstance(headers, dict)
+            and headers.get("Authorization") == f"Bearer {accepted}-token"
+        ):
+            return httpx.Response(200, headers={"x-databricks-org-id": "123"}, json={})
+        return httpx.Response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'})
+
+    def _no_sdk(**kwargs: str) -> object:
+        raise ValueError("default auth: cannot configure default credentials")
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _no_sdk)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _cli)
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(
+        cli, "_run_databricks_browser_login", lambda host, org_id=None: signed_in.add(profiles[0])
+    )
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    return minted
+
+
+def test_databricks_preflight_remembers_the_profile_the_server_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next launch goes straight to the profile the server accepted, skipping the stale one."""
+    from omnigent import chat
+    from omnigent.inner.databricks_executor import _remembered_profiles
+
+    minted = _two_profile_databricks_login(
+        tmp_path, monkeypatch, profiles=["stale", "live"], signed_in={"live"}, accepted="live"
+    )
+
+    cli._ensure_databricks_server_auth(_TWO_PROFILE_SERVER, non_interactive=True)
+    assert minted == ["stale", "live"]
+    assert _remembered_profiles() == {"example.databricks.com": "live"}
+
+    chat._databricks_auth_cache.clear()  # the next launch is a new process
+    minted.clear()
+    cli._ensure_databricks_server_auth(_TWO_PROFILE_SERVER, non_interactive=True)
+    assert minted == ["live"]
+
+
+def test_databricks_login_recovery_ignores_a_remembered_profile_the_server_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a refusal, the browser login's fresh profile is verified, remembered and reused."""
+    from omnigent import chat
+    from omnigent.inner.databricks_executor import _remember_profile, _remembered_profiles
+
+    minted = _two_profile_databricks_login(
+        tmp_path, monkeypatch, profiles=["acme", "other"], signed_in={"other"}, accepted="acme"
+    )
+    _remember_profile(_TWO_PROFILE_WORKSPACE, "other")  # accepted before, refused now
+    refused = chat._shared_token_source(_TWO_PROFILE_SERVER)
+
+    cli._ensure_databricks_server_auth(_TWO_PROFILE_SERVER)
+
+    assert _remembered_profiles() == {"example.databricks.com": "acme"}
+    shared = chat._shared_token_source(_TWO_PROFILE_SERVER)
+    assert shared is not refused
+    minted.clear()
+    assert shared.current_token() == "acme-token"
+    assert minted == [], "the next client minted again instead of reusing the verified login"
+
+
 def test_databricks_preflight_keeps_explicit_selector_for_inline_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3507,7 +3637,6 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
     assert attempts == [
-        ("sdk", {"profile": "expired"}),
         (
             "cli",
             [
@@ -3520,7 +3649,7 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
                 "json",
             ],
         ),
-        ("sdk", {"profile": "fresh"}),
+        ("sdk", {"profile": "expired"}),
         (
             "cli",
             [
@@ -3732,10 +3861,13 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         lambda server: "https://example.databricks.com",
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    fresh_auth = SimpleNamespace(current_token=lambda: "fresh-token", profile_name=None)
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
-        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh-token", profile_name=None),
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(
+            token="fresh-token", profile_name=None, auth=fresh_auth
+        ),
     )
     monkeypatch.setattr(
         cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("browser login ran")
@@ -3744,10 +3876,22 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         "omnigent.cli_auth.store_databricks_auth",
         lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
     )
+    from omnigent import chat
+
+    refused = chat._shared_token_source(_HOST_DATABRICKS_SERVER)
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
+    shared = chat._shared_token_source(_HOST_DATABRICKS_SERVER)
+    assert shared is not refused, (
+        "clients built after the refused probe would reuse the refused credential"
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda *args, **kwargs: pytest.fail("the next client resolved credentials again"),
+    )
+    assert shared.current_token() == "fresh-token"
 
 
 def _patch_foreground_host(
@@ -4278,3 +4422,175 @@ def test_mixed_case_server_gets_the_same_workspace_key_and_pin() -> None:
     assert cli._build_host_daemon_env(server_url=server)[PINNED_DATABRICKS_ORG_ENV_VAR].endswith(
         "?o=111"
     )
+
+
+def test_daemon_owned_sessions_adds_sub_agents_of_owned_sessions() -> None:
+    """A sub-agent has no host id, so it is owned only through its parent chain."""
+    sessions: list[cli._HostSessionRow] = [
+        {"id": "conv_top", "host_id": "host_a"},
+        {
+            "id": "conv_child",
+            "host_id": None,
+            "parent_session_id": "conv_top",
+        },
+        {
+            "id": "conv_grandchild",
+            "host_id": None,
+            "parent_session_id": "conv_child",
+        },
+        {
+            "id": "conv_other_child",
+            "host_id": None,
+            "parent_session_id": "conv_elsewhere",
+        },
+        {"id": "conv_other_host", "host_id": "host_b"},
+    ]
+
+    with_children = cli._daemon_owned_sessions(
+        [sessions[0], sessions[-1]], host_id="host_a", sub_agents=sessions[1:-1]
+    )
+    top_only = cli._daemon_owned_sessions(
+        [sessions[0], sessions[-1]], host_id="host_a", sub_agents=[]
+    )
+
+    assert [s["id"] for s in with_children] == ["conv_top", "conv_child", "conv_grandchild"]
+    assert [s["id"] for s in top_only] == ["conv_top"]
+
+
+def test_daemon_session_request_params_lists_sub_agents_only_when_asked() -> None:
+    """The drain fetches roots and sub-agents separately using the server kind filter."""
+    default = cli._daemon_session_request_params(connected_only=False, after=None)
+    drain = cli._daemon_session_request_params(connected_only=False, after=None, kind="sub_agent")
+
+    assert "kind" not in default
+    assert drain["kind"] == "sub_agent"
+
+
+@pytest.mark.parametrize("sub_agents_error", [False, True])
+def test_host_stop_drains_sub_agent_sessions_before_signalling(
+    monkeypatch: pytest.MonkeyPatch, sub_agents_error: bool
+) -> None:
+    """API rows omit kind; only the sub-agent query identifies child sessions."""
+    roots: list[cli._HostSessionRow] = [
+        {"id": "conv_top", "host_id": "host_a", "status": "running"},
+        {
+            "id": "conv_fork",
+            "host_id": "host_b",
+            "parent_session_id": "conv_top",
+            "status": "running",
+        },
+    ]
+    children: list[cli._HostSessionRow] = [
+        {
+            "id": "conv_grandchild",
+            "host_id": None,
+            "parent_session_id": "conv_child",
+            "status": "running",
+        },
+        {
+            "id": "conv_child",
+            "host_id": None,
+            "parent_session_id": "conv_top",
+            "status": "running",
+        },
+        {
+            "id": "conv_unrelated_child",
+            "host_id": None,
+            "parent_session_id": "conv_fork",
+            "status": "running",
+        },
+    ]
+    requests: list[dict[str, str | int]] = []
+
+    def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        params = kwargs["params"]
+        requests.append(params)
+        kind = params.get("kind", "default")
+        if kind == "sub_agent":
+            if sub_agents_error:
+                return cli._HostHttpResult(
+                    status_code=0, body="Connection refused", unreachable=True
+                )
+            after = params.get("after")
+            rows = children[:1] if after is None else children[1:]
+            has_more = after is None
+        else:
+            rows = roots + children if kind == "any" else roots
+            has_more = False
+        return cli._HostHttpResult(
+            status_code=200,
+            body={"data": rows, "last_id": rows[-1]["id"], "has_more": has_more},
+        )
+
+    stopped: list[str] = []
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http)
+    monkeypatch.setattr(cli, "_daemon_base_url", lambda record: "https://server.example.com")
+    monkeypatch.setattr(
+        cli,
+        "_stop_session_on_server",
+        lambda *, base_url, session_id: stopped.append(session_id),
+    )
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id="host_a",
+    )
+
+    if sub_agents_error:
+        with pytest.raises(click.ClickException, match="retry with --force"):
+            cli._stop_daemon_sessions(record)
+        assert stopped == []
+        return
+
+    assert cli._stop_daemon_sessions(record) == 3
+    assert sorted(stopped) == ["conv_child", "conv_grandchild", "conv_top"]
+    assert [(params.get("kind"), params.get("after")) for params in requests] == [
+        (None, None),
+        ("sub_agent", None),
+        ("sub_agent", "conv_grandchild"),
+    ]
+
+
+def test_stop_request_row_skips_a_stale_daemon_record(monkeypatch, caplog) -> None:
+    """A dead or recycled record has no daemon to stop, so no stop request is logged."""
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda _record: False)
+
+    with caplog.at_level("INFO", logger="omnigent.host.daemon_stop"):
+        cli._record_daemon_stop_requested(record, reason="host_stop", force=False)
+
+    assert [r for r in caplog.records if r.name == "omnigent.host.daemon_stop"] == []
+
+
+def test_stop_request_row_carries_reason_and_uptime(monkeypatch, caplog) -> None:
+    """The stop-request row names the reason and the daemon's uptime."""
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda _record: True)
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com/omnigent",
+        mode="server",
+        server_url="https://server.example.com/omnigent",
+        log_path=None,
+        started_at=0,
+    )
+
+    with caplog.at_level("INFO", logger="omnigent.host.daemon_stop"):
+        cli._record_daemon_stop_requested(record, reason="host_stop", force=True)
+
+    (row,) = [r for r in caplog.records if r.name == "omnigent.host.daemon_stop"]
+    assert row.event_name == "host_daemon_stop_requested"
+    assert row.attributes["reason"] == "host_stop"
+    assert row.attributes["force"] is True
+    assert row.attributes["daemon_pid"] == 42
+    assert float(row.attributes["daemon_uptime_s"]) > 0

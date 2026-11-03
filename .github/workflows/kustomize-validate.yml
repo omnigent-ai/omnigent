@@ -29,7 +29,7 @@ jobs:
   validate:
     name: Kustomize build (overlays)
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out repo

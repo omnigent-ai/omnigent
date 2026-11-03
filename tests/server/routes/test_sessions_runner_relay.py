@@ -387,6 +387,67 @@ async def test_subagent_activity_uses_effective_harness_for_runner_completion(
 
 
 @pytest.mark.asyncio
+async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
+    """An ACP report lands on ``reported_model`` and leaves the user's pinned request alone.
+
+    ``session.model`` is also the first event the relay publishes for the turn.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.update_conversation(conv.id, harness_override="grok", model_override="claude-opus-5")
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(
+        release,
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_grok_model",
+                    "model": "polly",
+                    "usage": {"model": "grok-4.6"},
+                },
+            }
+        ],
+    )
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            conv.id,
+            "runner_grok_model",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(conv.id)
+        release.set()
+
+        model_event = await collector.next_event()
+        assert model_event["type"] == "session.model"
+        assert model_event["conversation_id"] == conv.id
+        assert model_event["model"] == "grok-4.6"
+        # Reports and requests are separate roles: the harness's report lands
+        # on ``reported_model`` (the display authority) and must not touch the
+        # user's ``model_override`` request.
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed.reported_model == "grok-4.6"
+        assert refreshed.model_override == "claude-opus-5"
+    finally:
+        release.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(conv.id)
+        if handle is not None:
+            await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
     The relay's text flush publishes the persisted message to live clients.
@@ -1110,9 +1171,12 @@ class _ScriptedThenDropStreamResponse:
         the drop so the collector observes every scripted frame.
     """
 
-    def __init__(self, frames: list[str], gate: asyncio.Event) -> None:
+    def __init__(
+        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+    ) -> None:
         self._frames = frames
         self._gate = gate
+        self.extensions = {"omnigent_runner_connection": connection}
 
     async def __aenter__(self) -> _ScriptedThenDropStreamResponse:
         return self
@@ -1143,9 +1207,12 @@ class _ScriptedThenDropStreamResponse:
 class _ScriptedThenDropRunnerClient:
     """Fake runner client whose stream replays scripted frames then drops."""
 
-    def __init__(self, frames: list[str], gate: asyncio.Event) -> None:
+    def __init__(
+        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+    ) -> None:
         self._frames = frames
         self._gate = gate
+        self.extensions = {"omnigent_runner_connection": connection}
 
     def stream(
         self,
@@ -1155,14 +1222,18 @@ class _ScriptedThenDropRunnerClient:
         timeout: Any,
     ) -> _ScriptedThenDropStreamResponse:
         del method, path, timeout
-        return _ScriptedThenDropStreamResponse(self._frames, self._gate)
+        return _ScriptedThenDropStreamResponse(
+            self._frames, self._gate, self.extensions["omnigent_runner_connection"]
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("intentional", [False, True])
+@pytest.mark.parametrize("bare", [False, True])
 async def test_relay_preserves_failure_reported_during_intentional_teardown(
     monkeypatch: pytest.MonkeyPatch,
     intentional: bool,
+    bare: bool,
 ) -> None:
     """A failure arriving after stop intent keeps its status and durable details."""
     from omnigent.runtime import session_stream
@@ -1183,11 +1254,24 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
             "failure_source": "native_terminal_start",
             "exception_type": "RuntimeError",
             "exception_cause_type": "ReadTimeout",
+            "native_launch_code_origin": "omnigent.runner.native.orchestration.launch:42",
             "origin": "forged",
         },
     }
     gate = asyncio.Event()
-    runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
+    if bare:
+        event.pop("error")
+        event.pop("failure_context")
+    runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(event)}\n\n"],
+        gate,
+        {
+            "runner_id": runner_id,
+            "runner_version": "0.20.0",
+            "connection_id": "conn_old",
+            "generation": 17,
+        },
+    )
     store = _RecordingLabelStore(live_status="running")
     sessions_module._session_status_cache[session_id] = "running"
     collector = None
@@ -1209,19 +1293,29 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
         attrs = failure["attributes"]
         assert isinstance(attrs, dict)
-        assert attrs["failure_id"] == "err_synthetic_relay"
-        assert attrs["exception_cause_type"] == "ReadTimeout"
+        if not bare:
+            assert attrs["failure_id"] == "err_synthetic_relay"
+            assert attrs["exception_cause_type"] == "ReadTimeout"
+            assert attrs["native_launch_code_origin"].endswith(".launch:42")
         assert attrs["origin"] == "relayed_runner_status"
+        assert attrs["failure_wire_code"] == ("missing" if bare else "present")
+        assert attrs["failure_wire_message"] == ("missing" if bare else "present")
+        assert attrs["failure_wire_context"] == ("missing" if bare else "present")
+        assert attrs["failure_connection_source"] == "relay_stream"
+        assert attrs["failure_runner_version"] == "0.20.0"
+        assert attrs["failure_connection_id"] == "conn_old"
+        assert attrs["failure_connection_generation"] == "17"
 
         status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["type"] == "session.status"
         assert status["status"] == "failed"
-        assert status["error"]["code"] == error["code"]
         assert sessions_module._session_status_cache.get(session_id) == "failed"
-        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
-        assert persisted is not None
-        assert persisted["code"] == error["code"]
-        assert persisted["message"] == error["message"]
+        if not bare:
+            assert status["error"]["code"] == error["code"]
+            persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+            assert persisted is not None
+            assert persisted["code"] == error["code"]
+            assert persisted["message"] == error["message"]
         assert session_id not in sessions_module._intentional_stop_sessions
     finally:
         gate.set()

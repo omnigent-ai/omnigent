@@ -45,16 +45,19 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
-    :param permission_mode: Per-task permission mode for native coding harnesses
-        that support one (currently Claude Code), e.g. ``"acceptEdits"`` or
-        ``"bypassPermissions"``. The fire path turns it into the runner's
-        ``["--permission-mode", <value>]`` terminal launch args. ``None`` means
-        use the agent's configured default.
+    :param permission_mode: Harness-specific permission or execution mode.
+        The fire path translates it into that harness's launch options.
+        ``None`` means use the agent's configured default.
     :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
         fire path attaches a ``cost_budget`` policy to each spawned session that
         blocks all models once cumulative spend reaches this limit. ``None``
         means no per-firing cost cap (the session runs unconstrained unless the
         agent spec or server-wide defaults impose one).
+    :param session_mode: ``"new"`` (default) starts a new session per firing;
+        ``"continue"`` sends each firing's prompt into ``session_id``.
+    :param session_id: The session a ``"continue"`` task sends its prompt to.
+        ``None`` until its first firing creates one, unless the owner picked an
+        existing session.
     :param workspace: Absolute existing path where a fired session's connected
         host runner should start. ``None`` only for legacy or invalid rows.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
@@ -64,10 +67,11 @@ class ScheduledTask:
     :param host_id: Specific connected host to run on. ``None`` only for legacy
         or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
-        ``"deleted"``. Defaults to ``"active"``.
+        ``"deleted"``, or ``"completed"`` once a schedule has no remaining
+        occurrences. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
         ``None`` if it has never fired.
-    :param last_run_conversation_id: Conversation created by the most recent
+    :param last_run_conversation_id: Conversation used by the most recent
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -86,6 +90,8 @@ class ScheduledTask:
     reasoning_effort: str | None = None
     permission_mode: str | None = None
     max_cost_usd: float | None = None
+    session_mode: str = "new"
+    session_id: str | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"
@@ -99,6 +105,11 @@ class ScheduledTask:
     project_id: str | None = None
     delegation_ref: str | None = None
 
+    @property
+    def continues_session(self) -> bool:
+        """Whether the next firing sends its prompt into an existing session."""
+        return self.session_mode == "continue" and self.session_id is not None
+
 
 @dataclass
 class ScheduledTaskRun:
@@ -111,9 +122,9 @@ class ScheduledTaskRun:
         UUID string).
     :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
-    :param scheduled_at: Unix epoch seconds the fire worker began handling this
-        firing, stamped before dispatch. Not the nominal recurrence time the run
-        was due at, which is not recorded.
+    :param scheduled_at: Unix epoch seconds. Persistent dispatch records the
+        occurrence's scheduled time; legacy timers record when the fire worker
+        began handling the firing, before dispatch.
     :param conversation_id: Conversation created by this firing, or ``None``
         before dispatch / after the conversation is deleted.
     :param fired_at: Unix epoch seconds dispatch began, or ``None``.

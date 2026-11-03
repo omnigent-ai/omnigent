@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # posts the results comment
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     outputs:
       flagged: ${{ steps.compare.outputs.flagged }}
@@ -261,7 +261,7 @@ jobs:
     if: ${{ !cancelled() && needs.benchmark-pr.outputs.flagged == 'true' }}
     permissions:
       pull-requests: write # updates the results comment
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       # A missing artifact must still end in a posted verdict, not a stale comment.

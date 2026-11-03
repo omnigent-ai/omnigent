@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -21,15 +23,19 @@ class _FakeCodexClient:
         *,
         response: dict[str, object] | None = None,
         exc: Exception | None = None,
+        connect_exc: BaseException | None = None,
     ) -> None:
         self.response = response or {"result": {}}
         self.exc = exc
+        self.connect_exc = connect_exc
         self.connect_calls = 0
         self.request_calls: list[tuple[str, dict[str, object]]] = []
         self.closed = False
 
     async def connect(self) -> None:
         self.connect_calls += 1
+        if self.connect_exc is not None:
+            raise self.connect_exc
 
     async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
         self.request_calls.append((method, params))
@@ -48,6 +54,7 @@ def _make_runner(
     ),
     *,
     safe_detail: str = "safe detail",
+    bridge_is_inactive: Callable[[str, object], bool] | None = None,
 ) -> CodexGoalRunner:
     async def _bridge_state_for_session(
         conv_id: str,
@@ -62,6 +69,7 @@ def _make_runner(
         bridge_state_for_session=_bridge_state_for_session,
         client_safe_error_detail=lambda exc, *, context: f"{safe_detail}: {context}: {exc}",
         logger=logging.getLogger("tests.codex_goal_runner"),
+        bridge_is_inactive=bridge_is_inactive,
     )
 
 
@@ -237,6 +245,56 @@ async def test_request_maps_generic_exception_to_safe_detail(
         "detail": "safe: codex-native goal read: boom",
     }
     assert fake_client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("method", "stage", "error", "empty"),
+    [
+        ("thread/goal/get", "connect", ConnectionRefusedError(), True),
+        ("thread/goal/get", "connect", FileNotFoundError(), True),
+        ("thread/goal/get", "connect", RuntimeError("handshake failed"), False),
+        ("thread/goal/get", "request", ConnectionRefusedError(), False),
+        ("thread/goal/set", "connect", ConnectionRefusedError(), False),
+    ],
+)
+async def test_inactive_bridge_only_changes_read_connection_refusal(
+    monkeypatch: pytest.MonkeyPatch, method: str, stage: str, error: Exception, empty: bool
+) -> None:
+    fake_client = _FakeCodexClient(
+        connect_exc=error if stage == "connect" else None,
+        exc=error if stage == "request" else None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.harnesses.codex_native.app_server",
+        SimpleNamespace(client_for_transport=lambda *_args, **_kwargs: fake_client),
+    )
+    runner = _make_runner(bridge_is_inactive=lambda _conv_id, _state: True)
+
+    result = await runner._request("conv_1", action="read", method=method, params={})
+
+    if empty:
+        assert result == {"goal": None}
+    else:
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 503
+    assert len(fake_client.request_calls) == (1 if stage == "request" else 0)
+    assert fake_client.closed
+
+
+async def test_cancelling_goal_connect_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_client = _FakeCodexClient(connect_exc=asyncio.CancelledError())
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.harnesses.codex_native.app_server",
+        SimpleNamespace(client_for_transport=lambda *_args, **_kwargs: fake_client),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _make_runner().get("conv_1")
+
+    assert fake_client.closed
+    assert fake_client.request_calls == []
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ const { createUpdateOverlay } = require("./update_overlay");
 const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
+const { registerFolderChooser } = require("./folderChooser");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -55,12 +56,13 @@ const {
   normalizeSavedServerUrl,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
+  isLoopbackServerUrl,
   databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
   sanitizeServerName,
 } = require("./url");
-const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
+const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
 const {
   parseServerLabels,
   serverLabel,
@@ -76,6 +78,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
+const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -85,10 +88,13 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const arcaOnboarding = require("./arca_onboarding");
 const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
+const sshConnect = require("./ssh_connect");
+const { createSshConnectFlow } = require("./ssh_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
 const {
@@ -117,8 +123,11 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
+
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
+
+const isHostThisMachine = createHostThisMachineChecker();
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -368,6 +377,26 @@ const arcaConnectFlow = createArcaConnectFlow({
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
+/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
+const sshConnectFlow = createSshConnectFlow({
+  BrowserWindow,
+  ipcMain,
+  pagePath: path.join(__dirname, "..", "ssh-connect", "index.html"),
+  preloadPath: path.join(__dirname, "ssh_connect_preload.js"),
+  startConnect: (serverUrl, destination, hooks) =>
+    sshConnect.startSshConnect(serverUrl, destination, {
+      hooks,
+      openExternal: (url) => shell.openExternal(url),
+      readInstallScript: () => {
+        const script = cliInstall.resolveInstallScript();
+        return script ? fs.readFileSync(script, "utf8") : null;
+      },
+      log: (message) => console.log(`[omnigent] ${message}`),
+    }),
+  commandLines: (serverUrl, destination) => sshConnect.describeCommands(serverUrl, destination),
+  log: (message) => console.log(`[omnigent] ${message}`),
+});
+
 /** How long a negative arca-binary probe is trusted before re-checking PATH. */
 const ARCA_PATH_RETRY_MS = 60 * 1000;
 let cachedArcaPath = { path: null, checkedAt: 0 };
@@ -452,20 +481,29 @@ const arcaPreviewDeclinedUntil = new Map();
  * succeeded.
  */
 const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
-const onboardingArcaLogins = new Map();
+const onboardingArcaSetups = new Map();
 
 /**
  * Onboarding's Arca connect, run through the auto-connect state machine so
  * the window's own launch-time connect joins it instead of racing a second
  * `arca ssh`. Picking Arca opts into auto-connect; overlapping attempts share
  * the opt-in, and the last to finish keeps it only if any of them succeeded.
- * Like any auto-connect, a started run finishes in the background even if
- * setup closes; nothing starts once it has.
+ * Browser sign-in is canceled when the last setup window closes; a started
+ * noninteractive connection may finish in the background.
  *
  * @param {string} serverUrl
  * @param {(line: string) => void} log
  * @param {Electron.WebContents} sender The shell-owned setup page.
- * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string, authError?: boolean, errorKind?: import("./arca").ArcaErrorKind }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   canceled?: boolean,
+ *   alreadyRunning?: boolean,
+ *   error?: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
+ *   authError?: boolean,
+ *   errorKind?: import("./arca").ArcaErrorKind,
+ * }>}
  */
 async function connectOnboardingArca(serverUrl, log, sender) {
   const isClosed = () => sender.isDestroyed();
@@ -484,65 +522,62 @@ async function connectOnboardingArca(serverUrl, log, sender) {
     if (isClosed()) {
       result = { ok: false, canceled: true };
     } else {
-      const current = arcaAutoConnect.getStatus(serverUrl);
-      // Joining a run already in flight streams nothing, so only a new run shows its command.
-      if (current.command && (current.state === "idle" || current.state === "failed")) {
-        log(`$ ${current.command}`);
-      }
-      let status =
-        current.state === "failed"
-          ? await arcaAutoConnect.retry(serverUrl, log)
-          : await arcaAutoConnect.ensure(serverUrl, log);
-      if (status.state === "failed" && status.errorKind === "omni-auth" && !isClosed()) {
-        // The setup page's Install click authorizes sign-in; passive auto-connect never does.
-        log(`$ arca ${arca.buildLoginArgs(serverUrl).join(" ")}`);
-        log("Signing in on Arca. If a browser window opens, finish signing in there.");
-        const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
-        let login = onboardingArcaLogins.get(target);
-        if (!login) {
-          login = { ...arca.startArcaLogin(serverUrl), waiters: 0 };
-          onboardingArcaLogins.set(target, login);
-          login.promise = login.promise.finally(() => {
-            if (onboardingArcaLogins.get(target) === login) onboardingArcaLogins.delete(target);
-          });
-        }
-        login.waiters += 1;
-        let onClosed;
-        const closed = new Promise((resolve) => {
-          onClosed = () => resolve({ ok: false, canceled: true });
-          sender.once("destroyed", onClosed);
+      // The setup page's Install click authorizes browser sign-in before host startup.
+      log(`$ arca ${arcaOnboarding.buildSetupArgs(serverUrl).join(" ")}`);
+      log("If sign-in is needed, a browser opens on your laptop. Finish signing in to continue.");
+      const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
+      let setup = onboardingArcaSetups.get(target);
+      if (!setup) {
+        setup = { ...arcaOnboarding.startArcaSetup(serverUrl), waiters: 0 };
+        onboardingArcaSetups.set(target, setup);
+        setup.promise = setup.promise.finally(() => {
+          if (onboardingArcaSetups.get(target) === setup) onboardingArcaSetups.delete(target);
         });
-        let auth;
-        try {
-          auth = await Promise.race([login.promise, closed]);
-        } finally {
-          sender.removeListener("destroyed", onClosed);
-          login.waiters -= 1;
-          // A closed setup window must not cancel another window's sign-in.
-          if (login.waiters === 0 && onboardingArcaLogins.get(target) === login) {
-            onboardingArcaLogins.delete(target);
-            login.cancel();
-          }
-        }
-        if (isClosed()) {
-          result = { ok: false, canceled: true };
-        } else if (auth.ok) {
-          log("Signed in. Connecting Arca…");
-          status = await arcaAutoConnect.retry(serverUrl, log);
-        } else {
-          result = auth;
+      }
+      setup.waiters += 1;
+      let onClosed;
+      const closed = new Promise((resolve) => {
+        onClosed = () => resolve({ ok: false, canceled: true });
+        sender.once("destroyed", onClosed);
+      });
+      let prepared;
+      try {
+        prepared = await Promise.race([setup.promise, closed]);
+      } finally {
+        sender.removeListener("destroyed", onClosed);
+        setup.waiters -= 1;
+        // A closed setup window must not cancel another window's sign-in.
+        if (setup.waiters === 0 && onboardingArcaSetups.get(target) === setup) {
+          onboardingArcaSetups.delete(target);
+          setup.cancel();
         }
       }
-      result ??=
-        status.state === "online"
-          ? { ok: true, alreadyRunning: status.alreadyRunning === true }
-          : {
-              ok: false,
-              error:
-                status.state === "unavailable"
-                  ? "The arca CLI was not found on this machine."
-                  : (status.error ?? "Couldn't connect Arca."),
-            };
+      if (isClosed()) {
+        result = { ok: false, canceled: true };
+      } else if (!prepared.ok) {
+        result = prepared;
+      } else {
+        log("Sign-in ready. Connecting Arca…");
+        const current = arcaAutoConnect.getStatus(serverUrl);
+        // Joining a run already in flight streams nothing, so only a new run shows its command.
+        if (current.command && (current.state === "idle" || current.state === "failed")) {
+          log(`$ ${current.command}`);
+        }
+        const status =
+          current.state === "failed"
+            ? await arcaAutoConnect.retry(serverUrl, log)
+            : await arcaAutoConnect.ensure(serverUrl, log);
+        result =
+          status.state === "online"
+            ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+            : {
+                ok: false,
+                error:
+                  status.state === "unavailable"
+                    ? "The arca CLI was not found on this machine."
+                    : (status.error ?? "Couldn't connect Arca."),
+              };
+      }
     }
   } catch (error) {
     result = { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -576,6 +611,10 @@ let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
 // `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
 let reconnectSlowDelayMs = 60_000;
+// A silent reconnect's IP access list refusals are usually the VPN still connecting
+// after wake or idle, so the overlay says the network is blocked only once they have
+// lasted this long. `let` so wiring tests can shrink it via testApi.setBlockedHintDelayMs.
+let blockedHintDelayMs = 30_000;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -617,10 +656,10 @@ const GRANTED_PERMISSIONS = new Set([
  * (localhost-trusted origins, not just pinned ones — see
  * isLocalhostTrustedOrigin). Two names because Chromium renamed the
  * permission: ``loopback-network`` is the granular Chromium 145+ name
- * (valid in Electron 42's Chromium 148, and the one Okta FastPass queries
+ * (valid in Electron 45's Chromium 156, and the one Okta FastPass queries
  * FIRST), ``local-network-access`` the older aggregate it falls back to.
  *
- * The localhost fetches themselves are NOT gated in Electron 42 (Chromium's
+ * The localhost fetches themselves are NOT gated in Electron 45 (Chromium's
  * LNA checks are disabled; verified empirically, including with
  * LocalNetworkAccessChecks force-enabled). But
  * ``navigator.permissions.query({name: ...})`` for these routes through the
@@ -683,7 +722,7 @@ async function ensureSystemMicAccess() {
  * request/check to a webContents — the requesting page is its top-level
  * page. Permission *checks* (the permissions.query path) can arrive with a
  * null webContents; those are allowed on origin trust alone, because the
- * answer is advisory in Electron 42 — it gates nothing beyond what fetch
+ * answer is advisory in Electron 45 — it gates nothing beyond what fetch
  * already allows, and a "denied" would falsely turn away IdP scripts that
  * probe before fetching.
  *
@@ -918,12 +957,14 @@ const UNREACHABLE_NET_ERRORS = new Set([
   -137, // NAME_RESOLUTION_FAILED
 ]);
 
-// Pending silent reconnects behind the overlay:
-// win → { serverUrl, returnUrl, attempt, timer, hint, finalMessage, network }.
+// Pending silent reconnects behind the overlay: win → { serverUrl, returnUrl,
+// attempt, timer, hint, finalMessage, network, blocked, blockedHintAt, hintTimer }.
 const reconnects = new WeakMap();
 
 function cancelReconnect(win) {
-  clearTimeout(reconnects.get(win)?.timer);
+  const state = reconnects.get(win);
+  clearTimeout(state?.timer);
+  clearTimeout(state?.hintTimer);
   reconnects.delete(win);
   reconnectOverlay.hide(win);
 }
@@ -955,25 +996,39 @@ function stopReconnect(win) {
  * Arm the next silent reconnect for a transient failure and show the overlay;
  * false once the schedule runs out. `finalMessage` is what Cancel shows. A
  * `network` failure (unreachable, or blocked by the IP access list) never runs
- * out: past the fast schedule it retries every reconnectSlowDelayMs.
+ * out: past the fast schedule it retries every reconnectSlowDelayMs. A `blocked`
+ * failure's hint waits until the refusals have lasted blockedHintDelayMs, unless
+ * they started with an explicit Connect.
  */
-function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, network = false }) {
+function scheduleReconnect(
+  win,
+  serverUrl,
+  returnUrl,
+  { hint, finalMessage, network = false, blocked = false, interactive = false },
+) {
   restartReconnectsOnWake();
   const previous = reconnects.get(win);
   const same = previous?.serverUrl === serverUrl;
   clearTimeout(previous?.timer);
+  clearTimeout(previous?.hintTimer);
   const attempt = same ? previous.attempt : 0;
   const delayMs = reconnectDelaysMs[attempt] ?? (network ? reconnectSlowDelayMs : undefined);
   if (delayMs === undefined) return false;
+  const now = Date.now();
+  const previousHintAt = same ? previous.blockedHintAt : null;
+  const blockedHintAt = interactive ? now : (previousHintAt ?? now + blockedHintDelayMs);
   const state = {
     serverUrl,
     // Never logged: it can name a conversation.
     returnUrl: returnUrl ?? (same ? previous.returnUrl : undefined) ?? serverUrl,
     attempt: attempt + 1,
     timer: null,
+    hintTimer: null,
     hint,
     finalMessage,
     network,
+    blocked,
+    blockedHintAt: blocked ? blockedHintAt : null,
   };
   const origin = originOf(serverUrl);
   console.log("[omnigent] databricks auth: reconnect scheduled", {
@@ -999,15 +1054,22 @@ function scheduleReconnect(win, serverUrl, returnUrl, { hint, finalMessage, netw
   };
   state.timer = setTimeout(fire, delayMs);
   reconnects.set(win, state);
-  reconnectOverlay.show(win, hint);
+  const hintDelayMs = blocked ? state.blockedHintAt - now : 0;
+  reconnectOverlay.show(win, hintDelayMs > 0 ? "" : hint);
+  if (hintDelayMs > 0) {
+    state.hintTimer = setTimeout(() => {
+      if (reconnects.get(win) === state) reconnectOverlay.show(win, hint);
+    }, hintDelayMs);
+  }
   return true;
 }
 
 let restartsReconnectsOnWake = false;
 
 /**
- * Waking or unlocking the Mac starts pending reconnects' fast schedule over, so
- * a VPN that comes back after wake is picked up within seconds.
+ * Waking or unlocking the Mac starts pending reconnects' fast schedule (and the
+ * wait before a blocked-network hint) over, so a VPN that comes back after wake
+ * is picked up within seconds.
  */
 function restartReconnectsOnWake() {
   if (restartsReconnectsOnWake) return;
@@ -1021,6 +1083,7 @@ function restartReconnectsOnWake() {
         reason,
       });
       state.attempt = 0;
+      state.blockedHintAt = null;
       if (!scheduleReconnect(win, state.serverUrl, state.returnUrl, state)) stopReconnect(win);
     }
   };
@@ -1050,7 +1113,12 @@ function unreachableMessage(serverUrl, blocked = false) {
 
 const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
-function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
+function showDatabricksAuthRequired(
+  win,
+  failedUrl,
+  error,
+  { returnUrl: failedReturnUrl, interactive = false } = {},
+) {
   if (win.isDestroyed()) return;
   diagnostics.record("auth_required", {
     origin: originOf(failedUrl),
@@ -1096,6 +1164,8 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
       hint: unreachable ? reconnectingHint(serverUrl, blocked) : UNAVAILABLE_HINT,
       finalMessage: message,
       network: unreachable,
+      blocked,
+      interactive,
     });
   if (!retrying) showConnectFailure(win, serverUrl, message);
 }
@@ -1724,9 +1794,21 @@ function resolvedCliPath() {
  * @returns {string}
  */
 function missingHostCliError(serverUrl) {
+  const { errorMessage, errorAction } = missingHostCliErrorParts(serverUrl);
+  return `${errorMessage} ${errorAction}`;
+}
+
+/** @param {string} serverUrl */
+function missingHostCliErrorParts(serverUrl) {
   return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
-    ? "The isaac CLI was not found. Install it before connecting this machine."
-    : "The omnigent CLI was not found. Install it or set its path.";
+    ? {
+        errorMessage: "The isaac CLI was not found.",
+        errorAction: "Install it before connecting this machine.",
+      }
+    : {
+        errorMessage: "The omnigent CLI was not found.",
+        errorAction: "Install it or set its path.",
+      };
 }
 
 /**
@@ -2216,9 +2298,10 @@ async function loadServerUrl(
           } else {
             // The account URL's workspace was unreachable: reconnect to that workspace.
             const workspaceUrl = error.storedOrigin && databricksWorkspaceUiUrl(error.storedOrigin);
-            if (workspaceUrl) {
-              showDatabricksAuthRequired(win, workspaceUrl, error, { returnUrl: workspaceUrl });
-            } else showDatabricksAuthRequired(win, serverUrl, error, { returnUrl: target });
+            showDatabricksAuthRequired(win, workspaceUrl || serverUrl, error, {
+              returnUrl: workspaceUrl || target,
+              interactive,
+            });
           }
         }
         throw error;
@@ -2751,6 +2834,9 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  // The menu item opens the bar without a page keydown; the page must still
+  // render every transcript row for find to reach off-screen messages.
+  target.webContents.send("omnigent:find-opened");
   const existing = findBars.get(target);
   if (existing && !existing.isDestroyed()) {
     existing.focus();
@@ -2785,9 +2871,15 @@ function openFindBar(target) {
       matches: result.matches,
     });
   };
+  // Results belong to the searched conversation, so switching closes the bar.
+  const openedIn = findConversationId(target.webContents.getURL());
+  const onNavigate = (_event, url, isMainFrame) => {
+    if (isMainFrame && findConversationId(url) !== openedIn) bar.close();
+  };
   target.on("resize", reposition);
   target.on("move", reposition);
   target.webContents.on("found-in-page", onFound);
+  target.webContents.on("did-navigate-in-page", onNavigate);
 
   bar.once("ready-to-show", () => {
     reposition();
@@ -2799,12 +2891,18 @@ function openFindBar(target) {
     target.removeListener("resize", reposition);
     target.removeListener("move", reposition);
     target.webContents.removeListener("found-in-page", onFound);
+    target.webContents.removeListener("did-navigate-in-page", onNavigate);
     // Closing the parent (Cmd+W) destroys its webContents before this child's
     // "closed" fires, while the parent window itself is not yet destroyed.
     if (target.webContents.isDestroyed()) return;
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+/** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
+function findConversationId(url) {
+  return /\/c\/([^/]+)\/?$/.exec(URL.parse(url)?.pathname ?? "")?.[1] ?? null;
 }
 
 /**
@@ -3749,15 +3847,13 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 // the registry attribute each request to its view.
 const guardedAgentSessions = new WeakSet();
 
-/** Enforce the agent navigation policy on document requests at the network layer. */
+/** Enforce the agent network policy on documents, subresources, and workers. */
 function guardAgentPartitionRequests(partition, registry) {
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
-  // Documents only: frames plus <object>/<embed> content, which also renders.
   const filter = {
-    urls: ["http://*/*", "https://*/*"],
-    types: ["mainFrame", "subFrame", "object"],
+    urls: ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"],
   };
   const answer = (decision, callback) =>
     decision.then(
@@ -3765,13 +3861,13 @@ function guardAgentPartitionRequests(partition, registry) {
       () => callback({ cancel: true }),
     );
   ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
+    answer(registry.shouldCancelAgentRequest(details, partition), callback),
   );
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
+    callback(registry.agentRequestHeaders(details, partition)),
   );
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
+    answer(registry.shouldCancelAgentResponse(details, partition), callback),
   );
 }
 
@@ -3885,15 +3981,18 @@ function createBrowserRegistryForWindow(win) {
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
-    isArcaAgentContext: (context) => {
+    allowsLocalhost: (context) => {
+      if (context?.revoked || win.isDestroyed() || !pinnedOrigin(win)) return false;
       const target = windowArcaServerUrl(win);
-      return isArcaAgentContext(arcaIdentities.get(target), context, {
-        enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
-        managed:
-          isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
-          isDatabricksManagedServerUrl(target),
-        serverTarget: target,
-      });
+      return (
+        isArcaAgentContext(arcaIdentities.get(target), context, {
+          enabled: databricksInternalFeaturesEnabled(),
+          managed:
+            isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
+            isDatabricksManagedServerUrl(target),
+          serverTarget: target,
+        }) || context?.hostIsThisMachine === true
+      );
     },
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
@@ -4285,13 +4384,27 @@ function registerIpc() {
       return result;
     }
     const cliCommand = hostCliCommand(target);
-    if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
+    if (!cliCommand) {
+      const missingCli = missingHostCliErrorParts(target);
+      return {
+        ok: false,
+        error: `${missingCli.errorMessage} ${missingCli.errorAction}`,
+        ...missingCli,
+      };
+    }
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
       onLogin: () => log("If a browser window opens, finish signing in there."),
     });
-    if (!auth.ok) return { ok: false, error: auth.error };
+    if (!auth.ok) {
+      return {
+        ok: false,
+        error: auth.error,
+        ...(auth.errorMessage ? { errorMessage: auth.errorMessage } : {}),
+        ...(auth.errorAction ? { errorAction: auth.errorAction } : {}),
+      };
+    }
     // Close out the sign-in lines so the log never ends on a stale prompt.
     log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
@@ -4310,7 +4423,8 @@ function registerIpc() {
     if (typeof text !== "string") {
       throw new TypeError("copy-setup-text requires a string");
     }
-    clipboard.writeText(text);
+    // Async since Electron 44; returning it lets the page report a failed copy.
+    return clipboard.writeText(text);
   });
 
   // SPA server picker → the sender window's pinned origin plus the persisted
@@ -4615,7 +4729,9 @@ function registerIpc() {
     }
     const cliPath = resolvedCliPath();
     if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+      const errorMessage = "The omnigent CLI was not found.";
+      const errorAction = "Install it or set its path.";
+      return { ok: false, error: `${errorMessage} ${errorAction}`, errorMessage, errorAction };
     }
     // Stream the server's startup log lines to the setup page as it boots.
     const onLine = (line) => {
@@ -4661,6 +4777,13 @@ function registerIpc() {
     shell,
     isPinnedOriginSender,
     localHostId: () => omnigentCli.localHostId(),
+  });
+
+  registerFolderChooser({
+    ipcMain,
+    dialog,
+    windowFor: (event) => BrowserWindow.fromWebContents(event.sender) ?? undefined,
+    isPinnedOriginSender,
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
@@ -4850,6 +4973,39 @@ function registerIpc() {
     };
   });
 
+  // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
+  // and revalidates the destination before the shell-owned console asks consent.
+  ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("ssh-connect is only available to a connected server page");
+    }
+    if (process.platform === "win32") {
+      return { ok: false, error: "Connecting over SSH isn't available on Windows yet." };
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    // Where Run on Arca is offered, it replaces this path. Re-checked here: the
+    // server's own page decides what it shows.
+    if (databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)) {
+      return { ok: false, error: "Connecting over SSH is off here. Use Run on Arca instead." };
+    }
+    let target;
+    try {
+      target = sshConnect.validateDestination(destination);
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+    // On the remote machine, localhost is that machine, so this server is out of
+    // its reach; refuse before the install and sign-in rather than after.
+    if (isLoopbackServerUrl(serverUrl)) {
+      return {
+        ok: false,
+        error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
+      };
+    }
+    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
+  });
+
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
   // the window's server as a host, by running `isaac omni host --background`
   // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
@@ -4999,10 +5155,21 @@ function registerIpc() {
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
-    getAgentContextForEvent: (event, sourceHostId) => ({
-      serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
-      sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
-    }),
+    getAgentContextForEvent: (event, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
+      // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
+      return {
+        serverTarget: arcaTarget(windowArcaServerUrl(win)),
+        sourceHostId,
+        hostIsThisMachine:
+          opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+          isHostThisMachine({
+            hostId: sourceHostId,
+            serverUrl: windows.get(win)?.serverUrl,
+          }),
+      };
+    },
     recoverAgentNavigationForEvent: async (
       event,
       url,
@@ -5212,7 +5379,7 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     title: "Omnigent",
     message: `Open this Omnigent link?`,
     detail:
-      `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
+      `This link will connect Omnigent to ${host}.\n\n` +
       `Only open links from a server you trust — once connected, it can show ` +
       `notifications and (when you allow it) manage this machine as a runner.`,
     buttons: ["Cancel", "Open"],
@@ -5292,7 +5459,7 @@ function drainPendingDeepLinks() {
  */
 async function handleDeepLink(raw) {
   const parsed = parseOmnigentDeepLink(raw);
-  if (!parsed) return;
+  if (!parsed || !(await acceptCliDeepLink(raw))) return;
 
   // The origin is fixed by the link itself — no network request needed for the
   // decision. expandDatabricksWorkspaceUrl only appends a mount path under this
