@@ -48,6 +48,51 @@ The first two runs return exit code 3 (waiting). The final run returns 0. The
 and releases `summarize` only after review passes. Inspect with `--inspect --state`.
 Exit code 1 means execution failed; 2 means invalid CLI usage.
 
+## Design in the UI
+
+Start an isolated local server with the feature enabled, then open
+<http://127.0.0.1:6770/workflows>:
+
+```sh
+OMNIGENT_FEATURES=dynamic_workflows \
+OMNIGENT_DATA_DIR="$PWD/.omnigent/workflow-ui/data" \
+OMNIGENT_CONFIG_HOME="$PWD/.omnigent/workflow-ui/config" \
+OMNIGENT_AUTH_PROVIDER=header OMNIGENT_LOCAL_SINGLE_USER=1 \
+uv run --no-sync omnigent server --host 127.0.0.1 --port 6770
+```
+
+Build the frontend first with `pnpm --filter web build` after installing repository
+dependencies. Environments that require a launcher should use their launcher
+instead of the `omnigent` executable, or explicitly set `OMNIGENT_WRAPPER_BYPASS=1`
+for this isolated development server.
+
+The Workflows sidebar link and direct route appear only when the server advertises
+the flag. Without it, workflow API routes are absent and no workflow service is
+constructed. Restart the server after changing the flag.
+
+1. Click **Add task**, enter a name and goal, and choose prerequisites. Execution
+   settings belong to each task: agent IDs, roles, repositories, lead, and whether
+   agents contribute in parallel. Follow-ups start enabled with two retries.
+2. Read arrows from prerequisite to dependent task. Select an arrow and click
+   **Remove arrow**, or uncheck its prerequisite under **Wait for**.
+3. Click **Export YAML** to save the design. The server validates the same model
+   consumed by the CLI and API; the designer does not persist unsaved drafts.
+4. Choose **Simulation** and **Test workflow**. The test view shows the DAG,
+   outcomes, outputs and review gates. Fail a review to request repair, then pass
+   the new candidate and watch downstream tasks become runnable.
+
+For real agents, configure `OMNIGENT_WORKFLOW_ARCLET_URL` on the server and use
+**Task agents**. Set `OMNIGENT_WORKFLOW_OWNER` to the authenticated user allowed to
+use that operator connection; explicit local single-user mode permits the local
+user without an owner override. The connection uses the shared login described
+below. Export and simulation do not require live credentials. Web definitions
+accept external review gates; local command gates are CLI-only.
+
+The UI focuses on creating a workflow and testing its current definition. The
+API also exposes owner-scoped run inspection, event submission, stop and resume.
+Controllers are local to one server process; restarting it leaves checkpoints
+available for explicit resume.
+
 ## Real agent execution
 
 Copy `arclet-workflow.yaml`, replace the registered agent ID and set the server URL:
@@ -121,6 +166,15 @@ scheduler. Completed tasks cannot be reopened. `parent` records containment with
 adding aggregate completion semantics. MAR execution is deferred.
 
 ## Verification
+
+The browser journey owns isolated servers with the flag off and on, and exercises
+desktop sidebar navigation plus direct navigation on a touch viewport:
+
+```sh
+pnpm --filter web build
+uv run --no-sync pytest tests/e2e_ui/scheduled/test_dynamic_workflows.py \
+  --ui-skip-build --video=on --output=/tmp/workflow-ui-evidence --reruns 0 -q
+```
 
 ```sh
 uv run --no-sync pytest tests/workflows --reruns 0 -q

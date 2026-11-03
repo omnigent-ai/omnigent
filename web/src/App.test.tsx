@@ -29,6 +29,7 @@ vi.mock("@/pages/ChatPage", () => ({
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
+vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflow page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
@@ -242,6 +243,34 @@ function renderUsageRoute(enabled: boolean) {
     </CapabilitiesProvider>,
   );
 }
+
+describe.each([undefined, "/mount"])("workflow route with prefix %s", (basename) => {
+  it.each([undefined, false, true, "loading"])("requires explicit opt-in: %s", async (enabled) => {
+    render(
+      <CapabilitiesProvider
+        info={
+          enabled === "loading"
+            ? "loading"
+            : {
+                ...FALLBACK_SERVER_INFO,
+                features: enabled === undefined ? {} : { dynamic_workflows: enabled === true },
+              }
+        }
+      >
+        <MemoryRouter initialEntries={[`${basename ?? ""}/workflows`]}>
+          <App basename={basename} />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    if (enabled === "loading") {
+      expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+      expect(screen.queryByText("workflow page")).toBeNull();
+    } else {
+      expect(await screen.findByText(enabled ? "workflow page" : "not found")).toBeInTheDocument();
+    }
+    cleanup();
+  });
+});
 
 function renderRoute(
   path: string,

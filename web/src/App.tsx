@@ -58,6 +58,10 @@ const InboxPage = withPageView(
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
 const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+const WorkflowsPage = withPageView(
+  "workflows",
+  lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+);
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
@@ -216,6 +220,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="automations_v2">
                 <TaskDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/workflows`}
+            element={
+              <FeatureGatedPage feature="dynamic_workflows">
+                <WorkflowsPage />
               </FeatureGatedPage>
             }
           />

@@ -147,6 +147,53 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).automations_enabled is False
 
 
+@pytest.mark.parametrize(
+    "override", [None, "dynamic_workflows", "dynamic_workflows,-dynamic_workflows"]
+)
+async def test_dynamic_workflows_require_explicit_opt_in(override, request, monkeypatch):
+    from omnigent.workflows import service
+
+    created = []
+    original_service = service.WorkflowService
+
+    def create_service(directory):
+        created.append(directory)
+        return original_service(directory)
+
+    monkeypatch.setattr(service, "WorkflowService", create_service)
+    if override is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", override)
+    app = request.getfixturevalue("app")
+    enabled = override == "dynamic_workflows"
+    assert len(created) == int(enabled)
+    # A running server retains its startup snapshot until restarted.
+    monkeypatch.setenv("OMNIGENT_FEATURES", "" if enabled else "dynamic_workflows")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        info = (await client.get("/v1/info")).json()
+        assert info["features"]["dynamic_workflows"] is enabled
+        paths = app.openapi()["paths"]
+        assert ("/v1/workflows" in paths) is enabled
+        if enabled:
+            assert (await client.get("/v1/workflows/options")).status_code == 200
+        else:
+            for method, path in [
+                ("GET", "/v1/workflows"),
+                ("POST", "/v1/workflows"),
+                ("GET", "/v1/workflows/options"),
+                ("POST", "/v1/workflows/definition"),
+                ("GET", "/v1/workflows/saved-run"),
+                ("POST", "/v1/workflows/saved-run/events"),
+                ("POST", "/v1/workflows/saved-run/resume"),
+                ("POST", "/v1/workflows/saved-run/stop"),
+            ]:
+                response = await client.request(method, path)
+                assert response.status_code == 404, response.text
+
+
 async def test_info_disables_config_edit_for_unsupported_store(
     app: FastAPI,
     client: httpx.AsyncClient,

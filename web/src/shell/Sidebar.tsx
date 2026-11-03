@@ -51,6 +51,7 @@ import {
   GitForkIcon,
   GitPullRequestIcon,
   InboxIcon,
+  WorkflowIcon,
   ListChecksIcon,
   ListFilterIcon,
   LaptopIcon,
@@ -519,6 +520,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
+  isWorkflowsPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -540,6 +542,7 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
+  const isWorkflowsPage = !isExtensionRoute && leaf === "workflows";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -549,6 +552,7 @@ function useActiveNavItem(): {
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
+    !isWorkflowsPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const requestedProject = isNewSessionRoute
@@ -564,6 +568,7 @@ function useActiveNavItem(): {
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -842,6 +847,7 @@ function SidebarImpl({
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -1237,6 +1243,23 @@ function SidebarImpl({
                   />
                 </Link>
               </Button>
+              {isFeatureEnabled(serverInfo, "dynamic_workflows") && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isWorkflowsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                >
+                  <Link to="/workflows" onClick={onNavClick} componentId="sidebar.workflows">
+                    <WorkflowIcon className="ui-icon text-muted-foreground" />
+                    Workflows
+                  </Link>
+                </Button>
+              )}
               {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
               <Button
                 asChild

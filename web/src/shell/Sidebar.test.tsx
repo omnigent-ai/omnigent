@@ -1078,6 +1078,17 @@ describe("Sidebar session list", () => {
     expect(screen.queryByTestId("usage-nav")).toBeNull();
   });
 
+  it.each([undefined, false, true])("requires workflow opt-in: %s", (enabled) => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: enabled === undefined ? {} : { dynamic_workflows: enabled },
+    });
+    const link = screen.queryByRole("link", { name: "Workflows" });
+    if (enabled) expect(link).toHaveAttribute("href", "/workflows");
+    else expect(link).toBeNull();
+  });
+
   it("shows and highlights Usage navigation when the release feature is on", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/usage", undefined, {

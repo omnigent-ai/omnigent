@@ -114,7 +114,7 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 ## Features
 
 - [Dynamic workflows](./dynamic-workflows.md) covers opt-in DAG execution, outcomes,
-  validation, repair, and checkpoint recovery through the experimental module CLI.
+  validation, repair, and checkpoint recovery through the designer, API and module CLI.
 
 - [Automation templates](./automation-templates.md) covers the gallery tabs,
   empty-state preview, and direct template setup.
