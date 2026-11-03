@@ -905,7 +905,7 @@ function WorkspacePanelImpl({
   const listedSideChats = useListedSideChats(conversationId);
   const { sync: syncSideChats } = sideChats;
   useEffect(() => {
-    if (listedSideChats !== null) syncSideChats(listedSideChats);
+    if (listedSideChats !== null) syncSideChats(listedSideChats.ids, listedSideChats.requestedAt);
   }, [listedSideChats, syncSideChats]);
   const refreshListedSideChats = useCallback(() => {
     const queryKey = listedSideChatsQueryKey(conversationId);

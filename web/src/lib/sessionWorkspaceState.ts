@@ -47,6 +47,8 @@ export interface SessionWorkspaceState {
   /** The server's side-chat list at the last sync, so a side chat closed on
    *  another device can be told apart from one this browser opened itself. */
   syncedSideChats?: string[];
+  /** When the request for {@link syncedSideChats} started, so an older list is ignored. */
+  syncedSideChatsAt?: number;
   /** Side chats recently closed in this browser, oldest first, which a stale
    *  server list must not reopen. */
   closedSideChats?: string[];
@@ -141,6 +143,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
   if (Array.isArray(record.syncedSideChats))
     state.syncedSideChats = uniqueIds(record.syncedSideChats);
+  if (typeof record.syncedSideChatsAt === "number" && Number.isFinite(record.syncedSideChatsAt))
+    state.syncedSideChatsAt = record.syncedSideChatsAt;
   if (Array.isArray(record.closedSideChats))
     state.closedSideChats = uniqueIds(record.closedSideChats);
   if (Array.isArray(record.openSubagentTabs))

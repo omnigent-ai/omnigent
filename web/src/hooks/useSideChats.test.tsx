@@ -154,7 +154,7 @@ describe("side chats the server lists", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     act(() => result.current.open("conv_local"));
 
-    act(() => result.current.sync(["conv_remote"]));
+    act(() => result.current.sync(["conv_remote"], 1));
 
     expect(result.current.tabs).toEqual(["conv_local", "conv_remote"]);
     expect(result.current.selected).toBe("conv_local");
@@ -164,12 +164,12 @@ describe("side chats the server lists", () => {
   it("close when another device closes them, leaving tabs the list never named", () => {
     const subagentTab = subagentTabId("conv_child");
     const { result } = renderHook(() => useSideChats("session-a"));
-    act(() => result.current.sync(["conv_a", "conv_b"]));
+    act(() => result.current.sync(["conv_a", "conv_b"], 1));
     act(() => result.current.open("conv_unlisted"));
     act(() => result.current.open(subagentTab));
     act(() => result.current.select("conv_b"));
 
-    act(() => result.current.sync(["conv_a"]));
+    act(() => result.current.sync(["conv_a"], 2));
 
     expect(result.current.tabs).toEqual(["conv_a", "conv_unlisted", subagentTab]);
     expect(result.current.selected).toBe("conv_a");
@@ -179,7 +179,7 @@ describe("side chats the server lists", () => {
     [
       "after a sync",
       (hook: SideChatsHook) => {
-        hook.sync(["conv_a"]);
+        hook.sync(["conv_a"], 1);
         hook.close("conv_a");
       },
     ],
@@ -188,14 +188,14 @@ describe("side chats the server lists", () => {
       (hook: SideChatsHook) => {
         hook.open("conv_a");
         hook.close("conv_a");
-        hook.sync([]);
+        hook.sync([], 1);
       },
     ],
     [
       "on another device",
       (hook: SideChatsHook) => {
-        hook.sync(["conv_a"]);
-        hook.sync([]);
+        hook.sync(["conv_a"], 1);
+        hook.sync([], 3);
       },
     ],
   ])(
@@ -205,19 +205,55 @@ describe("side chats the server lists", () => {
       const second = renderHook(() => useSideChats("session-a"));
       act(() => closeTab(first.result.current));
 
-      act(() => second.result.current.sync(["conv_a"]));
+      act(() => second.result.current.sync(["conv_a"], 2));
 
       expect(second.result.current.tabs).toEqual([]);
       expect(readSessionWorkspaceState("session-a").openSideChats).toEqual([]);
     },
   );
 
+  it.each([
+    [
+      "a list another window requested before they were created arrives late",
+      (first: SideChatsHook, second: SideChatsHook) => {
+        first.open("conv_new");
+        first.sync(["conv_new"], 2);
+        second.sync([], 1);
+      },
+    ],
+    [
+      "a list requested later but answered earlier misses them",
+      (first: SideChatsHook, second: SideChatsHook) => {
+        first.sync(["conv_new"], 1);
+        second.sync([], 2);
+      },
+    ],
+  ])("stay open once listed when %s", (_when, missThem) => {
+    const first = renderHook(() => useSideChats("session-a"));
+    const second = renderHook(() => useSideChats("session-a"));
+    act(() => missThem(first.result.current, second.result.current));
+
+    act(() => second.result.current.sync(["conv_new"], 3));
+
+    expect(second.result.current.tabs).toEqual(["conv_new"]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_new"]);
+  });
+
+  it("apply lists after the clock moves back", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.sync(["conv_a"], Date.now() + 60_000));
+
+    act(() => result.current.sync([], Date.now()));
+
+    expect(result.current.tabs).toEqual([]);
+  });
+
   it("keep a side chat opened here before the list includes it, without duplicating it", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     act(() => result.current.open("conv_new"));
 
-    act(() => result.current.sync([]));
-    act(() => result.current.sync(["conv_new"]));
+    act(() => result.current.sync([], 1));
+    act(() => result.current.sync(["conv_new"], 2));
 
     expect(result.current.tabs).toEqual(["conv_new"]);
     expect(result.current.selected).toBe("conv_new");
@@ -226,13 +262,18 @@ describe("side chats the server lists", () => {
   it("reopen once a tab closes if the tab limit dropped them", () => {
     const listed = Array.from({ length: MAX_OPEN_SIDE_CHATS + 1 }, (_, index) => `conv_${index}`);
     const first = renderHook(() => useSideChats("session-a"));
-    act(() => first.result.current.sync(listed));
+    act(() => first.result.current.sync(listed, 1));
     expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(listed.slice(1));
     first.unmount();
 
     const reloaded = renderHook(() => useSideChats("session-a"));
     act(() => reloaded.result.current.close("conv_5"));
-    act(() => reloaded.result.current.sync(listed.filter((id) => id !== "conv_5")));
+    act(() =>
+      reloaded.result.current.sync(
+        listed.filter((id) => id !== "conv_5"),
+        2,
+      ),
+    );
 
     const reopened = [...listed.slice(1).filter((id) => id !== "conv_5"), "conv_0"];
     expect(reloaded.result.current.tabs).toEqual(reopened);
@@ -242,7 +283,7 @@ describe("side chats the server lists", () => {
   it("leave storage untouched when the list is unchanged", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
 
-    act(() => result.current.sync([]));
+    act(() => result.current.sync([], 1));
 
     expect(localStorage.getItem(SESSION_WORKSPACE_STATE_KEY)).toBeNull();
   });

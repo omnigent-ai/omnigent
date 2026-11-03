@@ -14,7 +14,10 @@ from omnigent.entities import Conversation
 from omnigent.server.routes._sessions.helpers import (
     _child_session_summary_from_conversation,
 )
-from omnigent.stores.conversation_store import pinned_label_key
+from omnigent.stores.conversation_store import (
+    SIDE_CHAT_ENTRY_LABEL_PREFIX,
+    pinned_label_key,
+)
 
 
 def _child(labels: dict[str, str]) -> Conversation:
@@ -43,4 +46,17 @@ def test_child_summary_strips_per_user_pin_keys() -> None:
     # No pin key of any kind survives — not the canonical one, not a per-user one.
     assert not any(k.startswith("omnigent.pinned") for k in summary.labels)
     # Unrelated labels are preserved.
+    assert summary.labels.get("omni_project") == "Moonshot"
+
+
+def test_child_summary_strips_side_chat_entries() -> None:
+    """Side-chat entries on a child row name their creators, so its summary omits them."""
+    conv = _child(
+        {
+            f"{SIDE_CHAT_ENTRY_LABEL_PREFIX}conv_side": "alice@example.com",
+            "omni_project": "Moonshot",
+        }
+    )
+    summary = _child_session_summary_from_conversation(conv, "conv_parent", None)
+    assert not any(k.startswith(SIDE_CHAT_ENTRY_LABEL_PREFIX) for k in summary.labels)
     assert summary.labels.get("omni_project") == "Moonshot"

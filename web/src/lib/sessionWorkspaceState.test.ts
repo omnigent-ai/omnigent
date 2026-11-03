@@ -224,7 +224,12 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
+      JSON.stringify([
+        {
+          id: "conv_b",
+          state: { open: true, widthPx: -5, rightRailTab: "bogus", syncedSideChatsAt: "soon" },
+        },
+      ]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
 
@@ -237,6 +242,7 @@ describe("sessionWorkspaceState", () => {
           state: {
             openSubagentTabs: ["subagent:a", "", 7, "subagent:a", "subagent:b"],
             syncedSideChats: ["conv_x", 7, "conv_x"],
+            syncedSideChatsAt: 5,
             closedSideChats: ["conv_y", null, "conv_y"],
           },
         },
@@ -245,6 +251,7 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_c")).toEqual({
       openSubagentTabs: ["subagent:a", "subagent:b"],
       syncedSideChats: ["conv_x"],
+      syncedSideChatsAt: 5,
       closedSideChats: ["conv_y"],
     });
   });

@@ -16,6 +16,8 @@ interface SideChatTabsState {
   selected: string | null;
   /** The server's side-chat list at the last {@link useSideChats} `sync`. */
   synced: string[];
+  /** When the request for {@link synced} started (ms since epoch; 0 before any sync). */
+  syncedAt: number;
   /** Side chats closed in this browser, so a list fetched before the close can't reopen them. */
   closed: string[];
 }
@@ -36,6 +38,7 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
     subagentTabs,
     selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
     synced: saved.syncedSideChats ?? [],
+    syncedAt: saved.syncedSideChatsAt ?? 0,
     closed: saved.closedSideChats ?? [],
   };
 }
@@ -107,6 +110,7 @@ export function useSideChats(conversationId: string) {
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
         syncedSideChats: next.synced.length > 0 ? next.synced : undefined,
+        syncedSideChatsAt: next.syncedAt > 0 ? next.syncedAt : undefined,
         closedSideChats: next.closed.length > 0 ? next.closed : undefined,
       });
       // Past the cap, keep only the result so a long storage outage can't grow the replay.
@@ -182,15 +186,23 @@ export function useSideChats(conversationId: string) {
    *  listed side chats this browser hasn't closed (the newest that fit the tab
    *  limit) without changing the selection, and close those another device
    *  removed from it. Tabs the list never named (Codex forks, pending tabs,
-   *  older side chats) are left alone. */
+   *  older side chats) are left alone, and so is everything when a newer list
+   *  was already applied here or in another window.
+   *
+   *  @param listed The listed side-chat ids, oldest first.
+   *  @param requestedAt When the list's request started (ms since epoch).
+   */
   const sync = useCallback(
-    (listed: string[]) =>
+    (listed: string[], requestedAt: number) =>
       update((current) => {
+        // A future syncedAt means the clock moved back, so it can't order lists.
+        if (requestedAt < current.syncedAt && current.syncedAt <= Date.now()) return current;
         const synced = new Set(current.synced);
         const listedSet = new Set(listed);
         let next = current;
         for (const id of current.synced) {
-          if (!listedSet.has(id)) next = withTabClosed(next, id);
+          // Not remembered as closed: a later list that names it again reopens it.
+          if (!listedSet.has(id)) next = withoutTab(next, id);
         }
         const closed = new Set(next.closed);
         const unopened = listed.filter((id) => !next.tabs.includes(id) && !closed.has(id));
@@ -199,7 +211,7 @@ export function useSideChats(conversationId: string) {
         const sameList =
           listed.length === current.synced.length && listed.every((id) => synced.has(id));
         if (next === current && added.length === 0 && sameList) return current;
-        return { ...next, tabs: [...next.tabs, ...added], synced: listed };
+        return { ...next, tabs: [...next.tabs, ...added], synced: listed, syncedAt: requestedAt };
       }),
     [update],
   );
