@@ -5019,7 +5019,10 @@ async function bindStream(
       // re-binds.)
       const allBlocks = [
         ...unique,
-        ...withoutRebuiltUserInputCards(currentBlocks, unique),
+        ...withoutPersistedStatusErrors(
+          withoutRebuiltUserInputCards(currentBlocks, unique),
+          unique,
+        ),
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
