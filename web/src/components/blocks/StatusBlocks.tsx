@@ -109,6 +109,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+  content_policy_refusal:
+    "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
   host_disk_full: "The host's disk is full, so the agent can't save the conversation.",
 };
 

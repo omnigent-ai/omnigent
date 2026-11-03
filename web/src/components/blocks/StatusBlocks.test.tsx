@@ -287,6 +287,10 @@ describe("ErrorBanner", () => {
       "codex_provider_auth_failed",
       "Codex couldn't get a token from the model provider's sign-in command on the host.",
     ],
+    [
+      "content_policy_refusal",
+      "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
