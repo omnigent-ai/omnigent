@@ -1,8 +1,9 @@
 # Automation templates
 
 Automations has Your automations and Templates tabs. The template gallery is
-also previewed when the user has no automations. Selecting a template opens
-the creation modal with its integration settings ready to customize.
+also previewed below Your automations, including when automations already exist.
+Selecting a template opens the creation modal with its integration settings ready
+to customize.
 
 ## Sub-features
 
@@ -10,9 +11,9 @@ the creation modal with its integration settings ready to customize.
   switching preserves the list's search and state filter.
 - `navigation`: Templates is linkable and survives refresh and browser back;
   old template-page links open the Templates tab.
-- `preview`: the empty list shows a template preview; populated lists and
-  filtered-empty lists do not.
-- `create`: a gallery item or empty-state preview opens integration setup;
+- `preview`: empty and populated lists show suggested automations in the All
+  filter with no search; searches and Active/Paused filters hide the preview.
+- `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
 - `workspace`: connected-host setup disables workspace browsing while the
   selected host is offline and asks the user to connect it. Reconnecting enables
@@ -41,8 +42,8 @@ the creation modal with its integration settings ready to customize.
 
 - **Standalone web:** open Automations from the sidebar, then Templates, or
   follow `/tasks?view=templates`. Old `/tasks/templates` links redirect here.
-- **Empty state:** open Your automations with no saved automations and select
-  a preview beneath the empty-state message.
+- **Your automations:** select a suggestion beneath the saved automations or
+  empty-state message, with All selected and the search cleared.
 - **Creation modal:** click New automation on either tab to start from scratch.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
