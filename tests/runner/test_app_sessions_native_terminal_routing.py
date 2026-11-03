@@ -18,7 +18,6 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
-from omnigent.process_logging import display_log_path
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _auto_create_repl_terminal,
@@ -277,8 +276,7 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     int(error_id.removeprefix("err_"), 16)
     assert error["message"] == (
         "Native Claude terminal failed to start (ImportError); "
-        f"see the runner log for details: {display_log_path(pinned_runner_log)} "
-        f"Error ID: {error_id}."
+        f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
     )
     assert "requires the 'claude' CLI" not in error["message"]
     # The structured, non-sensitive cause (exception type only, here) still
@@ -1074,14 +1072,11 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     ("backend_state", "recreated"),
     [
         ("missing", True),
-        ("failed_startup", True),
-        ("dead_backend", True),
+        ("pane_exits_between_probes", True),
         ("dead_backend_close_failed", True),
         ("dead_backend_retirement_cancelled", True),
-        ("unowned_dead_backend", False),
         ("starting", False),
         ("starting_no_process", False),
-        ("ready", False),
         ("detached", False),
         ("rotated", False),
         ("rotated_before_state_update", False),
@@ -1108,13 +1103,10 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
     if (
         backend_state
         in (
-            "ready",
             "detached",
-            "dead_backend",
+            "pane_exits_between_probes",
             "dead_backend_close_failed",
             "dead_backend_retirement_cancelled",
-            "unowned_dead_backend",
-            "rotated",
             "foreign_bridge",
         )
         or rotating
@@ -1130,19 +1122,15 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
                 codex_home=str(bridge_dir / "codex-home"),
             ),
         )
-    if backend_state == "failed_startup":
-        codex_native_bridge.record_app_server_stopped(bridge_dir)
     backend = None
     if (
         backend_state
         in (
             "starting",
             "starting_no_process",
-            "ready",
-            "dead_backend",
+            "pane_exits_between_probes",
             "dead_backend_close_failed",
             "dead_backend_retirement_cancelled",
-            "unowned_dead_backend",
         )
         or rotating
     ):
@@ -1175,15 +1163,22 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
         _harness_spec("codex-native"), terminal_registry=registry
     )
     resources = app.state.session_resource_registry
-    if backend_state != "unowned_dead_backend":
-        resources._terminal_roles[(source_session_id, "terminal_codex_main")] = (
-            CODEX_NATIVE_TERMINAL_ROLE
-        )
+    resources._terminal_roles[(source_session_id, "terminal_codex_main")] = (
+        CODEX_NATIVE_TERMINAL_ROLE
+    )
     launches: list[str] = []
+    forwarder = None
+    if backend_state == "pane_exits_between_probes":
+        # The turn sees a live pane; the resource lookup then observes its exit.
+        liveness = AsyncMock(side_effect=[True, False, False])
+        monkeypatch.setattr(instance, "is_alive", liveness)
+        forwarder = asyncio.get_running_loop().create_future()
+        monkeypatch.setitem(orchestration._AUTO_FORWARDER_TASKS, session_id, forwarder)
 
     async def launch(
         session_id: str, resource_registry: object, publish_event: object, **kwargs: object
     ) -> SessionResourceView:
+        assert not manager._client.posted_bodies
         launches.append(session_id)
         return SessionResourceView(
             id="terminal_codex_main", type="terminal", session_id=session_id, name="recovered"
@@ -1299,9 +1294,18 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
         await poll_until_async(lambda: bool(manager._client.posted_bodies), timeout_s=5.0)
 
     assert launches == ([session_id] if recreated else [])
-    assert close.await_count == int(recreated)
+    retired = recreated and backend_state != "pane_exits_between_probes"
+    assert close.await_count == int(retired)
     if backend is not None:
-        assert backend.close.await_count == int(recreated)
+        assert backend.close.await_count == int(retired)
+    if forwarder is not None:
+        try:
+            assert liveness.await_count == 3
+            assert orchestration._AUTO_CODEX_APP_SERVERS[session_id] is backend
+            assert orchestration._AUTO_FORWARDER_TASKS[session_id] is forwarder
+            assert not forwarder.done()
+        finally:
+            forwarder.cancel()
     if rotating:
         assert registry.get(session_id, "codex", "main") is instance
         assert orchestration._AUTO_CODEX_APP_SERVERS[source_session_id] is backend

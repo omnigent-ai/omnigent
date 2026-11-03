@@ -1552,10 +1552,11 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("config_model", "expected_default"),
+    ("config_model", "expected_default", "request_refused"),
     [
-        pytest.param(None, "gpt-5.5", id="unset-keeps-codex-default"),
-        pytest.param("gpt-5.4-mini", "gpt-5.4-mini", id="launch-model-wins"),
+        pytest.param(None, "gpt-5.5", False, id="unset-keeps-codex-default"),
+        pytest.param("gpt-5.4-mini", "gpt-5.4-mini", False, id="launch-model-wins"),
+        pytest.param(None, "gpt-5.5", True, id="model-list-refused-without-retry"),
     ],
 )
 async def test_codex_native_model_options_query_model_list(
@@ -1563,6 +1564,7 @@ async def test_codex_native_model_options_query_model_list(
     tmp_path: Path,
     config_model: str | None,
     expected_default: str,
+    request_refused: bool,
 ) -> None:
     """
     Runner model-options endpoint queries Codex ``model/list``.
@@ -1576,6 +1578,7 @@ async def test_codex_native_model_options_query_model_list(
     the pane launched on — wins when the list offers it.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.process_logging import process_log_reference
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(
@@ -1612,9 +1615,14 @@ async def test_codex_native_model_options_query_model_list(
     # state seeded below no matter which side of create seeds it. The endpoint
     # under test stays real: it still reads bridge state and CODEX_HOME off
     # disk and still queries Codex through the fake app-server client.
+    launch_codex = AsyncMock(side_effect=_fake_auto_create_codex)
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal",
-        _fake_auto_create_codex,
+        launch_codex,
+    )
+    retire_backend = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.runner.native_controls.retire_stopped_codex_backend", retire_backend
     )
 
     codex_native_bridge.write_bridge_state(
@@ -1632,6 +1640,10 @@ async def test_codex_native_model_options_query_model_list(
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    model_list_request = AsyncMock(wraps=fake_client.request)
+    if request_refused:
+        model_list_request.side_effect = ConnectionRefusedError("model/list connection refused")
+    monkeypatch.setattr(fake_client, "request", model_list_request)
     fake_client.model_list_responses = [
         {
             "result": {
@@ -1704,8 +1716,25 @@ async def test_codex_native_model_options_query_model_list(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
+        launch_codex.assert_awaited_once()
 
         resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    launch_codex.assert_awaited_once()
+    retire_backend.assert_not_awaited()
+    assert fake_client.connected
+    assert fake_client.closed
+    if request_refused:
+        assert resp.status_code == 503, resp.text
+        assert resp.json() == {
+            "error": "codex_native_model_options_failed",
+            "detail": (
+                "Request failed on the runner; see the runner log for details: "
+                f"{process_log_reference('runner')}"
+            ),
+        }
+        model_list_request.assert_awaited_once_with("model/list", {"includeHidden": False})
+        return
 
     assert resp.status_code == 200, resp.text
     expected_models: list[dict[str, object]] = [
@@ -1737,8 +1766,6 @@ async def test_codex_native_model_options_query_model_list(
         ("model/list", {"includeHidden": False}),
         ("model/list", {"includeHidden": False, "cursor": "next-page"}),
     ]
-    assert fake_client.connected
-    assert fake_client.closed
 
 
 @pytest.mark.asyncio
