@@ -558,6 +558,7 @@ _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 _APPEND_SYSTEM_PROMPT_FILE = "append-system-prompt.md"
+_CALLER_PROMPT_FILE_MAX_BYTES = 1024 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -3147,6 +3148,43 @@ def _last_claude_option_values(args: list[str], flags: frozenset[str]) -> dict[s
     return values
 
 
+def _read_caller_prompt_file(path: Path) -> str | None:
+    """Return a caller prompt file's text when it is safe to copy outside Claude's sandbox.
+
+    A sandboxed agent could swap a workspace path for a link to a host file, so
+    no component is followed. ``O_NONBLOCK`` keeps a FIFO from hanging the open.
+
+    :param path: Absolute, normalized path, e.g. ``Path("/workspace/profile.md")``.
+    :returns: The file's text, or ``None`` for a link, a non-regular or
+        hard-linked file, a file over the size limit, or an unreadable path.
+    """
+    *parents, name = path.parts
+    if IS_WINDOWS or not parents:
+        return None
+    try:
+        dir_fd = os.open(parents[0], os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parents[1:]:
+                next_fd = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+                )
+                os.close(dir_fd)
+                dir_fd = next_fd
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        with os.fdopen(file_fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return None
+            raw = handle.read(_CALLER_PROMPT_FILE_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _CALLER_PROMPT_FILE_MAX_BYTES:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
 def _merge_append_system_prompt(
     args: list[str],
     extra: str | None,
@@ -3159,7 +3197,8 @@ def _merge_append_system_prompt(
     Claude Code keeps only the last value of each prompt flag, so Omnigent's
     flag repeats the caller's value after ``extra``. A caller prompt file is
     copied into Omnigent's own file, because older Claude Code rejects a file
-    combined with ``--append-system-prompt``. Caller tokens are never rewritten.
+    combined with ``--append-system-prompt``; a file that is unsafe to copy is
+    left for Claude to read. Caller tokens are never rewritten.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
@@ -3173,11 +3212,8 @@ def _merge_append_system_prompt(
         args, frozenset({"--append-system-prompt", "--append-system-prompt-file"})
     )
     if caller_file := values.get("--append-system-prompt-file"):
-        try:
-            # Claude resolves the path from its cwd without expanding ``~``.
-            file_prompt = (cwd / caller_file).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            file_prompt = None  # Claude reports the unreadable file at startup.
+        # Claude resolves the path from its cwd, collapsing ``..`` without expanding ``~``.
+        file_prompt = _read_caller_prompt_file(Path(os.path.abspath(cwd / caller_file)))
         if file_prompt is not None:
             # Claude places a caller's inline prompt after this file's text.
             prompt_path = bridge_dir / _APPEND_SYSTEM_PROMPT_FILE

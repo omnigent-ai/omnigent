@@ -4453,33 +4453,61 @@ def test_augment_claude_args_copies_caller_system_prompt_file(
         ("--append-system-prompt-file=",),
         ("--system-prompt", "--append-system-prompt-file", "--model", "sonnet"),
         ("--append-subagent-system-prompt-file", "--append-system-prompt-file", "profile.md"),
+        ("--append-system-prompt-file", "profile.fifo"),
+        ("--append-system-prompt-file", "linked.md"),
+        ("--append-system-prompt-file", "linked-dir/secret.md"),
+        ("--append-system-prompt-file", "hard-linked.md"),
+        ("--append-system-prompt-file", "oversized.md"),
     ],
-    ids=["unreadable-file", "empty-path", "owned-by-another-option", "owned-by-subagent-file"],
+    ids=[
+        "unreadable-file",
+        "empty-path",
+        "owned-by-another-option",
+        "owned-by-subagent-file",
+        "fifo",
+        "symlinked-file",
+        "symlinked-directory",
+        "hard-linked-file",
+        "oversized-file",
+    ],
 )
 def test_augment_claude_args_keeps_inline_prompt_without_readable_caller_file(
     tmp_path: Path,
     user_args: tuple[str, ...],
 ) -> None:
-    """Without a caller file to copy, Omnigent keeps its inline prompt flag."""
-    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
+    """Without a caller file that is safe to copy, Omnigent keeps its inline prompt flag."""
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (workspace / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
+    (outside / "secret.md").write_text("Sandbox-excluded secret.\n", encoding="utf-8")
+    os.mkfifo(workspace / "profile.fifo")
+    (workspace / "linked.md").symlink_to(outside / "secret.md")
+    (workspace / "linked-dir").symlink_to(outside)
+    os.link(outside / "secret.md", workspace / "hard-linked.md")
+    (workspace / "oversized.md").write_bytes(
+        b"x" * (claude_native_bridge._CALLER_PROMPT_FILE_MAX_BYTES + 1)
+    )
+    bridge_dir = tmp_path / "bridge"
     omnigent_args = augment_claude_args(
         (),
-        bridge_dir=tmp_path,
-        workspace=tmp_path,
+        bridge_dir=bridge_dir,
+        workspace=workspace,
         python_executable="/venv/bin/python",
         append_system_prompt="Keep framework metadata separate.",
     )
 
     args = augment_claude_args(
         user_args,
-        bridge_dir=tmp_path,
-        workspace=tmp_path,
+        bridge_dir=bridge_dir,
+        workspace=workspace,
         python_executable="/venv/bin/python",
         append_system_prompt="Keep framework metadata separate.",
     )
 
     assert args == [*user_args, *omnigent_args]
-    assert not (tmp_path / "append-system-prompt.md").exists()
+    assert not (bridge_dir / "append-system-prompt.md").exists()
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
