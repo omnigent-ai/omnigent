@@ -29,8 +29,10 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
+from tests.server.helpers import create_test_agent
 
 
 @pytest_asyncio.fixture()
@@ -45,6 +47,43 @@ async def session_id(db_uri: str) -> str:
 
 
 # ── GET /v1/sessions (list) ─────────────────────────────────────────
+
+
+async def test_creating_client_surface_survives_create_child_and_fork(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = "desktop"
+    agent = await create_test_agent(client, name="client-surface")
+    source = store.get_conversation(agent["_session_id"])
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert response.status_code == 201, response.text
+    source_id = response.json()["id"]
+    source = store.get_conversation(source_id)
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    # A backend spawn's HTTP transport must not turn its desktop parent into CLI traffic.
+    del client.headers["X-Omnigent-Client"]
+    child = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "parent_session_id": source_id}
+    )
+    assert child.status_code == 201, child.text
+    child_row = store.get_conversation(child.json()["id"])
+    assert child_row is not None
+    assert child_row.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    fork = await client.post(
+        f"/v1/sessions/{source_id}/fork", json={}, headers={"X-Omnigent-Client": "web"}
+    )
+    assert fork.status_code == 201, fork.text
+    fork_row = store.get_conversation(fork.json()["id"])
+    assert fork_row is not None
+    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:

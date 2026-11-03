@@ -20,6 +20,7 @@
     "selection",
     "commentClick",
     "selectionCleared",
+    "zoom",
   ];
   if (requiredTypes.some((name) => typeof T[name] !== "string")) return;
   let port = null;
@@ -252,7 +253,7 @@
     return { range: sel.getRangeAt(0), text: text };
   }
 
-  function emitSelection() {
+  function emitSelection(reflow) {
     const s = currentSelection();
     if (s) {
       send({
@@ -260,6 +261,7 @@
         text: s.text,
         occ: selectionOccurrence(s.range, s.text),
         rect: rectOf(s.range),
+        reflow: reflow,
       });
     }
   }
@@ -308,16 +310,51 @@
   // React to programmatic and keyboard selection too; mouseup misses these.
   // Debounced and only emits non-empty selections; mouseup owns clearing.
   let selTimer = null;
-  document.addEventListener("selectionchange", function () {
+  let reflowOnly = true;
+  function scheduleSelection(reflow) {
+    if (!reflow) reflowOnly = false;
     if (selTimer) clearTimeout(selTimer);
-    selTimer = setTimeout(emitSelection, 150);
+    selTimer = setTimeout(function () {
+      const onlyReflowed = reflowOnly;
+      selTimer = null;
+      reflowOnly = true;
+      emitSelection(onlyReflowed);
+    }, 150);
+  }
+  document.addEventListener("selectionchange", function () {
+    scheduleSelection(false);
   });
+  // A resize (such as a preview zoom) moves the selection without changing it;
+  // flag the report so the parent only repositions a button it still shows.
+  window.addEventListener("resize", function () {
+    scheduleSelection(true);
+  });
+
+  function zoomAction(e) {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;
+    if (e.key === "=" || e.key === "+" || e.code === "NumpadAdd") return "in";
+    if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") return "out";
+    if (e.key === "0" || e.code === "Numpad0") return "reset";
+    return null;
+  }
+
+  // Browser zoom shortcuts would zoom the whole app; zoom only this preview.
+  // Bound on connect, after the artifact's startup listeners, so a shortcut
+  // they cancel stays with the artifact. Listeners added later run after this.
+  function onZoomKey(e) {
+    if (e.defaultPrevented) return;
+    const action = zoomAction(e);
+    if (!action) return;
+    e.preventDefault();
+    send({ type: T.zoom, action: action });
+  }
 
   window.addEventListener("message", function (e) {
     const d = e.data;
     if (!d || d.source !== SRC || d.nonce !== NONCE) return;
     if (d.type === T.init && e.ports && e.ports[0]) {
       port = e.ports[0];
+      window.addEventListener("keydown", onZoomKey);
       port.onmessage = function (ev) {
         const m = ev.data;
         if (!m) return;

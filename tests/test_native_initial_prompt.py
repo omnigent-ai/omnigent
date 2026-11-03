@@ -1,4 +1,4 @@
-"""The native wrappers hand an initial prompt to the TUI through argv."""
+"""Native prompts use one-shot delivery, separate from reusable remote args."""
 
 from __future__ import annotations
 
@@ -42,23 +42,23 @@ def _capture_local(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return captured
 
 
-def test_prompt_rides_as_claudes_leading_positional_argument(
+@pytest.mark.parametrize("session_id", [None, "conv_existing"])
+def test_remote_prompt_is_separate_from_persistent_launch_args(
     monkeypatch: pytest.MonkeyPatch,
+    session_id: str | None,
 ) -> None:
-    """The initial prompt is positional and precedes the pass-through flags."""
+    """Fresh and resumed launches submit an explicit prompt separately."""
     captured = _capture_remote(monkeypatch)
 
     claude_native.run_claude_native(
         server="https://example.com/",
-        session_id=None,
+        session_id=session_id,
         extra_args=("--dangerously-skip-permissions",),
         prompt="review the last commit",
     )
 
-    assert captured["claude_args"] == (
-        "review the last commit",
-        "--dangerously-skip-permissions",
-    )
+    assert captured["claude_args"] == ("--dangerously-skip-permissions",)
+    assert captured["prompt"] == "review the last commit"
 
 
 def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,10 +69,10 @@ def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -
     rejected as a missing config file. Leading with the prompt makes that
     impossible regardless of which value flags the user passes through.
     """
-    captured = _capture_remote(monkeypatch)
+    captured = _capture_local(monkeypatch)
 
     claude_native.run_claude_native(
-        server="https://example.com/",
+        server=None,
         session_id=None,
         extra_args=("--model", "haiku", "--mcp-config", "mcp.json"),
         prompt="hello",
@@ -81,12 +81,8 @@ def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -
     assert captured["claude_args"] == ("hello", "--model", "haiku", "--mcp-config", "mcp.json")
 
 
-def test_multiline_prompt_stays_one_argv_entry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Newlines and indentation survive because the prompt is never re-split.
-
-    Delivering the prompt through argv (not a tmux paste) is what keeps a
-    multi-line prompt from being interpreted line-by-line by the TUI.
-    """
+def test_remote_multiline_prompt_stays_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Newlines and indentation survive message delivery without re-splitting."""
     captured = _capture_remote(monkeypatch)
 
     claude_native.run_claude_native(
@@ -95,13 +91,14 @@ def test_multiline_prompt_stays_one_argv_entry(monkeypatch: pytest.MonkeyPatch) 
         prompt=_MULTILINE,
     )
 
-    assert captured["claude_args"] == (_MULTILINE,)
+    assert captured["claude_args"] == ()
+    assert captured["prompt"] == _MULTILINE
 
 
 def test_prompt_is_added_after_resume_args_are_stripped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stray ``--resume`` is still dropped, and the prompt stays first."""
+    """A stray ``--resume`` is dropped without losing the new prompt."""
     captured = _capture_remote(monkeypatch)
 
     claude_native.run_claude_native(
@@ -111,15 +108,20 @@ def test_prompt_is_added_after_resume_args_are_stripped(
         prompt="hello",
     )
 
-    assert captured["claude_args"] == ("hello", "--verbose")
+    assert captured["claude_args"] == ("--verbose",)
+    assert captured["prompt"] == "hello"
 
 
-def test_local_launch_path_also_receives_the_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("prompt", ["hello", _MULTILINE])
+def test_local_launch_path_receives_one_positional_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+) -> None:
     captured = _capture_local(monkeypatch)
 
-    claude_native.run_claude_native(server=None, session_id=None, prompt="hello")
+    claude_native.run_claude_native(server=None, session_id=None, prompt=prompt)
 
-    assert captured["claude_args"] == ("hello",)
+    assert captured["claude_args"] == (prompt,)
 
 
 @pytest.mark.parametrize("prompt", [None, "", "   "])
@@ -135,3 +137,4 @@ def test_no_prompt_adds_no_argument(monkeypatch: pytest.MonkeyPatch, prompt: str
     )
 
     assert captured["claude_args"] == ("--verbose",)
+    assert captured["prompt"] is None

@@ -14,14 +14,14 @@ permissions:
 jobs:
   unit:
     name: Manifest and retry policy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: node --test .github/actions/setup-harness-cli/setup-harness-cli.test.mjs
 
   install:
     name: Install ${{ matrix.harness }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

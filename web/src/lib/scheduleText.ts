@@ -18,6 +18,7 @@
 // calls for.
 
 import { RRule, rrulestr } from "rrule";
+import type { ScheduledTaskRunStatus } from "./scheduledTasksApi";
 
 // A fixed, far-past UTC anchor for occurrence generation. The scheduled-task
 // RRULEs carry no DTSTART (the time-of-day lives in BYHOUR/BYMINUTE), and
@@ -114,6 +115,174 @@ export function formatNextRunAt(
 /** `1 min` / `8 mins` — singular noun only when the count is exactly 1. */
 function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Format the wall-clock time a run FIRED (or was scheduled) as a short absolute
+ * label for the run-history list, e.g. `Today, 8:00 AM`, `Yesterday, 2:30 PM`,
+ * or `Jul 26, 8:00 AM` for anything older. The date is relative to `now` by
+ * calendar day (viewer-local), so "Today"/"Yesterday" track midnight rather than
+ * a rolling 24h window.
+ *
+ * @param epochSeconds The run's `firedAt ?? scheduledAt` (epoch SECONDS, matching
+ *   the server's `_run_to_response`), or `null`.
+ * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
+ * @returns The label, or `null` for a null / non-finite input so the caller
+ *   renders nothing.
+ */
+export function formatRunTimestamp(
+  epochSeconds: number | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (epochSeconds == null || !Number.isFinite(epochSeconds)) return null;
+  const date = new Date(epochSeconds * 1000);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const dayDelta = calendarDayDelta(date, now);
+  if (dayDelta === 0) return `Today, ${time}`;
+  if (dayDelta === 1) return `Yesterday, ${time}`;
+  // Older (or a future-dated run, e.g. a scheduled-but-not-fired row): show an
+  // absolute month/day. Include the year only when it differs from `now`'s so a
+  // run from a prior year isn't ambiguous.
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const datePart = date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+  return `${datePart}, ${time}`;
+}
+
+/**
+ * Whole-calendar-day difference (viewer-local) between `date` and `now`:
+ * `0` = same day, `1` = `date` was yesterday, negative = `date` is in the
+ * future. Compares local midnights so it ignores time-of-day.
+ */
+function calendarDayDelta(date: Date, now: Date): number {
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  return Math.round((startOfDay(now) - startOfDay(date)) / DAY_MS);
+}
+
+/**
+ * Format a run's elapsed wall-clock duration (`finishedAt − firedAt`) as a
+ * compact `1m 42s` / `3s` / `2h 5m` label for the run-history list.
+ *
+ * Both inputs are epoch SECONDS (server `_run_to_response`). Returns `null` when
+ * either bound is missing (the run hasn't finished, or never fired) or the
+ * arithmetic is nonsensical (finished before fired / non-finite), so the caller
+ * simply omits the duration rather than showing `0s` or a negative value.
+ *
+ * Units: shows the two most-significant non-zero units, largest first — `h`+`m`
+ * for hour-scale runs, `m`+`s` for minute-scale, bare `s` under a minute. A
+ * sub-second run rounds up to `1s` (a run that fired and finished always took
+ * *some* time; `0s` reads as "didn't run").
+ */
+export function formatRunDuration(
+  firedAt: number | null | undefined,
+  finishedAt: number | null | undefined,
+): string | null {
+  if (firedAt == null || finishedAt == null) return null;
+  if (!Number.isFinite(firedAt) || !Number.isFinite(finishedAt)) return null;
+  const seconds = finishedAt - firedAt;
+  if (seconds < 0) return null;
+  const total = Math.max(1, Math.round(seconds));
+
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  return `${s}s`;
+}
+
+/**
+ * Where a run stopped and why, for the run history. `stage` names the step of
+ * the fire that failed, so a failure can be attributed without reading logs;
+ * it is `null` when the code doesn't identify one.
+ */
+export interface RunFailure {
+  stage: string | null;
+  reason: string;
+}
+
+// Keyed by the `error_code` the fire path, the persistent scheduler and the
+// stale-run reconciler record (`omnigent/server/scheduled/`). Validation
+// failures carry an `ErrorCode` value, e.g. `invalid_input`.
+const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
+  owner_deleted: { stage: "Owner", reason: "The owner's account was removed." },
+  owner_identity_unavailable: {
+    stage: "Owner",
+    reason: "Couldn't act as the owner. The next run tries again.",
+  },
+  reauthorization_required: {
+    stage: "Owner",
+    reason: "The owner's authorization for this automation is no longer valid.",
+  },
+  invalid_input: {
+    stage: "Settings",
+    reason: "The agent, model or workspace is invalid. Edit the automation to fix it.",
+  },
+  not_found: {
+    stage: "Settings",
+    reason: "The agent or workspace no longer exists. Edit the automation to fix it.",
+  },
+  forbidden: { stage: "Settings", reason: "You no longer have access to the agent or workspace." },
+  missing_host_id: {
+    stage: "Settings",
+    reason: "No host or workspace is set. Edit the automation to fix it.",
+  },
+  missing_workspace: {
+    stage: "Settings",
+    reason: "No host or workspace is set. Edit the automation to fix it.",
+  },
+  missing_execution_input: {
+    stage: "Settings",
+    reason: "No host or workspace is set. Edit the automation to fix it.",
+  },
+  unsupported_target: { stage: "Settings", reason: "This target can't run automatically." },
+  no_online_host: { stage: "Host", reason: "None of your hosts was online." },
+  host_offline: { stage: "Host", reason: "The host was offline." },
+  host_not_found: { stage: "Host", reason: "The host no longer exists." },
+  host_not_owned: { stage: "Host", reason: "The host isn't yours." },
+  host_authority_revoked: { stage: "Host", reason: "The host was registered by another account." },
+  host_registry_unavailable: { stage: "Host", reason: "The server couldn't look up hosts." },
+  existing_sandbox_not_allowed: {
+    stage: "Host",
+    reason: "Automations can't use an existing sandbox. Choose a new sandbox for each run.",
+  },
+  default_workspace_unresolved: {
+    stage: "Host",
+    reason: "Couldn't find the host's home directory.",
+  },
+  managed_sandbox_unavailable: { stage: "Sandbox", reason: "This server has no sandboxes." },
+  session_create_failed: { stage: "Session", reason: "Couldn't create the session." },
+  owner_grant_failed: {
+    stage: "Session",
+    reason: "Couldn't give the owner access to the session.",
+  },
+  sandbox_create_failed: { stage: "Sandbox", reason: "Couldn't create the sandbox." },
+  sandbox_registration_timeout: { stage: "Sandbox", reason: "The sandbox didn't connect in time." },
+  runner_start_failed: { stage: "Runner", reason: "The agent didn't start." },
+  launch_failed: { stage: "Launch", reason: "The agent session failed to launch." },
+  startup_expired: { stage: "Startup", reason: "The run stopped before the agent started." },
+  incomplete: { stage: "Running", reason: "The agent stopped reporting before the run finished." },
+};
+
+/**
+ * Describe a run that did not succeed from its `errorCode`. An unknown or
+ * missing code still gets a reason, worded from the run's status, so a code
+ * added on the server later renders something rather than nothing.
+ *
+ * @param errorCode The run's `errorCode`, or `null`.
+ * @param status The run's status, used only for the fallback wording.
+ */
+export function describeRunFailure(
+  errorCode: string | null | undefined,
+  status: ScheduledTaskRunStatus,
+): RunFailure {
+  if (errorCode != null && Object.hasOwn(RUN_FAILURES, errorCode)) return RUN_FAILURES[errorCode];
+  return { stage: null, reason: status === "skipped" ? "Run skipped." : "Run failed." };
 }
 
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */
