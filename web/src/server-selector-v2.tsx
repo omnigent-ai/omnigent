@@ -1,15 +1,20 @@
-// Standalone entry for the gated server selector v2 (Electron shell).
+// Standalone entry for the Electron server selector V2.
 //
-// Loaded from a file:// window when OMNIGENT_SERVER_SELECTOR_V2=1 (see
-// electron/src/main.js `setupPagePath`). Renders the ServerSelectorV2, wiring it
+// Loaded from a file:// window (see electron/src/main.js `setupPagePath`).
+// Renders the ServerSelectorV2, wiring it
 // to the shell's `omnigentSetup` preload bridge (server URL, recent / managed
 // servers, connect, start-local). Theme follows the OS via index.css.
 
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Spinner } from "./components/ui/spinner";
 import type { Runner } from "./pages/onboarding/RunnerStep";
-import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
+import {
+  ServerSelectorV2,
+  type ConnectResult,
+  type ServerSelectorV2Setup,
+  type SetupResult,
+} from "./pages/onboarding/ServerSelectorV2";
 import { maybeMockSetup } from "./pages/onboarding/mockSetup";
 import "./index.css";
 
@@ -19,7 +24,7 @@ const CLOUD_DOCS_URL = "https://omnigent.ai/docs/deploy/overview";
 /** The `omnigentSetup` preload bridge (see electron/src/preload.js). */
 interface OmnigentSetup {
   getServerUrl: () => Promise<string | null>;
-  setServerUrl: (url: string, opts?: { requestId?: string }) => Promise<{ cancelled?: boolean }>;
+  setServerUrl: (url: string, opts?: { requestId?: string }) => Promise<ConnectResult>;
   cancelServerConnection?: (requestId: string) => Promise<boolean>;
   onConnectionProgress?: (cb: (p: { requestId?: string; phase?: string }) => void) => () => void;
   getManagedServers: () => Promise<string[]>;
@@ -28,7 +33,7 @@ interface OmnigentSetup {
   getRecentServers: () => Promise<string[]>;
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
-  connectRunner?: (url: string, runner: Runner) => Promise<{ ok?: boolean; error?: string }>;
+  connectRunner?: (url: string, runner: Runner) => Promise<Partial<SetupResult>>;
   onRunnerConnectLog?: (cb: (line: string) => void) => () => void;
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
@@ -42,9 +47,9 @@ interface OmnigentSetup {
     installSupported?: boolean;
     localServerRunning?: boolean;
   }>;
-  startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
+  startLocalServer: () => Promise<Partial<SetupResult> & { url?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
-  installCli?: () => Promise<{ ok?: boolean; error?: string; installed?: boolean }>;
+  installCli?: () => Promise<Partial<SetupResult> & { installed?: boolean }>;
   onCliInstallLog?: (cb: (line: string) => void) => () => void;
 }
 
@@ -102,6 +107,13 @@ export function BridgeSetupApp() {
   const [ready, setReady] = useState(false);
   // The in-flight connect's request ID; cleared by Cancel so its late result reads as cancelled.
   const activeConnect = useRef<string | null>(null);
+  const refreshCliStatus = useCallback(async () => {
+    const status = await setupBridge()?.getCliStatus();
+    setInstalled(status?.installed === true);
+    setInstallSupported(status?.installSupported === true);
+    setLocalServerRunning(status?.localServerRunning === true);
+    return status?.installed === true;
+  }, []);
 
   useEffect(() => {
     const bridge = setupBridge();
@@ -130,11 +142,7 @@ export function BridgeSetupApp() {
       (names) => setServerNames(names ?? {}),
       () => {},
     );
-    const cli = bridge.getCliStatus().then((status) => {
-      setInstalled(status?.installed === true);
-      setInstallSupported(status?.installSupported === true);
-      setLocalServerRunning(status?.localServerRunning === true);
-    });
+    const cli = refreshCliStatus();
     // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
     // it too, so the legacy item isn't shown enabled before v2Forced resolves.
     const caps = bridge.getSetupCapabilities
@@ -157,7 +165,7 @@ export function BridgeSetupApp() {
       setInstalled((prev) => prev ?? false);
       setReady(true);
     });
-  }, [failedUrl, isEphemeral]);
+  }, [failedUrl, isEphemeral, refreshCliStatus]);
 
   // Sync the wizard's `.dark` class with the shell's effective theme: the dark
   // styles key off the class (index.css), not the OS media query. The shell
@@ -177,6 +185,8 @@ export function BridgeSetupApp() {
     managedServerNames,
     serverNames,
     installed,
+    installSupported,
+    onRecheckCli: refreshCliStatus,
     connectedBefore,
     localServerRunning,
     onConnect: async (url, onPhase) => {
@@ -196,7 +206,9 @@ export function BridgeSetupApp() {
       });
       try {
         const result = await bridge.setServerUrl(url, { requestId });
-        return result?.cancelled || activeConnect.current !== requestId ? { cancelled: true } : {};
+        return result?.cancelled || activeConnect.current !== requestId
+          ? { cancelled: true }
+          : (result ?? {});
       } catch (e) {
         if (activeConnect.current !== requestId) return { cancelled: true };
         return { error: e instanceof Error ? e.message : "Could not connect to that server." };
@@ -229,7 +241,12 @@ export function BridgeSetupApp() {
           await bridge.setServerUrl(result.url);
           return { ok: true };
         }
-        return { ok: false, error: result?.error ?? "Could not start the local server." };
+        return {
+          ok: false,
+          error: result?.error ?? "Could not start the local server.",
+          errorMessage: result?.errorMessage,
+          errorAction: result?.errorAction,
+        };
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
@@ -253,14 +270,23 @@ export function BridgeSetupApp() {
               // issue). Treat "installed:false after a successful run" as a
               // failure rather than proceeding to start/connect with no CLI.
               if (result?.ok && result.installed !== true) {
+                const errorMessage =
+                  "The installer finished but the omnigent CLI still isn't detected.";
+                const errorAction =
+                  "Try opening a new terminal, or install it from https://omnigent.ai/.";
                 return {
                   ok: false,
-                  error:
-                    "The installer finished but the omnigent CLI still isn't detected. " +
-                    "Try opening a new terminal, or install it from https://omnigent.ai/.",
+                  error: `${errorMessage} ${errorAction}`,
+                  errorMessage,
+                  errorAction,
                 };
               }
-              return { ok: result?.ok === true, error: result?.error };
+              return {
+                ok: result?.ok === true,
+                error: result?.error,
+                errorMessage: result?.errorMessage,
+                errorAction: result?.errorAction,
+              };
             } catch (e) {
               return { ok: false, error: e instanceof Error ? e.message : String(e) };
             }
@@ -280,7 +306,12 @@ export function BridgeSetupApp() {
       ? async (url, runner) => {
           try {
             const result = await setupBridge()?.connectRunner?.(url, runner);
-            return { ok: result?.ok === true, error: result?.error };
+            return {
+              ok: result?.ok === true,
+              error: result?.error,
+              errorMessage: result?.errorMessage,
+              errorAction: result?.errorAction,
+            };
           } catch (e) {
             return { ok: false, error: e instanceof Error ? e.message : String(e) };
           }
@@ -337,10 +368,7 @@ export function BridgeSetupApp() {
 
   return (
     <>
-      {/* Window drag surface: with the native title bar hidden (titleBarStyle
-          "hiddenInset" / frame:false, see electron/src/main.js) this strip is
-          the only place the user can grab to move the window. Matches the
-          static setup page's 36px .drag-strip. */}
+      {/* Match the main shell and static setup page's 48px window drag band. */}
       <div
         style={
           {
@@ -348,7 +376,7 @@ export function BridgeSetupApp() {
             top: 0,
             left: 0,
             right: 0,
-            height: 36,
+            height: 48,
             WebkitAppRegion: "drag",
           } as CSSProperties
         }

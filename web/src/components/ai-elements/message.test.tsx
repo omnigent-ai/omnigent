@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
+import { MermaidPreview } from "@/shell/MermaidPreview";
+import { Reasoning, ReasoningContent } from "./reasoning";
 import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
@@ -101,6 +103,78 @@ describe("MessageResponse", () => {
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
 
+  describe("allowGitHubAttachmentImages", () => {
+    const asset = "https://github.com/user-attachments/assets/381e47c8-e3f1-4c3e-9b3d-aac5cfb3557b";
+
+    it("shows GitHub attachment images without a referrer", async () => {
+      render(<MessageResponse allowGitHubAttachmentImages>{`![shot](${asset})`}</MessageResponse>);
+
+      const image = await screen.findByRole("img", { name: "shot" });
+      expect(image).toHaveAttribute("src", asset);
+      expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
+    });
+
+    it.each([
+      ["another host", "https://attacker.example/pixel.png?q=secret"],
+      ["a path escaping the assets", "https://github.com/user-attachments/assets/../../x/y.png"],
+      ["a query string", `${asset}?q=secret`],
+      ["another GitHub path", "https://github.com/attacker/repo/raw/main/pixel.png"],
+      ["plain http", asset.replace("https:", "http:")],
+      ["a fragment", `${asset}#x`],
+      ["a trailing slash", `${asset}/`],
+      ["a lookalike host", asset.replace("github.com", "github.com.evil.example")],
+      ["userinfo", asset.replace("https://", "https://github.com@evil.example/")],
+      ["an id that isn't a UUID", "https://github.com/user-attachments/assets/deadbeef"],
+    ])("still blocks %s", async (_case, url) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{`![leak](${url})`}</MessageResponse>);
+
+      expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
+      expect(document.querySelector("img")).toBeNull();
+    });
+
+    it("drops every other attribute a raw-HTML GitHub image carries", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {`<img src="${asset}" alt="shot" srcset="https://evil.example/x.png 1x">`}
+        </MessageResponse>,
+      );
+
+      const image = await screen.findByRole("img", { name: "shot" });
+      expect(image).toHaveAttribute("src", asset);
+      expect(image).not.toHaveAttribute("srcset");
+    });
+
+    it("doesn't treat a raw parked-image tag as a GitHub image", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {
+            'before <omnigent-github-image src="https://evil.example/x.png"></omnigent-github-image>'
+          }
+        </MessageResponse>,
+      );
+
+      await screen.findByText(/before/);
+      expect(document.querySelector("img")).toBeNull();
+    });
+
+    it("leaves GitHub attachment images blocked without the option", async () => {
+      render(<MessageResponse>{`![shot](${asset})`}</MessageResponse>);
+
+      expect(await screen.findByText("[Image blocked: shot]")).toBeTruthy();
+    });
+
+    it("leaves links as the default renderer treats them", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {"[docs](docs/x.md) [root](/README.md)"}
+        </MessageResponse>,
+      );
+
+      expect(await screen.findByText(/\[blocked\]/)).toHaveTextContent("docs [blocked]");
+      expect(screen.getByRole("link", { name: "root" })).toHaveAttribute("href", "/README.md");
+    });
+  });
+
   it("re-renders when rendering props change even if the text is unchanged", async () => {
     const { container, rerender } = render(
       <MessageResponse className="math-config-a">same text</MessageResponse>,
@@ -144,6 +218,79 @@ describe("MessageResponse", () => {
 
     expect(container.firstElementChild).toHaveClass("wrap-anywhere", "math-config-a");
   });
+});
+
+describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
+  const source = "flowchart LR\n  Alpha --> Beta";
+  const markdown = `\`\`\`mermaid\n${source}\n\`\`\``;
+
+  it.each([
+    ["chat", () => <MessageResponse>{markdown}</MessageResponse>],
+    ["preview/editor", () => <MermaidPreview source={source} />],
+    [
+      "reasoning",
+      () => (
+        <Reasoning open>
+          <ReasoningContent>{markdown}</ReasoningContent>
+        </Reasoning>
+      ),
+    ],
+  ])(
+    "opens and dismisses the diagram from %s",
+    async (_surface, content) => {
+      vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+      // jsdom has no SVG layout; keep the real Mermaid renderer and supply its measurements.
+      const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+      Object.defineProperty(SVGElement.prototype, "getBBox", {
+        configurable: true,
+        value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+      });
+      const root = document.createElement("div");
+      root.className = "omnigent-app";
+      document.body.appendChild(root);
+      setEmbedRoot(embedded ? root : null);
+      try {
+        const { container } = render(content(), { container: root });
+        await waitFor(
+          () => {
+            expect(container.querySelector('svg[id^="mermaid-"]')).not.toBeNull();
+          },
+          { timeout: 10_000 },
+        );
+        const svg = container.querySelector('svg[id^="mermaid-"]')!;
+        expect(svg.textContent).toContain("Alpha");
+        expect(screen.getAllByTitle("View fullscreen")).toHaveLength(1);
+        fireEvent.click(screen.getByTitle("View fullscreen"));
+        const exit = screen.getByTitle("Exit fullscreen");
+        const overlay = exit.parentElement!;
+        expect(overlay.parentElement).toBe(embedded ? root : document.body);
+        expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(svg.outerHTML);
+        fireEvent.click(exit);
+        expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+        fireEvent.click(screen.getByTitle("View fullscreen"));
+        fireEvent.keyDown(window, { key: "Escape" });
+        expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+      } finally {
+        cleanup();
+        root.remove();
+        if (originalGetBBox)
+          Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+        else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+      }
+    },
+    15_000,
+  );
+});
+
+it("preserves ordinary code fences in reasoning", () => {
+  const { container } = render(
+    <Reasoning open>
+      <ReasoningContent>{"```text\nplain code\n```"}</ReasoningContent>
+    </Reasoning>,
+  );
+  expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent("plain code");
+  expect(screen.queryByTitle("View fullscreen")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Toggle word wrap" })).toBeNull();
 });
 
 describe("MessageResponse table fullscreen", () => {

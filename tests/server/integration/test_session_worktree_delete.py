@@ -89,7 +89,7 @@ async def _register_fake_host(
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             if isinstance(frame, HostRemoveWorktreeFrame):
                 captured.append(frame)
                 fut = conn.pending_remove_worktrees.pop(frame.request_id, None)

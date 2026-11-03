@@ -14,6 +14,7 @@ const meta = {
     isWorking: false,
     disabled: false,
     onSend: () => undefined,
+    onNewSession: () => undefined,
     onStop: () => undefined,
     agents: [{ id: "claude", name: "claude" }],
     selectedAgentId: "claude",

@@ -49,6 +49,23 @@ function getSnapshot(): Date {
   return currentNow;
 }
 
+function noSubscribe(): () => void {
+  return () => {};
+}
+
+/** Subscribe to a stable derived clock value only while enabled. */
+export function useNowSelector<T extends string | number | boolean>(
+  select: (now: Date) => T,
+  { enabled }: { enabled: boolean },
+): T {
+  const getSelectedSnapshot = () => select(currentNow);
+  return useSyncExternalStore(
+    enabled ? subscribe : noSubscribe,
+    getSelectedSnapshot,
+    getSelectedSnapshot,
+  );
+}
+
 /**
  * The current wall-clock time, refreshed every {@link TICK_MS} so relative time
  * labels re-render and stay fresh. Feed it as the `now` argument to

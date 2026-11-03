@@ -69,7 +69,7 @@ class SessionStreamCollector:
         """
         try:
             event = await asyncio.wait_for(self.queue.get(), within)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         raise AssertionError(f"unexpected broadcast: {event!r}")
 
@@ -584,12 +584,18 @@ def install_fake_openshell_launcher(
         env: list[str] | None = None,
         cluster: str | None = None,
         workspace: str | None = None,
+        providers: list[str] | None = None,
+        node_selector: dict[str, str] | None = None,
+        runtime_class: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
         fake.env = env
         fake.cluster = cluster
         fake.workspace = workspace
+        fake.providers = providers
+        fake.node_selector = node_selector
+        fake.runtime_class = runtime_class
         return fake
 
     monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
@@ -702,6 +708,7 @@ def register_test_runner(
     *,
     harnesses: list[str] | None = None,
     owner: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> None:
     """
     Register a runner in the app's live tunnel registry.
@@ -714,6 +721,7 @@ def register_test_runner(
         ``["default"]``.
     :param owner: Authenticated user who owns this runner, e.g.
         ``"alice@example.com"``. ``None`` for single-user mode.
+    :param capabilities: Optional capabilities advertised in the hello frame.
     :returns: None.
     """
     app.state.tunnel_registry.register(
@@ -724,6 +732,7 @@ def register_test_runner(
             frame_protocol_version=1,
             harnesses=harnesses or ["default"],
             envs=["os_sandbox"],
+            capabilities=capabilities or [],
         ),
         owner=owner,
     )
@@ -752,7 +761,9 @@ def build_agent_bundle(
     :param description: Optional description.
     :param sub_agents: Optional list of sub-agent config dicts.
         Each must have at least a ``"name"`` key, e.g.
-        ``[{"name": "researcher", "description": "..."}]``.
+        ``[{"name": "researcher", "description": "..."}]``. An optional
+        ``"skills"`` list, shaped like ``skills``, is bundled under the
+        sub-agent's directory.
     :param max_iterations: Optional override for
         ``executor.max_iterations`` — useful for tests that want
         to force an ``incomplete`` terminal state after a known
@@ -764,7 +775,8 @@ def build_agent_bundle(
     :param skills: Optional bundled skills. Each dict must include
         ``"name"``, ``"description"``, and ``"content"``, e.g.
         ``{"name": "triage", "description": "Triage issues",
-        "content": "Ask one question."}``.
+        "content": "Ask one question."}``. An optional ``"dir"`` names
+        the skill directory when it differs from ``"name"``.
     :param guardrails: Optional ``guardrails:`` block written verbatim
         into the spec, e.g. ``{"policies": {"cost_guard": {"type":
         "function", "function": {"path": "...cost_budget",
@@ -848,7 +860,12 @@ def build_agent_bundle(
             )
             sa_info.size = len(sa_bytes)
             tf.addfile(sa_info, io.BytesIO(sa_bytes))
-        for skill in skills or []:
+        bundled_skills = [("", skill) for skill in skills or []] + [
+            (f"agents/{sa['name']}/", skill)
+            for sa in sub_agents or []
+            for skill in sa.get("skills", [])
+        ]
+        for prefix, skill in bundled_skills:
             skill_doc = (
                 "---\n"
                 + yaml.dump(
@@ -863,7 +880,7 @@ def build_agent_bundle(
             )
             skill_bytes = skill_doc.encode()
             skill_info = tarfile.TarInfo(
-                name=f"skills/{skill['name']}/SKILL.md",
+                name=f"{prefix}skills/{skill.get('dir', skill['name'])}/SKILL.md",
             )
             skill_info.size = len(skill_bytes)
             tf.addfile(skill_info, io.BytesIO(skill_bytes))

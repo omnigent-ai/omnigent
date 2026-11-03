@@ -11,7 +11,10 @@ reattach when the session moves to another host.
 
 - `agent-terminal-view`: the Chat/Terminal switcher shows the harness terminal
   and returns to chat with the terminal's content kept. States: starting up
-  (no Resume action), stopped (Resume offered), connected.
+  (no Resume action), automatically restarting on an online host, stopped
+  (Resume offered after recovery fails or when the host is offline), connected.
+  Automatic recovery runs once when opening Terminal. Leaving it open does not
+  revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
@@ -27,23 +30,48 @@ reattach when the session moves to another host.
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
   says so and routes the user to the terminal.
+- `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
+  into shell panes, resize them (each side stays within 25–75%), and close them.
 
 ## How to get to it (user POV)
 
 **Agent terminal** (sessions whose harness has a terminal):
 
+Native subagents that share a parent's terminal show their work in chat and have
+no Chat/Terminal switcher. Open the parent session to use its terminal. Children
+with their own terminal retain the switcher.
+
 - Use the Chat/Terminal switcher in the session header.
+- Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
+  off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
 - Choose Resume when the terminal shows as stopped.
+- On desktop with `grid_sessions_display_ui` enabled, use each grid cell's header switch.
+  The shortcut targets the active cell; shells remain in the shared Workspace.
+- On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
+  right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
+  divider (or focus it and use the arrow keys along its axis) to resize. "Close
+  pane" asks for confirmation, then kills the focused shell; the agent pane
+  cannot be closed. Panes are saved per session in this browser and show only
+  for desktop owners outside grid cells. ⌘/Ctrl+Alt+Shift+\ splits right and
+  ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
+  chords work only while those buttons show. ⌘/Ctrl+Alt+Shift+] / [ focus the
+  next / previous pane. All of them work with focus inside a terminal.
 
 **User shells:**
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
+- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
+  is inert while the host is offline, the session is stranded, or a shell is
+  still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
+Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+hosts. Their "Switch host…" item is disabled; hover or focus it for the
+unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
@@ -60,14 +88,48 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
-  `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`,
+  `tests/browser_ui/chat/test_terminal_auto_resume.py` covers automatic recovery
+  through the desktop switch, keyboard shortcut, mobile menu and grid switch,
+  plus failed attempts followed by manual Resume, including a cached closed
+  terminal that stays mounted during recovery. It uses the built SPA with
+  mocked host, retry and terminal transports; run with
+  `--browser-ui-skip-build --reruns 0 --video=on`.
+  Grid cells: `tests/browser_ui/chat/test_session_grid.py` covers two real xterm
+  surfaces against mocked terminal WebSockets, independent input, per-cell
+  switches and keeping connections across view changes. Run without a server
+  using `--browser-ui-skip-build --reruns 0 --video=on`.
   `tests/e2e_ui/shells/test_new_shell.py::test_starting_terminal_view_shows_loading_without_resume`,
-  `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`
+  `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`.
+  The stopped state with a selectable empty terminal (own environment):
+  `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
+  kills the session's runner, so it fails under `verify-env run`; run it with
+  plain `uv run pytest`.
+  Native child ownership and live output (opt-in, own environment):
+  `tests/e2e/test_codex_native_child_visibility_e2e.py`.
+  This uses real Codex credentials and holds a child command open while checking
+  the parent terminal and child chat; see the prerequisites in
+  `tests/harnesses/codex_native/forwarder/README.md`.
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
+  A program's terminal queries get exactly one reply:
+  `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
+  coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
+  `web/src/hooks/useNewShellHotkey.test.tsx`,
+  `web/src/hooks/useTerminalSplitHotkey.test.tsx`,
+  `web/src/hooks/usePaneCycleHotkey.test.tsx`,
+  `web/src/shell/TerminalSplitControls.test.tsx` and
+  `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
+  in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
+  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
+  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
+  shell focused and expect no second shell. With `splittable_terminal_view_ui`,
+  in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
+  and expect a default shell pane on the right that takes typing; press
+  ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
 - **`scrollback`, wheel:**
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_wheel_scroll_reaches_mouse_tracking_program`
 - **`scrollback`, touch:**
@@ -87,10 +149,28 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).
+- **Launch failure and cancellation (plain `uv run pytest`, own tmux):**
+  `tests/terminals/test_launch_failure_cleanup.py` checks a missing tmux
+  executable at spawn and cancellation after a real pane starts, including
+  during the initial liveness check. Each must release its private directory
+  and tmux server before registry ownership; a caller cancelled during that
+  cleanup still gets a completed close first. This registry is shared by native
+  agent terminals, user shells, and `sys_terminal_launch`; no vendor model or
+  browser is used in these process checks.
+  `tests/e2e/test_terminal_launch_retry_cleanup_e2e.py` also drives the runner's
+  resource facade through three failed launches and a successful retry for
+  Claude/Codex terminal roles and an auxiliary shell. The successful real pane
+  must accept input, and final cleanup must release every allocated instance.
+  `tests/runner/test_native_terminal_start_error_payload.py::test_host_setup_error_surfaces_its_remedy`
+  (plain `uv run pytest`) checks that a host without a usable tmux shows how
+  to fix it, not a runner-log pointer.
 - **`hidden-terminal`:**
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  working/blocked status with an attached or closed viewer and the flag-off
+  fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 
 ## Gotchas
 
@@ -98,6 +178,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   are different surfaces. A reattach or reconnect fix must be checked on both.
 - A host switch updates the host badge immediately. The badge changing is not
   proof the terminal reattached; look for the new host's terminal content.
+- The ⌘/Ctrl+Alt chords use ⌘ on macOS and Ctrl elsewhere, and they match the
+  physical key, so AltGr+T on an international layout must not open a shell.
 - Key bindings added for scrollback can change how full-screen harness terminals
   behave. After a scrollback change, drive the harness terminal itself, not only
   a plain shell.
@@ -105,6 +187,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   Use the tests' approach (the harness's own transcript or program input)
   instead of reading the page.
 - "Starting up" and "stopped" look similar. Starting up offers no Resume action;
-  stopped does. Wait past startup before calling a terminal stopped.
+  stopped does. Wait past startup before calling a terminal stopped. A
+  cloud-sandbox session stays in Starting up until its sandbox is ready, which
+  can take minutes.
 - Tests that need a harness-specific or opt-in environment skip quietly without
   it. Check that the test ran, not only that the suite passed.

@@ -10,6 +10,7 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -30,8 +31,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => useGithubInfoMock(),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
 vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
   ...(await importOriginal<typeof FileViewerContextModule>()),
@@ -67,6 +68,10 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: () => ({ children: [] }),
 }));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
 
 // HostBadge now lives in the status-line tray (left of the worktree branch).
 // It reads the session's host binding via these hooks; stub them so the badge
@@ -77,13 +82,13 @@ const {
   useSessionMock,
   useHostsMock,
   useSessionHostOnlineMock,
-  useGithubInfoMock,
+  usePullRequestInfoMock,
   openGithubTabMock,
 } = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
-  useGithubInfoMock: vi.fn(),
+  usePullRequestInfoMock: vi.fn(),
   openGithubTabMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -127,6 +132,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     isWorking: false,
     disabled: false,
     onSend: vi.fn(),
+    onNewSession: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
     selectedAgentId: null,
@@ -180,7 +186,7 @@ describe("Composer status line (branch + context ring)", () => {
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
-    useGithubInfoMock.mockReset().mockReturnValue({ data: undefined });
+    usePullRequestInfoMock.mockReset().mockReturnValue({ data: undefined });
     useComposerGitStatusMock.mockReset().mockReturnValue(composerGitStatus());
     openGithubTabMock.mockReset();
     useChatStore.setState({

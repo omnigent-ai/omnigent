@@ -12,9 +12,8 @@
   const api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;
-  } else {
-    root.omnigentUrl = api;
   }
+  root.omnigentUrl = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
@@ -152,6 +151,20 @@
       return false;
     }
     return url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
+  }
+
+  /**
+   * True when a server URL names this computer, which no other machine can reach.
+   *
+   * @param {string} raw
+   * @returns {boolean}
+   */
+  function isLoopbackServerUrl(raw) {
+    try {
+      return LOCAL_HOSTS.has(new URL(raw).hostname);
+    } catch {
+      return false;
+    }
   }
 
   /** Path where the Omnigent SPA is mounted in a Databricks workspace. */
@@ -523,6 +536,7 @@
     normalizeRecentServers,
     serverDisplayLabel,
     isPlainHttpRemote,
+    isLoopbackServerUrl,
     normalizeSavedServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,

@@ -988,6 +988,52 @@ async def test_transient_subagent_502_stays_pending_past_batch_budget(
 
 
 @pytest.mark.asyncio
+async def test_subagent_client_gets_a_longer_post_timeout_than_the_live_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child-history batches get more time than latency-sensitive live posts."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    recorded_timeouts: list[httpx.Timeout] = []
+    both_clients_opened = asyncio.Event()
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **kwargs: Any) -> Any:
+        recorded_timeouts.append(kwargs["timeout"])
+        if len(recorded_timeouts) >= 2:
+            both_clients_opened.set()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(202, json={})),
+            base_url="http://ap",
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url="http://ap",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.wait_for(both_clients_opened.wait(), timeout=2.0)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    live_timeout, subagent_timeout = recorded_timeouts
+    assert live_timeout.read == 10.0
+    assert subagent_timeout.read == 30.0
+
+
+@pytest.mark.asyncio
 async def test_parent_output_forwards_while_child_history_is_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

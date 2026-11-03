@@ -1,14 +1,26 @@
-"""Shared text formatting and size limits for opt-in harness diagnostics."""
+"""Shared text formatting, size limits and stderr export for opt-in harness diagnostics."""
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import re
+import threading
 import unicodedata
+import uuid
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 from omnigent.process_logging import redact_log_text
 
 DIAGNOSTIC_TAIL_BYTES = 64 * 1024
+MAX_STDERR_RECORD_BYTES = 1024 * 1024  # Includes the newline when present.
+STDERR_QUEUE_BYTES = MAX_STDERR_RECORD_BYTES
+STDERR_QUEUE_RECORDS = 256
+_EXPORT_INTERVAL_S = 0.25
+_CLOSE_TIMEOUT_S = 1.0
 _TERMINAL_ESCAPE = re.compile(
     r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)"
     r"|\x1b[P^_].*?(?:\x1b\\|$)"
@@ -71,6 +83,177 @@ def bounded_diagnostic_tail(entries: list[str]) -> dict[str, object]:
     }
 
 
+def report_stderr_capture_start_failure(
+    *,
+    logger: logging.Logger,
+    label: str,
+    harness: str,
+    source_kind: str,
+    thread_prefix: str,
+    session_id: str | None,
+    pid: int,
+    error_type: str,
+) -> None:
+    """Best-effort, payload-free warning without logging I/O on the pipe reader."""
+
+    # Imported lazily: debug_logging pulls in httpx, and the import-light hook
+    # entrypoints reach this module only for its text helpers.
+    from omnigent.debug_logging import debug_event
+
+    def emit() -> None:
+        with contextlib.suppress(Exception):
+            logger.warning(
+                "%s stderr diagnostic capture unavailable; session=%s pid=%d error_type=%s",
+                label,
+                session_id,
+                pid,
+                error_type,
+                extra=debug_event(
+                    "harness_diagnostic_capture_failed",
+                    session_id=session_id,
+                    harness=harness,
+                    source_kind=source_kind,
+                    app_server_pid=pid,
+                    error_type=error_type,
+                ),
+            )
+
+    # If thread resources are exhausted, the startup snapshot retains the error type.
+    with contextlib.suppress(Exception):
+        threading.Thread(target=emit, name=f"{thread_prefix}-capture-failure", daemon=True).start()
+
+
+class HarnessStderrExporter:
+    """Buffer complete stderr records and export them without blocking the pipe reader.
+
+    Records are redacted and batched into ``harness_diagnostic_output`` INFO
+    logs on a daemon thread, so a slow logging handler never stalls the reader.
+    """
+
+    def __init__(
+        self,
+        *,
+        logger: logging.Logger,
+        label: str,
+        harness: str,
+        source_kind: str,
+        thread_prefix: str,
+        pid: int,
+        session_id: Callable[[], str | None],
+    ) -> None:
+        self._logger = logger
+        self._label = label
+        self._harness = harness
+        self._source_kind = source_kind
+        self._session_id = session_id
+        self._pid = pid
+        self._launch_id = uuid.uuid4().hex
+        self._records: deque[bytes] = deque()
+        self._queued_bytes = 0
+        self._omitted_lines = 0
+        self._omitted_bytes = 0
+        self._offset = 0
+        self._lock = threading.Lock()
+        self._finished = threading.Event()
+        # Process teardown must not join a stuck logging handler indefinitely.
+        self._thread = threading.Thread(
+            target=self._run, name=f"{thread_prefix}-{pid}", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, record: bytes, *, bytes_omitted: int = 0) -> None:
+        """Enqueue a whole record, shedding old records under sustained overload.
+
+        An oversized source record is omitted entirely: exporting a clipped
+        credential assignment could defeat redaction at the clipping boundary.
+        """
+        size = len(record)
+        with self._lock:
+            if self._finished.is_set():
+                return
+            self._offset += size + bytes_omitted
+            if bytes_omitted or size > STDERR_QUEUE_BYTES:
+                self._omitted_lines += 1
+                self._omitted_bytes += size + bytes_omitted
+                return
+            while self._records and (
+                self._queued_bytes + size > STDERR_QUEUE_BYTES
+                or len(self._records) >= STDERR_QUEUE_RECORDS
+            ):
+                removed = len(self._records.popleft())
+                self._queued_bytes -= removed
+                self._omitted_lines += 1
+                self._omitted_bytes += removed
+            self._records.append(record)
+            self._queued_bytes += size
+
+    def finish(self) -> None:
+        """Signal EOF/cancellation without waiting for the exporter."""
+        with self._lock:
+            self._finished.set()
+
+    def close(self) -> None:
+        """Allow a final batch, but bound teardown if a logging handler stalls."""
+        self.finish()
+        self._thread.join(timeout=_CLOSE_TIMEOUT_S)
+
+    def _run(self) -> None:
+        while True:
+            self._finished.wait(_EXPORT_INTERVAL_S)
+            with self._lock:
+                records = self._records
+                omitted_lines, omitted_bytes = self._omitted_lines, self._omitted_bytes
+                offset = self._offset
+                finished = self._finished.is_set()
+                self._records = deque()
+                self._queued_bytes = self._omitted_lines = self._omitted_bytes = 0
+            if records or omitted_lines or omitted_bytes:
+                with contextlib.suppress(Exception):
+                    self._emit(records, omitted_lines, omitted_bytes, offset)
+            if finished:
+                return
+
+    def _emit(
+        self, records: deque[bytes], omitted_lines: int, omitted_bytes: int, offset: int
+    ) -> None:
+        from omnigent.debug_logging import debug_event
+
+        session_id = None
+        with contextlib.suppress(Exception):
+            session_id = self._session_id()
+        snapshot = bounded_diagnostic_tail(
+            [record.decode("utf-8", errors="replace") for record in records]
+        )
+        text = snapshot["tail"]
+        omitted_lines += cast("int", snapshot["lines_omitted"])
+        omitted_bytes += cast("int", snapshot["bytes_omitted"])
+        self._logger.info(
+            "%s diagnostic output; session=%s launch=%s offset=%d "
+            "lines_omitted=%d bytes_omitted=%d\n%s",
+            self._label,
+            session_id,
+            self._launch_id,
+            offset,
+            omitted_lines,
+            omitted_bytes,
+            text,
+            extra=debug_event(
+                "harness_diagnostic_output",
+                session_id=session_id,
+                harness=self._harness,
+                source_kind=self._source_kind,
+                launch_id=self._launch_id,
+                app_server_pid=self._pid,
+                offset=offset,
+                text=text,
+                truncated=bool(snapshot["truncated"] or omitted_lines or omitted_bytes),
+                lines_omitted=omitted_lines,
+                bytes_omitted=omitted_bytes,
+                tail_byte_limit=DIAGNOSTIC_TAIL_BYTES,
+            ),
+        )
+
+
 @dataclass(frozen=True)
 class SignInPrompt:
     """A sign-in prompt a launcher printed to the terminal before the agent started.
@@ -118,6 +301,22 @@ _SIGN_IN_CODE = re.compile(
 )
 
 
+def _nearby(lines: list[str], index: int) -> str:
+    """Join the few screen lines around ``index`` where sign-in wording may sit."""
+    return "\n".join(lines[max(0, index - 3) : index + 3])
+
+
+def _is_endpoint(url: str) -> bool:
+    """Whether the path, query, or fragment of ``url`` (not its host) is auth-shaped."""
+    return _SIGN_IN_URL_SHAPE.search(re.sub(r"^https?://[^/?#]*", "", url)) is not None
+
+
+def _is_reprint(line: str, url: str) -> bool:
+    """Whether ``line`` is just ``url`` again or another endpoint (an earlier attempt's link)."""
+    text = line.strip().rstrip(".,;:")
+    return text == url or (_SIGN_IN_URL.fullmatch(text) is not None and _is_endpoint(text))
+
+
 def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     """Find a device-style sign-in prompt in terminal screen text.
 
@@ -127,17 +326,20 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     that prompt so the chat can offer to open the live link.
 
     Only an address that is itself an OAuth or device-flow endpoint, or that
-    sits within a few lines of sign-in instructions, counts. A running agent's
+    sits within a few lines of sign-in instructions, counts. The latest
+    endpoint wins (a launcher that retries prints a fresh link); an address
+    that only sits near instructions is the fallback. A running agent's
     screen is full of ordinary addresses (pull requests, docs links in a
     banner) and none of those is a gate. The prompt must also still be the
-    launcher's latest output: an agent that draws inline leaves the launcher's
-    lines on screen above its own, so any output below the address other than
-    the prompt's own trailing lines (the code, "waiting for sign-in") means the
-    sign-in already completed and the address is stale. The code is the first
-    device-code-shaped token on a line that mentions "code"; the address
-    itself is never taken as the code. An address wrapped across two pane
-    lines is truncated at the wrap, so callers should capture with wrapped
-    rows joined.
+    launcher's latest output: an agent that draws inline leaves the
+    launcher's lines on screen above its own, so any output below the first
+    such address other than the prompt's own trailing lines (the code,
+    "waiting for sign-in", an endpoint printed again) means the sign-in
+    already completed and the address is stale. The code is the
+    first device-code-shaped token on a line that mentions "code"; the
+    address itself is never taken as the code. An address wrapped across two
+    pane lines is truncated at the wrap, so callers should capture with
+    wrapped rows joined.
 
     :param screen: ANSI-stripped terminal screen text, or ``None``.
     :returns: The prompt, or ``None`` when no pending sign-in address is on screen.
@@ -145,21 +347,22 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     if not screen:
         return None
     lines = screen.splitlines()
-    url: str | None = None
-    for index, line in enumerate(lines):
-        for match in _SIGN_IN_URL.finditer(line):
-            candidate = match.group(0).rstrip(".,;:")
-            nearby = "\n".join(lines[max(0, index - 3) : index + 3])
-            if _SIGN_IN_URL_SHAPE.search(candidate) or _SIGN_IN_CUE.search(nearby):
-                url = candidate
-                break
-        if url is not None:
-            break
-    if url is None:
+    addresses = [
+        (index, match.group(0).rstrip(".,;:"))
+        for index, line in enumerate(lines)
+        for match in _SIGN_IN_URL.finditer(line)
+    ]
+    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
+    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    if not endpoints and not cued:
         return None
+    url = endpoints[-1][1] if endpoints else cued[0][1]
+    first = min(index for index, _ in endpoints + cued)
     if any(
-        re.search(r"\w", _ECHOED_CONTROL.sub("", line)) and not _SIGN_IN_TRAILER.search(line)
-        for line in lines[index + 1 :]
+        re.search(r"\w", _ECHOED_CONTROL.sub("", line))
+        and not _SIGN_IN_TRAILER.search(line)
+        and not _is_reprint(line, url)
+        for line in lines[first + 1 :]
     ):
         return None
     code: str | None = None
@@ -171,6 +374,69 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
             code = candidates[0]
             break
     return SignInPrompt(url=url, code=code)
+
+
+# A launcher that runs one sign-in at a time prints this while another
+# process's sign-in holds the lock, e.g. "Waiting for another process to finish
+# OAuth on port 8020...".
+_SIGN_IN_ELSEWHERE = re.compile(
+    r"waiting for another process to finish (?:oauth|sign[ -]?in|log[ -]?in)", re.IGNORECASE
+)
+
+
+def sign_in_running_elsewhere(screen: str | None) -> bool:
+    """Whether a launcher is waiting for a sign-in that another process started.
+
+    The screen shows no address of its own: the sign-in to finish is in the
+    browser tab or terminal of whichever launch started it first.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when the wait message is on screen.
+    """
+    return bool(screen) and _SIGN_IN_ELSEWHERE.search(screen) is not None
+
+
+# Closes a sign-in card's next step; dropped for a held message, which is sent on its own.
+SIGN_IN_RESEND_STEP = "; then send your message again."
+
+
+# A launcher, or a ``sudo`` it runs, reading a password from the terminal, e.g.
+# "Password:" or "[sudo] password for alice:". Typed input is not echoed, so
+# the prompt stays the last line until it is answered.
+_PASSWORD_PROMPT = re.compile(r"\bpassword(?: for [^:]+)?:\s*$", re.IGNORECASE)
+
+
+def launcher_password_prompt(screen: str | None) -> bool:
+    """Whether a launcher is waiting for a password typed into its terminal.
+
+    Only the last non-blank line counts: a launcher that moved on leaves the
+    prompt above its later output.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when the screen ends on a password prompt.
+    """
+    if not screen:
+        return False
+    lines = [line for line in screen.splitlines() if line.strip()]
+    return bool(lines) and _PASSWORD_PROMPT.search(lines[-1]) is not None
+
+
+_INSTALL_PROMPT = re.compile(r"\binstall\b[^?\r\n]*\?\s*\[[yn]/[yn]\]\s*:?\s*$", re.IGNORECASE)
+
+
+def launcher_install_prompt(screen: str | None) -> bool:
+    """Whether a launcher ends on an unanswered installation confirmation.
+
+    The short tail permits a wrapped question; later output or an echoed
+    answer means the launcher already moved past it.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` for an install question ending in a yes/no prompt.
+    """
+    if not screen:
+        return False
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    return bool(lines) and _INSTALL_PROMPT.search(" ".join(lines[-3:])) is not None
 
 
 def sign_in_next_step(agent: str) -> str:
@@ -187,5 +453,5 @@ def sign_in_next_step(agent: str) -> str:
     """
     return (
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
-        "sign-in completes; then send your message again."
+        f"sign-in completes{SIGN_IN_RESEND_STEP}"
     )

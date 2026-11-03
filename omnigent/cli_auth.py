@@ -32,9 +32,10 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
 from omnigent.process_logging import data_dir
-from omnigent.util.server_url import is_workspace_hosted_url
+from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx
@@ -258,15 +259,14 @@ def store_databricks_auth(
 
 
 def store_databricks_org_id(server_url: str, org_id: str) -> None:
-    """Persist a workspace selector without replacing existing credentials.
+    """Persist a verified workspace selector without replacing existing credentials.
 
-    URL normalization calls this when a managed server URL carries ``?o=``.
-    Keeping the selector beside the server's existing auth record lets later
-    CLI helpers and child processes rebuild routing headers after the query has
-    been removed from the HTTP base URL.
+    Call after successful authentication and workspace validation. Before that,
+    use :func:`pin_databricks_org_id` to route this process and its children
+    without changing a saved login.
 
     :param server_url: Canonical server API base.
-    :param org_id: Workspace selector parsed from the user-supplied URL.
+    :param org_id: Workspace selector accepted by the server.
     """
     existing = _load_entry(server_url) or {}
     if existing.get("org_id") == org_id:
@@ -602,14 +602,61 @@ def load_databricks_workspace_host(server_url: str) -> str | None:
     return host if isinstance(host, str) and host else None
 
 
+# The ``?o=`` server URL this process and its children are bound to, e.g.
+# ``"https://acct.example.com/api/2.0/omnigent?o=123"``. It overrides the stored
+# record, which every workspace behind that server shares.
+PINNED_DATABRICKS_ORG_ENV_VAR = "OMNIGENT_DATABRICKS_ORG_PIN"
+
+
+def databricks_org_pin(server_url: str, org_id: str) -> str:
+    """Return the :data:`PINNED_DATABRICKS_ORG_ENV_VAR` value binding *org_id* to *server_url*.
+
+    :param server_url: The server URL, e.g. ``"https://acct.example.com/api/2.0/omnigent"``.
+    :param org_id: The workspace org id, e.g. ``"2850744067564480"``.
+    :returns: e.g. ``"https://acct.example.com/api/2.0/omnigent?o=2850744067564480"``.
+    """
+    return f"{ServerUrl(api_base=server_url).api_base}?{urlencode({'o': org_id})}"
+
+
+def pinned_databricks_org_id(server_url: str) -> str | None:
+    """Return this process's pinned org id when it was pinned for *server_url*.
+
+    :param server_url: The server URL being called.
+    :returns: The pinned org id, or ``None`` when unpinned or pinned to another server.
+    """
+    pin = os.environ.get(PINNED_DATABRICKS_ORG_ENV_VAR)
+    if not pin:
+        return None
+    try:
+        pinned = ServerUrl(api_base=pin)
+        if pinned.api_base != ServerUrl(api_base=server_url).api_base:
+            return None
+    except ValueError:
+        # A malformed pin must not break header builds for every server.
+        return None
+    return pinned.org_id
+
+
+def pin_databricks_org_id(server_url: str, org_id: str) -> None:
+    """Bind this process, and the children it spawns, to *org_id* for *server_url*.
+
+    :param server_url: The server URL, e.g. ``"https://acct.example.com/api/2.0/omnigent"``.
+    :param org_id: The workspace selected for it, e.g. ``"2850744067564480"``.
+    """
+    os.environ[PINNED_DATABRICKS_ORG_ENV_VAR] = databricks_org_pin(server_url, org_id)
+
+
 def load_databricks_org_id(server_url: str) -> str | None:
-    """Load the workspace org id from a stored server record.
+    """Load the workspace org id from this process's pin or the stored server record.
 
     :param server_url: The server URL, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
     :returns: The org id, e.g. ``"2850744067564480"``, or ``None``
-        when the stored record carries no org id.
+        when neither the pin nor the stored record carries one.
     """
+    pinned = pinned_databricks_org_id(server_url)
+    if pinned is not None:
+        return pinned
     entry = _load_entry(server_url)
     if entry is None:
         return None
@@ -698,10 +745,10 @@ def databricks_request_headers(
         runners, and their session traffic all name it so they co-locate on one
         replica). Pass it unconditionally: it is emitted (as the
         :data:`OMNIGENT_SLICE_KEY_HEADER` routing header) only when *server_url*
-        is a host-sharded mount, since that is the only deployment with the
-        sharding layer that reads it. ``None`` defaults to the runner's own
-        host_id inside a runner process (via ``OMNIGENT_RUNNER_SLICE_KEY``) and
-        otherwise leaves routing to the default.
+        is a host-sharded mount or ``OMNIGENT_HOST_SLICE_KEY_ENABLED=1``
+        explicitly enables host routing on an OSS server. ``None`` defaults to
+        the runner's own host_id inside a runner process (via
+        ``OMNIGENT_RUNNER_SLICE_KEY``) and otherwise leaves routing to the default.
     :param org_id: An explicit workspace selector captured from the current
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
@@ -731,33 +778,23 @@ def databricks_request_headers(
     #      host identity — a host-less CLI request (session list, /me-adjacent
     #      reads, export) then keys to the replica holding this CLI's own hosts'
     #      tunnels. Read-only (never mints an identity), so a non-host machine
-    #      stays unkeyed (→ default). Gated on the host-sharded mount below so
-    #      the file read only happens for requests that could use it.
-    # Only a host-sharded deployment runs the sharding layer that reads the
-    # header; an unsharded server is single-replica and would just log a header
-    # it ignores — so gate emission (and the CLI identity lookup) on the mount.
-    # Callers never reason about the deployment; a new RPC routed through this
-    # builder is keyed automatically.
-    on_workspace_mount = is_workspace_hosted_url(server_url)
+    #      stays unkeyed (→ default). Read only when host routing is enabled.
+    # An explicit opt-in also supports OSS ingress routing by the same host key.
+    slice_key_setting = os.environ.get("OMNIGENT_HOST_SLICE_KEY_ENABLED")
+    host_routing = is_workspace_hosted_url(server_url) or slice_key_setting == "1"
     if host_id is None:
         from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
 
         host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
-    if host_id is None and on_workspace_mount:
+    if host_id is None and host_routing:
         from omnigent.host.identity import load_host_identity_if_present
 
         identity = load_host_identity_if_present()
         if identity is not None:
             host_id = identity.host_id
-    # Kill switch: slice-key emission is ON by default; export
-    # ``OMNIGENT_HOST_SLICE_KEY_ENABLED=0`` to turn it off and fall back to the
-    # server's default (workspace-id) routing with no redeploy — a per-process
-    # escape hatch for a bad rollout, since this emits from sidecar-less
-    # processes (laptop CLI, managed sandbox host, spawned runner) that can't
-    # evaluate a server-side flag. Only the exact value "0" disables it; unset,
-    # "1", or anything else leaves emission on.
-    slice_key_enabled = os.environ.get("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1") != "0"
-    if host_id and on_workspace_mount and slice_key_enabled:
+    # Workspace routing is on by default; OSS requires the explicit opt-in.
+    # Setting "0" disables the routing header for either deployment.
+    if host_id and host_routing and slice_key_setting != "0":
         headers[OMNIGENT_SLICE_KEY_HEADER] = host_id
     # Opaque dev/test extra headers (request-routing selectors); no-op in prod
     # (env unset).
@@ -831,6 +868,9 @@ def open_server_client(
         **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
     }
     kwargs: dict[str, Any] = {}
+    from omnigent.session_host import route_known_session_request
+
+    kwargs["event_hooks"] = {"request": [route_known_session_request]}
     if timeout is not _TIMEOUT_UNSET:
         kwargs["timeout"] = timeout
     if transport is not None:

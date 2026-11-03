@@ -12,23 +12,36 @@
 
 import type React from "react";
 import { useMemo } from "react";
+import { CopyIcon, GitPullRequestIcon } from "lucide-react";
+import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
-import { isNativeShell } from "@/lib/nativeBridge";
-import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
+import { copyText } from "@/lib/clipboard";
+import { absoluteWorkspacePath } from "@/lib/composerContext";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
   useFileViewerConversationId,
+  useFolderOpener,
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
@@ -44,9 +57,9 @@ type WithHastNode<T> = T & { node?: unknown };
 /** What the chat renderers know about a cited path's openability. */
 interface WorkspaceFileOpener {
   /**
-   * Click handler opening the file in the FileViewer, or null when the text
-   * isn't an openable file (no FileViewer, unresolvable path, or no such
-   * file).
+   * Click handler opening the file in the FileViewer (or an explicitly linked
+   * folder in the Files tree), or null when the text isn't openable (no
+   * FileViewer, unresolvable path, or no such file).
    */
   open: (() => void) | null;
   /**
@@ -60,6 +73,10 @@ interface WorkspaceFileOpener {
   unopenable: boolean;
   /** The path resolution produced, for feedback messaging; "" when none. */
   resolvedPath: string;
+  /** Clipboard path: host-absolute when the root is known, else the cited path. */
+  copyPath: string;
+  /** True when `open` shows a folder in the Files tree rather than a file. */
+  isFolder: boolean;
 }
 
 /**
@@ -67,8 +84,9 @@ interface WorkspaceFileOpener {
  * it in the FileViewer plus the openability verdict. Shared by the
  * inline-code and link renderers so both judge a path the same way.
  */
-function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
+function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFileOpener {
   const openFile = useFileViewer();
+  const openFolder = useFolderOpener();
   const isChangedPath = useIsChangedPath();
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
@@ -76,8 +94,8 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   // Agents cite a file with the position they mean, `docs/notes.md:12` or
   // `:12:7`. The position is not part of the filename, so no such path is ever
   // in the changed-files list or on disk; drop it before resolving, but keep
-  // the line so the viewer can land on the cited change. The span still
-  // displays the citation the agent wrote.
+  // the line so the viewer can land on the cited change. The link shows the file
+  // name and position; the full citation stays its accessible name.
   const citation = splitWorkspaceFileCitation(text);
   const cited = citation.path;
   const citedLine = citation.line;
@@ -88,17 +106,28 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   // home, …) → never a link.
   const resolution = cited ? resolveChatFilePath(cited, root, home) : null;
   const linkPath = resolution?.path ?? null;
+  const copyPath = linkPath === null ? cited : (absoluteWorkspacePath(linkPath, root) ?? linkPath);
 
   // Only relative paths can be in the changed-files list (it speaks
   // workspace-relative); an outside-workspace absolute is never a change.
   const isChanged = !!linkPath && !linkPath.startsWith("/") && isChangedPath(linkPath);
-  // Only hit the filesystem for path-shaped spans that aren't already known
-  // changes; passing null disables the query (keeps hook order stable).
-  const { exists, settled } = useWorkspaceFileExists(
+  // Explicit links also verify basenames; inline code keeps its path heuristic.
+  const { exists, isDirectory, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
-    resolution?.trusted ?? false,
+    explicitLink || (resolution?.trusted ?? false) || isVideoFile(cited),
   );
+
+  // Only explicit links open folders; the Files tree navigates by host-absolute path.
+  if (openFolder && explicitLink && isDirectory && linkPath && copyPath.startsWith("/")) {
+    return {
+      open: () => openFolder(copyPath),
+      unopenable: false,
+      resolvedPath: linkPath,
+      copyPath,
+      isFolder: true,
+    };
+  }
 
   if (!openFile || !linkPath || !(isChanged || exists)) {
     // An absolute / "~"-relative citation is unjudgeable until the workspace
@@ -111,8 +140,11 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
       // be noise; with one, a hard-rejected resolution is final immediately
       // and a resolved path is final once its existence check settles with a
       // completed listing (skipped/pending/errored checks stay unverified).
-      unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
+      unopenable:
+        !!openFile && !rootPending && (linkPath === null || (settled && !exists && !isDirectory)),
       resolvedPath: linkPath ?? "",
+      copyPath,
+      isFolder: false,
     };
   }
   return {
@@ -122,9 +154,12 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
         : openFile(linkPath, {
             line: citedLine,
             ...(citation.column ? { column: citation.column } : {}),
+            ...(citation.endLine ? { endLine: citation.endLine } : {}),
           }),
     unopenable: false,
     resolvedPath: linkPath,
+    copyPath,
+    isFolder: false,
   };
 }
 
@@ -143,9 +178,9 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
  * path that may be an uncommitted/deleted file — or (b) a path-shaped string
  * that the filesystem API confirms points at a real file in the workspace.
  * Everything else (prose-y inline code, non-existent paths) falls back to a
- * styled `<code>` matching Streamdown's default inline appearance. The span
- * always *displays* the original text the agent wrote; only the link target
- * uses the resolved relative path.
+ * styled `<code>` matching Streamdown's default inline appearance. A link
+ * displays only the file name and cited position; the full text the agent
+ * wrote stays its accessible name and hover title.
  *
  * Rendered by Streamdown as a real component (via the `inlineCode` slot), so
  * it may call hooks: the existence query re-renders this span when it settles,
@@ -164,6 +199,7 @@ function WorkspacePathInlineCode({
   const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
 
   if (openWorkspaceFile) {
+    const shortLabel = shortFileCitationLabel(text);
     // Rendered as an inline <code> (not a <button>): a button is laid out as
     // an atomic inline-block, so a long path can't break across lines and
     // drops below the list marker as a whole unit. An inline <code> flows and
@@ -178,9 +214,11 @@ function WorkspacePathInlineCode({
         // link only adds the underline affordance on top of Streamdown's
         // styling and any caller-provided attributes survive.
         className={cn(
-          "font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
+          "font-mono text-ui text-link underline decoration-dotted underline-offset-2 transition-colors cursor-pointer",
           className,
         )}
+        aria-label={shortLabel ? text : undefined}
+        title={shortLabel ? text : undefined}
         onClick={openWorkspaceFile}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -190,7 +228,7 @@ function WorkspacePathInlineCode({
         }}
         {...codeProps}
       >
-        {codeChildren}
+        {shortLabel ?? codeChildren}
       </code>
     );
   }
@@ -211,44 +249,35 @@ function WorkspacePathInlineCode({
 // slot replaces its link component wholesale, so both must be reproduced here:
 // index.css keys the pointer cursor and the table-cell `overflow-wrap` rule
 // (which stops a link-only table column collapsing to ~2ch) on the attribute.
-const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-primary underline";
+const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-link underline";
 
-/**
- * Follows an external chat link (`target="_blank"`) on a plain click, with a
- * same-tab fallback where popup creation is withheld. In a normal browser tab
- * the link still opens a new tab, but in an embedding host pane (or under a
- * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
- * and nothing navigates — so a click must fall back to navigating in place.
- * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
- * open-in-new-tab / menu semantics. In a native shell the default path is the
- * shell's window-open policy (external browser / system handlers) — except
- * when the user opted in to the in-app browser, where a plain click on a web
- * link routes to the conversation's embedded browser pane instead. The web
- * popup fallback never runs natively: the shell's policy reports `null` from
- * window.open regardless, so it would navigate twice.
- */
-function followLinkWithPopupFallback(
-  event: React.MouseEvent<HTMLAnchorElement>,
-  href: string,
-  conversationId: string | undefined,
-): void {
-  if (event.defaultPrevented || event.button !== 0) return;
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  if (isNativeShell()) {
-    if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
-    return;
+function githubPullRequest(href: string | undefined): string | null {
+  if (!href) return null;
+  try {
+    const url = new URL(href);
+    if (url.protocol !== "https:" || url.hostname !== "github.com") return null;
+    const match = url.pathname.match(/^\/[^/]+\/([^/]+)\/pull\/(\d+)\/?$/);
+    return match ? `${match[1]}#${match[2]}` : null;
+  } catch {
+    return null;
   }
-  if (!/^(?:https?:)?\/\//i.test(href)) return;
-  event.preventDefault();
-  const popup = window.open("about:blank", "_blank");
-  if (popup) {
-    popup.opener = null;
-  }
-  const link = (popup?.document ?? document).createElement("a");
-  link.href = href;
-  link.target = "_self";
-  link.rel = "noopener noreferrer";
-  link.click();
+}
+
+function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
+  const words = typeof children === "string" ? children.match(/^(\S+)([\s\S]*)$/) : null;
+  const prefix = (
+    <>
+      <GitPullRequestIcon aria-hidden="true" className="inline-block size-[1em] align-[-0.125em]" />
+      {"\u00a0"}
+      {words?.[1]}
+    </>
+  );
+  return (
+    <>
+      {words ? <span className="whitespace-nowrap">{prefix}</span> : prefix}
+      {words ? words[2] : children}
+    </>
+  );
 }
 
 /**
@@ -260,6 +289,10 @@ function followLinkWithPopupFallback(
  *
  * A marked path that names no workspace file renders as plain text: its href is
  * the parked fragment, so a live link there would go nowhere.
+ *
+ * A marked path rendered as a link or text offers "Copy path" on right-click
+ * (long-press on touch): with no href, neither the browser nor the desktop shell
+ * offers to copy it.
  */
 function WorkspaceFileLink({
   href,
@@ -271,11 +304,27 @@ function WorkspaceFileLink({
 }: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   const marked = (props as Record<string, unknown>)[WORKSPACE_FILE_LINK_ATTR];
   const path = typeof marked === "string" ? marked : "";
-  const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path);
+  const {
+    open: openWorkspaceFile,
+    unopenable,
+    resolvedPath,
+    copyPath,
+    isFolder,
+  } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
+  const { root, home } = useWorkspacePaths();
 
   if (!path) {
+    if (typeof href === "string" && isRemoteVideoUrl(href)) {
+      return (
+        <VideoPlayer
+          compact
+          src={href}
+          title={typeof children === "string" ? children : "Video recording"}
+        />
+      );
+    }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
     // `/c/<id>`) under the deployment base path; no-op for external URLs, `#`
     // fragments, and at the origin root. The router basename does not reach raw
@@ -284,11 +333,12 @@ function WorkspaceFileLink({
     // Streamdown renders external links with target="_blank"; those need the
     // popup fallback so a click still works where new tabs can't open.
     const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
+    const pullRequest = githubPullRequest(rebased);
     return (
       <a
         href={rebased}
         className={cn(STREAMDOWN_LINK_CLASS, className)}
-        title={title}
+        title={title ?? (pullRequest ? rebased : undefined)}
         data-streamdown="link"
         {...props}
         onClick={
@@ -300,7 +350,11 @@ function WorkspaceFileLink({
               }
         }
       >
-        {children}
+        {pullRequest ? (
+          <PullRequestLinkLabel>{children === href ? pullRequest : children}</PullRequestLinkLabel>
+        ) : (
+          children
+        )}
       </a>
     );
   }
@@ -324,58 +378,125 @@ function WorkspaceFileLink({
             : `Can't open ${path}: it doesn't resolve to an openable file path.`,
         );
       return (
-        <span
-          role="button"
-          tabIndex={0}
-          className={cn(
-            "cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-2",
-            className,
-          )}
-          title={title ?? path}
-          onClick={explain}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              explain();
-            }
-          }}
-        >
-          {children}
-        </span>
+        <FileLinkContextMenu path={copyPath}>
+          <span
+            role="button"
+            tabIndex={0}
+            className={cn(
+              "cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-2",
+              className,
+            )}
+            title={title ?? path}
+            onClick={explain}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                explain();
+              }
+            }}
+          >
+            {children}
+          </span>
+        </FileLinkContextMenu>
       );
     }
-    // Not verified yet (existence check still in flight, or it can't run):
-    // plain text, with the path on hover so it stays discoverable.
+    // Not verified yet (existence check still in flight, or it can't run), or
+    // a folder with no Files tree to show it: plain text, with the path on hover.
     return (
-      <span className={className} title={title ?? path}>
-        {children}
-      </span>
+      <FileLinkContextMenu path={copyPath}>
+        <span className={className} title={title ?? path}>
+          {children}
+        </span>
+      </FileLinkContextMenu>
     );
   }
+
+  if (conversationId && !isFolder && isVideoFile(resolvedPath)) {
+    return (
+      <VideoPlayer
+        compact
+        conversationId={conversationId}
+        path={resolvedPath}
+        title={
+          typeof children === "string" ? children : (resolvedPath.split("/").pop() ?? resolvedPath)
+        }
+        onOpenFile={openWorkspaceFile}
+      />
+    );
+  }
+
+  // Link text that spells out the linked file and position shows just its name;
+  // a descriptive label, or text citing a different place, is kept as written.
+  const linkText = typeof children === "string" ? children : null;
+  const shortLabel =
+    linkText && citesSamePlace(linkText, path, resolvedPath, root, home)
+      ? shortFileCitationLabel(linkText)
+      : null;
 
   // No href: the parked fragment would still navigate on cmd/middle-click, and
   // no URL opens the FileViewer. role/tabIndex/onKeyDown restore button semantics.
   return (
-    <a
-      {...props}
-      role="button"
-      tabIndex={0}
-      title={title ?? path}
-      data-streamdown="link"
-      // Dotted underline distinguishes "opens in the FileViewer" from a link
-      // that leaves the app; the rest matches Streamdown so a file link in a
-      // table cell wraps like any other.
-      className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
-      onClick={openWorkspaceFile}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openWorkspaceFile();
-        }
-      }}
-    >
-      {children}
-    </a>
+    <FileLinkContextMenu path={copyPath}>
+      <a
+        {...props}
+        role="button"
+        tabIndex={0}
+        aria-label={shortLabel && linkText ? linkText : props["aria-label"]}
+        title={title ?? path}
+        data-streamdown="link"
+        // Dotted underline distinguishes "opens in the FileViewer" from a link
+        // that leaves the app; the rest matches Streamdown so a file link in a
+        // table cell wraps like any other.
+        className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
+        onClick={openWorkspaceFile}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            openWorkspaceFile();
+          }
+        }}
+      >
+        {shortLabel ?? children}
+      </a>
+    </FileLinkContextMenu>
+  );
+}
+
+/** Right-click menu that copies the path a file link names. */
+function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
+  const copyPath = () =>
+    void copyText(path).then(
+      () => toast.success("Copied path"),
+      () => toast.error("Couldn't copy the path"),
+    );
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onSelect={copyPath}>
+          <CopyIcon />
+          Copy path
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
+function citesSamePlace(
+  text: string,
+  target: string,
+  resolvedTarget: string,
+  root: string | null,
+  home: string | null,
+): boolean {
+  const cited = splitWorkspaceFileCitation(text);
+  const linked = splitWorkspaceFileCitation(target);
+  return (
+    resolveChatFilePath(cited.path, root, home)?.path === resolvedTarget &&
+    (!cited.hasPosition ||
+      (cited.line === linked.line &&
+        cited.column === linked.column &&
+        cited.endLine === linked.endLine))
   );
 }
 
@@ -476,6 +597,20 @@ function PlainTextFallback({ text }: { text: string }) {
   );
 }
 
+interface MarkdownNode {
+  type: string;
+  children?: MarkdownNode[];
+}
+
+/** Turns raw HTML nodes into text nodes holding the same source. */
+function remarkHtmlAsText() {
+  const visit = (node: MarkdownNode) => {
+    if (node.type === "html") node.type = "text";
+    node.children?.forEach(visit);
+  };
+  return visit;
+}
+
 /**
  * Wraps `MessageResponse` with {@link WorkspacePathInlineCode} via Streamdown's
  * `inlineCode` slot — NOT `code` — so fenced code blocks keep their default
@@ -489,20 +624,30 @@ function PlainTextFallback({ text }: { text: string }) {
  * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
  * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
  * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
+ *
+ * When `literalHtml` is set, raw HTML shows as written instead of rendering,
+ * so markup or comments in a tool's text can't hide part of it.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
+  literalHtml = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean }) {
+}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
 
-  // Extend (don't replace) Streamdown's defaults so remark-gfm survives;
-  // append remark-breaks only when `breaks` is requested. When `breaks` is
-  // false we pass `undefined` so Streamdown uses its own defaults unchanged.
+  // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
+  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
-    () => (breaks ? [...Object.values(defaultRemarkPlugins), remarkBreaks] : undefined),
-    [breaks],
+    () =>
+      breaks || literalHtml
+        ? [
+            ...Object.values(defaultRemarkPlugins),
+            ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(breaks ? [remarkBreaks] : []),
+          ]
+        : undefined,
+    [breaks, literalHtml],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few

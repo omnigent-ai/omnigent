@@ -14,6 +14,7 @@ import json
 import logging
 
 import pytest
+from omnigent_client import PaginatedList
 from prompt_toolkit.document import Document
 
 from omnigent.repl._repl import (
@@ -1971,7 +1972,7 @@ async def test_list_all_conversation_items_paginates_past_100(
             limit: int = 100,
             after: str | None = None,
             order: str = "asc",
-        ) -> list[dict[str, object]]:
+        ) -> PaginatedList:
             del conversation_id, order
             fetch_calls.append((limit, after))
             if after is None:
@@ -1982,7 +1983,8 @@ async def test_list_all_conversation_items_paginates_past_100(
                 # semantics ("strictly after").
                 idx = next(i for i, it in enumerate(fixture) if it["id"] == after)
                 start = idx + 1
-            return fixture[start : start + limit]
+            page = fixture[start : start + limit]
+            return PaginatedList(data=page, has_more=len(page) == limit)
 
     class _FakeClient:
         sessions = _FakeConversations()
@@ -2038,10 +2040,10 @@ async def test_list_all_conversation_items_handles_empty_conversation() -> None:
     fetch_count = 0
 
     class _EmptyConversations:
-        async def list_items(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+        async def list_items(self, *args: object, **kwargs: object) -> PaginatedList:
             nonlocal fetch_count
             fetch_count += 1
-            return []
+            return PaginatedList(data=[], has_more=False)
 
     class _FakeClient:
         sessions = _EmptyConversations()
@@ -2079,14 +2081,15 @@ async def test_list_all_conversation_items_falls_back_on_error() -> None:
             limit: int = 100,
             after: str | None = None,
             order: str = "asc",
-        ) -> list[dict[str, object]]:
+        ) -> PaginatedList:
             del conversation_id, order
             nonlocal fetch_count
             fetch_count += 1
             if fetch_count == 1:
                 # First page returns 100 items so paging
                 # continues.
-                return [{"id": f"item_{i:04d}", "type": "message"} for i in range(limit)]
+                data = [{"id": f"item_{i:04d}", "type": "message"} for i in range(limit)]
+                return PaginatedList(data=data, has_more=True)
             # Second page errors — simulates a transient HTTP
             # failure mid-pagination.
             raise RuntimeError("simulated mid-pagination failure")
@@ -2228,6 +2231,31 @@ def test_completer_substring_filters_real_registry() -> None:
     # list. Catches both "filter bypassed" (== all) and "filter too
     # greedy" (empty) regressions against the real registry.
     assert 0 < len(names) < len(all_names)
+
+
+def test_completer_matches_skill_display_name_after_name_hits() -> None:
+    """A skill is reachable by its display name, ranked after command-name hits."""
+    from omnigent.repl import _repl as repl_mod
+
+    registered = repl_mod.register_skill_commands(
+        [
+            SkillSpec(
+                name="asd-ste100",
+                description="STE",
+                content="c",
+                display_name="Simplified Technical English (ASD-STE100)",
+            ),
+            SkillSpec(name="english-tutor", description="Tutor", content="c"),
+        ]
+    )
+    try:
+        # Completing inserts the command, not the label.
+        assert "/asd-ste100" in [name for name, _, _ in _completions_for("/simplified")]
+        names = [name for name, _, _ in _completions_for("/english")]
+        assert names.index("/english-tutor") < names.index("/asd-ste100")
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+    assert "/asd-ste100" not in repl_mod._SKILL_DISPLAY_NAMES
 
 
 def test_completer_ranks_prefix_before_substring(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2510,6 +2538,26 @@ def test_register_skill_commands_skips_invalid_command_names() -> None:
         assert "/etc/hosts" not in registered
         assert "/bad name" not in repl_mod.COMMANDS
         assert "/etc/hosts" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+
+
+def test_register_skill_commands_labels_command_with_display_name() -> None:
+    """A spaced display name labels the ``/<dir>`` command instead of blocking it."""
+    from omnigent.repl import _repl as repl_mod
+
+    skill = SkillSpec(
+        name="asd-ste100",
+        description="Write in STE",
+        content="c",
+        display_name="Simplified Technical English (ASD-STE100)",
+    )
+    registered = repl_mod.register_skill_commands([skill])
+    try:
+        assert registered == ["/asd-ste100"]
+        assert repl_mod.COMMANDS["/asd-ste100"][0] == (
+            "Simplified Technical English (ASD-STE100) — Write in STE"
+        )
     finally:
         repl_mod.unregister_skill_commands(registered)
 

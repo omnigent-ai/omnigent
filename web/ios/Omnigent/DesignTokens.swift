@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum DesignTokens {
   static let radius: CGFloat = 8
@@ -12,6 +13,10 @@ enum DesignTokens {
   static let darkForeground = Color(red: 0.910, green: 0.925, blue: 0.941)
   static let darkMutedForeground = Color(red: 0.572, green: 0.643, blue: 0.702)
   static let darkBorder = Color(red: 0.215, green: 0.219, blue: 0.230)
+
+  static let nativeBackground = UIColor { traits in
+    UIColor(background(traits.userInterfaceStyle == .dark ? .dark : .light))
+  }
 
   static func background(_ scheme: ColorScheme) -> Color {
     scheme == .dark ? darkBackground : lightBackground

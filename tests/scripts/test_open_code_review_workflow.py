@@ -212,7 +212,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         # PyYAML's YAML 1.1 loader reads the workflow's `on` key as True.
         triggers = WORKFLOW[True]
         polly = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
-        self.assertEqual(triggers["pull_request_target"], polly[True]["pull_request"])
+        self.assertEqual(triggers["pull_request_target"], polly[True]["pull_request_target"])
         self.assertNotIn("pull_request", triggers)
         self.assertNotIn("synchronize", triggers["pull_request_target"]["types"])
         for action in triggers["pull_request_target"]["types"]:
@@ -309,6 +309,26 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                     {"base": "main", "head": "new-head"} if state == "open" and not draft else {}
                 )
                 self.assertEqual(result["outputs"], expected)
+
+    def test_requested_head_cannot_silently_change_while_queued(self):
+        for expected_head in ("old-head", "new-head", ""):
+            with self.subTest(expected_head=expected_head):
+                result = self.run_script(
+                    self.comment(),
+                    script=RESOLVE,
+                    pr={
+                        "state": "open",
+                        "draft": False,
+                        "base": {"ref": "main"},
+                        "head": {"sha": "new-head"},
+                    },
+                    extra_env={"EXPECTED_HEAD": expected_head},
+                )
+                if expected_head == "old-head":
+                    self.assertEqual(result["outputs"], {})
+                    self.assertIn("PR moved", result["error"])
+                else:
+                    self.assertEqual(result["outputs"], {"base": "main", "head": "new-head"})
 
     def completed_comment(self, marker=None, *, login="github-actions[bot]", user_type="Bot"):
         return {
@@ -527,15 +547,18 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         self.assertNotIn("always()", STEPS["receipt"]["if"])
         self.assertNotIn("!cancelled()", STEPS["receipt"]["if"])
 
-    def run_report(self, status, log="", resolved_head=HEAD):
+    def run_report(self, status, log="", resolved_head=HEAD, summary=None, failed=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "ocr-result.json").write_text(
                 json.dumps(
                     {
                         "status": status,
-                        "summary": {},
-                        "manifest": {"input": {"resolved_head": resolved_head}},
+                        "summary": summary or {},
+                        "manifest": {
+                            "input": {"resolved_head": resolved_head},
+                            "coverage": {"failed": failed or []},
+                        },
                     }
                 )
             )
@@ -574,6 +597,43 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             with self.subTest(status=status):
                 result, _, _ = self.run_report(status)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_budget_only_partial_warns_without_completion_receipt(self):
+        budget = "aggregate token budget reached before dispatch completed"
+        result, summary, outputs = self.run_report(
+            "partial",
+            summary={"budget_exceeded": True},
+            failed=[
+                {"path": "b`.ts\n::error::injected", "reason": budget},
+                {"path": "a.ts", "reason": budget},
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "::warning::OCR token budget reached; 2 file(s) were not reviewed. "
+                "See the job summary for the list."
+            ],
+        )
+        self.assertIn("- `a.ts`\n- `b'.ts ::error::injected`\n", summary)
+        self.assertEqual(outputs, "")
+        budget_only = [{"path": "a.ts", "reason": budget}]
+        for status, summary_value, failed in (
+            (
+                "partial",
+                {"budget_exceeded": True},
+                [{"path": "a.ts", "reason": budget}, {"path": "b.ts", "reason": "LLM error"}],
+            ),
+            ("partial", {"budget_exceeded": True}, []),
+            ("partial", {}, budget_only),
+            ("failed", {"budget_exceeded": True}, budget_only),
+        ):
+            with self.subTest(status=status, summary=summary_value, failed=failed):
+                result, _, outputs = self.run_report(status, summary=summary_value, failed=failed)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("incomplete", result.stderr)
+                self.assertEqual(outputs, "")
 
     def test_filter_failure_remains_visible_for_complete_review(self):
         for log in (

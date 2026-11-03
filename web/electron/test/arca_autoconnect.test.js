@@ -85,10 +85,12 @@ describe("arca auto-connect", () => {
   it("reports a warm launch as already running", async () => {
     const { auto, runs } = harness();
     const pending = auto.ensure(SERVER);
-    runs[0].finish({ ok: true, alreadyRunning: true });
+    const identity = { serverUrl: SERVER, hostId: "a".repeat(32) };
+    runs[0].finish({ ok: true, alreadyRunning: true, identity });
     const status = await pending;
     assert.equal(status.state, "online");
     assert.equal(status.alreadyRunning, true);
+    assert.deepEqual(status.identity, identity);
   });
 
   it("keeps the failure kind and output tail, and retries only after a failure", async () => {

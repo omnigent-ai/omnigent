@@ -77,7 +77,9 @@ class RetryPolicy:
         their own jitter at L0.
     :param timeout_per_request_s: Per-HTTP-request timeout. ``None``
         lets the SDK use its default. Used at L0 only — bounds an
-        individual attempt's wall-clock.
+        individual attempt according to the SDK's timeout semantics.
+        For Claude CLI, this bounds the wait for response headers;
+        streaming responses have separate idle timeouts.
     :param retryable_status_codes: HTTP status codes the in-process
         LLM path's ``classify_llm_error`` treats as retryable.
         Used only by the in-process LLM path and the tool-retry
@@ -317,17 +319,16 @@ class _ClaudeCliRetryAdapter:
         """
         Env vars to merge into ``ClaudeAgentOptions.env``.
 
-        The Claude CLI's retry budget isn't publicly documented as
-        env-tunable; we set Anthropic SDK conventions
-        speculatively.
+        Claude CLI caps retries at 15 outside its retry-watchdog mode.
+        Its request timeout is in milliseconds and ends at response headers.
 
         :returns: Dict mapping env var names to string values.
         """
         env: dict[str, str] = {
-            "ANTHROPIC_MAX_RETRIES": str(self.policy.max_retries),
+            "CLAUDE_CODE_MAX_RETRIES": str(self.policy.max_retries),
         }
         if self.policy.timeout_per_request_s is not None:
-            env["ANTHROPIC_REQUEST_TIMEOUT_SECONDS"] = str(int(self.policy.timeout_per_request_s))
+            env["API_TIMEOUT_MS"] = str(max(1, round(self.policy.timeout_per_request_s * 1000)))
         return env
 
 
@@ -432,7 +433,7 @@ class DatabricksAuth:
     ``~/.databrickscfg``.
 
     Use this to route LLM calls through Databricks model serving
-    (Unity AI Gateway or another Databricks-hosted endpoint) using
+    (Unity Gateway or another Databricks-hosted endpoint) using
     a named credential profile.
 
     Example YAML::
@@ -874,16 +875,42 @@ class ToolsConfig:
 
 
 @dataclass
+class ToolGroupsConfig:
+    """
+    Which framework-owned tool groups an agent advertises.
+
+    Every group defaults to ``True``: the groups register on every agent
+    unless the spec opts out under a top-level ``tool_groups:`` block (a
+    mapping of group name to boolean). Trimming a group the agent cannot
+    use keeps the advertised tool payload under a strict provider's byte
+    limit and stops a small model from picking an irrelevant tool.
+
+    :param browser: The ``browser_*`` embedded-browser tools (5).
+    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4).
+    :param comments: ``list_comments`` and ``update_comment``.
+    :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
+    :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    """
+
+    browser: bool = True
+    scheduled_tasks: bool = True
+    comments: bool = True
+    policies: bool = True
+    agent_discovery: bool = True
+
+
+@dataclass
 class SkillSpec:
     """
     A parsed skill from ``skills/<dir>/SKILL.md``.
 
-    The directory name is provenance only — it is recorded in
-    :attr:`skill_dir` and need not equal :attr:`name`.
+    Like Claude Code, the directory name is the invocation identifier
+    and the frontmatter ``name`` is only a human-facing label.
 
-    :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
-        frontmatter, not from the directory name.
+    :param name: Invocation identifier, taken from the skill's
+        directory name, e.g. ``"asd-ste100"`` (typed as
+        ``/asd-ste100``). Bundled skills must match ``[a-z0-9-]+``.
+        Providers may namespace it, e.g. ``"plugin:asd-ste100"``.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -897,6 +924,10 @@ class SkillSpec:
         orchestration skills (frontmatter ``user-invocable: false``);
         such skills are excluded from the composer's ``/`` menu.
         Defaults to ``True`` (absent frontmatter field = invocable).
+    :param display_name: Human-facing label from the frontmatter
+        ``name``, e.g. ``"Simplified Technical English (ASD-STE100)"``.
+        May contain spaces. ``None`` when it equals :attr:`name` or the
+        source supplies no label (in-memory or CLI-listed skills).
     """
 
     name: str
@@ -904,6 +935,7 @@ class SkillSpec:
     content: str
     skill_dir: Path | None = None
     user_invocable: bool = True
+    display_name: str | None = None
 
 
 @dataclass
@@ -977,7 +1009,7 @@ class MCPServerConfig:
     """
 
     name: str
-    transport: Literal["http", "stdio"] = "http"
+    transport: Literal["http", "stdio", "registry"] = "http"
     # HTTP-only fields.
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict, repr=False)
@@ -1054,9 +1086,9 @@ class SharePolicy(str, Enum):
     - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
       registered at all (default).
     - :attr:`NON_PUBLIC`: the agent may grant access to named users
-      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+      (emails), but NOT to ``__public__``.
     - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
-      (anonymous read of the full transcript).
+      (link access subject to server authentication and its public permission ceiling).
     """
 
     NONE = "none"
@@ -1552,6 +1584,12 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``sys_session_get_history`` / ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
+    :param tool_groups: Which framework-owned tool groups register for
+        this agent. YAML key is ``tool_groups:`` (top-level mapping of
+        group name to boolean). **Every group defaults to ``True``**, so
+        an absent block changes nothing; a spec sets a group to
+        ``false`` to drop tools it cannot use from the advertised
+        payload. See :class:`ToolGroupsConfig` for the groups.
     :param agent_session_sharing: Authority for the agent to share the
         session it is running in, via ``sys_session_share``. YAML key is
         ``agent_session_sharing:`` (top-level, like ``spawn:``). This
@@ -1560,7 +1598,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         session through the server API or CLI. One of
         :class:`SharePolicy`: ``none`` (default — tool not registered),
         ``non-public`` (grant named users only), or ``public`` (also
-        allow ``__public__`` anonymous read). **Defaults to
+        allow ``__public__`` link access). **Defaults to
         ``SharePolicy.NONE``.**
     """
 
@@ -1613,5 +1651,6 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
+    tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)

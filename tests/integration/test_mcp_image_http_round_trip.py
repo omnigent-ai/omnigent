@@ -115,6 +115,7 @@ def _image_session(
         prompt="No agent turn is run by this transport test.",
         mock_llm_base_url=f"{mock_url}/v1",
         extra_config=config,
+        operator_authored=deny_result or transform_result,
     )
     return create_runner_bound_session(client, agent_name=registered, runner_id=runner_id)
 

@@ -2,7 +2,7 @@
 
 Session PR tracking observes completed shell calls on the runner
 (``omnigent/runner/pr_observer.py``) and surfaces associated PRs in the
-web UI: the workspace rail's GitHub tab shows a "Session pull request"
+web UI: the workspace rail's Pull Requests tab shows a "Session pull request"
 picker and the composer status line links the selected PR. Reported bug:
 tool completions that merely *read* a pull request (``gh pr view``, a
 ``gh api`` GET) or *comment* on one (``gh pr comment``) associate that PR
@@ -37,7 +37,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
 from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     configure_mock_llm,
@@ -174,7 +174,7 @@ def pr_probe_session(
 
     name = f"pr_assoc_probe_{uuid.uuid4().hex[:8]}"
     model = f"pr-assoc-probe-{uuid.uuid4().hex[:8]}"
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(name, model, str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()
@@ -231,12 +231,12 @@ def _drive_shell_turn(
 
 
 def _open_github_panel(page: Page) -> Locator:
-    """Reload like a returning user, open the rail, and select the GitHub tab."""
+    """Reload like a returning user, open the rail, and select the Pull Requests tab."""
     page.reload()
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
     # The "Link a PR" affordance renders once the panel's info request has
     # settled (with or without tracked PRs), so waiting on it keeps negative
     # assertions from passing vacuously against a still-loading panel.
@@ -267,8 +267,8 @@ def test_read_or_comment_does_not_associate_pr(
 
     rail = _open_github_panel(page)
     # A read/comment must leave the session unassociated: no session-PR
-    # picker in the GitHub tab and no composer status-line PR link.
-    expect(rail.get_by_role("combobox", name="Session pull request")).to_have_count(0)
+    # picker in the Pull Requests tab and no composer status-line PR link.
+    expect(rail.get_by_role("list", name="Pull requests")).to_have_count(0)
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     # The registry itself must stay empty — a hidden association would still
     # resurface in pickers and defaults later.
@@ -301,6 +301,7 @@ def test_created_pr_remains_tracked(
     )
 
     rail = _open_github_panel(page)
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_have_text("example/one #42", timeout=30_000)
+    expect(rail.get_by_role("link", name="Open the PR on GitHub")).to_have_attribute(
+        "href", _PR_URL, timeout=30_000
+    )
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")

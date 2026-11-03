@@ -105,7 +105,7 @@ describe("useHarnessInventory", () => {
     expect(result.current.unavailable).toEqual([]);
     expect(result.current.isEmpty).toBe(false);
     expect(result.current.context).toEqual({
-      credentials: [{ harness: "claude", source: "Databricks AI Gateway" }],
+      credentials: [{ harness: "claude", source: "Databricks Unity Gateway" }],
       skills: [
         { id: "claude:review", name: "review", harness: "claude", description: "" },
         { id: "codex:fix", name: "fix", harness: "codex", description: "" },

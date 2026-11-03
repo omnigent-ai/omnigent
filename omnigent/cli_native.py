@@ -74,6 +74,9 @@ def register_native_commands(cli: click.Group) -> None:
     _build_kiro_launch_args = _late_bound(lambda: _cli._build_kiro_launch_args)
     _ensure_backend = _late_bound(lambda: _cli._ensure_backend)
     _load_effective_config = _late_bound(lambda: _cli._load_effective_config)
+    _reject_reserved_codex_transport_args = _late_bound(
+        lambda: _cli._reject_reserved_codex_transport_args
+    )
     _reject_reserved_kiro_resume_args = _late_bound(lambda: _cli._reject_reserved_kiro_resume_args)
     _reject_reserved_devin_resume_args = _late_bound(
         lambda: _cli._reject_reserved_devin_resume_args
@@ -413,6 +416,7 @@ def register_native_commands(cli: click.Group) -> None:
                 or choice.conversation_id is not None
                 or session_id is not None
             )
+        _reject_reserved_codex_transport_args(codex_args)
 
         from omnigent.harness_startup_config import resolve_harness_command
         from omnigent.harnesses.codex_native.main import run_codex_native
@@ -507,7 +511,7 @@ def register_native_commands(cli: click.Group) -> None:
         # :param resume: None, picker sentinel, or a conversation id.
         # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
         # :param model: OpenCode model id pinned on the wrapper spec.
-        # :param opencode_args: Pass-through args persisted for the ``opencode attach`` TUI.
+        # :param opencode_args: Pass-through args persisted for the ``opencode --server`` TUI.
         # NOTE: no ``--command`` flag — override the opencode binary via
         # ``OMNIGENT_OPENCODE_PATH`` or ``harness.opencode-native.command`` config.
         # (opencode-native resolves its binary on the runner side; if a spec/env

@@ -171,7 +171,7 @@ def claude_agents_skill_args(
     for skill in skills:
         if skill.skill_dir is None:
             continue
-        # Older Claude versions use the directory basename as the command name.
+        # Claude uses the link's directory basename as the command name.
         destination = target / skill.name
         try:
             destination.symlink_to(skill.skill_dir.resolve(), target_is_directory=True)

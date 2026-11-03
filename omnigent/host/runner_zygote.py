@@ -73,11 +73,17 @@ class ZygoteRunnerProc:
 
     :param pid: The forked runner's process id.
     :param manager: The owning :class:`ZygoteManager`, used to poll exit status.
+    :param zygote_generation: The forkserver generation that owns this child.
     """
 
-    def __init__(self, pid: int, manager: ZygoteManager) -> None:
+    def __init__(
+        self, pid: int, manager: ZygoteManager, *, zygote_generation: int | None = None
+    ) -> None:
         self.pid = pid
         self._manager = manager
+        self._zygote_generation = (
+            manager._generation if zygote_generation is None else zygote_generation
+        )
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
@@ -88,7 +94,7 @@ class ZygoteRunnerProc:
         """
         if self.returncode is not None:
             return self.returncode
-        code = self._manager.poll(self.pid)
+        code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
         if code is not None:
             self.returncode = code
         return self.returncode
@@ -148,7 +154,8 @@ class ZygoteManager:
         self._log_path = log_path
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
-        self._lock = threading.Lock()
+        self._generation = 0
+        self._lock = threading.RLock()
 
     @property
     def pid(self) -> int | None:
@@ -182,6 +189,9 @@ class ZygoteManager:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return
+            if self._sock is not None:
+                self._sock.close()
+                self._sock = None
             parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 proc = self._spawn_zygote_process(child_sock.fileno())
@@ -192,22 +202,22 @@ class ZygoteManager:
             # The child owns its copy of child_fd now; close ours.
             child_sock.close()
             parent_sock.settimeout(_CONTROL_TIMEOUT_S)
+            self._generation += 1
             self._proc = proc
             self._sock = parent_sock
 
-        # Confirm the zygote is answering before the caller relies on it. Any
-        # failure here (bad pong, or the exchange itself raising on a timeout /
-        # EOF) must tear down the partially-started zygote so a failed start
-        # never leaks a process + socket.
-        try:
-            reply = self._exchange({"cmd": "ping"})
-            answered = bool(reply.get("pong"))
-        except ZygoteUnavailable:
-            self.stop()
-            raise
-        if not answered:
-            self.stop()
-            raise ZygoteUnavailable("runner zygote did not answer ping")
+            # Prewarming and session launch can race. Keep the readiness check
+            # and failed-start cleanup locked so neither caller can use an
+            # unverified parent that the other caller is about to terminate.
+            try:
+                reply = self._exchange({"cmd": "ping"})
+                answered = bool(reply.get("pong"))
+            except ZygoteUnavailable:
+                self.stop()
+                raise
+            if not answered:
+                self.stop()
+                raise ZygoteUnavailable("runner zygote did not answer ping")
 
     def _spawn_zygote_process(self, child_fd: int) -> subprocess.Popen[bytes]:
         """Popen the zygote interpreter, handing it *child_fd* as its control fd.
@@ -264,29 +274,34 @@ class ZygoteManager:
         :returns: A :class:`ZygoteRunnerProc` for the forked runner.
         :raises ZygoteUnavailable: If the zygote is down or reports a fork error.
         """
+        generation = self._generation
         reply = self._exchange(
             {
                 "cmd": "fork",
                 "env": env,
                 "log_path": log_path,
                 "cwd": workspace,
-            }
+            },
+            zygote_generation=generation,
         )
         if "error" in reply:
             raise ZygoteUnavailable(f"zygote fork failed: {reply['error']}")
         pid = reply.get("pid")
         if not isinstance(pid, int):
             raise ZygoteUnavailable(f"zygote returned no pid: {reply!r}")
-        return ZygoteRunnerProc(pid, self)
+        return ZygoteRunnerProc(pid, self, zygote_generation=generation)
 
-    def poll(self, pid: int) -> int | None:
+    def poll(self, pid: int, *, zygote_generation: int | None = None) -> int | None:
         """Return the exit code for a forked runner, or ``None`` if still live.
 
         :param pid: The forked runner pid.
+        :param zygote_generation: The child's forkserver generation, if pinned.
         :returns: Exit code once the zygote has reaped it, else ``None``.
         """
         try:
-            reply = self._exchange({"cmd": "poll", "pid": pid})
+            reply = self._exchange(
+                {"cmd": "poll", "pid": pid}, zygote_generation=zygote_generation
+            )
         except ZygoteUnavailable:
             # The zygote (the runner's OS parent) died, so exit status can no
             # longer be recovered over the control socket. Probe the runner pid
@@ -323,14 +338,19 @@ class ZygoteManager:
                             self._proc.wait(timeout=5.0)
                 self._proc = None
 
-    def _exchange(self, request: dict[str, object]) -> dict[str, object]:
+    def _exchange(
+        self, request: dict[str, object], *, zygote_generation: int | None = None
+    ) -> dict[str, object]:
         """Send one request and read one JSON reply under the control lock.
 
         :param request: The protocol request (``ping`` / ``fork`` / ``poll``).
+        :param zygote_generation: Refuse exchanges with a replacement forkserver.
         :returns: The decoded reply.
         :raises ZygoteUnavailable: On any socket error or if the zygote closed.
         """
         with self._lock:
+            if zygote_generation is not None and zygote_generation != self._generation:
+                raise ZygoteUnavailable("runner belongs to a previous zygote generation")
             sock = self._sock
             if sock is None:
                 raise ZygoteUnavailable("runner zygote is not running")

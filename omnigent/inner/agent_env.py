@@ -20,10 +20,12 @@ and stops seeing every *other* provider's.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable, Mapping
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, ci_request_tags
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 
 # Desktop access requires an explicit grant outside the sandbox.
@@ -72,6 +74,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # The user's URL-opener command, so an agent's CLI logins open URLs the
         # way the user configured (e.g. forwarded to a laptop from a remote box).
         "BROWSER",
+        # Config locations, not bearer tokens: agent tools use the host's CLI login.
+        "GH_CONFIG_DIR",
+        "GLAB_CONFIG_DIR",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX
@@ -110,11 +115,14 @@ def clean_agent_env(
     extra = set(extra_allowed)
     exact = BASE_ALLOW_EXACT | set(allow_exact) | extra
     denied = set(deny_exact) | (DESKTOP_SESSION_ENV_VARS - extra)
-    return {
+    filtered = {
         key: value
         for key, value in env_source.items()
         if key not in denied and (key in exact or key.startswith(prefixes))
     }
+    if CI_CONTEXT_ENV not in denied and (tags := ci_request_tags(env_source)):
+        filtered[CI_CONTEXT_ENV] = json.dumps(tags, separators=(",", ":"))
+    return filtered
 
 
 def strip_desktop_session_env(env: Mapping[str, str]) -> dict[str, str]:

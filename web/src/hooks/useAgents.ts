@@ -48,6 +48,8 @@ export interface Agent {
   mcp_servers?: McpServerSummary[];
   /** Whether the active session's agent bundle can be edited through the UI. */
   mcp_servers_editable?: boolean;
+  /** Whether managed MCP services can be selected for the active session. */
+  mcp_registry_editable?: boolean;
   /** Guardrails policies declared on the agent. Empty when none configured. */
   policies?: PolicySummary[];
   /** Terminal names declared in the spec's `terminals:` block, in
@@ -76,6 +78,7 @@ interface AgentObjectWire {
   harness?: string | null;
   mcp_servers?: McpServerSummary[];
   mcp_servers_editable?: boolean;
+  mcp_registry_editable?: boolean;
   policies?: PolicySummary[];
   terminals?: string[];
 }
@@ -97,6 +100,7 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
     harness: json.harness ?? null,
     mcp_servers: json.mcp_servers,
     mcp_servers_editable: json.mcp_servers_editable,
+    mcp_registry_editable: json.mcp_registry_editable,
     policies: json.policies,
     terminals: json.terminals,
   };
@@ -121,7 +125,7 @@ export function useSessionAgent(sessionId: string | null) {
 
 export interface UpsertMcpServerInput {
   name: string;
-  transport: "http" | "stdio";
+  transport: "http" | "stdio" | "registry";
   description?: string | null;
   url?: string | null;
   headers?: Record<string, string> | null;

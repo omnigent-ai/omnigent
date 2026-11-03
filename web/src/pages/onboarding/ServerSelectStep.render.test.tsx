@@ -93,7 +93,7 @@ describe("ServerSelectStep", () => {
     fireEvent.click(screen.getByRole("button", { name: "Join" }));
 
     // Added + selected → Join enabled, connects to the normalized URL.
-    const normalized = "http://my-server.example.com/";
+    const normalized = "https://my-server.example.com/";
     expect(onCheckServer).toHaveBeenCalledWith(normalized);
     expect(screen.getByRole("button", { name: /open omnigent/i })).toBeEnabled();
     // The probe result surfaces on the card.

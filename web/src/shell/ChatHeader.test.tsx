@@ -9,6 +9,8 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import * as sessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
@@ -69,6 +71,8 @@ function renderHeader(props: {
   isChildSession?: boolean;
   subAgentName?: string | null;
   conversationId?: string;
+  createdBySessionId?: string;
+  queryClient?: QueryClient;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -77,6 +81,7 @@ function renderHeader(props: {
   wrapperLabel?: string | null;
   canShare?: boolean;
   canFork?: boolean;
+  forkDisabledReason?: string;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
@@ -90,7 +95,8 @@ function renderHeader(props: {
   onFork?: () => void;
   settingsMode?: boolean;
 }) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const qc =
+    props.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
@@ -105,6 +111,7 @@ function renderHeader(props: {
             // right-panel toggle / rail entries all gate on conversationId and
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
+            createdBySessionId={props.createdBySessionId}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
@@ -113,6 +120,7 @@ function renderHeader(props: {
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
             canFork={props.canFork ?? false}
+            forkDisabledReason={props.forkDisabledReason}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
@@ -135,10 +143,62 @@ function renderHeader(props: {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
   isMobileMock.mockReturnValue(false);
+});
+
+it.each([false, true])("links the creating session (mobile=%s)", async (mobile) => {
+  isMobileMock.mockReturnValue(mobile);
+  let resolveCreator!: (session: Session) => void;
+  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
+    new Promise<Session>((resolve) => {
+      resolveCreator = resolve;
+    }),
+  );
+  renderHeader({ sidebarOpen: true, conversationId: "worker", createdBySessionId: "manager" });
+  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
+  await act(async () => {
+    resolveCreator({ id: "manager", title: "Release manager" } as Session);
+  });
+  expect(await screen.findByRole("link", { name: "Release manager" })).toHaveAttribute(
+    "href",
+    "/c/manager",
+  );
+  expect(lookup).toHaveBeenCalledWith("manager");
+  expect(screen.getByText(/Created by/)).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Back to parent session" })).not.toBeInTheDocument();
+});
+
+it("rechecks creator access without displaying cached metadata", async () => {
+  const queryClient = new QueryClient();
+  const cached = { id: "private", title: "Previously shared manager" } as Session;
+  queryClient.setQueryData(["session", "private"], cached);
+  queryClient.setQueryData(["session-creator", "private"], cached);
+  let rejectCreator!: (error: Error) => void;
+  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
+    new Promise<Session>((_, reject) => {
+      rejectCreator = reject;
+    }),
+  );
+  renderHeader({
+    sidebarOpen: true,
+    conversationId: "worker",
+    createdBySessionId: "private",
+    queryClient,
+  });
+  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
+  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  await act(async () => {
+    rejectCreator(new sessionsApi.ApiError("Unavailable", 403, null));
+  });
+  expect(await screen.findByText("Created by another session")).toBeInTheDocument();
+  expect(lookup).toHaveBeenCalledWith("private");
+  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
 });
 
 describe("ChatHeader — deployed Share presentation", () => {
@@ -221,6 +281,15 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+
+  it("adds the glass backdrop only on session pages", () => {
+    const landing = renderHeader({ sidebarOpen: true });
+    expect(landing.container.querySelector("header")).not.toHaveClass("session-header-glass");
+    landing.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).toHaveClass("session-header-glass");
   });
 });
 
@@ -736,6 +805,24 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     permission_level: 3,
   };
 
+  it.each([
+    { name: "landing", actionConversation: null },
+    { name: "shared session", actionConversation: null, conversationId: "conv-1" },
+    { name: "sub-agent", actionConversation: conversation, isChildSession: true },
+    { name: "pending session", actionConversation: conversation, pending: true },
+  ])("leaves the rename shortcut untouched on $name", (props) => {
+    renderHeader({ sidebarOpen: true, conversationTitle: conversation.title, ...props });
+    const pressed = new KeyboardEvent("keydown", {
+      code: "KeyR",
+      ctrlKey: true,
+      altKey: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(pressed);
+    expect(pressed.defaultPrevented).toBe(false);
+    expect(screen.queryByRole("textbox", { name: "Session name" })).toBeNull();
+  });
+
   it("keeps the overflow trigger immediately after a truncating title", () => {
     renderHeader({
       sidebarOpen: true,
@@ -861,6 +948,28 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(onFork).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])("disables the fallback Fork menu (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      actionConversation: null,
+      canFork: true,
+      forkDisabledReason: "Forking this sandbox session is not supported yet.",
+      onFork,
+    });
+    fireEvent.pointerDown(
+      screen.getByTestId(mobile ? "session-actions-menu" : "desktop-fork-actions-menu"),
+      { button: 0 },
+    );
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(onFork).not.toHaveBeenCalled();
+  });
+
   it("folds the workspace-rail entries into the one mobile kebab", () => {
     // Previously a second `PanelRight` trigger sat beside the kebab; the rail
     // entries now ride in the same menu, so a phone has a single trigger.
@@ -879,15 +988,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
-    // textContent includes it but it's invisible; the labels are what matters.
-    const svgTitleText = (el: Element) =>
-      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
-    expect(
-      screen
-        .getAllByRole("menuitem")
-        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
-    ).toEqual([
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Pin",
       "Export",
       "Rename",
@@ -895,7 +996,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       "Add to project",
       "Files",
       "Changes",
-      "GitHub",
+      "Pull Requests",
       "Agents1",
       "Archive",
       "Delete",

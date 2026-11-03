@@ -269,7 +269,9 @@ async def test_sandbox_preview_authorizes_a_shared_agent_like_binding(
     perm_store.grant("bob@example.com", fork_id, LEVEL_READ)
     agent_store._session_id_for_agent = lambda _agent_id: source_id  # type: ignore[method-assign]
     spec = SimpleNamespace(
-        executor=SimpleNamespace(config={"harness": "claude-sdk"}, type="omnigent", auth=None)
+        executor=SimpleNamespace(
+            config={"harness": "claude-sdk"}, type="omnigent", auth=None, profile=None
+        )
     )
     cache = SimpleNamespace(load=lambda *_args, **_kwargs: SimpleNamespace(spec=spec))
     catalog = {"configured": True, "models": ["m"]}

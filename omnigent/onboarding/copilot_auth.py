@@ -3,7 +3,7 @@
 Copilot is deliberately outside the anthropic/openai provider-family + gateway
 machinery (see :func:`omnigent.runtime.workflow._build_copilot_spawn_env`): the
 GitHub Copilot SDK (``github-copilot-sdk``) talks only to GitHub's Copilot
-backend, authenticated by a **GitHub token** — never the Databricks AI gateway.
+backend, authenticated by a **GitHub token** — never the Databricks Unity Gateway.
 It therefore has no ``providers:`` family entry, but a user should still be able
 to register a Copilot token once through ``omnigent setup`` rather than
 exporting it in every shell.

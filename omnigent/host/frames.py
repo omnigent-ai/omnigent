@@ -20,17 +20,23 @@ see.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+    CAP_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -42,9 +48,19 @@ from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 
 # when the host refuses a launch because the session's workspace directory
-# does not exist on the host (e.g. the worktree was deleted). Shared by the
-# daemon (producer) and server (consumer) so both can handle it structurally.
+# does not exist on the host and could not be recreated. Shared by the daemon
+# (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+# when the host's launch handler raised before any runner process was spawned
+# (a post-spawn fault is not reported as a failure). Unlike the codes above
+# this is not a categorical refusal: the server cannot describe the cause from
+# its own state, so it stays a generic failure.
+LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
+
+# Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
+# tail, whose last line the server keeps when it shortens the report for storage.
+RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
@@ -52,22 +68,38 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+# The runner starts a codex-native session whose collaboration-mode label is
+# ``plan`` (armed on the New Session screen) in Codex Plan mode:
+CAP_CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
 # The host answers ``host.mcp_servers`` with its user-level MCP inventory:
 CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_REFRESH_HARNESSES = "refresh_harnesses"
+CAP_HARNESS_ACCOUNTS = "harness_accounts"
+CAP_HARNESS_LOGIN = "harness_login"
+CAP_MCP_REGISTRY = "mcp_registry"
+# The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
+CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
+    CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_REFRESH_HARNESSES,
+    CAP_WORKTREE_CREATE_BUDGET,
+    CAP_HARNESS_ACCOUNTS,
+    CAP_HARNESS_LOGIN,
 ]
 
 
@@ -142,6 +174,17 @@ class HostFrameKind(str, Enum):
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
+    REFRESH_HARNESSES = "host.refresh_harnesses"
+    REFRESH_HARNESSES_RESULT = "host.refresh_harnesses_result"
+    PROBE_HARNESS_ACCOUNTS = "host.probe_harness_accounts"
+    PROBE_HARNESS_ACCOUNTS_RESULT = "host.probe_harness_accounts_result"
+    HARNESS_LOGIN = "host.harness_login"
+    HARNESS_LOGIN_RESULT = "host.harness_login_result"
+    HARNESS_LOGIN_CANCEL = "host.harness_login_cancel"
+    HARNESS_LOGIN_CANCEL_RESULT = "host.harness_login_cancel_result"
+    HARNESS_LOGIN_COMPLETED = "host.harness_login_completed"
+    HARNESS_LOGOUT = "host.harness_logout"
+    HARNESS_LOGOUT_RESULT = "host.harness_logout_result"
     STORE_SECRET = "host.store_secret"
     STORE_SECRET_RESULT = "host.store_secret_result"
     DETECT_CREDENTIALS = "host.detect_credentials"
@@ -206,6 +249,8 @@ class HostHelloFrame:
         (see ``HOST_CAPABILITIES`` / ``CAP_*``). Empty from an older host that
         predates a given capability, so the server treats absence as "not
         supported" without a version check.
+    :param connection_id: Host-minted identifier for this socket, shared with
+        server diagnostics. Absent from older hosts.
     """
 
     version: str
@@ -213,11 +258,13 @@ class HostHelloFrame:
     name: str
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
     gateway_inference: dict[str, bool] | None = None
     interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -249,6 +296,7 @@ class HostHarnessReadinessFrame:
     """
 
     configured_harnesses: dict[str, HarnessAvailability]
+    harness_accounts: HarnessAccounts | None = None
     gateway_inference: dict[str, bool] | None = None
 
 
@@ -273,6 +321,11 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param superseded_runner_ids: Runners this launch replaces, which the
+        host stops once the new runner is alive. ``None`` (an older server)
+        falls back to stopping every runner launched for ``session_id``; an
+        empty tuple stops none, e.g. after /clear moved the old runner to
+        another session.
     """
 
     request_id: str
@@ -281,6 +334,7 @@ class HostLaunchRunnerFrame:
     session_id: str | None = None
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
+    superseded_runner_ids: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -302,6 +356,10 @@ class HostLaunchRunnerResultFrame:
         :data:`WORKSPACE_MISSING_ERROR_CODE`. ``None`` for uncategorized
         failures and on success (and always from older hosts that don't
         send it).
+    :param workspace_recreated: ``True`` when the host found the session
+        workspace missing and recreated it as an empty directory before
+        spawning the runner, so the server can tell the user. ``False`` on
+        failure and from older hosts that don't send it.
     """
 
     request_id: str
@@ -309,6 +367,7 @@ class HostLaunchRunnerResultFrame:
     runner_id: str | None = None
     error: str | None = None
     error_code: str | None = None
+    workspace_recreated: bool = False
 
 
 @dataclass
@@ -358,11 +417,15 @@ class HostRunnerExitedFrame:
         ``"runner_abc123..."``.
     :param error: Human-readable cause, e.g.
         ``"runner process exited with code 1 (log: ~/...) ..."``,
-        including the trailing lines of the runner's log.
+        followed by :data:`RUNNER_LOG_TAIL_HEADING` and the trailing
+        lines of the runner's log.
+    :param had_connected: Whether the runner touched its first-connect marker.
+        ``None`` when unavailable or reported by an older host.
     """
 
     runner_id: str
     error: str
+    had_connected: bool | None = None
 
 
 @dataclass
@@ -396,6 +459,8 @@ class HostRunnerStatusResultFrame:
 
         * ``"alive"`` — the host has this runner and its process is
           running (booting or serving). The runner is coming; wait.
+        * ``"sign_in_pending"`` — this live, unconnected runner is waiting
+          within its bounded host sign-in window. Keep the original input.
         * ``"dead"`` — the host has this runner but its process has
           exited. It will never connect; relaunch now.
         * ``"unknown"`` — the host has no record of this runner (it was
@@ -575,6 +640,9 @@ class HostCreateWorktreeFrame:
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
+    :param timeout_s: Seconds the host may spend on this create; the
+        server waits a margin longer. ``None`` on frames from an older
+        server, whose shorter deadline the host must then stay within.
     """
 
     request_id: str
@@ -582,6 +650,7 @@ class HostCreateWorktreeFrame:
     branch_name: str
     base_branch: str | None = None
     existing_branch: bool = False
+    timeout_s: float | None = None
 
 
 @dataclass
@@ -774,6 +843,9 @@ class HostInstallHarnessResultFrame:
         after the install attempt, e.g. ``{"claude-native": True,
         "codex-native": "needs-auth"}``. ``None`` when the install could
         not run (the server keeps its prior readiness view).
+    :param version: Installed CLI version after the operation, e.g.
+        ``"1.18.4"``. ``None`` when an older host does not report it or the
+        version could not be determined.
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
@@ -787,7 +859,116 @@ class HostInstallHarnessResultFrame:
     request_id: str
     status: str
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+    version: str | None = None
     gateway_inference: dict[str, bool] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostRefreshHarnessesFrame:
+    """Server → host: immediately re-probe all harness readiness."""
+
+    request_id: str
+
+
+@dataclass
+class HostRefreshHarnessesResultFrame:
+    """Host → server: result of a forced harness readiness re-probe."""
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+    gateway_inference: dict[str, bool] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostProbeAccountsFrame:
+    """Server → host: probe non-secret harness account metadata."""
+
+    request_id: str
+    refresh_codex: bool = False
+
+
+@dataclass
+class HostProbeAccountsResultFrame:
+    """Host → server: result of an on-demand account probe."""
+
+    request_id: str
+    status: str
+    harness_accounts: HarnessAccounts | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostHarnessLoginFrame:
+    """Server → host: begin a Codex device-code login."""
+
+    request_id: str
+    harness: str
+    login_id: str
+
+
+@dataclass
+class HostHarnessLoginResultFrame:
+    """Host → server: device-code details for a newly started login."""
+
+    request_id: str
+    status: str
+    login_id: str | None = None
+    verification_url: str | None = None
+    user_code: str | None = None
+    expires_at: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostHarnessLoginCancelFrame:
+    """Server → host: cancel an active device-code login."""
+
+    request_id: str
+    login_id: str
+
+
+@dataclass
+class HostHarnessLoginCancelResultFrame:
+    """Host → server: acknowledgement of a login cancellation."""
+
+    request_id: str
+    status: str
+    error: str | None = None
+
+
+@dataclass
+class HostHarnessLoginCompletedFrame:
+    """Host → server: unsolicited completion of a device-code login."""
+
+    login_id: str
+    success: bool
+    expired: bool = False
+    error: str | None = None
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+
+
+@dataclass
+class HostHarnessLogoutFrame:
+    """Server → host: sign the selected harness out."""
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostHarnessLogoutResultFrame:
+    """Host → server: logout result plus freshly probed readiness."""
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
     error: str | None = None
 
 
@@ -862,6 +1043,7 @@ class HostStoreSecretResultFrame:
     request_id: str
     status: str
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
     gateway_inference: dict[str, bool] | None = None
     error: str | None = None
 
@@ -911,7 +1093,8 @@ class HostFsRequestFrame:
 
     :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
     :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
-        ``"diff"``, ``"search"``.
+        ``"diff"``, ``"search"``, or PR resources including ``"github_info"``,
+        ``"github_review_threads"`` and ``"github_review_thread_comments"``.
     :param workspace: Absolute path to the session's workspace on the
         host, e.g. ``"/Users/alice/project"``.
     :param session_id: Session id, forwarded to the change registry.
@@ -933,13 +1116,26 @@ class HostFsWriteFrame:
 
     The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
     this carries the small set of writes the host can serve when the session's
-    runner is offline — currently the GitHub account/base preference
-    (``op="github_set_preference"``). The host runs the mutation against
+    runner is offline — currently the pull request panel's account/base
+    preference (``op="github_set_preference"``), PR attach/remove
+    (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
+    reviewer edits (``op="github_reviewers_update"``), title and description edits
+    (``op="github_details_update"``), comments (``op="github_comment_create"``),
+    review replies (``op="github_review_thread_reply"``), description attachment uploads
+    (``op="github_attachment_upload"``, the file base64-encoded in
+    ``content_base64``), merges (``op="github_merge"``),
+    and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
+    provider; the op names are
+    stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
-    :param op: Write op name — currently ``"github_set_preference"``.
+    :param op: Write op name — ``"github_set_preference"``,
+        ``"github_prs_update"``, ``"github_labels_update"``,
+        ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1030,6 +1226,8 @@ class HostSkillsResultFrame:
     error_code: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
+    # Sources the host could not read; non-empty means ``skills`` is incomplete.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1057,7 +1255,7 @@ class HostMcpServersFrame:
 
 @dataclass
 class HostMcpServersResultFrame:
-    """Host → server: MCP server names and metadata, never env, args, or URLs."""
+    """Host → server: MCP server metadata and account state; no env, args, or server URLs."""
 
     request_id: str
     status: str
@@ -1137,6 +1335,8 @@ class HostImportedLocalSession:
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
         per session so an "all harnesses" request can mix sources in one batch.
+    :param archived: Whether the harness had archived this session; the server
+        archives the imported conversation too. Absent from older hosts.
     """
 
     external_session_id: str
@@ -1144,6 +1344,7 @@ class HostImportedLocalSession:
     items: list[_JsonObject]
     title: str | None = None
     source: str = ""
+    archived: bool = False
 
 
 @dataclass
@@ -1274,6 +1475,17 @@ HostFrame = (
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
     | HostInstallHarnessResultFrame
+    | HostRefreshHarnessesFrame
+    | HostRefreshHarnessesResultFrame
+    | HostProbeAccountsFrame
+    | HostProbeAccountsResultFrame
+    | HostHarnessLoginFrame
+    | HostHarnessLoginResultFrame
+    | HostHarnessLoginCancelFrame
+    | HostHarnessLoginCancelResultFrame
+    | HostHarnessLoginCompletedFrame
+    | HostHarnessLogoutFrame
+    | HostHarnessLogoutResultFrame
     | HostStoreSecretFrame
     | HostStoreSecretResultFrame
     | HostDetectCredentialsFrame
@@ -1348,11 +1560,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "name": frame.name,
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
+                "connection_id": frame.connection_id,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1369,21 +1583,23 @@ def encode_host_frame(frame: HostFrame) -> str:
             {
                 "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.LAUNCH_RUNNER.value,
-                "request_id": frame.request_id,
-                "binding_token": frame.binding_token,
-                "workspace": frame.workspace,
-                "session_id": frame.session_id,
-                "harness": frame.harness,
-                "inference_config": frame.inference_config,
-            }
-        )
+        payload: dict[str, Any] = {
+            "kind": HostFrameKind.LAUNCH_RUNNER.value,
+            "request_id": frame.request_id,
+            "binding_token": frame.binding_token,
+            "workspace": frame.workspace,
+            "session_id": frame.session_id,
+            "harness": frame.harness,
+            "inference_config": frame.inference_config,
+        }
+        if frame.superseded_runner_ids is not None:
+            payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
+        return _encode_payload(payload)
     if isinstance(frame, HostLaunchRunnerResultFrame):
         return _encode_payload(
             {
@@ -1393,6 +1609,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runner_id": frame.runner_id,
                 "error": frame.error,
                 "error_code": frame.error_code,
+                "workspace_recreated": frame.workspace_recreated,
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -1418,6 +1635,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+                "had_connected": frame.had_connected,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -1496,6 +1714,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
                 "existing_branch": frame.existing_branch,
+                "timeout_s": frame.timeout_s,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1581,7 +1800,116 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
+                "version": frame.version,
                 "gateway_inference": frame.gateway_inference,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRefreshHarnessesFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.REFRESH_HARNESSES.value,
+                "request_id": frame.request_id,
+            }
+        )
+    if isinstance(frame, HostRefreshHarnessesResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.REFRESH_HARNESSES_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
+                "gateway_inference": frame.gateway_inference,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostProbeAccountsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PROBE_HARNESS_ACCOUNTS.value,
+                "request_id": frame.request_id,
+                "refresh_codex": frame.refresh_codex,
+            }
+        )
+    if isinstance(frame, HostProbeAccountsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PROBE_HARNESS_ACCOUNTS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "harness_accounts": frame.harness_accounts,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "login_id": frame.login_id,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "login_id": frame.login_id,
+                "verification_url": frame.verification_url,
+                "user_code": frame.user_code,
+                "expires_at": frame.expires_at,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginCancelFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_CANCEL.value,
+                "request_id": frame.request_id,
+                "login_id": frame.login_id,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginCancelResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_CANCEL_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginCompletedFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_COMPLETED.value,
+                "login_id": frame.login_id,
+                "success": frame.success,
+                "expired": frame.expired,
+                "error": frame.error,
+                "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
+            }
+        )
+    if isinstance(frame, HostHarnessLogoutFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGOUT.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostHarnessLogoutResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGOUT_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
                 "error": frame.error,
             }
         )
@@ -1606,6 +1934,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
                 "gateway_inference": frame.gateway_inference,
                 "error": frame.error,
             }
@@ -1703,6 +2032,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
                 "agent_id": frame.agent_id,
+                "warnings": frame.warnings,
             }
         )
     if isinstance(frame, HostPluginsFrame):
@@ -1854,6 +2184,7 @@ def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonO
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -2125,6 +2456,73 @@ def _decode_known_host_frame(
             return _decode_install_harness(msg)
         case HostFrameKind.INSTALL_HARNESS_RESULT:
             return _decode_install_harness_result(msg)
+        case HostFrameKind.REFRESH_HARNESSES:
+            return HostRefreshHarnessesFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.REFRESH_HARNESSES_RESULT:
+            return _decode_refresh_harnesses_result(msg)
+        case HostFrameKind.PROBE_HARNESS_ACCOUNTS:
+            return HostProbeAccountsFrame(
+                request_id=_required_str(msg, "request_id"),
+                refresh_codex=(
+                    _required_bool(msg, "refresh_codex") if "refresh_codex" in msg else False
+                ),
+            )
+        case HostFrameKind.PROBE_HARNESS_ACCOUNTS_RESULT:
+            return HostProbeAccountsResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.HARNESS_LOGIN:
+            return HostHarnessLoginFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+                login_id=_required_str(msg, "login_id"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_RESULT:
+            return HostHarnessLoginResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                login_id=_optional_nullable_str(msg, "login_id"),
+                verification_url=_optional_nullable_str(msg, "verification_url"),
+                user_code=_optional_nullable_str(msg, "user_code"),
+                expires_at=_optional_nullable_int(msg, "expires_at"),
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_CANCEL:
+            return HostHarnessLoginCancelFrame(
+                request_id=_required_str(msg, "request_id"),
+                login_id=_required_str(msg, "login_id"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_CANCEL_RESULT:
+            return HostHarnessLoginCancelResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_COMPLETED:
+            return HostHarnessLoginCompletedFrame(
+                login_id=_required_str(msg, "login_id"),
+                success=_required_bool(msg, "success"),
+                expired=_required_bool(msg, "expired") if "expired" in msg else False,
+                error=_optional_nullable_str(msg, "error"),
+                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
+            )
+        case HostFrameKind.HARNESS_LOGOUT:
+            return HostHarnessLogoutFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+            )
+        case HostFrameKind.HARNESS_LOGOUT_RESULT:
+            return HostHarnessLogoutResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
+                error=_optional_nullable_str(msg, "error"),
+            )
         case HostFrameKind.STORE_SECRET:
             return _decode_store_secret(msg)
         case HostFrameKind.STORE_SECRET_RESULT:
@@ -2228,6 +2626,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         interactive_shells=(
             _optional_str_list(msg, "interactive_shells")
@@ -2237,6 +2636,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_nullable_str(msg, "connection_id"),
     )
 
 
@@ -2254,6 +2654,7 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(
         configured_harnesses=configured_harnesses,
+        harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
     )
 
@@ -2274,6 +2675,12 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        # Absent (an older server) is distinct from an empty list.
+        superseded_runner_ids=(
+            tuple(_optional_str_list(msg, "superseded_runner_ids"))
+            if "superseded_runner_ids" in msg
+            else None
+        ),
     )
 
 
@@ -2291,6 +2698,7 @@ def _decode_launch_runner_result(
         runner_id=_optional_nullable_str(msg, "runner_id"),
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
+        workspace_recreated=_optional_bool(msg, "workspace_recreated"),
     )
 
 
@@ -2330,6 +2738,9 @@ def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+        had_connected=(
+            _required_bool(msg, "had_connected") if msg.get("had_connected") is not None else None
+        ),
     )
 
 
@@ -2469,6 +2880,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
         existing_branch=existing_branch is True,
+        timeout_s=_optional_positive_float(msg, "timeout_s"),
     )
 
 
@@ -2606,6 +3018,20 @@ def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResult
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
+        version=_optional_nullable_str(msg, "version"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_refresh_harnesses_result(msg: _JsonObject) -> HostRefreshHarnessesResultFrame:
+    """Decode a host.refresh_harnesses_result frame."""
+    return HostRefreshHarnessesResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
     )
@@ -2639,6 +3065,7 @@ def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         error=_optional_nullable_str(msg, "error"),
     )
@@ -2774,12 +3201,15 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
     for skill in raw_skills:
         if not isinstance(skill, dict):
             raise ValueError("frame field must be a list of skill summaries: 'skills'")
-        skills.append(
-            {
-                "name": _required_str(skill, "name"),
-                "description": _required_str(skill, "description"),
-            }
-        )
+        summary = {
+            "name": _required_str(skill, "name"),
+            "description": _required_str(skill, "description"),
+        }
+        # Absent from older hosts; the menu falls back to ``name``.
+        display_name = _optional_nullable_str(skill, "display_name")
+        if display_name is not None:
+            summary["display_name"] = display_name
+        skills.append(summary)
     return HostSkillsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
@@ -2788,11 +3218,48 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+        # Absent from older hosts, which never reported partial catalogs.
+        warnings=_optional_str_list(msg, "warnings"),
     )
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed")
+#: Account states a host may report. Anything else is dropped rather than rejected, so a
+#: newer host reporting a state this build does not know degrades to "no state reported".
+MCP_AUTH_STATUSES = ("connected", "sign_in_required")
+
+
+def mcp_account_fields(auth_status: object, sign_in_url: object) -> dict[str, str]:
+    """Validate one server's reported account state, the only account data hosts send.
+
+    Shared by the reporting host and the decoding server, so the rule lives in one place.
+
+    :param auth_status: Reported state; only :data:`MCP_AUTH_STATUSES` survive.
+    :param sign_in_url: Reported sign-in page; kept only while sign-in is due and only
+        when it is an absolute ``http(s)`` URL a browser can open.
+    :returns: The fields to publish, empty when nothing valid was reported.
+    """
+    if auth_status not in MCP_AUTH_STATUSES:
+        return {}
+    fields = {"auth_status": str(auth_status)}
+    if auth_status == "sign_in_required" and isinstance(sign_in_url, str):
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in sign_in_url):
+            return fields
+        try:
+            parts = urlsplit(sign_in_url)
+        except ValueError:
+            return fields
+        # Credentials in the URL would be published to the browser and sit in the
+        # DOM, so a page that carries them is not worth opening.
+        if (
+            parts.scheme in ("http", "https")
+            and parts.hostname
+            and not parts.username
+            and not parts.password
+        ):
+            fields["sign_in_url"] = sign_in_url
+    return fields
 
 
 def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
@@ -2809,6 +3276,7 @@ def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
             value = _optional_nullable_str(server, key)
             if value is not None:
                 summary[key] = value
+        summary.update(mcp_account_fields(server.get("auth_status"), server.get("sign_in_url")))
         servers.append(summary)
     return HostMcpServersResultFrame(
         request_id=_required_str(msg, "request_id"),
@@ -2959,6 +3427,7 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
         items=items,
         title=title,
         source=source,
+        archived=_required_bool(raw, "archived") if "archived" in raw else False,
     )
 
 
@@ -3031,6 +3500,16 @@ def _required_int(msg: _JsonObject, key: str) -> int:
     return val
 
 
+def _optional_nullable_int(msg: _JsonObject, key: str) -> int | None:
+    """Return an optional nullable integer field."""
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, int) or isinstance(val, bool):
+        raise ValueError(f"frame field must be an int or null: {key!r}")
+    return val
+
+
 def _required_bool(msg: _JsonObject, key: str) -> bool:
     """Return a required boolean field.
 
@@ -3042,6 +3521,22 @@ def _required_bool(msg: _JsonObject, key: str) -> bool:
     val = msg.get(key)
     if not isinstance(val, bool):
         raise ValueError(f"frame missing required bool field: {key!r}")
+    return val
+
+
+def _optional_bool(msg: _JsonObject, key: str) -> bool:
+    """Extract an optional boolean field, ``False`` when absent or null.
+
+    :param msg: Decoded frame object.
+    :param key: Field name.
+    :returns: The boolean value, or ``False`` for an older peer that omits it.
+    :raises ValueError: If the field is present and not a bool.
+    """
+    val = msg.get(key)
+    if val is None:
+        return False
+    if not isinstance(val, bool):
+        raise ValueError(f"frame field must be a bool: {key!r}")
     return val
 
 
@@ -3118,3 +3613,26 @@ def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     if not isinstance(val, str):
         raise ValueError(f"frame field must be a string or null: {key!r}")
     return val
+
+
+def _optional_positive_float(msg: _JsonObject, key: str) -> float | None:
+    """Return an optional positive number field as a float.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"timeout_s"``.
+    :returns: The value as a float, or ``None`` when absent or null.
+    :raises ValueError: If the field is present but not a positive,
+        finite number.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"frame field must be a number: {key!r}")
+    try:
+        number = float(val)
+    except OverflowError:
+        number = math.inf
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"frame field must be positive and finite: {key!r}")
+    return number

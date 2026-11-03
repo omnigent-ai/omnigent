@@ -1,8 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 
 import {
   ImportContextModal,
@@ -25,19 +23,16 @@ afterEach(() => {
 function renderModal(
   context: ImportContext = MOCK_IMPORT_CONTEXT,
   props: Partial<Omit<ImportContextModalProps, "context">> = {},
-  info: ServerInfo | "loading" = "loading",
 ) {
   return render(
     <MemoryRouter>
-      <CapabilitiesProvider info={info}>
-        <ImportContextModal
-          open={true}
-          onOpenChange={vi.fn()}
-          onConfirm={vi.fn()}
-          {...props}
-          context={context}
-        />
-      </CapabilitiesProvider>
+      <ImportContextModal
+        open={true}
+        onOpenChange={vi.fn()}
+        onConfirm={vi.fn()}
+        {...props}
+        context={context}
+      />
       <LocationProbe />
     </MemoryRouter>,
   );
@@ -99,7 +94,7 @@ describe("ImportContextModal – harness tabs", () => {
   it("shows the credential line and read-only asset lists with details", () => {
     renderModal();
 
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
     expect(screen.getAllByText("Detected")).toHaveLength(1);
     expect(assetTabNames()).toEqual(["MCPs 5", "Skills 10", "Plugins 3"]);
 
@@ -191,7 +186,7 @@ describe("ImportContextModal – empty states", () => {
     renderModal({ ...MOCK_IMPORT_CONTEXT, mcps: [], skills: [], plugins: [] });
 
     expect(harnessTabs()).toHaveLength(3);
-    expect(screen.getByText("Databricks AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Databricks Unity Gateway")).toBeTruthy();
     expect(screen.getByText("No MCPs, skills, or plugins detected")).toBeTruthy();
     expect(assetTabNames()).toEqual([]);
   });
@@ -205,14 +200,10 @@ describe("ImportContextModal – empty states", () => {
 });
 
 describe("ImportContextModal – closing", () => {
-  it("opens Harnesses and dismisses without confirming on See more when enabled", () => {
+  it("opens Harnesses and dismisses without confirming on See more", () => {
     const onConfirm = vi.fn();
     const onOpenChange = vi.fn();
-    renderModal(
-      MOCK_IMPORT_CONTEXT,
-      { onConfirm, onOpenChange },
-      { ...FALLBACK_SERVER_INFO, features: { harness_settings_ui: true } },
-    );
+    renderModal(MOCK_IMPORT_CONTEXT, { onConfirm, onOpenChange });
 
     const seeMore = screen.getByRole("link", { name: "See more" });
     expect(seeMore.getAttribute("href")).toBe("/settings/harnesses");
@@ -223,24 +214,6 @@ describe("ImportContextModal – closing", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(onConfirm).not.toHaveBeenCalled();
   });
-
-  it.each([false, undefined, "loading"] as const)(
-    "hides See more when the feature is %s",
-    (enabled) => {
-      renderModal(
-        MOCK_IMPORT_CONTEXT,
-        {},
-        enabled === "loading"
-          ? "loading"
-          : {
-              ...FALLBACK_SERVER_INFO,
-              features: enabled === undefined ? {} : { harness_settings_ui: enabled },
-            },
-      );
-      expect(screen.queryByRole("link", { name: "See more" })).toBeNull();
-      expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
-    },
-  );
 
   it("confirms and closes on Confirm", () => {
     const onConfirm = vi.fn();

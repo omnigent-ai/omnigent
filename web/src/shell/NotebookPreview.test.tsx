@@ -104,6 +104,40 @@ describe("NotebookPreview — typical notebook", () => {
   });
 });
 
+describe("NotebookPreview — markdown links", () => {
+  it("opens URLs outside the app window", () => {
+    // Same rule as the Markdown preview: a same-window URL navigates the app
+    // itself off its server.
+    const notebook = {
+      nbformat: 4,
+      nbformat_minor: 5,
+      metadata: {},
+      cells: [
+        {
+          cell_type: "markdown",
+          metadata: {},
+          source: "[docs](https://example.com/docs), [plan](plan.md) and [below](#usage)",
+        },
+      ],
+    };
+    render(<NotebookPreview content={JSON.stringify(notebook)} />);
+
+    const link = screen.getByText("docs");
+    expect(link.getAttribute("href")).toBe("https://example.com/docs");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    // Only URLs open outside the app window; relative and in-page links are unchanged.
+    for (const [text, href] of [
+      ["plan", "plan.md"],
+      ["below", "#usage"],
+    ]) {
+      const unchanged = screen.getByText(text);
+      expect(unchanged.getAttribute("href")).toBe(href);
+      expect(unchanged.getAttribute("target")).toBeNull();
+    }
+  });
+});
+
 describe("NotebookPreview — edge cases", () => {
   it("renders error tracebacks (ANSI codes handled, not shown raw)", () => {
     const { container } = render(<NotebookPreview content={edgecasesRaw} />);

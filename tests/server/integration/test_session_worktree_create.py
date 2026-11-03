@@ -22,8 +22,10 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostLaunchRunnerFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
@@ -61,6 +63,7 @@ class _HostCapture:
 
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    launches: list[HostLaunchRunnerFrame] = field(default_factory=list)
 
 
 # Factory yielded by the ``register_worktree_host`` fixture:
@@ -97,12 +100,18 @@ async def register_worktree_host(
         create_status: str = "ok",
         create_error: str | None = None,
         workspace: str | None = None,
+        capabilities: list[str] | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
-            hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
+            hello=HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="wt-host",
+                capabilities=HOST_CAPABILITIES if capabilities is None else capabilities,
+            ),
             owner=RESERVED_USER_LOCAL,
         )
         cap = _HostCapture()
@@ -113,7 +122,7 @@ async def register_worktree_host(
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
                     return
-                frame = decode_host_frame(frame_text)
+                frame = decode_host_frame(frame_text.data)
                 if isinstance(frame, HostStatFrame):
                     fut = conn.pending_stats.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
@@ -155,6 +164,11 @@ async def register_worktree_host(
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
+                elif isinstance(frame, HostLaunchRunnerFrame):
+                    cap.launches.append(frame)
+                    fut = conn.pending_launches.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result({"status": "launched", "error": None})
 
         conn._drain_task_for_test = asyncio.create_task(_drain())  # type: ignore[attr-defined]
         conns.append(conn)
@@ -284,9 +298,12 @@ async def test_create_with_invalid_base_branch_fails_400(
     assert "base branch does not exist" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("select_registry", [False, True])
 async def test_create_with_existing_worktree_persists_without_creating(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
+    select_registry: bool,
 ) -> None:
     """Starting in an existing worktree persists its branch, creates nothing.
 
@@ -297,6 +314,23 @@ async def test_create_with_existing_worktree_persists_without_creating(
     """
     cap = register_worktree_host()
     agent = await create_test_agent(client, name="wt-existing-agent")
+    if select_registry:
+        from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+
+        app.state.mcp_registry = McpRegistry(
+            McpRegistryConfig(
+                services=[
+                    McpService(
+                        id="tracker",
+                        title="Tracker",
+                        url="https://example.test/mcp",
+                        auth="none",
+                        tools=["read_ticket"],
+                    )
+                ]
+            ),
+            None,
+        )
 
     resp = await client.post(
         "/v1/sessions",
@@ -305,6 +339,7 @@ async def test_create_with_existing_worktree_persists_without_creating(
             "host_id": _HOST_ID,
             "workspace": _SOURCE_REPO,
             "git": {"branch_name": "feature/existing", "existing_worktree": True},
+            **({"mcp_registry_services": ["tracker"]} if select_registry else {}),
         },
     )
     assert resp.status_code == 201, resp.text
@@ -315,8 +350,15 @@ async def test_create_with_existing_worktree_persists_without_creating(
     # The existing worktree's branch is persisted; the workspace is the
     # supplied directory verbatim (no worktree-path rewrite).
     body = resp.json()
+    assert body["agent_id"] == agent["id"]
     assert body["git_branch"] == "feature/existing"
     assert body["workspace"] == _SOURCE_REPO
+    if select_registry:
+        assert body["labels"]["omnigent.mcp_service.tracker"] == "1"
+        selected = await client.get(f"/v1/sessions/{body['id']}/agent")
+        assert selected.status_code == 200, selected.text
+        assert selected.json()["mcp_servers"][0]["name"] == "tracker"
+        assert selected.json()["mcp_servers"][0]["url"] is None
 
 
 async def test_create_with_invalid_existing_worktree_branch_fails_400(
@@ -524,3 +566,74 @@ async def test_create_rejects_forged_worktree_identity(
         json={"agent_id": agent["id"], "labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}},
     )
     assert response.status_code == 400, response.text
+
+
+async def test_registry_create_persists_overrides_and_worktree_atomically(
+    register_worktree_host, client, app, monkeypatch
+):
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    app.state.mcp_registry = McpRegistry(
+        McpRegistryConfig(
+            services=[
+                McpService(
+                    id="tracker",
+                    title="Tracker",
+                    url="https://example.test/mcp",
+                    auth="none",
+                    tools=["read_ticket"],
+                )
+            ]
+        ),
+        None,
+    )
+    cap = register_worktree_host()
+    agent = await create_test_agent(client, name="registry-worktree-atomic")
+    persisted = []
+    original_create = SqlAlchemyConversationStore.create_conversation
+
+    def capture(self, **kwargs):
+        result = original_create(self, **kwargs)
+        persisted.append((kwargs, self.get_conversation(result.id)))
+        return result
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", capture)
+    overrides = {
+        "cost_control_mode_override": "off",
+        "subagent_routing_override": "off",
+        "harness_override": "openai-agents",
+    }
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/registry"},
+            "mcp_registry_services": ["tracker"],
+            **overrides,
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert len(cap.create) == len(persisted) == 1
+    assert not cap.remove
+    initial, stored = persisted[0]
+    assert stored.id == response.json()["id"]
+    workspace = f"{_SOURCE_REPO}-worktrees/feature-registry"
+    for key, value in {
+        "agent_id": agent["id"],
+        "host_id": _HOST_ID,
+        "workspace": workspace,
+        "git_branch": "feature/registry",
+        **overrides,
+    }.items():
+        assert initial[key] == value
+        assert getattr(stored, key) == value
+    assert initial["labels"] == stored.labels
+    assert stored.labels["omnigent.mcp_service.tracker"] == "1"
+    assert stored.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(workspace)

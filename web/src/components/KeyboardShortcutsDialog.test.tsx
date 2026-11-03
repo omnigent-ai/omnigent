@@ -13,6 +13,18 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPr
 const isNativeShell = vi.fn(() => false);
 const isElectronShell = vi.fn(() => false);
 const supportsBrowser = vi.fn(() => false);
+const contentSearchEnabled = vi.fn(() => false);
+const gridsEnabled = vi.fn(() => false);
+const splitTerminalEnabled = vi.fn(() => false);
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({
+    features: {
+      workspace_content_search: contentSearchEnabled(),
+      grid_sessions_display_ui: gridsEnabled(),
+      splittable_terminal_view_ui: splitTerminalEnabled(),
+    },
+  }),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
   isElectronShell: () => isElectronShell(),
@@ -26,6 +38,9 @@ beforeEach(() => {
   isNativeShell.mockReturnValue(false);
   isElectronShell.mockReturnValue(false);
   supportsBrowser.mockReturnValue(false);
+  contentSearchEnabled.mockReturnValue(false);
+  gridsEnabled.mockReturnValue(false);
+  splitTerminalEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -46,11 +61,12 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
@@ -80,15 +96,49 @@ describe("KeyboardShortcutsList settings layout", () => {
 
     const heading = screen.getByRole("heading", { name: "General" });
     const list = heading.closest("section")?.querySelector("ul");
+    expect(heading.closest("section")?.parentElement).toHaveClass("gap-10");
     expect(heading).toHaveClass("text-ui", "text-foreground");
     expect(list).toHaveClass("rounded-xl", "border-border", "bg-card");
   });
 });
 
 describe("KeyboardShortcutsDialog", () => {
+  it("shows the workspace search shortcut only when the feature is enabled", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Search workspace contents")).toBeNull();
+    expect(keysFor("Select a workspace tab")).toContain("1…4");
+    contentSearchEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Search workspace contents")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Select a workspace tab")).toContain("1…5");
+  });
+
+  it("shows pane shortcuts only for the enabled grid and split-terminal features", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Panes")).toBeNull();
+    gridsEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Focus next pane")).toEqual(["Ctrl", "Alt", "⇧", "]"]);
+    expect(screen.queryByText("Split terminal right")).toBeNull();
+    gridsEnabled.mockReturnValue(false);
+    splitTerminalEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Focus previous pane")).toEqual(["Ctrl", "Alt", "⇧", "["]);
+    expect(keysFor("Split terminal right")).toEqual(["Ctrl", "Alt", "⇧", "\\"]);
+    expect(keysFor("Split terminal down")).toEqual(["Ctrl", "Alt", "-"]);
+  });
+
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+  });
+
+  it("keeps native new-session keys and updates the Settings reference", () => {
+    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
+    isNativeShell.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
   });
 
   it("renders nothing until opened", () => {
@@ -103,12 +153,14 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
     expect(screen.getByText("Start a new session")).toBeTruthy();
-    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
+    expect(keysFor("Rename current session")).toEqual(["Ctrl", "Alt", "R"]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
+    expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);

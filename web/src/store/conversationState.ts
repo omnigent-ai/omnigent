@@ -15,6 +15,7 @@ import type { ConversationState } from "./chatStore";
 const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   blocks: true,
   pendingUserMessages: true,
+  settledShellInputs: true,
   activeResponse: true,
   interruptedResponseIds: true,
   status: true,
@@ -54,6 +55,8 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   terminalPending: true,
   viewers: true,
   sandboxStatus: true,
+  sandboxActionDismissed: true,
+  startupPending: true,
   mcpStartup: true,
   mcpStartupLaunch: true,
   btwSidechat: true,
@@ -82,6 +85,7 @@ export function createInitialConversationState(): ConversationState {
   return {
     blocks: [],
     pendingUserMessages: [],
+    settledShellInputs: [],
     activeResponse: null,
     interruptedResponseIds: [],
     status: "idle",
@@ -121,6 +125,8 @@ export function createInitialConversationState(): ConversationState {
     terminalPending: false,
     viewers: [],
     sandboxStatus: null,
+    sandboxActionDismissed: null,
+    startupPending: false,
     mcpStartup: null,
     mcpStartupLaunch: { pending: false, dismissed: false },
     btwSidechat: null,

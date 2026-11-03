@@ -72,6 +72,36 @@ def message_item(
     }
 
 
+def tool_call_items(
+    call_id: str,
+    name: str,
+    arguments: Mapping[str, Any],
+    output: str,
+    *,
+    response_id: str,
+) -> list[dict[str, Any]]:
+    """Build one persisted tool call and its output, oldest first."""
+    return [
+        {
+            "id": f"{call_id}-call",
+            "response_id": response_id,
+            "type": "function_call",
+            "status": "completed",
+            "name": name,
+            "arguments": json.dumps(dict(arguments)),
+            "call_id": call_id,
+        },
+        {
+            "id": f"{call_id}-output",
+            "response_id": response_id,
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": call_id,
+            "output": output,
+        },
+    ]
+
+
 def transcript_items(turns: int) -> list[dict[str, Any]]:
     """Build newest-first history with markdown and fenced code in every turn."""
     chronological: list[dict[str, Any]] = []
@@ -281,6 +311,10 @@ class ChatSessionContract:
     def update_session(self, **fields: Any) -> None:
         """Merge wire fields into subsequent mocked session snapshots."""
         self._session_updates.update(fields)
+
+    def session_snapshot(self) -> dict[str, Any]:
+        """Return a fresh wire snapshot for route overrides."""
+        return self._session()
 
     def set_health(self, **fields: Any) -> None:
         """Override per-session fields returned by the health endpoint."""
@@ -520,6 +554,12 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             {"error": {"message": "No browser-contract environment"}},
             status=404,
         )
+    # This ordinary host has no canonical Arca machine labels.
+    contract.json(
+        f"{session_api}/resources/environments/default/filesystem/etc/metric_proxy/labels/default?base=host",
+        {"detail": "File not found"},
+        status=404,
+    )
     contract.json(
         "/health",
         lambda _request: handle._health(),
@@ -653,11 +693,15 @@ def _multipart_file_metadata(request: Mapping[str, Any]) -> tuple[str, int]:
 def chat_session_handle(
     page: Page,
     browser_contract: BrowserContract,
+    *,
+    session_id: str = DEFAULT_SESSION_ID,
 ) -> Iterator[ChatSessionContract]:
     """Create, install, and clean up a reusable chat contract handle."""
     stream = _ChatSseStream()
     try:
-        handle = ChatSessionContract(page=page, contract=browser_contract, stream=stream)
+        handle = ChatSessionContract(
+            page=page, contract=browser_contract, stream=stream, session_id=session_id
+        )
         install_chat_session_routes(handle)
         yield handle
     finally:

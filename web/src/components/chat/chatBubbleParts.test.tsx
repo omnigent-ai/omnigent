@@ -4,6 +4,7 @@ import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
@@ -90,6 +91,72 @@ describe("Mermaid diagram width", () => {
   });
 });
 
+describe("AssistantBubble fork source", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_side_reply",
+    stableId: "side_reply",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "side_text", text: "Side reply", final: true }],
+  };
+
+  it("disables the message fork without hiding its explanation", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider
+          value={{
+            canFork: true,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <BubbleView bubble={bubble} isLastAssistant={false} />
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+    const fork = screen.getByTestId("fork-from-response");
+    expect(fork).toBeDisabled();
+    expect(fork.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork.parentElement!, { key: "Enter" });
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "side chat",
+      scope: "conv_side_child",
+      expected: {
+        sourceSessionId: "conv_side_child",
+        upToResponseId: "resp_side_reply",
+      },
+    },
+    {
+      name: "main chat",
+      scope: null,
+      expected: { sourceSessionId: undefined, upToResponseId: "resp_side_reply" },
+    },
+  ])("opens from the $name session", ({ scope, expected }) => {
+    const openForkDialog = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} isLastAssistant={false} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("fork-from-response"));
+
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(openForkDialog).toHaveBeenCalledWith(expected);
+  });
+});
+
 describe("message navigation highlight", () => {
   const text = "Highlight only this message content";
   const messageId = "highlight_target";
@@ -144,6 +211,27 @@ describe("message navigation highlight", () => {
 });
 
 describe("UserBubble literal text", () => {
+  it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
+    "keeps indented bullets as siblings after stripping %j",
+    (preamble) => {
+      render(
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_list",
+            content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
+          }}
+          isLastAssistant={false}
+        />,
+      );
+
+      expect(screen.getAllByRole("list")).toHaveLength(1);
+      const items = screen.getAllByRole("listitem");
+      expect(items).toHaveLength(2);
+      expect(items[0].parentElement).toBe(items[1].parentElement);
+    },
+  );
+
   it.each([
     [
       "unfinished placeholder",
@@ -394,6 +482,85 @@ describe("AssistantBubble error retry", () => {
   });
 });
 
+describe("AssistantBubble error-only role", () => {
+  // The reconnect journey counts [data-role="assistant"] bubbles as Claude
+  // replies. An undelivered-message notice is a standalone error item with no
+  // prose, so it must not carry the assistant role and inflate that count.
+  it("tags an undelivered-message notice as an error bubble, not an assistant reply", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_undelivered",
+            stableId: "undelivered_notice",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              {
+                kind: "error",
+                itemId: "undelivered_notice",
+                message: "Message not delivered. Try sending it again.",
+                source: "runtime",
+                code: "native_prompt_not_recorded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "error");
+    expect(bubble).toHaveTextContent("Message not delivered. Try sending it again.");
+  });
+
+  it.each<{ name: string; nonError: Extract<Bubble, { kind: "assistant" }>["items"][number] }>([
+    {
+      name: "a prose reply carrying a trailing error",
+      nonError: { kind: "text", itemId: "reply_text", text: "the answer is 42", final: true },
+    },
+    {
+      name: "a failed turn with reasoning but no prose",
+      nonError: {
+        kind: "reasoning",
+        itemId: "thinking",
+        text: "Weighing the options.",
+        duration: 1,
+      },
+    },
+  ])("keeps $name on the assistant role", ({ nonError }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_mixed_failure",
+            stableId: "mixed_failure",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              nonError,
+              {
+                kind: "error",
+                itemId: "mixed_error",
+                message: "API Error: Request rejected (429): rate limit",
+                source: "execution",
+                code: "rate_limit_exceeded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "assistant");
+  });
+});
+
 describe("AssistantBubble sealed side-chat recovery", () => {
   it("removes recovery actions when the side chat is sealed but keeps the error", () => {
     const view = render(
@@ -445,6 +612,25 @@ describe("AssistantBubble sealed side-chat recovery", () => {
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent("This side chat has ended."),
     );
+  });
+});
+
+describe("UserBubble shell prompts", () => {
+  it("preserves shell syntax and attachment-like text literally", () => {
+    const command = "printf '%s\\n' '**hi**' '[Attached: /tmp/file]' '`pwd`'\necho done";
+    const bubble: Extract<Bubble, { kind: "user" }> = {
+      kind: "user",
+      itemId: "shell-input",
+      content: [{ type: "input_text", text: `!${command}` }],
+      shellCommand: command,
+    };
+    render(<BubbleView bubble={bubble} />);
+
+    const prompt = screen.getByTestId("message-bubble");
+    expect(prompt).toHaveAttribute("data-role", "user");
+    expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
+    expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
+    expect(screen.getByTestId("copy-message-link")).toBeEnabled();
   });
 });
 
@@ -522,5 +708,51 @@ describe("UserBubble long-prompt collapse", () => {
     expect(bubble).not.toHaveTextContent("🔥");
     expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
     expect(bubble).toHaveTextContent("a".repeat(COLLAPSE_THRESHOLD - 1));
+  });
+});
+
+describe("AssistantBubble copy", () => {
+  const MARKDOWN = "## Findings\n\nA **bold** claim and `code`.";
+
+  function assistantBubble(text: string): Extract<Bubble, { kind: "assistant" }> {
+    return {
+      kind: "assistant",
+      responseId: "resp_copy",
+      stableId: "copy_assistant",
+      lifecycle: "completed",
+      error: null,
+      items: [{ kind: "text", itemId: "copy_text", text, final: true }],
+      createdAtS: 1_700_000_000,
+    };
+  }
+
+  it("offers rendered HTML alongside the markdown so a rich-text paste keeps formatting", async () => {
+    const write = vi.fn().mockResolvedValue(undefined);
+    class FakeClipboardItem {
+      items: Record<string, Blob>;
+
+      constructor(items: Record<string, Blob>) {
+        this.items = items;
+      }
+    }
+
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    vi.stubGlobal("navigator", { clipboard: { write } });
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={assistantBubble(MARKDOWN)} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^copy$/i }));
+
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+
+    const [item] = write.mock.calls[0][0] as FakeClipboardItem[];
+    expect(await item.items["text/plain"].text()).toBe(MARKDOWN);
+    expect(await item.items["text/html"].text()).toBe(
+      "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
+    );
   });
 });

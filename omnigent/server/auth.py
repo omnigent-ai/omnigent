@@ -72,6 +72,7 @@ _DELEGATED_ALLOWED_PREFIXES = (
     "/v1/agents",
     "/v1/hosts",
     "/v1/sessions",
+    "/v1/mcp",
     "/v1/skills",
     "/v1/runners",
     "/oauth/token",
@@ -770,6 +771,15 @@ class UnifiedAuthProvider(AuthProvider):
         if self._local_single_user:
             return RESERVED_USER_LOCAL
         return None
+
+
+def authentication_requires_identity(provider: AuthProvider | None) -> bool:
+    """Whether missing credentials are denied rather than mapped to the local user."""
+    return provider is not None and not (
+        isinstance(provider, UnifiedAuthProvider)
+        and provider._source == "header"
+        and provider._local_single_user
+    )
 
 
 def auth_mode(provider: AuthProvider | None) -> str:

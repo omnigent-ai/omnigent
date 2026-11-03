@@ -150,6 +150,29 @@ final class AppDeviceSupportTests: XCTestCase {
   }
 }
 
+final class OmnigentEndpointTests: XCTestCase {
+  func testAppendsRouteUnderTheServerMount() {
+    let cases: [(String, String, String)] = [
+      ("https://h/omnigent/", "/auth/login", "https://h/omnigent/auth/login"),
+      ("https://h/omnigent", "/auth/login", "https://h/omnigent/auth/login"),
+      ("https://h/omnigent///", "/v1/me", "https://h/omnigent/v1/me"),
+      ("https://h", "/v1/me", "https://h/v1/me"),
+      ("https://h/", "/v1/me", "https://h/v1/me"),
+      ("http://localhost:6767", "/oauth/token", "http://localhost:6767/oauth/token"),
+      ("https://h:8443/a/b?o=1#frag", "/auth/logout", "https://h:8443/a/b/auth/logout"),
+      ("https://h/my%20mount/", "/v1/me", "https://h/my%20mount/v1/me"),
+    ]
+    for (server, route, expected) in cases {
+      XCTAssertEqual(
+        URL(string: server)!.omnigentEndpoint(route)?.absoluteString, expected, server)
+    }
+  }
+
+  func testRejectsRelativeRoute() {
+    XCTAssertNil(URL(string: "https://h/omnigent")!.omnigentEndpoint("auth/login"))
+  }
+}
+
 final class AppPrivacyInfoTests: XCTestCase {
   func testPrivacyUsageDescriptionsArePresent() throws {
     for key in [

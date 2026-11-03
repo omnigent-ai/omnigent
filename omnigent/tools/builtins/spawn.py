@@ -16,7 +16,6 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
 )
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -540,11 +539,14 @@ class SysSessionListTool(Tool):
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
-            "you can access, each with status + runner connectivity, "
-            "for orchestration (inspect via sys_agent_get / "
-            "sys_session_get_info, or drive via sys_session_send by "
-            "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "you can access, each with status, runner connectivity and "
+            "created_by_session_id (creation origin for independent workers). "
+            "Match that field to your session ID to find workers you created. "
+            "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
+            "for children or sys_session_message for independent sessions. "
+            "Pass agent_name to filter the global list to "
+            "sessions running that agent, and include_archived to also list "
+            "archived sessions (marked archived). Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -574,6 +576,14 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: also list archived sessions in the "
+                                "global 'sessions' view; each row then carries "
+                                "'archived'. Defaults to false."
                             ),
                         },
                         "limit": {
@@ -745,7 +755,7 @@ class SysSessionShareTool(Tool):
     (:class:`omnigent.spec.types.SharePolicy`), which is its sole gate:
     ``none`` leaves the tool unregistered, ``non-public`` allows
     granting named users, and ``public`` additionally allows the
-    ``__public__`` sentinel (anonymous read of the full transcript).
+    ``__public__`` sentinel (link access subject to server authentication).
     ``allow_public`` carries that last tier into the tool so it can
     both advertise and refuse public grants when the policy is
     ``non-public``.
@@ -753,9 +763,9 @@ class SysSessionShareTool(Tool):
     ``session_id`` is optional — when omitted, the caller's own session
     is shared, which is the common case ("share this session with X").
     ``user_id`` is the grantee's email, or (when ``allow_public``) the
-    sentinel ``"__public__"`` for anonymous read-only access. ``level``
+    sentinel ``"__public__"`` for link access. ``level``
     is ``"read"`` (default), ``"edit"``, or ``"manage"``; the server
-    caps public grants at read.
+    caps public grants at its configured maximum (read by default, optionally edit).
 
     Runner-dispatched: the runner proxies ``PUT
     /v1/sessions/{id}/permissions`` using its authenticated server
@@ -811,13 +821,13 @@ class SysSessionShareTool(Tool):
         if self._allow_public:
             user_id_desc = (
                 "Grantee's email, e.g. 'alice@example.com', or the "
-                "sentinel '__public__' for anonymous read-only access "
-                "(anyone with the link)."
+                "sentinel '__public__' for anyone with the link who can sign in. "
+                "Public grants are capped at read unless the server permits edit."
             )
         else:
             user_id_desc = (
                 "Grantee's email, e.g. 'alice@example.com'. "
-                "Public/anonymous sharing is not enabled for this agent."
+                "Public link sharing is not enabled for this agent."
             )
         return {
             "type": "function",
@@ -858,7 +868,7 @@ class SysSessionShareTool(Tool):
 
 class SysSessionCreateTool(Tool):
     """
-    Create a child session from an existing agent or a local bundle.
+    Create a session from an existing agent or a local bundle.
 
     The child is a separate Omnigent agent session — its own
     conversation, visible in the session tree, optionally a different
@@ -866,11 +876,10 @@ class SysSessionCreateTool(Tool):
     subagent/Task tool (which remains the right choice for quick
     in-context helpers).
 
-    A **child-only write**: the new session's ``parent_session_id`` is
-    forced to the caller's own session, so an orchestrator can only spawn
-    sessions inside its own subtree — never a top-level or sibling
-    session. The child inherits the caller's runner (co-location), so it
-    starts executing as soon as a message is queued.
+    The default placement forces ``parent_session_id`` to the caller.
+    A child inherits the caller's runner and starts when a message is queued.
+    With ``agent_id``, independent placements use the server's orchestration
+    gate and create private top-level sessions without completion forwarding.
 
     Two addressing modes — exactly one of ``agent_id`` or
     ``config_path`` must be given:
@@ -888,16 +897,13 @@ class SysSessionCreateTool(Tool):
       proxies the multipart ``POST /v1/sessions`` create, registering
       a fresh session-scoped agent.
 
-    An optional ``message`` is queued as the child's first user turn;
+    An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``. The
     session runs asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it, or ``sys_session_send`` (with
-    the returned ``conversation_id``) to drive it further.
-
-    Runner-dispatched: both modes force ``parent_session_id`` to the
-    caller.
+    ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
+    further child work and ``sys_session_message`` for independent sessions.
     """
 
     @classmethod
@@ -909,7 +915,7 @@ class SysSessionCreateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Create a child session from an agent. This launches a "
+            "Create a session from an agent. This launches a "
             "separate Omnigent agent session — its own conversation, "
             "visible in the session tree, optionally a different "
             "registered agent. It is not your harness's built-in "
@@ -926,12 +932,21 @@ class SysSessionCreateTool(Tool):
             "with sys_os_write) and launches it. Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
-            "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
+            "message. By default the new session is a child of the caller. "
+            "With agent_id, placement='same_host' creates an independent private session "
+            "on the caller's host/workspace; placement='managed' provisions a new sandbox "
+            "using the server's configured default provider. Managed creation requires a "
+            "configured sandbox provider; use same_host for an existing connected host. "
+            "These placements require orchestration enabled "
+            "and a private sending session, including its side-chat source chain. "
+            "An independent worker's optional "
+            "first message must contain 1–8000 characters. "
+            "Independent sessions do not forward replies: "
+            "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send."
+            "with sys_session_send for children or sys_session_message for independent sessions."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -952,6 +967,30 @@ class SysSessionCreateTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "placement": {
+                            "type": "string",
+                            "enum": ["child", "same_host", "managed"],
+                            "description": (
+                                "Default child; same_host or managed launches a private "
+                                "top-level session (agent_id only)."
+                            ),
+                        },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": "Optional provider for placement='managed'.",
+                        },
+                        "sandbox_profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Authorized profile ID for placement='managed', required by "
+                                "providers that manage profiles. Use a selection supplied by "
+                                "the user or discovered through GET /v1/sandbox-profiles."
+                            ),
+                        },
+                        "sandbox_profile_revision": {
+                            "type": "string",
+                            "description": "Expected catalog revision of sandbox_profile_id.",
+                        },
                         "agent_id": {
                             "type": "string",
                             "description": (
@@ -1660,6 +1699,9 @@ class SysSessionGetHistoryTool(Tool):
             )
             for item in reversed(page.data)
         ]
+        # The server's pending index imports ORM models for workspace scoping.
+        from omnigent.runtime import pending_elicitations
+
         # A parked elicitation never lands in the conversation store
         # (it lives only in the pending-elicitations index), so without
         # this a peek on a sub-agent blocked on AskUserQuestion would

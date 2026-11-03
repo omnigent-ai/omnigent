@@ -44,6 +44,12 @@ from omnigent.stores.permission_store import PermissionStore
 _LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
 
 
+def _require_persisted_session_id(conversation_id: str) -> None:
+    """Keep client-only new-chat route IDs out of backing stores."""
+    if conversation_id.startswith("temp:"):
+        raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+
+
 def get_user_id(
     request: Request,
     auth_provider: AuthProvider | None,
@@ -120,6 +126,7 @@ def _require_access_sync(
     :raises OmnigentError: 403 if insufficient level, 404 if no
         access at all.
     """
+    _require_persisted_session_id(conversation_id)
     if permission_store is None:
         return
     if user_id is None:
@@ -270,8 +277,8 @@ def _require_access_and_level_sync(
     reused for both the sub-agent parent check and the snapshot.
 
     Behaviour is identical to calling ``require_access`` followed by
-    ``get_permission_level``: the displayed level is the caller's direct
-    grant (no parent walk), while the access decision walks sub-agent
+    ``get_permission_level``: the displayed level combines direct and capped
+    public grants (no parent walk), while the access decision walks sub-agent
     parents and yields 403 vs 404 the same way.
 
     :param user_id: The authenticated user, or ``None`` to skip.
@@ -285,6 +292,7 @@ def _require_access_and_level_sync(
     :raises OmnigentError: 401 unauthenticated, 403 insufficient level,
         404 no access at all / conversation not found.
     """
+    _require_persisted_session_id(conversation_id)
     if permission_store is None:
         return SessionAccess(level=None, conversation=None)
     if user_id is None:
@@ -300,8 +308,7 @@ def _require_access_and_level_sync(
     # ``pool_pre_ping`` — is the cost that matters.
     with shared_read_scope():
         # Single round-trip: admin flag + the user's and public grants on the
-        # conversation the caller asked about. The displayed level is the direct
-        # grant (no parent walk), matching get_permission_level exactly.
+        # conversation the caller asked about, without a parent walk for display.
         access = permission_store.resolve_access(user_id, conversation_id)
         level = resolved_level(access)
 

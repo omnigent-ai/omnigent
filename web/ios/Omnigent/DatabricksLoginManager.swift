@@ -2,46 +2,23 @@ import AuthenticationServices
 import Foundation
 
 @MainActor
-protocol DatabricksAuthenticationSession: AnyObject {
-  func start() -> Bool
-  func cancel()
-}
-
-extension ASWebAuthenticationSession: DatabricksAuthenticationSession {}
-
-@MainActor
 final class DatabricksLoginManager {
-  typealias SessionFactory = (
-    URL, ASWebAuthenticationSession.Callback, ASWebAuthenticationPresentationContextProviding,
-    @escaping ASWebAuthenticationSession.CompletionHandler
-  ) -> any DatabricksAuthenticationSession
-
   private let client: DatabricksOAuthClient
   private let tokenManager: DatabricksTokenManager
-  private let makeSession: SessionFactory
+  private let browser: WebAuthenticationBrowser
   private var activeID: UUID?
   private var operation: Task<DatabricksOAuthTokens, Error>?
-  private var browser: (any DatabricksAuthenticationSession)?
-  private var presentationContext: DatabricksPresentationContext?
-  private var callbackContinuation: CheckedContinuation<URL, Error>?
 
   var isInFlight: Bool { activeID != nil }
 
   init(
     client: DatabricksOAuthClient = DatabricksOAuthClient(),
     tokenManager: DatabricksTokenManager = .shared,
-    sessionFactory: SessionFactory? = nil
+    sessionFactory: WebAuthenticationBrowser.SessionFactory? = nil
   ) {
     self.client = client
     self.tokenManager = tokenManager
-    makeSession =
-      sessionFactory ?? { url, callback, provider, completion in
-        let session = ASWebAuthenticationSession(
-          url: url, callback: callback, completionHandler: completion)
-        session.presentationContextProvider = provider
-        session.prefersEphemeralWebBrowserSession = false
-        return session
-      }
+    browser = WebAuthenticationBrowser(sessionFactory: sessionFactory)
   }
 
   func signIn(
@@ -92,40 +69,18 @@ final class DatabricksLoginManager {
   ) async throws -> URL {
     try Task.checkCancellation()
     guard activeID == id else { throw CancellationError() }
-    return try await withCheckedThrowingContinuation { continuation in
-      let context = DatabricksPresentationContext(anchor: anchor)
-      presentationContext = context
-      callbackContinuation = continuation
-      let redirect = attempt.configuration.redirectURL
-      let browser = makeSession(
-        attempt.authorizationURL, .https(host: redirect.host!, path: redirect.path), context
-      ) { [weak self] url, error in
-        Task { @MainActor in self?.completeBrowser(id: id, url: url, error: error) }
+    let redirect = attempt.configuration.redirectURL
+    do {
+      return try await browser.callbackURL(
+        for: attempt.authorizationURL, callback: .https(host: redirect.host!, path: redirect.path),
+        anchor: anchor)
+    } catch let error as WebAuthenticationBrowserError {
+      switch error {
+      case .inProgress: throw DatabricksOAuthError.loginInProgress
+      case .unavailable: throw DatabricksOAuthError.browserUnavailable
+      case .failed: throw DatabricksOAuthError.authenticationFailed
+      case .missingCallback: throw DatabricksOAuthError.invalidCallback
       }
-      self.browser = browser
-      if !browser.start() {
-        callbackContinuation = nil
-        continuation.resume(throwing: DatabricksOAuthError.browserUnavailable)
-      }
-    }
-  }
-
-  private func completeBrowser(id: UUID, url: URL?, error: Error?) {
-    guard activeID == id, let continuation = callbackContinuation else { return }
-    callbackContinuation = nil
-    if let error {
-      let error = error as NSError
-      if error.domain == ASWebAuthenticationSessionErrorDomain,
-        error.code == ASWebAuthenticationSessionError.Code.canceledLogin.rawValue
-      {
-        continuation.resume(throwing: CancellationError())
-      } else {
-        continuation.resume(throwing: DatabricksOAuthError.authenticationFailed)
-      }
-    } else if let url {
-      continuation.resume(returning: url)
-    } else {
-      continuation.resume(throwing: DatabricksOAuthError.invalidCallback)
     }
   }
 
@@ -134,28 +89,6 @@ final class DatabricksLoginManager {
     activeID = nil
     operation?.cancel()
     operation = nil
-    let continuation = callbackContinuation
-    callbackContinuation = nil
-    let browser = browser
-    self.browser = nil
-    browser?.cancel()
-    presentationContext = nil
-    // Programmatic browser cancellation need not invoke its completion handler.
-    continuation?.resume(throwing: CancellationError())
-  }
-}
-
-@MainActor
-private final class DatabricksPresentationContext: NSObject,
-  ASWebAuthenticationPresentationContextProviding
-{
-  let anchor: ASPresentationAnchor
-
-  init(anchor: ASPresentationAnchor) {
-    self.anchor = anchor
-  }
-
-  func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-    anchor
+    browser.cancel()
   }
 }

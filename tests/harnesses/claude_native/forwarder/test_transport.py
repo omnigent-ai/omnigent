@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     record_hook_event,
 )
+from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from tests.harnesses.claude_native.forwarder._support import (
     _get_recorded_request,
     _start_recording_server,
@@ -55,6 +58,101 @@ async def test_handback_provenance_is_transported_outside_message_content(candid
     assert "subagent_return_id" not in captured[0]["data"]["item_data"]
     assert "agent_message_candidate" not in captured[0]["data"]["item_data"]
     assert forwarder._external_conversation_item_event(item) == captured[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("character,encoded_bytes", [("x", 1), ("\x00", 6), ("€", 3)])
+async def test_forwarder_caps_tool_output_before_request_body_limit(
+    tmp_path: Path, character: str, encoded_bytes: int
+) -> None:
+    """Oversized tool results reach the server without blocking later transcript items."""
+    output = character * (MAX_SESSION_EVENT_REQUEST_BYTES // encoded_bytes + 1)
+    records = [
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": output}],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "after-tool",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        },
+    ]
+    transcript = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(transcript, encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+    delivered: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        # An early body rejection may close the upload before its HTTP error arrives.
+        if len(request.content) > MAX_SESSION_EVENT_REQUEST_BYTES:
+            raise httpx.ReadError("request body rejected", request=request)
+        delivered.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=forwarder.TranscriptForwardState(
+                transcript_path=transcript_path, line_cursor=0, byte_offset=0
+            ),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert [event["data"]["source_id"] for event in delivered] == [
+        "tool-result:0:function_call_output",
+        "after-tool:0:message",
+    ]
+    assert delivered[0]["data"]["item_data"] == {
+        "call_id": "call-1",
+        "output": cap_tool_output(output),
+    }
+    assert "output truncated by omnigent" in delivered[0]["data"]["item_data"]["output"]
+    assert delivered[1]["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "done"}
+    ]
+    assert state.byte_offset == len(transcript.encode("utf-8"))
+    assert forwarder._read_forward_state(bridge_dir) == state
+    assert not (bridge_dir / "dead_letter.jsonl").exists()
+    assert transcript_path.read_text(encoding="utf-8") == transcript
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["small", None, {"content": "structured"}])
+async def test_tool_output_upload_preserves_uncapped_data(output: object) -> None:
+    """Small output and malformed non-string values retain their existing wire shape."""
+    data = {"call_id": "call-1", "output": output}
+    item = ClaudeTranscriptItem(
+        source_id="tool-result",
+        item_type="function_call_output",
+        data=data,
+        response_id="turn-1",
+        subagent_return_id="child-1",
+    )
+    captured: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await forwarder._post_external_conversation_item(client, session_id="parent", item=item)
+    assert captured == [forwarder._external_conversation_item_event(item)]
+    assert item.data is data
+    assert item.data["output"] == output
 
 
 class _CountingAuth(httpx.Auth):
@@ -217,8 +315,24 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "response_body", "rejection_reason"),
+    [
+        (
+            422,
+            {"detail": "event batch exceeds count or size limit"},
+            "event batch exceeds count or size limit",
+        ),
+        (400, {"detail": "invalid_input"}, "invalid_input"),
+        (422, {"detail": [{"input": "private transcript content"}]}, None),
+        (422, {"detail": "private transcript content"}, None),
+    ],
+)
 async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     tmp_path: Path,
+    status_code: int,
+    response_body: dict[str, Any],
+    rejection_reason: str | None,
 ) -> None:
     """
     Permanent item rejections eventually advance the transcript cursor.
@@ -266,7 +380,7 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         assert isinstance(payload, dict)
         requests.append(payload)
         if payload["type"] == "external_conversation_item":
-            return httpx.Response(422, json={"error": "bad item"})
+            return httpx.Response(status_code, json=response_body)
         return httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
@@ -306,6 +420,12 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     context = requests[-1]["data"].pop("failure_context")
     assert context["failure_source"] == "forwarder_delivery"
     assert context["detail_source"] == "forwarder_delivery_error"
+    assert context["http_status"] == status_code
+    assert context.get("forwarder_rejection_reason") == rejection_reason
+    attributes = forwarder.failure_log_attributes(context)
+    assert attributes["http_status"] == str(status_code)
+    assert attributes.get("forwarder_rejection_reason") == rejection_reason
+    assert "private transcript content" not in json.dumps(attributes)
     assert context["failure_id"]
     assert "poison-item:0:message" in context["forwarder_source_id"]
     assert requests[-1]["data"] == {
@@ -328,6 +448,147 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     assert record["event_type"] == "external_conversation_item"
     assert record["reason"] == "permanent HTTP failure after retries"
     assert record["payload"]["item_type"] == "message"
+
+
+def _session_not_bound_rows(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    from omnigent.debug_logging import record_to_row
+
+    return [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_forwarder_session_not_bound"
+    ]
+
+
+def _assistant_items_state(path: Path, *uuids: str) -> forwarder.TranscriptForwardState:
+    """Write one assistant record per uuid; return a cursor positioned before them."""
+    path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": uuid,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"private reply {uuid}"}],
+                    },
+                }
+            )
+            for uuid in uuids
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return forwarder.TranscriptForwardState(
+        transcript_path=path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(path, 0),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejection_status", "dropped", "fails_session"),
+    [
+        pytest.param(403, True, False, id="session-left-this-runner"),
+        pytest.param(422, True, True, id="rejected-item"),
+        pytest.param(500, False, False, id="transient-server-error"),
+    ],
+)
+async def test_failed_status_follows_why_an_item_was_not_delivered(
+    tmp_path: Path, rejection_status: int, dropped: bool, fails_session: bool
+) -> None:
+    """
+    Only a rejection of the item itself marks the session failed.
+
+    After a host switch the superseded runner's forwarder keeps posting for a
+    session now bound to another runner; the tunnel answers 403. The item is
+    still dropped, but a failed status would flip the session that is live on
+    its new runner. A 5xx is retried, never dropped.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    state = _assistant_items_state(transcript_path, "item-1")
+    retry_tracker = forwarder._PostRetryTracker(
+        max_permanent_attempts=1, base_delay_s=0.0, max_delay_s=0.0
+    )
+    requests: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload["type"] == "external_conversation_item":
+            return httpx.Response(rejection_status, json={"detail": "rejected"})
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for _ in range(2):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+    statuses = [r["data"]["status"] for r in requests if r["type"] == "external_session_status"]
+    assert statuses == (["failed"] if fails_session else [])
+    assert (state.seen_source_ids == ("item-1:0:message",)) is dropped
+    assert (state.byte_offset == transcript_path.stat().st_size) is dropped
+    assert (bridge_dir / "dead_letter.jsonl").exists() is dropped
+
+
+@pytest.mark.asyncio
+async def test_session_left_runner_is_logged_once_without_item_content(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+    transcript_path = tmp_path / "session.jsonl"
+    state = _assistant_items_state(transcript_path, "item-1", "item-2")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": "forbidden"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(
+                max_permanent_attempts=1, base_delay_s=0.0, max_delay_s=0.0
+            ),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert state.seen_source_ids == ("item-1:0:message", "item-2:0:message")
+    [row] = _session_not_bound_rows(caplog)
+    assert row["level"] == "INFO"
+    assert row["session_id"] == "conv_abc"
+    assert isinstance(row["attributes"], dict)
+    assert row["attributes"]["source_id"] == "item-1:0:message"
+    assert "private" not in json.dumps(row)
+
+
+def test_session_not_bound_notice_repeats_only_for_a_new_session(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+    dedupe = forwarder._ForwardDedupeState()
+    for session_id in ("conv_a", "conv_a", "conv_b"):
+        forwarder._log_session_not_bound_once(
+            dedupe, session_id=session_id, source_id="item-1:0:message"
+        )
+    assert [row["session_id"] for row in _session_not_bound_rows(caplog)] == ["conv_a", "conv_b"]
 
 
 @pytest.mark.asyncio

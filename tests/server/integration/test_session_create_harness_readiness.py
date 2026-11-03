@@ -301,9 +301,6 @@ async def test_nested_parent_readiness_has_bounded_reads(
         host_store=hosts,
         parent=parent,
     )
-    if depth <= 16:
-        with pytest.raises(OmnigentError, match="not configured"):
-            await validation
-    else:
+    with pytest.raises(OmnigentError, match="not configured"):
         await validation
     assert read.call_count == min(depth, 16)

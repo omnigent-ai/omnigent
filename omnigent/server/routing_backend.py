@@ -1,7 +1,7 @@
-"""Which router answers a routing call — the AI Gateway's, or the built-in judge's.
+"""Which router answers a routing call — the Unity Gateway's, or the built-in judge's.
 
 Smart Routing has two possible backends. The external ``task_v1`` client rewrites
-a launch's model to a Databricks AI Gateway catalog id, so it can only serve a
+a launch's model to a Databricks Unity Gateway catalog id, so it can only serve a
 harness whose inference is gateway-backed. The built-in OSS judge
 (:class:`~omnigent.server.smart_routing.LLMRoutingClient`) names models from the
 candidate menu it is handed, so it serves any harness.
@@ -162,7 +162,7 @@ async def route_with_fallback(
         )
     try:
         result = await choice.client.route(message, available_models)
-    except Exception:  # noqa: BLE001 — the judge is the fallback for any failure
+    except Exception:  # the judge is the fallback for any failure
         _logger.warning(
             "routing: the external router raised; falling back to the built-in judge",
             exc_info=True,
@@ -211,7 +211,7 @@ def gateway_backs_all(
     host: Any,  # type: ignore[explicit-any]  # a Host row, or None for a sandbox
     harnesses: Iterable[str],
 ) -> bool:
-    """Whether *host* backs every one of *harnesses* with the workspace AI gateway.
+    """Whether *host* backs every one of *harnesses* with the workspace Unity Gateway.
 
     Unknown reads as backed: a host that reports nothing, an older build, one
     bound to another replica, or none bound at all all land here, and

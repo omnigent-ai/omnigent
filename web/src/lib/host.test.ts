@@ -98,3 +98,28 @@ describe("isDatabricksWorkspace", () => {
     expect(isDatabricksWorkspace()).toBe(true);
   });
 });
+
+describe("isHostRoutingEnabled", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("defaults to disabled for an OSS server", async () => {
+    const { isHostRoutingEnabled } = await import("./host");
+    expect(isHostRoutingEnabled()).toBe(false);
+  });
+
+  it("enables OSS host routing without enabling Databricks behavior", async () => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    const { isHostRoutingEnabled, isDatabricksWorkspace } = await import("./host");
+    expect(isHostRoutingEnabled()).toBe(true);
+    expect(isDatabricksWorkspace()).toBe(false);
+  });
+
+  it("keeps host routing enabled for Databricks", async () => {
+    vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+    const { isHostRoutingEnabled } = await import("./host");
+    expect(isHostRoutingEnabled()).toBe(true);
+  });
+});

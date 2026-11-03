@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Annotated, Any
 
 from fastapi import (
@@ -17,6 +18,7 @@ from fastapi.responses import Response
 
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
@@ -34,10 +36,10 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
@@ -161,12 +163,27 @@ def register_agent_routes(
                 runner_router=runner_router or get_server_runner_router(),
             )
             terminals_override = normalized or None
-        return _to_agent_object(
+        result = _to_agent_object(
             agent,
             agent_cache,
             terminals_override=terminals_override,
             mcp_servers_editable=mcp_servers_editable,
+            mcp_selection=conv.labels,
         )
+        result.mcp_registry_editable = not conv.sub_agent_name and (
+            mcp_servers_editable
+            or permission_store is None
+            or await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+                conversation=conv,
+            )
+        )
+        return result
 
     @router.get(
         "/sessions/{session_id}/agent/contents",
@@ -238,11 +255,21 @@ def register_agent_routes(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        selection_headers = {}
+        if request.headers.get(MCP_SELECTION_HEADER) == "1":
+            selection_headers[MCP_SELECTION_HEADER] = json.dumps(
+                {
+                    key: value
+                    for key, value in conv.labels.items()
+                    if key.startswith(MCP_SELECTION_PREFIX)
+                }
+            )
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
             headers={
                 "Cache-Control": "no-store",
+                **selection_headers,
                 "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
@@ -326,7 +353,7 @@ def register_agent_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:
             raise OmnigentError("spec missing name", code=ErrorCode.INVALID_INPUT)
@@ -338,11 +365,31 @@ def register_agent_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        from omnigent.runner.routing import routing_host_id
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(selected_mcp_spec(spec, conv.labels)),
+            host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
+            runner_id=conv.runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
+        )
         new_loc = bundle_location(agent.id, bundle_bytes)
 
         # Idempotency: same bundle content = no-op
         if new_loc == agent.bundle_location:
-            return _to_agent_object(agent, agent_cache, mcp_servers_editable=True)
+            return _to_agent_object(
+                agent,
+                agent_cache,
+                mcp_servers_editable=True,
+                mcp_selection=conv.labels,
+                mcp_registry_editable=not conv.sub_agent_name,
+            )
 
         if artifact_store is None:
             raise OmnigentError(
@@ -350,7 +397,12 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
+        if agent_store.supports_config_edit:
+            updated = await asyncio.to_thread(
+                agent_store.update, agent.id, new_loc, user_id, description=spec.description
+            )
+        else:
+            updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",
@@ -364,7 +416,13 @@ def register_agent_routes(
                 agent.id, new_loc, bundle_bytes, expand_env=agent.operator_authored
             )
 
-        return _to_agent_object(updated, agent_cache, mcp_servers_editable=True)
+        return _to_agent_object(
+            updated,
+            agent_cache,
+            mcp_servers_editable=True,
+            mcp_selection=conv.labels,
+            mcp_registry_editable=not conv.sub_agent_name,
+        )
 
     # ── POST /sessions/{session_id}/mcp ──────────────────────────────────
     # MCP Streamable HTTP proxy endpoint. Only registered when a
@@ -458,15 +516,42 @@ def register_agent_routes(
             )
 
         if method == "tools/list":
-            return await _handle_mcp_tools_list(
+            response = await _handle_mcp_tools_list(
                 rpc_id,
                 session_id,
                 runner_router,
             )
+            registry = getattr(request.app.state, "mcp_registry", None)
+            if registry is not None and not params.get("_omnigent_skip_registry"):
+                import json
+
+                from omnigent.server.registry_gateway import registry_tools
+                from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+
+                data = json.loads(bytes(response.body))
+                if "error" in data:
+                    return response
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if conv is not None and not conv.archived:
+                    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+                    if spec is not None and any(
+                        c.transport == "registry" for c in spec.mcp_servers
+                    ):
+                        extra = await registry_tools(
+                            registry,
+                            request,
+                            spec,
+                            user_id,
+                        )
+                        tools = data.get("result", {}).get("tools", [])
+                        return _mcp_ok_response(rpc_id, {**data["result"], "tools": tools + extra})
+            return response
 
         if method == "tools/call":
-            _mcp_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            turn_actor = _mcp_conv.labels.get(_TURN_ACTOR_LABEL) if _mcp_conv is not None else None
+            from omnigent.server.mcp_identity import mcp_policy_actor
+
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -474,7 +559,8 @@ def register_agent_routes(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(turn_actor or user_id),
+                actor=actor,
+                credential_user=user_id,
                 request=request,
             )
 

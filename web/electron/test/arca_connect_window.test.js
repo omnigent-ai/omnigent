@@ -3,12 +3,19 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
-const { createArcaConnectFlow } = require("../src/arca_connect_window");
+const {
+  createArcaConnectFlow,
+  CONTENT_WIDTH,
+  MIN_CONTENT_HEIGHT,
+  RUNNING_CONTENT_HEIGHT,
+  MAX_CONTENT_HEIGHT,
+} = require("../src/arca_connect_window");
 const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
-it("renders consent, sign-in, retry, and completion", (t) => {
+/** Load the console page with a fake bridge; jsdom has no layout, so scrollHeight is stubbed. */
+function renderConsole(t, { scrollHeight }) {
   const dom = new JSDOM(
     fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8"),
     {
@@ -16,50 +23,85 @@ it("renders consent, sign-in, retry, and completion", (t) => {
     },
   );
   t.after(() => dom.window.close());
-  const events = {};
-  let confirms = 0;
+  const page = { document: dom.window.document, events: {}, sizes: [] };
   // Electron supplies this bridge; no remote process is launched by a renderer test.
-  dom.window.arcaConnect = { confirm: () => confirms++, cancel() {} };
+  dom.window.arcaConnect = {
+    confirm() {},
+    cancel() {},
+    resizeToContent: (size) => page.sizes.push(size),
+  };
+  dom.window.Terminal = class Terminal {
+    loadAddon() {}
+    open() {}
+    write() {}
+  };
+  dom.window.FitAddon = {
+    FitAddon: class FitAddon {
+      fit() {}
+    },
+  };
   for (const event of ["Init", "Started", "Output", "Done"]) {
     dom.window.arcaConnect[`on${event}`] = (listener) => {
-      events[event] = listener;
+      page.events[event] = listener;
     };
   }
-  dom.window.requestAnimationFrame = () => {};
+  dom.window.requestAnimationFrame = (callback) => {
+    callback();
+    return 1;
+  };
+  dom.window.cancelAnimationFrame = () => {};
+  Object.defineProperty(page.document.documentElement, "scrollHeight", { value: scrollHeight });
   dom.window.eval(fs.readFileSync(path.join(__dirname, "../arca-connect/console.js"), "utf8"));
-  const document = dom.window.document;
-  const confirm = document.getElementById("confirm");
-  const command = document.getElementById("command");
-  events.Init({
-    serverUrl: "https://account.databricks.com/omnigent?o=123",
-    command: "host command",
+  return page;
+}
+
+for (const copy of [
+  {
+    name: "ordinary connection",
+    reason: null,
+    title: "Connect your Arca instance?",
+    intro: "This runs the command below over ",
+    button: "Connect",
+  },
+  {
+    name: "preview reconnect",
+    reason: "preview-reconnect",
+    title: "Reconnect Arca for this preview?",
+    intro: "To load this preview, run the command below over ",
+    button: "Reconnect",
+  },
+]) {
+  it(`renders consent, sign-in, retry, and completion for ${copy.name}`, (t) => {
+    const { document, events, sizes } = renderConsole(t, { scrollHeight: 360 });
+    const confirm = document.getElementById("confirm");
+    const command = document.getElementById("command");
+    events.Init({
+      serverUrl: "https://account.databricks.com/omnigent?o=123",
+      command: "host command",
+      reason: copy.reason,
+    });
+    assert.equal(document.getElementById("title").textContent, copy.title);
+    assert.equal(document.getElementById("intro").textContent, copy.intro);
+    assert.equal(confirm.textContent, copy.button);
+    assert.equal(sizes.at(-1).height, 360);
+    assert.equal(sizes.at(-1).phase, "asking");
+    confirm.click();
+    events.Started({ login: false, command: "host command" });
+    assert.equal(confirm.disabled, true);
+    // The console can go straight from the connect to sign-in.
+    events.Started({ login: true, command: "login command" });
+    assert.equal(command.textContent, "login command");
+    assert.equal(confirm.textContent, "Signing in…");
+    assert.equal(confirm.disabled, true);
+    events.Started({ login: false, command: "host command" });
+    assert.equal(command.textContent, "host command");
+    assert.equal(confirm.textContent, "Connecting…");
+    events.Done({ ok: true });
+    assert.equal(confirm.hidden, true);
+    assert.equal(document.getElementById("cancel").textContent, "Close");
+    assert.match(document.getElementById("status").textContent, /Connected/);
   });
-  confirm.click();
-  events.Started({ login: false, command: "host command" });
-  assert.equal(confirm.disabled, true);
-  events.Done({
-    ok: false,
-    authRequired: true,
-    command: "login command",
-    error: "Sign-in required",
-  });
-  assert.equal(confirm.hidden, false);
-  assert.equal(confirm.textContent, "Sign in and retry");
-  assert.equal(document.activeElement, confirm);
-  confirm.click();
-  assert.equal(confirms, 2);
-  events.Started({ login: true, command: "login command" });
-  assert.equal(command.textContent, "login command");
-  assert.equal(confirm.textContent, "Signing in…");
-  assert.equal(confirm.disabled, true);
-  events.Started({ login: false, command: "host command" });
-  assert.equal(command.textContent, "host command");
-  assert.equal(confirm.textContent, "Connecting…");
-  events.Done({ ok: true });
-  assert.equal(confirm.hidden, true);
-  assert.equal(document.getElementById("cancel").textContent, "Close");
-  assert.match(document.getElementById("status").textContent, /Connected/);
-});
+}
 
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
 function flowHarness() {
@@ -71,8 +113,9 @@ function flowHarness() {
   };
 
   class FakeWindow extends EventEmitter {
-    constructor() {
+    constructor(options) {
       super();
+      this.options = options;
       this.webContents = new EventEmitter();
       this.webContents.id = 100 + world.windows.length;
       this.webContents.sent = [];
@@ -82,11 +125,11 @@ function flowHarness() {
       this.destroyed = false;
       this.shown = 0;
       this.focused = 0;
-      this.size = null;
+      this.contentSize = null;
       world.windows.push(this);
     }
-    setSize(width, height) {
-      this.size = [width, height];
+    setContentSize(width, height) {
+      this.contentSize = [width, height];
     }
     loadFile() {
       // The page "loads" immediately: fire the init + show hooks.
@@ -101,6 +144,9 @@ function flowHarness() {
     }
     focus() {
       this.focused += 1;
+    }
+    setTitle(title) {
+      this.title = title;
     }
     close() {
       this.destroyed = true;
@@ -148,28 +194,51 @@ function flowHarness() {
   });
 
   /** Emit a preload→main message as if it came from `win`'s webContents. */
-  world.sendFrom = (win, channel) =>
-    world.ipc.emit(channel, { sender: { id: win.webContents.id } });
+  world.sendFrom = (win, channel, payload) =>
+    world.ipc.emit(channel, { sender: { id: win.webContents.id } }, payload);
   return { world, flow };
 }
 
 describe("arca connect console flow", () => {
-  it("requires shell consent to sign in, then retries the identical target only once", async () => {
+  it("does not share another workspace's in-flight identity", async () => {
+    const { world, flow } = flowHarness();
+    const server = "https://account.databricks.com/omnigent?o=123";
+    const first = flow.run(null, server);
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    const second = await flow.run(null, server.replace("123", "456"));
+    assert.equal(second.ok, false);
+    assert.equal(second.identity, undefined);
+    assert.equal(world.windows.length, 1);
+    assert.equal(world.connects.length, 1);
+    const identity = { serverUrl: server, hostId: "a".repeat(32) };
+    world.connects[0].finish({ ok: true, identity });
+    assert.deepEqual((await first).identity, identity);
+  });
+
+  it("signs in under the Connect consent, then retries the identical target only once", async () => {
     const { world, flow } = flowHarness();
     const url = "https://account.databricks.com/omnigent?o=123";
     const result = flow.run(null, url);
     const win = world.windows[0];
+    world.ipc.emit("arca-connect:confirm", { sender: { id: 9999 } });
+    assert.equal(world.connects.length, 0);
     world.sendFrom(win, "arca-connect:confirm");
     world.connects[0].finish({ ok: false, authError: true });
     await Promise.resolve();
-    assert.equal(world.logins.length, 0);
-    assert.equal(win.webContents.sent.at(-1)[1].authRequired, true);
-    world.ipc.emit("arca-connect:confirm", { sender: { id: 9999 } });
-    assert.equal(world.logins.length, 0);
-    world.sendFrom(win, "arca-connect:confirm");
-    world.sendFrom(win, "arca-connect:confirm");
     assert.equal(world.logins.length, 1);
     assert.equal(world.logins[0].serverUrl, url);
+    const started = win.webContents.sent.filter(([channel]) => channel === "arca-connect:started");
+    assert.deepEqual(started.at(-1)[1], {
+      login: true,
+      command: `arca ssh isaac omni login ${url}`,
+    });
+    assert.equal(
+      win.webContents.sent.some(([channel]) => channel === "arca-connect:done"),
+      false,
+    );
+    world.sendFrom(win, "arca-connect:confirm");
+    assert.equal(world.logins.length, 1);
     world.logins[0].finish({ ok: true });
     await Promise.resolve();
     assert.equal(world.connects[1].serverUrl, url);
@@ -179,6 +248,20 @@ describe("arca connect console flow", () => {
     assert.equal(world.logins.length, 1);
   });
 
+  it("shows a failed sign-in and doesn't retry the host", async () => {
+    const { world, flow } = flowHarness();
+    const result = flow.run(null, "https://account.databricks.com/omnigent?o=123");
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    world.connects[0].finish({ ok: false, authError: true });
+    await Promise.resolve();
+    world.logins[0].finish({ ok: false, authError: true, error: "sign-in timed out" });
+    assert.equal((await result).error, "sign-in timed out");
+    assert.equal(world.connects.length, 1);
+    const done = win.webContents.sent.filter(([channel]) => channel === "arca-connect:done");
+    assert.deepEqual(done.at(-1)[1], { ok: false, error: "sign-in timed out" });
+  });
+
   it("cancels remote login without starting a host after a late successful exit", async () => {
     const { world, flow } = flowHarness();
     const result = flow.run(null, "https://account.databricks.com/omnigent?o=123");
@@ -186,7 +269,6 @@ describe("arca connect console flow", () => {
     world.sendFrom(win, "arca-connect:confirm");
     world.connects[0].finish({ ok: false, authError: true });
     await Promise.resolve();
-    world.sendFrom(win, "arca-connect:confirm");
     win.close();
     assert.equal(world.logins[0].canceled, true);
     world.logins[0].finish({ ok: true });
@@ -200,11 +282,13 @@ describe("arca connect console flow", () => {
 
     const init = win.webContents.sent.find(([c]) => c === "arca-connect:init");
     assert.equal(init[1].command, "arca ssh isaac omni host --server https://srv.example.com …");
+    assert.equal(init[1].reason, null);
     assert.equal(world.connects.length, 0); // nothing ran yet — consent first
 
     world.sendFrom(win, "arca-connect:confirm");
     assert.equal(world.connects.length, 1);
-    assert.deepEqual(win.size, [720, 500]); // grows to reveal the terminal pane
+    world.sendFrom(win, "arca-connect:resize", { height: 420, phase: "running" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, RUNNING_CONTENT_HEIGHT]);
     world.connects[0].onOutput("booting…\n");
     assert.ok(
       win.webContents.sent.some(([c, p]) => c === "arca-connect:output" && p === "booting…\n"),
@@ -215,6 +299,46 @@ describe("arca connect console flow", () => {
     const done = win.webContents.sent.find(([c]) => c === "arca-connect:done");
     assert.deepEqual(done[1], { ok: true, error: null });
     assert.equal(win.destroyed, false); // stays open so the output is readable
+  });
+
+  it("labels preview recovery as a reconnect before asking consent", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com", { reason: "preview-reconnect" });
+    const win = world.windows[0];
+    const init = win.webContents.sent.find(([channel]) => channel === "arca-connect:init");
+    assert.equal(win.options.title, "Reconnect Arca");
+    assert.equal(init[1].reason, "preview-reconnect");
+    assert.equal(world.connects.length, 0);
+  });
+
+  it("updates consent copy when a preview reattaches before confirmation", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com");
+    const win = world.windows[0];
+    void flow.run(null, "https://srv.example.com", { reason: "preview-reconnect" });
+    const init = win.webContents.sent.filter(([channel]) => channel === "arca-connect:init").at(-1);
+    assert.equal(win.title, "Reconnect Arca");
+    assert.equal(init[1].reason, "preview-reconnect");
+    assert.equal(world.windows.length, 1);
+  });
+
+  it("uses content bounds and honors only its renderer's measured height", () => {
+    const { world, flow } = flowHarness();
+    void flow.run(null, "https://srv.example.com/a/very/long/path");
+    const win = world.windows[0];
+    assert.equal(win.options.useContentSize, true);
+    assert.equal(win.options.height, MIN_CONTENT_HEIGHT);
+    assert.equal(win.options.resizable, false);
+
+    world.sendFrom(win, "arca-connect:resize", { height: 100, phase: "running" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, MIN_CONTENT_HEIGHT]);
+    world.sendFrom(win, "arca-connect:confirm");
+    world.sendFrom(win, "arca-connect:resize", { height: 412, phase: "asking" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, RUNNING_CONTENT_HEIGHT]);
+    world.sendFrom(win, "arca-connect:resize", { height: 5000, phase: "asking" });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, MAX_CONTENT_HEIGHT]);
+    world.ipc.emit("arca-connect:resize", { sender: { id: 9999 } }, { height: 333 });
+    assert.deepEqual(win.contentSize, [CONTENT_WIDTH, MAX_CONTENT_HEIGHT]);
   });
 
   it("Close still works after the run finished (routing outlives the result)", async () => {

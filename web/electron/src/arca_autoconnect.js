@@ -27,6 +27,7 @@ const OUTPUT_TAIL_CHARS = 8000;
  *   state: "unavailable" | "idle" | "starting" | "online" | "failed",
  *   command: string | null,
  *   alreadyRunning?: boolean,
+ *   identity?: { serverUrl: string, hostId: string },
  *   errorKind?: import("./arca").ArcaErrorKind,
  *   error?: string,
  *   startedAt?: number,
@@ -117,7 +118,13 @@ function createArcaAutoConnect({
       const base = { command, startedAt: status.startedAt };
       const finishedAt = now();
       const next = result.ok
-        ? { ...base, state: "online", alreadyRunning: result.alreadyRunning === true, finishedAt }
+        ? {
+            ...base,
+            state: "online",
+            alreadyRunning: result.alreadyRunning === true,
+            identity: result.identity,
+            finishedAt,
+          }
         : {
             ...base,
             state: "failed",

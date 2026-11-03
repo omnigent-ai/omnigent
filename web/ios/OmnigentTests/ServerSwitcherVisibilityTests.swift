@@ -63,3 +63,27 @@ final class ServerSwitcherVisibilityTests: XCTestCase {
       loadFailed: { _, _ in }, loadSucceeded: {})
   }
 }
+
+final class RecoveryPageTests: XCTestCase {
+  func testRecoveryPageAppliesOnlyToTheDestinationItWasRecordedFor() {
+    let server = URL(string: "https://omnigent.example.com")!
+    let page = RecoveryPage(
+      url: URL(string: "https://omnigent.example.com/c/old")!, initialURL: server)
+    XCTAssertEqual(page.url(for: server), URL(string: "https://omnigent.example.com/c/old"))
+    XCTAssertNil(page.url(for: URL(string: "https://omnigent.example.com/c/new")!))
+    XCTAssertNil(page.url(for: URL(string: "https://other.example.com")!))
+  }
+}
+
+final class RecoveryIntentTests: XCTestCase {
+  func testRecoveryAppliesOnlyToTheDestinationItWasStartedFor() {
+    let workspace = URL(string: "https://workspace.cloud.databricks.com/ml/omnigents?o=1")!
+    let intent = RecoveryIntent(initialURL: workspace)
+    XCTAssertEqual(intent.intent(for: workspace), .recover)
+    XCTAssertEqual(intent.intent(for: URL(string: "https://omnigent.example.com")!), .connect)
+    XCTAssertEqual(
+      intent.intent(
+        for: URL(string: "https://workspace.cloud.databricks.com/ml/omnigents/c/x?o=1")!),
+      .connect)
+  }
+}

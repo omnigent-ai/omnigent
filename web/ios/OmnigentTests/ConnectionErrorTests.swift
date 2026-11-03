@@ -42,7 +42,7 @@ final class ConnectionErrorTests: XCTestCase {
     }
   }
 
-  func testNavigationFailureCallbacksUseCurrentFlag() {
+  func testNavigationFailureCallbacksUseCurrentFlag() async {
     let defaultsName = "ConnectionErrorTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: defaultsName)!
     defer { defaults.removePersistentDomain(forName: defaultsName) }
@@ -60,8 +60,12 @@ final class ConnectionErrorTests: XCTestCase {
     // Mirror makeUIView: failure callbacks act only for the attached, model-held view.
     view.model.webView = webView
     coordinator.attach(webView)
+    // The page loads, and the origin is pinned, once the manifest read falls back.
+    let loaded = expectation(description: "page load after the manifest read")
+    webView.onLoad = { loaded.fulfill() }
     coordinator.load(url, in: webView)
     defer { coordinator.detach() }
+    await fulfillment(of: [loaded], timeout: 10)
 
     for enabled in [true, false] {
       coordinator.parent = OmnigentWebView(
@@ -95,5 +99,11 @@ final class ConnectionErrorTests: XCTestCase {
 
 @MainActor
 private final class NoNetworkWebView: WKWebView {
-  override func load(_ request: URLRequest) -> WKNavigation? { nil }
+  var onLoad: (() -> Void)?
+
+  override func load(_ request: URLRequest) -> WKNavigation? {
+    onLoad?()
+    onLoad = nil
+    return nil
+  }
 }

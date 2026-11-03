@@ -48,3 +48,17 @@ wire shape and can drive arbitrary scripted stream events after navigation.
 The stream queues events emitted before its first connection once and never
 replays prior events on reconnect, matching the server. Call `wait_for_stream()`
 after navigation before emitting status or transcript events.
+
+## Choosing coverage
+
+Use this lane for DOM geometry, local drafts, picker labels/payloads, and UI
+responses to scripted API or stream events. Keep viewport, font, theme, input,
+and entry-point variants when consolidating; share a journey only when its
+steps belong to the same workflow and leave a known state for the next step.
+
+Keep server persistence, permissions, real uploads, dispatch, and native harness
+lifecycle in E2E. A mocked status event proves browser rendering, not server
+persistence: `tests/e2e_ui/chat/test_working_indicator_background_tasks.py` keeps
+reload/reconnect coverage. Likewise, composer attachment checks complement the
+real upload/ingestion tests in `tests/e2e/test_files_upload_e2e.py` and
+`tests/e2e/test_image_upload_e2e.py`.

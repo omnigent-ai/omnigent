@@ -20,11 +20,11 @@ rejects it.
 
 from __future__ import annotations
 
-import time
-
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _COMPOSER = "Send a message…"
 _APPROVAL_CARD = '[data-testid="approval-card"]'
@@ -67,7 +67,9 @@ def test_approval_card_renders_and_approves(
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
     expect(responded).to_be_visible(timeout=30_000)
     expect(responded.get_by_text("Approved", exact=False).first).to_be_visible()
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(
+        lambda: not _pending_elicitations(base_url, session_id), timeout_s=15.0, interval_s=0.25
+    )
 
 
 @pytest.mark.nightly
@@ -92,14 +94,6 @@ def test_approval_card_reject(
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
     expect(responded).to_be_visible(timeout=30_000)
     expect(responded.get_by_text("Rejected", exact=False).first).to_be_visible()
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
-
-
-def _wait_for(predicate, *, timeout_s: float = 15.0, interval_s: float = 0.25) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
+    poll_until(
+        lambda: not _pending_elicitations(base_url, session_id), timeout_s=15.0, interval_s=0.25
+    )

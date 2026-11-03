@@ -7,14 +7,17 @@
 // the server cares about.
 
 import type * as TerminalSessionModule from "./TerminalSession";
+import type * as TerminalsModule from "@/lib/terminals";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { act, useMemo } from "react";
+import { StrictMode, act, useMemo, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import * as host from "@/lib/host";
+import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
+import { resolveInitialAttachUrl, watchDirectUpgrade } from "@/lib/terminals";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -32,6 +35,15 @@ const clipboardMock = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/clipboard", () => ({ copyText: clipboardMock.copyText }));
+
+vi.mock("@/lib/terminals", async (importOriginal) => {
+  const real = await importOriginal<typeof TerminalsModule>();
+  return {
+    ...real,
+    resolveInitialAttachUrl: vi.fn(real.resolveInitialAttachUrl),
+    watchDirectUpgrade: vi.fn(real.watchDirectUpgrade),
+  };
+});
 
 function FileViewerHarness({
   openFile,
@@ -118,12 +130,16 @@ beforeEach(() => {
   render(<Toaster visibleToasts={100} />);
   terminalSessionMock.instances = [];
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
+  vi.mocked(resolveInitialAttachUrl).mockReset();
+  vi.mocked(watchDirectUpgrade).mockReset();
 });
 
 afterEach(() => {
   act(() => toast.dismiss());
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  setSessionHost("conv_abc", null);
 });
 
 describe("buildAttachPath", () => {
@@ -214,7 +230,7 @@ describe("control-mode terminal", () => {
     expect(
       terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
     ).toBe(true);
-    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42 });
+    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42, endLine: 50 });
   });
 });
 
@@ -1170,6 +1186,118 @@ describe("hidden pre-warmed surface", () => {
   });
 });
 
+describe("unmount", () => {
+  const DIRECT_URL =
+    "ws://127.0.0.1:54321/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?token=t";
+
+  it("disposes the live session so its WebSocket closes", async () => {
+    const onStateChange = vi.fn();
+    const { unmount } = render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        onStateChange={onStateChange}
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    unmount();
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalledTimes(1);
+    expect(onStateChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it.each([
+    ["plain", (el: ReactElement) => el],
+    ["StrictMode", (el: ReactElement) => <StrictMode>{el}</StrictMode>],
+  ])("lets a same-id successor's state win over the outgoing null (%s)", async (_name, wrap) => {
+    const onStateChange = vi.fn();
+    const view = (conv: string) =>
+      wrap(
+        <div key={`${conv}:terminal_claude_main`}>
+          <TerminalView
+            sessionId={conv}
+            terminalId="terminal_claude_main"
+            onStateChange={onStateChange}
+          />
+        </div>,
+      );
+    const { rerender } = render(view("conv_a"));
+    await act(async () => {});
+    expect(onStateChange).toHaveBeenLastCalledWith({ kind: "connecting" });
+    rerender(view("conv_b"));
+    await act(async () => {});
+
+    expect(onStateChange).toHaveBeenLastCalledWith({ kind: "connecting" });
+  });
+
+  it("does not dial when it unmounts while the initial URL is resolving", async () => {
+    let resolveUrl: ((url: string) => void) | undefined;
+    vi.mocked(resolveInitialAttachUrl).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveUrl = resolve;
+        }),
+    );
+    const { unmount } = render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={DIRECT_URL}
+      />,
+    );
+    await waitFor(() => expect(resolveUrl).toBeDefined());
+    unmount();
+    await act(async () => resolveUrl!(DIRECT_URL));
+
+    expect(terminalSessionMock.instances).toHaveLength(0);
+  });
+
+  it("keeps the upgrade watch live under StrictMode and aborts it on unmount", async () => {
+    let upgradeSignal: AbortSignal | undefined;
+    vi.mocked(resolveInitialAttachUrl).mockImplementationOnce(async (_direct, relay) => relay);
+    vi.mocked(watchDirectUpgrade).mockImplementationOnce((_direct, signal) => {
+      upgradeSignal = signal;
+      return new Promise(() => {});
+    });
+    const { unmount } = render(
+      <StrictMode>
+        <TerminalView
+          sessionId="conv_abc"
+          terminalId="terminal_bash_s1"
+          directAttachUrl={DIRECT_URL}
+        />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(upgradeSignal).toBeDefined());
+    expect(upgradeSignal!.aborted).toBe(false);
+    unmount();
+    await act(async () => {});
+
+    expect(upgradeSignal!.aborted).toBe(true);
+  });
+
+  it("does not dial when it unmounts before the deferred attach runs", async () => {
+    const { unmount } = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    unmount();
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances).toHaveLength(0);
+  });
+
+  it("dials exactly once under StrictMode and keeps that session live", async () => {
+    render(
+      <StrictMode>
+        <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />
+      </StrictMode>,
+    );
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(terminalSessionMock.instances[0].dispose).not.toHaveBeenCalled();
+  });
+});
+
 describe("late direct-attach advert", () => {
   it("retires the outgoing session when the advert lands on a live terminal", async () => {
     // The runner's loopback advert reaches the client on a terminals
@@ -1208,6 +1336,47 @@ describe("late direct-attach advert", () => {
 });
 
 describe("closed bridge overlay", () => {
+  it.each<ConnectionState>([
+    { kind: "connecting" },
+    { kind: "closed", reason: "not found", code: 4404 },
+    { kind: "error" },
+  ])(
+    "redials a $kind bridge after external recovery and preserves an already connected pane",
+    async (state) => {
+      const props = { sessionId: "conv_abc", terminalId: "terminal_codex_main" };
+      const { rerender } = render(<TerminalView {...props} resumeGeneration={0} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const previous = terminalSessionMock.instances[0];
+      act(() => previous.onState(state));
+
+      rerender(<TerminalView {...props} resumeGeneration={1} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      expect(previous.dispose).toHaveBeenCalledTimes(1);
+      const connected = terminalSessionMock.instances[1];
+      act(() => connected.onState({ kind: "connected" }));
+      rerender(<TerminalView {...props} resumeGeneration={2} />);
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+      expect(connected.dispose).not.toHaveBeenCalled();
+    },
+  );
+
+  it("redials once when its resume callback also signals successful external recovery", async () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    const props = { sessionId: "conv_abc", terminalId: "terminal_codex_main", onResume };
+    const { rerender } = render(<TerminalView {...props} resumeGeneration={0} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "stopped", code: 4404 });
+    });
+
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume session" })));
+    expect(onResume).toHaveBeenCalledTimes(1);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    rerender(<TerminalView {...props} resumeGeneration={1} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+  });
+
   it("renders a resume button beside the closed message and invokes the callback", async () => {
     const onResume = vi.fn().mockResolvedValue(undefined);
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" onResume={onResume} />);
@@ -1269,7 +1438,14 @@ describe("closed bridge overlay", () => {
 
   it("keeps the closed overlay visible and surfaces resume failures", async () => {
     const onResume = vi.fn().mockRejectedValue(new Error("host offline"));
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" onResume={onResume} />);
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        onResume={onResume}
+        resumeGeneration={0}
+      />,
+    );
     // Start from exactly one bridge so the later length check proves failed
     // resume did not remount xterm.
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
@@ -1286,6 +1462,26 @@ describe("closed bridge overlay", () => {
     // Failed resume must not remount xterm: the original closed bridge stays
     // visible so the user can retry after fixing the host.
     expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("names an offline sandbox in the resume action and its failures", async () => {
+    const onResume = vi.fn().mockRejectedValue(new Error("launch failed"));
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        onResume={onResume}
+        resumeTarget="sandbox"
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "stopped", code: 4405 });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^resume sandbox$/i }));
+
+    await screen.findByText("Couldn't resume sandbox: launch failed");
   });
 });
 
@@ -1360,6 +1556,21 @@ describe("automatic reconnect", () => {
     // callback-ref cleanup, so a missing dispose here means every
     // retry leaks an xterm instance and its listeners.
     expect(terminalSessionMock.instances[0].dispose).toHaveBeenCalled();
+  });
+
+  it("retries a rollout routing miss with the same OSS host key", async () => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    setSessionHost("conv_abc", "host_oss");
+    await renderAndAttach();
+    const firstUrl = terminalSessionMock.instances[0].url;
+    expect(new URL(firstUrl).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+
+    closeNewest(4400);
+    await elapse(RECONNECT_BACKOFF_MS[0]);
+
+    expect(terminalSessionMock.instances).toHaveLength(2);
+    expect(terminalSessionMock.instances[1].url).toBe(firstUrl);
+    expect(isHostKeyless("host_oss")).toBe(false);
   });
 
   it("re-dials after a code-less close (1005) — the redeploy-behind-ingress case", async () => {
@@ -1479,32 +1690,39 @@ describe("automatic reconnect", () => {
     }
   });
 
-  it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
-    // A warm surface parked behind another session's view: the transport
-    // flaps with nobody watching and the background reconnect loop burns
-    // its whole budget.
-    const { rerender } = render(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
-    );
-    await act(async () => {});
-    expect(terminalSessionMock.instances).toHaveLength(1);
+  it.each([1006, 4400])(
+    "re-dials a hidden terminal after exhausting retries for close %s",
+    async (code) => {
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+      setSessionHost("conv_abc", "host_oss");
+      // A warm surface parked behind another session's view: the transport
+      // flaps with nobody watching and the background reconnect loop burns
+      // its whole budget.
+      const { rerender } = render(
+        <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+      );
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(1);
 
-    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
-      closeNewest(1006);
-      // oxlint-disable-next-line no-await-in-loop
-      await elapse(delay);
-    }
-    closeNewest(1006);
-    await elapse(60_000);
-    const exhausted = RECONNECT_BACKOFF_MS.length + 1;
-    expect(terminalSessionMock.instances).toHaveLength(exhausted);
+      for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+        closeNewest(code);
+        // oxlint-disable-next-line no-await-in-loop
+        await elapse(delay);
+      }
+      closeNewest(code);
+      await elapse(60_000);
+      const exhausted = RECONNECT_BACKOFF_MS.length + 1;
+      expect(terminalSessionMock.instances).toHaveLength(exhausted);
 
-    // Reveal: a user is now looking at the dead pane — that is the retry
-    // signal, same as a tab thaw. One fresh dial, budget restored.
-    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
-    await act(async () => {});
-    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
-  });
+      // Reveal: a user is now looking at the dead pane — that is the retry
+      // signal, same as a tab thaw. One fresh dial, budget restored.
+      rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+      expect(terminalSessionMock.instances.at(-1)!.url).toBe(terminalSessionMock.instances[0].url);
+      expect(isHostKeyless("host_oss")).toBe(false);
+    },
+  );
 
   it("does not resurrect a deliberately closed terminal on reveal", async () => {
     const { rerender } = render(

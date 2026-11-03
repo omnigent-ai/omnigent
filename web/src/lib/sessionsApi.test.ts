@@ -16,6 +16,7 @@ import {
   createSideChat,
   exportSessionTranscript,
   fetchSessionItemsPage,
+  fetchSessionRepositoryBranches,
   forkSession,
   getSession,
   getSessionSlim,
@@ -73,7 +74,27 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   localStorage.clear();
+});
+
+describe("fetchSessionRepositoryBranches", () => {
+  it("reads per-repository branch availability and forwards cancellation", async () => {
+    const response = {
+      repositories: [
+        { url: "https://github.com/org/api", branch: "feature/api", pushed: true },
+        { url: "https://github.com/org/web", branch: "wip/web", pushed: false },
+        { url: "https://github.com/org/tools", branch: null, pushed: null },
+      ],
+    };
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
+    const { signal } = new AbortController();
+    expect(await fetchSessionRepositoryBranches("session with space", signal)).toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/session%20with%20space/resources/repository-branches",
+      expect.objectContaining({ signal }),
+    );
+  });
 });
 
 describe("apiErrorFromResponse", () => {
@@ -151,6 +172,7 @@ describe("createSession", () => {
       queuedItems: undefined,
       contextWindow: undefined,
       labels: undefined,
+      projectId: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
@@ -172,8 +194,10 @@ describe("createSession", () => {
       backgroundTaskCount: undefined,
       todos: [],
       codexModelOptions: [],
+      sideChatSettingsSupported: false,
       terminalPending: false,
       sandboxStatus: null,
+      sandboxProfile: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
@@ -375,6 +399,7 @@ describe("createBundledSession", () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         session_id: "conv_bundle",
+        agent_id: "ag_bundle",
       }),
     );
 
@@ -383,7 +408,7 @@ describe("createBundledSession", () => {
       { workspace: "/tmp/project" },
     );
 
-    expect(result.id).toBe("conv_bundle");
+    expect(result).toEqual({ id: "conv_bundle", agentId: "ag_bundle" });
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
@@ -432,6 +457,28 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({ title: "My clone" });
   });
 
+  it("sends a managed fork's chosen sandbox host id", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", {
+      sandbox: { workspace: null, hostId: "0123456789abcdef0123456789abcdef" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      workspace: null,
+      host_id: "0123456789abcdef0123456789abcdef",
+    });
+  });
+
   it("forwards run-config overrides (model / effort / launch args)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -475,27 +522,42 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({});
   });
 
-  it("asks for a managed sandbox when a sandbox target is given", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+  it.each([
+    { profile: false, multiRepo: false },
+    { profile: true, multiRepo: false },
+    { profile: true, multiRepo: true },
+  ])(
+    "sends a managed sandbox target with profile=$profile and multiRepo=$multiRepo",
+    async ({ profile, multiRepo }) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
 
-    await forkSession("conv_src", {
-      sandbox: { provider: "modal", workspace: "https://github.com/org/repo#main" },
-    });
+      const repositoryFields = multiRepo
+        ? { workspaces: ["https://github.com/org/api#main", "https://github.com/org/web#dev"] }
+        : { workspace: "https://github.com/org/repo#main" };
+      await forkSession("conv_src", {
+        sandbox: {
+          provider: "modal",
+          ...repositoryFields,
+          ...(profile ? { profileId: "large", profileRevision: "revision-1" } : {}),
+        },
+      });
 
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({
-      host_type: "managed",
-      sandbox_provider: "modal",
-      workspace: "https://github.com/org/repo#main",
-    });
-  });
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "modal",
+        ...repositoryFields,
+        ...(profile ? { sandbox_profile_id: "large", sandbox_profile_revision: "revision-1" } : {}),
+      });
+    },
+  );
 
   it("keeps an explicit null workspace, so a sandbox fork can start empty", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -514,6 +576,57 @@ describe("forkSession", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
+  });
+
+  it.each([
+    {
+      workspaces: [
+        "https://github.com/org/api#fix-auth",
+        "https://github.com/org/web#update-login",
+      ],
+    },
+    { workspaces: [] },
+    { workspaces: null },
+  ])(
+    "forwards a sandbox fork's explicit repository selection: $workspaces",
+    async ({ workspaces }) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
+
+      await forkSession("conv_src", { sandbox: { provider: "kubernetes", workspaces } });
+
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "kubernetes",
+        workspaces,
+      });
+    },
+  );
+
+  it("omits both repository fields when inheriting the source's entire selection", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", { sandbox: { provider: "kubernetes" } });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      sandbox_provider: "kubernetes",
+    });
   });
 
   it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {
@@ -555,33 +668,67 @@ describe("createSideChat", () => {
     agent_id: "agent_fork",
     status: "idle",
     created_at: 1704067200,
+    labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
 
-  it.each(["worktree-from-another-machine", "main", null])(
-    "uses the current workspace without requiring saved branch %s",
-    async (gitBranch) => {
+  it.each(["max", null])(
+    "passes draft effort %s into the fork before binding its runner",
+    async (reasoningEffort) => {
       fetchMock
-        .mockResolvedValueOnce(mockJsonResponse({ ...source, git_branch: gitBranch }))
+        .mockResolvedValueOnce(mockJsonResponse(source))
         .mockResolvedValueOnce(mockJsonResponse(fork))
-        .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
-
-      await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
-
-      const [forkUrl, forkInit] = fetchMock.mock.calls[1] as [string, RequestInit];
-      expect(forkUrl).toBe(`/v1/sessions/${source.id}/fork`);
-      expect(JSON.parse(forkInit.body as string)).toEqual({ title: "Side chat", side_chat: true });
-      const [launchUrl, launchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
-      expect(launchUrl).toBe("/v1/hosts/host_mac/runners");
-      expect(JSON.parse(launchInit.body as string)).toEqual({
-        session_id: fork.id,
-        workspace: source.workspace,
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+      await createSideChat(source.id, { modelOverride: "gpt-6-sol", reasoningEffort });
+      const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(url).toBe(`/v1/sessions/${source.id}/fork`);
+      expect(JSON.parse(init.body as string)).toEqual({
+        title: "Side chat",
+        side_chat: true,
+        model_override: "gpt-6-sol",
+        reasoning_effort: reasoningEffort,
       });
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[2][0]).toBe(`/v1/sessions/${fork.id}`);
     },
   );
 
-  it.each([{ host_id: null, workspace: null }, { host_online: false }])(
-    "uses the parent's online runner when its host cannot launch (%j)",
+  it.each(["worktree-from-another-machine", "main", null])(
+    "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
+    async (gitBranch) => {
+      const relaunchedRunnerId = "runner_relaunched";
+      fetchMock
+        .mockResolvedValueOnce(
+          mockJsonResponse({ ...source, runner_online: false, git_branch: gitBranch }),
+        )
+        .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
+        .mockResolvedValueOnce(
+          mockJsonResponse({
+            ...source,
+            runner_id: relaunchedRunnerId,
+            runner_online: true,
+            git_branch: gitBranch,
+          }),
+        )
+        .mockResolvedValueOnce(mockJsonResponse(fork))
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: relaunchedRunnerId }));
+
+      await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+
+      const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
+      expect(JSON.parse(retryInit.body as string)).toEqual({ type: "retry_session", data: {} });
+      const [forkUrl, forkInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+      expect(forkUrl).toBe(`/v1/sessions/${source.id}/fork`);
+      expect(JSON.parse(forkInit.body as string)).toEqual({ title: "Side chat", side_chat: true });
+      const [bindUrl, bindInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+      expect(bindUrl).toBe(`/v1/sessions/${fork.id}`);
+      expect(bindInit.method).toBe("PATCH");
+      expect(JSON.parse(bindInit.body as string)).toEqual({ runner_id: relaunchedRunnerId });
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+    },
+  );
+
+  it.each([{}, { host_id: null, workspace: null }, { host_online: false }])(
+    "reuses the parent's online runner regardless of host availability (%j)",
     async (placement) => {
       fetchMock
         .mockResolvedValueOnce(mockJsonResponse({ ...source, ...placement }))
@@ -609,6 +756,33 @@ describe("createSideChat", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["omnigent.side_chat.source_id", "omnigent.fork.source_id"])(
+    "routes the initial runner bind using %s without making the fork a sub-agent",
+    async (sourceLabel) => {
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      const side = {
+        ...fork,
+        labels: { "omnigent.side_chat": "1", [sourceLabel]: source.id },
+      };
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse(source))
+        .mockResolvedValueOnce(mockJsonResponse(side))
+        .mockResolvedValueOnce(mockJsonResponse({ ...side, runner_id: source.runner_id }));
+
+      await createSideChat(source.id);
+
+      const init = fetchMock.mock.calls[2][1] as RequestInit;
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(source.host_id);
+      expect(getSessionHost(side.id)).toBe(source.host_id);
+      fetchMock.mockResolvedValueOnce(mockJsonResponse(side));
+      expect(await getSession(side.id)).toMatchObject({
+        hostId: null,
+        parentSessionId: null,
+        kind: "default",
+      });
+    },
+  );
+
   it("wakes a resumable host and refreshes its placement before starting a side chat", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -621,22 +795,25 @@ describe("createSideChat", () => {
       )
       .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
       .mockResolvedValueOnce(
-        mockJsonResponse({ ...source, host_id: "host_awake", workspace: "/resumed/workspace" }),
+        mockJsonResponse({
+          ...source,
+          host_id: "host_awake",
+          workspace: "/resumed/workspace",
+          runner_id: "runner_awake",
+        }),
       )
       .mockResolvedValueOnce(mockJsonResponse(fork))
-      .mockResolvedValueOnce(mockJsonResponse({ runner_id: "runner_side" }));
+      .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: "runner_awake" }));
 
     await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
 
     const [retryUrl, retryInit] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(retryUrl).toBe(`/v1/sessions/${source.id}/events`);
     expect(JSON.parse(retryInit.body as string)).toMatchObject({ type: "retry_session" });
-    const [launchUrl, launchInit] = fetchMock.mock.calls[4] as [string, RequestInit];
-    expect(launchUrl).toBe("/v1/hosts/host_awake/runners");
-    expect(JSON.parse(launchInit.body as string)).toEqual({
-      session_id: fork.id,
-      workspace: "/resumed/workspace",
-    });
+    const [bindUrl, bindInit] = fetchMock.mock.calls[4] as [string, RequestInit];
+    expect(bindUrl).toBe(`/v1/sessions/${fork.id}`);
+    expect(bindInit.method).toBe("PATCH");
+    expect(JSON.parse(bindInit.body as string)).toEqual({ runner_id: "runner_awake" });
   });
 
   it("does not create an orphan fork when neither the host nor runner is available", async () => {
@@ -924,6 +1101,19 @@ describe("runner binding", () => {
 });
 
 describe("getSession", () => {
+  it.each([undefined, false, true])("reads side-chat settings support (%s)", async (supported) => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "side",
+        agent_id: "agent",
+        status: "idle",
+        created_at: 0,
+        side_chat_settings_supported: supported,
+      }),
+    );
+    expect((await getSession("side")).sideChatSettingsSupported).toBe(supported === true);
+  });
+
   it("GETs the sessions endpoint and parses the response", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

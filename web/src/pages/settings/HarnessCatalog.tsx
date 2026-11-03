@@ -4,6 +4,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { BrandHarness } from "@/components/onboarding/harnessBrand";
@@ -39,10 +40,12 @@ export function BackButton({
   label,
   to,
   onClick,
+  componentId = "settings.harnesses.back",
 }: {
   label: string;
   to?: string;
   onClick?: () => void;
+  componentId?: string;
 }) {
   return (
     <Button
@@ -53,7 +56,7 @@ export function BackButton({
       onClick={onClick}
     >
       {to !== undefined ? (
-        <Link to={to} componentId="settings.harnesses.back">
+        <Link to={to} componentId={componentId}>
           <ArrowLeftIcon />
           {label}
         </Link>
@@ -77,16 +80,18 @@ export function HarnessCatalog({
   settings,
   host,
   family,
+  defaultTab = "mcps",
 }: {
   header: ReactNode;
   settings: ReactNode;
   host: Host;
   family: BrandHarness;
+  defaultTab?: CatalogKind | "settings";
 }) {
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
   const [searchParams] = useSearchParams();
   const [tab, setTab] = useState<CatalogKind | "settings">(
-    searchParams.get("tab") === "settings" ? "settings" : "mcps",
+    searchParams.get("tab") === "settings" ? "settings" : defaultTab,
   );
   const [open, setOpen] = useState<OpenPlugin | null>(null);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
@@ -260,18 +265,21 @@ function plural(n: number, word: string) {
 function CatalogRow({
   icon,
   name,
+  label = name,
   detail,
   onOpen,
 }: {
   icon: ReactNode;
   name: string;
+  /** Text shown for the row when it differs from its identifying name. */
+  label?: string;
   detail?: string;
   onOpen?: () => void;
 }) {
   const main = (
     <>
       <span className="flex shrink-0 items-center">{icon}</span>
-      <span className="shrink-0 text-ui font-medium text-foreground">{name}</span>
+      <span className="shrink-0 text-ui font-medium text-foreground">{label}</span>
       {detail && <span className="min-w-0 truncate text-ui text-muted-foreground">{detail}</span>}
     </>
   );
@@ -349,7 +357,7 @@ function PluginPage({
           <PlugIcon className="size-5 text-muted-foreground" />
         </span>
         <div className="flex min-w-0 flex-col">
-          <h1 className="settings-page-title truncate text-2xl font-semibold">{plugin.name}</h1>
+          <h1 className="settings-page-title truncate text-2xl font-medium">{plugin.name}</h1>
           <span className="text-ui text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
@@ -426,7 +434,7 @@ function SkillPage({
   return (
     <>
       <BackButton label={backLabel} onClick={onBack} />
-      <h1 className="settings-page-title truncate text-2xl font-semibold">{name}</h1>
+      <h1 className="settings-page-title truncate text-2xl font-medium">{name}</h1>
       {query.isPending ? (
         <Notice>Loading skill contents…</Notice>
       ) : query.error ? (
@@ -459,11 +467,15 @@ function SkillPage({
 
 const SKILL_MARKDOWN_COMPONENTS: Components = {
   img: ({ alt }) => <span>{alt}</span>,
-  a: ({ href, children }) => (
-    <a href={href} rel="noreferrer" target="_blank">
-      {children}
-    </a>
-  ),
+  // Only SKILL.md is shown, so relative links (sibling files, anchors) lead nowhere.
+  a: ({ href, children }) =>
+    href && /^[a-z][a-z\d+.-]*:/i.test(href) ? (
+      <a href={href} rel="noreferrer" target="_blank">
+        {children}
+      </a>
+    ) : (
+      <span>{children}</span>
+    ),
 };
 
 function McpList({
@@ -488,6 +500,7 @@ function McpList({
               key={server.id}
               icon={<LetterAvatar name={server.name} />}
               name={server.name}
+              label={mcpServerDisplayName(server.name)}
               detail={server.detail}
             />
           ))}
@@ -562,7 +575,9 @@ function McpRow({
         >
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
           <LetterAvatar name={server.name} />
-          <span className="shrink-0 font-medium text-foreground">{server.name}</span>
+          <span className="shrink-0 font-medium text-foreground">
+            {mcpServerDisplayName(server.name)}
+          </span>
           {data?.connection === "connected" && (
             <span className="shrink-0 text-muted-foreground">
               · {data.tools.length}
@@ -592,7 +607,7 @@ function McpRow({
               ? `Update ${host.name} to list tools.`
               : query.error instanceof ApiError && query.error.status === 503
                 ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
-                : `Couldn't reach ${server.name}.`}
+                : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
           </Notice>
         ) : data ? (
           data.connection !== "connected" ? (
@@ -605,11 +620,18 @@ function McpRow({
                 {data.tools.map((tool, index) => (
                   // Capped names can collide; these display-only rows have no state.
                   // eslint-disable-next-line react/no-array-index-key
-                  <li key={index}>
-                    <div>
-                      <span className="font-mono">{tool.name}</span>
-                    </div>
-                    {tool.description && <div className="mb-1">{tool.description}</div>}
+                  <li key={`${tool.name}-${index}`}>
+                    {tool.description ? (
+                      <details className="group">
+                        <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                          <span className="font-mono">{tool.name}</span>
+                          <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
+                        </summary>
+                        <div className="my-1">{tool.description}</div>
+                      </details>
+                    ) : (
+                      <span className="pl-4 font-mono">{tool.name}</span>
+                    )}
                   </li>
                 ))}
               </ul>

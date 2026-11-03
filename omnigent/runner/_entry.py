@@ -16,12 +16,14 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -30,7 +32,14 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
-from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+from omnigent.runner.transports.ws_tunnel.serve import (
+    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
+    RUNNER_TUNNEL_REJECTION_PREFIX,
+    RunnerTunnelAuthRejectedError,
+    _reset_recoverable_decline,
+)
+from omnigent.util.event_loop_watchdog import monitor_event_loop
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -237,6 +246,30 @@ def _runner_threadpool_max_workers() -> int:
     return raw_workers
 
 
+def _runner_last_activity(
+    tunnel_activity_at: float,
+    dispatch_activity_at: float | None,
+    forwarder_post_at: float | None,
+) -> float:
+    """Return the newest runner-activity timestamp across the activity clocks.
+
+    The tunnel clock covers server→runner request frames; the other two cover
+    outbound native-forwarder event posts (tunnel-dispatched batches and
+    direct HTTP posts), so a mirrored sub-agent that is still streaming keeps
+    an otherwise idle runner alive. A clock that never fired passes ``None``.
+
+    :param tunnel_activity_at: Last tunnel request-frame time (loop clock).
+    :param dispatch_activity_at: Last acknowledged tunnel event-batch time.
+    :param forwarder_post_at: Last native-forwarder POST round-trip time.
+    :returns: The latest of the non-``None`` timestamps.
+    """
+    return max(
+        stamp
+        for stamp in (tunnel_activity_at, dispatch_activity_at, forwarder_post_at)
+        if stamp is not None
+    )
+
+
 async def _run_inactivity_monitor(
     *,
     idle_timeout_s: float,
@@ -350,33 +383,27 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
+            from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
 
-            request.headers.update(databricks_request_headers(self._server_url))
+            request.headers.update(
+                databricks_request_headers(
+                    self._server_url, host_id=request.extensions.get(REQUEST_HOST_EXTENSION)
+                )
+            )
         if self._factory is not None:
             token, declined = _call_factory_with_declined(self._factory)
             if not token:
                 if declined:
-                    # The mint path declined for this runner (HTTP 400/404
-                    # no-auth/header mode, or a 5xx from an intermediary).
-                    # Bare requests are correct on a no-auth server; do NOT
-                    # fail closed or the runner bricks every callback.
+                    # The mint declined (400/404 no-auth, intermediary 5xx, or a
+                    # pre-bearer 401/403): send bare, since failing closed here
+                    # would brick every callback on a no-auth server.
                     response = yield request
                     if not _is_login_redirect_or_unauthorized(response):
                         return
-                    # The bare request was rejected, so the server DOES
-                    # require auth and the decline was wrong (e.g. an
-                    # intermediary 5xx latched it while the server was
-                    # briefly down). Clear the latch and try a fresh mint
-                    # so a recovered server re-authenticates the runner.
-                    # Only a 5xx-latched decline is recoverable; a genuine
-                    # no-auth refusal (400/404) must not re-probe the mint
-                    # endpoint on every rejected callback.
-                    if not getattr(self._factory, "declined_by_server_error", False):
+                    # Rejected bare: the server needs auth, so re-mint after a
+                    # recoverable decline; a 400/404 refusal must not re-probe.
+                    if not _reset_recoverable_decline(self._factory):
                         return
-                    reset = getattr(self._factory, "reset_decline", None)
-                    if not callable(reset):
-                        return
-                    reset()
                     token = self._factory()
                     if token:
                         request.headers["Authorization"] = f"Bearer {token}"
@@ -555,6 +582,20 @@ class _InitialAuthTokenFactory:
         with self._lock:
             return bool(getattr(self._fallback_factory, "declined_by_server_error", False))
 
+    @property
+    def declined_without_proxy_bearer(self) -> bool:
+        """True when the inner fallback factory declined on a 401/403 it sent no bearer with."""
+        with self._lock:
+            return bool(getattr(self._fallback_factory, "declined_without_proxy_bearer", False))
+
+    @property
+    def sign_in_pending(self) -> bool:
+        """True while the fallback credential source waits on an interactive sign-in."""
+        with self._lock:
+            if self._initial_token is not None:
+                return False
+            return bool(getattr(self._fallback_factory, "sign_in_pending", False))
+
     def reset_decline(self) -> None:
         """Clear the inner fallback factory's ``declined`` latch, if any."""
         with self._lock:
@@ -645,6 +686,23 @@ def _make_auth_token_factory(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     )
 
+    # Behind the Databricks Apps proxy (header auth) the server cannot mint a
+    # runner token and the proxy admits only the owner's own Databricks token,
+    # so that launcher-refreshed bearer is the runner's credential, for its server only.
+    from omnigent.util.proxy_bearer import (
+        proxy_bearer_allowed_for,
+        proxy_bearer_configured,
+        read_proxy_bearer,
+    )
+
+    if (
+        proxy_bearer_configured()
+        and resolved_server_url
+        and proxy_bearer_allowed_for(resolved_server_url)
+    ):
+        os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, None)
+        return lambda: read_proxy_bearer(resolved_server_url)
+
     initial_token = (
         os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()
         if _allow_initial_token
@@ -661,12 +719,17 @@ def _make_auth_token_factory(
     # credentials stay out of the runner and credential discovery is skipped.
     delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
     binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+    # A binding token the server just refused to mint for (bare request), so
+    # the managed fallback below doesn't resend the identical probe.
+    refused_binding_token: str | None = None
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(
             resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
         )
         if delegated_factory is not None:
             return delegated_factory
+        if _proxy_bearer is None:
+            refused_binding_token = binding_token
 
     sdk_token_source: _ReusedDatabricksTokenSource | None = None
 
@@ -736,7 +799,7 @@ def _make_auth_token_factory(
             fallback_binding_token = _runner_tunnel_binding_token_from_env()
         except RuntimeError:
             fallback_binding_token = None
-        if fallback_binding_token is not None:
+        if fallback_binding_token is not None and fallback_binding_token != refused_binding_token:
             return _make_managed_mint_factory(resolved_server_url, fallback_binding_token)
     return None
 
@@ -785,6 +848,7 @@ def _make_managed_mint_factory(
         bare requests. A post-install 401/403 with no still-valid cache
         latches ``proxy_auth_failed`` instead, which
         :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
+        A bearer-less 401/403 latches a recoverable ``declined``.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -810,6 +874,8 @@ def _make_managed_mint_factory(
         # the latch and re-mints once the server is reachable again —
         # dropping the factory here would lose that recovery path.
         return factory
+    # A probe 401/403 still drops the factory, leaving the boot-time app and
+    # tunnel clients bare; host launches bind the session before the runner starts.
     if factory.declined or factory.proxy_auth_failed:
         return None
     return factory
@@ -833,6 +899,8 @@ class _ManagedMintTokenFactory:
     :attr:`proxy_auth_failed` instead: the credential presented to the proxy
     died (the seeded host bearer, or the minted JWT once a session outlives
     it), so callers should re-resolve SDK/OIDC rather than send bare requests.
+    A bearer-less 401/403 may precede session binding, so it latches a
+    recoverable :attr:`declined` and :attr:`declined_without_proxy_bearer`.
     """
 
     def __init__(
@@ -871,15 +939,19 @@ class _ManagedMintTokenFactory:
         # refusal). Unlike ``declined``, this means the caller should try
         # another credential path (SDK/OIDC) rather than sending bare requests.
         self.proxy_auth_failed = False
+        # True when ``declined`` was latched by a 401/403 sent without a proxy
+        # bearer; recoverable via :meth:`reset_decline` like a 5xx decline.
+        self.declined_without_proxy_bearer = False
 
     def __call__(self) -> str | None:
         """Return a fresh owner JWT, or ``None``.
 
         :returns: The cached or freshly-minted JWT; ``None`` after a
-            definitive server decline or a 5xx with no prior successful
-            mint (sets :attr:`declined`), after a mint 401/403 with no
-            still-valid cached token (sets :attr:`proxy_auth_failed`), or
-            on a transient mint failure with no still-valid cached token.
+            definitive server decline, a 5xx with no prior successful mint,
+            or a 401/403 with no proxy bearer (sets :attr:`declined`), after
+            a mint 401/403 with no still-valid cached token (sets
+            :attr:`proxy_auth_failed`), or on a transient mint failure with
+            no still-valid cached token.
         """
         with self._lock:
             return self._call_locked()
@@ -924,6 +996,12 @@ class _ManagedMintTokenFactory:
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
+                if self._proxy_bearer is None:
+                    # A successful mint would have promoted a bearer, so
+                    # nothing expired: the server will not mint for us yet.
+                    self.declined = True
+                    self.declined_without_proxy_bearer = True
+                    return None
                 # The proxy bearer is expired or invalid — the seeded host
                 # bearer, or the minted JWT once a session outlives it. With
                 # no still-valid cache left the mint loop cannot renew itself:
@@ -961,12 +1039,13 @@ class _ManagedMintTokenFactory:
 
         Used when a bare request is rejected with a re-auth signal: the
         server does require auth, so a decline latched by an intermediary
-        5xx (rather than a genuine no-auth server) must not stick once the
-        server is reachable again.
+        5xx or a no-bearer 401/403 (rather than a genuine no-auth server)
+        must not stick once the server will mint again.
         """
         with self._lock:
             self.declined = False
             self.declined_by_server_error = False
+            self.declined_without_proxy_bearer = False
 
     def invalidate(self) -> bool:
         """Discard the cached JWT so the next call re-mints.
@@ -1250,9 +1329,91 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+# The server waits 10s for session init, so throttled spec fetches retry well inside that.
+_SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+_SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
+
+
+class _AgentSpecCache:
+    """Serialize worker-owned bundle loading and shutdown for one runner."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._admission = asyncio.Lock()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    async def resolve(
+        self, response: httpx.Response, agent_id: str, session_id: str
+    ) -> ResolvedSpec:
+        """Queue before occupying a worker, and retain admission through cancellation."""
+        await self._admission.acquire()
+        worker = asyncio.create_task(asyncio.to_thread(self._load, response, agent_id, session_id))
+        worker.add_done_callback(self._load_finished)
+        return await asyncio.shield(worker)
+
+    def _load_finished(self, worker: asyncio.Task[ResolvedSpec]) -> None:
+        self._admission.release()
+        if not worker.cancelled():
+            worker.exception()
+
+    def _load(self, response: httpx.Response, agent_id: str, session_id: str) -> ResolvedSpec:
+        """Keep cache mutation owned until the worker ends, even after cancellation."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("spec_resolver: agent bundle cache is closed")
+            return _load_agent_spec_bundle(self.root, response, agent_id, session_id)
+
+    def close(self) -> None:
+        """Retire the cache before deleting it so queued workers cannot recreate it."""
+        with self._lock:
+            self._closed = True
+            shutil.rmtree(self.root, ignore_errors=True)
+
+
+def _load_agent_spec_bundle(
+    spec_cache_root: Path, resp: httpx.Response, agent_id: str, session_id: str
+) -> ResolvedSpec:
+    """Hash, load and publish a validated bundle while its cache lock is held."""
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.runner.native import ResolvedSpec
+    from omnigent.spec import load
+
+    # Only operator-authored bundles may expand the runner's environment.
+    # Missing or unknown provenance stays tenant-scoped.
+    session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
+    expand_env = session_scoped_header == "false"
+    # The digest keeps a reused agent/version id off a previous bundle's directory.
+    version = resp.headers.get("X-Agent-Version", "0")
+    digest = hashlib.sha256(resp.content).hexdigest()[:16]
+    dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
+    # An older runner may not support sub-agents validated by a newer server.
+    try:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    except Exception:  # noqa: BLE001 — the downloaded bundle must validate before replacement
+        # Cached files can be missing, truncated, or malformed. Validate the
+        # downloaded bundle privately before replacing any cached files.
+        spec_cache_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
+            staging = Path(staging_dir)
+            load(resp.content, dest=staging, expand_env=expand_env, prune_invalid_sub_agents=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+                _logger.warning(
+                    "Rebuilding incomplete agent bundle cache for %s",
+                    agent_id,
+                    extra={"session_id": session_id},
+                )
+            staging.rename(dest)
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
+    _apply_host_interactive_shells(spec)
+    return ResolvedSpec(spec=spec, workdir=dest)
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
-    spec_cache_root: Path,
+    spec_cache: _AgentSpecCache,
     agent_id: str,
     session_id: str | None = None,
 ) -> ResolvedSpec | None:
@@ -1261,8 +1422,7 @@ async def _resolve_agent_spec_from_server(
 
     :param server_client: HTTP client pointed at the Omnigent server,
         e.g. base URL ``"http://127.0.0.1:6767"``.
-    :param spec_cache_root: Stable runner-local cache root for
-        extracted agent bundles.
+    :param spec_cache: Runner-owned bundle cache with serialized worker access.
     :param agent_id: Opaque agent identifier to fetch, e.g.
         ``"ag_abc123"``.
     :param session_id: Session identifier used to fetch the bundle
@@ -1273,10 +1433,10 @@ async def _resolve_agent_spec_from_server(
         directory, or ``None`` when the server returns 404 for the
         requested agent.
     :raises RuntimeError: If the server returns a non-200 status
-        other than 404.
+        other than 404, including a 429 that outlasts the retries.
     """
-    from omnigent.runner.native import ResolvedSpec
-    from omnigent.spec import load
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER
+    from omnigent.native.native_terminal import request_with_429_retry
 
     if session_id is None:
         _logger.warning(
@@ -1286,7 +1446,13 @@ async def _resolve_agent_spec_from_server(
         )
         return None
     path = f"/v1/sessions/{session_id}/agent/contents"
-    resp = await server_client.get(path)
+    # Every runner re-initializes its sessions when the server restarts, and the
+    # resulting burst gets throttled; a failed fetch here fails the session's init.
+    resp = await request_with_429_retry(
+        lambda: server_client.get(path, headers={MCP_SELECTION_HEADER: "1"}),
+        delays_s=_SPEC_FETCH_429_RETRY_DELAYS_S,
+        max_retry_after_s=_SPEC_FETCH_MAX_RETRY_AFTER_S,
+    )
     if resp.status_code == 404:
         _logger.info(
             "spec_resolver: GET %s returned 404 for missing agent",
@@ -1296,45 +1462,23 @@ async def _resolve_agent_spec_from_server(
         return None
     if resp.status_code != 200:
         raise RuntimeError(f"spec_resolver: GET {path} failed with HTTP {resp.status_code}")
-    # Env-expansion decision: the MCP/LLM
-    # connection actually opens here on the runner, so the runner —
-    # not just the server — must refuse to expand ${VAR} against its
-    # process env for tenant-supplied (session-scoped) bundles. The
-    # server reports provenance via X-Agent-Session-Scoped. Fail safe:
-    # a missing/unknown header is treated as session-scoped (no
-    # expansion). Only operator-authored template agents expand.
-    session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
-    expand_env = session_scoped_header == "false"
-    # Cache key: agent id + version header + content digest. Re-extracting
-    # on every dispatch would be wasteful; the digest keeps an agent removed
-    # and added again (its version restarts at 1) off the old bundle's directory.
-    version = resp.headers.get("X-Agent-Version", "0")
-    digest = hashlib.sha256(resp.content).hexdigest()[:16]
-    dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
-    # prune_invalid_sub_agents: the server already validated this bundle
-    # before serving it, so a sub-agent that fails validation *here* means
-    # this runner is older than that server and can't run that sub-agent
-    # (e.g. it names a harness this version doesn't know). Drop the
-    # unsupported sub-agent and launch the parent with what this runner
-    # *does* support, rather than failing every dispatch of the agent.
-    # See omnigent.spec.load.
-    if not dest.exists():
-        dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    _apply_host_interactive_shells(spec)
-    return ResolvedSpec(spec=spec, workdir=dest)
+    return await spec_cache.resolve(resp, agent_id, session_id)
 
 
 def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
+    *,
+    auth_resolved: bool = False,
 ) -> FastAPI:
     """Factory for the runner FastAPI app exposing the harness-contract subset.
 
     :param auth_token_factory: Pre-built server bearer factory to reuse for the
         HTTP client and native terminal helpers, e.g. the delegated factory
         ``_run_tunnel_from_env`` already built for the WS tunnel. When ``None``,
-        the app builds its own.
+        the app builds its own unless *auth_resolved* is set.
+    :param auth_resolved: Whether *auth_token_factory* is the caller's
+        finished credential resolution, so ``None`` means "no credentials"
+        rather than "resolve again" (which would re-probe the same endpoints).
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.cli_auth import open_server_client
@@ -1382,7 +1526,7 @@ def create_app(
 
     # Reuse the caller's factory when given (shares one resolved SDK auth +
     # token cache); otherwise build our own.
-    if auth_token_factory is None:
+    if auth_token_factory is None and not auth_resolved:
         auth_token_factory = _make_auth_token_factory()
     binding_token = _runner_tunnel_binding_token_from_env()
     server_client = open_server_client(
@@ -1428,7 +1572,7 @@ def create_app(
     # references.
     import tempfile
 
-    _spec_cache_root = Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-"))
+    _spec_cache = _AgentSpecCache(Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-")))
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
         """
@@ -1453,7 +1597,7 @@ def create_app(
         """
         return await _resolve_agent_spec_from_server(
             server_client,
-            _spec_cache_root,
+            _spec_cache,
             agent_id,
             session_id=session_id,
         )
@@ -1463,6 +1607,7 @@ def create_app(
     # Out-of-process runner owns its own TerminalRegistry.
     from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.pane_reaper import resolve_native_pane_idle_timeout_s
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
     if not host_owns_global_cleanup:
@@ -1483,7 +1628,7 @@ def create_app(
                     "Reaped %d orphaned native bridge dir(s) from prior runs",
                     _reaped_bridge_dirs,
                 )
-        except Exception:  # noqa: BLE001 — housekeeping must never block startup
+        except Exception:  # housekeeping must never block startup
             _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
@@ -1501,6 +1646,9 @@ def create_app(
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
         auth_token_factory=auth_token_factory,
+        native_pane_idle_timeout_s=resolve_native_pane_idle_timeout_s(
+            _load_runner_idle_timeout_s_from_config()
+        ),
     )
 
     async def _start_pm() -> None:
@@ -1583,20 +1731,25 @@ def create_app(
         if mcp_manager is not None:
             await mcp_manager.shutdown()
         await server_client.aclose()
-        # Best-effort cleanup of extracted spec bundles. Missing
-        # / already-gone is fine; ignore_errors handles a partial
-        # write that leaves a directory in an unreadable state.
-        import shutil
-
-        shutil.rmtree(_spec_cache_root, ignore_errors=True)
+        # A cancelled resolver can still own a worker; retire and clean under its lock.
+        await asyncio.to_thread(_spec_cache.close)
 
     # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        from omnigent.runner import pr_reports
+
         await _start_pm()
+        reporter = pr_reports.PullRequestReporter(
+            lambda *args, **kwargs: server_client.post(*args, **kwargs)
+        )
+        pr_reports.install(reporter)
         try:
-            yield
+            with monitor_event_loop(process_role="runner"):
+                yield
         finally:
+            pr_reports.install(None)
+            await reporter.aclose()
             await _stop_pm()
 
     app.router.lifespan_context = _lifespan
@@ -1616,6 +1769,10 @@ def _handle_loop_exception(
     callback = getattr(handle, "_callback", None)
     while isinstance(callback, functools.partial):
         callback = callback.func
+    # Callback failures carry a Handle, but usually omit the receiver Future.
+    callback_future = getattr(callback, "__self__", None)
+    if future is None and isinstance(callback_future, asyncio.Future):
+        future = callback_future
     coroutine = future.get_coro() if isinstance(future, asyncio.Task) else None
     extra = debug_event(
         "runner_async_failure",
@@ -1648,16 +1805,17 @@ async def _run_tunnel_from_env() -> None:
 
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
+    from omnigent.util.thread_pool_watchdog import watch_thread_pool
 
     # Bound the asyncio default executor before anything uses it (create_app,
     # telemetry, and every to_thread offload). Setting it here means Python's
     # lazy min(32, cpu+4)-thread default pool is never created.
-    asyncio.get_running_loop().set_default_executor(
-        ThreadPoolExecutor(
-            max_workers=_runner_threadpool_max_workers(),
-            thread_name_prefix="runner",
-        )
+    runner_executor = ThreadPoolExecutor(
+        max_workers=_runner_threadpool_max_workers(),
+        thread_name_prefix="runner",
     )
+    asyncio.get_running_loop().set_default_executor(runner_executor)
+    watch_thread_pool(runner_executor, thread_name_prefix="runner", process_role="runner")
 
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
@@ -1682,7 +1840,7 @@ async def _run_tunnel_from_env() -> None:
         from omnigent.runtime import telemetry
 
         telemetry.init("omni-runner")
-    except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
+    except Exception:  # best-effort; tracing failure must not crash the runner
         _logger.debug(
             "telemetry init failed in runner",
             exc_info=True,
@@ -1691,7 +1849,10 @@ async def _run_tunnel_from_env() -> None:
 
     # Reuse the tunnel's token factory for the app's httpx client so the
     # runner resolves Databricks auth once at boot, not twice.
-    app = create_app(auth_token_factory=auth_token_factory)
+    app = create_app(auth_token_factory=auth_token_factory, auth_resolved=True)
+    from omnigent.native._native_forwarder_health import (
+        last_post_at as native_forwarder_last_post_at,
+    )
     from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
     event_dispatcher = RunnerEventDispatcher()
@@ -1723,9 +1884,17 @@ async def _run_tunnel_from_env() -> None:
     def _last_activity() -> float:
         """Return the last real runner activity time.
 
+        Outbound native-forwarder event posts count too, so a mirrored
+        sub-agent that is still streaming holds off the idle watchdog while
+        the parent session is idle.
+
         :returns: Monotonic timestamp from the runner event loop.
         """
-        return last_activity_at
+        return _runner_last_activity(
+            last_activity_at,
+            event_dispatcher.last_dispatch_at,
+            native_forwarder_last_post_at(),
+        )
 
     def _has_active_work() -> bool:
         """Return whether the runner is currently executing agent work.
@@ -1792,7 +1961,7 @@ async def _run_tunnel_from_env() -> None:
                         allowed_origins=frozenset({allowed_origin}),
                     )
                 )
-        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+        except Exception:  # optimization only; never block the tunnel
             _logger.warning(
                 "direct-attach listener setup failed",
                 exc_info=True,
@@ -2075,26 +2244,23 @@ def main() -> None:
     """
     from omnigent.process_logging import configure_process_logging
 
-    # Spawned with -P, so the workspace is not on sys.path. Re-add it now that
-    # the real omnigent is imported (it can no longer be shadowed) so
-    # spec-declared local tools living in the workspace still import.
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-
     configure_process_logging("runner", force=True)
     _install_crash_logging()
     _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
-        if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
+        if not str(exc).startswith(
+            (RUNNER_TUNNEL_REJECTION_PREFIX, RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+        ):
             raise
-        # A fatal server rejection is an expected, actionable exit — log the
+        # A fatal tunnel auth failure is an expected, actionable exit — log the
         # reason but keep stderr to the concise message (no traceback).
         _logger.error("runner exiting: %s", exc, extra={"session_id": runner_primary_session_id()})
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
+        # A refused credential gets its own code so the host reports a sign-in problem.
+        auth_rejected = isinstance(exc, RunnerTunnelAuthRejectedError)
+        raise SystemExit(RUNNER_AUTH_REJECTED_EXIT_CODE if auth_rejected else 1) from None
 
 
 if __name__ == "__main__":

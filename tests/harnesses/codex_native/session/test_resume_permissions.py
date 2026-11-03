@@ -49,9 +49,11 @@ def test_clear_bridge_state_removes_stale_runtime_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("retain_client", [False, True])
+@pytest.mark.parametrize("model_provider", [None, "omnigent_databricks"])
 def test_preload_codex_thread_for_resume_manages_subscription(
     monkeypatch: pytest.MonkeyPatch,
     retain_client: bool,
+    model_provider: str | None,
 ) -> None:
     """
     Preloading uses Codex ``thread/resume`` before bridge state is exposed.
@@ -92,6 +94,7 @@ def test_preload_codex_thread_for_resume_manages_subscription(
                 'approvals_reviewer="auto_review"',
             ],
             retain_client=retain_client,
+            model_provider=model_provider,
         )
     )
 
@@ -105,6 +108,7 @@ def test_preload_codex_thread_for_resume_manages_subscription(
                 "permissions": ":danger-full-access",
                 "approvalPolicy": "never",
                 "approvalsReviewer": "auto_review",
+                **({"modelProvider": model_provider} if model_provider is not None else {}),
             },
         )
     ]
@@ -172,6 +176,19 @@ def test_preload_codex_thread_closes_client_on_failure(
         ),
         (
             codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": (
+                        "invalid paginated history lineage for "
+                        "019e96aa-0be2-7343-8d3b-6f914d60936d: "
+                        "source rollout is not paginated"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
                 {"code": -32603, "message": "internal error: something unrelated"}
             ),
             False,
@@ -187,7 +204,8 @@ def test_preload_codex_thread_closes_client_on_failure(
 )
 def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     """
-    Only codex's thread-store read failure counts as an unreadable thread.
+    Only codex's thread-store read failure and its unpaginated-lineage
+    rejection count as an unreadable thread.
 
     A refused resume (another writer holds the thread) and a plain runtime
     error must keep failing loud rather than silently starting a fresh thread.

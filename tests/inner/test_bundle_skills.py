@@ -153,7 +153,12 @@ def test_claude_agents_skill_args_without_portable_skills_skips_native_reads(
 
 @pytest.mark.parametrize(
     "skills_filter,expected",
-    [("all", {"portable", "hidden"}), ("none", set()), (["portable"], {"portable"})],
+    [
+        ("all", {"portable", "hidden"}),
+        ("none", set()),
+        (["portable"], {"portable"}),
+        (["label-portable"], {"portable"}),
+    ],
 )
 def test_claude_agents_skill_args(
     tmp_path: Path,
@@ -164,11 +169,12 @@ def test_claude_agents_skill_args(
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     workspace = tmp_path / "workspace"
     for name in ("portable", "hidden", "duplicate"):
-        source = workspace / ".agents" / "skills" / f"source-{name}"
+        source = workspace / ".agents" / "skills" / name
         source.mkdir(parents=True)
         hidden = "user-invocable: false\n" if name == "hidden" else ""
+        # The frontmatter name is only a label; links are named by directory.
         (source / "SKILL.md").write_text(
-            f"---\nname: {name}\ndescription: {name}\n{hidden}---\nRead reference.txt.\n"
+            f"---\nname: label-{name}\ndescription: {name}\n{hidden}---\nRead reference.txt.\n"
         )
         (source / "reference.txt").write_text(name)
     config = tmp_path / "claude-config"
@@ -244,7 +250,9 @@ def test_claude_agents_skill_args_copy_fallback_isolates_failures(
     assert not overlay.exists()
 
 
-@pytest.mark.parametrize("skills_filter", ["all", ["Deploy", "deploy", "directory", "label"]])
+@pytest.mark.parametrize(
+    "skills_filter", ["all", ["Deploy", "deploy", "Native", "native", "label"]]
+)
 def test_claude_agents_skill_args_case_collisions_match_menu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skills_filter: str | list[str]
 ) -> None:
@@ -253,12 +261,13 @@ def test_claude_agents_skill_args_case_collisions_match_menu(
     home, workspace = tmp_path / "home", tmp_path / "workspace"
     monkeypatch.setattr(Path, "home", lambda: home)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    # Collisions compare directory names; a native skill's label reserves nothing.
     for root, tier, directory, name in (
-        (workspace, ".agents", "upper", "Deploy"),
-        (home, ".agents", "lower", "deploy"),
-        (workspace, ".claude", "Directory", "native-label"),
-        (workspace, ".claude", "Native", "label"),
-        (workspace, ".agents", "alias", "directory"),
+        (workspace, ".agents", "Deploy", "upper"),
+        (home, ".agents", "deploy", "lower"),
+        (workspace, ".claude", "Native", "native-label"),
+        (workspace, ".agents", "native", "alias"),
+        (workspace, ".claude", "Other", "label"),
         (workspace, ".agents", "label", "label"),
     ):
         skill = root / tier / "skills" / directory / "SKILL.md"
@@ -267,15 +276,15 @@ def test_claude_agents_skill_args_case_collisions_match_menu(
 
     args = claude_agents_skill_args(tmp_path / "bridge", (workspace,), skills_filter)
     exposed = Path(args[1]) / ".claude" / "skills"
-    assert {path.name for path in exposed.iterdir()} == {"Deploy"}
+    assert {path.name for path in exposed.iterdir()} == {"Deploy", "label"}
     ctx = skill_source_context_from_env(
         roots=(workspace,), harness="claude-native", skills_filter=skills_filter
     )
     menu = resolve_harness_skills(ctx, "claude-native")
     assert {
         skill.name for skill in menu if skill.skill_dir and ".agents" in skill.skill_dir.parts
-    } == {"Deploy"}
-    assert "label" in {skill.name for skill in menu}
+    } == {"Deploy", "label"}
+    assert "Native" in {skill.name for skill in menu}
 
 
 def test_claude_agents_skill_args_ignores_unloaded_bundle_claude_skills(

@@ -55,6 +55,8 @@ def test_plain_plugin_and_private_diagnostics(tmp_path, monkeypatch, caplog):
         ("é" * (MAX_SKILL_CONTENT_BYTES // 2 + 1), True),
         ("€" * MAX_SKILL_CONTENT_BYTES, True),
     ],
+    # The content itself would make each test id hundreds of KB long.
+    ids=["ascii-at-cap", "two-byte-over-cap", "three-byte-over-cap"],
 )
 def test_content_byte_cap(monkeypatch, content, truncated):
     from omnigent.spec.types import SkillSpec
@@ -80,7 +82,8 @@ def test_installed_skill_identity_survives_collisions_and_invocation_filters(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     claude = tmp_path / ".claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
-    plain = claude / "skills" / "plain"
+    # The directory, not the frontmatter, is a skill's identity.
+    plain = claude / "skills" / "toolkit:lint"
     plain.mkdir(parents=True)
     (plain / "SKILL.md").write_text("---\nname: toolkit:lint\ndescription: Plain\n---\nplain body")
     installs = {}
@@ -106,7 +109,7 @@ def test_installed_skill_identity_survives_collisions_and_invocation_filters(
         bodies = set()
         for entry in plugin["skill_entries"]:
             ids.add(entry["id"])
-            result = read_skill_content("claude-native", "toolkit:lint", entry["id"])
+            result = read_skill_content("claude-native", f"toolkit:{entry['name']}", entry["id"])
             bodies.add(result["content"])
             assert str(tmp_path) not in json.dumps(result)
         assert bodies == {
