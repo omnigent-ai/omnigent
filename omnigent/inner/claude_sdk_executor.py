@@ -937,11 +937,16 @@ def _inventory_mcp_server_name(live_name: str) -> str:
 
 
 async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
-    """Reconnect the named servers the CLI reports failed; return those to check again."""
+    """Reconnect the named servers the CLI reports failed; return those to check again.
+
+    :raises TimeoutError: The CLI did not answer in time and is still busy with the request.
+    """
     try:
         response = await asyncio.wait_for(
             client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
         )
+    except TimeoutError:
+        raise
     except Exception:
         logger.warning("Reading MCP status before reconnect failed", exc_info=True)
         return names
@@ -962,20 +967,14 @@ async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) 
         elif status in ("failed", "needs-auth"):
             failed.append((live_name, name))
 
-    async def reconnect(live_name: str, name: str) -> None:
-        try:
-            await asyncio.wait_for(
-                client.reconnect_mcp_server(live_name), timeout=_MCP_RECONNECT_TIMEOUT_SECONDS
-            )
-        except TimeoutError:
-            # Not retried, so a server that hangs cannot stall every later turn.
-            logger.warning("Reconnecting MCP server %r timed out", live_name)
-        except Exception:
-            logger.warning("Reconnecting MCP server %r failed", live_name, exc_info=True)
-            retry.add(name)
-
-    # Run together, so several hung servers delay the turn by one timeout at most.
-    await asyncio.gather(*(reconnect(live_name, name) for live_name, name in failed))
+    # The CLI handles control requests one at a time, so the reconnects share one budget.
+    async with asyncio.timeout(_MCP_RECONNECT_TIMEOUT_SECONDS):
+        for live_name, name in failed:
+            try:
+                await client.reconnect_mcp_server(live_name)
+            except Exception:
+                logger.warning("Reconnecting MCP server %r failed", live_name, exc_info=True)
+                retry.add(name)
     return retry
 
 
@@ -2158,14 +2157,16 @@ class ClaudeSDKExecutor(Executor):
         if state.model != model:
             await state.client.set_model(model)
             state.model = model
-        await self._reconnect_signed_in_mcp_servers(state)
         return state.client
 
-    async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> None:
+    async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> bool:
         """Reconnect servers the host reports signed in since this client last checked.
 
         The CLI connects MCP servers only at startup, so one that failed while its
         sign-in was pending stays failed for the life of the client.
+
+        :returns: ``False`` when the CLI is still busy with a timed-out request and
+            would hold the next prompt, so the client must be replaced.
         """
         current = _claude_mcp_auth_statuses()
         signed_in = {
@@ -2173,11 +2174,21 @@ class ClaudeSDKExecutor(Executor):
             for name, status in current.items()
             if status == "connected" and state.mcp_auth.get(name) != "connected"
         }
-        retry = (
-            await _reconnect_failed_mcp_servers(state.client, signed_in) if signed_in else set()
-        )
+        try:
+            retry = (
+                await _reconnect_failed_mcp_servers(state.client, signed_in)
+                if signed_in
+                else set()
+            )
+        except TimeoutError:
+            logger.warning(
+                "Reconnecting MCP servers timed out; restarting the Claude CLI, "
+                "which connects them as it starts"
+            )
+            return False
         # A server left out of the snapshot is checked again next turn.
         state.mcp_auth = {name: status for name, status in current.items() if name not in retry}
+        return True
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
@@ -2882,12 +2893,21 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
-            # turns, but let /compact operate on the existing client's context.
-            await self._close_live_client(session_key)
-            resume_session = False
-            prompt = self._build_prompt(messages, resume_session=False)
+        if state is not None and prompt != "/compact":
+            # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
+            # holds the prompt. Rebuild with history for conversational turns, but let
+            # /compact operate on the existing client's context.
+            rebuild = state.effort != reasoning_effort
+            if not rebuild:
+                try:
+                    rebuild = not await self._reconnect_signed_in_mcp_servers(state)
+                except asyncio.CancelledError:
+                    self._evict_client_on_cancel(session_key)
+                    raise
+            if rebuild:
+                await self._close_live_client(session_key)
+                resume_session = False
+                prompt = self._build_prompt(messages, resume_session=False)
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
