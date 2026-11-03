@@ -98,7 +98,7 @@ from omnigent.host.frames import (
 from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
-from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
@@ -3824,6 +3824,41 @@ async def test_hello_advertises_installed_version() -> None:
     assert hello.version != "0.1.0"
 
 
+async def test_hello_does_not_wait_for_forkserver_control(
+    tmp_path: Path,
+) -> None:
+    host = _make_host_process()
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(os.getpid(), manager)
+    host._runners["runner_alive"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    control_locked = threading.Event()
+    release_control = threading.Event()
+    hello_sent = threading.Event()
+    completed_before_release: list[bool] = []
+
+    def hold_control() -> None:
+        with manager._lock:
+            control_locked.set()
+            release_control.wait(5.0)
+            completed_before_release.append(hello_sent.is_set())
+
+    holder = threading.Thread(target=hold_control)
+    holder.start()
+    tunnel = _FakeTunnel()
+    try:
+        assert await asyncio.to_thread(control_locked.wait, 5.0)
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await host._serve_frames(tunnel)  # type: ignore[arg-type]
+        hello_sent.set()
+        hello = decode_host_frame(tunnel.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.runners == ["runner_alive"]
+    finally:
+        release_control.set()
+        await asyncio.to_thread(holder.join, 5.0)
+    assert completed_before_release == [True], "hello waited for the forkserver control lock"
+
+
 async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
@@ -3976,14 +4011,9 @@ async def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     assert result.status == "unknown"
 
 
-def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
-    """
-    Verify that _alive_runner_ids removes dead processes and returns
-    only alive ones.
-
-    If dead runners persist, reconnect reconciliation would report
-    runners that are no longer running.
-    """
+@pytest.mark.parametrize("forked", [False, True])
+async def test_alive_runner_ids_preserves_exit_reporting(tmp_path: Path, forked: bool) -> None:
+    """Inventory omits observed exits without taking ownership from the watcher."""
     host = _make_host_process()
     maintenance_reasons: list[str] = []
     host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
@@ -3994,28 +4024,41 @@ def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
         stderr=subprocess.DEVNULL,
     )
     dead_proc = subprocess.Popen(
-        ["true"],
+        [sys.executable, "-c", "raise SystemExit(7)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     dead_proc.wait()
+    dead_handle: subprocess.Popen[bytes] | ZygoteRunnerProc = dead_proc
+    if forked:
+        dead_handle = ZygoteRunnerProc(dead_proc.pid, ZygoteManager())
+        dead_handle.returncode = dead_proc.returncode
 
     host._runners["runner_alive"] = _RunnerHandle(
         proc=alive_proc, log_path=tmp_path / "runner-alive.log"
     )
     host._runners["runner_dead"] = _RunnerHandle(
-        proc=dead_proc, log_path=tmp_path / "runner-dead.log"
+        proc=dead_handle, log_path=tmp_path / "runner-dead.log"
     )
 
-    alive_ids = host._alive_runner_ids()
-
-    assert "runner_alive" in alive_ids
-    assert "runner_dead" not in alive_ids, "Dead runner should be cleaned up"
-    assert "runner_dead" not in host._runners, "Dead runner should be removed from tracking dict"
-    assert maintenance_reasons == ["runner_exited_during_reconnect"]
-
-    alive_proc.terminate()
-    alive_proc.wait()
+    try:
+        alive_ids = host._alive_runner_ids()
+        assert alive_ids == ["runner_alive"]
+        assert "runner_dead" in host._runners
+        assert maintenance_reasons == []
+        tunnel = _FakeTunnel()
+        host._ws = tunnel  # type: ignore[assignment]
+        await host._watch_runner("runner_dead")
+        await host._watch_runner("runner_dead")
+        [report] = [decode_host_frame(raw) for raw in tunnel.sent]
+        assert isinstance(report, HostRunnerExitedFrame)
+        assert report.runner_id == "runner_dead"
+        assert "code 7" in report.error
+        assert "runner_dead" not in host._runners
+        assert maintenance_reasons == ["runner_exited"]
+    finally:
+        alive_proc.terminate()
+        alive_proc.wait()
 
 
 def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
@@ -7979,6 +8022,68 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     assert maintenance_reasons == ["runner_spawn_abandoned"]
 
 
+@pytest.mark.parametrize("cancel_during_poll", [False, True])
+async def test_initial_runner_poll_keeps_loop_responsive_and_cancellation_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_during_poll: bool
+) -> None:
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    loop = asyncio.get_running_loop()
+    loop_thread_id = threading.get_ident()
+    poll_started = asyncio.Event()
+    release_poll = threading.Event()
+    poll_thread_ids: list[int] = []
+    proc = subprocess.Popen(["sleep", "60"])
+    real_poll = proc.poll
+
+    def gated_poll() -> int | None:
+        thread_id = threading.get_ident()
+        poll_thread_ids.append(thread_id)
+        loop.call_soon_threadsafe(poll_started.set)
+        if thread_id != loop_thread_id:
+            release_poll.wait(5.0)
+        return real_poll()
+
+    monkeypatch.setattr(proc, "poll", gated_poll)
+    monkeypatch.setattr(host, "_spawn_runner_proc", lambda *_: (proc, tmp_path / "runner.log"))
+    frame = HostLaunchRunnerFrame(
+        request_id="req_initial_poll",
+        binding_token="token_initial_poll",
+        workspace=str(tmp_path),
+    )
+    launch = asyncio.create_task(host._handle_launch(frame))
+    try:
+        await asyncio.wait_for(poll_started.wait(), timeout=5.0)
+        assert loop_thread_id not in poll_thread_ids, "runner poll blocked the host event loop"
+        assert not launch.done()
+        assert frame.request_id in host._spawned_launch_requests
+        assert not host._runners
+        if cancel_during_poll:
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+            assert host._runner_stop_tasks
+            release_poll.set()
+            await host._drain_runner_stop_tasks()
+            assert real_poll() is not None, "cancellation abandoned the spawned runner"
+            assert not host._runners
+        else:
+            release_poll.set()
+            result = await launch
+            assert result.status == "launched"
+            assert result.runner_id == token_bound_runner_id(frame.binding_token)
+            assert host._runners[result.runner_id].proc is proc
+    finally:
+        release_poll.set()
+        await _cancel(launch)
+        _cleanup_host(host)
+        if real_poll() is None:
+            proc.terminate()
+        proc.wait()
+        await host._drain_runner_stop_tasks()
+
+
 @pytest.mark.timeout(5, method="signal")
 async def test_drain_runner_stop_tasks_removes_completed_tasks_before_callbacks() -> None:
     host = _make_host_process()
@@ -9124,6 +9229,26 @@ async def test_launch_handler_fault_after_spawn_leaves_the_launch_unanswered(
         )
     finally:
         _cleanup_host(host)
+
+
+async def test_initial_runner_poll_failure_does_not_refuse_a_spawned_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    proc = Mock(poll=Mock(side_effect=OSError("poll unavailable")))
+    monkeypatch.setattr(host, "_spawn_runner_proc", lambda *_: (proc, tmp_path / "runner.log"))
+    frame = HostLaunchRunnerFrame(
+        request_id="req_poll_error",
+        binding_token="token_poll_error",
+        workspace=str(tmp_path),
+    )
+    ws = _CollectingWs()
+    with pytest.raises(OSError, match="poll unavailable"):
+        await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+    assert not ws.sent, "a spawned runner must not receive a failed-launch response"
+    assert not host._spawned_launch_requests
 
 
 async def test_launch_handler_fault_survives_a_lost_answer(
