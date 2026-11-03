@@ -412,7 +412,9 @@ describe("bridge runtime scroll position", () => {
     },
   );
 
-  type RuntimePort = { onmessage: ((event: { data: unknown }) => void) | null };
+  interface RuntimePort {
+    onmessage: ((event: { data: unknown }) => void) | null;
+  }
 
   /** Restore to 640 in a page whose one comment's highlight sits at `highlightTop`. */
   function restoreWithComment(highlightTop: number, run: (port: RuntimePort) => void) {
