@@ -381,12 +381,12 @@ class _FakeProcessManager:
         :param only_if_idle_cutoff: Idle-reap cutoff; when given, a
             conversation with an active turn is not torn down.
         :param only_if_current: Ownership check guarding delayed cleanup.
-        :param only_if_unused_since: Preserve a harness used after this time.
+        :param only_if_unused_since: Preserve a harness used at or after this time.
         """
         self.release_calls.append((conversation_id, only_if_idle_cutoff))
         owned = only_if_current() if only_if_current is not None else None
         unused = (
-            self._last_used_at.get(conversation_id, 0.0) <= only_if_unused_since
+            self._last_used_at.get(conversation_id, 0.0) < only_if_unused_since
             if only_if_unused_since is not None
             else None
         )

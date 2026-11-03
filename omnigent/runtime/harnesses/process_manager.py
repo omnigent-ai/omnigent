@@ -1193,9 +1193,9 @@ class HarnessProcessManager:
         :param conversation_id: AP-allocated conversation id.
         :param only_if_current: Synchronous ownership check evaluated under the
             spawn and registry locks, immediately before unregistering.
-        :param only_if_unused_since: Preserve an entry acquired or touched after
+        :param only_if_unused_since: Preserve an entry acquired or touched at or after
             this monotonic timestamp, even before a new terminal is registered.
-            Unlike idle reaping, a draining old turn does not veto release.
+            Unlike ``only_if_idle_cutoff``, a turn still in flight does not veto release.
         """
         spawn_lock = await self._get_spawn_lock(conversation_id)
         async with spawn_lock:
@@ -1206,7 +1206,7 @@ class HarnessProcessManager:
                 if (
                     only_if_unused_since is not None
                     and current is not None
-                    and current.last_used_at > only_if_unused_since
+                    and current.last_used_at >= only_if_unused_since
                 ):
                     return
                 if only_if_idle_cutoff is not None:
