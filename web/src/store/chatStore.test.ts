@@ -7410,8 +7410,14 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         return rewindFetch(input, init);
       });
 
+      const warning = vi.spyOn(toast, "warning");
+      onTestFinished(() => warning.mockRestore());
+
       await useChatStore.getState().rewindToPrompt("msg_second");
 
+      expect(warning).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't restore gone.txt to the composer. Attach again to send.",
+      );
       const files = getSessionDraft("conv_new")?.files ?? [];
       expect(files.map((file) => [file.name, file.type])).toEqual([
         ["diagram.png", "image/png"],

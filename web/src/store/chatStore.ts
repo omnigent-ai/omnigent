@@ -1925,13 +1925,14 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
 /**
  * Download a rewound prompt's attachments from the new session as composer
  * files. Each is remembered as already uploaded there, so sending reuses the
- * session's copy. An attachment that fails to download is left out.
+ * session's copy. An attachment that fails to download is left out, and a
+ * warning names it.
  */
 async function rewindAttachmentFiles(
   sessionId: string,
   attachments: readonly RewindAttachment[],
 ): Promise<File[]> {
-  const files = await Promise.all(
+  const downloads = await Promise.all(
     attachments.map(async (attachment) => {
       try {
         const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
@@ -1948,7 +1949,12 @@ async function rewindAttachmentFiles(
       }
     }),
   );
-  return files.filter((file): file is File => file !== null);
+  const missing = attachments.filter((_attachment, index) => downloads[index] === null);
+  if (missing.length > 0) {
+    const names = missing.map((attachment) => attachment.filename).join(", ");
+    toast.warning(`Couldn't restore ${names} to the composer. Attach again to send.`);
+  }
+  return downloads.filter((file): file is File => file !== null);
 }
 
 async function uploadFileBlocks(

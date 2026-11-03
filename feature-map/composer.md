@@ -153,7 +153,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   prompts failed to load, no prompts, older prompts loading or failed, refused
   while a turn runs or the runner and host are offline (error under the
   composer), prompt arriving after the new session opened (filled unless the
-  user has typed there).
+  user has typed there), an attachment that could not be restored (a warning
+  names it).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
