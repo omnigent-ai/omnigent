@@ -8,7 +8,7 @@ import { apiErrorFromResponse } from "./sessionsApi";
 const SESSION_TITLE_INSTRUCTIONS_PATH = "/v1/settings/session-title-instructions";
 
 export interface SessionTitleInstructions {
-  /** Saved guidance, or null when the default title prompt applies. */
+  /** Saved guidance, or null when only the server or default title prompt applies. */
   instructions: string | null;
   /** Longest guidance the server accepts, in characters. */
   max_chars: number;

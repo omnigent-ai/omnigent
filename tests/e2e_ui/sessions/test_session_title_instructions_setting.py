@@ -10,6 +10,7 @@ model received, not model obedience.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import Iterator
 
@@ -87,6 +88,22 @@ def _system_text(body: dict) -> str:
     return system if isinstance(system, str) else json.dumps(system)
 
 
+def _hold_for_recording(page: Page, milliseconds: int) -> None:
+    """Keep a step on screen long enough to read in a recorded run."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
+
+
+def _click_and_await_save(page: Page, test_id: str) -> None:
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith(_SETTINGS_ROUTE) and response.request.method == "PUT"
+        )
+    ) as saved:
+        page.get_by_test_id(test_id).click()
+    assert saved.value.ok
+
+
 def _open_general_settings(page: Page, base_url: str):
     page.goto(f"{base_url}/settings/general")
     field = page.get_by_test_id("session-title-instructions-input")
@@ -101,7 +118,7 @@ def _send_first_message(page: Page, base_url: str, session_id: str, prompt: str)
     composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
     expect(page.get_by_text(_AGENT_REPLY).first).to_be_visible(timeout=180_000)
-    page.wait_for_timeout(1_000)
+    _hold_for_recording(page, 1_000)
 
 
 def test_saved_title_instructions_shape_new_session_title(
@@ -122,20 +139,20 @@ def test_saved_title_instructions_shape_new_session_title(
     expect(page.get_by_test_id("session-title-instructions-status")).to_contain_text(
         f"{len(_INSTRUCTIONS)} / 4000 characters"
     )
-    page.wait_for_timeout(1_500)
-    page.get_by_test_id("session-title-instructions-save").click()
+    _hold_for_recording(page, 1_500)
+    _click_and_await_save(page, "session-title-instructions-save")
     expect(page.get_by_text("Title instructions saved")).to_be_visible(timeout=10_000)
-    page.wait_for_timeout(2_000)
+    _hold_for_recording(page, 2_000)
 
     page.reload()
     field = _open_general_settings(page, base_url)
     expect(field).to_have_value(_INSTRUCTIONS)
-    page.wait_for_timeout(1_500)
+    _hold_for_recording(page, 1_500)
 
     _send_first_message(page, base_url, session_id, prompt)
     row = page.locator(f'a[href="/c/{session_id}"]').first
     expect(row).to_contain_text("[OMNI-123] Login timeout", timeout=120_000)
-    page.wait_for_timeout(3_000)
+    _hold_for_recording(page, 3_000)
 
     for instructions in _title_request_instructions(mock_llm_server_url, nonce):
         assert f"<title_requirements>\n{_INSTRUCTIONS}\n" in instructions
@@ -158,21 +175,21 @@ def test_cleared_title_instructions_restore_default_prompt(
 
     field = _open_general_settings(page, base_url)
     expect(field).to_have_value(_INSTRUCTIONS)
-    page.wait_for_timeout(1_000)
-    page.get_by_test_id("session-title-instructions-clear").click()
+    _hold_for_recording(page, 1_000)
+    _click_and_await_save(page, "session-title-instructions-clear")
     expect(page.get_by_text("Title instructions cleared")).to_be_visible(timeout=10_000)
     expect(field).to_have_value("")
-    page.wait_for_timeout(2_000)
+    _hold_for_recording(page, 2_000)
 
     page.reload()
     field = _open_general_settings(page, base_url)
     expect(field).to_have_value("")
-    page.wait_for_timeout(1_500)
+    _hold_for_recording(page, 1_500)
 
     _send_first_message(page, base_url, session_id, prompt)
     row = page.locator(f'a[href="/c/{session_id}"]').first
     expect(row).to_contain_text("Investigate login timeout", timeout=120_000)
-    page.wait_for_timeout(3_000)
+    _hold_for_recording(page, 3_000)
 
     for instructions in _title_request_instructions(mock_llm_server_url, nonce):
         assert "Create a concise 2-5 word title" in instructions

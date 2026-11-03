@@ -283,11 +283,15 @@ async def test_agent_rename_adds_session_owner_instructions(
         json={"instructions": "End every title with the ticket id."},
     )
     assert saved.status_code == 200, saved.text
-    # Another user's setting must not reach the owner's session.
+    # A collaborator who triggers the rename must not have their own setting applied.
+    SqlAlchemyPermissionStore(db_uri).grant(
+        "collaborator@example.test", title_session.id, LEVEL_EDIT
+    )
+    collaborator = {"X-Forwarded-Email": "collaborator@example.test"}
     other = await title_client.put(
         "/v1/settings/session-title-instructions",
         json={"instructions": "Write titles in French."},
-        headers={"X-Forwarded-Email": "someone-else@example.test"},
+        headers=collaborator,
     )
     assert other.status_code == 200, other.text
     generator = AsyncMock(return_value="sep-13-PR-123-resolve-conflict-OMNI-1")
@@ -296,6 +300,7 @@ async def test_agent_rename_adds_session_owner_instructions(
     response = await title_client.post(
         f"/v1/sessions/{title_session.id}/agent-title",
         json={"title": "Resolve PR 123 conflict"},
+        headers=collaborator,
     )
 
     assert response.status_code == 200, response.text

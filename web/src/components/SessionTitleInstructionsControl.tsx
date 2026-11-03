@@ -78,7 +78,7 @@ export function SessionTitleInstructionsControl() {
         label="Title instructions"
         labelId={labelId}
         descriptionId={descriptionId}
-        description="Guidance for automatic session titles, such as a format, language or prefix. Leave blank to use the default title prompt."
+        description="Guidance for automatic session titles, such as a format, language or prefix. Leave blank to use the server's title instructions, or the default prompt."
         descriptionClassName="text-ui"
       />
       <Textarea
