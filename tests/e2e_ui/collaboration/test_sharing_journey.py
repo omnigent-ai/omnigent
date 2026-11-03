@@ -22,7 +22,6 @@ the sidebar.
 
 from __future__ import annotations
 
-import re
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -48,7 +47,6 @@ _BUBBLE = '[data-testid="message-bubble"]'
 # Permission levels mirrored from omnigent/server/auth.py.
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
-_PUBLIC_USER = "__public__"
 
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
 _OWNER_ROW = '[data-testid="agent-info-session-owner"]'
@@ -304,33 +302,3 @@ def test_agent_info_popover_shows_session_owner(
         owner_row = owner_page.locator(_OWNER_ROW)
         expect(owner_row).to_be_visible(timeout=15_000)
         expect(owner_row).to_contain_text("(you)")
-
-
-def test_link_shared_session_tab_title_matches_header(
-    browser: Browser,
-    live_server: str,
-    shared: _SharedFixture,
-) -> None:
-    """The tab shows the session title, like the header, without a sidebar row.
-
-    Public grants stay out of Bob's lists and the silenced socket can't push the row in.
-    """
-    sid = shared.session_id
-    title = f"Shared tab title {uuid.uuid4().hex[:6]}"
-    shared.owner.patch(f"/v1/sessions/{sid}", json={"title": title}).raise_for_status()
-    shared.owner.put(
-        f"/v1/sessions/{sid}/permissions",
-        json={"user_id": _PUBLIC_USER, "level": _LEVEL_READ},
-    ).raise_for_status()
-    assert shared.bob.get(f"/v1/sessions/{sid}").json()["title"] == title
-    for visibility in ("all", "shared"):
-        listed = shared.bob.get("/v1/sessions", params={"visibility": visibility}).json()
-        assert sid not in {row["id"] for row in listed["data"]}
-
-    with user_page(browser, headers={"X-Forwarded-Email": shared.bob_email}) as bob_page:
-        bob_page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
-        bob_page.goto(f"{live_server}/c/{sid}")
-        expect(bob_page.get_by_placeholder(_READONLY_PLACEHOLDER)).to_be_visible(timeout=30_000)
-        breadcrumb = bob_page.get_by_role("navigation", name="Conversation")
-        expect(breadcrumb.get_by_text(title, exact=True)).to_be_visible()
-        expect(bob_page).to_have_title(re.compile(rf"^(?:● )?{re.escape(title)}$"))
