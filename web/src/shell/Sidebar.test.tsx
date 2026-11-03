@@ -32,6 +32,7 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import { writeProjectFolderPagination } from "@/lib/projectFolderPaginationPreferences";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
@@ -2773,6 +2774,43 @@ describe("Sidebar project Show more", () => {
     // Every loaded row is listed but the server has more, so the next click fetches.
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists every session and auto-loads more pages when pagination is turned off", () => {
+    let observerCallback: IntersectionObserverCallback | undefined;
+    class TestObserver {
+      constructor(cb: IntersectionObserverCallback) {
+        observerCallback = cb;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+      takeRecords = () => [];
+      root = null;
+      rootMargin = "";
+      thresholds = [];
+    }
+    vi.stubGlobal("IntersectionObserver", TestObserver);
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    const fetchNextPage = vi.fn();
+    projectSessionsNextPage.current["Customer X"] = fetchNextPage;
+    writeProjectFolderPagination(false);
+    renderSidebar();
+    toggleFolder();
+
+    expect(folderRowIds()).toEqual(filedIds(12));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+    // Scrolling the folder's end into view fetches its next server page.
+    act(() => {
+      observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
+    });
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+
+    // Turning pagination back on applies to the open folder without a reload.
+    act(() => writeProjectFolderPagination(true));
+    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
 
   it("badges Show more with the state of the sessions it hides", () => {

@@ -1,3 +1,4 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
@@ -7,6 +8,10 @@ import {
   subscribeHiddenPickerAgents,
   writeHiddenPickerAgents,
 } from "./pickerEntryVisibility";
+import {
+  PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
+  useProjectFolderPagination,
+} from "./projectFolderPaginationPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -144,4 +149,21 @@ it("carries hidden picker entries through export and import and tells an open pi
   expect(readHiddenPickerAgents()).toEqual(new Set(["polly"]));
   expect(listener).toHaveBeenCalledTimes(2);
   unsubscribe();
+});
+
+it("carries project folder pagination through export and import and tells a mounted sidebar", () => {
+  localStorage.setItem(PROJECT_FOLDER_PAGINATION_STORAGE_KEY, "false");
+  const exported = collectSettings()!;
+  expect(exported.settings[PROJECT_FOLDER_PAGINATION_STORAGE_KEY]).toBe("false");
+  const { result } = renderHook(() => useProjectFolderPagination());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(result.current).toBe(true);
+  act(() => {
+    applyImportedSettings(exported);
+  });
+  expect(result.current).toBe(false);
 });

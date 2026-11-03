@@ -10,6 +10,10 @@ import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePrefer
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import {
+  notifyProjectFolderPaginationChanged,
+  PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
+} from "./projectFolderPaginationPreferences";
+import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
 } from "./pickerEntryVisibility";
@@ -39,6 +43,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  PROJECT_FOLDER_PAGINATION_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
@@ -163,6 +168,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   // Same-tab writes fire no storage event, so the subscribable preferences
   // have to be told; otherwise an open picker keeps the pre-import set.
   notifyHiddenPickerAgentsChanged();
+  notifyProjectFolderPaginationChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

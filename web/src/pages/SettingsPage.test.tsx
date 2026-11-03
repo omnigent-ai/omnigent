@@ -541,6 +541,7 @@ describe("SettingsPage", () => {
     for (const testId of [
       "settings-group-theme",
       "settings-group-chat",
+      "settings-group-sidebar",
       "settings-group-interface-type",
       "settings-group-code-type",
       "settings-group-data",
@@ -1051,6 +1052,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
+    fireEvent.click(screen.getByTestId("project-folder-pagination-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -1077,6 +1079,11 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
       "aria-checked",
       "true",
+    );
+    expect(localStorage.getItem("omnigent:project-folder-pagination")).toBe("false");
+    expect(screen.getByTestId("project-folder-pagination-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
     );
 
     // Open the confirmation dialog and confirm the reset.
@@ -1130,6 +1137,11 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(screen.getByTestId("project-folder-pagination-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:project-folder-pagination")).toBeNull();
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 

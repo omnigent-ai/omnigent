@@ -5,6 +5,7 @@ import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDr
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
+import { useProjectFolderPagination } from "@/lib/projectFolderPaginationPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -1437,7 +1438,8 @@ const PROJECT_FOLDER_PAGE_SIZE = 5;
  * shows ALL its members regardless of how far the global sidebar list has been
  * scrolled. It lists PROJECT_FOLDER_PAGE_SIZE rows at a time; "Show more"
  * reveals the next page, fetching another server page once the loaded rows run
- * out. Lazy: the fetch is gated on `expanded`, so a collapsed folder costs
+ * out. With pagination turned off in Appearance settings it lists every loaded
+ * row and loads further server pages as the sidebar scrolls. Lazy: the fetch is gated on `expanded`, so a collapsed folder costs
  * nothing. The collapsed `marker` is supplied by the parent (best-effort, from
  * the globally-loaded window) since a collapsed folder hasn't fetched yet.
  */
@@ -1462,7 +1464,10 @@ function ProjectFolder({
   onProjectAssigned,
   onConversationsLoaded,
   ordering,
+  scrollRoot,
 }: {
+  /** The sidebar's scroll container, the root for unpaginated auto-loading. */
+  scrollRoot: RefObject<HTMLElement | null>;
   ordering: {
     disabled: boolean;
     insertion?: "before" | "after";
@@ -1555,10 +1560,11 @@ function ProjectFolder({
     viewerId,
   ]);
   // Each expansion starts at one page; the open session is never left hidden.
+  const paginated = useProjectFolderPagination();
   const display = useSidebarDisplayPagination(
     conversations,
     JSON.stringify([expanded, archived, sortBy]),
-    PROJECT_FOLDER_PAGE_SIZE,
+    paginated ? PROJECT_FOLDER_PAGE_SIZE : undefined,
     query.hasNextPage,
     query.fetchNextPage,
     expanded ? conversations.findIndex((c) => c.id === activeConversationId) : -1,
@@ -1730,6 +1736,15 @@ function ProjectFolder({
                 Loading…
               </p>
             </div>
+          ) : !paginated ? (
+            <InfiniteScrollSentinel
+              hasMore={query.hasNextPage}
+              isFetching={query.isFetchingNextPage}
+              fetchMore={query.fetchNextPage}
+              scrollRoot={scrollRoot}
+              scopeKey={name}
+              indent
+            />
           ) : display.hasMore ? (
             <ProjectShowMoreRow
               loading={query.isFetchingNextPage}
@@ -2993,6 +3008,7 @@ function ConversationList({
                                     : "before"
                                   : undefined,
                             }}
+                            scrollRoot={scrollContainerRef}
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}

@@ -68,7 +68,10 @@ the header menu), and each place is a separate entry point.
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
   attention or is unread. Filing a session into the folder leaves its listed
-  rows as they are, so an older one lands behind Show more.
+  rows as they are, so an older one lands behind Show more. Settings →
+  Appearance → Sidebar → "Show project sessions five at a time" (on by
+  default, per device) turns this off: folders then list every loaded session
+  and load more as the sidebar scrolls, with no Show more row.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
@@ -1026,7 +1029,10 @@ plain `uv run pytest`, which starts a private server for the test.
   reveal, row-menu filing leaving the listed rows as they are, the
   hidden-session badge, and the ⌘[ / ⌘] hotkey;
   `web/src/shell/Sidebar.shiftSelect.test.tsx` covers shift ranges, bulk
-  actions, and bulk filing. By hand: create a project
+  actions, and bulk filing. The Settings switch is covered by the Sidebar test
+  "lists every session and auto-loads more pages when pagination is turned
+  off", `web/src/pages/SettingsPage.test.tsx` (reset), and
+  `web/src/lib/settingsPortability.test.ts` (export/import). By hand: create a project
   (`POST /v1/projects`), file six or more sessions into it with
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
