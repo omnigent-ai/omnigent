@@ -660,25 +660,25 @@ owner (`local` for auth-disabled servers); attributes are `task_id`,
 `target`, and `session_mode`. Rejected creates emit no creation event. As with
 run logs, delivery is best-effort; reconcile current inventory against the store.
 
-UI events use the existing host-provided `OmnigentHostConfig.analytics` sink:
+UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 
-| Metric | Previously available | Current measurement |
-| --- | --- | --- |
-| Feature visitors | Page views (`tasks`, `tasks.detail`) and action clicks | Distinct host-identified users on `page_view` with `pageId=tasks`, `tasks.templates`, or `tasks.detail`; templates now have a separate page ID. |
-| Users creating automations | Current task owners in the store | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` in the reporting window. |
-| Automations created per person | Surviving tasks grouped by owner | Distinct `task_id` per owner on `scheduled_task_created`, including tasks later deleted while events remain retained. |
-| Active tasks and active owners | Task state and owner in the store | Continue using `scheduled_tasks` filtered to `state=active`; group by workspace and owner. This is a current snapshot, not historical daily activity. |
-| Template selections | No template-specific click | `click` with `componentId=tasks.template.<id>`, from both the empty-state preview and Templates tab. |
-| Successful template use | No creation attribution | `scheduled_task_created` grouped by `template_id`; distinct owners gives template users. |
-| UI creation attempts, successes, failures, latency | Save clicks | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
-| UI / agent / API share | No explicit origin | `scheduled_task_created` grouped by `creation_source`. |
+| Metric | Measurement |
+| --- | --- |
+| Feature visitors | Distinct host-identified users on `page_view` with `pageId=tasks`, `tasks.templates`, or `tasks.detail`. |
+| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` in the reporting window. |
+| Automations created per person | Distinct `task_id` per owner on `scheduled_task_created`, including tasks later deleted while events remain retained. |
+| Active tasks and active owners | Use `scheduled_tasks` filtered to `state=active`; group by workspace and owner. This is a current snapshot, not historical daily activity. |
+| Template selections | `click` with `componentId=tasks.template.<id>`, from both the empty-state preview and Templates tab. |
+| Successful template use | `scheduled_task_created` grouped by `template_id`; distinct owners gives template users. |
+| UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
+| UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
 
 Template IDs are bounded: `custom`, `jira`, `slack`, `github`,
 `follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
 unattributed/older clients. The current gallery offers Jira, Slack, and GitHub;
 the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
 its prompt is edited. No task name, prompt, Jira query, channel, or repository
-text is added to these events. Attribution headers are diagnostic client claims;
+text is recorded in these events. Attribution headers are diagnostic client claims;
 they never determine ownership or authorization.
 
 The host sink supplies user/workspace identity for UI analytics. Without that
