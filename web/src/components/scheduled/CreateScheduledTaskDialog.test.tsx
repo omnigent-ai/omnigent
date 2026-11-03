@@ -640,6 +640,208 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
   });
 
+  it.each([
+    {
+      mode: "create",
+      saved: null,
+      label: "Provider default",
+      pick: "runtime",
+      expected: "https://github.com/example/runtime",
+    },
+    {
+      mode: "create-default",
+      saved: null,
+      label: "Provider default",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit",
+      saved: "https://github.com/example/runtime",
+      label: "runtime",
+      pick: "universe",
+      expected: "https://github.com/example/universe",
+    },
+    {
+      mode: "edit-default",
+      saved: null,
+      label: "Provider default",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-unchanged",
+      saved: "https://github.com/example/runtime",
+      label: "runtime",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-branch",
+      saved: "https://github.com/example/runtime#main",
+      label: "https://github.com/example/runtime#main",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-legacy",
+      saved: "/home/me",
+      label: "Provider default",
+      pick: null,
+      expected: undefined,
+    },
+    {
+      mode: "edit-clear",
+      saved: "https://github.com/example/runtime",
+      label: "runtime",
+      pick: "Provider default",
+      expected: null,
+    },
+  ])(
+    "saves only changed repository selections ($mode)",
+    async ({ mode, saved, label, pick, expected }) => {
+      const editing = mode.startsWith("edit");
+      const exercisesRestoration = mode === "edit-unchanged";
+      const runtime = "https://github.com/example/runtime";
+      const universe = "https://github.com/example/universe";
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            scheduled_task_harness_settings: true,
+            scheduled_task_sandbox_workspaces: true,
+            sandbox_provider: "arclet",
+            sandbox_provider_capabilities: {
+              arclet: {
+                repo_catalog: [
+                  { name: "universe", url: universe },
+                  { name: "runtime", url: runtime },
+                ],
+              },
+            },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="Nightly"
+            initialPrompt="Do it"
+            editingTask={
+              editing
+                ? scheduledTask({
+                    agentId: "ag_claude_native",
+                    executionTarget: "managed_sandbox",
+                    workspace: saved,
+                    sessionMode: "continue",
+                    sessionId: "existing-session",
+                    modelOverride: "sonnet",
+                    reasoningEffort: "medium",
+                    permissionMode: "acceptEdits",
+                  })
+                : null
+            }
+          />
+        </CapabilitiesProvider>,
+      );
+      if (!editing) {
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+      } else if (exercisesRestoration) {
+        openHostSelect();
+        fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+        openHostSelect();
+        fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+      }
+      expect(screen.queryByTestId("task-workspace-browse")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Repository")).toHaveTextContent(label);
+      const sessionLock = /To change model, effort, or permission mode/;
+      if (editing) {
+        expect(screen.getByText(sessionLock)).toBeInTheDocument();
+        expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+        expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+      }
+      if (exercisesRestoration) {
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "universe" }));
+        expect(screen.queryByText(sessionLock)).not.toBeInTheDocument();
+        expect(screen.getByTestId("task-model-trigger")).toBeEnabled();
+        expect(screen.getByTestId("task-permission-trigger")).toBeEnabled();
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: label }));
+        expect(screen.getByText(sessionLock)).toBeInTheDocument();
+        expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+        expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+        expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
+        expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Accept edits");
+      }
+      if (pick !== null) {
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: pick }));
+      }
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      const mutation = editing ? updateMutateAsync : mutateAsync;
+      await waitFor(() => expect(mutation).toHaveBeenCalledTimes(1));
+      const input = editing ? mutation.mock.calls[0][0].input : mutation.mock.calls[0][0];
+      if (expected === undefined) {
+        expect(input).not.toHaveProperty("workspace");
+        if (editing) {
+          expect(input).not.toHaveProperty("sessionId");
+          expect(input).not.toHaveProperty("modelOverride");
+        }
+      } else {
+        expect(input.workspace).toBe(expected);
+      }
+      expect(input).not.toHaveProperty("hostId");
+    },
+  );
+
+  it.each([false, true])(
+    "gates catalog selection and clears it on a host switch (supported: %s)",
+    async (supported) => {
+      render(
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            scheduled_task_sandbox_workspaces: supported,
+            sandbox_provider: "arclet",
+            sandbox_provider_capabilities: {
+              arclet: {
+                repo_catalog: [{ name: "runtime", url: "https://github.com/example/runtime" }],
+              },
+            },
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="Nightly"
+            initialPrompt="Do it"
+          />
+        </CapabilitiesProvider>,
+      );
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+      if (supported) {
+        fireEvent.keyDown(screen.getByLabelText("Repository"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "runtime" }));
+      } else {
+        expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
+      }
+      openHostSelect();
+      fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+      expect(screen.queryByLabelText("Repository")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("Browse folders");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+      expect(mutateAsync.mock.calls[0][0]).toMatchObject({ hostId: "host_1" });
+      expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("workspace");
+    },
+  );
+
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],

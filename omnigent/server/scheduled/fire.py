@@ -83,6 +83,12 @@ from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
+from omnigent.server.managed_hosts import (
+    is_repo_workspace,
+    managed_repo_labels,
+    parse_repo_workspace,
+    read_managed_repo_workspaces,
+)
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -355,9 +361,17 @@ UNATTENDED_RUN_NOTE = (
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
     "No one can answer questions, approve requests or give input, so work toward the "
     "goal above on your own. Don't ask questions, wait for confirmation or stop to "
-    "request permission. When something is unclear, make a reasonable choice and keep "
-    "going. If an action needs approval or is denied, skip it and say so in your reply. "
-    "End with a reply that says what you did, what you assumed and anything you couldn't do."
+    "request permission. When something is unclear, make a reasonable assumption only "
+    "if it is easy to reverse and within the user's authorization. Record each "
+    "assumption, its basis and how easily it can be changed. For decisions that are "
+    "hard to reverse, involve significant trade-offs or would likely surprise the user, "
+    "record the options and your recommendation, and defer the affected work. Continue "
+    "independent work that does not depend on those decisions. If an action is denied or "
+    "requires unavailable approval, skip that action and explain the blocker. Continue "
+    "independent work and permitted alternatives. Do not change permission settings to "
+    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
+    "prioritizing those the user is most likely to want to change, then summarize what "
+    "you did and anything you couldn't do."
 )
 
 
@@ -649,7 +663,7 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
-        conv = await _create_session(deps, effective)
+        conv = await _create_session(deps, effective, labels=_session_labels(task))
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -746,7 +760,9 @@ async def _run_fire_for_task(
         return
 
     if hand_off:
-        await recorder.hand_off_managed(conv, effective, fire_dispatch.managed_start)
+        await recorder.hand_off_managed(
+            conv, replace(effective, workspace=task.workspace), fire_dispatch.managed_start
+        )
     else:
         await recorder.finish("running", conversation_id=conv.id)
     _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
@@ -881,13 +897,17 @@ async def continued_session_problem(
     # A pin the task changed since would otherwise be ignored silently: the
     # session keeps running where it was created.
     if (task.host_id is not None and task.host_id != conv.host_id) or (
-        task.workspace is not None and task.workspace != conv.workspace
+        task.execution_target != "managed_sandbox"
+        and task.workspace is not None
+        and task.workspace != conv.workspace
     ):
         return (
             "the session runs on a different host or workspace than the automation pins",
             "continued_session_incompatible",
         )
     if task.execution_target == "managed_sandbox":
+        if read_managed_repo_workspaces(conv.labels) != _sandbox_workspaces(task):
+            return "the session uses a different repository", "continued_session_incompatible"
         if conv.host_id is None:
             # Hostless only while the task's own first run provisions its sandbox.
             # The origin label is server-set, so no other session can claim it.
@@ -1011,6 +1031,8 @@ async def _continued_host_binding(deps: FireDeps, task: ScheduledTask) -> tuple[
         deps.conversation_store.get_conversation, task.last_run_conversation_id
     )
     if earlier is None or earlier.host_id != host_id or earlier.workspace is None:
+        return None
+    if read_managed_repo_workspaces(earlier.labels) != _sandbox_workspaces(task):
         return None
     return host_id, earlier.workspace
 
@@ -1332,13 +1354,27 @@ async def _fire_project_id(deps: FireDeps, task: ScheduledTask) -> str | None:
     return project.id
 
 
+def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
+    """Repository selection, excluding stale directory pins from legacy sandbox tasks."""
+    if (
+        task.execution_target == "managed_sandbox"
+        and task.workspace is not None
+        and is_repo_workspace(task.workspace)
+    ):
+        return [task.workspace]
+    return []
+
+
 def _session_labels(task: ScheduledTask) -> dict[str, str]:
     """Labels a fired session starts with.
 
     A continue task's sandbox session records the host id it routes by, so a
     relaunched sandbox keeps connecting to the replica that owns that id.
     """
-    labels = {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id}
+    labels = {
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
+        **managed_repo_labels(_sandbox_workspaces(task)),
+    }
     if task.execution_target == "managed_sandbox" and task.session_mode == "continue":
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
@@ -1346,7 +1382,9 @@ def _session_labels(task: ScheduledTask) -> dict[str, str]:
     return labels
 
 
-async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+async def _create_session(
+    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     launch_args, permission_labels = await _permission_mode_launch_options(deps, task)
     conv: Conversation = await asyncio.to_thread(
@@ -1356,7 +1394,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         host_id=task.host_id,
         workspace=task.workspace,
         terminal_launch_args=launch_args,
-        labels={**_session_labels(task), **permission_labels},
+        labels={**labels, **permission_labels},
         project_id=await _fire_project_id(deps, task),
     )
     reasoning_effort = task.reasoning_effort
@@ -1954,7 +1992,9 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
                     session_id=conv.id,
                     owner=task.user_id or RESERVED_USER_LOCAL,
                     sandbox_config=deps.sandbox_config,
-                    repos=(),
+                    repos=tuple(
+                        parse_repo_workspace(value) for value in _sandbox_workspaces(task)
+                    ),
                     tracker=tracker,
                     conversation_store=deps.conversation_store,
                     host_store=deps.host_store,
