@@ -653,7 +653,11 @@ export function ChatHeader({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-44">
-              <SessionActionMenuItem disabledReason={forkDisabledReason} onSelect={onFork}>
+              <SessionActionMenuItem
+                className="mobile-touch-target"
+                disabledReason={forkDisabledReason}
+                onSelect={onFork}
+              >
                 <GitForkIcon className="size-3.5" />
                 Fork
               </SessionActionMenuItem>
@@ -703,6 +707,7 @@ export function ChatHeader({
                 {isMobile && <ViewModeMenuItems />}
                 {canFork && (
                   <SessionActionMenuItem
+                    className="mobile-touch-target"
                     disabledReason={forkDisabledReason}
                     onSelect={onFork}
                     data-testid="fallback-fork-conversation"
