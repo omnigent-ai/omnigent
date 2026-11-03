@@ -11,13 +11,13 @@ import httpx
 import pytest
 
 from tests._helpers.server_runner import server_runner
-from tests._helpers.zerobus_capture import ZeroBusCapture
+from tests.e2e.test_native_terminal_start_error_log_correlation_e2e import _ZeroBusCapture
 
 
 @pytest.mark.timeout(90)
 def test_validation_rejections_reach_the_debug_sink_without_rejected_input(tmp_path: Path) -> None:
     with (
-        contextlib.closing(ZeroBusCapture()) as capture,
+        contextlib.closing(_ZeroBusCapture()) as capture,
         server_runner(
             tmp_path / "stack",
             server_env={

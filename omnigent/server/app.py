@@ -10,7 +10,7 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
@@ -619,6 +619,25 @@ def _session_id_from_request(request: Request) -> str | None:
     """
     match = _SESSION_PATH_RE.search(request.url.path)
     return match.group(1) if match else None
+
+
+def _attribute_schema_rejection(errors: Sequence[Mapping[str, object]]) -> None:
+    """Attribute a 422 schema rejection to the request audit row.
+
+    Caller-side input (category=user) that rejects one request without harming
+    the session (impact=benign). Records field names and error types only, see
+    :func:`omnigent.server.validation_audit.validation_audit_attrs`.
+
+    :param errors: Pydantic-style error dicts carrying ``loc`` and ``type``.
+    """
+    add_audit_attrs(
+        code=str(ErrorCode.INVALID_INPUT),
+        http_status="422",
+        error_category=ErrorCategory.USER.value,
+        error_impact=ErrorImpact.BENIGN.value,
+        error_phase=ErrorPhase.REQUEST.value,
+        **validation_audit_attrs(errors),
+    )
 
 
 def _error_audit_extra(
@@ -2859,14 +2878,7 @@ def create_app(
                 if isinstance(error, dict) and "type" in error and "loc" in error
             ]
             if errors:
-                add_audit_attrs(
-                    code=str(ErrorCode.INVALID_INPUT),
-                    http_status="422",
-                    error_category=ErrorCategory.USER.value,
-                    error_impact=ErrorImpact.BENIGN.value,
-                    error_phase=ErrorPhase.REQUEST.value,
-                    **validation_audit_attrs(errors),
-                )
+                _attribute_schema_rejection(errors)
         return await http_exception_handler(request, exc)
 
     @app.exception_handler(RequestValidationError)
@@ -2885,14 +2897,7 @@ def create_app(
         # Attribute on the per-request audit row, not the ERROR stream: a schema
         # rejection is expected, low-signal caller input, so it should be
         # queryable without adding noise where the 500s must stand out.
-        add_audit_attrs(
-            code=str(ErrorCode.INVALID_INPUT),
-            http_status="422",
-            error_category=ErrorCategory.USER.value,
-            error_impact=ErrorImpact.BENIGN.value,
-            error_phase=ErrorPhase.REQUEST.value,
-        )
-        add_audit_attrs(**validation_audit_attrs(exc.errors()))
+        _attribute_schema_rejection(exc.errors())
         return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(ConversationNotFoundError)
