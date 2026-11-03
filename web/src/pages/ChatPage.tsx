@@ -97,9 +97,12 @@ import {
   holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
+  type ChatState,
   type PendingInitialPrompt,
+  type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
   isNativeTerminalSession,
   nativeCodingAgentForSession,
@@ -131,6 +134,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  appendReplyDraft,
   appendReplyQuote,
   restoreReplyDraft,
   serializeReplyDraft,
@@ -530,6 +534,9 @@ export function ChatPage() {
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
   );
+  const nativeInputPending = useChatStore((s) =>
+    hasSentNativeInputPending(s.isNativeTerminalSession, s.pendingUserMessages),
+  );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // True while the session's managed-sandbox launch is still running
   // (a failed launch is NOT "launching" — it gets normal unreachable
@@ -721,8 +728,13 @@ export function ChatPage() {
 
   // Keep the parent's Stop action live while its turn waits on an elicitation.
   // Child activity and display suppression belong to `showsWorking` below.
-  const isWorking =
-    computeIsTurnActive(sessionStatus, status === "streaming") || hasPendingInitialMessage;
+  const { isWorking, indicatorSendInFlight } = useWorkingSignals({
+    status,
+    sessionStatus,
+    hasPendingInitialMessage,
+    nativeInputPending,
+    conversationId: sessionConvId,
+  });
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -735,7 +747,7 @@ export function ChatPage() {
     // for the server's ``running``. The sidebar row already reads this same
     // flag (``isStartingUp`` in Sidebar.tsx), so the two agreed only once the
     // server confirmed; now they agree immediately.
-    localSendInFlight: status === "streaming" && !spinUpInFlight,
+    localSendInFlight: indicatorSendInFlight && !spinUpInFlight,
   });
 
   // A fork of a coding session carries the source id in this label (set by
@@ -842,23 +854,18 @@ export function ChatPage() {
     launchedAt: runnerLaunchedAt,
   });
 
-  // Browser tab title: "● Title" while the main session is working so
-  // background tabs signal parent activity without duplicating child-session
-  // badges from the sidebar/Agents rail. An open-but-untitled session
-  // (no synthesized title yet) reads as "New session" to match its
-  // sidebar row; the landing page (no active session) stays "Omnigent".
-  // Sub-agent (child) sessions are absent from the sidebar list, so
-  // ``activeConv`` is null and the title would otherwise read "New session";
-  // name the tab after the sub-agent instead, mirroring the header.
-  const subAgentTabTitle =
+  // Browser tab title mirrors the header; "● " flags main-session work in background tabs.
+  // Sessions missing from the loaded sidebar rows use their snapshot (sub-agent name for
+  // children), and untitled sessions read "New session" to match their sidebar row.
+  const sessionTabTitle =
     activeSession?.parentSessionId != null
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
-      : null;
+      : (activeSession?.title ?? null);
   useEffect(() => {
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
-    const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
+    const base = truncateTitle(activeConv?.title || sessionTabTitle || fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, sessionTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const llmModel = useChatStore((s) => s.llmModel);
@@ -949,14 +956,23 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
-  const { reconnect, reconnectsArca, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
-    useSessionReconnect({
-      sessionId: urlConvId ?? null,
-      hostId: reconnectHostId,
-      hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
-      hostResumable: activeSession?.hostResumable ?? false,
-      isOwner: isOwnerLevel(permissionLevel),
-    });
+  const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
+  const {
+    reconnect,
+    reconnectsArca,
+    sandboxStarting,
+    dialogOpen,
+    setDialogOpen,
+    localReconnect,
+    arcaReconnect,
+  } = useSessionReconnect({
+    sessionId: urlConvId ?? null,
+    hostId: reconnectHostId,
+    hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
+    hostResumable: activeSession?.hostResumable ?? false,
+    hostOnline: reconnectHostOnline,
+    isOwner: isOwnerLevel(permissionLevel),
+  });
   // A message to an offline Arca host reconnects it from the desktop and waits
   // in the queue until the host is back.
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
@@ -1214,6 +1230,7 @@ export function ChatPage() {
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
       sendReconnectsArca={sendReconnectsArca}
+      sandboxStarting={sandboxStarting}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1369,6 +1386,8 @@ interface MainAgentSurfaceProps {
   onShowReconnectHelp: () => void;
   /** Sending reconnects the offline Arca host, so the composer stays enabled. */
   sendReconnectsArca: boolean;
+  /** Reconnect host is waking this session's sandbox; the composer host dot spins. */
+  sandboxStarting: boolean;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   /** Whether older messages exist that haven't been loaded yet. */
@@ -1545,6 +1564,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   onStop,
   onShowReconnectHelp,
   sendReconnectsArca,
+  sandboxStarting,
   agents,
   selectedAgentId,
   hasMoreHistory,
@@ -1896,6 +1916,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
             }
             sendReconnectsArca={sendReconnectsArca}
+            sandboxStarting={sandboxStarting}
             onShowReconnectHelp={onShowReconnectHelp}
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
@@ -2048,6 +2069,8 @@ interface ComposerProps {
    * enabled while `unreachable`, and the placeholder says so.
    */
   sendReconnectsArca?: boolean;
+  /** Reconnect host is waking this session's sandbox; the host badge's dot spins. */
+  sandboxStarting?: boolean;
   /**
    * Open the reconnect help dialog. Always wired to the status line's host
    * badge, which turns itself into a clickable reconnect affordance whenever
@@ -2099,6 +2122,8 @@ interface ComposerProps {
  * :param showModel: Whether to include ``/model`` (in-process sessions
  *     and claude-native, which both honor ``conv.model_override``; see
  *     the call site).
+ * :param showPermissions: Whether to include ``/permissions``, which opens
+ *     the codex-native approval-mode control in place of Codex's own popup.
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
@@ -2112,6 +2137,7 @@ export function buildSlashCommandMap(
   supportsModelReset = false,
   showMcp = false,
   showClear = false,
+  showPermissions = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2120,6 +2146,7 @@ export function buildSlashCommandMap(
     if (name === "/compact" && !showCompact) continue;
     if (name === "/mcp" && !showMcp) continue;
     if (name === "/clear" && !showClear) continue;
+    if (name === "/permissions" && !showPermissions) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2343,6 +2370,7 @@ function ComposerImpl(
     isNativeWrapper = false,
     unreachable = false,
     sendReconnectsArca = false,
+    sandboxStarting = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
     subAgentLabel = null,
@@ -2423,6 +2451,9 @@ function ComposerImpl(
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
+  // Bumped by "/permissions" on codex-native to open the approval-mode control
+  // instead of sending the command, which would open Codex's popup in its terminal.
+  const [permissionPickerOpenNonce, setPermissionPickerOpenNonce] = useState(0);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
   // submits the form, so it would otherwise bypass the Button entirely.
@@ -2798,6 +2829,22 @@ function ComposerImpl(
     };
   }, [conversationId, replaceText]);
 
+  // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
+  const inputDisabled =
+    ((disabled || (unreachable && !sendReconnectsArca)) && sendDisabledReason === null) ||
+    isReadOnly ||
+    composerLockedByBtw;
+  // A disabled textarea can't take focus, so the focus above is lost while the
+  // session starts. Focus it once it enables, unless the user focused something else.
+  const inputDisabledRef = useRef(inputDisabled);
+  useEffect(() => {
+    const wasDisabled = inputDisabledRef.current;
+    inputDisabledRef.current = inputDisabled;
+    if (!wasDisabled || inputDisabled || isMobileRef.current) return;
+    if (document.activeElement !== null && document.activeElement !== document.body) return;
+    textareaRef.current?.focus();
+  }, [inputDisabled]);
+
   // Publish edits as they happen so the open sidebar updates immediately,
   // rather than only learning about a draft when this composer unmounts.
   useEffect(() => {
@@ -2876,6 +2923,7 @@ function ComposerImpl(
         supportsModelReset,
         composerSessionId !== null,
         showClear,
+        showCodexApprovalMode,
       ),
     [
       skills,
@@ -2888,6 +2936,7 @@ function ComposerImpl(
       supportsModelReset,
       composerSessionId,
       showClear,
+      showCodexApprovalMode,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -3024,7 +3073,8 @@ function ComposerImpl(
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
   // case — `submit` clears it optimistically — so only fill it when the user
-  // hasn't already started something new; their in-progress text wins. Files
+  // hasn't already started something new; their in-progress text wins, and
+  // text recovered when the session loaded goes after it. Files
   // are re-validated on the way in: when the upload itself was what failed
   // (a 415 on an unsupported type), re-arming the same file would only fail
   // again, so it's dropped with the same inline reason a fresh attach gives.
@@ -3037,11 +3087,15 @@ function ComposerImpl(
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
     // Re-check live delivery and preserve any newer input before consuming the failure.
-    const failed = takeFailedSendDraft(
-      failedSendDraft.conversationId,
-      valueRef.current.trim() !== "" || filesRef.current.length > 0,
-    );
+    const hasNewerInput = valueRef.current.trim() !== "" || filesRef.current.length > 0;
+    const failed = takeFailedSendDraft(failedSendDraft.conversationId, hasNewerInput, true);
     if (!failed) return;
+    if (hasNewerInput) {
+      const joined = appendReplyDraft(draft, restoreReplyDraft(failed.text, failed.replyDraft));
+      replaceText(serializeReplyDraft(joined), snapshotReplyDraft(joined));
+      dirtyRef.current = true;
+      return;
+    }
     pendingFailedSendRestore.current = failed.stableId
       ? { stableId: failed.stableId, draft }
       : null;
@@ -3263,6 +3317,27 @@ function ComposerImpl(
       case "/mcp":
         if (arg) setCommandError("Usage: /mcp");
         return true;
+      case "/permissions": {
+        // Claude's /permissions edits tool rules, not the mode, so it reaches the CLI.
+        if (!showCodexApprovalMode) return false;
+        if (arg) {
+          setCommandError("/permissions does not accept arguments");
+          return true;
+        }
+        if (!permissionControlInteractive || configBusy) {
+          setCommandError(
+            !isOwnerLevel(permissionLevel)
+              ? "Only the session owner can change the permission mode"
+              : "The permission mode can't be changed right now",
+          );
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setPermissionPickerOpenNonce((n) => n + 1);
+        return true;
+      }
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
         setCommandError(lines.join("\n"));
@@ -3989,11 +4064,7 @@ function ComposerImpl(
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
-          // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
-          disabled:
-            ((disabled || (unreachable && !sendReconnectsArca)) && sendDisabledReason === null) ||
-            isReadOnly ||
-            composerLockedByBtw,
+          disabled: inputDisabled,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -4205,6 +4276,7 @@ function ComposerImpl(
                   appearance="composer"
                   readOnly={isReadOnly}
                   onReconnect={onShowReconnectHelp}
+                  starting={sandboxStarting}
                 />
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
@@ -4221,6 +4293,7 @@ function ComposerImpl(
                       : "Only the session owner can change the permission mode"
                   }
                   onSelect={(mode) => void changePermission(mode)}
+                  openNonce={permissionPickerOpenNonce}
                 />
               )}
             </>
@@ -4342,6 +4415,61 @@ function ComposerImpl(
 }
 
 export const Composer = memo(forwardRef(ComposerImpl));
+
+// A native terminal session finishes a send's response once the message reaches the
+// terminal, before its agent reports `running`. Measured gaps run 70-350ms.
+const NATIVE_PICKUP_GRACE_MS = 3_000;
+
+/**
+ * Whether this tab sent a native terminal session input its agent has not consumed yet.
+ * Only this tab's sends carry `createdAtS`; input replayed from the snapshot may be
+ * waiting on a runner that is offline.
+ */
+export function hasSentNativeInputPending(
+  nativeTerminal: boolean,
+  pendingUserMessages: PendingUserMessage[],
+): boolean {
+  return (
+    nativeTerminal &&
+    pendingUserMessages.some(
+      (message) => message.initialDraft === undefined && message.createdAtS !== undefined,
+    )
+  );
+}
+
+/**
+ * The chat's two busy signals. `isWorking` drives Stop and Esc and follows the turn's
+ * real state. `indicatorSendInFlight` lights Working for a held first message (the
+ * terminal's ready `idle` resets the send before it goes out) and, for up to
+ * NATIVE_PICKUP_GRACE_MS each time nothing else would, for native input not yet taken up.
+ */
+export function useWorkingSignals({
+  status,
+  sessionStatus,
+  hasPendingInitialMessage,
+  nativeInputPending,
+  conversationId,
+}: {
+  status: ChatState["status"];
+  sessionStatus: SessionStatus;
+  hasPendingInitialMessage: boolean;
+  nativeInputPending: boolean;
+  conversationId: string | undefined;
+}): { isWorking: boolean; indicatorSendInFlight: boolean } {
+  const isWorking =
+    computeIsTurnActive(sessionStatus, status === "streaming") || hasPendingInitialMessage;
+  // Bounded: a runner that goes offline after accepting the input never consumes it.
+  const awaitingNativePickup = useTrueForAtMost(
+    nativeInputPending && status !== "streaming" && !computeIsWorking(sessionStatus),
+    NATIVE_PICKUP_GRACE_MS,
+    conversationId,
+  );
+  return {
+    isWorking,
+    indicatorSendInFlight:
+      status === "streaming" || awaitingNativePickup || hasPendingInitialMessage,
+  };
+}
 
 /**
  * Whether the main chat's display-only "Working…" indicator should light up.

@@ -199,6 +199,13 @@ jobs:
               -v --tb=long --showlocals --log-level=INFO -r a \
               || { rc=$?; [ "$rc" -eq 5 ] && [ "$DEPENDENCY" != "true" ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
+      - name: Test installed sandbox profile example
+        if: ${{ !cancelled() && matrix.group == 'server-rest' }}
+        run: |
+          trap 'uv pip uninstall --python .venv/bin/python omnigent-sandbox-profile-example' EXIT
+          uv pip install --python .venv/bin/python --no-deps -e examples/sandbox-profile-provider
+          uv run --no-sync pytest examples/sandbox-profile-provider/tests -q --reruns 0
+
       - name: Stage coverage data for upload
         if: always()
         shell: bash

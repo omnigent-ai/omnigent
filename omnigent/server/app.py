@@ -161,6 +161,10 @@ from omnigent.server.seeded_agents import (
     seeded_agent_allowed,
     seeded_agent_allowlist,
 )
+from omnigent.server.server_config import (
+    RESTRICT_TO_AGENT_NAMES_KEY,
+    PickerCuration,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -210,6 +214,22 @@ class BrandingInfo(BaseModel):
     powered_by: bool
 
 
+class PickerInfo(BaseModel):
+    """How a deployment curates what the New Chat picker shows.
+
+    Display only: it narrows the picker, never what exists. Every agent stays
+    seeded, forkable and reachable through the API.
+
+    :param restrict_to_agent_names: Names the picker may offer; empty means
+        the full roster.
+    :param default_agent_name: Name a fresh New Chat starts on, or ``None``.
+        A user's remembered pick wins over it.
+    """
+
+    restrict_to_agent_names: list[str] = []
+    default_agent_name: str | None = None
+
+
 class FilesystemAttachmentsInfo(BaseModel):
     """Which uploads native sessions receive as files, for client-side checks."""
 
@@ -251,6 +271,8 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Scheduled permissions use the selected native harness's vocabulary.
+    scheduled_task_harness_settings: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -273,6 +295,7 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
     branding: BrandingInfo
+    picker: PickerInfo = PickerInfo()
 
 
 def _resolve_extension_state(
@@ -972,6 +995,59 @@ def _ensure_builtin_agent(
     agent_store.create(agent_id, name, bundle_key)
     agent_cache.evict(agent_id)
     _logger.info("Registered built-in %s agent as %s", name, agent_id)
+
+
+def _warn_on_empty_picker_restriction(
+    agent_store: AgentStore,
+    curation: PickerCuration,
+    suppressed_agent_names: frozenset[str] = frozenset(),
+) -> None:
+    """Say so at startup when ``restrict_to_agent_names`` names an agent New Chat cannot offer.
+
+    The restriction is display-only, so a mistyped name, or one
+    ``OMNIGENT_SEEDED_AGENTS`` leaves out, fails quietly: the picker simply has
+    less in it, or nothing at all. Each name is looked up directly, so the
+    check holds however many agents the server has.
+
+    :param agent_store: Store the picker's roster is read from.
+    :param curation: The configured curation; checked only when it restricts.
+    :param suppressed_agent_names: Packaged agents ``OMNIGENT_SEEDED_AGENTS``
+        leaves out; seeded, but never offered.
+    """
+    if not curation.restricted:
+        return
+    names = curation.restrict_to_agent_names
+    try:
+        missing = [name for name in names if agent_store.get_by_name(name) is None]
+    except Exception:  # noqa: BLE001 — a store hiccup must not stop startup
+        _logger.warning("could not check %s against the agent roster", RESTRICT_TO_AGENT_NAMES_KEY)
+        return
+    suppressed = [name for name in names if name in suppressed_agent_names and name not in missing]
+    if suppressed:
+        # The env var wins: it decides what the server offers at all.
+        _logger.warning(
+            "server config %s names %d agent(s) that %s leaves out, so New Chat will not "
+            "offer them: %s",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            len(suppressed),
+            SEEDED_AGENTS_ENV,
+            ", ".join(suppressed),
+        )
+    if len(missing) + len(suppressed) == len(names):
+        _logger.warning(
+            "server config %s matches no agent this server offers (%s); only a user's own "
+            "agent with one of these names will show in New Chat",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            ", ".join(names),
+        )
+        return
+    if missing:
+        _logger.warning(
+            "server config %s has %d name(s) matching no server agent: %s",
+            RESTRICT_TO_AGENT_NAMES_KEY,
+            len(missing),
+            ", ".join(missing),
+        )
 
 
 def _ensure_default_agents(
@@ -1692,12 +1768,14 @@ def create_app(
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
+        load_picker_curation,
         load_server_config,
         session_title_instructions,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
+    picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     if harness_install is None:
@@ -1930,6 +2008,10 @@ def create_app(
             app_inst.state.suppressed_agent_names = _ensure_default_agents(
                 agent_store, artifact_store, agent_cache
             )
+        # The roster exists either way, so the check does not depend on seeding here.
+        _warn_on_empty_picker_restriction(
+            agent_store, picker_curation, app_inst.state.suppressed_agent_names
+        )
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -2225,6 +2307,7 @@ def create_app(
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
+    app.state.picker_curation = picker_curation
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
     app.state.automations = True if automations is None else automations
@@ -2278,6 +2361,42 @@ def create_app(
         if _owner_credentials:
             sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
             app.state.sandbox_config = sandbox_config
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    sandbox_profiles = (
+        SandboxProfileCatalog(conversation_store, sandbox_config, host_store)
+        if host_store is not None and resolved_feature_flags.enabled(Feature.SANDBOX_PROFILES)
+        else None
+    )
+    app.state.sandbox_profiles = sandbox_profiles
+    if host_store is not None and sandbox_profiles is not None:
+
+        def admit_profiled_launch(
+            host_id: str,
+            session_id: str,
+            owner: str | None,
+            generation: str | None,
+            allow_unbound: bool = False,
+            transfer_from_host_id: str | None = None,
+        ) -> None:
+            _admit_host_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+            host = host_store.get_host(host_id)
+            sandbox_profiles.require_session_host(
+                session_id,
+                host_id,
+                bind=not allow_unbound and transfer_from_host_id is None,
+                sandbox_provider=host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
+            )
+
+        host_registry.launch_authorizer = admit_profiled_launch
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -3521,6 +3640,7 @@ def create_app(
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
                 "branding": branding_snapshot.config(),
+                "picker": picker_curation.config(),
             }
         )
 
@@ -3728,6 +3848,13 @@ def create_app(
         tags=["extensions"],
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+    from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+
+    app.include_router(
+        create_sandbox_profiles_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["sandbox profiles"],
+    )
 
     app.include_router(
         create_sandbox_inference_router(
@@ -3982,6 +4109,7 @@ def create_app(
         hold_started = time.monotonic()
         hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
         hold_s = None if hold is None else time.monotonic() - hold_started
+        relaunch_host_id: str | None = None
         if hold in ("runner_reconnected", "server_shutdown"):
             return
         if hold is not None:
@@ -4005,23 +4133,27 @@ def create_app(
                         f"within {HOST_OFFLINE_HOLD_S / 3600:g} hours."
                     ),
                 )
-            elif hold == "host_back_relaunched":
-                # Not runner_disconnected: a passive reconnect clears that code to idle.
-                error = ErrorDetail(
-                    code="runner_interrupted",
-                    message=(
-                        "The host restarted during this turn, so the turn was interrupted. "
-                        "The session is running again; send the message again to retry."
-                    ),
-                )
             elif hold == "host_back_without_runner":
-                error = ErrorDetail(
-                    code="runner_disconnected",
-                    message=(
-                        "The host for this session came back without the runner that was "
-                        "running this turn, so the turn was lost. Send the message again to retry."
-                    ),
-                )
+                host_id = await _routing_host_id(affected)
+                if host_id is not None and host_registry.get(host_id) is not None:
+                    relaunch_host_id = host_id
+                    # Keep interruption evidence across the replacement's passive reconnect.
+                    error = ErrorDetail(
+                        code="runner_interrupted",
+                        message=(
+                            "The host restarted during this turn, so the turn was interrupted. "
+                            "Send a new message to continue."
+                        ),
+                    )
+                else:
+                    error = ErrorDetail(
+                        code="runner_disconnected",
+                        message=(
+                            "The host for this session came back without the runner that was "
+                            "running this turn, so the turn was lost. "
+                            "Send the message again to retry."
+                        ),
+                    )
         if idle_shutdown:
             # The sweep's stop path settles these to idle instead of failing them.
             _note_runner_idle_shutdown(runner_id, affected)
@@ -4047,6 +4179,9 @@ def create_app(
             conversation_store,
             disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
         )
+        if relaunch_host_id is not None:
+            # Settlement must still own the old binding before a launch rotates it.
+            await _relaunch_held_sessions(affected, relaunch_host_id)
 
     async def _routing_host_id(convs: "list[Conversation]") -> str | None:
         """Return the host *convs*' shared runner runs on, or ``None`` when unknown."""
@@ -4069,34 +4204,44 @@ def create_app(
             return False
         return await _host_row_offline(host_store, host_id)
 
-    async def _relaunch_held_sessions(held: "list[Conversation]", host_id: str | None) -> bool:
-        """Relaunch the runner of each held root session on a host that came back without it.
+    async def _relaunch_held_sessions(held: "list[Conversation]", host_id: str) -> None:
+        """Restore settled root sessions on a host that returned without its runner.
 
-        The held turn is not redelivered: its prompt may already have reached the
-        harness, so a resend could run it twice. The relaunch restores the session,
-        so the user's next message runs without a manual resume.
-
-        :returns: ``True`` when the host acknowledged every relaunch.
+        The interrupted input may already have executed, so only the user's next
+        message starts new work. Stop and newer bindings retain ownership.
         """
-        from omnigent.server.routes.sessions import _launch_runner_on_host
+        from omnigent.server.routes.sessions import (
+            _intentional_stop_sessions,
+            _last_task_error_from_labels,
+            _launch_runner_on_host,
+            _session_status_cache,
+        )
 
-        host_conn = None if host_id is None else host_registry.get(host_id)
+        host_conn = host_registry.get(host_id)
         roots = [conv for conv in held if conv.kind != "sub_agent"]
         if host_conn is None or not roots:
-            return False
-        acknowledged = True
+            return
         for conv in roots:
             try:
-                attempt = await _launch_runner_on_host(
-                    conv, conversation_store, host_registry, host_conn
-                )
-            except Exception:  # a failed relaunch keeps the plain failure
+                fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+                last_error = _last_task_error_from_labels(fresh.labels) if fresh else None
+                if (
+                    fresh is None
+                    or fresh.runner_id is None
+                    or fresh.runner_id != conv.runner_id
+                    or fresh.host_id != host_id
+                    or conv.id in _intentional_stop_sessions
+                    or _session_status_cache.get(conv.id, fresh.live_status) != "failed"
+                    or last_error is None
+                    or last_error["code"] != "runner_interrupted"
+                    or tunnel_registry.get(fresh.runner_id) is not None
+                ):
+                    continue
+                await _launch_runner_on_host(conv, conversation_store, host_registry, host_conn)
+            except Exception:  # a failed relaunch keeps the interruption visible
                 _logger.warning(
                     "Relaunch after host return failed for session=%s", conv.id, exc_info=True
                 )
-                return False
-            acknowledged = acknowledged and attempt.acknowledged
-        return acknowledged
 
     async def _hold_for_offline_host(runner_id: str, affected: "list[Conversation]") -> str | None:
         """Wait for a runner whose user-run host dropped with it mid-turn.
@@ -4104,13 +4249,12 @@ def create_app(
         A laptop that sleeps or loses Wi-Fi takes its runner along and usually
         resumes the turn when it wakes, so the turn waits for it instead of
         failing. A host that comes back without its runner gets one more grace,
-        then its runner is relaunched. A crash report cancels this task and
-        fails the turn as before.
+        then the caller settles the turn before relaunching its runner.
+        A crash report cancels this task and fails the turn as before.
 
         :returns: ``None`` when nothing was held, else how the hold ended:
             ``"runner_reconnected"``, ``"server_shutdown"``, ``"expired"``,
-            ``"host_back_relaunched"`` (the host came back and its runner was
-            relaunched) or ``"host_back_without_runner"`` (the relaunch failed).
+            or ``"host_back_without_runner"`` (the host returned without its runner).
         """
         from omnigent.server.routes.sessions import (
             _MID_TURN_STATUSES,
@@ -4174,10 +4318,7 @@ def create_app(
                     if host_back_deadline is None:
                         host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
                     if now >= host_back_deadline:
-                        relaunched = await _relaunch_held_sessions(held, host_id)
-                        outcome = (
-                            "host_back_relaunched" if relaunched else "host_back_without_runner"
-                        )
+                        outcome = "host_back_without_runner"
                         break
                 else:
                     # A brief host return cannot end a sleeping host's absolute hold.
@@ -4747,6 +4888,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            admit_managed_runner=(
+                sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
+            ),
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
@@ -5078,7 +5222,7 @@ def create_app(
             ):
                 _logger.warning(
                     "device-grant: GitHub OAuth does not support prompt=login / "
-                    "max_age=0, so the anti-phishing re-auth gate cannot be enforced. "
+                    "max_age, so the anti-phishing re-auth gate cannot be enforced. "
                     "Device-grant flow skipped for this deployment; only "
                     "/oauth/token + /oauth/revoke are mounted."
                 )

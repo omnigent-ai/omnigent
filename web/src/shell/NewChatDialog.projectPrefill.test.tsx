@@ -36,6 +36,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -57,6 +59,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // unset falls through to the composer's generic defaults (last host, recent
 // workspace, last-used agent). These tests pin those seeding rules.
 const navigateMock = vi.fn();
+
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
 
 const RECENT_KEY = "omnigent:recent-workspaces";
 const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
@@ -227,13 +234,13 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
     databricks_features: false,
     enabled_connections: [],
     managed_sandboxes_enabled: true,
-    sandbox_provider: null,
+    sandbox_provider: "modal",
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
-    features: { harness_install: false },
+    features: { harness_install: false, sandbox_profiles: true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -617,15 +624,30 @@ describe("NewChatLandingScreen project prefill", () => {
     expect("agent_id" in body).toBe(false);
   });
 
-  it("clears a drafted sandbox repository on an in-place project switch (screen stays mounted)", async () => {
+  it("clears the sandbox repository and profile on an in-place project switch", async () => {
     // Mounted mirror of the unmount/remount sandbox-leak case: clicking
     // another project's pencil only changes `?project=` — the screen never
     // unmounts, so the draft-restore strip can't help. The reset effect must
     // clear the staged repo/branch or project Beta's sandbox silently clones
     // project Alpha's repository.
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [
+        {
+          id: "large",
+          name: "Large workspace",
+          provider: "modal",
+          revision: "revision-1",
+          description: "",
+        },
+      ],
+      managed_providers: ["modal"],
+      next_cursor: null,
+    });
     const { rerender } = renderSandboxLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }));
+    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/alpha-repo" },
@@ -643,6 +665,13 @@ describe("NewChatLandingScreen project prefill", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
     );
+    const picker = screen.getByRole("button", { name: "Sandbox profile: Choose profile" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
     // No repos carried over → an empty workspaces list; workspace stays pinned
@@ -650,6 +679,8 @@ describe("NewChatLandingScreen project prefill", () => {
     // default-filled path) — not Alpha's repo.
     expect(body.workspaces).toEqual([]);
     expect(body.workspace).toBeNull();
+    expect(body.project_id).toBe("proj_beta");
+    expect(body.sandbox_profile_id).toBe("large");
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
