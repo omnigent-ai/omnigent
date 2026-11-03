@@ -1270,9 +1270,10 @@ def _pr_changed_files_at_revision(
     root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
 ) -> dict[str, Any]:
     """List changed files at the displayed revision; flag a list GitHub truncated."""
-    pr = _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
-    result = _pr_changed_files(root, reference)
-    _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        pr = _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+        result = _pr_changed_files(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
     total = pr.get("changed_files")
     total_count = total if isinstance(total, int) else None
     shown = len(result["data"])
