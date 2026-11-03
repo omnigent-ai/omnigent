@@ -162,7 +162,7 @@ function renderDialog(
     // Server capabilities the dialog reads. Omitted leaves the context on
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
-    info?: Partial<ServerInfo>;
+    info?: Partial<ServerInfo> | "loading";
     // Renders the form without its dialog, so hiding it keeps it mounted
     // (as the dialog's close animation does).
     bareForm?: boolean;
@@ -206,7 +206,11 @@ function renderDialog(
             shown()
           ) : (
             <CapabilitiesProvider
-              info={{ ...FALLBACK_SERVER_INFO, session_fork_workspaces: true, ...props.info }}
+              info={
+                props.info === "loading"
+                  ? "loading"
+                  : { ...FALLBACK_SERVER_INFO, session_fork_workspaces: true, ...props.info }
+              }
             >
               {shown()}
             </CapabilitiesProvider>
@@ -2095,54 +2099,63 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     });
 
-    it("forks an Arclet source onto a fresh Arclet beside the connected hosts", async () => {
-      useSessionMock.mockReturnValue({
-        session: {
-          hostId: "host_1",
-          labels: {
-            "omnigent.host_type": "managed",
-            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+    it.each([
+      // The first provider row keeps the bare test id; later rows add the provider.
+      ["a fresh Arclet", "arclet", "fork-session-sandbox-option-arclet"],
+      ["another sandbox provider", "lakebox", "fork-session-sandbox-option"],
+    ])(
+      "forks an Arclet source onto %s beside the connected hosts",
+      async (_name, provider, row) => {
+        useSessionMock.mockReturnValue({
+          session: {
+            hostId: "host_1",
+            labels: {
+              "omnigent.host_type": "managed",
+              [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+            },
           },
-        },
-        isLoading: false,
-        error: null,
-      } as unknown as ReturnType<typeof useSession>);
-      // The source Arclet is filtered from the picker; another machine is a target.
-      setHosts([host({ sandbox_provider: "arclet" }), host({ host_id: "host_2", name: "laptop" })]);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      renderDialog({
-        ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] },
-      });
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        // The source Arclet is filtered from the picker; another machine is a target.
+        setHosts([
+          host({ sandbox_provider: "arclet" }),
+          host({ host_id: "host_2", name: "laptop" }),
+        ]);
+        forkSessionMock.mockResolvedValue({
+          id: "conv_fork",
+        } as unknown as Awaited<ReturnType<typeof forkSession>>);
+        renderDialog({
+          ...CODING,
+          info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+        });
 
-      await act(async () => {});
-      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
-      openHostSelect();
-      expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-      expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
-      expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");
-      fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
-      expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+        await act(async () => {});
+        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+        openHostSelect();
+        expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
+        expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+        fireEvent.click(screen.getByTestId(row));
+        expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
 
-      // Picking the sandbox starts a repository-branch lookup that disables Clone until it settles.
-      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
-      fireEvent.click(screen.getByTestId("fork-session-submit"));
-      await act(async () => {});
+        // Picking the sandbox starts a repository-branch lookup that disables Clone until it settles.
+        await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+        await act(async () => {});
 
-      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
-        title: undefined,
-        agentId: undefined,
-        upToResponseId: undefined,
-        config: {},
-        sandbox: { provider: "arclet", workspaces: ["https://github.com/databricks-eng/universe"] },
-      });
-      expect(launchRunnerMock).not.toHaveBeenCalled();
-      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
-      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
-    });
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+          title: undefined,
+          agentId: undefined,
+          upToResponseId: undefined,
+          config: {},
+          sandbox: { provider, workspaces: ["https://github.com/databricks-eng/universe"] },
+        });
+        expect(launchRunnerMock).not.toHaveBeenCalled();
+        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+      },
+    );
 
     it("forks a Databricks Sandbox source onto a connected host and starts it there", async () => {
       useSessionMock.mockReturnValue({
@@ -2231,40 +2244,24 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Modal Sandbox");
     });
 
-    it("forks an Arclet source onto another sandbox provider", async () => {
+    it("keeps the same-provider default when server capabilities arrive after hosts", async () => {
       useSessionMock.mockReturnValue({
-        session: {
-          hostId: "host_1",
-          labels: {
-            "omnigent.host_type": "managed",
-            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
-          },
-        },
+        session: { hostId: "host_1", labels: {} },
         isLoading: false,
         error: null,
       } as unknown as ReturnType<typeof useSession>);
-      setHosts([host({ sandbox_provider: "arclet" })]);
-      forkSessionMock.mockResolvedValue({
-        id: "conv_fork",
-      } as unknown as Awaited<ReturnType<typeof forkSession>>);
-      renderDialog({
-        ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
-      });
+      setHosts([host({ sandbox_provider: "arclet" }), host({ host_id: "host_2", name: "laptop" })]);
+      const props: Parameters<typeof renderDialog>[0] = { ...CODING, info: "loading" };
+      const { refresh } = renderDialog(props);
 
       await act(async () => {});
-      openHostSelect();
-      fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
-      await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
-      fireEvent.click(screen.getByTestId("fork-session-submit"));
-      await act(async () => {});
+      // Hosts are known but the offered providers aren't, so nothing is chosen yet.
+      expect(screen.getByTestId("fork-session-host-select")).not.toHaveTextContent("laptop");
 
-      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
-        provider: "lakebox",
-        workspaces: ["https://github.com/databricks-eng/universe"],
-      });
-      expect(launchRunnerMock).not.toHaveBeenCalled();
+      props.info = { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] };
+      refresh();
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
     });
 
     it.each([true, false])(

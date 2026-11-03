@@ -1079,19 +1079,17 @@ function SupportedForkSessionForm({
   const sameFamilyAsSource = !switching || (sourceFamily !== null && sourceFamily === targetFamily);
   const sameAgentAsSource = !switching;
 
-  // Default the host = source host (when online) else the first online
-  // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden. A clone defaults to reproducing the source:
-  // a sandbox source on a fresh sandbox from its own provider, any other
-  // source on its host. A sandbox is otherwise not the default while any
-  // host is online — it costs a fresh provision, and the user asks for it
-  // explicitly. But with no host online a sandbox-only deployment has
-  // nothing to reproduce the source on, so default to the sandbox rather
-  // than strand the picker empty and unsubmittable.
+  // Default destination: a clone reproduces its source, so a sandbox source
+  // gets a fresh sandbox from its own provider and any other source its own
+  // host. Otherwise prefer an online host, since a sandbox costs a fresh
+  // provision; with none online, fall back to a sandbox so the picker isn't
+  // stranded. Only fills an empty slot, so an explicit pick always wins.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
-    // Wait for the source's provider so a connected host isn't chosen first.
+    // The source's provider and the offered providers decide a sandbox
+    // source's default; a connected host chosen first would stick.
     if (sourceHostId && sourceHostLoading) return;
+    if (sourceSandboxProvider !== null && !workspaceRecovery && info === "loading") return;
     if (managedSandboxesEnabled && sourceProviderRow !== undefined) {
       setSandboxSelected(true);
       setSandboxProvider(sourceProviderRow);
@@ -1110,6 +1108,9 @@ function SupportedForkSessionForm({
     sourceHostId,
     sourceHostOnline,
     sourceHostLoading,
+    sourceSandboxProvider,
+    workspaceRecovery,
+    info,
     sourceProviderRow,
     onlineHosts,
     managedSandboxesEnabled,
