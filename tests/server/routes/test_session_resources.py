@@ -3232,6 +3232,137 @@ async def test_files_route_not_captured_as_resource_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("multiple", [False, True])
+async def test_repository_branches_use_stored_launch_targets(
+    app: FastAPI, client: httpx.AsyncClient, multiple: bool
+) -> None:
+    from omnigent.server.managed_hosts import managed_repo_labels
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conversation = app.state.test_conversation_store.get_conversation(session_id)
+    urls = (
+        ["https://github.com/one/api", "https://github.com/two/api"]
+        if multiple
+        else ["https://github.com/one/api"]
+    )
+    conversation.labels = managed_repo_labels([f"{url}#main" for url in urls])
+    conversation.workspace = "/sandbox/workspace"
+    original_labels = dict(conversation.labels)
+    payload = {"repositories": [{"url": url, "branch": "feature", "pushed": True} for url in urls]}
+    runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{session_id}/resources/repository-branches"
+
+    response = await client.get(
+        path, params={"repositories": '[{"url":"file:///secret","path":"../../secret"}]'}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == payload
+    assert runner.calls == [("GET", path)]
+    assert json.loads(runner.get_params[0]["repositories"]) == [
+        {"url": url, "path": name if multiple else ""}
+        for url, name in zip(urls, ["one__api", "two__api"], strict=False)
+    ]
+    assert conversation.labels == original_labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_state",
+    ["offline-host", "live-host", "old-runner", "old-host", "timeout", "unbound-runner"],
+)
+async def test_repository_branches_fall_back_without_waking_source(
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, source_state: str
+) -> None:
+    from omnigent.server.managed_hosts import managed_repo_labels
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    url = "https://github.com/one/api"
+    conversation = app.state.test_conversation_store.get_conversation(session_id)
+    conversation.labels = managed_repo_labels([f"{url}#main"])
+    conversation.workspace = "/sandbox/workspace"
+    conversation.host_id = "source-host"
+    monkeypatch.setattr(app.state.test_host_registry, "get", lambda _host_id: object())
+    wake = Mock(side_effect=AssertionError("Branch suggestions must not wake the source"))
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    runner = _FakeRunnerRouter(
+        _FakeRunnerClient(payload={"detail": "Not Found"}, status_code=404)
+        if source_state == "old-runner"
+        else _OfflineRunnerClient()  # type: ignore[arg-type]
+    )
+    if source_state == "unbound-runner":
+        monkeypatch.setattr(
+            runner,
+            "client_for_session_resources",
+            Mock(
+                side_effect=OmnigentError(
+                    "Session is not bound to a runner", code=ErrorCode.CONFLICT
+                )
+            ),
+        )
+    set_runner_router(runner)  # type: ignore[arg-type]
+    host_reads = []
+
+    async def read(**kwargs):
+        host_reads.append(kwargs)
+        assert kwargs["op"] == "repository_branches"
+        assert kwargs["workspace"] == conversation.workspace
+        assert kwargs["params"] == {"repositories": [{"url": url, "path": ""}]}
+        if source_state == "offline-host":
+            raise _host_filesystem.HostFsUnavailableError("offline")
+        if source_state == "old-host":
+            raise _host_filesystem.HostFsError(400, "invalid_request", "unknown fs op")
+        if source_state == "timeout":
+            raise TimeoutError("Repository branch lookup deadline expired")
+        return {"repositories": [{"url": url, "branch": "feature", "pushed": False}]}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    response = await client.get(f"/v1/sessions/{session_id}/resources/repository-branches")
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "repositories": [
+            {
+                "url": url,
+                "branch": "feature" if source_state == "live-host" else None,
+                "pushed": False if source_state == "live-host" else None,
+            }
+        ]
+    }
+    assert len(host_reads) == (0 if source_state in {"old-runner", "unbound-runner"} else 1)
+    wake.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [False, True])
+async def test_repository_branches_require_session_read_access(
+    runner_globals_reset: None, granted: bool
+) -> None:
+    del runner_globals_reset
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    permissions = _StubPermissionStore()
+    if granted:
+        permissions.add_grant("alice@example.com", session_id, LEVEL_READ)
+    app = _sessions_app(
+        _ConversationStore(),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{session_id}/resources/repository-branches",
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    assert response.status_code == (200 if granted else 404)
+    if granted:
+        assert response.json() == {"repositories": []}
+
+
+@pytest.mark.asyncio
 async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
     """GET /resources/github proxies to the runner and returns its payload.
 
@@ -10300,6 +10431,8 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/labels", "github_labels"),
         ("/merge-options", "github_merge_options"),
         ("/reviewers", "github_reviewers"),
+        ("/review-threads", "github_review_threads"),
+        ("/review-threads/thread-1/comments", "github_review_thread_comments"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -10318,13 +10451,23 @@ async def test_selected_pr_reaches_offline_host(
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
     url = "https://github.com/example/second/pull/42"
+    params = {"pr_url": url}
+    if resource.startswith("/review-threads"):
+        params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
     response = await offline_env_client.get(
-        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
     assert response.status_code == 200
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"]["pr_url"] == url
+    if resource.startswith("/review-threads"):
+        assert captured["params"]["after"] == "cursor"
+        if resource.endswith("/comments"):
+            assert captured["params"]["thread_id"] == "thread-1"
+        else:
+            assert captured["params"]["head_sha"] == "a" * 40
+            assert captured["params"]["base_sha"] == "b" * 40
 
 
 async def test_pr_attachment_uses_bound_session_when_runner_offline(
@@ -10354,6 +10497,18 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     "resource,body,op,params",
     [
         ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
+        (
+            "/review-threads",
+            {"body": "Hello", "anchor": {"line": 2}},
+            "github_review_thread_create",
+            {"body": "Hello", "anchor": {"line": 2}},
+        ),
+        (
+            "/review-threads/thread-1/replies",
+            {"body": "Hello"},
+            "github_review_thread_reply",
+            {"body": "Hello", "thread_id": "thread-1"},
+        ),
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
         (
             "/reviewers",
@@ -10954,8 +11109,13 @@ async def test_environment_id_is_one_runner_url_segment(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource", ["comments", "review-threads", "review-threads/thread-1/replies"]
+)
 async def test_comment_transport_timeout_does_not_retry_on_host(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
 ) -> None:
     from omnigent.server.routes import _host_filesystem
 
@@ -10972,7 +11132,7 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 
     monkeypatch.setattr(runner, "post", timeout)
     monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", unexpected_fallback)
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/comments"
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
     response = await client.post(
         path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"}
     )
@@ -10981,7 +11141,15 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource,expected", [("comments", 502), ("details", 503)])
+@pytest.mark.parametrize(
+    "resource,expected",
+    [
+        ("comments", 502),
+        ("review-threads", 502),
+        ("review-threads/thread-1/replies", 502),
+        ("details", 503),
+    ],
+)
 async def test_host_write_timeout_preserves_comment_uncertainty(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -11015,7 +11183,7 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
     assert response.status_code == expected, response.text
     assert len(sent) == 1
     assert connection.pending_fs_requests == {}
-    if resource == "comments":
+    if resource != "details":
         assert (
             response.json()["detail"]
             == "Could not confirm comment posting. Check GitHub before retrying."

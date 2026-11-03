@@ -1,4 +1,5 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
@@ -127,6 +128,7 @@ import {
   type FileNavigationGuard,
 } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
+import { revealFolderInFilesPanel } from "./FilesPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
@@ -137,7 +139,6 @@ import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import { workspaceRecoveryDisabledReason } from "@/lib/sessionCapabilities";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -840,10 +841,7 @@ function AppShellImpl() {
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
-  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
-    serverConversationId,
-    activeConv,
-  );
+  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -1477,17 +1475,22 @@ function AppShellImpl() {
       fileNavigationGuardsRef.current.delete(guard);
     };
   }, []);
-  const openFileViewer = useCallback(
-    (path: string, options?: OpenFileOptions) => {
+  const guardFileNavigation = useCallback(
+    (path: string, options: OpenFileOptions | undefined, commit: () => void) => {
       const guards = [...fileNavigationGuardsRef.current];
       const navigate = (index: number) => {
         const guard = guards[index];
         if (guard) guard(path, options, () => navigate(index + 1));
-        else commitFileNavigation(path, options);
+        else commit();
       };
       navigate(0);
     },
-    [commitFileNavigation],
+    [],
+  );
+  const openFileViewer = useCallback(
+    (path: string, options?: OpenFileOptions) =>
+      guardFileNavigation(path, options, () => commitFileNavigation(path, options)),
+    [guardFileNavigation, commitFileNavigation],
   );
 
   useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
@@ -2134,18 +2137,21 @@ function AppShellImpl() {
 
   // Mobile FAB → "Files" / "Changes" both open the files drawer (mirroring the
   // desktop rail's two tabs); the entry picks the scope the drawer opens in.
-  function openFilesDrawer(flatView: boolean) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setSideChatsPanelOpen(false); // close mobile side-chats drawer
-    setFilesDrawerFlatView(flatView);
-    setFilesPanelOpen(true);
-  }
+  const openFilesDrawer = useCallback(
+    (flatView: boolean) => {
+      setSelectedFilePath(null); // close file viewer
+      clearFileViewerUrl();
+      setPanelInitialKey(null); // close terminals panel
+      setExecutionLogsKey(null); // close execution-logs panel
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setShellsPanelOpen(false); // close mobile shells drawer
+      setGithubPanelOpen(false); // close mobile github drawer
+      setSideChatsPanelOpen(false); // close mobile side-chats drawer
+      setFilesDrawerFlatView(flatView);
+      setFilesPanelOpen(true);
+    },
+    [clearFileViewerUrl, setPanelInitialKey],
+  );
   const openFilesPanel = () => openFilesDrawer(false);
   const openChangesPanel = () => openFilesDrawer(true);
 
@@ -2225,6 +2231,38 @@ function AppShellImpl() {
     openExecutionLogsPanel(executionLogTabKey(MAIN_EXECUTION_LOG_KEY));
   }
 
+  // A chat link to a folder browses the Files tree there (drawer on mobile).
+  const openFolderInFiles = useCallback(
+    (absolutePath: string) =>
+      guardFileNavigation(absolutePath, undefined, () => {
+        if (!conversationId) return;
+        revealFolderInFilesPanel(conversationId, absolutePath);
+        if (isMobileViewport()) {
+          openFilesDrawer(false);
+          return;
+        }
+        showScopeView();
+        setSelectedTerminalKey(null);
+        if (!terminalFirst) setPanelInitialKey(null);
+        setExecutionLogsKey(null);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        selectRightRailTab("files");
+        setRightPanelOpenAnimated(true);
+        writeSessionWorkspaceState(conversationId, { open: true });
+      }),
+    [
+      guardFileNavigation,
+      conversationId,
+      openFilesDrawer,
+      showScopeView,
+      terminalFirst,
+      setPanelInitialKey,
+      selectRightRailTab,
+      setRightPanelOpenAnimated,
+    ],
+  );
+
   // Workspace root + runner home let chat path-links collapse absolute or
   // ``~``-relative paths the agent mentions onto workspace-relative ones.
   // Sourced from the same environment query that gates the files panel.
@@ -2235,6 +2273,7 @@ function AppShellImpl() {
       openFile: openFileViewer,
       registerNavigationGuard,
       openGithubTab,
+      openFolder: showFilesPanel ? openFolderInFiles : undefined,
       isChangedPath,
       conversationId,
       workspaceRoot,
@@ -2245,6 +2284,8 @@ function AppShellImpl() {
       openFileViewer,
       registerNavigationGuard,
       openGithubTab,
+      showFilesPanel,
+      openFolderInFiles,
       isChangedPath,
       conversationId,
       workspaceRoot,
@@ -2414,7 +2455,6 @@ function AppShellImpl() {
       currentSessionId: serverConversationId ?? null,
       canFork: canClone,
       disabledReason: forkDisabledReason,
-      workspaceRecoveryDisabledReason: workspaceRecoveryDisabledReason(forkSandboxProvider),
       openForkDialog: (opts) => {
         const sourceSessionId =
           opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
@@ -2436,7 +2476,7 @@ function AppShellImpl() {
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, forkSandboxProvider, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2658,7 +2698,9 @@ function AppShellImpl() {
                   data-session-id={conversationId}
                 >
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
-                    <Outlet />
+                    <RenderErrorBoundary name="this page" resetKey={location.pathname}>
+                      <Outlet />
+                    </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
 
@@ -2820,7 +2862,9 @@ function AppShellImpl() {
                   onClose={() => setGithubPanelOpen(false)}
                   testId="github-panel-drawer"
                 >
-                  <PullRequestPanel conversationId={conversationId} />
+                  <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                    <PullRequestPanel conversationId={conversationId} />
+                  </RenderErrorBoundary>
                 </MobilePanelDrawer>
               )}
               <div ref={setMobileFileTarget} className="md:hidden" />
