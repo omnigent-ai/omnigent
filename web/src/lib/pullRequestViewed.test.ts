@@ -17,18 +17,46 @@ import {
   type PullRequestIdentity,
 } from "./pullRequestViewed";
 
-const INDEX_KEY = "omnigent:pr-viewed:v1:index";
+const KEY_PREFIX = "omnigent:pr-viewed:v1:";
 const DAY_MS = 24 * 60 * 60 * 1000;
+const SERVER = "https://omni.example";
 const PR: PullRequestIdentity = {
   provider: "github",
   host: "github.com",
   repository: "acme/app",
   number: 7,
 };
+const AZURE_PR: PullRequestIdentity = {
+  provider: "azure_devops",
+  host: "dev.azure.com",
+  repository: "org/proj/repo",
+  number: 42,
+};
+
+function storedKeys(): string[] {
+  return Object.keys(localStorage).filter((key) => key.startsWith(KEY_PREFIX));
+}
+
+function failStorageWrites() {
+  return vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new DOMException("full", "QuotaExceededError");
+  });
+}
+
+/** Simulate another tab: write storage directly, then deliver its `storage` event. */
+function remoteWrite(key: string, value: string | null) {
+  if (value === null) localStorage.clear();
+  else localStorage.setItem(key, value);
+  act(() => {
+    window.dispatchEvent(new StorageEvent("storage", { key: value === null ? null : key }));
+  });
+}
 
 beforeEach(() => {
   localStorage.clear();
-  identity.server = "https://omni.example";
+  // A cleared-storage event also drops the module's in-memory fallback values.
+  window.dispatchEvent(new StorageEvent("storage", { key: null }));
+  identity.server = SERVER;
   identity.user = "alice";
 });
 
@@ -54,25 +82,11 @@ describe("pullRequestIdentityFromUrl", () => {
       "gitlab",
       { provider: "gitlab", host: "gitlab.com", repository: "group/sub/project", number: 3 },
     ],
+    ["https://dev.azure.com/Org/Proj/_git/Repo/pullrequest/42?_a=files", "azure_devops", AZURE_PR],
     [
-      "https://dev.azure.com/Org/Proj/_git/Repo/pullrequest/42?_a=files",
-      "azure_devops",
-      {
-        provider: "azure_devops",
-        host: "dev.azure.com",
-        repository: "org/proj/_git/repo",
-        number: 42,
-      },
-    ],
-    [
-      "https://org.visualstudio.com/Proj/_git/Repo/pullrequest/5",
+      "https://dev.azure.com/Org/Repo/_git/Repo/pullrequest/5",
       null,
-      {
-        provider: "azure_devops",
-        host: "org.visualstudio.com",
-        repository: "proj/_git/repo",
-        number: 5,
-      },
+      { ...AZURE_PR, repository: "org/repo/repo", number: 5 },
     ],
   ])("parses %s", (url, provider, expected) => {
     expect(pullRequestIdentityFromUrl(url, provider)).toEqual(expected);
@@ -88,6 +102,18 @@ describe("pullRequestIdentityFromUrl", () => {
     for (const variant of variants) expect(variant).toEqual(PR);
   });
 
+  it("maps Azure DevOps aliases to the dev.azure.com identity", () => {
+    const variants = [
+      "https://dev.azure.com/org/proj/_git/repo/pullrequest/42",
+      "https://org.visualstudio.com/Proj/_git/Repo/pullrequest/42",
+      "https://org.visualstudio.com/DefaultCollection/Proj/_git/Repo/pullRequest/42/",
+    ].map((url) => pullRequestIdentityFromUrl(url, null));
+    for (const variant of variants) expect(variant).toEqual(AZURE_PR);
+    expect(
+      pullRequestIdentityFromUrl("https://dev.azure.com/org/_git/repo/pullrequest/1", null),
+    ).toEqual({ ...AZURE_PR, repository: "org/repo/repo", number: 1 });
+  });
+
   it.each([
     ["not a url", null],
     ["ftp://github.com/acme/app/pull/7", null],
@@ -95,6 +121,12 @@ describe("pullRequestIdentityFromUrl", () => {
     ["https://github.com/acme/app/pull/seven", null],
     ["https://github.com/acme/app/pull/7", "gitlab"],
     ["https://github.com/acme/app/pull/7", "bitbucket"],
+    ["https://github.com/acme/app/pull/7", "constructor"],
+    ["https://example.org/org/proj/_git/repo/pullrequest/7", null],
+    ["https://example.org/org/proj/_git/repo/pullrequest/7", "azure_devops"],
+    ["https://dev.azure.com:8443/org/proj/_git/repo/pullrequest/7", null],
+    ["https://dev.azure.com/org/a/b/_git/repo/pullrequest/7", null],
+    ["https://dev.azure.com/_git/repo/pullrequest/7", null],
   ])("rejects %s for provider %s", (url, provider) => {
     expect(pullRequestIdentityFromUrl(url, provider)).toBeNull();
   });
@@ -128,17 +160,36 @@ describe("readViewed / writeViewed", () => {
     });
   });
 
-  it("reads a different head as empty and reports the stored head", () => {
+  it("reads a new head as empty and reports the latest other head", () => {
+    vi.useFakeTimers({ now: DAY_MS });
     writeViewed(key, "head1", ["a.ts"]);
-    expect(readViewed(key, "head2")).toEqual({ paths: new Set(), resetFromHead: "head1" });
+    vi.advanceTimersByTime(1);
     writeViewed(key, "head2", ["b.ts"]);
-    expect(readViewed(key, "head2")).toEqual({ paths: new Set(["b.ts"]), resetFromHead: null });
+    expect(readViewed(key, "head3")).toEqual({ paths: new Set(), resetFromHead: "head2" });
+  });
+
+  it("does not let a write for an older head erase a newer head's marks", () => {
+    writeViewed(key, "head2", ["new.ts"]);
+    writeViewed(key, "head1", ["old.ts"]);
+    expect(readViewed(key, "head2").paths).toEqual(new Set(["new.ts"]));
+    expect(readViewed(key, "head1").paths).toEqual(new Set(["old.ts"]));
+  });
+
+  it("keeps the three most recently written heads", () => {
+    vi.useFakeTimers({ now: DAY_MS });
+    for (const head of ["head1", "head2", "head3", "head4"]) {
+      writeViewed(key, head, [`${head}.ts`]);
+      vi.advanceTimersByTime(1);
+    }
+    expect(readViewed(key, "head1").paths.size).toBe(0);
+    expect(readViewed(key, "head2").paths).toEqual(new Set(["head2.ts"]));
+    expect(readViewed(key, "head4").paths).toEqual(new Set(["head4.ts"]));
   });
 
   it("reads corrupt or unknown values as empty", () => {
     localStorage.setItem(key, "{not json");
     expect(readViewed(key, "head1")).toEqual({ paths: new Set(), resetFromHead: null });
-    localStorage.setItem(key, JSON.stringify({ v: 2, headSha: "head1", paths: ["a.ts"] }));
+    localStorage.setItem(key, JSON.stringify({ v: 1, headSha: "head1", paths: ["a.ts"] }));
     expect(readViewed(key, "head1").paths.size).toBe(0);
   });
 
@@ -149,14 +200,11 @@ describe("readViewed / writeViewed", () => {
     writeViewed(stale, "h", ["a.ts"]);
     vi.setSystemTime(150 * DAY_MS);
     writeViewed(recent, "h", ["a.ts"]);
+    localStorage.setItem(`${KEY_PREFIX}corrupt`, "{");
     vi.setSystemTime(191 * DAY_MS);
     writeViewed(key, "h", ["a.ts"]);
 
-    expect(localStorage.getItem(stale)).toBeNull();
-    expect(localStorage.getItem(recent)).not.toBeNull();
-    expect(Object.keys(JSON.parse(localStorage.getItem(INDEX_KEY)!)).sort()).toEqual(
-      [key, recent].sort(),
-    );
+    expect(storedKeys().sort()).toEqual([key, recent].sort());
   });
 
   it("keeps only the 500 most recently written entries", () => {
@@ -164,31 +212,42 @@ describe("readViewed / writeViewed", () => {
     const keys = Array.from({ length: 501 }, (_, index) =>
       viewedStorageKey("https://a", "alice", { ...PR, number: index + 1 }),
     );
-    for (const entryKey of keys) {
+    for (const entryKey of keys.slice(0, 500)) {
       writeViewed(entryKey, "h", ["a.ts"]);
       vi.advanceTimersByTime(1);
     }
-    expect(localStorage.getItem(keys[0])).toBeNull();
-    expect(localStorage.getItem(keys[1])).not.toBeNull();
-    expect(Object.keys(JSON.parse(localStorage.getItem(INDEX_KEY)!))).toHaveLength(500);
+    // Rewriting the oldest entry makes the second-oldest the one to evict.
+    writeViewed(keys[0], "h", ["b.ts"]);
+    vi.advanceTimersByTime(1);
+    writeViewed(keys[500], "h", ["a.ts"]);
+
+    expect(localStorage.getItem(keys[0])).not.toBeNull();
+    expect(localStorage.getItem(keys[1])).toBeNull();
+    expect(storedKeys()).toHaveLength(500);
   });
 
-  it("keeps values in memory when storage throws", () => {
-    const memoryKey = viewedStorageKey("https://a", "alice", { ...PR, number: 99 });
-    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new DOMException("full", "QuotaExceededError");
-    });
-    expect(writeViewed(memoryKey, "head1", ["a.ts"])).toEqual({ persisted: false });
-    expect(readViewed(memoryKey, "head1").paths).toEqual(new Set(["a.ts"]));
+  it("keeps values in memory when storage throws, until a write succeeds", () => {
+    const writes = failStorageWrites();
+    expect(writeViewed(key, "head1", ["a.ts"])).toEqual({ persisted: false });
+    expect(readViewed(key, "head1").paths).toEqual(new Set(["a.ts"]));
 
-    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    const reads = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new DOMException("denied", "SecurityError");
     });
-    expect(readViewed(memoryKey, "head1").paths).toEqual(new Set(["a.ts"]));
+    const otherKey = viewedStorageKey("https://a", "alice", { ...PR, number: 98 });
+    expect(readViewed(key, "head1").paths).toEqual(new Set(["a.ts"]));
+    expect(readViewed(otherKey, "head1")).toEqual({ paths: new Set(), resetFromHead: null });
+
+    writes.mockRestore();
+    reads.mockRestore();
+    expect(writeViewed(key, "head1", ["a.ts", "b.ts"])).toEqual({ persisted: true });
+    expect(JSON.parse(localStorage.getItem(key)!).heads.head1.paths).toEqual(["a.ts", "b.ts"]);
   });
 });
 
 describe("useViewedFiles", () => {
+  const key = viewedStorageKey(SERVER, "alice", PR);
+
   it("is unavailable until server, user, PR and head are known", () => {
     expect(renderHook(() => useViewedFiles(null, "head1")).result.current.available).toBe(false);
     expect(renderHook(() => useViewedFiles(PR, null)).result.current.available).toBe(false);
@@ -200,6 +259,7 @@ describe("useViewedFiles", () => {
     expect(result.current.available).toBe(false);
     act(() => result.current.toggle("a.ts"));
     expect(result.current.viewed.size).toBe(0);
+    expect(storedKeys()).toEqual([]);
   });
 
   it("persists toggles across remounts and isolates users", () => {
@@ -218,7 +278,16 @@ describe("useViewedFiles", () => {
     expect(renderHook(() => useViewedFiles(PR, "head1")).result.current.viewed.size).toBe(0);
   });
 
-  it("resets on a new head and reports it until the head changes again", () => {
+  it("keeps simultaneous consumers in one tab in sync", () => {
+    const first = renderHook(() => useViewedFiles(PR, "head1"));
+    const second = renderHook(() => useViewedFiles(PR, "head1"));
+    act(() => first.result.current.toggle("a.ts"));
+    expect(second.result.current.viewed).toEqual(new Set(["a.ts"]));
+    act(() => second.result.current.toggle("a.ts"));
+    expect(first.result.current.viewed.size).toBe(0);
+  });
+
+  it("starts a new head empty and reports the reset until that head gets a mark", () => {
     const { result, rerender } = renderHook(({ head }) => useViewedFiles(PR, head), {
       initialProps: { head: "head1" },
     });
@@ -228,38 +297,56 @@ describe("useViewedFiles", () => {
     rerender({ head: "head2" });
     expect(result.current.viewed.size).toBe(0);
     expect(result.current.resetNotice).toBe(true);
+    expect(renderHook(() => useViewedFiles(PR, "head2")).result.current.resetNotice).toBe(true);
+
     act(() => result.current.toggle("b.ts"));
     expect(result.current.viewed).toEqual(new Set(["b.ts"]));
-    expect(result.current.resetNotice).toBe(true);
+    expect(result.current.resetNotice).toBe(false);
 
-    rerender({ head: "head2" });
-    expect(result.current.resetNotice).toBe(true);
-    expect(renderHook(() => useViewedFiles(PR, "head2")).result.current.resetNotice).toBe(false);
-  });
-
-  it("reports a storage failure and keeps marks in memory", () => {
-    const { result } = renderHook(() => useViewedFiles({ ...PR, number: 77 }, "head1"));
-    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new DOMException("full", "QuotaExceededError");
-    });
-    act(() => result.current.toggle("a.ts"));
-    expect(result.current.persisted).toBe(false);
+    rerender({ head: "head1" });
     expect(result.current.viewed).toEqual(new Set(["a.ts"]));
   });
 
-  it("follows writes from another tab", () => {
-    const { result } = renderHook(() => useViewedFiles(PR, "head1"));
-    const key = viewedStorageKey("https://omni.example", "alice", PR);
-    writeViewed(key, "head1", ["remote.ts"]);
-    act(() => {
-      window.dispatchEvent(new StorageEvent("storage", { key }));
+  it("reports unsaved marks from the store, across remounts and identity changes", () => {
+    failStorageWrites();
+    const first = renderHook(({ pr }) => useViewedFiles(pr, "head1"), {
+      initialProps: { pr: PR },
     });
+    act(() => first.result.current.toggle("a.ts"));
+    expect(first.result.current.persisted).toBe(false);
+    expect(first.result.current.viewed).toEqual(new Set(["a.ts"]));
+    first.rerender({ pr: { ...PR, number: 8 } });
+    expect(first.result.current.persisted).toBe(true);
+    first.unmount();
+
+    const remounted = renderHook(() => useViewedFiles(PR, "head1"));
+    expect(remounted.result.current.persisted).toBe(false);
+    expect(remounted.result.current.viewed).toEqual(new Set(["a.ts"]));
+  });
+
+  it("follows writes and clears from another tab, even over unsaved marks", () => {
+    const { result } = renderHook(() => useViewedFiles(PR, "head1"));
+    const remote = JSON.stringify({
+      v: 1,
+      heads: { head1: { paths: ["remote.ts"], updatedAt: Date.now() } },
+    });
+    remoteWrite(key, remote);
     expect(result.current.viewed).toEqual(new Set(["remote.ts"]));
 
-    localStorage.clear();
-    act(() => {
-      window.dispatchEvent(new StorageEvent("storage", { key: null }));
-    });
+    const writes = failStorageWrites();
+    act(() => result.current.toggle("local.ts"));
+    expect(result.current.viewed).toEqual(new Set(["remote.ts", "local.ts"]));
+    writes.mockRestore();
+    remoteWrite(key, remote);
+    expect(result.current.viewed).toEqual(new Set(["remote.ts"]));
+    expect(result.current.persisted).toBe(true);
+
+    failStorageWrites();
+    act(() => result.current.toggle("local.ts"));
+    vi.restoreAllMocks();
+    remoteWrite(key, null);
     expect(result.current.viewed.size).toBe(0);
+    act(() => result.current.toggle("next.ts"));
+    expect(readViewed(key, "head1").paths).toEqual(new Set(["next.ts"]));
   });
 });

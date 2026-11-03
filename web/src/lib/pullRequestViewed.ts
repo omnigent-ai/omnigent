@@ -1,7 +1,7 @@
 // Browser-local "viewed" marks for pull request files, scoped to one server,
-// user, pull request and head revision. A new head resets the marks.
+// user, pull request and head revision. A new head starts with no marks.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { z } from "zod";
 import { useViewerId } from "@/hooks/useViewerId";
 import { getOmnigentServerIdentity } from "./host";
@@ -14,16 +14,59 @@ export interface PullRequestIdentity {
 }
 
 const KEY_PREFIX = "omnigent:pr-viewed:v1:";
-const INDEX_KEY = `${KEY_PREFIX}index`;
 const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 const MAX_ENTRIES = 500;
+// Older heads stay so a tab still showing one can't overwrite marks for a newer head.
+const MAX_HEADS = 3;
 
 // Path patterns capture the repository and number; any suffix (e.g. `/files`) is ignored.
-const PULL_REQUEST_PATHS: readonly [provider: string, pattern: RegExp][] = [
-  ["github", /^\/([^/]+\/[^/]+)\/pull\/(\d+)(?:\/|$)/],
-  ["gitlab", /^\/(.+?)\/-\/merge_requests\/(\d+)(?:\/|$)/],
-  ["azure_devops", /^\/(.+?\/_git\/[^/]+)\/pullrequest\/(\d+)(?:\/|$)/i],
-];
+const GITHUB_PATH = /^\/([^/]+\/[^/]+)\/pull\/(\d+)(?:\/|$)/;
+const GITLAB_PATH = /^\/(.+?)\/-\/merge_requests\/(\d+)(?:\/|$)/;
+const AZURE_PATH = /^\/(?:(.+?)\/)?_git\/([^/]+)\/pullrequest\/(\d+)(?:\/|$)/i;
+const AZURE_HOST = "dev.azure.com";
+const LEGACY_AZURE_HOST = /^([^.]+)\.visualstudio\.com$/;
+
+function pathIdentity(provider: string, url: URL, pattern: RegExp): PullRequestIdentity | null {
+  const match = pattern.exec(url.pathname);
+  if (!match) return null;
+  return {
+    provider,
+    host: url.host.toLowerCase(),
+    repository: match[1].toLowerCase(),
+    number: Number(match[2]),
+  };
+}
+
+/** Azure DevOps Services only, normalized to `dev.azure.com/{org}/{project}/{repo}` like the server. */
+function azureIdentity(url: URL): PullRequestIdentity | null {
+  const match = AZURE_PATH.exec(url.pathname);
+  if (!match || url.port) return null;
+  const prefix = match[1]?.split("/") ?? [];
+  const host = url.hostname.toLowerCase();
+  let org: string | undefined;
+  if (host === AZURE_HOST) {
+    org = prefix.shift();
+  } else {
+    org = LEGACY_AZURE_HOST.exec(host)?.[1];
+    if (prefix[0]?.toLowerCase() === "defaultcollection") prefix.shift();
+  }
+  if (!org || prefix.length > 1) return null;
+  const [, , repo, number] = match;
+  // A project's default repository URL omits the project; it shares the repository's name.
+  const project = prefix[0] ?? repo;
+  return {
+    provider: "azure_devops",
+    host: AZURE_HOST,
+    repository: `${org}/${project}/${repo}`.toLowerCase(),
+    number: Number(number),
+  };
+}
+
+const PARSERS = new Map<string, (url: URL) => PullRequestIdentity | null>([
+  ["github", (url) => pathIdentity("github", url, GITHUB_PATH)],
+  ["gitlab", (url) => pathIdentity("gitlab", url, GITLAB_PATH)],
+  ["azure_devops", azureIdentity],
+]);
 
 /** Parse a GitHub, GitLab or Azure DevOps PR URL; null for anything else. */
 export function pullRequestIdentityFromUrl(
@@ -37,17 +80,10 @@ export function pullRequestIdentityFromUrl(
     return null;
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
-  for (const [id, pattern] of PULL_REQUEST_PATHS) {
-    if (provider && provider !== id) continue;
-    const match = pattern.exec(parsed.pathname);
-    if (match) {
-      return {
-        provider: id,
-        host: parsed.host.toLowerCase(),
-        repository: match[1].toLowerCase(),
-        number: Number(match[2]),
-      };
-    }
+  const parsers = provider ? [PARSERS.get(provider)] : [...PARSERS.values()];
+  for (const parse of parsers) {
+    const identity = parse?.(parsed);
+    if (identity) return identity;
   }
   return null;
 }
@@ -65,143 +101,182 @@ export function viewedStorageKey(server: string, user: string, pr: PullRequestId
 
 const storedSchema = z.object({
   v: z.literal(1),
-  headSha: z.string(),
-  paths: z.array(z.string()),
-  updatedAt: z.number(),
+  heads: z.record(z.string(), z.object({ paths: z.array(z.string()), updatedAt: z.number() })),
 });
-const indexSchema = z.record(z.string(), z.number());
+type StoredHeads = z.infer<typeof storedSchema>["heads"];
 
-// Values whose localStorage write failed; they shadow storage for this page's lifetime.
+// Values whose localStorage write failed. They win over storage until another tab changes it.
 const memoryFallback = new Map<string, string>();
+const listeners = new Set<() => void>();
 
-function readStored(key: string): z.infer<typeof storedSchema> | null {
-  let raw = memoryFallback.get(key) ?? null;
+function notify(): void {
+  for (const listener of listeners) listener();
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+if (typeof window !== "undefined") {
+  // Other tabs' writes arrive only as `storage` events; a null key means storage.clear().
+  window.addEventListener("storage", (event) => {
+    if (event.key === null) memoryFallback.clear();
+    else if (event.key.startsWith(KEY_PREFIX)) memoryFallback.delete(event.key);
+    else return;
+    notify();
+  });
+}
+
+function storedRaw(key: string): string | null {
+  const memory = memoryFallback.get(key);
+  if (memory !== undefined) return memory;
   try {
-    raw ??= window.localStorage.getItem(key);
-    const result = storedSchema.safeParse(JSON.parse(raw ?? "null"));
-    return result.success ? result.data : null;
+    return window.localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-/** Viewed paths for `headSha`; a different stored head reads as empty and reports it. */
-export function readViewed(
-  key: string,
-  headSha: string,
-): { paths: Set<string>; resetFromHead: string | null } {
-  const stored = readStored(key);
-  if (stored === null) return { paths: new Set(), resetFromHead: null };
-  if (stored.headSha !== headSha) return { paths: new Set(), resetFromHead: stored.headSha };
-  return { paths: new Set(stored.paths), resetFromHead: null };
-}
-
-function readIndex(): Record<string, number> {
+function parseHeads(raw: string | null): StoredHeads {
   try {
-    const result = indexSchema.safeParse(
-      JSON.parse(window.localStorage.getItem(INDEX_KEY) ?? "{}"),
-    );
-    return result.success ? result.data : {};
+    const result = storedSchema.safeParse(JSON.parse(raw ?? "null"));
+    return result.success ? result.data.heads : {};
   } catch {
     return {};
   }
 }
 
-/** Record `key` as just used and drop entries past the age and count limits. */
-function touchIndex(key: string, now: number): void {
-  const entries = Object.entries({ ...readIndex(), [key]: now }).filter(([entryKey]) =>
-    entryKey.startsWith(KEY_PREFIX),
-  );
-  entries.sort((a, b) => b[1] - a[1]);
-  const kept = entries.filter(
-    ([, at], position) => position < MAX_ENTRIES && now - at <= MAX_AGE_MS,
-  );
-  const keptKeys = new Set(kept.map(([entryKey]) => entryKey));
-  for (const [entryKey] of entries) {
-    if (!keptKeys.has(entryKey)) {
-      window.localStorage.removeItem(entryKey);
-      memoryFallback.delete(entryKey);
-    }
-  }
-  window.localStorage.setItem(INDEX_KEY, JSON.stringify(Object.fromEntries(kept)));
+function viewedFor(
+  heads: StoredHeads,
+  headSha: string,
+): { paths: Set<string>; resetFromHead: string | null } {
+  const current = Object.hasOwn(heads, headSha) ? heads[headSha] : undefined;
+  if (current) return { paths: new Set(current.paths), resetFromHead: null };
+  const [latestOther] = Object.entries(heads).sort((a, b) => b[1].updatedAt - a[1].updatedAt);
+  return { paths: new Set(), resetFromHead: latestOther?.[0] ?? null };
 }
 
-/** Store the viewed paths for `headSha`, replacing any other head; keeps them in memory if storage fails. */
+/** Viewed paths for `headSha`; when only other heads have marks, `resetFromHead` names the latest. */
+export function readViewed(
+  key: string,
+  headSha: string,
+): { paths: Set<string>; resetFromHead: string | null } {
+  return viewedFor(parseHeads(storedRaw(key)), headSha);
+}
+
+function lastUpdated(key: string): number {
+  const times = Object.values(parseHeads(window.localStorage.getItem(key))).map(
+    (head) => head.updatedAt,
+  );
+  return times.length > 0 ? Math.max(...times) : -Infinity;
+}
+
+/** Evict other entries past the age and count limits, scanning storage so no shared index can drift. */
+function pruneEntries(currentKey: string, now: number): void {
+  // ponytail: parses every stored entry (≤ MAX_ENTRIES) per write; keep a cached index if that shows up in profiles.
+  try {
+    const entries: [string, number][] = [];
+    for (let position = 0; position < window.localStorage.length; position++) {
+      const entryKey = window.localStorage.key(position);
+      if (entryKey?.startsWith(KEY_PREFIX) && entryKey !== currentKey) {
+        entries.push([entryKey, lastUpdated(entryKey)]);
+      }
+    }
+    entries.sort((a, b) => b[1] - a[1]);
+    entries.forEach(([entryKey, updatedAt], position) => {
+      if (position >= MAX_ENTRIES - 1 || now - updatedAt > MAX_AGE_MS) {
+        window.localStorage.removeItem(entryKey);
+      }
+    });
+  } catch {
+    // Pruning is best effort; the write reports whether storage works.
+  }
+}
+
+/** Store the viewed paths for `headSha`; keeps them in memory if storage fails. */
 export function writeViewed(
   key: string,
   headSha: string,
   paths: Iterable<string>,
 ): { persisted: boolean } {
   const updatedAt = Date.now();
-  const value = JSON.stringify({ v: 1, headSha, paths: [...new Set(paths)], updatedAt });
+  const otherHeads = Object.entries(parseHeads(storedRaw(key)))
+    .filter(([sha]) => sha !== headSha)
+    .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+    .slice(0, MAX_HEADS - 1);
+  const heads = Object.fromEntries([
+    [headSha, { paths: [...new Set(paths)], updatedAt }],
+    ...otherHeads,
+  ]);
+  const value = JSON.stringify({ v: 1, heads });
+  pruneEntries(key, updatedAt);
+  let persisted = true;
   try {
-    touchIndex(key, updatedAt);
     window.localStorage.setItem(key, value);
     memoryFallback.delete(key);
-    return { persisted: true };
   } catch {
     memoryFallback.set(key, value);
-    return { persisted: false };
+    persisted = false;
   }
+  notify();
+  return { persisted };
 }
 
-const EMPTY: ReadonlySet<string> = new Set();
-
-interface LoadedViewed {
-  key: string | null;
-  headSha: string | null;
+interface ViewedSnapshot {
+  /** False until server, user, PR and head are known; mutations do nothing meanwhile. */
+  available: boolean;
   viewed: ReadonlySet<string>;
+  /** True while this head has no marks but an earlier head did. */
   resetNotice: boolean;
+  /** False while the marks live only in memory because storage failed. */
+  persisted: boolean;
 }
 
-function loadViewed(key: string | null, headSha: string | null): LoadedViewed {
-  if (key === null || headSha === null) return { key, headSha, viewed: EMPTY, resetNotice: false };
-  const { paths, resetFromHead } = readViewed(key, headSha);
-  return { key, headSha, viewed: paths, resetNotice: resetFromHead !== null };
+const UNAVAILABLE: ViewedSnapshot = {
+  available: false,
+  viewed: new Set(),
+  resetNotice: false,
+  persisted: true,
+};
+
+/** A `useSyncExternalStore` reader that returns the same snapshot until the stored value changes. */
+function snapshotReader(key: string | null, headSha: string | null): () => ViewedSnapshot {
+  if (key === null || headSha === null) return () => UNAVAILABLE;
+  let lastRaw: string | null | undefined;
+  let lastInMemory = false;
+  let snapshot = UNAVAILABLE;
+  return () => {
+    const raw = storedRaw(key);
+    const inMemory = memoryFallback.has(key);
+    if (raw !== lastRaw || inMemory !== lastInMemory) {
+      lastRaw = raw;
+      lastInMemory = inMemory;
+      const { paths, resetFromHead } = viewedFor(parseHeads(raw), headSha);
+      snapshot = {
+        available: true,
+        viewed: paths,
+        resetNotice: resetFromHead !== null,
+        persisted: !inMemory,
+      };
+    }
+    return snapshot;
+  };
 }
 
 export function useViewedFiles(
   pr: PullRequestIdentity | null,
   headSha: string | null,
-): {
-  available: boolean;
-  viewed: ReadonlySet<string>;
+): ViewedSnapshot & {
   toggle: (path: string) => void;
   setMany: (paths: string[], viewed: boolean) => void;
-  resetNotice: boolean;
-  persisted: boolean;
 } {
   const server = getOmnigentServerIdentity();
   const user = useViewerId();
   const key = server && user && pr ? viewedStorageKey(server, user, pr) : null;
   const head = headSha || null;
-  const [loaded, setLoaded] = useState(() => loadViewed(key, head));
-  const [persisted, setPersisted] = useState(true);
-  let current = loaded;
-  if (loaded.key !== key || loaded.headSha !== head) {
-    current = loadViewed(key, head);
-    setLoaded(current);
-  }
-
-  const showPaths = useCallback(
-    (paths: ReadonlySet<string>) =>
-      setLoaded((previous) =>
-        previous.key === key && previous.headSha === head
-          ? { ...previous, viewed: paths }
-          : previous,
-      ),
-    [key, head],
-  );
-
-  useEffect(() => {
-    if (key === null || head === null) return;
-    // Other tabs' writes arrive only as `storage` events; a null key means storage.clear().
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key === key) showPaths(readViewed(key, head).paths);
-    };
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, [key, head, showPaths]);
+  const getSnapshot = useMemo(() => snapshotReader(key, head), [key, head]);
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const update = useCallback(
     (change: (paths: Set<string>) => void) => {
@@ -209,10 +284,9 @@ export function useViewedFiles(
       // Start from storage so back-to-back calls and other tabs' writes are not lost.
       const { paths } = readViewed(key, head);
       change(paths);
-      setPersisted(writeViewed(key, head, paths).persisted);
-      showPaths(paths);
+      writeViewed(key, head, paths);
     },
-    [key, head, showPaths],
+    [key, head],
   );
   const toggle = useCallback(
     (path: string) =>
@@ -232,15 +306,5 @@ export function useViewedFiles(
     [update],
   );
 
-  return useMemo(
-    () => ({
-      available: current.key !== null && current.headSha !== null,
-      viewed: current.viewed,
-      toggle,
-      setMany,
-      resetNotice: current.resetNotice,
-      persisted,
-    }),
-    [current, toggle, setMany, persisted],
-  );
+  return useMemo(() => ({ ...snapshot, toggle, setMany }), [snapshot, toggle, setMany]);
 }
