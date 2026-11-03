@@ -15,7 +15,9 @@
 import { XIcon } from "lucide-react";
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
+import { useInertRef } from "@/hooks/useInertRef";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { cn } from "@/lib/utils";
 
@@ -85,8 +87,10 @@ export function MobilePanelDrawer({
     () => ({ actions: headerTarget, title: titleTarget }),
     [headerTarget, titleTarget],
   );
+  const inertRef = useInertRef<HTMLElement>(!open);
   return (
     <aside
+      ref={inertRef}
       data-testid={testId}
       data-state={open ? "open" : "closed"}
       style={keyboardInset > 0 ? { paddingBottom: keyboardInset } : undefined}
@@ -100,7 +104,6 @@ export function MobilePanelDrawer({
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
-      inert={!open}
     >
       <header className="flex shrink-0 items-center justify-between border-border border-b pl-4 pr-2 py-2">
         <div ref={setTitleTarget} className="min-w-0 [&:has(>[data-mobile-panel-title])>h2]:hidden">
@@ -115,7 +118,11 @@ export function MobilePanelDrawer({
       </header>
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <MobilePanelHeaderContext.Provider value={headerTargets}>
-          {(open || keepMounted) && children}
+          {(open || keepMounted) && (
+            <RenderErrorBoundary name={title} resetKey={open ? "open" : "closed"}>
+              {children}
+            </RenderErrorBoundary>
+          )}
         </MobilePanelHeaderContext.Provider>
       </div>
     </aside>
