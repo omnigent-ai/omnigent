@@ -15,12 +15,15 @@ own ``GET /v1/sessions/{id}`` snapshot returns it.
 
 from __future__ import annotations
 
+import sys
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from tests.e2e_ui.conftest import _create_runner_bound_session, _server_state
 
 
 def _row(page: Page, session_id: str) -> Locator:
@@ -135,3 +138,72 @@ def test_rename_row_never_repaints_the_old_title(
         f"row repainted the pre-rename title {old_title!r} for {len(stale)} frame(s) after "
         f"the editor closed; frames after commit: {[s['text'] for s in after_commit[:5]]}"
     )
+
+
+def _rename_shortcut() -> str:
+    """Return the platform's Cmd/Ctrl+Alt+R chord for Playwright."""
+    modifier = "Meta" if sys.platform == "darwin" else "Control"
+    return f"{modifier}+Alt+r"
+
+
+def test_rename_hotkey_edits_sidebar_rows_in_sequence(
+    request: pytest.FixtureRequest,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The shortcut renames the open session in its sidebar row, one session after another."""
+    base_url, first_id = seeded_session
+    second_id = _create_runner_bound_session(base_url, str(_server_state["runner_id"]))
+    titles = {first_id: "Rename shortcut first", second_id: "Rename shortcut second"}
+    try:
+        for session_id, title in titles.items():
+            httpx.patch(
+                f"{base_url}/v1/sessions/{session_id}", json={"title": title}, timeout=10.0
+            ).raise_for_status()
+        page: Page = request.getfixturevalue("page")
+        page.goto(f"{base_url}/c/{first_id}")
+
+        composer = page.get_by_placeholder("Send a message…")
+        expect(composer).to_be_visible(timeout=30_000)
+        composer.fill("Keep this draft while renaming")
+        # The edit field replaces the row's link, so find it in the sidebar by its value.
+        edit = page.locator("aside.conversations-sidebar").get_by_test_id(
+            "rename-conversation-input"
+        )
+        renamed = {first_id: "First renamed from sidebar", second_id: "Second renamed from sidebar"}
+        for session_id in (first_id, second_id):
+            row = _row(page, session_id)
+            if session_id != first_id:
+                row.get_by_role("link").click()
+                expect(page.get_by_test_id("header-title")).to_have_text(titles[session_id])
+            page.keyboard.press(_rename_shortcut())
+            expect(edit).to_be_focused()
+            expect(edit).to_have_value(titles[session_id])
+            assert edit.evaluate("el => [el.selectionStart, el.selectionEnd]") == [
+                0,
+                len(titles[session_id]),
+            ]
+            expect(page.get_by_test_id("header-title-input")).to_have_count(0)
+            page.keyboard.type(renamed[session_id])
+            edit.press("Enter")
+            expect(edit).to_have_count(0)
+            expect(row.get_by_role("link")).to_contain_text(renamed[session_id])
+            expect(page.get_by_test_id("header-title")).to_have_text(renamed[session_id])
+
+        page.keyboard.press(_rename_shortcut())
+        expect(edit).to_be_focused()
+        expect(edit).to_have_value(renamed[second_id])
+        edit.fill("Cancel this rename")
+        edit.press("Escape")
+        expect(edit).to_have_count(0)
+        expect(_row(page, second_id).get_by_role("link")).to_contain_text(renamed[second_id])
+
+        _row(page, first_id).get_by_role("link").click()
+        expect(composer).to_have_value("Keep this draft while renaming")
+        page.reload()
+        for session_id, title in renamed.items():
+            expect(_row(page, session_id).get_by_role("link")).to_contain_text(title)
+            snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+            snapshot.raise_for_status()
+            assert snapshot.json()["title"] == title
+    finally:
+        httpx.delete(f"{base_url}/v1/sessions/{second_id}", timeout=10.0)

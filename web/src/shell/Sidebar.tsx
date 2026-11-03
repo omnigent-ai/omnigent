@@ -195,6 +195,7 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
+import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -5256,6 +5257,19 @@ function ConversationRowImpl({
   // double-click (an updated_at bump slides another row under the cursor),
   // and only a row that saw both clicks may enter rename.
   const recentClickTimesRef = useRef<number[]>([]);
+  // The rename shortcut edits this row, like its Rename menu item, while the
+  // row is on screen; otherwise the header title takes the edit.
+  const canRenameInline = isOwner && !isProvisionalRow && !selectionMode;
+  useEffect(() => {
+    if (!canRenameInline) return;
+    return registerSidebarRename(conversation.id, () => {
+      if (isEditing) return true;
+      const row = rowRef.current;
+      if (!row?.isConnected || isInClosedSidebar(row)) return false;
+      setIsEditing(true);
+      return true;
+    });
+  }, [canRenameInline, conversation.id, isEditing]);
 
   if (isEditing) {
     return (
