@@ -89,6 +89,8 @@ export interface ScheduledTask {
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
 export interface ScheduledTaskRun {
+  /** Current cumulative session cost; null when not reported (not a per-run delta). */
+  sessionCostUsd: number | null;
   id: string;
   scheduledTaskId: string;
   status: ScheduledTaskRunStatus;
@@ -226,6 +228,7 @@ interface ScheduledTaskWire {
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
 interface ScheduledTaskRunWire {
+  session_cost_usd?: number | null;
   id: string;
   scheduled_task_id: string;
   status: ScheduledTaskRunStatus;
@@ -310,6 +313,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
 
 function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
   return {
+    sessionCostUsd: wire.session_cost_usd ?? null,
     id: wire.id,
     scheduledTaskId: wire.scheduled_task_id,
     status: wire.status,
@@ -441,4 +445,53 @@ export async function runScheduledTaskNow(id: string): Promise<void> {
     method: "POST",
   });
   if (!res.ok) throw await errorFromResponse(res);
+}
+
+/** Latest failed run from an automation without a session Inbox entry. */
+interface AutomationFailureWire {
+  task_id: string;
+  task_name: string;
+  run_id: string;
+  scheduled_at: number;
+  finished_at: number | null;
+  error_code: string | null;
+}
+
+export interface AutomationFailure {
+  taskId: string;
+  taskName: string;
+  runId: string;
+  scheduledAt: number;
+  finishedAt: number | null;
+  errorCode: string | null;
+}
+
+export interface AutomationFailurePage {
+  data: AutomationFailure[];
+  nextCursor: string | null;
+}
+
+function failureFromWire(wire: AutomationFailureWire): AutomationFailure {
+  return {
+    taskId: wire.task_id,
+    taskName: wire.task_name,
+    runId: wire.run_id,
+    scheduledAt: wire.scheduled_at,
+    finishedAt: wire.finished_at,
+    errorCode: wire.error_code,
+  };
+}
+
+const AUTOMATION_INBOX_PAGE_SIZE = 50;
+
+/** Pages over owned tasks; an empty result can still have a continuation. */
+export async function listAutomationFailures(after: string | null): Promise<AutomationFailurePage> {
+  const params = new URLSearchParams({ limit: String(AUTOMATION_INBOX_PAGE_SIZE) });
+  if (after !== null) params.set("after", after);
+  const response = await authenticatedFetch(`/v1/scheduled-tasks/inbox?${params}`);
+  const page = await readJsonOrThrow<{
+    data: AutomationFailureWire[];
+    next_cursor: string | null;
+  }>(response);
+  return { data: page.data.map(failureFromWire), nextCursor: page.next_cursor };
 }

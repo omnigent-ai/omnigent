@@ -42,6 +42,10 @@
  * what clears an approval.
  */
 
+import type { AutomationFailure } from "@/lib/scheduledTasksApi";
+import { describeRunFailure } from "@/lib/scheduleText";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
@@ -179,7 +183,8 @@ const PREVIEW_MAX_CHARS = 280;
 type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
-  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem };
+  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
+  | { kind: "automation"; key: string; at: number; item: AutomationFailure };
 
 const TILE_TONES = {
   yellow: "bg-status-yellow/12 text-status-yellow",
@@ -196,11 +201,16 @@ const PRIMARY_ACTION =
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ["automation-inbox"] });
+  }, [queryClient]);
   const {
     inbox: conversationsQuery,
     inboxRows: allRows,
     comments: commentInbox,
+    automationInbox,
   } = useSidebarData();
+  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
@@ -307,19 +317,35 @@ export function InboxPage() {
   const visibleApprovals = showApprovals ? items : [];
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
-  const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
-  const totalCount = items.length + commentInbox.items.length + unreadItems.length;
+  const visibleAutomations = showUnread ? automationInbox.items : [];
+  const visibleCount =
+    visibleApprovals.length +
+    visibleComments.length +
+    visibleUnread.length +
+    visibleAutomations.length;
+  const totalCount =
+    items.length + commentInbox.items.length + unreadItems.length + automationInbox.items.length;
   const summary = [
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
     unreadItems.length > 0 && `${unreadItems.length} unread`,
+    automationInbox.items.length > 0 &&
+      (automationInbox.items.length === 1
+        ? "1 failed automation"
+        : `${automationInbox.items.length} failed automations`),
   ]
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
   const groups = groupInboxEntries<InboxEntry>([
+    ...visibleAutomations.map((item) => ({
+      kind: "automation" as const,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
+      item,
+    })),
     ...visibleApprovals.map((item) => ({
       kind: "approval" as const,
       key: `approval:${item.elicitation.elicitationId}`,
@@ -379,7 +405,8 @@ export function InboxPage() {
     conversationsQuery.isLoading ||
     isFetchingNextPage ||
     snapshotQueries.some((q) => q.isLoading) ||
-    commentInbox.isLoading;
+    commentInbox.isLoading ||
+    (showUnread && automationInbox.isLoading);
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount =
     failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
@@ -438,6 +465,47 @@ export function InboxPage() {
       trackClick(`inbox.${entry.kind}.toggle_expanded`, "button");
       setExpandedOverrides((prev) => ({ ...prev, [entry.key]: !expanded }));
     };
+    if (entry.kind === "automation") {
+      const { item } = entry;
+      const failure = describeRunFailure(item.errorCode, "failed");
+      const reason = failure.stage ? `${failure.stage} · ${failure.reason}` : failure.reason;
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-automation-item"
+          tile={<KindTile icon={AlertTriangleIcon} tone="red" />}
+          kindLabel="Automation failed"
+          title={item.taskName}
+          preview={reason}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.taskName}</p>
+          <p className="mt-2 text-ui text-muted-foreground">{reason}</p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link
+                to={taskDetailsEnabled ? `/tasks/${item.taskId}` : "/tasks"}
+                componentId="inbox.automation.open"
+              >
+                Open automation <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              className={OUTLINE_ACTION}
+              onClick={() => automationInbox.markRead(item.runId)}
+              componentId="inbox.automation.mark_read"
+            >
+              <CheckIcon className="size-3.5" /> Mark as read
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
     const title = conversationDisplayLabel(entry.item.row);
 
     if (entry.kind === "approval") {
@@ -847,6 +915,20 @@ export function InboxPage() {
         </div>
       )}
 
+      {showUnread && automationInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load automation failures.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void automationInbox.refetch()}
+            componentId="inbox.retry_automations"
+          >
+            Retry automations
+          </Button>
+        </div>
+      )}
+
       {assembling && visibleCount === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -854,15 +936,20 @@ export function InboxPage() {
         </div>
       )}
 
-      {!assembling && failedSessionCount === 0 && visibleCount === 0 && (
-        <div className="flex flex-col items-center gap-2 py-16 text-center">
-          <InboxIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">
-            {hasNextPage ? "Nothing waiting in these sessions" : emptyState.title}
-          </p>
-          <p className="text-sm text-muted-foreground">{emptyState.body}</p>
-        </div>
-      )}
+      {!assembling &&
+        failedSessionCount === 0 &&
+        !(showUnread && automationInbox.isError) &&
+        visibleCount === 0 && (
+          <div className="flex flex-col items-center gap-2 py-16 text-center">
+            <InboxIcon className="size-8 text-muted-foreground/50" />
+            <p className="text-ui font-medium">
+              {hasNextPage || (showUnread && automationInbox.hasNextPage)
+                ? "Nothing waiting in the loaded items"
+                : emptyState.title}
+            </p>
+            <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+          </div>
+        )}
 
       <div className="flex flex-col gap-4">
         {groups.map((group) => (
@@ -887,6 +974,17 @@ export function InboxPage() {
           className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
+        </Button>
+      )}
+      {showUnread && automationInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={automationInbox.isFetching}
+          onClick={() => void automationInbox.fetchNextPage()}
+          componentId="inbox.load_more_automations"
+          className="mt-4"
+        >
+          {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
     </PageScroll>

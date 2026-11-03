@@ -6227,6 +6227,11 @@
             "title": "Scheduled Task Harness Settings",
             "type": "boolean"
           },
+          "scheduled_task_inbox": {
+            "default": false,
+            "title": "Scheduled Task Inbox",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
