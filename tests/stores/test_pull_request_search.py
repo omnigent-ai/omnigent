@@ -13,6 +13,7 @@ from omnigent.stores.conversation_store.pull_request_search import parse_pull_re
         "#1234",
         " PR 1234 ",
         "PR  1234",
+        "PR  :  1234",
         "pr#1234",
         "PR-1234",
         "pull request #1234",

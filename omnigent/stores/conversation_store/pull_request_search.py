@@ -17,7 +17,7 @@ from omnigent.git_providers import resolve_pr_url
 # number stays a plain substring search.
 _REFERENCE_LABEL = r"(?:pr|mr|pull request|merge request)"
 _NUMBER_QUERY = re.compile(
-    rf"(?:{_REFERENCE_LABEL}\s*[-:]?\s*)?[#!]?([1-9][0-9]{{0,8}})",
+    rf"(?:{_REFERENCE_LABEL}\s*(?:[-:]\s*)?)?[#!]?([1-9][0-9]{{0,8}})",
     re.IGNORECASE,
 )
 # What precedes a number in a PR reference: "#"/"!", a PR URL path segment, or
@@ -25,7 +25,7 @@ _NUMBER_QUERY = re.compile(
 # PostgreSQL, CockroachDB (RE2), and MySQL (ICU).
 _REFERENCE_PREFIX = (
     r"(#|!|/pull/|/pulls/|/merge_requests/|/pullrequests?/|"
-    rf"(^|[^a-zA-Z0-9_]){_REFERENCE_LABEL}\s*[-:]?\s*)"
+    rf"(^|[^a-zA-Z0-9_]){_REFERENCE_LABEL}\s*(?:[-:]\s*)?)"
 )
 # A following digit would make it a different, longer PR number.
 _NUMBER_END = r"([^0-9]|$)"
