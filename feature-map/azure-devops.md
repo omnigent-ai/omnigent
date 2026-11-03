@@ -24,9 +24,11 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 - `canvas`: when Canvas is enabled, follow a request link on a session card.
 - `agent-tool`: create or update a request through the session's agent tools.
 
-Select a row in the PR list to open its details; **All pull requests** returns
-to the list. Stored metadata and row actions remain available while the host
-is offline; checks and merge controls resume after reconnection.
+A session with one PR opens its details directly under **Pull Requests**.
+With multiple PRs, select a row in the list to open its details;
+**All pull requests** returns to the list. Stored metadata and unlinking remain
+available while the host is offline; checks and merge controls resume after
+reconnection.
 On desktop, mobile and Canvas, **Try again** retries failed panel content;
 switching sessions also clears a failed panel. Healthy chat drafts stay mounted.
 

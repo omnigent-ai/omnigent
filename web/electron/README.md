@@ -508,9 +508,12 @@ request. Both an updated desktop and web bundle are required; older web bundles
 remain public-only without destroying existing public views.
 
 Eligibility is granted at navigation and re-checked at every navigation and agent
-read/action. A failed check revokes access before clearing the previous document;
-access stays revoked if clearing fails. Request and redirect checks use the
-in-memory grant and window trust gates, keeping disk reads off the request path.
+read/action. Local identity/enrollment results are cached per host/server pair for
+at most one second measured with a monotonic clock, so these checks can use
+enrollment information up to one second old. A failed check revokes access before
+clearing the previous document; access stays revoked if clearing fails. Request
+and redirect checks use the in-memory grant and window trust gates, keeping disk
+reads off the request path.
 
 Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.

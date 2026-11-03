@@ -202,16 +202,19 @@ describe("resolveServerInfo session_search_scope", () => {
   });
 });
 
-describe("resolveServerInfo scheduled_task_projects", () => {
-  it.each([
-    [true, true],
-    [undefined, false],
-    ["yes", false],
-  ])("reads %j as %j", async (advertised, expected) => {
-    const payload = advertised === undefined ? {} : { scheduled_task_projects: advertised };
-    expect((await probe(payload)).scheduled_task_projects).toBe(expected);
-  });
-});
+describe.each(["scheduled_task_projects", "scheduled_task_harness_settings"] as const)(
+  "resolveServerInfo %s",
+  (capability) => {
+    it.each([
+      [true, true],
+      [undefined, false],
+      ["yes", false],
+    ])("reads %j as %j", async (advertised, expected) => {
+      const payload = advertised === undefined ? {} : { [capability]: advertised };
+      expect((await probe(payload))[capability]).toBe(expected);
+    });
+  },
+);
 
 describe("resolveServerInfo scheduled_task_session_modes", () => {
   it("reads the advertised capability", async () => {
