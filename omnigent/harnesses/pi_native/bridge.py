@@ -56,7 +56,7 @@ def pi_native_env_unset(environ: Mapping[str, str]) -> list[str]:
     return sorted({name.strip() for name in raw.split(",") if name.strip()})
 
 
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "pi-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "pi-native"
 _CONFIG_FILE = "config.json"
 _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"

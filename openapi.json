@@ -4793,6 +4793,34 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PickerInfo": {
+        "description": "How a deployment curates what the New Chat picker shows.\n\nDisplay only: it narrows the picker, never what exists. Every agent stays\nseeded, forkable and reachable through the API.",
+        "properties": {
+          "default_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Name a fresh New Chat starts on, or `None`. A user's remembered pick wins over it.",
+            "title": "Default Agent Name"
+          },
+          "restrict_to_agent_names": {
+            "default": [],
+            "description": "Names the picker may offer; empty means the full roster.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Restrict To Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "PickerInfo",
+        "type": "object"
+      },
       "PluginAsset": {
         "properties": {
           "id": {
@@ -5958,6 +5986,58 @@
         "title": "SandboxStatus",
         "type": "object"
       },
+      "ScheduledRunLogContext": {
+        "description": "Occurrence identity retained with a saved prompt across replica changes.",
+        "properties": {
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "scheduled_at": {
+            "format": "int64",
+            "title": "Scheduled At",
+            "type": "integer"
+          },
+          "session_mode": {
+            "title": "Session Mode",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "task_workspace_id": {
+            "format": "int64",
+            "title": "Task Workspace Id",
+            "type": "integer"
+          },
+          "trigger_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Key"
+          }
+        },
+        "required": [
+          "task_id",
+          "run_id",
+          "task_workspace_id",
+          "scheduled_at",
+          "target",
+          "session_mode"
+        ],
+        "title": "ScheduledRunLogContext",
+        "type": "object"
+      },
       "SendCommentsRequest": {
         "description": "Request body for `POST .../comments/send`.",
         "properties": {
@@ -6089,6 +6169,12 @@
             "title": "Needs Setup",
             "type": "boolean"
           },
+          "picker": {
+            "$ref": "#/components/schemas/PickerInfo",
+            "default": {
+              "restrict_to_agent_names": []
+            }
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -6135,6 +6221,11 @@
             },
             "title": "Sandbox Providers",
             "type": "array"
+          },
+          "scheduled_task_harness_settings": {
+            "default": true,
+            "title": "Scheduled Task Harness Settings",
+            "type": "boolean"
           },
           "scheduled_task_projects": {
             "default": false,
@@ -9865,6 +9956,16 @@
               }
             ],
             "title": "Model Override"
+          },
+          "scheduled_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduledRunLogContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "tools": {
             "anyOf": [
