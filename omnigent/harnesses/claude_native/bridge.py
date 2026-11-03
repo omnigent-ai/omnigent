@@ -95,6 +95,7 @@ from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -276,18 +277,14 @@ _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # The control POST carries an empty JSON object; anything larger is not ours.
 _TOOLS_CHANGED_BODY_MAX_BYTES = 4096
-# Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
-# tool dispatch to complete on the harness event loop.
+# Active dispatch budget; each call excludes its own bounded approval waits.
 _TOOL_CALL_TIMEOUT_S = 300.0
-# Timeout for the bridge's POST to the active-turn relay server
-# (``_call_relay_tool``). This is the OUTER hop: it waits for the relay
-# handler's entire ``_TOOL_CALL_TIMEOUT_S`` dispatch, which itself fans out
-# to the Omnigent policy server and back. It MUST exceed ``_TOOL_CALL_TIMEOUT_S``
-# so the inner handler times out first and returns a clean MCP error over
-# HTTP 200 — rather than the outer ``urlopen`` raising and tearing down the
-# stdio MCP server (see ``_stdio_jsonrpc_loop``). The previous flat 10s sat
-# below the real round-trip latency under load, so slow-but-healthy calls
-# (session history reads, shell) tripped it and crashed the bridge.
+_TOOL_RELAY_HEARTBEAT_S = 1.0
+_MCP_CALL_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
+    "mcp_call_cancel_event", default=None
+)
+# Socket inactivity budget. Whitespace heartbeats keep approval waits alive;
+# the relay separately enforces active execution time and cancels disconnected calls.
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
 # Backstop per-request threads above any expected client tool-call fan-out.
 _MAX_CONCURRENT_MCP_REQUESTS = 64
@@ -1392,6 +1389,7 @@ class ClaudeNativeToolRelay:
         advertised_url: str,
         relay_info: _JsonObject,
         tool_executor: ToolExecutor,
+        closed: threading.Event,
     ) -> None:
         """
         Initialize the relay handle.
@@ -1409,6 +1407,7 @@ class ClaudeNativeToolRelay:
         self._advertised_url = advertised_url
         self._relay_info = relay_info
         self._tool_executor = tool_executor
+        self._closed = closed
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
         """Refresh tools on the owning event loop without changing cached relay credentials.
@@ -1447,6 +1446,7 @@ class ClaudeNativeToolRelay:
         if _read_json_file(relay_file).get("url") == self._advertised_url:
             with contextlib.suppress(FileNotFoundError):
                 relay_file.unlink()
+        self._closed.set()
         self._httpd.shutdown()
         self._httpd.server_close()
 
@@ -7534,6 +7534,7 @@ def start_tool_relay(
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
+    closed = threading.Event()
 
     async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
         return await relay._tool_executor(name, arguments)
@@ -7542,6 +7543,7 @@ def start_tool_relay(
         token,
         _execute_current_tool,
         loop,
+        closed=closed,
         policy_client=policy_client,
         session_id=session_id,
         bridge_dir=bridge_dir,
@@ -7570,6 +7572,7 @@ def start_tool_relay(
         advertised_url=advertised_url,
         relay_info=relay_info,
         tool_executor=tool_executor,
+        closed=closed,
     )
     thread = threading.Thread(
         target=httpd.serve_forever,
@@ -7841,6 +7844,7 @@ def _tool_relay_handler_factory(
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
     *,
+    closed: threading.Event | None = None,
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
     bridge_dir: Path | None = None,
@@ -7943,9 +7947,35 @@ def _tool_relay_handler_factory(
                 if name == "sys_add_policy" and bridge_dir is not None
                 else contextlib.nullcontext()
             )
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("X-Omnigent-Relay-Heartbeat", "1")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            last_heartbeat = 0.0
+
+            def keep_alive() -> None:
+                """Detect a departed caller and keep the response's idle timer alive."""
+                nonlocal last_heartbeat
+                if closed is not None and closed.is_set():
+                    raise ConnectionAbortedError("Omnigent tool relay closed")
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if readable:
+                    raise ConnectionAbortedError("Omnigent tool caller disconnected")
+                now = time.monotonic()
+                if now - last_heartbeat >= _TOOL_RELAY_HEARTBEAT_S:
+                    self.wfile.write(b"\n")
+                    self.wfile.flush()
+                    last_heartbeat = now
+
             with mutation:
-                result = _run_relay_tool(tool_executor, loop, name, arguments)
-            self._send_json(result)
+                result = _run_relay_tool(
+                    tool_executor, loop, name, arguments, keep_alive=keep_alive
+                )
+            with contextlib.suppress(OSError):
+                self.wfile.write(json.dumps(result).encode("utf-8") + b"\n")
+                self.wfile.flush()
 
         def _handle_claude_hook(self, payload: _JsonObject) -> None:
             """Record one Claude hook event the way the Python hook does.
@@ -8230,6 +8260,8 @@ def _run_relay_tool(
     loop: asyncio.AbstractEventLoop,
     name: str,
     arguments: _JsonObject,
+    *,
+    keep_alive: Callable[[], None] | None = None,
 ) -> _JsonObject:
     """
     Execute one relay tool call on the harness event loop.
@@ -8239,15 +8271,42 @@ def _run_relay_tool(
     :param loop: Event loop that owns ``tool_executor``.
     :param name: Tool name, e.g. ``"sys_os_shell"``.
     :param arguments: Decoded tool arguments.
+    :param keep_alive: Check caller liveness and refresh the HTTP response while waiting.
     :returns: MCP tool-call response.
     """
-    future = asyncio.run_coroutine_threadsafe(
-        _await_tool_result(tool_executor(name, arguments)), loop
-    )
+    deadline = ToolCallDeadline(_TOOL_CALL_TIMEOUT_S)
+
+    async def execute() -> object:
+        with bind_tool_call_deadline(deadline):
+            return await tool_executor(name, arguments)
+
+    future = asyncio.run_coroutine_threadsafe(execute(), loop)
     try:
-        result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
+        while not future.done():
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                return _mcp_error(
+                    f"Omnigent tool dispatch timed out after {_TOOL_CALL_TIMEOUT_S:g}s "
+                    "of active work (approval waiting excluded). Cancellation requested; "
+                    "completion is unknown. Check the affected state before retrying."
+                )
+            if keep_alive is not None:
+                keep_alive()
+            try:
+                result = future.result(timeout=min(0.1, remaining))
+                break
+            except TimeoutError:
+                if future.done():
+                    result = future.result()
+                    break
+        else:
+            result = future.result()
     except Exception as exc:  # noqa: BLE001 - relay converts callback failures to MCP errors.
-        return _mcp_error(f"Omnigent tool dispatch failed: {exc}")
+        detail = str(exc).strip() or type(exc).__name__
+        return _mcp_error(f"Omnigent tool dispatch failed: {detail}. Completion is unknown.")
+    finally:
+        if not future.done():
+            future.cancel()
     return _mcp_response_from_tool_result(result)
 
 
@@ -8297,9 +8356,30 @@ def _stdio_jsonrpc_loop(
     """
     use_content_length = False
     request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_MCP_REQUESTS)
+    pending_calls: dict[str, threading.Event] = {}
+    pending_lock = threading.Lock()
+
+    def dispatch(
+        request_id: object, method: str, params: object, framed: bool, cancelled: threading.Event
+    ) -> None:
+        token = _MCP_CALL_CANCEL_EVENT.set(cancelled)
+        try:
+            _handle_and_write_mcp_request(
+                request_id, method, params, tools, bridge_dir, stdout_lock, framed, request_slots
+            )
+        finally:
+            _MCP_CALL_CANCEL_EVENT.reset(token)
+            key = json.dumps(request_id)
+            with pending_lock:
+                if pending_calls.get(key) is cancelled:
+                    pending_calls.pop(key)
+
     while True:
         raw_line = sys.stdin.buffer.readline()
         if raw_line == b"":
+            with pending_lock:
+                for cancelled in pending_calls.values():
+                    cancelled.set()
             return
         if raw_line.lower().startswith(b"content-length:"):
             use_content_length = True
@@ -8329,20 +8409,28 @@ def _stdio_jsonrpc_loop(
             continue
         request_id = message.get("id")
         method = message.get("method")
+        if method == "notifications/cancelled":
+            params = message.get("params")
+            if isinstance(params, dict):
+                with pending_lock:
+                    cancelled = pending_calls.get(json.dumps(params.get("requestId")))
+                    if cancelled is not None:
+                        cancelled.set()
+            continue
         if request_id is None or not isinstance(method, str):
             continue
         if request_slots.acquire(blocking=False):
+            cancelled = threading.Event()
+            with pending_lock:
+                pending_calls[json.dumps(request_id)] = cancelled
             request_thread = threading.Thread(
-                target=_handle_and_write_mcp_request,
+                target=dispatch,
                 args=(
                     request_id,
                     method,
                     message.get("params"),
-                    tools,
-                    bridge_dir,
-                    stdout_lock,
                     use_content_length,
-                    request_slots,
+                    cancelled,
                 ),
                 name="claude-native-mcp-request",
                 daemon=True,
@@ -8350,6 +8438,8 @@ def _stdio_jsonrpc_loop(
             try:
                 request_thread.start()
             except RuntimeError:
+                with pending_lock:
+                    pending_calls.pop(json.dumps(request_id), None)
                 request_slots.release()
             else:
                 continue
@@ -8504,8 +8594,8 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # A request failure must not tear down the long-lived MCP server.
-    # Heartbeat only relay-routed calls: the relay's own 300 s budget
-    # guarantees they terminate, so keep-alive is safe. A hung LOCAL tool
+    # Heartbeat only relay-routed calls: execution and approval each have
+    # their own bounded budget. A hung LOCAL tool
     # must stay killable by the client's static timeout, so it gets no
     # heartbeat that would reset that deadline forever.
     progress_token = (
@@ -8735,10 +8825,22 @@ def _call_relay_tool(
         },
     )
     try:
+        cancelled = _MCP_CALL_CANCEL_EVENT.get()
+        if cancelled is not None and cancelled.is_set():
+            return _mcp_error("Omnigent tool call cancelled before dispatch")
         with request.urlopen(req, timeout=_TOOL_RELAY_POST_TIMEOUT_S) as resp:
-            raw = resp.read().decode("utf-8")
             if resp.status >= 400:
                 return _mcp_error(f"tool relay POST failed with HTTP {resp.status}")
+            if resp.headers.get("X-Omnigent-Relay-Heartbeat") == "1":
+                raw = ""
+                for line in iter(resp.readline, b""):
+                    if cancelled is not None and cancelled.is_set():
+                        raise InterruptedError("Tool call cancelled; completion is unknown")
+                    if line.strip():
+                        raw = line.decode("utf-8")
+                        break
+            else:
+                raw = resp.read().decode("utf-8")
     # ``OSError`` (the base of ``error.URLError``) also covers the bare
     # timeout / reset errors that ``urlopen`` raises mid-read —
     # ``TimeoutError``, ``socket.timeout``, ``ConnectionResetError`` — which
@@ -8747,7 +8849,11 @@ def _call_relay_tool(
     # through ``_call_mcp_tool`` → ``_stdio_jsonrpc_loop`` and kill the MCP
     # server.
     except OSError as exc:
-        return _mcp_error(f"failed to call Omnigent tool relay: {exc}")
+        detail = str(exc).strip() or type(exc).__name__
+        return _mcp_error(
+            f"failed to call Omnigent tool relay: {detail}. Completion is unknown; "
+            "check the affected state before retrying."
+        )
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:

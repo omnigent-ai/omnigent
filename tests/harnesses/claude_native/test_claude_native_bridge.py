@@ -16378,3 +16378,267 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
             pytest.fail("delivery continued after a failed resize")
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [True, False])
+async def test_relay_approval_outlives_execution_and_http_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved: bool
+) -> None:
+    """The real HTTP relay stays pending until its own approval is answered."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_POST_TIMEOUT_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_HEARTBEAT_S", 0.02, raising=False)
+    bridge_dir = prepare_bridge_dir("conv_approval_timeout", workspace=tmp_path)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+
+    async def executor(name: str, arguments: dict[str, object]) -> object:
+        waiting.set()
+        try:
+            allowed = await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_relay_timeout",
+                conversation_id="conv_approval_timeout",
+                publish_event=lambda *_: None,
+                timeout_seconds=5,
+            )
+            if allowed:
+                effects.append(name)
+            return {"approved": allowed}
+        finally:
+            finished.set()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_scheduled_task_create"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    call = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._call_relay_tool,
+            bridge_dir,
+            "sys_scheduled_task_create",
+            {},
+        )
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(call), 0.4)
+        assert effects == []
+        assert pending_approvals.has_pending("conv_approval_timeout")
+        assert pending_approvals.resolve("elicit_relay_timeout", approved)
+        result = await asyncio.wait_for(call, 2)
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"approved": approved}
+        assert effects == (["sys_scheduled_task_create"] if approved else [])
+        assert not pending_approvals.has_pending("conv_approval_timeout")
+    finally:
+        pending_approvals.resolve("elicit_relay_timeout", False)
+        await asyncio.wait_for(finished.wait(), 2)
+        await asyncio.wait_for(call, 2)
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_approval_does_not_extend_another_calls_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked create cannot keep an unrelated stuck shell call alive."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.15)
+    waiting, shell_cancelled = asyncio.Event(), asyncio.Event()
+
+    async def executor(name, arguments):
+        if name == "sys_scheduled_task_create":
+            waiting.set()
+            return {
+                "approved": await pending_approvals.wait_for_user_approval(
+                    elicitation_id="elicit_concurrent",
+                    conversation_id="conv_concurrent",
+                    publish_event=lambda *_: None,
+                    timeout_seconds=3,
+                )
+            }
+        try:
+            await asyncio.Future()
+        finally:
+            shell_cancelled.set()
+
+    loop = asyncio.get_running_loop()
+    approval = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool, executor, loop, "sys_scheduled_task_create", {}
+        )
+    )
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                claude_native_bridge._run_relay_tool, executor, loop, "sys_os_shell", {}
+            ),
+            1,
+        )
+        assert result["isError"]
+        assert "active work" in result["content"][0]["text"]
+        await asyncio.wait_for(shell_cancelled.wait(), 1)
+        assert not approval.done()
+        assert pending_approvals.resolve("elicit_concurrent", False)
+        assert not (await asyncio.wait_for(approval, 1)).get("isError")
+    finally:
+        pending_approvals.resolve("elicit_concurrent", False)
+        await asyncio.wait_for(approval, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["expiry", "approved_then_stuck", "callback_timeout"])
+async def test_relay_reports_approval_expiry_and_execution_outcomes(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Approval expiry denies; after approval a timed-out write stays uncertain."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.05)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        try:
+            if outcome == "callback_timeout":
+                raise TimeoutError()
+            waiting.set()
+            approved = await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_outcome",
+                conversation_id="conv_outcome",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=0.2,
+            )
+            if approved:
+                effects.append("saved")
+                await asyncio.Future()
+            return {"approved": approved}
+        finally:
+            finished.set()
+
+    call = asyncio.create_task(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool,
+            executor,
+            asyncio.get_running_loop(),
+            "sys_scheduled_task_update",
+            {},
+        )
+    )
+    if outcome == "approved_then_stuck":
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert pending_approvals.resolve("elicit_outcome", True)
+    result = await asyncio.wait_for(call, 2)
+    await asyncio.wait_for(finished.wait(), 1)
+    if outcome == "expiry":
+        assert not result.get("isError")
+        assert json.loads(result["content"][0]["text"]) == {"approved": False}
+        assert events[-1]["reason"] == "unanswered"
+    else:
+        error = json.loads(result["content"][0]["text"])["error"]
+        assert result["isError"]
+        assert "unknown" in error
+        assert ("TimeoutError" if outcome == "callback_timeout" else "timed out") in error
+    assert effects == (["saved"] if outcome == "approved_then_stuck" else [])
+    assert not pending_approvals.has_pending("conv_outcome")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["notification", "eof", "relay_close"])
+async def test_relay_mcp_cancellation_releases_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subprocess_bridge_root: Path, stop: str
+) -> None:
+    """A real stdio bridge releases the approval when its caller cancels or leaves."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", Path(tempfile.gettempdir()))
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", subprocess_bridge_root)
+    monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_HEARTBEAT_S", 0.02)
+    bridge_dir = prepare_bridge_dir("conv_cancel_relay", workspace=tmp_path)
+    waiting, finished = asyncio.Event(), asyncio.Event()
+    effects: list[str] = []
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        waiting.set()
+        try:
+            if await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_cancel_relay",
+                conversation_id="conv_cancel_relay",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=10,
+            ):
+                effects.append("saved")
+            return {}
+        finally:
+            finished.set()
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "sys_scheduled_task_create"}],
+        tool_executor=executor,
+        loop=asyncio.get_running_loop(),
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdin is not None
+        _write_json_line(
+            proc.stdin,
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "sys_scheduled_task_create", "arguments": {}},
+            },
+        )
+        await asyncio.wait_for(waiting.wait(), 8)
+        if stop == "notification":
+            _write_json_line(
+                proc.stdin,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 51},
+                },
+            )
+        elif stop == "eof":
+            proc.stdin.close()
+        else:
+            relay.close()
+        await asyncio.wait_for(finished.wait(), 3)
+        assert effects == []
+        assert events[-1]["reason"] == "unanswered"
+        assert not pending_approvals.has_pending("conv_cancel_relay")
+        assert not pending_approvals.resolve("elicit_cancel_relay", True)
+    finally:
+        pending_approvals.resolve("elicit_cancel_relay", False)
+        if stop != "relay_close":
+            relay.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
