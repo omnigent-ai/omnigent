@@ -709,8 +709,11 @@ export function PullRequestChangesTab({
   };
   const onTabKeyDown = (event: React.KeyboardEvent) => {
     // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.
+    // IME composition keys confirm text, not find.
     if (
       !toolbarShown ||
+      event.nativeEvent.isComposing ||
+      event.keyCode === 229 ||
       !hasCommandModifier(event) ||
       event.altKey ||
       event.shiftKey ||

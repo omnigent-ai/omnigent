@@ -1,4 +1,12 @@
-import { act, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Tabs } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -140,8 +148,11 @@ function openFind(query: string) {
 const diffOf = (path: string) => document.querySelector<HTMLElement>(`[data-path="${path}"]`);
 const rowOf = (path: string, line: number) =>
   diffOf(path)?.querySelector<HTMLElement>(`[data-line="${line}"]`) ?? null;
+// Scoped to the file's section, so header controls elsewhere in the tab can't match.
 const sectionHeader = (path: string, expanded: boolean) =>
-  screen.getByRole("button", { name: new RegExp(path.replace(".", "\\.")), expanded });
+  within(document.querySelector<HTMLElement>(`[data-github-file="${path}"]`)!).getByRole("button", {
+    expanded,
+  });
 
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
@@ -259,6 +270,14 @@ describe("PullRequestChangesTab", () => {
     renderTab({ conversationId: "find-no-toolbar", files: [], patch: "" });
     const tab = document.querySelector<HTMLElement>('[data-slot="tabs-content"]')!;
     expect(fireEvent.keyDown(tab, { key: "f", ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
+  });
+
+  it("ignores the shortcut while an IME is composing", () => {
+    renderTab({ conversationId: "find-ime" });
+    const header = sectionHeader("a.ts", true);
+    header.focus();
+    expect(fireEvent.keyDown(header, { key: "f", ctrlKey: true, isComposing: true })).toBe(true);
     expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
   });
 

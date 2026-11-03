@@ -1157,7 +1157,7 @@ def test_changes_find_reveals_collapsed_and_filtered(
     tabs.get_by_role("tab", name="Changes", exact=False).click()
 
     file = panel.locator('[data-github-file="src/app/main.py"]')
-    panel.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).click()
+    file.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).click()
     expect(file.locator("diffs-container")).to_have_count(0)
 
     panel.get_by_role("button", name="Find in changes", exact=True).click()
@@ -1212,7 +1212,7 @@ def test_changes_find_reveals_collapsed_and_filtered(
     assert highlighted() == []
 
     # Ctrl/Cmd+F reopens the bar from inside the Changes tab.
-    panel.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).focus()
+    file.get_by_role("button", name=re.compile(r"main\.py"), expanded=True).focus()
     page.keyboard.press("ControlOrMeta+f")
     expect(panel.get_by_role("textbox", name="Find in changes", exact=True)).to_be_focused()
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
