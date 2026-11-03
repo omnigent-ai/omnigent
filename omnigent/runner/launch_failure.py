@@ -120,8 +120,9 @@ _BROKEN_CLAUDE_INSTALL_MARKERS = (
     "failedtoinstallclaudecode",
     "claudenativebinarynotinstalled",
 )
-# The launcher's exec of a half-written binary, e.g. "Exec format error: '~/.local/bin/claude'".
-_EXEC_FORMAT_ERROR = re.compile(r"execformaterror\W+\S*?claude")
+# The launcher's exec of a half-written binary, "Exec format error: '<path>/claude'";
+# matched on compacted text, so only the quoted path may name claude.
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror:'[^']*claude'")
 # Pane captures wrap long lines and draw borders, which can split a marker.
 _PANE_WRAP = re.compile(r"[\s│┃]+")
 

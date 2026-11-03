@@ -150,10 +150,14 @@ def test_classifies_broken_claude_install(exit_status: int, output: str) -> None
 
 
 def test_exec_format_error_of_another_program_is_not_a_broken_claude_install() -> None:
+    # The launcher's exit box names Claude Code right after the other program's path.
     diagnosis = classify_terminal_failure(
         command="env",
         exit_status=1,
-        output="OSError: [Errno 8] Exec format error: '/home/dev/bin/helper'",
+        output=(
+            "OSError: [Errno 8] Exec format error: '/home/dev/bin/helper'\n"
+            "│ Claude Code exited with code 1 │"
+        ),
     )
     assert diagnosis is None
 
