@@ -5818,14 +5818,17 @@ class HostProcess:
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
+            # Even a single metadata lookup can block on a mounted filesystem.
+            stat_result = await asyncio.to_thread(self._handle_stat, frame)
+            await self._send_text(ws, encode_host_frame(stat_result))
         elif isinstance(frame, HostListDirFrame):
             # Stat-ing every entry can be slow on large or network-backed
             # directories; keep the tunnel's event loop free meanwhile.
             list_result = await asyncio.to_thread(self._handle_list_dir, frame)
             await self._send_text(ws, encode_host_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
+            create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
+            await self._send_text(ws, encode_host_frame(create_dir_result))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
