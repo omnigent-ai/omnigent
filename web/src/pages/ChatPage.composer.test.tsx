@@ -5490,6 +5490,7 @@ describe("Composer reply quotes", () => {
             text: "file a single PR",
             files: [],
             stableId: "e".repeat(32),
+            mirrorable: true,
           },
         }),
       );

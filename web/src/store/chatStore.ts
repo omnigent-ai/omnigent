@@ -120,6 +120,7 @@ import {
   peekUnsentSend,
   rememberQueuedSends,
   rememberUnsentSend,
+  type NativeSendAnchor,
 } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
@@ -927,6 +928,12 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
+    /**
+     * Its message POST was dispatched, so on a native terminal a newer mirror
+     * saying the same thing can prove it delivered (see `unansweredSendsOf`).
+     * Never set for a send that failed before dispatch, e.g. in its upload.
+     */
+    mirrorable?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -948,6 +955,8 @@ export interface ConversationState {
     replyDraft?: StoredReplyDraft;
     /** Carried over from `failedSendDraft.serverRefused`; see there. */
     serverRefused?: boolean;
+    /** Carried over from `failedSendDraft.mirrorable`; see there. */
+    mirrorable?: boolean;
     delivered: boolean;
   } | null;
   /**
@@ -2802,7 +2811,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Set the moment the message POST goes out; until then no mirror can be its.
     let nativeAnchor: NativeSendAnchor | undefined;
+    let messageDispatched = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2819,22 +2830,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      nativeAnchor = nativeSendAnchor(setterForState(sessionId), tempId);
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
       // tells the single-user `local` viewer apart from one not yet resolved.
       const senderId = getCurrentUserId();
-      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
-        const afterItemId = nativeAnchor?.afterItemId;
-        rememberUnsentSend(sessionId, {
-          stableId,
-          text,
-          authorId: senderId,
-          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-          ...(afterItemId !== undefined ? { afterItemId } : {}),
-        });
-      }
+      const unsentRecord =
+        !compacts && sentOnScreen && senderId !== null && text.trim()
+          ? {
+              stableId,
+              text,
+              authorId: senderId,
+              ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            }
+          : null;
+      if (unsentRecord !== null) rememberUnsentSend(sessionId, unsentRecord);
       if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
       if (compacts) {
@@ -2884,6 +2894,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           sendLatchedAt: Date.now(),
         }));
         initialDispatched = true;
+      }
+      nativeAnchor = nativeSendAnchor(setterForState(sessionId), { tempId, stableId }, text);
+      messageDispatched = true;
+      // A later send may own the record by now if the chain wait timed out.
+      if (
+        nativeAnchor !== undefined &&
+        unsentRecord !== null &&
+        peekUnsentSend(sessionId)?.stableId === stableId
+      ) {
+        rememberUnsentSend(sessionId, { ...unsentRecord, nativeAnchor });
       }
       const postResult = await postEvent(
         sessionId,
@@ -3030,14 +3050,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (
         !deliveredDespiteFailure &&
         !serverRefused &&
+        messageDispatched &&
         draftState.isNativeTerminalSession &&
-        nativeAnchor !== undefined &&
-        nativeMirrorDelivers(
-          draftState.blocks,
-          nativeAnchor.afterItemId,
-          { stableId, text: nativeMirrorText(text) },
-          nativeAnchor.ahead,
-        )
+        nativeMirrorDelivers(draftState.blocks, nativeAnchor, text)
       ) {
         deliveredDespiteFailure = true;
       }
@@ -3055,6 +3070,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             stableId,
             serverRefused,
             ...(unsettled ? { unsettled: true } : {}),
+            ...(messageDispatched ? { mirrorable: true } : {}),
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
           },
         });
@@ -3077,7 +3093,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       // A delivered send needs no card. One the server never answered may still
       // arrive, so its card names the send for the commit that retracts it.
-      const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
+      const sentText =
+        messageDispatched && failGet().isNativeTerminalSession ? messageContentText(content) : "";
       const failureCard: ErrorBlock | null = deliveredDespiteFailure
         ? null
         : {
@@ -7518,6 +7535,7 @@ export function takeFailedSendDraft(
       files: failed.files,
       replyDraft: failed.replyDraft,
       serverRefused: failed.serverRefused,
+      ...(failed.mirrorable ? { mirrorable: true } : {}),
       delivered: false,
     };
   setterFor(conversationId)(patch);
@@ -7667,10 +7685,7 @@ function unsentSendToRestore(
   const mirrored =
     unsent !== null &&
     nativeTranscript !== null &&
-    nativeMirrorDelivers(nativeTranscript, unsent.afterItemId, {
-      stableId: unsent.stableId,
-      text: nativeMirrorText(unsent.text),
-    });
+    nativeMirrorDelivers(nativeTranscript, unsent.nativeAnchor, unsent.text);
   const sends = [...(unsent === null || mirrored ? [] : [unsent]), ...queued].filter(
     // Another account may have signed in to this tab since.
     (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
@@ -7691,6 +7706,8 @@ function unsentSendToRestore(
     ...(replyDraft ? { replyDraft } : {}),
     serverRefused: false,
     recovered: true,
+    // Only a POST that went out can have a mirror to retract it later.
+    ...(sends.length === 1 && first === unsent && unsent.nativeAnchor ? { mirrorable: true } : {}),
   };
 }
 
@@ -7780,18 +7797,34 @@ function nativeMirrorText(text: string): string {
 }
 
 /**
- * The unanswered sends a newly committed message can deliver, oldest first:
- * failure cards in transcript order, then a tracked draft without a card (one
- * recovered after a reload, or one whose failure rode on a response bubble).
- * A draft carries text only where its card would: on a native terminal, and
- * only when the server did not refuse it.
+ * The messages a newly committed native mirror can belong to, in the order
+ * they claim one. Bubbles still awaiting their mirror go first: they were sent
+ * before any failure now on screen or are still pending, so a mirror saying
+ * what one says is presumed theirs. Then failure cards in transcript order,
+ * then a tracked draft without a card (recovered after a reload, or one whose
+ * failure rode on a response bubble). Only a native terminal's entries carry
+ * text, and a draft carries it only where its card would: its POST was
+ * dispatched and the server did not refuse it.
  *
- * @param s - The conversation's state, for its drafts.
+ * @param s - The conversation's state, for its bubbles and drafts.
  * @param blocks - The blocks holding the failure cards.
- * @returns The sends, at most one per stable id.
+ * @param exceptTempId - A bubble to leave out: the send being judged.
+ * @returns The claimants, at most one per stable id. Bubbles are keyed by
+ *   temp id and only reserve mirrors.
  */
-function unansweredSendsOf(s: ChatState, blocks: AnyBlock[]): UnansweredSend[] {
+function unansweredSendsOf(
+  s: ChatState,
+  blocks: AnyBlock[],
+  exceptTempId?: string,
+): UnansweredSend[] {
   const sends: UnansweredSend[] = [];
+  if (s.isNativeTerminalSession) {
+    for (const bubble of s.pendingUserMessages) {
+      const text = messageContentText(bubble.content);
+      if (bubble.tempId !== exceptTempId && text !== "")
+        sends.push({ stableId: bubble.tempId, text });
+    }
+  }
   for (const block of blocks) {
     if (block.type === "error" && block.unansweredSend) sends.push(block.unansweredSend);
   }
@@ -7799,8 +7832,9 @@ function unansweredSendsOf(s: ChatState, blocks: AnyBlock[]): UnansweredSend[] {
   for (const draft of [restored, s.failedSendDraft]) {
     const stableId = draft?.stableId;
     if (!draft || !stableId || sends.some((send) => send.stableId === stableId)) continue;
-    const text =
-      s.isNativeTerminalSession && draft.serverRefused !== true ? nativeMirrorText(draft.text) : "";
+    const provable =
+      s.isNativeTerminalSession && draft.mirrorable === true && draft.serverRefused !== true;
+    const text = provable ? nativeMirrorText(draft.text) : "";
     sends.push({ stableId, ...(text ? { text } : {}) });
   }
   return sends;
@@ -7864,62 +7898,63 @@ function withoutDeliveredSendFailureCards(
 }
 
 /**
- * Where a native transcript stood when a send was posted. Its mirror carries
- * no stable id, so only a newer user message can prove the send, and the
- * messages already queued ahead of it claim matching mirrors first.
- */
-interface NativeSendAnchor {
-  /** The newest committed item, `null` for an empty transcript. */
-  afterItemId: string | null;
-  /** Unanswered sends and queued bubbles ahead of the send. */
-  ahead: UnansweredSend[];
-}
-
-/**
- * Anchor a send in a native session's transcript (see `NativeSendAnchor`).
+ * Anchor a native send at the moment its message POST is dispatched (see
+ * `NativeSendAnchor`): the newest committed item, and how many messages that
+ * may still claim a mirror say the same thing.
  *
  * @param state - The session's state; only a bound one knows it is native.
- * @param tempId - The send's optimistic bubble, which marks where it queued.
+ * @param send - The send: its own bubble, and its stable id, which a retry
+ *   shares with the earlier attempt the server dedupes it into.
+ * @param text - The send's text.
  * @returns `undefined` outside a native terminal.
  */
-function nativeSendAnchor(state: ChatState | null, tempId: string): NativeSendAnchor | undefined {
+function nativeSendAnchor(
+  state: ChatState | null,
+  send: { tempId: string; stableId: string },
+  text: string,
+): NativeSendAnchor | undefined {
   if (!state?.isNativeTerminalSession) return undefined;
-  const at = state.pendingUserMessages.findIndex((bubble) => bubble.tempId === tempId);
-  const queued = state.pendingUserMessages
-    .slice(0, at === -1 ? undefined : at)
-    .filter((bubble) => !bubble.initialDraft)
-    .map((bubble) => ({ stableId: bubble.tempId, text: messageContentText(bubble.content) }))
-    .filter((bubble) => bubble.text !== "");
+  const sent = nativeMirrorText(text);
+  const ahead = unansweredSendsOf(state, state.blocks, send.tempId).filter(
+    (other) => other.stableId !== send.stableId && other.text === sent,
+  );
   return {
     afterItemId: state.blocks.findLast((block) => block.ctx.itemId)?.ctx.itemId ?? null,
-    ahead: [...unansweredSendsOf(state, state.blocks), ...queued],
+    sameTextAhead: ahead.length,
   };
 }
 
 /**
- * Whether a user message newer than a native send's anchor delivers it, once
- * the sends ahead of it have claimed theirs (see `deliveredSendIds`).
+ * Whether user messages newer than a native send's anchor deliver it once the
+ * messages ahead of it have claimed theirs (see `deliveredSendIds`).
  *
  * @param blocks - The native transcript, oldest first.
- * @param afterItemId - The send's anchor (see `NativeSendAnchor`).
- * @param send - The send, with its mirror text.
- * @param ahead - Sends queued before it.
+ * @param anchor - Set when the send's message POST was dispatched.
+ * @param text - The send's text.
  * @returns `false` when the anchor is unknown or outside `blocks`.
  */
 function nativeMirrorDelivers(
   blocks: AnyBlock[],
-  afterItemId: string | null | undefined,
-  send: UnansweredSend,
-  ahead: readonly UnansweredSend[] = [],
+  anchor: NativeSendAnchor | undefined,
+  text: string,
 ): boolean {
-  if (afterItemId === undefined || !send.text) return false;
+  const sent = nativeMirrorText(text);
+  if (anchor === undefined || sent === "") return false;
   let start = 0;
-  if (afterItemId !== null) {
-    start = blocks.findLastIndex((block) => block.ctx.itemId === afterItemId) + 1;
+  if (anchor.afterItemId !== null) {
+    start = blocks.findLastIndex((block) => block.ctx.itemId === anchor.afterItemId) + 1;
     if (start === 0) return false;
   }
-  const mirrored = committedUserTextsOf(blocks.slice(start));
-  return deliveredSendIds([...ahead, send], new Set(), mirrored).has(send.stableId);
+  const ahead = Array.from({ length: anchor.sameTextAhead }, (_, index) => ({
+    stableId: `ahead_${index}`,
+    text: sent,
+  }));
+  const send = { stableId: "send", text: sent };
+  return deliveredSendIds(
+    [...ahead, send],
+    new Set(),
+    committedUserTextsOf(blocks.slice(start)),
+  ).has(send.stableId);
 }
 
 /**
