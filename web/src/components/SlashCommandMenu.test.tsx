@@ -200,10 +200,15 @@ describe("full skill descriptions", () => {
     expect(description("review")).not.toHaveClass("truncate");
   });
 
-  it("shows a cut-off description in full in a hover tooltip", async () => {
+  it("shows a cut-off description in full in a hover tooltip after a short delay", async () => {
     render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
     overflowDescription("triage", 900);
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
+    // A pointer passing over rows shouldn't flash tooltips; the menu waits 400 ms.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 200);
+    });
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
     const tooltip = await screen.findByTestId("slash-menu-tooltip-triage", {}, { timeout: 2000 });
     expect(tooltip).toHaveTextContent(triage);
   });

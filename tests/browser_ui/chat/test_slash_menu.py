@@ -362,7 +362,9 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     description = page.get_by_test_id("slash-menu-description-triage")
     expect(triage).to_be_visible()
     assert description.evaluate(_IS_CUT_OFF), "an unhighlighted row keeps one line"
-    one_line_height = description.bounding_box()["height"]
+    one_line_box = description.bounding_box()
+    assert one_line_box is not None
+    one_line_height = one_line_box["height"]
 
     # Hovering the cut-off row shows its whole description in a tooltip.
     triage.hover()
@@ -377,7 +379,9 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     expect(triage).to_have_attribute("data-active", "true")
     expect(description).to_have_text(_LONG_SKILL_DESCRIPTION)
     assert not description.evaluate(_IS_CUT_OFF)
-    assert description.bounding_box()["height"] > one_line_height * 1.5
+    wrapped_box = description.bounding_box()
+    assert wrapped_box is not None
+    assert wrapped_box["height"] > one_line_height * 1.5
     assert not page.get_by_test_id("slash-menu-description-review-pr").evaluate(_IS_CUT_OFF)
 
     # The highlighted row needs no tooltip; moving on collapses it again.
