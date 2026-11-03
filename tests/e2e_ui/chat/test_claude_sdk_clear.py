@@ -49,23 +49,38 @@ def test_claude_sdk_clear_follows_a_new_empty_session(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     """``/clear`` from the composer opens an empty session on the same runner."""
-    _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    source_id, _agent_name = _create_claude_sdk_session(
-        live_server, runner_id, mock_llm_server_url
-    )
-    token = f"clear-prompt-{uuid.uuid4().hex[:6]}"
-    # The CLI's side requests share the match, so queue enough replies.
-    configure_mock_llm(mock_llm_server_url, [{"text": "ack one"}] * 20, key=token, match=token)
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    created: list[str] = []
+    try:
+        runner_id = str(_server_state["runner_id"])
+        source_id, _agent_name = _create_claude_sdk_session(
+            live_server, runner_id, mock_llm_server_url
+        )
+        created.append(source_id)
+        token = f"clear-prompt-{uuid.uuid4().hex[:6]}"
+        # The CLI's side requests share the match, so queue enough replies.
+        configure_mock_llm(mock_llm_server_url, [{"text": "ack one"}] * 20, key=token, match=token)
 
-    page.goto(f"{live_server}/c/{source_id}")
-    send_and_wait(page, f"Say ack. {token}", "ack one")
+        page.goto(f"{live_server}/c/{source_id}")
+        send_and_wait(page, f"Say ack. {token}", "ack one")
 
-    page.get_by_placeholder(COMPOSER).fill("/cle")
-    page.get_by_test_id("slash-menu-item-clear").click()
-    expect(page).not_to_have_url(re.compile(f"/c/{source_id}$"), timeout=30_000)
-    cleared_id = page.url.rsplit("/c/", 1)[1]
-    expect(page.get_by_placeholder(COMPOSER)).to_be_visible()
-    expect(page.locator(USER)).to_have_count(0)
-    assert httpx.get(f"{live_server}/v1/sessions/{cleared_id}").json()["runner_id"] == runner_id
-    assert session_mentions(live_server, source_id, f"/c/{cleared_id}")
+        page.get_by_placeholder(COMPOSER).fill("/cle")
+        page.get_by_test_id("slash-menu-item-clear").click()
+        expect(page).not_to_have_url(re.compile(f"/c/{source_id}$"), timeout=30_000)
+        cleared_id = page.url.rsplit("/c/", 1)[1]
+        created.append(cleared_id)
+        expect(page.get_by_placeholder(COMPOSER)).to_be_visible()
+        expect(page.locator(USER)).to_have_count(0)
+        cleared = httpx.get(f"{live_server}/v1/sessions/{cleared_id}").json()
+        assert cleared["runner_id"] == runner_id
+        assert session_mentions(live_server, source_id, f"/c/{cleared_id}")
+    finally:
+        for session_id in created:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except Exception:  # best-effort teardown
+                respawned.kill()
+                respawned.wait(timeout=5)
