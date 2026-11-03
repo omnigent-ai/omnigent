@@ -1434,13 +1434,18 @@ describe("browserIpc — typed actions", () => {
   it("fails an action whose script never settles before the server stops waiting", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
     const wc = makeWebContents();
-    wc.executeJavaScript = () => new Promise(() => {});
+    const started = Promise.withResolvers();
+    wc.executeJavaScript = () => {
+      started.resolve();
+      return new Promise(() => {});
+    };
     const { ipcMain, event } = setup({ webContents: wc });
     const pending = ipcMain.invoke("omnigent:browser-perform-action", event, {
       conversationId: "conv_1",
       action: "click",
       params: { selector: "button" },
     });
+    await started.promise;
     t.mock.timers.tick(29_999);
     const result = await pending;
     assert.equal(result.ok, false);
