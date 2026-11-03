@@ -206,11 +206,19 @@ async def test_failed_send_preserves_evidence_and_original_exception(cancel: boo
     snapshot = diagnostics.snapshot()
     assert snapshot["send_duration_max_s"] == 4.0
     assert snapshot["last_send_outcome"] == ("cancelled" if cancel else "error")
+    assert snapshot["last_send_error_type"] == (None if cancel else "ConnectionError")
+    assert "send failed" not in str(snapshot)
     assert snapshot["send_cancellations"] == int(cancel)
     assert snapshot["send_errors"] == int(not cancel)
     assert snapshot["last_sent_frame_age_s"] is None
     assert snapshot["last_app_ping_sent_age_s"] is None
     assert snapshot["sends_in_flight"] == 0
+
+    async def next_send(_data: str) -> None:
+        pass
+
+    await diagnostics.send(next_send, "next frame")
+    assert diagnostics.snapshot()["last_send_error_type"] is None
 
 
 async def test_concurrent_sends_freeze_before_cleanup_and_reset_on_reconnect() -> None:

@@ -40,7 +40,7 @@ jobs:
       github.repository == 'omnigent-ai/omnigent'
       && github.event.issue.pull_request
       && startsWith(github.event.comment.body, '/regen')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       ok: ${{ steps.authz.outputs.ok }}
@@ -143,7 +143,7 @@ jobs:
       issues: write        # comment the result on the PR thread
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && needs.authorize.outputs.cross == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # One regen per PR at a time; a second /regen waits rather than racing a push.
     concurrency:
@@ -160,7 +160,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up uv (clean public resolution, no proxy cache)
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: false
           version: "0.13.4"
