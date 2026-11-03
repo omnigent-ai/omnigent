@@ -2776,7 +2776,7 @@ describe("Sidebar project Show more", () => {
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
   });
 
-  it("lists every session and auto-loads more pages when pagination is turned off", () => {
+  it("lists every session and auto-loads more pages when pagination is turned off", async () => {
     let observerCallback: IntersectionObserverCallback | undefined;
     let observerOptions: IntersectionObserverInit | undefined;
     class TestObserver {
@@ -2800,10 +2800,12 @@ describe("Sidebar project Show more", () => {
     mockConversations(filedSessions(12));
     const fetchNextPage = vi.fn();
     projectSessionsNextPage.current["Customer X"] = fetchNextPage;
-    writeProjectFolderPagination(false);
     renderSidebar();
     toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
 
+    // Turning pagination off applies to the open folder without a reload.
+    act(() => writeProjectFolderPagination(false));
     expect(folderRowIds()).toEqual(filedIds(12));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
     // The folder's end is watched within the sidebar's own scroll container.
@@ -2811,12 +2813,13 @@ describe("Sidebar project Show more", () => {
     expect(scrollContainer).not.toBeNull();
     expect(observerOptions?.root).toBe(scrollContainer);
     // Scrolling the folder's end into view fetches its next server page.
-    act(() => {
+    // Await the settled fetch so the sentinel's follow-up render stays inside act.
+    await act(async () => {
       observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
     });
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
 
-    // Turning pagination back on applies to the open folder without a reload.
+    // Turning it back on returns the open folder to one page.
     act(() => writeProjectFolderPagination(true));
     expect(folderRowIds()).toEqual(filedIds(5));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();

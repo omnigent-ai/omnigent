@@ -1465,9 +1465,12 @@ function ProjectFolder({
   onConversationsLoaded,
   ordering,
   scrollRoot,
+  paginated,
 }: {
   /** The sidebar's scroll container, the root for unpaginated auto-loading. */
   scrollRoot: RefObject<HTMLElement | null>;
+  /** Whether the folder lists a page at a time behind Show more. */
+  paginated: boolean;
   ordering: {
     disabled: boolean;
     insertion?: "before" | "after";
@@ -1559,7 +1562,6 @@ function ProjectFolder({
     name,
     viewerId,
   ]);
-  const paginated = useProjectFolderPagination();
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
   const listScope = JSON.stringify([expanded, archived, sortBy]);
@@ -2220,6 +2222,9 @@ function ConversationList({
   ]);
 
   const config = useContext(SidebarConfigContext);
+  // Read here, not in ProjectFolder: React drops a store subscriber's snapshot
+  // update when that render also resets state (the folder's page window).
+  const projectFolderPaginated = useProjectFolderPagination();
   // Shared renders above Sessions, so the display window pages through both in that order.
   const listRows = useMemo(
     () => [...loadedSections.shared, ...loadedSections.sessions],
@@ -3018,6 +3023,7 @@ function ConversationList({
                                   : undefined,
                             }}
                             scrollRoot={scrollContainerRef}
+                            paginated={projectFolderPaginated}
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}

@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import {
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
@@ -120,23 +120,18 @@ it.each([
   expect(readSessionWorkspaceState("browser")).toEqual({ openBrowsers: ["one"] });
 });
 
-describe.each([
-  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
-  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
-])("%s portability", (_label, storageKey) => {
-  it("exports, imports, and clears the device-local preference", () => {
-    localStorage.setItem(storageKey, "true");
-    expect(collectSettings()?.settings[storageKey]).toBe("true");
+it("exports, imports, and clears the composer shortcut", () => {
+  localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+  expect(collectSettings()?.settings[COMPOSER_SEND_SHORTCUT_STORAGE_KEY]).toBe("true");
 
-    applyImportedSettings({ version: 1, settings: {} });
-    expect(localStorage.getItem(storageKey)).toBeNull();
+  applyImportedSettings({ version: 1, settings: {} });
+  expect(localStorage.getItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY)).toBeNull();
 
-    applyImportedSettings({
-      version: 1,
-      settings: { [storageKey]: "true" },
-    });
-    expect(localStorage.getItem(storageKey)).toBe("true");
+  applyImportedSettings({
+    version: 1,
+    settings: { [COMPOSER_SEND_SHORTCUT_STORAGE_KEY]: "true" },
   });
+  expect(localStorage.getItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY)).toBe("true");
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {
@@ -177,9 +172,11 @@ it.each([
   act(() => {
     applyImportedSettings({ version: 1, settings: {} });
   });
+  expect(localStorage.getItem(row.key)).toBeNull();
   expect(String(result.current)).not.toBe(row.stored);
   act(() => {
     applyImportedSettings(exported);
   });
+  expect(localStorage.getItem(row.key)).toBe(row.stored);
   expect(String(result.current)).toBe(row.stored);
 });
