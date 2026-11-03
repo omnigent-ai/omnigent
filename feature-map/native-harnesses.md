@@ -1133,10 +1133,12 @@ throwaway automation afterward. The 30-second save-request timeout is unchanged.
 
 The native client's own deadline must exceed the wait being tested. Codex 0.166.0
 has a separate 300-second MCP deadline that does not extend with relay progress.
-For a bounded before/after demo, launch both revisions with
-`-c mcp_servers.omnigent.tool_timeout_sec=600` and leave approval pending for
-345 seconds. This isolates the relay's unchanged 300-second execution budget;
-it does not prove the default Codex client can wait for a full approval day.
+For a bounded before/after demo, set the isolated instance's
+`harness.codex-native.app_server` command to `codex` and its args to
+`["-c", "mcp_servers.omnigent.tool_timeout_sec=600"]`, then leave approval pending
+for 345 seconds. A TUI-only launch argument does not configure the separate
+app-server's MCP client. This isolates the relay's unchanged 300-second execution
+budget; it does not prove the default client can wait for a full approval day.
 With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
 
