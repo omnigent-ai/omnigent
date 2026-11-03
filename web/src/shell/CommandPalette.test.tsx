@@ -74,8 +74,10 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
-  render(<CommandPalette {...props} />);
-  return props;
+  const view = render(<CommandPalette {...props} />);
+  const rerender = (next: Partial<ComponentProps<typeof CommandPalette>>) =>
+    view.rerender(<CommandPalette {...props} {...next} />);
+  return { ...props, rerender };
 }
 
 beforeEach(() => {
@@ -870,11 +872,13 @@ describe("CommandPalette — new project", () => {
   }
 
   it("closes the palette and opens the empty create-project modal", () => {
-    const { onOpenChange } = renderPalette();
+    const { onOpenChange, rerender } = renderPalette();
 
     fireEvent.click(screen.getByText("New project"));
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
+    rerender({ open: false });
+    expect(screen.queryByTestId("command-palette-input")).toBeNull();
     expect(screen.getByRole("dialog", { name: "New project" })).toBeTruthy();
     expect(screen.getByPlaceholderText("Project name…")).toHaveProperty("value", "");
   });
@@ -882,6 +886,7 @@ describe("CommandPalette — new project", () => {
   it("offers to create a project named after a query that matches no session", () => {
     vi.useFakeTimers();
     try {
+      setSearchGroups({ title: searchPages([]), content: searchPages([]) });
       renderPalette();
       typeAndSettle("  Billing revamp ");
 
