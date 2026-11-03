@@ -865,7 +865,7 @@ async def test_release_clears_marker_before_same_session_replacement(
         await manager.shutdown()
 
 
-@pytest.mark.parametrize("replacement", ["owner", "reacquired", "activity"])
+@pytest.mark.parametrize("replacement", ["owner", "reacquired", "activity", "activity_at_cutoff"])
 async def test_release_rechecks_ownership_after_waiting_for_spawn(
     manager: HarnessProcessManager,
     replacement: str,
@@ -896,8 +896,10 @@ async def test_release_rechecks_ownership_after_waiting_for_spawn(
             assert not release.done()
             if replacement == "owner":
                 owns_release = False
-            elif replacement == "activity":
+            elif replacement in {"activity", "activity_at_cutoff"}:
                 manager.note_activity("conv_release")
+                if replacement == "activity_at_cutoff":
+                    manager._entries["conv_release"].last_used_at = cutoff
         if reacquired is not None:
             assert await reacquired is client
         await release
