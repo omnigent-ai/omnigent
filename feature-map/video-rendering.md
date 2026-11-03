@@ -49,7 +49,7 @@ Preconditions: build this checkout and install its Playwright Chromium. The brow
 - Actions need video-relative seconds in the companion annotation file; session timestamps alone cannot align a recording. Missing or invalid annotations preserve ordinary playback. Remote video links do not discover annotation files.
 - Browser codec support determines playback. A MOV container can contain codecs the browser cannot decode; download remains available.
 - Workspace playback buffers the complete file in a Blob before playback. Large recordings need time and memory; bytes are released when the player unmounts.
-- The raw download endpoint needs a runner. Host-only offline filesystem previews cannot provide complete video bytes.
+- Workspace playback and downloads need a runner and resume a sleeping session for callers with edit access. Host-only filesystem previews cannot provide complete video bytes.
 - Markdown link syntax is the supported transcript entry point. Raw HTML video tags and image syntax are not recording embeds.
 - Video uploads in the composer remain governed by the existing attachment policy.
 - Browser-contract recordings use mocked APIs. Supplement them with the real runner and Electron human checks above; native iOS/Android devices and embedded host authentication need separate checks.

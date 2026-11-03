@@ -1207,16 +1207,31 @@ def _list_agy_pids() -> list[int]:
         # can still be injected. ``exc_info`` records the real cause.
         _logger.debug("pgrep failed; falling back to /proc scan for agy pids", exc_info=True)
         return _list_agy_pids_from_proc()
-    return [int(line) for line in completed.stdout.split() if line.isdigit()]
+    pids = []
+    for line in completed.stdout.split():
+        if not line.isdigit():
+            continue
+        pid = int(line)
+        try:
+            argv = psutil.Process(pid).cmdline()
+        except psutil.Error:
+            continue
+        # Supervisors mention the agy command in their arguments, too.
+        if argv and _is_agy_executable(argv[0]):
+            pids.append(pid)
+    return pids
+
+
+def _is_agy_executable(executable: str) -> bool:
+    return executable == "bin/agy" or executable.endswith("/bin/agy")
 
 
 def _list_agy_pids_from_proc() -> list[int]:
     """
     Enumerate agy pids by scanning ``/proc/<pid>/cmdline`` (no ``pgrep`` needed).
 
-    The Linux-only fallback for :func:`_list_agy_pids`. Mirrors ``pgrep -f
-    bin/agy``: a process matches when its full (NUL-joined) command line
-    contains ``bin/agy``, which the launcher always satisfies because
+    The Linux-only fallback for :func:`_list_agy_pids`. Matches the executable
+    rather than wrapper arguments containing ``bin/agy``. The launcher satisfies this because
     :func:`omnigent.harnesses.antigravity_native.launch.agy_binary_path` resolves to an
     absolute ``.../bin/agy`` path. Unreadable or vanished ``/proc`` entries are
     skipped; a missing ``/proc`` (non-Linux) yields ``[]``.
@@ -1237,7 +1252,7 @@ def _list_agy_pids_from_proc() -> list[int]:
         except OSError:
             # Process exited between listdir and open, or cmdline is unreadable.
             continue
-        if b"bin/agy" in cmdline.replace(b"\0", b" "):
+        if _is_agy_executable(os.fsdecode(cmdline.split(b"\0", 1)[0])):
             pids.append(int(entry))
     return pids
 

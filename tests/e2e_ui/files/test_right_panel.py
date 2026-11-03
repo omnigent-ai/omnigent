@@ -8,6 +8,7 @@ unreachable on the desktop viewport these tests run at.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.conftest import (
     _TERMINAL_PANEL_FILE,
     _TERMINAL_PANEL_FILE_CONTENT,
+    configure_mock_llm,
     open_right_rail,
 )
 
@@ -205,6 +207,53 @@ def test_right_panel_terminals_and_file_viewer(
         workspace_file.unlink(missing_ok=True)
         if test_file.exists():
             test_file.unlink()
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_agent_opens_workspace_file(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+    request: pytest.FixtureRequest,
+    width: int,
+) -> None:
+    """A real tool dispatch opens the existing viewer through the session stream."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": width, "height": 900})
+    filesystem = f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem"
+    listing = page.request.get(filesystem)
+    assert listing.status == 200, listing.text()
+    name = f"ui-open-{session_id}.md"
+    target = Path(listing.json()["base"]) / name
+    target.write_text("# Agent opened this file\n\nWorkspace preview.\n")
+    request.addfinalizer(lambda: target.unlink(missing_ok=True))
+    prompt = f"Show my file {session_id}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "open_file",
+                        "name": "ui_open_file",
+                        "arguments": json.dumps({"path": name}),
+                    }
+                ]
+            },
+            {"text": "Requested the file preview."},
+        ],
+        match=prompt,
+        required_tools=["ui_open_file"],
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(prompt)
+    page.get_by_role("button", name="Send", exact=True).click()
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer).to_be_visible(timeout=60_000)
+    expect(viewer.get_by_text("Agent opened this file", exact=True)).to_be_visible()
+    expect(page).to_have_url(re.compile(r"[?&]file=" + re.escape(name)))
 
 
 @pytest.mark.parametrize("file_name", ["big-download.txt", "big-download.md"])

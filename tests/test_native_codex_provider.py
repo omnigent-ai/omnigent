@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import shlex
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 import yaml
 
 from omnigent.errors import OmnigentError

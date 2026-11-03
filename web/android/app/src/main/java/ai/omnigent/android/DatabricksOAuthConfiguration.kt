@@ -18,8 +18,15 @@ data class DatabricksOAuthConfiguration(
         }
     }
 
+    val isPrivateRedirect: Boolean
+        get() = redirectUri.scheme.equals(PRIVATE_CALLBACK_SCHEME, ignoreCase = true)
+
     fun matchesCallback(uri: URI): Boolean =
-        matchesRegisteredRedirect(uri) || matchesPrivateCallback(uri)
+        if (isPrivateRedirect) {
+            matchesPrivateCallback(uri)
+        } else {
+            matchesRegisteredRedirect(uri) || matchesPrivateCallback(uri)
+        }
 
     private fun matchesRegisteredRedirect(uri: URI): Boolean =
         uri.scheme.equals("https", ignoreCase = true) &&
@@ -48,15 +55,18 @@ data class DatabricksOAuthConfiguration(
             )
 
         private fun isValidRedirect(uri: URI): Boolean =
-            uri.scheme.equals("https", ignoreCase = true) &&
-                !uri.host.isNullOrEmpty() &&
-                uri.rawUserInfo == null &&
-                (uri.port == -1 || uri.port == 443) &&
-                !uri.rawPath.isNullOrEmpty() &&
-                uri.rawQuery == null &&
-                uri.rawFragment == null &&
-                uri.toString().none { it.isWhitespace() || it.isISOControl() } &&
-                !uri.toString().contains("$(")
+            (
+                uri.scheme.equals("https", ignoreCase = true) &&
+                    !uri.host.isNullOrEmpty() &&
+                    uri.rawUserInfo == null &&
+                    (uri.port == -1 || uri.port == 443) &&
+                    !uri.rawPath.isNullOrEmpty() &&
+                    uri.rawQuery == null &&
+                    uri.rawFragment == null &&
+                    uri.toString().none { it.isWhitespace() || it.isISOControl() } &&
+                    !uri.toString().contains("$(")
+            ) ||
+                (uri.toString() == "$PRIVATE_CALLBACK_SCHEME://$PRIVATE_CALLBACK_HOST")
 
         private fun effectivePort(uri: URI): Int = if (uri.port == -1) 443 else uri.port
     }

@@ -6,6 +6,7 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { GridWorkspace } from "./GridWorkspace";
 import type { ReactNode } from "react";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { gridSessionIds, splitGrid } from "./gridLayout";
 import { GridSessionsProvider, useGridSessions } from "./GridSessionsContext";
 
@@ -13,6 +14,14 @@ const identity = vi.hoisted(() => ({
   viewer: "alice" as string | null,
   server: "one",
   ready: true,
+}));
+const device = vi.hoisted(() => ({ mobile: false, touch: false, ios: false, android: false }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => device.mobile }));
+vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => device.touch }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
+  isIOSShell: () => device.ios,
+  isAndroidShell: () => device.android,
 }));
 vi.mock("@/hooks/useViewerId", () => ({
   useViewerId: () => identity.viewer,
@@ -42,6 +51,10 @@ function Probe() {
       <button type="button" onClick={() => grids?.closePane("third")}>
         Close third
       </button>
+      <button type="button" onClick={() => grids?.selectSession("third")}>
+        Select third
+      </button>
+      <output data-testid="selected">{grids?.selectedSessionId}</output>
       <output data-testid="count">{grids?.grids.length ?? 0}</output>
       <button type="button" onClick={() => grids?.split("first", "second", "right")}>
         Split
@@ -70,16 +83,44 @@ function tree(path: string, enabled = true, children: ReactNode = <Probe />) {
 }
 
 beforeEach(() => {
+  Object.assign(device, { mobile: false, touch: false, ios: false, android: false });
   identity.viewer = "alice";
   identity.ready = true;
   identity.server = "one";
   localStorage.clear();
 });
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+
+it.each(["mobile", "touch", "ios", "android"] as const)(
+  "blocks creation and saved grids on %s without touching storage",
+  (kind) => {
+    const key = "omnigent:session-grids:one:alice";
+    const saved = JSON.stringify([
+      { id: "saved", layout: splitGrid("first", "first", "second", "right") },
+    ]);
+    localStorage.setItem(key, saved);
+    const read = vi.spyOn(Storage.prototype, "getItem");
+    const write = vi.spyOn(Storage.prototype, "setItem");
+    device[kind] = true;
+    const view = render(tree("/c/first"));
+    fireEvent.click(screen.getByText("Split"));
+    expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
+    expect(screen.getByTestId("count")).toHaveTextContent("0");
+    view.unmount();
+    render(tree("/grid/saved", true, <GridWorkspace active={false}>{null}</GridWorkspace>));
+    expect(screen.getByText(/Grids are available on desktop only/)).toBeVisible();
+    expect(screen.getByRole("link", { name: "Back to sessions" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+    expect(read).not.toHaveBeenCalledWith(key);
+    expect(write).not.toHaveBeenCalled();
+    expect(localStorage.getItem(key)).toBe(saved);
+  },
+);
 
 it.each([true, false])("persists and scopes grids (secure context: %s)", (secureContext) => {
   if (!secureContext)
@@ -174,7 +215,12 @@ it("keeps a trimmed custom name through layout changes and reloads", () => {
   fireEvent.click(screen.getByText("Rename"));
   fireEvent.click(screen.getByText("Add third"));
   expect(screen.getByTestId("name")).toHaveTextContent("My work");
+  expect(screen.getByTestId("selected")).toHaveTextContent("first");
+  fireEvent.click(screen.getByText("Select third"));
+  expect(screen.getByTestId("selected")).toHaveTextContent("third");
+  // Removing the selected session falls back to the first remaining cell.
   fireEvent.click(screen.getByText("Close third"));
+  expect(screen.getByTestId("selected")).toHaveTextContent("first");
   fireEvent.click(screen.getByText("Swap"));
   expect(screen.getByTestId("order")).toHaveTextContent("second,first");
   const path = screen.getByTestId("path").textContent!;
@@ -229,6 +275,12 @@ it("never accesses anonymous grids and preserves the session subtree through ide
   const input = screen.getByRole("textbox");
   fireEvent.change(input, { target: { value: "Do not remount" } });
   identity.viewer = "alice";
+  ordinary.rerender(session());
+  expect(screen.getByRole("textbox")).toBe(input);
+  expect(input).toHaveValue("Do not remount");
+  device.mobile = true;
+  ordinary.rerender(session());
+  device.mobile = false;
   ordinary.rerender(session());
   expect(screen.getByRole("textbox")).toBe(input);
   expect(input).toHaveValue("Do not remount");

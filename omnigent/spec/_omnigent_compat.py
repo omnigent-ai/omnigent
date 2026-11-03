@@ -188,13 +188,27 @@ def validate_omnigent_executor(
     if "context_files" in spec.executor.config:
         if not isinstance(spec.executor.config["context_files"], bool):
             result.add("executor.config.context_files", "must be a boolean")
-        if harness != "pi":
-            result.add("executor.config.context_files", "only supported with harness 'pi'")
+        if harness not in ("pi", "pi-native"):
+            result.add(
+                "executor.config.context_files", "only supported with harness 'pi' or 'pi-native'"
+            )
     if "system_prompt_mode" in spec.executor.config:
         if spec.executor.config["system_prompt_mode"] not in ("append", "replace"):
             result.add("executor.config.system_prompt_mode", "must be 'append' or 'replace'")
-        if harness != "pi":
-            result.add("executor.config.system_prompt_mode", "only supported with harness 'pi'")
+        if harness not in ("pi", "pi-native"):
+            result.add(
+                "executor.config.system_prompt_mode",
+                "only supported with harness 'pi' or 'pi-native'",
+            )
+        elif (
+            harness == "pi-native"
+            and spec.executor.config["system_prompt_mode"] == "replace"
+            and not (spec.instructions or "").strip()
+        ):
+            result.add(
+                "instructions",
+                "pi-native system_prompt_mode='replace' requires non-empty authored instructions",
+            )
     if not harness:
         result.add(
             "executor.config.harness",
