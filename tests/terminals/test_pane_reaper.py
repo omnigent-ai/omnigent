@@ -212,12 +212,12 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
     assert f.reaped == []
 
 
-def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
-    # kimi records no resumable chat id, so a reaped pane cannot be re-created
+def test_only_resumable_native_harnesses_are_offered_to_the_reaper() -> None:
+    # Bob and Kimi record no resumable chat id, so a reaped pane cannot be re-created
     # with its context. Any other harness missing from the name filter keeps
     # every finished pane resident for the runner's lifetime.
     pane_names = {native_terminal_name(harness) for harness in NATIVE_HARNESSES}
-    assert pane_names - NATIVE_PANE_TERMINAL_NAMES == {"kimi"}
+    assert pane_names - NATIVE_PANE_TERMINAL_NAMES == {"bob", "kimi"}
     assert pane_names >= NATIVE_PANE_TERMINAL_NAMES
 
 

@@ -61,9 +61,8 @@ PANE_OUTPUT_BUSY_WINDOW_S = 120.0
 # ROLE is a native harness (so a user terminal that merely shares the name is not
 # reaped — see ``create_runner_app``).
 #
-# "kimi" is deliberately absent: kimi records no resumable chat id, so a reaped
-# pane cannot be re-created with its context — the next turn would silently
-# start a fresh TUI. Keep kimi panes alive until the session is torn down.
+# Bob and Kimi record no resumable chat id. Keep their panes alive until
+# session teardown so the next turn does not silently start a fresh TUI.
 NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     {
         "claude",
