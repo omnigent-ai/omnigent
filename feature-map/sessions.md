@@ -83,6 +83,11 @@ the header menu), and each place is a separate entry point.
   Closing the dialog mid-clone keeps the clone running: a toast reports it
   (with **Open** on success), and reopening the dialog shows it again.
   Dismissing that toast stops tracking the clone, so a new one can start.
+- `edit-message`: edit a submitted prompt and choose **Save & resend** to
+  create a branch with the earlier conversation and the revised message.
+  Attachments are retained; the original prompt and later replies stay in the
+  original session. Saving interrupts any running response there. Cancelling
+  the editor leaves the original unchanged.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
@@ -295,6 +300,13 @@ mode pickers. Your custom
 agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
+
+**Edit a submitted message (desktop and mobile):** hover your prompt or tap its
+pencil action, choose **Edit message**, revise the text, and choose **Save &
+resend**. The dialog uses the source's host and directory defaults and lets you
+choose another target. This action also appears on your prompts in side chats
+and desktop session grids. Pending sends, shell commands, system notices, and
+other contributors' prompts do not offer editing.
 
 **Sandbox fork repositories:** from the header menu, sidebar row menu,
 right-click menu, or a message's Fork action, choose a sandbox destination. The
@@ -662,6 +674,19 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
+- **`edit-message`, desktop and phone message actions:**
+  `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_edit_message_resubmits_in_branch`
+  checks editor prefilling, resubmission, earlier context, exclusion of later
+  messages, and preservation of the source through the real server and runner.
+  First-message cutoffs and attachment remapping have store/server coverage in
+  `tests/stores/test_conversation_store.py` and
+  `tests/server/routes/test_sessions_fork.py`.
+  Side-chat scoping has component coverage in
+  `web/src/components/chat/chatBubbleParts.test.tsx`; manually open a side chat,
+  edit one of your prompts there, and check that the new branch keeps that
+  chat's earlier context. For a desktop grid, edit a prompt in a non-active
+  cell and check that the branch comes from that cell. Native harness delivery
+  reuses the truncated-fork rebuild; live native edit flows remain unverified.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):
@@ -1112,6 +1137,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - A copied web transcript does not prove the native CLI received that history.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.
+- Editing preserves conversation context, not earlier workspace contents. Native
+  targets without history replay reject edits after earlier turns; choose a
+  supported agent in the edit dialog. Editing the first prompt needs no replay.
 - Continuing in another directory preserves conversation history, not files
   from the missing workspace. A new worktree starts from the `HEAD` of the
   chosen repository's main checkout, never from the missing worktree's branch.

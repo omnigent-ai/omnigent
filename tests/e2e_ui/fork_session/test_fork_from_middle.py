@@ -24,8 +24,10 @@ from __future__ import annotations
 import re
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import configure_mock_llm
 
 # Two distinct code words with no shared substring, so the kept/dropped
@@ -37,6 +39,94 @@ _DROPPED_MARKER = "quasar-castoff"
 
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _USER = '[data-testid="message-bubble"][data-role="user"]'
+
+
+@pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile"])
+def test_edit_message_resubmits_in_branch(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+    mobile: bool,
+) -> None:
+    """Editing keeps earlier context and resends once without later history."""
+    base_url, session_id = seeded_session
+    revised = "Revised request: include the missing context."
+    later = "Later request that belongs only to the original conversation."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "I received the revised request."}],
+        key="edited-message",
+        match=revised,
+    )
+    if mobile:
+        page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_placeholder("Send a message…")
+    for index, prompt in enumerate([_KEPT_MARKER, _DROPPED_MARKER, later], start=1):
+        if prompt == later and not mobile:
+            configure_mock_llm(
+                mock_llm_server_url,
+                [{"text": "This later response should be interrupted.", "delay": 30}],
+                key="later-source-response",
+                match=later,
+            )
+        composer.fill(prompt)
+        page.get_by_role("button", name="Send", exact=True).click()
+        if prompt == later and not mobile:
+            expect(page.get_by_role("button", name="Interrupt", exact=True)).to_be_visible(
+                timeout=30_000
+            )
+            poll_until(
+                lambda: (
+                    httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()[
+                        "status"
+                    ]
+                    == "running"
+                ),
+                timeout_s=10.0,
+                interval_s=0.1,
+            )
+        else:
+            expect(page.locator(_ASSISTANT)).to_have_count(index, timeout=60_000)
+            expect(page.get_by_test_id("fork-from-response").last).to_be_visible(timeout=30_000)
+
+    original = page.locator(_USER).filter(has_text=_DROPPED_MARKER)
+    original.hover()
+    original.get_by_role("button", name="Edit message", exact=True).click()
+    dialog = page.get_by_test_id("fork-session-dialog")
+    editor = dialog.get_by_role("textbox", name="Message", exact=True)
+    expect(editor).to_have_value(_DROPPED_MARKER)
+    editor.fill(revised)
+    dialog.get_by_role("button", name="Save & resend", exact=True).click()
+    expect(page).to_have_url(
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"), timeout=30_000
+    )
+    expect(page.locator(_USER).filter(has_text=_KEPT_MARKER)).to_be_visible(timeout=30_000)
+    expect(page.locator(_USER).filter(has_text=revised)).to_have_count(1)
+    expect(page.locator(_USER).filter(has_text=_DROPPED_MARKER)).to_have_count(0)
+    expect(page.locator(_USER).filter(has_text=later)).to_have_count(0)
+    expect(page.locator(_ASSISTANT).last).to_contain_text(
+        "I received the revised request.", timeout=60_000
+    )
+
+    fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]
+    fork_response = httpx.get(f"{base_url}/v1/sessions/{fork_id}", timeout=10.0)
+    fork_response.raise_for_status()
+    fork_users = [
+        item["data"]["content"]
+        for item in fork_response.json()["items"]
+        if item.get("data", {}).get("role") == "user"
+    ]
+    assert fork_users == [
+        [{"type": "input_text", "text": _KEPT_MARKER}],
+        [{"type": "input_text", "text": revised}],
+    ]
+    source_response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    source_response.raise_for_status()
+    assert source_response.json()["status"] != "running"
+    assert _DROPPED_MARKER in source_response.text
+    assert later in source_response.text
+    assert revised not in source_response.text
 
 
 def test_fork_from_middle_truncates_history(

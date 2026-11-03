@@ -26,8 +26,9 @@ export function cloneKey(
   sourceSessionId: string,
   upToResponseId?: string | null,
   workspaceRecovery = false,
+  beforeItemId?: string,
 ): string {
-  return `${sourceSessionId}:${upToResponseId ?? ""}:${workspaceRecovery}`;
+  return `${sourceSessionId}:${upToResponseId ?? ""}:${workspaceRecovery}${beforeItemId === undefined ? "" : `:edit:${beforeItemId}`}`;
 }
 
 /** `useSyncExternalStore` subscription for {@link pendingClone}. */

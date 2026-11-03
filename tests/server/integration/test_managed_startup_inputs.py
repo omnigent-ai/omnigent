@@ -18,13 +18,18 @@ import pytest_asyncio
 from fastapi import FastAPI
 from starlette.datastructures import Headers
 
-from omnigent.entities.conversation import ErrorData
+from omnigent.entities.conversation import ErrorData, MessageData, NewConversationItem
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
-from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
+from omnigent.harness_plugins import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+    KIRO_NATIVE_CODING_AGENT,
+)
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
@@ -776,13 +781,13 @@ async def test_saved_sdk_skill_resolves_after_launch_and_replaces_pending_bubble
     assert hidden.data.is_meta and hidden.id == turn["persisted_item_id"]
 
 
-def _connect_host(env: _Env, host_id: str) -> Any:
+def _connect_host(env: _Env, host_id: str, *, managed: bool = True) -> Any:
     return env.app.state.host_registry.register(
         host_id,
         AsyncMock(),
         HostHelloFrame(version="test", frame_protocol_version=1, name="startup-test", runners=[]),
         owner=None,
-        registered_with_managed_token=True,
+        registered_with_managed_token=managed,
     )
 
 
@@ -1261,3 +1266,405 @@ async def test_saved_delivery_identifies_failed_boundary(
             if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
         ]
     ) == int(reported_stage == "post_delivery")
+
+
+@pytest.mark.parametrize("mode", ["managed", "external", "shared_sdk"])
+async def test_edited_fork_saves_revised_input_and_original_attachment_before_launch(
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    env = startup_env
+    agent = await create_test_agent(env.client)
+    source_response = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert source_response.status_code == 201, source_response.text
+    source_id = source_response.json()["id"]
+    upload = await env.client.post(
+        f"/v1/sessions/{source_id}/resources/files",
+        files={"file": ("context.txt", b"original attachment", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    original_file_id = upload.json()["id"]
+    original_content = [
+        {"type": "input_file", "file_id": original_file_id, "filename": "context.txt"},
+        {"type": "input_text", "text": "original question"},
+    ]
+    source_items = env.conv_store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="earlier",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "earlier question"}]
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="earlier",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "earlier answer"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="original",
+                data=MessageData(role="user", content=original_content),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="original",
+                data=MessageData(
+                    role="assistant",
+                    agent="test-agent",
+                    content=[{"type": "output_text", "text": "stale answer"}],
+                ),
+            ),
+        ],
+    )
+    if mode == "external":
+        env.conv_store.set_host_id(source_id, uuid4().hex, "/tmp/source-workspace")
+    elif mode == "shared_sdk":
+        env.conv_store.set_runner_id(source_id, "shared-sdk-runner")
+        monkeypatch.setattr(env.app.state.runner_router, "runner_is_online", lambda _: True)
+    original_snapshot = env.conv_store.list_items(source_id).data
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        response = await env.client.post(
+            f"/v1/sessions/{source_id}/fork",
+            json={
+                "before_item_id": source_items[2].id,
+                "edited_text": "revised question with more context",
+                "interrupt_source": True,
+                **({"host_type": "managed"} if mode == "managed" else {}),
+            },
+        )
+        assert response.status_code == 201, response.text
+        fork_id = response.json()["id"]
+        assert env.conv_store.list_items(source_id).data == original_snapshot
+        snapshot = (await env.client.get(f"/v1/sessions/{fork_id}")).json()
+        if mode == "shared_sdk":
+            assert snapshot["pending_inputs"] == []
+            assert STARTUP_LABEL not in env.conv_store.get_conversation(fork_id).labels
+        else:
+            [queued] = snapshot["pending_inputs"]
+            assert queued["content"][1]["text"] == "revised question with more context"
+            copied_file_id = queued["content"][0]["file_id"]
+            assert copied_file_id != original_file_id
+            assert SqlAlchemyFileStore(db_uri).get(copied_file_id).session_id == fork_id
+            assert not [event for event in forwarded if event.get("type") == "message"]
+            original_startup = env.app.state.startup_inputs
+            saved = _bind(env, fork_id)
+            restarted = ManagedStartupInputs(env.conv_store, original_startup.hosts)
+            restarted.dispatch = original_startup.dispatch
+            host_id = env.conv_store.get_conversation(fork_id).host_id
+            _connect_host(env, host_id, managed=mode == "managed")
+            restarted.host_changed(env.app, host_id)
+            try:
+                for _ in range(100):
+                    if not env.conv_store.list_pending_inputs(fork_id) and any(
+                        event.get("type") == "message" for event in forwarded
+                    ):
+                        break
+                    await asyncio.sleep(0.02)
+                await restarted._deliver(env.app, fork_id, saved)
+            finally:
+                await restarted.shutdown()
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1
+        assert turns[0]["content"][1]["text"] == "revised question with more context"
+        assert base64.b64decode(turns[0]["content"][0]["file_data"].split(",", 1)[1]) == (
+            b"original attachment"
+        )
+        snapshot = (await env.client.get(f"/v1/sessions/{fork_id}")).json()
+        assert "original question" not in json.dumps(snapshot["items"])
+        assert "stale answer" not in json.dumps(snapshot["items"])
+        assert "earlier question" in json.dumps(snapshot["items"])
+        if mode == "shared_sdk":
+            subsequent = await env.client.post(f"/v1/sessions/{fork_id}/events", json=_INPUT)
+            assert subsequent.status_code == 202, subsequent.text
+            assert len([event for event in forwarded if event.get("type") == "message"]) == 2
+    finally:
+        await runner.aclose()
+
+
+async def test_edited_fork_does_not_create_branch_when_interrupt_fails(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    source_id = await _create(env)
+    # Use a committed user message rather than the startup queue.
+    [source_item] = env.conv_store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="source",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "original"}]
+                ),
+            )
+        ],
+    )
+    before = await _session_count(env)
+    original_dispatch = env.app.state.startup_inputs.dispatch
+
+    async def refuse(*_: Any) -> dict[str, bool]:
+        raise RuntimeError("interrupt failed")
+
+    env.app.state.startup_inputs.dispatch = refuse
+    try:
+        with pytest.raises(RuntimeError, match="interrupt failed"):
+            await env.client.post(
+                f"/v1/sessions/{source_id}/fork",
+                json={
+                    "before_item_id": source_item.id,
+                    "edited_text": "revised",
+                    "interrupt_source": True,
+                },
+            )
+    finally:
+        env.app.state.startup_inputs.dispatch = original_dispatch
+    assert await _session_count(env) == before
+
+
+async def test_read_only_user_cannot_edit_or_interrupt_source(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    startup_permissions: SqlAlchemyPermissionStore,
+) -> None:
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    agent = await create_test_agent(auth_client)
+    response = await auth_client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert response.status_code == 201, response.text
+    source_id = response.json()["id"]
+    startup = auth_app.state.startup_inputs
+    [original] = startup.conversations.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="source",
+                created_by="alice",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "original"}]
+                ),
+            )
+        ],
+    )
+    startup_permissions.ensure_user("reader")
+    startup_permissions.grant("reader", source_id, LEVEL_READ)
+    dispatch = startup.dispatch
+    interrupted = AsyncMock()
+    startup.dispatch = interrupted
+    try:
+        response = await auth_client.post(
+            f"/v1/sessions/{source_id}/fork",
+            json={
+                "before_item_id": original.id,
+                "edited_text": "revised",
+                "interrupt_source": True,
+            },
+            headers={"X-Forwarded-Email": "reader"},
+        )
+    finally:
+        startup.dispatch = dispatch
+    assert response.status_code == 403, response.text
+    interrupted.assert_not_awaited()
+    assert startup.conversations.list_items(source_id).data == [original]
+
+
+@pytest.mark.parametrize("failure", ["offline", "refused", "disconnected"])
+async def test_edited_fork_requires_active_source_interrupt_acknowledgment(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    env = startup_env
+    source_id = await _create(env, initial_input=None)
+    [original] = env.conv_store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="source",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "original"}]
+                ),
+            )
+        ],
+    )
+    env.conv_store.set_session_live_status(source_id, "running")
+    runner = _stub_runner(monkeypatch, status=503)
+
+    async def unavailable(*_: Any, **__: Any):
+        if failure == "disconnected":
+            raise ConnectionError("runner tunnel disconnected")
+        return
+
+    if failure == "offline":
+        monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", unavailable)
+    elif failure == "disconnected":
+        monkeypatch.setattr(runner, "post", unavailable)
+    before = await _session_count(env)
+    try:
+        response = await env.client.post(
+            f"/v1/sessions/{source_id}/fork",
+            json={
+                "before_item_id": original.id,
+                "edited_text": "revised",
+                "interrupt_source": True,
+            },
+        )
+    finally:
+        await runner.aclose()
+    assert response.status_code == 503, response.text
+    assert "interrupt" in response.text
+    assert await _session_count(env) == before
+    assert env.conv_store.get_conversation(source_id).live_status == "running"
+
+
+@pytest.mark.parametrize("resume", ["retry", "followup"])
+async def test_hostless_edited_input_recovers_after_restart_before_dispatch(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, resume: str
+) -> None:
+    env = startup_env
+    agent = await create_test_agent(env.client)
+    response = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    source_id = response.json()["id"]
+    [original] = env.conv_store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="source",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "original"}]
+                ),
+            )
+        ],
+    )
+    env.conv_store.set_runner_id(source_id, "shared-sdk-runner")
+    monkeypatch.setattr(env.app.state.runner_router, "runner_is_online", lambda _: True)
+    original_startup = env.app.state.startup_inputs
+    monkeypatch.setattr(original_startup, "dispatch_pending", AsyncMock())
+    response = await env.client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={"before_item_id": original.id, "edited_text": "revised"},
+    )
+    assert response.status_code == 201, response.text
+    fork_id = response.json()["id"]
+    assert env.conv_store.get_conversation(fork_id).runner_id == "shared-sdk-runner"
+    restarted = ManagedStartupInputs(env.conv_store, original_startup.hosts)
+    restarted.dispatch = original_startup.dispatch
+    env.app.state.startup_inputs = restarted
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        response = await env.client.post(
+            f"/v1/sessions/{fork_id}/events",
+            json=({"type": "retry_session", "data": {}} if resume == "retry" else _INPUT),
+        )
+        assert response.status_code == 202, response.text
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == (1 if resume == "retry" else 2)
+        assert turns[0]["content"][0]["text"] == "revised"
+        assert env.conv_store.list_pending_inputs(fork_id) == []
+        assert STARTUP_LABEL not in env.conv_store.get_conversation(fork_id).labels
+    finally:
+        env.app.state.startup_inputs = original_startup
+        await restarted.shutdown()
+        await runner.aclose()
+
+
+async def test_edited_fork_cannot_reuse_another_users_runner(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    startup_permissions: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    agent = await create_test_agent(auth_client)
+    response = await auth_client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    source_id = response.json()["id"]
+    startup = auth_app.state.startup_inputs
+    [original] = startup.conversations.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="source",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "original"}]
+                ),
+            )
+        ],
+    )
+    startup.conversations.set_runner_id(source_id, "alices-runner")
+    startup_permissions.ensure_user("editor")
+    startup_permissions.grant("editor", source_id, LEVEL_EDIT)
+    monkeypatch.setattr(auth_app.state.runner_router, "runner_is_online", lambda _: True)
+    monkeypatch.setattr(auth_app.state.runner_router, "runner_owner", lambda _: "alice")
+    interrupted = AsyncMock()
+    monkeypatch.setattr(startup, "dispatch", interrupted)
+    response = await auth_client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={"before_item_id": original.id, "edited_text": "revised", "interrupt_source": True},
+        headers={"X-Forwarded-Email": "editor"},
+    )
+    assert response.status_code == 403, response.text
+    interrupted.assert_not_awaited()
+
+
+@pytest.mark.parametrize("has_earlier_history", [False, True])
+async def test_edited_fork_rejects_lost_context_on_non_replaying_native_harness(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, has_earlier_history: bool
+) -> None:
+    env = startup_env
+    source_id = await _create(env, initial_input=None)
+    items = env.conv_store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="source",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for text in (["earlier", "original"] if has_earlier_history else ["original"])
+        ],
+    )
+    monkeypatch.setattr(
+        routes_core, "_native_coding_agent_for_agent", lambda _: KIRO_NATIVE_CODING_AGENT
+    )
+    response = await env.client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={"before_item_id": items[-1].id, "edited_text": "revised"},
+    )
+    assert response.status_code == (400 if has_earlier_history else 201), response.text
+    if has_earlier_history:
+        assert "cannot replay earlier conversation history" in response.text
+
+
+async def test_managed_host_recovers_saved_input_without_startup_label(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    source_id = await _create(env)
+    _bind(env, source_id)
+    env.conv_store.delete_label(source_id, STARTUP_LABEL)
+    host_id = env.conv_store.get_conversation(source_id).host_id
+    _connect_host(env, host_id)
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        env.app.state.startup_inputs.host_changed(env.app, host_id)
+        for _ in range(100):
+            if not env.conv_store.list_pending_inputs(source_id) and any(
+                event.get("type") == "message" for event in forwarded
+            ):
+                break
+            await asyncio.sleep(0.02)
+        assert env.conv_store.list_pending_inputs(source_id) == []
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    finally:
+        await env.app.state.startup_inputs.shutdown()
+        await runner.aclose()

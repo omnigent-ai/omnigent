@@ -7,6 +7,11 @@
 
 import { createContext, useContext } from "react";
 
+export interface MessageEdit {
+  itemId: string;
+  text: string;
+}
+
 export interface ForkDialogContextValue {
   /** Session described by canFork and disabledReason; scoped sources resolve their own checks. */
   currentSessionId?: string | null;
@@ -16,6 +21,8 @@ export interface ForkDialogContextValue {
    * Callers hide their fork affordance when false.
    */
   canFork: boolean;
+  /** Advertised by servers that support editing and resubmitting submitted prompts. */
+  canEditMessages?: boolean;
   /** Visible but unavailable: callers disable the action and explain why. */
   disabledReason?: string;
   /**
@@ -27,6 +34,7 @@ export interface ForkDialogContextValue {
   openForkDialog: (opts?: {
     sourceSessionId?: string;
     upToResponseId?: string;
+    editMessage?: MessageEdit;
     workspaceRecovery?: boolean;
   }) => void;
 }

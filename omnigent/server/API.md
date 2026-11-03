@@ -1241,6 +1241,27 @@ Request body matches `SessionForkRequest`:
     source's full native transcript. When null or omitted, the full
     history is copied.
 
+  before_item_id (string | null, optional)
+    Copy only history before this submitted user message, excluding the
+    message and every later item. A first-message cutoff produces empty
+    history. Mutually exclusive with up_to_response_id. Missing, pending,
+    assistant, and hidden context messages return 400. A native target
+    rebuilds from the retained items and never resumes the full source
+    transcript.
+
+  edited_text (string | null, optional)
+    Revised nonblank text for before_item_id. Requires edit access to the
+    source. The replacement retains the original non-text content and
+    attachments, remapped to the fork's copied file resources. It is saved
+    durably before launch and delivered through the normal message path
+    after the chosen host binds; hostless SDK sessions reuse their shared
+    runner. The original transcript remains intact.
+    Send only when GET /v1/info reports session_message_edit: true.
+
+  interrupt_source (boolean, default false)
+    With edited_text, interrupt the source turn before creating the fork.
+    Input validation and source authorization run before interruption.
+
   host_type (string, "external" | "managed", default "external")
     How the fork's host is obtained. `"external"` (the default, and
     the pre-existing behavior): the fork is created unbound and the

@@ -170,6 +170,12 @@ class _ConversationStore:
         """
         return self._convs.get(conversation_id)
 
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
+        """Look up the exact source message for an edited fork."""
+        return next(
+            (item for item in self._items.get(conversation_id, []) if item.id == item_id), None
+        )
+
     def fork_conversation(
         self,
         source_conversation_id: str,
@@ -193,6 +199,7 @@ class _ConversationStore:
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,
@@ -259,6 +266,7 @@ class _ConversationStore:
                 "resume_source_native_session": resume_source_native_session,
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
+                "before_item_id": before_item_id,
                 "project_id": project_id,
                 "file_id_map": file_id_map,
                 "created_by": created_by,
@@ -288,6 +296,11 @@ class _ConversationStore:
                 if item.response_id == up_to_response_id
             )
             source_items = source_items[: cutoff_index + 1]
+        if before_item_id is not None:
+            cutoff_index = next(
+                index for index, item in enumerate(source_items) if item.id == before_item_id
+            )
+            source_items = source_items[:cutoff_index]
         self._items[fork_id] = source_items
         # Mirror the real store's label handling for the three rules the route
         # depends on: source labels are copied EXCEPT the store's own fork-only
@@ -1023,6 +1036,55 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     assert [item["response_id"] for item in body["items"]] == ["resp_001", "resp_001"], (
         f"Fork should contain only resp_001 items, got {body['items']!r}"
     )
+
+
+@pytest.mark.parametrize("cutoff_index", [0, 2])
+def test_fork_before_user_message(cutoff_index: int) -> None:
+    conv = _make_conversation()
+    items = [_make_item(f"{index:032x}", f"message {index}") for index in range(3)]
+    store = _ConversationStore(conversations={conv.id: conv}, items_by_conv={conv.id: items})
+    response = TestClient(_build_app(store)).post(
+        f"/v1/sessions/{conv.id}/fork", json={"before_item_id": items[cutoff_index].id}
+    )
+    assert response.status_code == 201, response.text
+    assert store.fork_calls[0]["before_item_id"] == items[cutoff_index].id
+    assert len(response.json()["items"]) == cutoff_index
+    assert len(store._items[conv.id]) == 3
+
+
+@pytest.mark.parametrize("cutoff", ["missing", "assistant", "pending", "meta"])
+def test_fork_before_message_rejects_invalid_cutoff(cutoff: str) -> None:
+    conv = _make_conversation()
+    item = _make_item("9980c8a9248139f14f4165e5d53088aa", "original")
+    if cutoff == "assistant":
+        item.data = MessageData(role="assistant", content=[], agent="test-agent")
+    elif cutoff == "pending":
+        item.response_id = "pending_input"
+    elif cutoff == "meta":
+        item.data = MessageData(role="user", content=[], is_meta=True)
+    store = _ConversationStore(conversations={conv.id: conv}, items_by_conv={conv.id: [item]})
+    response = TestClient(_build_app(store)).post(
+        f"/v1/sessions/{conv.id}/fork",
+        json={"before_item_id": "missing" if cutoff == "missing" else item.id},
+    )
+    assert response.status_code == 400, response.text
+    assert not store.fork_calls
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"before_item_id": "message", "up_to_response_id": "response"},
+        {"edited_text": "revised"},
+        {"before_item_id": "message", "edited_text": "  "},
+    ],
+)
+def test_fork_rejects_conflicting_edit_fields(payload: dict[str, str]) -> None:
+    conv = _make_conversation()
+    store = _ConversationStore(conversations={conv.id: conv})
+    response = TestClient(_build_app(store)).post(f"/v1/sessions/{conv.id}/fork", json=payload)
+    assert response.status_code == 422, response.text
+    assert not store.fork_calls
 
 
 @pytest.mark.asyncio
@@ -2928,3 +2990,33 @@ def test_fork_counts_files_recorded_for_filesystem_delivery(
         assert [f.source_metadata for f in copied if f.filename == "trace.gz"] == [recorded]
     else:
         assert not conv_store.fork_calls
+
+
+@pytest.mark.parametrize("retained_attachment", [False, True])
+def test_attachment_scan_honors_exclusive_user_message_cutoff(retained_attachment: bool) -> None:
+    from omnigent.server.routes._sessions.helpers import _filesystem_attachment_in_history
+
+    source = _make_conversation()
+    files = _FileStore()
+    attachment = files.create(
+        "trace.gz", bytes=4, session_id=source.id, source_metadata={"delivery": "filesystem"}
+    )
+    attached_content = [{"type": "input_file", "file_id": attachment.id}]
+    earlier = _make_item("1" * 32, "earlier")
+    if retained_attachment:
+        earlier.data = MessageData(role="user", content=attached_content)
+    target = _make_item("2" * 32, "edited")
+    later = _make_item("3" * 32, "excluded").model_copy(update={"response_id": None})
+    later.data = MessageData(role="user", content=attached_content)
+    store = _ConversationStore(
+        conversations={source.id: source}, items_by_conv={source.id: [earlier, target, later]}
+    )
+    assert _filesystem_attachment_in_history(
+        source.id, store, files, before_item_id=target.id
+    ) == ("trace.gz" if retained_attachment else None)
+    assert (
+        _filesystem_attachment_in_history(
+            source.id, store, files, before_item_id=earlier.id, content=attached_content
+        )
+        == "trace.gz"
+    )

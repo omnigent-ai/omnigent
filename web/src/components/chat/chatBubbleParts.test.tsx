@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
+import * as identity from "@/lib/identity";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
@@ -154,6 +155,181 @@ describe("AssistantBubble fork source", () => {
 
     expect(openForkDialog).toHaveBeenCalledOnce();
     expect(openForkDialog).toHaveBeenCalledWith(expected);
+  });
+});
+
+describe("UserBubble edit message", () => {
+  const originalText = "Review this file.\n[Attached: docs/design.md]\n";
+  const bubble: Extract<Bubble, { kind: "user" }> = {
+    kind: "user",
+    itemId: "user_edit",
+    createdBy: "owner@example.test",
+    content: [
+      { type: "input_text", text: originalText },
+      { type: "input_file", file_id: "file_context", filename: "context.txt" },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.spyOn(identity, "getCurrentAuthorId").mockReturnValue("owner@example.test");
+  });
+
+  it.each([
+    { name: "main chat", scope: null, sourceSessionId: "conv_retry" },
+    { name: "side chat", scope: "conv_side_child", sourceSessionId: "conv_side_child" },
+  ])(
+    "opens the $name editor with the original attachment context",
+    ({ scope, sourceSessionId }) => {
+      const openForkDialog = vi.fn();
+      render(
+        <ForkDialogContextProvider value={{ canFork: true, canEditMessages: true, openForkDialog }}>
+          <ConversationScopeContext.Provider value={scope}>
+            <BubbleView bubble={bubble} />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit message" }));
+
+      expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+        sourceSessionId,
+        editMessage: { itemId: "user_edit", text: originalText },
+      });
+    },
+  );
+
+  it.each<Partial<Extract<Bubble, { kind: "user" }>>>([
+    { pending: true },
+    { shellCommand: "pwd" },
+    { createdBy: "someone-else@example.test" },
+    { content: [{ type: "input_text", text: "[System: interrupted]" }] },
+  ])("does not offer editing for non-editable messages: %o", (overrides) => {
+    render(
+      <ForkDialogContextProvider
+        value={{ canFork: true, canEditMessages: true, openForkDialog: vi.fn() }}
+      >
+        <BubbleView bubble={{ ...bubble, ...overrides }} />
+      </ForkDialogContextProvider>,
+    );
+
+    expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the disabled explanation accessible", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          canFork: true,
+          canEditMessages: true,
+          disabledReason: "Checking session capabilities…",
+          openForkDialog,
+        }}
+      >
+        <BubbleView bubble={bubble} />
+      </ForkDialogContextProvider>,
+    );
+
+    const edit = screen.getByRole("button", { name: "Edit message" });
+    expect(edit).toBeDisabled();
+    expect(edit.parentElement).toHaveAttribute("tabindex", "0");
+    fireEvent.click(edit);
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([false, undefined])(
+    "hides editing when the server does not advertise support: %s",
+    (canEditMessages) => {
+      render(
+        <ForkDialogContextProvider
+          value={{ canFork: true, canEditMessages, openForkDialog: vi.fn() }}
+        >
+          <BubbleView bubble={bubble} />
+        </ForkDialogContextProvider>,
+      );
+      expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
+    },
+  );
+
+  it("does not apply the main session's disabled reason to a scoped editor", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          currentSessionId: "conv_retry",
+          canFork: true,
+          canEditMessages: true,
+          disabledReason: "Unable to check session capabilities. Reload to try again.",
+          openForkDialog,
+        }}
+      >
+        <ConversationScopeContext.Provider value="conv_side_child">
+          <BubbleView bubble={bubble} />
+        </ConversationScopeContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+    const edit = screen.getByRole("button", { name: "Edit message" });
+    expect(edit).toBeEnabled();
+    fireEvent.click(edit);
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: "conv_side_child",
+      editMessage: { itemId: "user_edit", text: originalText },
+    });
+  });
+
+  it("opens an inactive grid cell's editor when the grid has no main session", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          currentSessionId: null,
+          canFork: false,
+          canEditMessages: true,
+          disabledReason: "Checking session capabilities…",
+          openForkDialog,
+        }}
+      >
+        <ConversationScopeContext.Provider value="conv_grid_cell">
+          <BubbleView bubble={bubble} />
+        </ConversationScopeContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+
+    const edit = screen.getByRole("button", { name: "Edit message" });
+    expect(edit).toBeEnabled();
+    fireEvent.click(edit);
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: "conv_grid_cell",
+      editMessage: { itemId: "user_edit", text: originalText },
+    });
+  });
+
+  it("hides the main chat's editor when that session cannot be forked", () => {
+    render(
+      <ForkDialogContextProvider
+        value={{ canFork: false, canEditMessages: true, openForkDialog: vi.fn() }}
+      >
+        <BubbleView bubble={bubble} />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
+  });
+
+  it.each<Extract<Bubble, { kind: "user" }>["content"]>([
+    [{ type: "input_file", file_id: "file_context", filename: "context.txt" }],
+    [{ type: "input_image", filename: "screenshot.png" }],
+  ])("allows adding text to an attachment-only message: %o", (...content) => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, canEditMessages: true, openForkDialog }}>
+        <BubbleView bubble={{ ...bubble, content }} />
+      </ForkDialogContextProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit message" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: "conv_retry",
+      editMessage: { itemId: "user_edit", text: "" },
+    });
   });
 });
 

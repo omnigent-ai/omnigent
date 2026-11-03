@@ -415,6 +415,31 @@ describe("createBundledSession", () => {
 });
 
 describe("forkSession", () => {
+  it("sends the exclusive message cutoff and revised text for an edit", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_revised",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", {
+      beforeItemId: "user_original",
+      editedText: "Original request.\nAdditional context.",
+      interruptSource: true,
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_src/fork");
+    expect(JSON.parse(init.body as string)).toEqual({
+      before_item_id: "user_original",
+      edited_text: "Original request.\nAdditional context.",
+      interrupt_source: true,
+    });
+  });
+
   it("POSTs the fork endpoint with the (url-encoded) source id and parses the fork", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

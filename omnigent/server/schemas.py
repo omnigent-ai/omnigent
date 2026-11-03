@@ -2795,6 +2795,13 @@ class SessionForkRequest(_SandboxProfileSelection):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
+    :param before_item_id: Retain only history before this user message, excluding
+        the message and all later items. Mutually exclusive with ``up_to_response_id``.
+    :param edited_text: Revised text for the user message identified by
+        ``before_item_id``. Its attachments are retained with fork-owned file IDs,
+        and the replacement is saved durably before the fork's runner starts.
+    :param interrupt_source: Interrupt the original session before creating the
+        edited fork. Requires ``edited_text`` and edit access to the source.
     :param model_override: Per-session LLM model override to apply to the
         fork, e.g. ``"claude-opus-4-7"``. **Omitting** the field inherits
         the source's model (same as today, within the same provider
@@ -2858,6 +2865,9 @@ class SessionForkRequest(_SandboxProfileSelection):
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     agent_id: str | None = None
     up_to_response_id: str | None = None
+    before_item_id: str | None = None
+    edited_text: str | None = None
+    interrupt_source: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2873,6 +2883,20 @@ class SessionForkRequest(_SandboxProfileSelection):
     side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_edit_fields(self) -> Self:
+        """An edited fork replaces one user message after retaining its earlier history."""
+        if self.before_item_id is not None and self.up_to_response_id is not None:
+            raise ValueError("before_item_id and up_to_response_id are mutually exclusive")
+        if self.interrupt_source and self.edited_text is None:
+            raise ValueError("interrupt_source requires edited_text")
+        if self.edited_text is not None:
+            if self.before_item_id is None:
+                raise ValueError("edited_text requires before_item_id")
+            if not self.edited_text.strip():
+                raise ValueError("edited_text must not be blank")
+        return self
 
     @model_validator(mode="after")
     def _check_managed_fork_fields(self) -> Self:

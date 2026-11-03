@@ -504,8 +504,9 @@ class ConversationStore(ABC):
         *,
         after: str | None = None,  # noqa: ARG002
         limit: int = 32,  # noqa: ARG002
+        label_key: str | None = None,  # noqa: ARG002
     ) -> list[str]:
-        """Page the sessions assigned to a host, including not-yet-launched sessions."""
+        """Page host sessions, optionally retaining only those with a given label."""
         return []
 
     def __init__(
@@ -2081,6 +2082,7 @@ class ConversationStore(ABC):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -2184,6 +2186,9 @@ class ConversationStore(ABC):
             transcript; when the response is the source's last one, the
             copy is equivalent to a full fork and the directive is kept.
             ``None`` (default) copies the full history.
+        :param before_item_id: Exclusive cutoff at a persisted user message.
+            Copy only earlier items, and always rebuild native history.
+            Mutually exclusive with ``up_to_response_id``.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -2201,8 +2206,8 @@ class ConversationStore(ABC):
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
-        :raises ValueError: If *up_to_response_id* is set but no item in
-            the source conversation has that ``response_id``.
+        :raises ValueError: If the cutoff is missing, is not a user message,
+            or both cutoff forms are supplied.
         """
         ...
 

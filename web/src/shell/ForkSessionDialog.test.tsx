@@ -14,6 +14,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
+import type { MessageEdit } from "./ForkDialogContext";
 import { beginClone, cloneKey, pendingClones } from "./cloneRequests";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
@@ -158,6 +159,7 @@ function renderDialog(
     sourceHostId?: string | null;
     sourceGitBranch?: string | null;
     upToResponseId?: string | null;
+    editMessage?: MessageEdit;
     workspaceRecovery?: boolean;
     // Server capabilities the dialog reads. Omitted leaves the context on
     // "loading", which fails the sandbox gate closed — the world every
@@ -180,6 +182,7 @@ function renderDialog(
       sourceWorkspace={props.sourceWorkspace}
       sourceHostId={props.sourceHostId}
       upToResponseId={form.upToResponseId}
+      editMessage={props.editMessage}
       visible={form.visible}
       onClose={onClose}
     />
@@ -192,6 +195,7 @@ function renderDialog(
       sourceHostId={props.sourceHostId}
       sourceGitBranch={props.sourceGitBranch}
       upToResponseId={props.upToResponseId}
+      editMessage={props.editMessage}
       workspaceRecovery={props.workspaceRecovery}
       open
       onOpenChange={vi.fn()}
@@ -490,6 +494,103 @@ describe("ForkSessionDialog", () => {
       config: {},
       sandbox: undefined,
     });
+  });
+
+  it("prefills the editor and resubmits the revision before the selected message", async () => {
+    forkSessionMock.mockResolvedValue({ id: "conv_revised" } as ForkResponse);
+    renderDialog({
+      editMessage: { itemId: "user_original", text: "Review this.\nKeep newlines." },
+    });
+
+    expect(screen.getByRole("heading", { name: "Edit message" })).toBeInTheDocument();
+    const editor = screen.getByRole("textbox", { name: "Message" });
+    expect(editor).toHaveValue("Review this.\nKeep newlines.");
+    expect(editor).toHaveFocus();
+    expect(
+      screen.getByText(/running response.*stopped; its history stays available/),
+    ).toBeVisible();
+
+    fireEvent.change(editor, { target: { value: "Review this.\nAlso include the API." } });
+    fireEvent.click(screen.getByRole("button", { name: "Save & resend" }));
+
+    await waitFor(() =>
+      expect(forkSessionMock).toHaveBeenCalledExactlyOnceWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        beforeItemId: "user_original",
+        editedText: "Review this.\nAlso include the API.",
+        interruptSource: true,
+        config: {},
+        sandbox: undefined,
+      }),
+    );
+    expect(navigateMock).toHaveBeenCalledWith("/c/conv_revised");
+  });
+
+  it("keeps the edited text after a failed resubmit and permits retry", async () => {
+    forkSessionMock.mockRejectedValueOnce(new Error("Host disconnected"));
+    renderDialog({ editMessage: { itemId: "user_original", text: "Original prompt" } });
+    const editor = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(editor, { target: { value: "Revised prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save & resend" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("fork-session-error")).toHaveTextContent("Host disconnected"),
+    );
+    expect(editor).toHaveValue("Revised prompt");
+    expect(screen.getByRole("button", { name: "Save & resend" })).toBeEnabled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    forkSessionMock.mockResolvedValueOnce({ id: "conv_revised" } as ForkResponse);
+    fireEvent.click(screen.getByRole("button", { name: "Save & resend" }));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_revised"));
+    expect(forkSessionMock).toHaveBeenCalledTimes(2);
+    expect(forkSessionMock.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({ editedText: "Revised prompt" }),
+    );
+  });
+
+  it("lets the user add context to an attachment-only prompt", async () => {
+    forkSessionMock.mockResolvedValue({ id: "conv_revised" } as ForkResponse);
+    renderDialog({ editMessage: { itemId: "user_original", text: "" } });
+    const editor = screen.getByRole("textbox", { name: "Message" });
+    const submit = screen.getByRole("button", { name: "Save & resend" });
+    expect(editor).toHaveValue("");
+    expect(submit).toBeDisabled();
+    fireEvent.change(editor, { target: { value: "Describe the attached screenshot." } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+    expect(forkSessionMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        beforeItemId: "user_original",
+        editedText: "Describe the attached screenshot.",
+        interruptSource: true,
+      }),
+    );
+  });
+
+  it("does not resubmit an empty revision or create anything on cancel", () => {
+    const { onClose } = renderDialog({
+      editMessage: { itemId: "user_original", text: "Original prompt" },
+      bareForm: true,
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: " \n " },
+    });
+    const submit = screen.getByRole("button", { name: "Save & resend" });
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(forkSessionMock).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("does not confuse an edit with an in-flight full clone", () => {
+    beginClone(cloneKey("conv_src"), IDLE_LISTENER, vi.fn());
+    renderDialog({ editMessage: { itemId: "user_original", text: "Original prompt" } });
+    expect(screen.getByRole("button", { name: "Save & resend" })).toBeEnabled();
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled();
   });
 
   it("omits the title (server derives it) when the field is cleared", async () => {

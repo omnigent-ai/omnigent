@@ -152,7 +152,11 @@ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
-import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
+import {
+  ForkDialogContextProvider,
+  type ForkDialogContextValue,
+  type MessageEdit,
+} from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -588,6 +592,7 @@ function AppShellImpl() {
   // the mobile menu Clone entry's behavior. Cleared whenever the dialog
   // opens fresh or closes, so a later Clone doesn't silently truncate.
   const [forkUpToResponseId, setForkUpToResponseId] = useState<string | null>(null);
+  const [forkMessageEdit, setForkMessageEdit] = useState<MessageEdit | undefined>();
   const [forkWorkspaceRecovery, setForkWorkspaceRecovery] = useState(false);
   // Agent tools & policies dialog — the mobile counterpart of the desktop
   // AgentInfoButton popover, opened from the header's three-dot menu.
@@ -2454,6 +2459,7 @@ function AppShellImpl() {
     () => ({
       currentSessionId: serverConversationId ?? null,
       canFork: canClone,
+      canEditMessages: serverInfo !== "loading" && serverInfo.session_message_edit === true,
       disabledReason: forkDisabledReason,
       openForkDialog: (opts) => {
         const sourceSessionId =
@@ -2472,11 +2478,12 @@ function AppShellImpl() {
         setForkSourceSessionId(sourceSessionId);
         setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
         setForkUpToResponseId(opts?.upToResponseId ?? null);
+        setForkMessageEdit(opts?.editMessage);
         setForkWorkspaceRecovery(opts?.workspaceRecovery ?? false);
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, queryClient, serverConversationId, serverInfo],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2882,7 +2889,7 @@ function AppShellImpl() {
             <ForkSessionDialog
               // Remount per source so source-derived form defaults reset when
               // a side-chat bubble opens the app-wide dialog.
-              key={`fork-session-dialog-${effectiveForkSourceSessionId}-${forkWorkspaceRecovery}`}
+              key={`fork-session-dialog-${effectiveForkSourceSessionId}-${forkWorkspaceRecovery}-${forkMessageEdit?.itemId ?? ""}`}
               sourceSessionId={effectiveForkSourceSessionId}
               sourceTitle={forkSourceSession?.title}
               sourceWorkspace={
@@ -2899,6 +2906,7 @@ function AppShellImpl() {
               }
               sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
+              editMessage={forkMessageEdit}
               workspaceRecovery={forkWorkspaceRecovery}
               open={forkOpen}
               onOpenChange={(open) => {
@@ -2907,6 +2915,7 @@ function AppShellImpl() {
                 // clear immediately so Clone never forks partial history.
                 if (!open) {
                   setForkUpToResponseId(null);
+                  setForkMessageEdit(undefined);
                   setForkWorkspaceRecovery(false);
                 }
               }}

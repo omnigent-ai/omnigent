@@ -800,6 +800,9 @@ export async function createBundledSession(
  * @param options.upToResponseId - Optional truncation point, e.g.
  *   "resp_abc". When set, the fork copies history only up to and including
  *   that response ("fork from here"); omitted, the full history is copied.
+ * @param options.beforeItemId - Copy history before this user message, exclusively.
+ * @param options.editedText - Resubmit this text in place of that message, preserving its attachments.
+ * @param options.interruptSource - Stop a running source response before creating the edited branch.
  * @param options.config - Optional run-config overrides from the fork
  *   dialog's model / effort / permission-mode pickers. Each field is
  *   opt-in: a field left `undefined` inherits the source (model settings
@@ -828,6 +831,9 @@ export async function forkSession(
     title?: string;
     agentId?: string;
     upToResponseId?: string;
+    beforeItemId?: string;
+    editedText?: string;
+    interruptSource?: boolean;
     config?: {
       modelOverride?: string;
       reasoningEffort?: string | null;
@@ -847,11 +853,24 @@ export async function forkSession(
     sideChat?: boolean;
   } = {},
 ): Promise<Session> {
-  const { title, agentId, upToResponseId, config, sandbox, sideChat } = options;
+  const {
+    title,
+    agentId,
+    upToResponseId,
+    beforeItemId,
+    editedText,
+    interruptSource,
+    config,
+    sandbox,
+    sideChat,
+  } = options;
   const body: {
     title?: string;
     agent_id?: string;
     up_to_response_id?: string;
+    before_item_id?: string;
+    edited_text?: string;
+    interrupt_source?: boolean;
     model_override?: string;
     reasoning_effort?: string | null;
     terminal_launch_args?: string[];
@@ -876,6 +895,15 @@ export async function forkSession(
   }
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
+  }
+  if (beforeItemId !== undefined) {
+    body.before_item_id = beforeItemId;
+  }
+  if (editedText !== undefined) {
+    body.edited_text = editedText;
+  }
+  if (interruptSource !== undefined) {
+    body.interrupt_source = interruptSource;
   }
   if (config?.modelOverride !== undefined) {
     body.model_override = config.modelOverride;

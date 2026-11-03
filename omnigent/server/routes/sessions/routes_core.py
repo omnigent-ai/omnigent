@@ -8,7 +8,7 @@ import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import httpx
@@ -41,6 +41,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    MessageData,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -159,6 +160,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_permission_mode,
     _publish_sandbox_status,
     _publish_terminal_pending,
+    _registered_runner_id,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
     _require_codex_approval_mode_forward,
@@ -228,6 +230,7 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.conversation_store import (
+    PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -252,6 +255,7 @@ from omnigent.util.reasoning_effort import (
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
+from omnigent.util.uuid import uuid_to_bytes
 from omnigent.version import VERSION
 
 
@@ -262,6 +266,8 @@ def _require_attachment_compatible_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
+    content: Sequence[dict[str, Any]] = (),
 ) -> str | None:
     """Reject a target that cannot replay files in the retained transcript.
 
@@ -270,13 +276,20 @@ def _require_attachment_compatible_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive user-message cutoff, or all history when absent.
+    :param content: Revised message content whose attachments will be resubmitted.
     :returns: A retained filesystem attachment's name, or ``None``.
     :raises OmnigentError: If the target cannot open a referenced attachment.
     """
     from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
 
     filename = _filesystem_attachment_in_history(
-        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+        session_id,
+        conversation_store,
+        file_store,
+        up_to_response_id=up_to_response_id,
+        before_item_id=before_item_id,
+        content=content,
     )
     if filename is not None:
         native = _native_coding_agent_for_agent(target_agent)
@@ -3838,6 +3851,10 @@ def register_core_routes(
         from the truncated items instead of resuming the source's full
         native transcript.
 
+        ``body.before_item_id`` instead copies only history before a submitted
+        user message. ``body.edited_text`` saves its revised text, keeping its
+        attachments, as the fork's durable first input before launch.
+
         The dialog's run-config picks (``body.model_override``,
         ``body.reasoning_effort``, ``body.terminal_launch_args`` — the
         permission-/approval-mode selector) override what the fork would
@@ -3899,6 +3916,35 @@ def register_core_routes(
             raise OmnigentError(
                 "Source session has no agent binding — cannot fork.",
                 code=ErrorCode.INVALID_INPUT,
+            )
+
+        edited_source = None
+        if body.before_item_id is not None:
+            try:
+                body.before_item_id = uuid_to_bytes(body.before_item_id).hex()
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            edited_source = await asyncio.to_thread(
+                conversation_store.get_item, source_id, body.before_item_id
+            )
+            if (
+                edited_source is None
+                or not isinstance(edited_source.data, MessageData)
+                or edited_source.data.role != "user"
+                or edited_source.data.is_meta
+                or edited_source.response_id == PENDING_INPUT_RESPONSE_ID
+            ):
+                raise OmnigentError(
+                    "before_item_id must identify a submitted user message",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if body.edited_text is not None:
+            await _require_access_and_level(
+                user_id, source_id, LEVEL_EDIT, permission_store, conversation_store
+            )
+            await _check_initial_input(
+                request,
+                SessionEventInput(type="message", data={"role": "user", "content": []}),
             )
 
         sandbox_profile = await prepare_profile(
@@ -3999,7 +4045,25 @@ def register_core_routes(
             conversation_store,
             file_store,
             up_to_response_id=body.up_to_response_id,
+            before_item_id=body.before_item_id,
+            content=edited_source.data.content
+            if body.edited_text is not None
+            and edited_source is not None
+            and isinstance(edited_source.data, MessageData)
+            else (),
         )
+
+        reuse_source_runner = (
+            body.edited_text is not None
+            and body.host_type == "external"
+            and source.workspace is None
+            and source.host_id is None
+            and source.runner_id is not None
+            and await asyncio.to_thread(_native_coding_agent_for_agent, base_agent) is None
+        )
+        if reuse_source_runner:
+            assert source.runner_id is not None
+            _registered_runner_id(runner_router, source.runner_id, user_id=user_id)
 
         # Cross-user forks copy the agent (bundle under the copy's id) so its owner
         # can never change code in the caller's sessions; same-user forks share it.
@@ -4165,6 +4229,26 @@ def register_core_routes(
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
         )
+        if (
+            body.edited_text is not None
+            and not carry_history_into_native
+            and await asyncio.to_thread(_native_coding_agent_for_agent, base_agent) is not None
+        ):
+            previous_messages = await asyncio.to_thread(
+                conversation_store.list_items,
+                source_id,
+                after=body.before_item_id,
+                limit=1,
+                order="desc",
+                type="message",
+            )
+            if previous_messages.data:
+                raise OmnigentError(
+                    "This harness cannot replay earlier conversation history. "
+                    "Choose a harness that supports fork history to edit this message.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
@@ -4307,6 +4391,23 @@ def register_core_routes(
                     _delete_stored_session_bundle_after_failure, artifact_store, clone_location
                 )
 
+        if body.interrupt_source:
+            dispatch = request.app.state.startup_inputs.dispatch
+            if dispatch is None:
+                await drop_unused_copy()
+                raise OmnigentError(
+                    "Input dispatch is not configured", code=ErrorCode.INTERNAL_ERROR
+                )
+            try:
+                await dispatch(
+                    request,
+                    source_id,
+                    SessionEventInput(type="interrupt", data={"require_delivery": True}),
+                )
+            except Exception:
+                await drop_unused_copy()
+                raise
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -4340,6 +4441,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                before_item_id=body.before_item_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
@@ -4422,6 +4524,29 @@ def register_core_routes(
                         exc_info=True,
                     )
 
+        if reuse_source_runner:
+            assert source.runner_id is not None
+            await asyncio.to_thread(
+                conversation_store.set_runner_id, new_conv.id, source.runner_id
+            )
+
+        if body.edited_text is not None:
+            assert edited_source is not None and isinstance(edited_source.data, MessageData)
+            content = [
+                {**block, "file_id": fork_file_id_map.get(block["file_id"], block["file_id"])}
+                if isinstance(block.get("file_id"), str)
+                else dict(block)
+                for block in edited_source.data.content
+                if block.get("type") not in ("input_text", "text", "output_text")
+            ]
+            content.append({"type": "input_text", "text": body.edited_text})
+            await _accept_initial_input(
+                request,
+                new_conv.id,
+                SessionEventInput(type="message", data={"role": "user", "content": content}),
+                user_id,
+            )
+
         # Grant ownership BEFORE scheduling the managed launch, mirroring
         # both create paths: a managed-guard failure (misconfigured server,
         # unconfigured provider) must not leave the just-forked session
@@ -4470,6 +4595,14 @@ def register_core_routes(
                 workspace=new_conv.workspace,
                 host_id=new_conv.host_id,
             )
+
+        if reuse_source_runner:
+            assert source.runner_id is not None
+            # Hostless SDK runners serve multiple sessions; the fork needs its
+            # own session id on the existing runner, not a second host process.
+            await request.app.state.startup_inputs.dispatch_pending(request.app, new_conv.id)
+            new_conv = await asyncio.to_thread(conversation_store.get_conversation, new_conv.id)
+            assert new_conv is not None
 
         # Bound the response like the GET-session snapshot: newest item page,
         # chronological. Clients navigate by the fork's id and hydrate the

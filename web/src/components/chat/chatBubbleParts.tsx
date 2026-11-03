@@ -22,6 +22,7 @@ import {
   ImageIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
   XIcon,
 } from "lucide-react";
@@ -742,6 +743,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
   const sessionId = useScopedConversationId();
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const forkDialog = useForkDialog();
+  const editDisabledReason =
+    scopedConversationId && scopedConversationId !== forkDialog?.currentSessionId
+      ? undefined
+      : forkDialog?.disabledReason;
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
@@ -961,6 +968,37 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             </span>
           )}
           <MessageActions>
+            {forkDialog &&
+              (forkDialog.canFork || scopedConversationId != null) &&
+              forkDialog.canEditMessages &&
+              !bubble.pending &&
+              !isShellCommand &&
+              (text || images.length > 0 || fileChips.length > 0 || mentionedChips.length > 0) &&
+              (!author || author === getCurrentAuthorId()) && (
+                <DisabledActionTooltip reason={editDisabledReason} label="Edit message">
+                  <MessageAction
+                    tooltip={editDisabledReason ? undefined : "Edit message"}
+                    label="Edit message"
+                    size="icon-xxs"
+                    disabled={!!editDisabledReason}
+                    componentId="chat.message.edit"
+                    onClick={() =>
+                      forkDialog.openForkDialog({
+                        sourceSessionId: sessionId ?? undefined,
+                        editMessage: {
+                          itemId: bubble.itemId,
+                          text: bubble.content
+                            .filter(isTextBlock)
+                            .map((part) => part.text)
+                            .join(""),
+                        },
+                      })
+                    }
+                  >
+                    <PencilIcon size={14} />
+                  </MessageAction>
+                </DisabledActionTooltip>
+              )}
             {text && (
               <MessageAction
                 tooltip="Copy"

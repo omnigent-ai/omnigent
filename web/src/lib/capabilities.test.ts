@@ -261,6 +261,18 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
+describe("resolveServerInfo session_message_edit", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_message_edit: advertised });
+    expect(parsed.session_message_edit).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_event_types", () => {
   it.each([
     [undefined, []],

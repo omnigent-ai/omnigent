@@ -36,6 +36,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import type { MessageEdit } from "./ForkDialogContext";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -767,11 +769,13 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
           {!loading && (
             <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
               <Button data-testid="fork-session-submit" disabled>
-                {props.workspaceRecovery
-                  ? "Continue"
-                  : props.sourceWorkspace
-                    ? "Clone & start"
-                    : "Clone"}
+                {props.editMessage
+                  ? "Save & resend"
+                  : props.workspaceRecovery
+                    ? "Continue"
+                    : props.sourceWorkspace
+                      ? "Clone & start"
+                      : "Clone"}
               </Button>
             </DisabledActionTooltip>
           )}
@@ -789,6 +793,7 @@ function SupportedForkSessionForm({
   sourceHostId,
   sourceGitBranch,
   upToResponseId,
+  editMessage,
   workspaceRecovery = false,
   visible,
   onClose,
@@ -799,6 +804,7 @@ function SupportedForkSessionForm({
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
+  editMessage?: MessageEdit;
   workspaceRecovery?: boolean;
   visible: boolean;
   onClose: () => void;
@@ -817,11 +823,17 @@ function SupportedForkSessionForm({
   // Name is optional — left blank, the server derives "Fork of <source
   // title>" (shown as the input's placeholder). So the field starts empty.
   const [title, setTitle] = useState("");
+  const [editedText, setEditedText] = useState(editMessage?.text ?? "");
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // `submitting` covers the directory pre-flight; `request` the clone after it.
-  const requestKey = cloneKey(sourceSessionId, upToResponseId, workspaceRecovery);
+  const requestKey = cloneKey(
+    sourceSessionId,
+    upToResponseId,
+    workspaceRecovery,
+    editMessage?.itemId,
+  );
   const request = useSyncExternalStore(subscribeClones, () => pendingClone(requestKey));
   const busy = submitting || request !== undefined;
   // Read through a ref so a clone that settles later closes with the latest host callback.
@@ -1495,6 +1507,7 @@ function SupportedForkSessionForm({
   }
 
   async function handleFork(): Promise<void> {
+    if (busy || (editMessage && !editedText.trim())) return;
     if (sandboxBranchesPending) return;
     if (submitBlocker !== null) {
       // Point at what's missing rather than ignoring the click.
@@ -1555,6 +1568,9 @@ function SupportedForkSessionForm({
         title: trimmed === "" ? undefined : trimmed,
         agentId: switching ? agentChoice : undefined,
         upToResponseId: upToResponseId ?? undefined,
+        ...(editMessage
+          ? { beforeItemId: editMessage.itemId, editedText, interruptSource: true }
+          : {}),
         config: runConfig,
         // Sandbox clone: the server provisions the host, so the fork call
         // carries the compute request itself and no launchRunner follows.
@@ -1734,6 +1750,27 @@ function SupportedForkSessionForm({
         ref={formRef}
         className="-mr-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-4 [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
       >
+        {editMessage && (
+          <div className="flex flex-col gap-2">
+            <label htmlFor="edit-message-text" className="text-sm font-medium">
+              Message
+            </label>
+            <Textarea
+              id="edit-message-text"
+              componentId="chat.message.edit_text"
+              value={editedText}
+              onChange={(event) => setEditedText(event.target.value)}
+              disabled={busy}
+              autoFocus
+              rows={6}
+              className="max-h-64 min-h-32 resize-y field-sizing-fixed"
+            />
+            <p className="text-sm text-muted-foreground">
+              Earlier messages and attachments are kept in a new branch. Any running response in the
+              original session is stopped; its history stays available.
+            </p>
+          </div>
+        )}
         {/* Host first: with nothing to run the clone on, the user learns up
               front whether they can proceed. Mirrors NewChatDialog: a picker
               when a target is available (sandbox rows pinned above the
@@ -2170,12 +2207,18 @@ function SupportedForkSessionForm({
           data-testid="fork-session-submit"
           onClick={handleFork}
           loading={busy}
-          disabled={sandboxBranchesPending}
+          disabled={sandboxBranchesPending || !!(editMessage && !editedText.trim())}
           // Greyed but clickable: a blocked click points at the missing field.
           aria-disabled={!canSubmit || undefined}
           className="aria-disabled:opacity-50"
         >
-          {workspaceRecovery ? "Continue" : isCodingSource ? "Clone & start" : "Clone"}
+          {editMessage
+            ? "Save & resend"
+            : workspaceRecovery
+              ? "Continue"
+              : isCodingSource
+                ? "Clone & start"
+                : "Clone"}
         </Button>
       </DialogFooter>
     </>
@@ -2209,6 +2252,7 @@ export function ForkSessionDialog({
   sourceHostId,
   sourceGitBranch,
   upToResponseId,
+  editMessage,
   workspaceRecovery = false,
   open,
   onOpenChange,
@@ -2219,6 +2263,7 @@ export function ForkSessionDialog({
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
+  editMessage?: MessageEdit;
   workspaceRecovery?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -2226,13 +2271,15 @@ export function ForkSessionDialog({
   const truncated = upToResponseId != null;
   // Shown in the title's info tooltip (and a visually-hidden DialogDescription
   // for screen readers). Coding sources also start on a picked host/directory.
-  const cloneDescription = `${
-    truncated
-      ? "Copies this session's history up to the selected response into a new session you own — messages after it aren't carried over"
-      : "Copies this session's history into a new session you own"
-  }${
-    sourceWorkspace ? ", then starts it on the host and directory you pick" : ""
-  }. Comments aren't copied, and changes in the clone won't affect the original.`;
+  const cloneDescription = editMessage
+    ? "Resends the edited message in a new branch, keeping earlier context and attachments. Any running response in the original session is stopped; its history stays available. Workspace files are not reverted."
+    : `${
+        truncated
+          ? "Copies this session's history up to the selected response into a new session you own — messages after it aren't carried over"
+          : "Copies this session's history into a new session you own"
+      }${
+        sourceWorkspace ? ", then starts it on the host and directory you pick" : ""
+      }. Comments aren't copied, and changes in the clone won't affect the original.`;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2242,16 +2289,18 @@ export function ForkSessionDialog({
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-1.5">
-            {workspaceRecovery
-              ? "Continue in another directory"
-              : truncated
-                ? "Fork from this response"
-                : "Clone session"}
+            {editMessage
+              ? "Edit message"
+              : workspaceRecovery
+                ? "Continue in another directory"
+                : truncated
+                  ? "Fork from this response"
+                  : "Clone session"}
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
                   type="button"
-                  aria-label="What does cloning do?"
+                  aria-label={editMessage ? "About editing messages" : "What does cloning do?"}
                   data-testid="fork-session-info"
                   // tabIndex=-1 keeps the dialog's open-autofocus (and tabbing)
                   // off this icon, so the tooltip only opens on hover — not the
@@ -2266,10 +2315,12 @@ export function ForkSessionDialog({
               <TooltipContent>{cloneDescription}</TooltipContent>
             </Tooltip>
           </DialogTitle>
-          <DialogDescription className={workspaceRecovery ? undefined : "sr-only"}>
-            {workspaceRecovery
-              ? "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored."
-              : cloneDescription}
+          <DialogDescription className={workspaceRecovery || editMessage ? undefined : "sr-only"}>
+            {editMessage
+              ? "Revise your message and resend it with the conversation before it. Later replies stay in the original session."
+              : workspaceRecovery
+                ? "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored."
+                : cloneDescription}
           </DialogDescription>
         </DialogHeader>
         <ForkSessionForm
@@ -2279,6 +2330,7 @@ export function ForkSessionDialog({
           sourceHostId={sourceHostId}
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
+          editMessage={editMessage}
           workspaceRecovery={workspaceRecovery}
           visible={open}
           onClose={() => onOpenChange(false)}

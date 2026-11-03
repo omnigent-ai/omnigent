@@ -121,6 +121,15 @@ def test_host_pagination_and_workspace_isolation(db_uri):
         store.append(session_id, [_input()])
     assert store.list_host_conversation_ids(host_id, limit=2) == ids[:2]
     assert store.list_host_conversation_ids(host_id, after=ids[1], limit=2) == ids[2:]
+    store.set_labels(ids[0], {"omnigent.startup": "pending"})
+    store.set_labels(ids[2], {"omnigent.startup": "ready"})
+    assert store.list_host_conversation_ids(host_id, label_key="omnigent.startup") == [
+        ids[0],
+        ids[2],
+    ]
+    assert store.list_host_conversation_ids(
+        host_id, label_key="omnigent.startup", after=ids[0], limit=1
+    ) == [ids[2]]
     with workspace_scope(17):
         assert store.list_host_conversation_ids(host_id) == []
         assert store.list_pending_inputs(ids[0]) == []

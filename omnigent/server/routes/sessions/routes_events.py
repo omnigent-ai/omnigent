@@ -1444,6 +1444,8 @@ def register_events_routes(
             if startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)
+                else:
+                    await startup.dispatch_pending(request.app, session_id)
                 return {**result, "queued": True}
             return result
         # Refuse input the session's saved provider can't serve before saving it.
@@ -1480,6 +1482,8 @@ def register_events_routes(
             )
             if conv.host_id is not None:
                 startup.host_changed(request.app, conv.host_id)
+            else:
+                await startup.dispatch_pending(request.app, session_id)
             return {
                 "queued": True,
                 "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
@@ -1790,6 +1794,14 @@ def register_events_routes(
         if stop_codex_side_chat and is_session_closed(conv.labels, conv.title):
             return {"queued": False}
         if body.type == _INTERRUPT_TYPE or stop_codex_side_chat:
+            require_interrupt_delivery = body.data.get("require_delivery") is True
+            if require_interrupt_delivery:
+                source_status = _session_status_cache.get(session_id, conv.live_status)
+                if not _session_active_response_cache.get(session_id) and (
+                    source_status == "idle"
+                    or (source_status is None and conv.runner_id is None and conv.host_id is None)
+                ):
+                    return {"queued": False}
             target_session_id = session_id
             interrupt_payload: dict[str, Any] = {"type": "interrupt"}
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
@@ -1834,7 +1846,8 @@ def register_events_routes(
                     codex_side_turn_id=response_id.removeprefix("codex_"),
                 )
             else:
-                _publish_interrupted(session_id)
+                if not require_interrupt_delivery:
+                    _publish_interrupted(session_id)
                 # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
                 # Read before the forward so a message sent after Stop stays live;
@@ -1868,7 +1881,14 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                if require_interrupt_delivery:
+                    raise OmnigentError(
+                        "Couldn't interrupt the original session. Try again before resubmitting.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             elif not codex_child:
+                if require_interrupt_delivery:
+                    _publish_interrupted(session_id)
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if stop_codex_side_chat:
                 await asyncio.to_thread(

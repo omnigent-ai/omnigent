@@ -6224,6 +6224,73 @@ def test_fork_conversation_up_to_response_truncates_items(
     assert len(conversation_store.list_items(source.id).data) == 6
 
 
+@pytest.mark.parametrize("cutoff_index", [0, 2, 4])
+def test_fork_before_user_message_preserves_only_earlier_history(
+    conversation_store: SqlAlchemyConversationStore,
+    cutoff_index: int,
+) -> None:
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    )
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_external_session_id(source.id, "source-native-session")
+    _append_three_responses(conversation_store, source.id)
+    original_items = conversation_store.list_items(source.id).data
+    fork = conversation_store.fork_conversation(
+        source.id,
+        before_item_id=original_items[cutoff_index].id,
+        carry_history_into_native=True,
+    )
+    copied = conversation_store.list_items(fork.id).data
+    assert [item.data for item in copied] == [item.data for item in original_items[:cutoff_index]]
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+    assert fork.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
+    assert conversation_store.list_items(source.id).data == original_items
+    [added] = conversation_store.append(
+        fork.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="revised",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "revised"}]),
+            )
+        ],
+    )
+    assert conversation_store.list_items(fork.id).data[-1].id == added.id
+
+
+@pytest.mark.parametrize("cutoff", ["missing", "assistant", "pending", "meta", "conflict"])
+def test_fork_before_user_message_rejects_invalid_cutoff(
+    conversation_store: SqlAlchemyConversationStore,
+    cutoff: str,
+) -> None:
+    source = conversation_store.create_conversation()
+    [message] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="pending_input" if cutoff == "pending" else "response",
+                data=MessageData(
+                    role="assistant" if cutoff == "assistant" else "user",
+                    agent="test-agent" if cutoff == "assistant" else None,
+                    is_meta=cutoff == "meta",
+                    content=[{"type": "input_text", "text": "original"}],
+                ),
+            )
+        ],
+    )
+    with pytest.raises(ValueError):
+        conversation_store.fork_conversation(
+            source.id,
+            before_item_id="missing" if cutoff == "missing" else message.id,
+            up_to_response_id="response" if cutoff == "conflict" else None,
+        )
+    assert conversation_store.get_item(source.id, message.id) == message
+
+
 def test_fork_conversation_truncated_drops_external_session_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

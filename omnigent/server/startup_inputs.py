@@ -191,16 +191,16 @@ class ManagedStartupInputs:
                 )
             }
         )
+        if first:
+            await asyncio.to_thread(
+                self.conversations.set_labels, session_id, {STARTUP_LABEL: "pending"}
+            )
         saved = await asyncio.to_thread(self.conversations.append, session_id, [item])
         if saved[0].deduplicated and not _stable_id_reuse_is_exact_retry(saved[0], item):
             raise OmnigentError(
                 "This input id already belongs to a different message", code=ErrorCode.CONFLICT
             )
-        if first:
-            await asyncio.to_thread(
-                self.conversations.set_labels, session_id, {STARTUP_LABEL: "pending"}
-            )
-        else:
+        if not first:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
             if conv is not None and STARTUP_LABEL not in conv.labels:
                 # The startup finished as this was saved; keep later messages behind it.
@@ -208,6 +208,29 @@ class ManagedStartupInputs:
                     self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
                 )
         return saved[0]
+
+    async def dispatch_pending(self, app: Any, session_id: str) -> None:
+        """Drain saved inputs for a hostless session on a shared runner."""
+        conversation = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if (
+            conversation is None
+            or conversation.host_id is not None
+            or conversation.runner_id is None
+            or conversation.labels.get(STARTUP_LABEL) == "cancelled"
+        ):
+            return
+        previous_head = None
+        while True:
+            pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+            head = next((item for item in pending if item.status != "failed"), None)
+            if head is None:
+                if not pending:
+                    await self._finish(session_id)
+                return
+            if head.status != "in_progress" or head.id == previous_head:
+                return
+            previous_head = head.id
+            await self._deliver(app, session_id, head)
 
     async def record_launch_failure(self, session_id: str, reason: str) -> None:
         """
@@ -294,7 +317,7 @@ class ManagedStartupInputs:
                 wake.set()
                 return
             worker.cancel()
-        if connection is None or not connection.registered_with_managed_token:
+        if connection is None:
             return
         wake = asyncio.Event()
 
@@ -305,7 +328,12 @@ class ManagedStartupInputs:
                 busy = False
                 try:
                     ids = await asyncio.to_thread(
-                        self.conversations.list_host_conversation_ids, host_id, after=after
+                        self.conversations.list_host_conversation_ids,
+                        host_id,
+                        after=after,
+                        label_key=None
+                        if connection.registered_with_managed_token
+                        else STARTUP_LABEL,
                     )
                     for session_id in ids:
                         if self.hosts.get(host_id) is not connection:
@@ -535,7 +563,8 @@ class ManagedStartupInputs:
 
     async def retry(self, session_id: str) -> bool:
         changed = False
-        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+        pending = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        for item in pending:
             if item.status == "failed":
                 changed |= await asyncio.to_thread(
                     self.conversations.transition_pending_input,
@@ -544,7 +573,7 @@ class ManagedStartupInputs:
                     expected="failed",
                     status="in_progress",
                 )
-        return changed
+        return changed or any(item.status == "in_progress" for item in pending)
 
     async def cancel(self, session_id: str) -> None:
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)

@@ -83,6 +83,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -2226,6 +2227,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         after: str | None = None,
         limit: int = 32,
+        label_key: str | None = None,
     ) -> list[str]:
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
@@ -2233,6 +2235,15 @@ class SqlAlchemyConversationStore(ConversationStore):
             SqlConversationMetadata.workspace_id == current_workspace_id(),
             SqlConversationMetadata.host_id == host_id,
         )
+        if label_key is not None:
+            query = query.where(
+                SqlConversationMetadata.id.in_(
+                    select(SqlConversationLabel.conversation_id).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.key == label_key,
+                    )
+                )
+            )
         if after is not None:
             query = query.where(SqlConversationMetadata.id > after)
         with self._session("list_host_conversations") as session:
@@ -5142,6 +5153,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5260,6 +5272,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             response is the source's last one the copy is equivalent to a
             full fork, so the directive is kept. ``None`` (default)
             copies the full history.
+        :param before_item_id: Exclusive cutoff at a persisted user message.
+            Copy only earlier items, and always rebuild native history.
+            Mutually exclusive with ``up_to_response_id``.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -5276,8 +5291,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
-        :raises ValueError: If *up_to_response_id* is set but no item in
-            the source conversation has that ``response_id``.
+        :raises ValueError: If the cutoff is missing, is not a user message,
+            or both cutoff forms are supplied.
         """
         return self._fork_conversation_with_id(
             generate_conversation_id(),
@@ -5301,6 +5316,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             resume_source_native_session=resume_source_native_session,
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
+            before_item_id=before_item_id,
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
@@ -5330,6 +5346,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5338,6 +5355,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         ``conversation_id``. The public method generates a fresh id; this seam
         lets a subclass inject one (MAS's WHS-homed store injects the WHS node id
         so a forked session keeps a single identity across storage backends)."""
+        if up_to_response_id is not None and before_item_id is not None:
+            raise ValueError("before_item_id and up_to_response_id are mutually exclusive")
+        if before_item_id is not None:
+            before_item_id = uuid_to_bytes(before_item_id).hex()
         now = now_epoch()
         new_conv_id = conversation_id
         creating_clone = cloned_agent_bundle_location is not None
@@ -5440,6 +5461,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 ).scalar_one()
                 truncated = cutoff_position < last_position
+
+            if before_item_id is not None:
+                cutoff_item = session.execute(
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == source_conversation_id,
+                        SqlConversationItem.id == before_item_id,
+                    )
+                ).scalar_one_or_none()
+                if cutoff_item is None:
+                    raise ValueError(f"User message not found: {before_item_id!r}")
+                [cutoff_data] = self._decode_item_data_batch([cutoff_item.data])
+                parsed_cutoff = _to_item(cutoff_item, cutoff_data)
+                if (
+                    not isinstance(parsed_cutoff.data, MessageData)
+                    or parsed_cutoff.data.role != "user"
+                    or parsed_cutoff.data.is_meta
+                    or parsed_cutoff.response_id == PENDING_INPUT_RESPONSE_ID
+                ):
+                    raise ValueError("before_item_id must identify a submitted user message")
+                cutoff_position = cutoff_item.position - 1
+                truncated = True
 
             # Copy items ordered by position so the fork preserves
             # the original chronological order.
