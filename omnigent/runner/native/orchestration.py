@@ -1956,7 +1956,11 @@ async def _auto_create_opencode_terminal(
     # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
     # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
     config = maybe_merge_user_provider_config(config)
-    write_opencode_provider_config(xdg_config_home, config)
+    write_opencode_provider_config(
+        xdg_config_home,
+        config,
+        client_surface=resource_registry.client_surface(session_id),
+    )
 
     # The per-session DB imports $XDG_DATA_HOME/opencode/auth.json once when it is
     # created; seed it with the user's auth.json and v2 SQLite credentials.
@@ -2946,6 +2950,7 @@ async def _auto_create_pi_terminal(
                 launch_config.reasoning_effort,
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
+                client_surface=resource_registry.client_surface(session_id),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -8091,6 +8096,33 @@ async def _claude_legacy_prompt_consumed(
     return has_prior_history
 
 
+def _without_claude_session_id_arg(args: list[str]) -> list[str]:
+    """Drop a pass-through ``--session-id`` that a cold ``--resume`` would conflict with.
+
+    Claude exits with code 1 when ``--session-id`` accompanies ``--resume``
+    without ``--fork-session``; the id only named the session's first launch.
+
+    :param args: Pass-through Claude args, e.g. ``["--session-id", "<uuid>", "--verbose"]``.
+    :returns: *args* without ``--session-id <value>`` / ``--session-id=<value>``,
+        unchanged when ``--fork-session`` is present.
+    """
+    if "--fork-session" in args:
+        return args
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == "--session-id":
+            skip_value = True
+            continue
+        if arg.startswith("--session-id="):
+            continue
+        kept.append(arg)
+    return kept
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -8157,7 +8189,10 @@ def _build_claude_native_base_args(
         skip_leading_prompt = (
             skip_initial_prompt and _claude_legacy_launch_prompt(terminal_launch_args) is not None
         )
-        args.extend(terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args)
+        passthrough = terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args
+        if resume_external_session_id:
+            passthrough = _without_claude_session_id_arg(passthrough)
+        args.extend(passthrough)
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
     # or the joined ``--model=X`` form).
@@ -9712,7 +9747,15 @@ async def _auto_create_claude_terminal(
 
     _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
-    claude_terminal_env = build_native_claude_terminal_env(claude_config)
+    # Check the resolved override before environment/cwd planning, matching
+    # the local CLI's interpreter preflight.
+    resolved_claude = resolve_cli_binary(launch_command)
+    if resolved_claude is not None:
+        validate_claude_hook_interpreter_compatibility(resolved_claude)
+    claude_terminal_env = build_native_claude_terminal_env(
+        claude_config,
+        client_surface=resource_registry.client_surface(session_id),
+    )
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
     # Inherit the agent's sandbox (and pass ``parent_os_env`` below): otherwise
     # launch_terminal falls back to _default_sandbox_for_platform, overriding
@@ -9841,14 +9884,6 @@ async def _auto_create_claude_terminal(
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
-    # Validate the binary this terminal will actually spawn: ``launch_command``
-    # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
-    # name resolves against this process's inherited PATH (same lookup tmux's
-    # pane shell and omnigent.inner.terminal perform). Mirrors
-    # ``_preflight_local_tools`` on the local-CLI path.
-    resolved_claude = resolve_cli_binary(launch_command)
-    if resolved_claude is not None:
-        validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     env_spec = TerminalEnvSpec(
         os_env=claude_terminal_os_env,
