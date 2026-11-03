@@ -222,7 +222,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
-import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
@@ -2730,7 +2729,7 @@ function ConversationList({
   }, [resolvedActiveId, activeProjectName, pinnedSet, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the numbered
-  // and ⌘[ / ⌘] session hotkeys. Titles must match the <ConversationSection> props below.
+  // session hotkeys. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list;
@@ -2771,7 +2770,6 @@ function ConversationList({
         : visibleIds("Chats", sections.sessions)),
     ];
   };
-  useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Cmd/Ctrl+1..9/0 opens the first ten sessions the sidebar lists, top to
   // bottom (see the hook for the chord). A row listed twice keeps its first slot.

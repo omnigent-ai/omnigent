@@ -303,7 +303,9 @@ export type DesktopCommand =
   | "new-browser-tab"
   | "archive-session"
   | "toggle-pin-session"
-  | "fork-session";
+  | "fork-session"
+  | "go-back"
+  | "go-forward";
 
 const DESKTOP_COMMANDS: readonly string[] = [
   "close",
@@ -312,6 +314,8 @@ const DESKTOP_COMMANDS: readonly string[] = [
   "archive-session",
   "toggle-pin-session",
   "fork-session",
+  "go-back",
+  "go-forward",
 ] satisfies DesktopCommand[];
 
 export interface DesktopCommandEvent {
