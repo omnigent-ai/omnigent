@@ -98,6 +98,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
+- `thread-reset`: native Codex `/new` starts a separate conversation while
+  retaining the session's workspace, launch arguments, model override, and reasoning effort.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
@@ -267,6 +269,10 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
 
+**Codex thread reset:** open the native Terminal view from web or run
+`omnigent codex`, then type `/new` in Codex. The new conversation stays in the
+same workspace with the selected launch arguments, model and effort.
+
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
 columns name one journey test per harness; "—" means none exists yet.
@@ -419,6 +425,15 @@ Cross-harness journeys:
   It does not launch Claude or verify OSC production. Shared terminal launch
   and cleanup checks, including Codex-role and auxiliary-shell controls, are
   in [Terminals](./terminals.md); they do not establish full harness acceptance.
+
+- **`thread-reset`, Codex (own environment):**
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_new_preserves_session_settings`
+  starts the real server, runner, Codex app-server and TUI. It completes a local
+  mock-backed turn with explicit launch arguments, model and effort, then types
+  `/new` in the native terminal and checks its workspace and settings through REST.
+  This covers persistence across native thread resets, including the terminal
+  reached from web or CLI; browser navigation does not initiate this reset.
+  It does not prove a subsequent model turn or a live provider connection.
 
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`

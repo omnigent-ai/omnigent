@@ -81,8 +81,62 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     assert state.thread_id == "thread_old"
 
 
+@pytest.mark.parametrize(
+    ("session_settings", "expected_settings"),
+    [
+        pytest.param({}, {}, id="legacy-snapshot"),
+        pytest.param(
+            {
+                "workspace": None,
+                "terminal_launch_args": None,
+                "model_override": None,
+                "reasoning_effort": None,
+            },
+            {},
+            id="default-settings",
+        ),
+        pytest.param(
+            {"terminal_launch_args": []},
+            {"terminal_launch_args": []},
+            id="cleared-launch-args",
+        ),
+        pytest.param(
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["-s", "read-only", "-a", "never"],
+            },
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["-s", "read-only", "-a", "never"],
+            },
+            id="launch-options",
+        ),
+        pytest.param(
+            {"model_override": "gpt-5.4-mini", "reasoning_effort": "high"},
+            {"model_override": "gpt-5.4-mini", "reasoning_effort": "high"},
+            id="model-and-effort",
+        ),
+        pytest.param(
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["--model", "gpt-5.4-mini"],
+                "model_override": "gpt-5.4-mini",
+                "reasoning_effort": "high",
+            },
+            {
+                "workspace": "/work/project",
+                "terminal_launch_args": ["--model", "gpt-5.4-mini"],
+                "model_override": "gpt-5.4-mini",
+                "reasoning_effort": "high",
+            },
+            id="combined-settings",
+        ),
+    ],
+)
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    session_settings: dict[str, Any],
+    expected_settings: dict[str, Any],
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -120,6 +174,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                         "omnigent.wrapper": "codex-native-ui",
                         "omnigent.codex_native.bridge_id": "bridge_shared",
                     },
+                    **session_settings,
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -241,6 +296,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                 "omnigent.wrapper": "codex-native-ui",
                 "omnigent.codex_native.bridge_id": "bridge_shared",
             },
+            **expected_settings,
         },
     ) in requests
     assert (
