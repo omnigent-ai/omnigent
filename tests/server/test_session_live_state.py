@@ -221,6 +221,27 @@ def test_refresh_window_flushes_on_its_timer(
     assert recording_store.touches == [["runner_a"]]
 
 
+def test_flush_writes_large_workspaces_in_bounded_batches(
+    recording_store: _RecordingStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workspace with more runners than one batch is written as bounded UPDATEs."""
+    from omnigent.db.db_models import workspace_scope
+
+    monkeypatch.setattr(session_live_state, "_LIVENESS_WRITE_BATCH_SIZE", 2)
+    with workspace_scope(7):
+        for runner_id in ["runner_a", "runner_b", "runner_c", "runner_d", "runner_e"]:
+            session_live_state.refresh_runner_liveness(runner_id)
+    session_live_state.flush_runner_liveness()
+    _wait_until(lambda: len(recording_store.touch_stamps) >= 3)
+
+    assert [(workspace, runners) for workspace, runners, _ in recording_store.touch_stamps] == [
+        (7, ["runner_a", "runner_b"]),
+        (7, ["runner_c", "runner_d"]),
+        (7, ["runner_e"]),
+    ]
+
+
 def test_immediate_touch_bypasses_and_supersedes_the_refresh_window(
     recording_store: _RecordingStore,
 ) -> None:

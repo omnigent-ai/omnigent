@@ -45,6 +45,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from itertools import batched
 from typing import TYPE_CHECKING, Any
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
@@ -98,6 +99,8 @@ _refresh_stamp: int | None = None
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by workspace id itself
 _refresh_pending: dict[int, set[str]] = {}
 _refresh_timer: threading.Timer | None = None
+# Largest runner-id list one batched UPDATE carries, so its IN list stays bounded.
+_LIVENESS_WRITE_BATCH_SIZE = 500
 
 
 def configure(
@@ -408,9 +411,10 @@ def flush_runner_liveness() -> None:
 def _touch_in_workspace(
     store: ConversationStore, workspace_id: int, runner_ids: list[str], stamp: int
 ) -> None:
-    """Stamp *runner_ids* under *workspace_id*; the timer thread has no scope of its own."""
+    """Stamp *runner_ids* in batches under *workspace_id*; the timer thread has no scope."""
     with workspace_scope(workspace_id):
-        store.touch_runner_liveness(runner_ids, stamp)
+        for batch in batched(runner_ids, _LIVENESS_WRITE_BATCH_SIZE):
+            store.touch_runner_liveness(list(batch), stamp)
 
 
 def _withdraw_pending_refresh(runner_ids: list[str]) -> None:
