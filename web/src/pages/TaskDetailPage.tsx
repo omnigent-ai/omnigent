@@ -48,7 +48,8 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { claudePermissionModeLabel } from "@/lib/claudePermissionMode";
+import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
+import { canonicalNativeHarness, nativePermissionOptions } from "@/lib/nativeHarnessModes";
 import { formatStatusEffortLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import {
@@ -192,10 +193,10 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const info = useServerInfo();
   const { data: projects } = useProjects({ enabled: task?.projectId != null });
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
-  const agentLabel = useMemo(() => {
-    if (!task) return "";
-    return agents?.find((a) => a.id === task.agentId)?.display_name ?? task.agentId;
-  }, [agents, task]);
+  const agent = agents?.find((candidate) => candidate.id === task?.agentId);
+  const agentLabel = agent?.display_name ?? task?.agentId ?? "";
+  const agentHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent?.harness;
+  const harness = agentHarness ? canonicalNativeHarness(agentHarness) : null;
   const hostLabel = useMemo(() => {
     if (!task) return "";
     if (task.executionTarget === "managed_sandbox") return sandboxLabel;
@@ -252,6 +253,14 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   const paused = task.state === "paused";
+  const permissionOption = nativePermissionOptions(harness).find(
+    (option) => option.value === task.permissionMode,
+  );
+  // Outside Claude, the default permission choice leaves the CLI configuration unchanged.
+  const permissionLabel =
+    !task.permissionMode || (permissionOption?.value === "default" && harness !== "claude-native")
+      ? "Agent default"
+      : (permissionOption?.label ?? task.permissionMode);
   const scheduleSummary = describeSchedule(task.rrule);
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
@@ -422,7 +431,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
             />
             <ConfigField
               label="Permission mode"
-              value={claudePermissionModeLabel(task.permissionMode) || "Agent default"}
+              value={permissionLabel}
               testId="task-detail-permission"
             />
             <ConfigField

@@ -51,7 +51,7 @@ vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => sho
 
 // Agent / host catalogs — return simple lists so labels resolve.
 const defaultAgentCatalog = (_options?: { pinnedAgentIds?: string[] }) => ({
-  data: [{ id: "ag_1", name: "polly", display_name: "Polly" }],
+  data: [{ id: "ag_1", name: "polly", display_name: "Polly", harness: null as string | null }],
 });
 const useAvailableAgents = vi.fn(defaultAgentCatalog);
 vi.mock("@/hooks/useAvailableAgents", () => ({
@@ -263,6 +263,9 @@ describe("header, prompt, configuration", () => {
   });
 
   it("shows saved launch settings and the continued session configuration", () => {
+    useAvailableAgents.mockReturnValue({
+      data: [{ ...defaultAgentCatalog().data[0], harness: "claude-native" }],
+    });
     setTask(
       task({
         modelOverride: "opus",
@@ -289,6 +292,9 @@ describe("header, prompt, configuration", () => {
   });
 
   it("preserves unknown settings and distinguishes Manual from an unset permission mode", () => {
+    useAvailableAgents.mockReturnValue({
+      data: [{ ...defaultAgentCatalog().data[0], harness: "claude-native" }],
+    });
     setTask(
       task({
         modelOverride: "custom-model",
@@ -304,13 +310,39 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("missing-project");
   });
 
+  it.each([
+    ["codex-native", "default", "Agent default"],
+    ["cursor-native", "default", "Agent default"],
+    ["antigravity-native", "default", "Agent default"],
+    ["native-codex", "read-only", "Read only"],
+    ["cursor-native", "auto-review", "Auto-review"],
+    ["antigravity-native", "skip", "Skip permissions"],
+    ["codex-native", "future-mode", "future-mode"],
+    [null, "default", "default"],
+    [null, "acceptEdits", "acceptEdits"],
+  ])("uses %s permission semantics for %s", (harness, permissionMode, label) => {
+    useAvailableAgents.mockReturnValue({
+      data: [{ ...defaultAgentCatalog().data[0], harness }],
+    });
+    setTask(task({ permissionMode }));
+    renderPage();
+    expect(screen.getByTestId("task-detail-permission").textContent).toBe(label);
+  });
+
   it("keeps the task's agent in the catalog when another agent shares its name", () => {
     // The catalog merges agents by name and keeps a pinned id; without the pin
     // a session's same-named copy wins and the task's own agent drops out.
     useAvailableAgents.mockImplementation((options) => ({
       data: options?.pinnedAgentIds?.includes("ag_1")
-        ? [{ id: "ag_1", name: "polly", display_name: "Polly" }]
-        : [{ id: "ag_session_copy", name: "polly", display_name: "Polly (session copy)" }],
+        ? [{ id: "ag_1", name: "polly", display_name: "Polly", harness: null }]
+        : [
+            {
+              id: "ag_session_copy",
+              name: "polly",
+              display_name: "Polly (session copy)",
+              harness: null,
+            },
+          ],
     }));
     setTask(task({ agentId: "ag_1" }));
     renderPage();
