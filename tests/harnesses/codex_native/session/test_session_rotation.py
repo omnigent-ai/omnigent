@@ -81,6 +81,7 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     assert state.thread_id == "thread_old"
 
 
+@pytest.mark.parametrize("project_available", [True, False], ids=["project", "project-removed"])
 @pytest.mark.parametrize(
     ("session_settings", "expected_settings"),
     [
@@ -137,15 +138,16 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
     session_settings: dict[str, Any],
     expected_settings: dict[str, Any],
+    project_available: bool,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
 
     This is the ``/clear`` regression shape: Codex keeps the terminal
-    alive but starts a new app-server thread. The forwarder must move
-    terminal ownership, update bridge state, resubscribe to the new
-    thread, and send subsequent status/history events to the new AP
-    session.
+    alive but starts a new app-server thread. The forwarder must keep the
+    old title and project, move terminal ownership, update bridge state,
+    resubscribe to the new thread, and send subsequent status/history
+    events to the new AP session.
     """
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
@@ -174,10 +176,15 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                         "omnigent.wrapper": "codex-native-ui",
                         "omnigent.codex_native.bridge_id": "bridge_shared",
                     },
+                    "title": "Fix login flow",
+                    "project_id": "proj_alpha",
                     **session_settings,
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
+            assert isinstance(body, dict)
+            if not project_available and "project_id" in body:
+                return httpx.Response(404, json={"detail": "Project not found"})
             return httpx.Response(200, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path in {
             "/v1/sessions/conv_new",
@@ -287,18 +294,28 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         ("thread/resume", {"threadId": "thread_old", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_new", "excludeTurns": True}),
     ]
-    assert (
-        "POST",
-        "/v1/sessions",
-        {
-            "agent_id": "ag_codex",
-            "labels": {
-                "omnigent.wrapper": "codex-native-ui",
-                "omnigent.codex_native.bridge_id": "bridge_shared",
-            },
-            **expected_settings,
+    expected_metadata = {
+        "agent_id": "ag_codex",
+        "labels": {
+            "omnigent.wrapper": "codex-native-ui",
+            "omnigent.codex_native.bridge_id": "bridge_shared",
         },
-    ) in requests
+        "title": "Fix login flow",
+    }
+    expected_creates = [
+        {
+            **expected_metadata,
+            "project_id": "proj_alpha",
+            "workspace": None,
+            "git": None,
+            **expected_settings,
+        }
+    ]
+    if not project_available:
+        expected_creates.append({**expected_metadata, **expected_settings})
+    assert [
+        body for method, path, body in requests if method == "POST" and path == "/v1/sessions"
+    ] == expected_creates
     assert (
         "POST",
         "/v1/sessions/conv_old/resources/terminals/terminal_codex_main/transfer",
