@@ -36,7 +36,9 @@ import base64
 import mimetypes
 import os
 import re
+import subprocess
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeAlias, cast
 
@@ -60,8 +62,47 @@ from omnigent.runtime.filesystem_registry import (
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+_REPOSITORY_BRANCH_TIMEOUT_S = 3.0
+_MAX_REPOSITORY_BRANCHES = 10
 
 _WorkspacePayload: TypeAlias = dict[str, object]
+
+
+def _repository_branch(url: str, checkout: Path) -> _WorkspacePayload:
+    """Inspect one checkout without fetching or trusting stale remote-tracking refs."""
+    result: _WorkspacePayload = {"url": url, "branch": None, "pushed": None}
+    if not (checkout / ".git").exists():
+        return result
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=checkout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"},
+            capture_output=True,
+            text=True,
+            timeout=_REPOSITORY_BRANCH_TIMEOUT_S,
+            check=False,
+        )
+
+    try:
+        current = git("symbolic-ref", "--quiet", "HEAD")
+        current_ref = current.stdout.strip()
+        if current.returncode or not current_ref.startswith("refs/heads/"):
+            return result
+        branch = current_ref.removeprefix("refs/heads/")
+        result["branch"] = branch
+        remote = git("ls-remote", "--exit-code", "--heads", "--", url, f"refs/heads/{branch}")
+        if remote.returncode == 2:
+            result["pushed"] = False
+        elif remote.returncode == 0:
+            result["pushed"] = any(
+                line.partition("\t")[2] == f"refs/heads/{branch}"
+                for line in remote.stdout.splitlines()
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return result
 
 
 class WorkspaceReaderError(Exception):
@@ -81,6 +122,44 @@ class WorkspaceReaderError(Exception):
         self.status = status
         self.code = code
         self.message = message
+
+
+def _resolve_workspace_path(root: Path, path: str) -> Path:
+    """Resolve a relative path, including symlinks, within the workspace root."""
+    try:
+        validated = _validate_path(path) if path else ""
+    except InvalidPath as exc:
+        raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
+    if not validated:
+        return root
+    full = (root / validated).resolve()
+    try:
+        full.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceReaderError(
+            400, "invalid_path", f"Path {path!r} escapes the workspace root"
+        ) from exc
+    return full
+
+
+def read_repository_branches(root: Path, repositories: list[dict[str, str]]) -> _WorkspacePayload:
+    """Read current branches and their availability at the original clone URLs.
+
+    Targets come from server-owned launch metadata. Paths remain confined
+    to this workspace; failures and detached HEADs return unknown state.
+    """
+    if len(repositories) > _MAX_REPOSITORY_BRANCHES:
+        raise WorkspaceReaderError(400, "invalid_repositories", "Too many repositories")
+    root = root.resolve()
+    targets = [
+        (repository["url"], _resolve_workspace_path(root, repository["path"]))
+        for repository in repositories
+    ]
+    if not targets:
+        return {"repositories": []}
+    with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+        branches = list(executor.map(lambda target: _repository_branch(*target), targets))
+    return {"repositories": branches}
 
 
 class WorkspaceReader:
@@ -108,20 +187,7 @@ class WorkspaceReader:
         :raises WorkspaceReaderError: 400 when the path escapes the root
             or is otherwise invalid.
         """
-        try:
-            validated = _validate_path(path) if path else ""
-        except InvalidPath as exc:
-            raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
-        if not validated:
-            return self._root
-        full = (self._root / validated).resolve()
-        try:
-            full.relative_to(self._root)
-        except ValueError as exc:
-            raise WorkspaceReaderError(
-                400, "invalid_path", f"Path {path!r} escapes the workspace root"
-            ) from exc
-        return full
+        return _resolve_workspace_path(self._root, path)
 
     # ── Directory listing / file content ──────────────────────────
 
@@ -576,6 +642,37 @@ class WorkspaceReader:
             ),
         )
 
+    def github_review_threads(
+        self, session_id: str, pr_url: str, after: str, head_sha: str, base_sha: str
+    ) -> _WorkspacePayload:
+        """Published review conversations, optionally paginated at a requested revision."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_threads(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                after=after,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            ),
+        )
+
+    def github_review_thread_comments(
+        self, session_id: str, pr_url: str, thread_id: str, after: str
+    ) -> _WorkspacePayload:
+        """Additional replies in a selected-PR review conversation."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_thread_comments(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                thread_id=thread_id,
+                after=after,
+            ),
+        )
+
     def github_changes(
         self, session_id: str | None = None, pr_url: str | None = None
     ) -> _WorkspacePayload:
@@ -615,7 +712,12 @@ class WorkspaceReader:
         )
 
     def github_pr_diff(
-        self, session_id: str | None = None, pr_url: str | None = None
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> _WorkspacePayload:
         """The selected PR's unified diff patch."""
         return cast(
@@ -624,6 +726,8 @@ class WorkspaceReader:
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
+                head_sha=head_sha,
+                base_sha=base_sha,
             ),
         )
 

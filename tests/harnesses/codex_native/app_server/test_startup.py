@@ -29,6 +29,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_certificate_failure,
 )
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from tests.budgets import budget
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _fake_trust_policy_hooks,
@@ -679,7 +680,8 @@ async def test_wait_until_ready_releases_stalled_initialize(
     """A stalled initialize cannot outlive its startup deadline or caller cancellation."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
-    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.2)
+    # Scaled: on a loaded runner, connecting alone can outlast an unscaled 0.2s deadline.
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", budget(0.2))
     initialize_received = asyncio.Event()
     connection_closed = asyncio.Event()
 
@@ -707,16 +709,16 @@ async def test_wait_until_ready_releases_stalled_initialize(
         server.listen_url = f"ws://127.0.0.1:{port}"
         task = asyncio.create_task(server._wait_until_ready())
         try:
-            await asyncio.wait_for(initialize_received.wait(), timeout=2)
+            await asyncio.wait_for(initialize_received.wait(), timeout=budget(2))
             if outcome == "cancelled":
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
             else:
                 with pytest.raises(CodexAppServerSilentStartTimeout) as excinfo:
-                    await asyncio.wait_for(task, timeout=2)
+                    await asyncio.wait_for(task, timeout=budget(2))
                 assert excinfo.value.last_error_type == "TimeoutError"
-            await asyncio.wait_for(connection_closed.wait(), timeout=2)
+            await asyncio.wait_for(connection_closed.wait(), timeout=budget(2))
             assert len(clients) == 1
             assert clients[0]._pending_requests == {}
             assert clients[0]._reader_task is None
@@ -1177,3 +1179,167 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
     )
     # The terminal keeps attaching through Codex itself, not the wrapper.
     assert server.codex_path == sys.executable
+
+
+@dataclass
+class _ConfigReadStartupClient(_FakeStartupClient):
+    """Startup client whose ``config/read`` answers a provider or response, fails, or stalls."""
+
+    effective_provider: str | None = None
+    response: dict[str, object] | None = None
+    read_stalls: bool = False
+    requests: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        self.requests.append((method, params))
+        if self.read_stalls:
+            await asyncio.Event().wait()
+        if self.response is not None:
+            return self.response
+        if method != "config/read" or self.effective_provider is None:
+            raise RuntimeError("config/read unavailable")
+        return {"result": {"config": {"model_provider": self.effective_provider}}}
+
+
+@pytest.mark.parametrize(
+    ("version", "overrides", "effective_provider", "expected_overrides", "reads", "read_stalls"),
+    [
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"', 'model="m"'],
+            "Databricks",
+            ['model_provider="Databricks"', 'model="m"'],
+            1,
+            False,
+            id="managed_provider_wins",
+        ),
+        pytest.param(
+            None,
+            ['model_provider="omnigent_databricks"'],
+            "Databricks",
+            ['model_provider="Databricks"'],
+            1,
+            False,
+            id="unknown_version",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"'],
+            "omnigent_databricks",
+            ['model_provider="omnigent_databricks"'],
+            1,
+            False,
+            id="pin_already_effective",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"'],
+            None,
+            ['model_provider="omnigent_databricks"'],
+            1,
+            False,
+            id="read_fails",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model_provider="omnigent_databricks"'],
+            None,
+            ['model_provider="omnigent_databricks"'],
+            1,
+            True,
+            id="read_stalls",
+        ),
+        pytest.param(
+            (0, 165, 0),
+            ['model_provider="omnigent_databricks"'],
+            "Databricks",
+            ['model_provider="omnigent_databricks"'],
+            0,
+            False,
+            id="before_provider_check",
+        ),
+        pytest.param(
+            (0, 166, 0),
+            ['model="m"'],
+            "Databricks",
+            ['model="m"'],
+            0,
+            False,
+            id="no_pin",
+        ),
+    ],
+)
+async def test_start_pins_the_terminal_to_codex_effective_model_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    version: tuple[int, int, int] | None,
+    overrides: list[str],
+    effective_provider: str | None,
+    expected_overrides: list[str],
+    reads: int,
+    read_stalls: bool,
+) -> None:
+    """A managed provider outranks the launch pin, so the TUI must start its thread under it."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _set_codex_version(monkeypatch, version)
+    monkeypatch.setattr(
+        codex_native_app_server, "_MODEL_PROVIDER_READ_TIMEOUT_SECONDS", budget(0.05)
+    )
+    startup_client = _ConfigReadStartupClient(
+        effective_provider=effective_provider, read_stalls=read_stalls
+    )
+
+    async def _ready(_self: CodexNativeAppServer) -> _ConfigReadStartupClient:
+        return startup_client
+
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.config_overrides = list(overrides)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"):
+        await server.start()
+    try:
+        assert server.config_overrides == expected_overrides
+        assert (
+            startup_client.requests
+            == [("config/read", {"includeLayers": False, "cwd": str(workspace)})] * reads
+        )
+        assert startup_client.close_calls == 1
+        assert ("Could not read Codex's effective model provider" in caplog.text) == (
+            effective_provider is None and reads == 1
+        )
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"result": {"config": {}}},
+        {"result": {"config": {"model_provider": ""}}},
+        {"result": {"config": {"model_provider": 42}}},
+        {"result": {"config": None}},
+    ],
+    ids=["missing", "empty", "not_a_string", "no_config"],
+)
+async def test_malformed_config_read_keeps_the_launch_model_provider_pin(
+    tmp_path: Path, response: dict[str, object]
+) -> None:
+    """A ``config/read`` answer naming no usable provider leaves the launch's pin in place."""
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server.codex_cli_version = (0, 166, 0)
+    server.config_overrides = ['model_provider="omnigent_databricks"', 'model="m"']
+    client = _ConfigReadStartupClient(response=response)
+
+    await server._pin_effective_model_provider(client)
+
+    assert server.config_overrides == ['model_provider="omnigent_databricks"', 'model="m"']
+    assert [method for method, _params in client.requests] == ["config/read"]
