@@ -310,6 +310,7 @@ async def test_dispatch_hooks_pass_the_live_switch_and_interval_to_the_scheduler
         assert scheduler._poll_interval is poll_interval
 
 
+@pytest.mark.usefixtures("frozen_recurrence_clock")
 @pytest.mark.parametrize("features", [None, "-automations_v2", "automations_v2,-automations_v2"])
 async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
     runtime_init: None,
