@@ -364,6 +364,44 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert live_runner.superseded == [(source_id, new_id, "clear")]
 
 
+async def test_claude_sdk_clear_copies_no_item_written_while_it_runs(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty source that gains an item mid-clear still yields an empty session.
+
+    A concurrent clear's notice can land in the source after this clear has
+    looked at it; the new session must not inherit it.
+    """
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id, _items = await create_placed_session(client, store, turns=0)
+    live_runner.on_clear = lambda: store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_notice",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Earlier clear notice"}],
+                    agent="test-agent",
+                ),
+            )
+        ],
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert message_texts(store, source_id)[0] == "Earlier clear notice"
+    assert store.list_items(resp.json()["session_id"]).data == []
+
+
 async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
     client: httpx.AsyncClient,
     db_uri: str,

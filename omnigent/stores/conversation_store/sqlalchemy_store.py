@@ -5347,6 +5347,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
+        copy_items: bool = True,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5470,6 +5471,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             after it are dropped. Always a truncation, so the
             external-session directive is skipped. Mutually exclusive with
             *up_to_response_id*.
+        :param copy_items: ``False`` copies no items at all, whatever the
+            source holds when the fork commits. A truncation; exclusive with
+            both cutoffs.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -5513,6 +5517,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
             before_item_id=before_item_id,
+            copy_items=copy_items,
             project_id=project_id,
             file_id_map=file_id_map,
             created_by=created_by,
@@ -5543,6 +5548,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
+        copy_items: bool = True,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -5670,6 +5676,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 cutoff_position = before_position - 1
                 truncated = True
+            if not copy_items:
+                if cutoff_position is not None:
+                    raise ValueError("copy_items=False excludes a history cutoff")
+                truncated = True
 
             # Copy items ordered by position so the fork preserves
             # the original chronological order.
@@ -5684,7 +5694,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if cutoff_position is not None:
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
-            source_items = session.execute(items_query).scalars().all()
+            source_items = session.execute(items_query).scalars().all() if copy_items else []
 
             # Compaction cursors refer to item IDs. Since every copied item gets
             # a fresh ID, build the complete mapping before copying any payloads

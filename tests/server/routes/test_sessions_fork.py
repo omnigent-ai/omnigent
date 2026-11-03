@@ -194,6 +194,7 @@ class _ConversationStore:
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
+        copy_items: bool = True,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
         created_by: str | None = None,

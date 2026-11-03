@@ -2176,6 +2176,7 @@ class ConversationStore(ABC):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
+        copy_items: bool = True,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
@@ -2285,6 +2286,9 @@ class ConversationStore(ABC):
             as ``/clear`` does). Always a truncation, so the external-session fork
             directive is dropped. Mutually exclusive with
             ``up_to_response_id``.
+        :param copy_items: ``False`` copies no items at all, whatever the
+            source holds when the fork commits, e.g. for ``/clear``. A
+            truncation; exclusive with both cutoffs.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
