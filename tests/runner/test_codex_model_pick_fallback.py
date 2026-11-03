@@ -301,9 +301,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
         pytest.param(
             ("system.ai.gpt-5-6-sol",), ["system.ai.gpt-6-1-sol"], False, id="live-lacks"
         ),
-        pytest.param(
-            OSError("listing failed"), ["system.ai.gpt-5-6-sol"], False, id="cache-lacks"
-        ),
+        pytest.param(OSError("listing failed"), ["system.ai.gpt-5-6-sol"], True, id="cache-lacks"),
         pytest.param(OSError("listing failed"), None, True, id="no-listing"),
     ],
 )
@@ -314,7 +312,7 @@ async def test_profile_launch_validates_the_pick_against_its_workspace_listing(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The workspace listing, else ucode's copy, decides; an unknown listing keeps the pick."""
+    """The live workspace listing decides; a miss in ucode's copy or no listing keeps the pick."""
     harness = codex_launch_harness
     harness.routing["databricks_profile"] = True
     pick = "gpt-6.1-sol"

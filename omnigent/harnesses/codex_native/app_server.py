@@ -2193,10 +2193,14 @@ class CodexLaunchModels:
     :param rows: ``model/list``-shaped rows with one default marked, e.g.
         ``[{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}]``.
     :param stale: Whether the rows came from a stored catalog past its TTL.
+    :param cached_fallback: Whether the rows are ucode's cached workspace
+        listing, read because live discovery failed. That copy can predate a
+        newly served model, so a pick it lacks is unknown rather than missing.
     """
 
     rows: list[_JsonObject]
     stale: bool
+    cached_fallback: bool = False
 
 
 async def codex_launch_models(
@@ -2206,8 +2210,9 @@ async def codex_launch_models(
     Resolve the models one launch shape can run.
 
     A Databricks profile launch runs what its workspace serves, so the
-    workspace listing (then ucode's cached copy) decides, default first.
-    Every other shape uses Codex's own ``model/list`` from the shared store.
+    workspace listing decides, default first; ucode's cached copy stands in,
+    marked as a fallback, when live discovery fails. Every other shape uses
+    Codex's own ``model/list`` from the shared store.
 
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape.
@@ -2216,12 +2221,12 @@ async def codex_launch_models(
         (it failed or came back empty).
     """
     if launch.profile is not None:
-        servable = await asyncio.to_thread(databricks_profile_codex_models, launch.profile)
-        if not servable:
+        listing = await asyncio.to_thread(databricks_profile_codex_models, launch.profile)
+        if not listing.ids:
             return None
-        rows: list[_JsonObject] = [{"id": model, "model": model} for model in servable]
+        rows: list[_JsonObject] = [{"id": model, "model": model} for model in listing.ids]
         rows[0]["isDefault"] = True
-        return CodexLaunchModels(rows=rows, stale=False)
+        return CodexLaunchModels(rows=rows, stale=False, cached_fallback=listing.cached)
     if reload:
         fresh = await codex_reprobed_launch_catalog(codex_path=codex_path, launch=launch)
         return CodexLaunchModels(rows=fresh, stale=False) if fresh else None
@@ -3902,7 +3907,7 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     """
     from omnigent.models.databricks_model_discovery import select_servable_model
 
-    servable = _databricks_servable_codex_models(host, profile)
+    servable = _databricks_servable_codex_models(host, profile).ids
     if requested:
         return select_servable_model(requested, servable) or requested
     if servable:
@@ -3910,16 +3915,30 @@ def _resolve_databricks_codex_model(host: str, profile: str, requested: str | No
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 
-def databricks_profile_codex_models(profile: str) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class DatabricksCodexModelListing:
+    """
+    The codex-servable ids a Databricks workspace lists, and where they came from.
+
+    :param ids: Servable ids, launch default first, e.g. ``("system.ai.gpt-5-6-sol",)``;
+        empty when no listing could be read.
+    :param cached: Whether *ids* are ucode's cached copy, read because live
+        discovery failed.
+    """
+
+    ids: tuple[str, ...] = ()
+    cached: bool = False
+
+
+def databricks_profile_codex_models(profile: str) -> DatabricksCodexModelListing:
     """
     List the codex-servable ids a Databricks profile's workspace serves.
 
     Reads the same listing a profile launch resolves its model from.
 
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
-    :returns: Servable ids, launch default first, e.g.
-        ``("system.ai.gpt-5-6-sol",)``; empty when the profile resolves no
-        host or no listing could be read.
+    :returns: The workspace's listing; its ids are empty when the profile
+        resolves no host or no listing could be read.
     """
     try:
         host = _databricks_gateway_host(profile)
@@ -3930,17 +3949,16 @@ def databricks_profile_codex_models(profile: str) -> tuple[str, ...]:
             exc,
             exc_info=_logger.isEnabledFor(logging.DEBUG),
         )
-        return ()
+        return DatabricksCodexModelListing()
     if not host:
-        return ()
+        return DatabricksCodexModelListing()
     return _databricks_servable_codex_models(host.rstrip("/"), profile)
 
 
-def _databricks_servable_codex_models(host: str, profile: str) -> tuple[str, ...]:
+def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
     """List codex-servable ids live, then from ucode's cached copy; empty when neither reads."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
-    servable: tuple[str, ...] = ()
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -3952,7 +3970,7 @@ def _databricks_servable_codex_models(host: str, profile: str) -> tuple[str, ...
         # launch targeting workspace B. A token that does not match ``host``
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
-        servable = discover_databricks_codex_models(host, creds.token)
+        return DatabricksCodexModelListing(discover_databricks_codex_models(host, creds.token))
     except Exception as exc:  # cached ucode state is the launch fallback
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
@@ -3968,12 +3986,14 @@ def _databricks_servable_codex_models(host: str, profile: str) -> tuple[str, ...
 
             workspace_state = read_ucode_state(host)
             if workspace_state is not None:
-                servable = tuple(workspace_state.codex_models)
+                return DatabricksCodexModelListing(
+                    tuple(workspace_state.codex_models), cached=True
+                )
         except Exception:  # the bundled catalog is the last resort
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
-    return servable
+    return DatabricksCodexModelListing()
 
 
 def build_codex_native_server(

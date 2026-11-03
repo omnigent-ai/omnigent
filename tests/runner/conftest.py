@@ -103,7 +103,7 @@ def _isolated_model_catalog_store(
     )
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.databricks_profile_codex_models",
-        lambda _profile: (),
+        lambda _profile: codex_native_app_server.DatabricksCodexModelListing(),
     )
 
 

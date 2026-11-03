@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import (
+    DatabricksCodexModelListing,
     NativeCodexLaunch,
     build_codex_native_server,
 )
@@ -85,6 +86,7 @@ def test_build_codex_native_server_resolves_the_model_from_the_workspace(
     assert 'databricks auth token --profile \\"prof\\"' in overrides
 
 
+@pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize(
     ("servable", "expected"),
     [
@@ -106,11 +108,12 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
     monkeypatch: pytest.MonkeyPatch,
     servable: tuple[str, ...],
     expected: list[dict[str, object]] | None,
+    cached: bool,
 ) -> None:
-    """A profile shape lists the workspace's models, default first; an empty listing is unknown."""
+    """A profile shape lists the workspace's models, default first, marking ucode's copy."""
     from omnigent.harnesses.codex_native import app_server
 
-    listing = Mock(return_value=servable)
+    listing = Mock(return_value=DatabricksCodexModelListing(servable, cached=cached))
     monkeypatch.setattr(app_server, "databricks_profile_codex_models", listing)
     codex_catalog = AsyncMock(side_effect=AssertionError("profile shapes skip Codex rows"))
     monkeypatch.setattr(app_server, "codex_launch_catalog", codex_catalog)
@@ -120,7 +123,7 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
     )
 
     assert (models.rows if models is not None else None) == expected
-    assert models is None or models.stale is False
+    assert models is None or (models.stale, models.cached_fallback) == (False, cached)
     listing.assert_called_once_with("prof")
 
 
@@ -130,19 +133,26 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
         pytest.param(
             ("system.ai.gpt-6-1-sol",),
             ["system.ai.gpt-5-6-sol"],
-            ("system.ai.gpt-6-1-sol",),
+            DatabricksCodexModelListing(("system.ai.gpt-6-1-sol",)),
             id="live",
         ),
-        pytest.param((), ["system.ai.gpt-5-6-sol"], (), id="empty-live"),
+        pytest.param(
+            (), ["system.ai.gpt-5-6-sol"], DatabricksCodexModelListing(), id="empty-live"
+        ),
         pytest.param(
             OSError("listing failed"),
             ["system.ai.gpt-6-1-sol"],
-            ("system.ai.gpt-6-1-sol",),
+            DatabricksCodexModelListing(("system.ai.gpt-6-1-sol",), cached=True),
             id="cache",
         ),
-        pytest.param(OSError("listing failed"), None, (), id="no-listing"),
         pytest.param(
-            OSError("listing failed"), ValueError("bad state"), (), id="cache-unreadable"
+            OSError("listing failed"), None, DatabricksCodexModelListing(), id="no-listing"
+        ),
+        pytest.param(
+            OSError("listing failed"),
+            ValueError("bad state"),
+            DatabricksCodexModelListing(),
+            id="cache-unreadable",
         ),
     ],
 )
@@ -150,7 +160,7 @@ def test_databricks_profile_codex_models_reads_live_then_cached_listing(
     monkeypatch: pytest.MonkeyPatch,
     live_listing: tuple[str, ...] | Exception,
     cached_listing: list[str] | Exception | None,
-    expected: tuple[str, ...],
+    expected: DatabricksCodexModelListing,
 ) -> None:
     """The live listing decides, even when empty; a failed read uses ucode's copy, if readable."""
     from types import SimpleNamespace
@@ -204,7 +214,7 @@ def test_databricks_profile_codex_models_is_empty_without_a_host(
         "omnigent.models.databricks_model_discovery.discover_databricks_codex_models", discover
     )
 
-    assert app_server.databricks_profile_codex_models("prof") == ()
+    assert app_server.databricks_profile_codex_models("prof") == DatabricksCodexModelListing()
     discover.assert_not_called()
 
 

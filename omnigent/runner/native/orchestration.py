@@ -5419,13 +5419,13 @@ async def _auto_create_codex_terminal(
                 )
                 if _launch_models is not None:
                     reachable = codex_reachable_model_slug(pick, _launch_models.rows)
-            if _launch_models is None:
-                # An unknown list cannot retire the pick; Codex or the gateway reports a real miss.
+            if _launch_models is None or (reachable is None and _launch_models.cached_fallback):
+                # Only a live list can retire the pick; Codex or the gateway reports a real miss.
                 _logger.warning(
-                    "codex-native: model list reload failed for session %s; "
-                    "launching on the pick %r",
-                    session_id,
+                    "codex-native: no live model list confirms the pick %r for session %s; "
+                    "launching on the pick",
                     pick,
+                    session_id,
                     extra={"session_id": session_id},
                 )
             elif reachable is None:
