@@ -1,4 +1,4 @@
-"""The MCP tools route is owner-only and fails fast for older hosts."""
+"""The MCP tools and sign-in routes are owner-only and fail fast for older hosts."""
 
 from __future__ import annotations
 
@@ -12,8 +12,11 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_MCP_LOGIN,
     CAP_MCP_TOOLS,
     HostHelloFrame,
+    HostMcpLoginFrame,
+    HostMcpLoginResultFrame,
     HostMcpToolsFrame,
     HostMcpToolsResultFrame,
     decode_host_frame,
@@ -79,6 +82,12 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
     "result,status",
     [
         (HostMcpToolsResultFrame("", "ok", **_TOOLS), 200),
+        (
+            HostMcpToolsResultFrame(
+                "", "ok", tools=[], connection="needs_auth", harness_sign_in="available"
+            ),
+            200,
+        ),
         (HostMcpToolsResultFrame("", "failed", error="lookup failed"), 502),
         (HostMcpToolsResultFrame("", "busy"), 503),
         # A malformed connection enum is a host failure.
@@ -108,7 +117,12 @@ async def test_owner_gets_mcp_tools(
         response = await task
     assert response.status_code == status
     if status == 200:
-        assert response.json() == _TOOLS
+        assert response.json() == {
+            "tools": result.tools,
+            "connection": result.connection,
+            "truncated": False,
+            "harness_sign_in": result.harness_sign_in,
+        }
     assert not conn.pending_mcp_tools
 
 
@@ -204,3 +218,147 @@ async def test_disconnect_after_sending_fails_fast() -> None:
         await asyncio.wait_for(task, 2)  # well under the 15s timeout
     assert exc_info.value.status_code == 502
     assert conn.pending_mcp_tools == {}
+
+
+_LOGIN_URL = f"/v1/hosts/{_HOST_ID}/mcp-servers/login"
+_OWNER = {"x-test-user": "owner"}
+_PENDING = {
+    "login_id": "abc_DEF-123",
+    "state": "pending",
+    "authorization_url": "https://auth.example.test/authorize?redirect_uri=x",
+    "error": None,
+}
+
+
+async def _answer_login(
+    conn: HostConnection, result: HostMcpLoginResultFrame
+) -> HostMcpLoginFrame:
+    frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+    assert isinstance(frame, HostMcpLoginFrame)
+    result.request_id = frame.request_id
+    conn.pending_mcp_logins[frame.request_id].set_result(result)
+    return frame
+
+
+@pytest.mark.parametrize(
+    "method,path,body,expected",
+    [
+        (
+            "POST",
+            "",
+            {"harness": "claude", "server": "linear", "plugin": "tools", "source_id": "b" * 64},
+            {
+                "action": "start",
+                "harness": "claude",
+                "server": "linear",
+                "plugin": "tools",
+                "source_id": "b" * 64,
+            },
+        ),
+        ("GET", "/abc_DEF-123", None, {"action": "status", "login_id": "abc_DEF-123"}),
+        (
+            "POST",
+            "/abc_DEF-123/callback",
+            {"callback_url": "http://localhost:1/callback?code=c"},
+            {
+                "action": "submit",
+                "login_id": "abc_DEF-123",
+                "callback_url": "http://localhost:1/callback?code=c",
+            },
+        ),
+        ("DELETE", "/abc_DEF-123", None, {"action": "cancel", "login_id": "abc_DEF-123"}),
+    ],
+)
+async def test_owner_drives_mcp_login(
+    tools_app, method: str, path: str, body: dict | None, expected: dict
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        task = asyncio.create_task(
+            client.request(method, _LOGIN_URL + path, json=body, headers=_OWNER)
+        )
+        frame = await _answer_login(conn, HostMcpLoginResultFrame("", "ok", **_PENDING))
+        response = await task
+    assert response.status_code == 200
+    assert response.json() == _PENDING
+    assert {key: getattr(frame, key) for key in expected} == expected
+    assert not conn.pending_mcp_logins
+
+
+@pytest.mark.parametrize(
+    "result,status",
+    [
+        (HostMcpLoginResultFrame("", "not_found", error="Sign-in not found"), 404),
+        (HostMcpLoginResultFrame("", "invalid", error="That isn't the address"), 400),
+        (HostMcpLoginResultFrame("", "busy", error="Too many sign-ins"), 503),
+        (HostMcpLoginResultFrame("", "failed", error="private detail"), 502),
+        (HostMcpLoginResultFrame("", "ok", login_id="x", state="bogus"), 502),
+    ],
+)
+async def test_mcp_login_host_errors(
+    tools_app, result: HostMcpLoginResultFrame, status: int
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        task = asyncio.create_task(client.get(f"{_LOGIN_URL}/abc", headers=_OWNER))
+        await _answer_login(conn, result)
+        response = await task
+    assert response.status_code == status
+    if status in (400, 404, 503):
+        assert response.json()["detail"] == result.error
+    else:
+        assert "private detail" not in response.text
+
+
+@pytest.mark.parametrize(
+    "user,capabilities,method,path,body,status",
+    [
+        ("stranger", (CAP_MCP_LOGIN,), "GET", "/abc", None, 403),
+        (None, (CAP_MCP_LOGIN,), "DELETE", "/abc", None, 401),
+        ("owner", (CAP_MCP_TOOLS,), "GET", "/abc", None, 501),
+        ("owner", (CAP_MCP_LOGIN,), "GET", "/a.b", None, 422),
+        ("owner", (CAP_MCP_LOGIN,), "POST", "", {"harness": "cursor", "server": "x"}, 422),
+        (
+            "owner",
+            (CAP_MCP_LOGIN,),
+            "POST",
+            "/abc/callback",
+            {"callback_url": "x" * 4097},
+            422,
+        ),
+    ],
+)
+async def test_mcp_login_requests_rejected_before_the_host(
+    tools_app,
+    user: str | None,
+    capabilities: tuple[str, ...],
+    method: str,
+    path: str,
+    body: dict | None,
+    status: int,
+) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, *capabilities)
+    async with _client(app) as client:
+        response = await client.request(
+            method,
+            _LOGIN_URL + path,
+            json=body,
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status
+    assert conn.outbound_queue.empty()
+
+
+async def test_mcp_login_disconnect_fails_fast(tools_app) -> None:
+    app, registry, _ = tools_app
+    conn = _register(registry, CAP_MCP_LOGIN)
+    async with _client(app) as client:
+        task = asyncio.create_task(client.get(f"{_LOGIN_URL}/abc", headers=_OWNER))
+        await asyncio.wait_for(conn.outbound_queue.get(), 2)
+        registry.deregister(conn.host_id)
+        response = await asyncio.wait_for(task, 2)
+    assert response.status_code == 502
+    assert conn.pending_mcp_logins == {}

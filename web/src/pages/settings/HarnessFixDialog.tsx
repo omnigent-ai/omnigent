@@ -9,6 +9,7 @@ import {
   Loader2Icon,
 } from "lucide-react";
 
+import { CopyButton, StepNumber } from "@/components/SignInSteps";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -835,42 +836,6 @@ function DeviceCodeError({ error, hostName }: { error: string; hostName: string 
         {error || "The sign-in did not complete."}
       </div>
     </>
-  );
-}
-
-function StepNumber({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-border bg-muted text-xs">
-      {children}
-    </span>
-  );
-}
-
-function CopyButton({
-  text,
-  label,
-  iconOnly = false,
-}: {
-  text: string;
-  label: string;
-  iconOnly?: boolean;
-}) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <Button
-      type="button"
-      variant="outline"
-      size={iconOnly ? "icon-sm" : "sm"}
-      aria-label={label}
-      onClick={() => {
-        void copyText(text)
-          .then(() => setCopied(true))
-          .catch(() => showToast("Couldn't copy — select and copy manually.", { duration: 0 }));
-      }}
-    >
-      {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-      {!iconOnly && (copied ? "Copied" : "Copy link")}
-    </Button>
   );
 }
 

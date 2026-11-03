@@ -79,6 +79,8 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+# The host runs a harness's own ``mcp login`` for a configured server:
+CAP_MCP_LOGIN = "mcp_login"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
@@ -95,6 +97,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_LOGIN,
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
@@ -204,6 +207,8 @@ class HostFrameKind(str, Enum):
     SKILL_CONTENT_RESULT = "host.skill_content_result"
     MCP_TOOLS = "host.mcp_tools"
     MCP_TOOLS_RESULT = "host.mcp_tools_result"
+    MCP_LOGIN = "host.mcp_login"
+    MCP_LOGIN_RESULT = "host.mcp_login_result"
     HARNESS_STARTUP = "host.harness_startup"
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
     MCP_SERVERS = "host.mcp_servers"
@@ -1324,6 +1329,42 @@ class HostMcpToolsResultFrame:
     connection: str = "unsupported"
     truncated: bool = False
     error: str | None = None
+    harness_sign_in: str | None = None
+
+
+MCP_HARNESS_SIGN_IN_STATES = ("available", "signed_in")
+MCP_LOGIN_ACTIONS = ("start", "status", "submit", "cancel")
+MCP_LOGIN_STATES = ("pending", "succeeded", "failed", "expired", "cancelled")
+
+
+@dataclass
+class HostMcpLoginFrame:
+    """Server → host: drive the harness's ``mcp login`` for one configured server.
+
+    ``start`` names the server; ``status``, ``submit`` and ``cancel`` name the
+    ``login_id`` it returned. ``submit`` carries the redirect address the user pasted.
+    """
+
+    request_id: str
+    action: str
+    harness: str | None = None
+    server: str | None = None
+    plugin: str | None = None
+    source_id: str | None = None
+    login_id: str | None = None
+    callback_url: str | None = None
+
+
+@dataclass
+class HostMcpLoginResultFrame:
+    """Host → server: a login's state and, while pending, its authorization page."""
+
+    request_id: str
+    status: str
+    login_id: str | None = None
+    state: str | None = None
+    authorization_url: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -1506,6 +1547,8 @@ HostFrame = (
     | HostSkillContentResultFrame
     | HostMcpToolsFrame
     | HostMcpToolsResultFrame
+    | HostMcpLoginFrame
+    | HostMcpLoginResultFrame
     | HostHarnessStartupFrame
     | HostHarnessStartupResultFrame
     | HostMcpServersFrame
@@ -2095,6 +2138,33 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "connection": frame.connection,
                 "truncated": frame.truncated,
                 "error": frame.error,
+                "harness_sign_in": frame.harness_sign_in,
+            }
+        )
+    if isinstance(frame, HostMcpLoginFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MCP_LOGIN.value,
+                "request_id": frame.request_id,
+                "action": frame.action,
+                "harness": frame.harness,
+                "server": frame.server,
+                "plugin": frame.plugin,
+                "source_id": frame.source_id,
+                "login_id": frame.login_id,
+                "callback_url": frame.callback_url,
+            }
+        )
+    if isinstance(frame, HostMcpLoginResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MCP_LOGIN_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "login_id": frame.login_id,
+                "state": frame.state,
+                "authorization_url": frame.authorization_url,
+                "error": frame.error,
             }
         )
     if isinstance(frame, HostHarnessStartupFrame):
@@ -2606,6 +2676,19 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.MCP_TOOLS_RESULT:
             return _decode_mcp_tools_result(msg)
+        case HostFrameKind.MCP_LOGIN:
+            return HostMcpLoginFrame(
+                request_id=_required_str(msg, "request_id"),
+                action=_required_str(msg, "action"),
+                harness=_optional_nullable_str(msg, "harness"),
+                server=_optional_nullable_str(msg, "server"),
+                plugin=_optional_nullable_str(msg, "plugin"),
+                source_id=_optional_nullable_str(msg, "source_id"),
+                login_id=_optional_nullable_str(msg, "login_id"),
+                callback_url=_optional_nullable_str(msg, "callback_url"),
+            )
+        case HostFrameKind.MCP_LOGIN_RESULT:
+            return _decode_mcp_login_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
         case HostFrameKind.IMPORT_LOCAL_BY_ID:
@@ -3249,23 +3332,31 @@ def mcp_account_fields(auth_status: object, sign_in_url: object) -> dict[str, st
     if auth_status not in MCP_AUTH_STATUSES:
         return {}
     fields = {"auth_status": str(auth_status)}
-    if auth_status == "sign_in_required" and isinstance(sign_in_url, str):
-        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in sign_in_url):
-            return fields
-        try:
-            parts = urlsplit(sign_in_url)
-        except ValueError:
-            return fields
-        # Credentials in the URL would be published to the browser and sit in the
-        # DOM, so a page that carries them is not worth opening.
-        if (
-            parts.scheme in ("http", "https")
-            and parts.hostname
-            and not parts.username
-            and not parts.password
-        ):
-            fields["sign_in_url"] = sign_in_url
+    if (
+        auth_status == "sign_in_required"
+        and isinstance(sign_in_url, str)
+        and is_sign_in_page_url(sign_in_url)
+    ):
+        fields["sign_in_url"] = sign_in_url
     return fields
+
+
+def is_sign_in_page_url(url: str) -> bool:
+    """Whether *url* is an absolute ``http(s)`` page safe to hand a browser."""
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    # Credentials in the URL would be published to the browser and sit in the
+    # DOM, so a page that carries them is not worth opening.
+    return bool(
+        parts.scheme in ("http", "https")
+        and parts.hostname
+        and not parts.username
+        and not parts.password
+    )
 
 
 def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
@@ -3359,6 +3450,7 @@ def _decode_skill_content_result(msg: _JsonObject) -> HostSkillContentResultFram
 
 def _decode_mcp_tools_result(msg: _JsonObject) -> HostMcpToolsResultFrame:
     request_id = _required_str(msg, "request_id")
+    sign_in = msg.get("harness_sign_in")
     try:
         raw = msg.get("tools")
         if not isinstance(raw, list) or len(raw) > 500:
@@ -3380,10 +3472,35 @@ def _decode_mcp_tools_result(msg: _JsonObject) -> HostMcpToolsResultFrame:
             connection=_required_str(msg, "connection"),
             truncated=_required_bool(msg, "truncated"),
             error=_optional_nullable_str(msg, "error"),
+            # An older host omits it; an unknown value from a newer one is dropped.
+            harness_sign_in=sign_in if sign_in in MCP_HARNESS_SIGN_IN_STATES else None,
         )
     except ValueError:
         return HostMcpToolsResultFrame(
             request_id=request_id, status="failed", error="malformed MCP tools reply"
+        )
+
+
+def _decode_mcp_login_result(msg: _JsonObject) -> HostMcpLoginResultFrame:
+    request_id = _required_str(msg, "request_id")
+    try:
+        state = _optional_nullable_str(msg, "state")
+        if state is not None and state not in MCP_LOGIN_STATES:
+            raise ValueError("unknown login state")
+        url = _optional_nullable_str(msg, "authorization_url")
+        if url is not None and not is_sign_in_page_url(url):
+            raise ValueError("unsafe authorization URL")
+        return HostMcpLoginResultFrame(
+            request_id=request_id,
+            status=_required_str(msg, "status"),
+            login_id=_optional_nullable_str(msg, "login_id"),
+            state=state,
+            authorization_url=url,
+            error=_optional_nullable_str(msg, "error"),
+        )
+    except ValueError:
+        return HostMcpLoginResultFrame(
+            request_id=request_id, status="failed", error="malformed MCP sign-in reply"
         )
 
 

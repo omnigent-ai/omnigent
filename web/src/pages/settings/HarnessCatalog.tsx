@@ -1,5 +1,10 @@
 import * as AccordionPrimitive from "radix-ui/accordion";
-import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
+import {
+  mcpServerToolsKey,
+  useMcpServerTools,
+  type McpServerTools,
+} from "@/hooks/useMcpServerTools";
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
@@ -7,7 +12,8 @@ import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { BrandHarness } from "@/components/onboarding/harnessBrand";
+import { harnessDisplayName, type BrandHarness } from "@/components/onboarding/harnessBrand";
+import { showToast } from "@/components/ui/toast";
 import type { Host } from "@/hooks/useHosts";
 import {
   INVENTORY_HARNESS_IDS,
@@ -21,6 +27,7 @@ import remarkGfm from "remark-gfm";
 import { useSkillContent } from "@/hooks/useSkillContent";
 import { ApiError } from "@/lib/sessionsApi";
 import { Spinner } from "../../components/ui/spinner";
+import { McpSignInDialog } from "./McpSignInDialog";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
@@ -545,6 +552,14 @@ const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; c
   unsupported: { label: "Failed to connect", color: "bg-destructive" },
 };
 
+const SIGNED_IN_STATUS = { label: "Signed in", color: "bg-success" };
+
+function mcpRowStatus(data: McpServerTools) {
+  if (data.connection === "needs_auth" && data.harness_sign_in === "signed_in")
+    return SIGNED_IN_STATUS;
+  return CONNECTION_STATUS[data.connection];
+}
+
 function McpRow({
   host,
   server,
@@ -565,7 +580,11 @@ function McpRow({
     if (missingRoute) onUnavailable();
   }, [missingRoute, onUnavailable]);
   const data = query.data;
-  const status = data && CONNECTION_STATUS[data.connection];
+  const status = data && mcpRowStatus(data);
+  const queryClient = useQueryClient();
+  const [signingIn, setSigningIn] = useState(false);
+  const serverLabel = mcpServerDisplayName(server.name);
+  const harnessLabel = harnessDisplayName(server.harness);
   return (
     <AccordionPrimitive.Item value={server.id} className="not-last:border-b">
       <AccordionPrimitive.Header className="flex">
@@ -610,7 +629,19 @@ function McpRow({
                 : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
           </Notice>
         ) : data ? (
-          data.connection !== "connected" ? (
+          data.connection === "needs_auth" && data.harness_sign_in === "signed_in" ? (
+            <Notice>
+              Signed in through {harnessLabel}, so its sessions can use this server. Omnigent can't
+              list the tools because it doesn't reuse {harnessLabel}'s credentials.
+            </Notice>
+          ) : data.connection === "needs_auth" && data.harness_sign_in === "available" ? (
+            <div className="my-1 flex flex-wrap items-center gap-3">
+              <Notice>Sign in so {harnessLabel} sessions can use this server.</Notice>
+              <Button size="sm" onClick={() => setSigningIn(true)}>
+                Sign in
+              </Button>
+            </div>
+          ) : data.connection !== "connected" ? (
             <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>
           ) : (
             <>
@@ -639,6 +670,32 @@ function McpRow({
           )
         ) : null}
       </AccordionPrimitive.Content>
+      {signingIn && (
+        <McpSignInDialog
+          open
+          onOpenChange={setSigningIn}
+          host={host}
+          harness={server.harness}
+          harnessLabel={harnessLabel}
+          server={server.name}
+          serverLabel={serverLabel}
+          plugin={server.plugin}
+          sourceId={server.sourceId}
+          onSignedIn={() => {
+            setSigningIn(false);
+            showToast(`Signed in to ${serverLabel}.`);
+            void queryClient.invalidateQueries({
+              queryKey: mcpServerToolsKey(
+                host.host_id,
+                server.harness,
+                server.name,
+                server.plugin,
+                server.sourceId,
+              ),
+            });
+          }}
+        />
+      )}
     </AccordionPrimitive.Item>
   );
 }

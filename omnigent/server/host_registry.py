@@ -44,6 +44,7 @@ from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     HostHelloFrame,
+    HostMcpLoginResultFrame,
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
@@ -142,11 +143,13 @@ def _fail_pending_skill_content(conn: HostConnection) -> None:
 
 
 def _fail_pending_mcp_tools(conn: HostConnection) -> None:
-    """Settle probes immediately when their host connection disappears."""
-    while conn.pending_mcp_tools:
-        _request_id, future = conn.pending_mcp_tools.popitem()
-        if not future.done():
-            future.set_exception(ConnectionError("host disconnected"))
+    """Settle probes and sign-in requests immediately when their host disappears."""
+    pending: list[dict[str, Any]] = [conn.pending_mcp_tools, conn.pending_mcp_logins]
+    for requests in pending:
+        while requests:
+            _request_id, future = requests.popitem()
+            if not future.done():
+                future.set_exception(ConnectionError("host disconnected"))
 
 
 def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: str) -> None:
@@ -481,6 +484,7 @@ class HostConnection:
     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
     :param pending_skill_content: Per-request futures for transient SKILL.md reads.
     :param pending_mcp_tools: Per-request futures for lazy MCP discovery.
+    :param pending_mcp_logins: Per-request futures for harness MCP sign-in actions.
     """
 
     workspace_id: int
@@ -581,6 +585,9 @@ class HostConnection:
         default_factory=dict
     )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
+        default_factory=dict
+    )
+    pending_mcp_logins: dict[str, asyncio.Future[HostMcpLoginResultFrame]] = field(
         default_factory=dict
     )
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(

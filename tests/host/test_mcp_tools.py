@@ -187,8 +187,22 @@ async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, cap
             }
         )
         monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
-        result = await HostMcpTools().probe("claude", "docs")
+        sign_in_states = ["available", "signed_in"]
+        checked = []
+
+        async def sign_in_state(server):
+            checked.append(server)
+            return sign_in_states.pop(0)
+
+        monkeypatch.setattr(mcp_tools, "harness_sign_in_state", sign_in_state)
+        discovery = HostMcpTools()
+        result = await discovery.probe("claude", "docs")
+        # A cached 401 still reports the harness's current sign-in state.
+        again = await discovery.probe("claude", "docs")
     assert result["connection"] == "needs_auth"
+    assert (result["harness_sign_in"], again["harness_sign_in"]) == ("available", "signed_in")
+    assert checked == [entry, entry]
+    assert all("harness_sign_in" not in cached for cached in discovery._cache.values())
     output = json.dumps(result) + caplog.text + str(capfd.readouterr())
     assert "synthetic-url-secret" not in output
     assert "synthetic-header-secret" not in output
@@ -278,6 +292,10 @@ def test_effective_config_expansion_and_inheritance(tmp_path, monkeypatch):
 
 
 async def test_unsupported_and_missing_credentials(monkeypatch):
+    async def no_sign_in_check(server):
+        raise AssertionError("a harness sign-in can't supply an environment credential")
+
+    monkeypatch.setattr(mcp_tools, "harness_sign_in_state", no_sign_in_check)
     entry = _entry({"command": "${workspaceFolder}/run"}, harness="cursor")
     monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
     assert (await HostMcpTools().probe("cursor", "docs"))["connection"] == "unsupported"
@@ -285,7 +303,7 @@ async def test_unsupported_and_missing_credentials(monkeypatch):
         {"url": "https://example.test/mcp", "bearer_token_env_var": "ABSENT_TEST_TOKEN"},
         harness="codex",
     )
-    assert (await HostMcpTools().probe("codex", "docs"))["connection"] == "needs_auth"
+    assert await HostMcpTools().probe("codex", "docs") == mcp_tools._result("needs_auth")
 
 
 async def test_missing_executable_is_unreachable(monkeypatch, tmp_path):

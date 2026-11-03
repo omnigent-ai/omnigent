@@ -110,6 +110,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostMcpLoginFrame,
+    HostMcpLoginResultFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -1312,6 +1314,10 @@ class HostProcess:
         from omnigent.host.mcp_tools import HostMcpTools
 
         self._mcp_tools = HostMcpTools()
+        from omnigent.host.mcp_login import HostMcpLogins
+
+        # A completed sign-in changes what the next probe should report.
+        self._mcp_logins = HostMcpLogins(on_success=self._mcp_tools.clear_cache)
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -1483,6 +1489,7 @@ class HostProcess:
             for active in self._active_harness_logins.values()
             if (pid := active.session.pid) is not None
         )
+        pids.update(self._mcp_logins.pids())
         return pids
 
     @staticmethod
@@ -3936,6 +3943,42 @@ class HostProcess:
             )
         return HostMcpToolsResultFrame(request_id=frame.request_id, status="ok", **result)
 
+    async def _handle_mcp_login(self, frame: HostMcpLoginFrame) -> HostMcpLoginResultFrame:
+        from omnigent.host.mcp_login import LoginError
+        from omnigent.host.mcp_tools import find_configured_server
+
+        try:
+            if frame.action == "start":
+                if frame.harness is None or frame.server is None:
+                    raise LoginError("invalid", "Missing MCP server")
+                try:
+                    server = await find_configured_server(
+                        frame.harness, frame.server, frame.plugin, frame.source_id
+                    )
+                except LookupError:
+                    raise LoginError("not_found", "MCP server not found") from None
+                result = await self._mcp_logins.start(server)
+            elif frame.login_id is None:
+                raise LoginError("invalid", "Missing sign-in id")
+            elif frame.action == "status":
+                result = self._mcp_logins.status(frame.login_id)
+            elif frame.action == "submit":
+                result = await self._mcp_logins.submit(frame.login_id, frame.callback_url or "")
+            elif frame.action == "cancel":
+                result = await self._mcp_logins.cancel(frame.login_id)
+            else:
+                raise LoginError("invalid", "Unknown sign-in action")
+        except LoginError as exc:
+            return HostMcpLoginResultFrame(
+                request_id=frame.request_id, status=exc.status, error=str(exc)
+            )
+        except Exception as exc:  # noqa: BLE001 — CLI failures must not expose private config
+            _logger.warning("MCP sign-in %s failed: %s", frame.action, type(exc).__name__)
+            return HostMcpLoginResultFrame(
+                request_id=frame.request_id, status="failed", error="MCP sign-in failed"
+            )
+        return HostMcpLoginResultFrame(request_id=frame.request_id, status="ok", **result)
+
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
@@ -5564,6 +5607,7 @@ class HostProcess:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
             await self._cancel_all_harness_logins()
+            await self._mcp_logins.close()
 
     async def _harness_readiness_loop(
         self,
@@ -5910,6 +5954,9 @@ class HostProcess:
         elif isinstance(frame, HostMcpToolsFrame):
             tools_result = await self._handle_mcp_tools(frame)
             await self._send_text(ws, encode_host_frame(tools_result))
+        elif isinstance(frame, HostMcpLoginFrame):
+            login_result = await self._handle_mcp_login(frame)
+            await self._send_text(ws, encode_host_frame(login_result))
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
             await self._send_text(ws, encode_host_frame(startup_result))

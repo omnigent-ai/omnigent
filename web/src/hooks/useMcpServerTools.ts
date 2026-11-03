@@ -6,6 +6,18 @@ export interface McpServerTools {
   tools: { name: string; description: string | null }[];
   connection: "connected" | "needs_auth" | "unreachable" | "timeout" | "unsupported";
   truncated: boolean;
+  /** With `needs_auth`: the harness can sign in to the server, or already has. */
+  harness_sign_in?: "available" | "signed_in" | null;
+}
+
+export function mcpServerToolsKey(
+  hostId: string,
+  harness: string,
+  server: string,
+  plugin: string | undefined,
+  sourceId: string | undefined,
+) {
+  return ["mcp-tools", hostId, harness, server, plugin, sourceId] as const;
 }
 
 export function useMcpServerTools(
@@ -16,7 +28,7 @@ export function useMcpServerTools(
   { enabled, sourceId }: { enabled: boolean; sourceId?: string },
 ) {
   return useQuery({
-    queryKey: ["mcp-tools", hostId, harness, server, plugin, sourceId],
+    queryKey: mcpServerToolsKey(hostId, harness, server, plugin, sourceId),
     queryFn: async ({ signal }): Promise<McpServerTools> => {
       const response = await authenticatedFetch(
         `/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers/tools`,

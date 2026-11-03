@@ -67,6 +67,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostMcpLoginFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -11116,6 +11117,60 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
         HostMcpToolsFrame("m", "claude", "unknown")
     )
     assert result.status == status
+    assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
+
+
+async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch, tmp_path):
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+
+    server = ConfiguredMcpServer(
+        {"name": "docs", "harness": "claude", "transport": "http", "plugin": "toolkit"}, {}
+    )
+
+    async def find(harness, name, plugin, source_id):
+        assert (harness, name, plugin, source_id) == ("claude", "docs", "toolkit", None)
+        return server
+
+    started = []
+
+    async def start(self, configured):
+        started.append(configured)
+        return {
+            "login_id": "l1",
+            "state": "pending",
+            "authorization_url": "https://auth.example.test/a",
+            "error": None,
+        }
+
+    monkeypatch.setattr("omnigent.host.mcp_tools.find_configured_server", find)
+    monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.start", start)
+    host = _make_host_process()
+    ws = _RecordingWS()
+    host._start_frame_task(
+        ws,
+        encode_host_frame(HostMcpLoginFrame("m", "start", "claude", "docs", "toolkit")),
+    )
+    host._start_frame_task(ws, encode_host_frame(HostMcpLoginFrame("n", "status", login_id="x")))
+    await _drain_frame_tasks(host)
+    results = {frame.request_id: frame for frame in map(decode_host_frame, ws.sent)}
+    assert started == [server]
+    assert (results["m"].status, results["m"].login_id, results["m"].state) == (
+        "ok",
+        "l1",
+        "pending",
+    )
+    assert (results["n"].status, results["n"].error) == ("not_found", "Sign-in not found")
+
+
+async def test_host_mcp_login_failure_is_private(monkeypatch, caplog):
+    async def fail(*args):
+        raise RuntimeError("synthetic-private-config")
+
+    monkeypatch.setattr("omnigent.host.mcp_tools.find_configured_server", fail)
+    result = await _make_host_process()._handle_mcp_login(
+        HostMcpLoginFrame("m", "start", "claude", "docs")
+    )
+    assert (result.status, result.error) == ("failed", "MCP sign-in failed")
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
 
 

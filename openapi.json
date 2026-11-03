@@ -3907,6 +3907,120 @@
         "title": "MCPServerSummary",
         "type": "object"
       },
+      "McpLoginCallbackRequest": {
+        "properties": {
+          "callback_url": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Callback Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "callback_url"
+        ],
+        "title": "McpLoginCallbackRequest",
+        "type": "object"
+      },
+      "McpLoginRequest": {
+        "properties": {
+          "harness": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Harness",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plugin"
+          },
+          "server": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Server",
+            "type": "string"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "harness",
+          "server"
+        ],
+        "title": "McpLoginRequest",
+        "type": "object"
+      },
+      "McpLoginResponse": {
+        "description": "A harness sign-in on the host; `authorization_url` is set only while pending.",
+        "properties": {
+          "authorization_url": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authorization Url"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "login_id": {
+            "maxLength": 64,
+            "title": "Login Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "succeeded",
+              "failed",
+              "expired",
+              "cancelled"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "login_id",
+          "state"
+        ],
+        "title": "McpLoginResponse",
+        "type": "object"
+      },
       "McpServerStartup": {
         "description": "One MCP server's startup state within a `session.mcp_startup` event.",
         "properties": {
@@ -4151,6 +4265,21 @@
             ],
             "title": "Connection",
             "type": "string"
+          },
+          "harness_sign_in": {
+            "anyOf": [
+              {
+                "enum": [
+                  "available",
+                  "signed_in"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness Sign In"
           },
           "tools": {
             "items": {
@@ -12933,6 +13062,222 @@
           }
         },
         "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers/login": {
+      "post": {
+        "operationId": "start_mcp_login_v1_hosts__host_id__mcp_servers_login_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpLoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Mcp Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers/login/{login_id}": {
+      "delete": {
+        "operationId": "cancel_mcp_login_v1_hosts__host_id__mcp_servers_login__login_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpLoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Mcp Login",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "get": {
+        "operationId": "get_mcp_login_v1_hosts__host_id__mcp_servers_login__login_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpLoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/mcp-servers/login/{login_id}/callback": {
+      "post": {
+        "operationId": "submit_mcp_login_callback_v1_hosts__host_id__mcp_servers_login__login_id__callback_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpLoginCallbackRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpLoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Mcp Login Callback",
         "tags": [
           "hosts"
         ]

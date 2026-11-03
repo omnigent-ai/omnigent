@@ -127,6 +127,9 @@ implements them separately, so a fix for one harness does not reach the others.
 
 - `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
+- `mcp-sign-in`: a needs-auth Claude Code or Codex MCP server (standalone or
+  plugin) offers Sign in, which runs the harness CLI's `mcp login` on the host
+  and finishes through its loopback listener or a pasted redirect address.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 - `harness-settings-navigation`: Harnesses is always available in Settings and
@@ -218,6 +221,9 @@ select its namespaced suggestion. See the
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion.
+
+**MCP sign-in:** the same path to a needs-auth server → Sign in → Open sign-in
+page, approve, and return; or paste the redirect address and click Finish.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
@@ -896,6 +902,14 @@ Cross-harness journeys:
   404 from the contents route and verify the list remains with nonclickable
   skill rows. A 502/504 shows a generic failure. Bodies must be absent from
   the skills listing and host/server logs, with no other files or paths returned.
+
+- **`mcp-sign-in`:** run `tests/host/test_mcp_login.py`,
+  `tests/server/routes/test_mcp_tools.py`, and
+  `web/src/pages/settings/McpSignInDialog.test.tsx`. With the real `claude` and
+  `codex` CLIs installed, `tests/e2e_ui/settings/test_mcp_sign_in.py` signs in to
+  a local OAuth MCP server through a user server, a plugin server, and Codex's
+  paste path. By hand, check timeout, cancel, a rejected paste, and an older
+  host (Sign in shows an update hint).
 
 - **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,
   `tests/server/routes/test_mcp_tools.py`, and the real-host test

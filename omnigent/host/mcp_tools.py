@@ -11,12 +11,13 @@ import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 from cachetools import TTLCache
 from mcp.client.stdio import get_default_environment
 
 from omnigent.host.mcp_inventory import ConfiguredMcpServer, configured_mcp_servers
+from omnigent.host.mcp_login import SignInState, harness_sign_in_state
 from omnigent.inner._proc import remember_process_group, spawn_kwargs
 from omnigent.inner._subprocess_lifecycle import terminate_subprocess
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -45,6 +46,8 @@ class McpProbeResult(TypedDict):
     tools: list[dict[str, str | None]]
     connection: str
     truncated: bool
+    # Whether the harness itself can sign in, or already has; only with ``needs_auth``.
+    harness_sign_in: NotRequired[SignInState]
 
 
 def _result(connection: str) -> McpProbeResult:
@@ -158,34 +161,54 @@ def _effective_config(server: ConfiguredMcpServer) -> tuple[MCPServerConfig, Pat
     return config, cwd, transport
 
 
+async def find_configured_server(
+    harness: str, name: str, plugin: str | None = None, source_id: str | None = None
+) -> ConfiguredMcpServer:
+    """The one configured server a request names; ``LookupError`` if none or several."""
+    servers = await asyncio.to_thread(configured_mcp_servers)
+    matches = [
+        s
+        for s in servers
+        if s.summary["harness"] == harness
+        and (
+            s.summary.get("source_id") == source_id
+            if source_id is not None
+            else (s.summary["name"], s.summary.get("plugin")) == (name, plugin)
+        )
+    ]
+    if len(matches) != 1:
+        raise LookupError("MCP server unavailable or ambiguous")
+    return matches[0]
+
+
 class HostMcpTools:
     def __init__(self) -> None:
         self._slots = asyncio.Semaphore(2)
         self._cache: TTLCache[str, McpProbeResult] = TTLCache(maxsize=128, ttl=PROBE_CACHE_SECONDS)
 
+    def clear_cache(self) -> None:
+        """Forget probe results, e.g. after the user signs in to a server."""
+        self._cache.clear()
+
     async def probe(
         self, harness: str, name: str, plugin: str | None = None, source_id: str | None = None
     ) -> McpProbeResult:
-        servers = await asyncio.to_thread(configured_mcp_servers)
-        matches = [
-            s
-            for s in servers
-            if s.summary["harness"] == harness
-            and (
-                s.summary.get("source_id") == source_id
-                if source_id is not None
-                else (s.summary["name"], s.summary.get("plugin")) == (name, plugin)
-            )
-        ]
-        if len(matches) != 1:
-            raise LookupError("MCP server unavailable or ambiguous")
-        server = matches[0]
+        server = await find_configured_server(harness, name, plugin, source_id)
         try:
             config, cwd, transport = _effective_config(server)
         except PermissionError:
+            # A missing environment credential; signing in through the harness won't help.
             return _result("needs_auth")
         except (ValueError, TypeError):
             return _result("unsupported")
+        result = await self._probe(config, cwd, transport)
+        if result["connection"] == "needs_auth":
+            sign_in = await harness_sign_in_state(server)
+            if sign_in is not None:
+                return {**result, "harness_sign_in": sign_in}
+        return result
+
+    async def _probe(self, config: MCPServerConfig, cwd: Path, transport: str) -> McpProbeResult:
         payload = json.dumps(
             {
                 "config": asdict(config),
