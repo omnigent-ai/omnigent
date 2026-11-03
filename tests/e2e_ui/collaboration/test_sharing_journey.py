@@ -331,5 +331,6 @@ def test_link_shared_session_tab_title_matches_header(
         bob_page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
         bob_page.goto(f"{live_server}/c/{sid}")
         expect(bob_page.get_by_placeholder(_READONLY_PLACEHOLDER)).to_be_visible(timeout=30_000)
-        expect(bob_page.get_by_text(title, exact=True).first).to_be_visible()
+        breadcrumb = bob_page.get_by_role("navigation", name="Conversation")
+        expect(breadcrumb.get_by_text(title, exact=True)).to_be_visible()
         expect(bob_page).to_have_title(re.compile(rf"^(?:● )?{re.escape(title)}$"))

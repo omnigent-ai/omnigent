@@ -854,14 +854,9 @@ export function ChatPage() {
     launchedAt: runnerLaunchedAt,
   });
 
-  // Browser tab title: "● Title" while the main session is working so
-  // background tabs signal parent activity without duplicating child-session
-  // badges from the sidebar/Agents rail. An open-but-untitled session
-  // (no synthesized title yet) reads as "New session" to match its
-  // sidebar row; the landing page (no active session) stays "Omnigent".
-  // Sessions outside the loaded sidebar rows (``activeConv`` is null) fall
-  // back to their own snapshot, mirroring the header: sub-agent (child)
-  // sessions are named after the sub-agent, others after the session title.
+  // Browser tab title mirrors the header; "● " flags main-session work in background tabs.
+  // Sessions missing from the loaded sidebar rows use their snapshot (sub-agent name for
+  // children), and untitled sessions read "New session" to match their sidebar row.
   const sessionTabTitle =
     activeSession?.parentSessionId != null
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
