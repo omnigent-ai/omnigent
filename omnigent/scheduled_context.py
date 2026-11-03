@@ -54,7 +54,7 @@ def scheduled_run_scope(
                 **(
                     run.model_dump()
                     if run is not None
-                    else dict.fromkeys(ScheduledRunLogContext.model_fields)
+                    else dict.fromkeys((*ScheduledRunLogContext.model_fields, "fire_stage"))
                 )
             ),
             current_session_id_scope(session_id),
