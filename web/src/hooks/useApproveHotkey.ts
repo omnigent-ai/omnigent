@@ -67,15 +67,13 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       if (isDraftingTarget(e.target)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
-      // Newest-first: accept the most recent still-pending prompt that takes a
-      // plain verdict. Skip AskUserQuestion (needs an explicit choice).
-      // The newest pending prompt is the one on screen. Searching past it for
-      // an older binary one would accept something the person cannot see while
-      // they are filling in a form.
+      // Select the newest pending prompt before checking eligibility, so a
+      // form or an unconfirmed delivery cannot expose an older approval.
       const newest = [...blocks]
         .reverse()
         .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
       if (!newest) return;
+      if (newest.nativeDelivery && newest.nativeDelivery.state !== "ready") return;
       const takesAPlainVerdict =
         !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
       if (!takesAPlainVerdict) return;

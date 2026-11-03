@@ -6,6 +6,9 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isSandboxLaunchStopped, SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
+import type { SandboxStatus } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
@@ -14,6 +17,7 @@ import {
   ComposerConfigTooltipRows,
   ComposerHostTrigger,
   ComposerMenuTooltip,
+  HostStatusDot,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -80,6 +84,12 @@ const CONNECTION_WORD: Record<HostBadgeStatus, string> = {
   unknown: "Unknown",
 };
 
+/** Composer status for a sandbox that is still launching, or failed to launch. */
+function launchStatusWord(launch: SandboxStatus): string {
+  if (launch.stage === "failed") return "Sandbox launch failed";
+  return SANDBOX_STAGE_LABELS[launch.stage] ?? "Launching sandbox";
+}
+
 /**
  * Session-bound host status with shared liveness, reconnect and switch behavior.
  * The composer variant uses the compact host menu; the default retains the
@@ -88,11 +98,14 @@ const CONNECTION_WORD: Record<HostBadgeStatus, string> = {
 export function HostBadge({
   sessionId,
   onReconnect,
+  starting = false,
   appearance = "status",
   readOnly = false,
 }: {
   sessionId: string;
   onReconnect?: () => void;
+  /** The session's sandbox is being woken; the composer dot spins until it is online. */
+  starting?: boolean;
   appearance?: "status" | "composer";
   readOnly?: boolean;
 }) {
@@ -107,6 +120,8 @@ export function HostBadge({
   const liveOnline = useSessionHostOnline(sessionId);
 
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
+  // The open session's sandbox launch, which its chat progress banners also show.
+  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -148,19 +163,43 @@ export function HostBadge({
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
   if (appearance === "composer") {
-    const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
-    const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    // A launching sandbox has no host record yet: show the launch, not a missing host.
+    const launchStatus = launch && !host ? launchStatusWord(launch) : null;
+    // A wake, or a launch or resume the server reports by stage, spins the status
+    // dot until the host itself is online. A launch waiting on the user isn't progress.
+    const launchInProgress = launch !== null && !isSandboxLaunchStopped(launch);
+    // The wake's owner ends `starting` when the launch reports a stop.
+    const localWakeRunning = starting && !!badge;
+    const hostStarting = (localWakeRunning || launchInProgress) && badge?.status !== "online";
+    const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
+    const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
+    // Only this tab's own wake hides Reconnect: a server-reported stage can go stale.
+    const reconnectable =
+      !launchStatus && !localWakeRunning && badge?.status === "offline" && !!onReconnect;
+    const statusWord = hostStarting ? startingWord : STATUS_WORD[badge?.status ?? "unknown"];
+    let label = badge ? `Host ${badge.label}, ${statusWord}` : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
-    const tooltipRows = badge
+    let connectionWord = CONNECTION_WORD[badge?.status ?? "unknown"];
+    if (hostStarting) connectionWord = startingWord;
+    else if (asleep) connectionWord = "Asleep — wakes on next message";
+    let tooltipRows = badge
       ? [
           { label: "Host", value: badge.label },
-          {
-            label: "Status",
-            value: asleep ? "Asleep — wakes on next message" : CONNECTION_WORD[badge.status],
-          },
+          // An Arclet's host takes the Arclet's own name, e.g. "omnigent-arclet-1234",
+          // which the provider label hides. Other providers' managed-<hex> names don't help.
+          ...(host?.sandbox_provider === "arclet" ? [{ label: "Name", value: host.name }] : []),
+          { label: "Status", value: connectionWord },
         ]
       : [{ label: "Host", value: "None" }];
+    const launchHost = launch?.provider ? sandboxOptionLabel(launch.provider) : "Sandbox";
+    if (launchStatus) {
+      label = `Host ${launchHost}, ${launchStatus}`;
+      tooltipRows = [
+        { label: "Host", value: launchHost },
+        { label: "Status", value: launchStatus },
+      ];
+    }
     return (
       <>
         <DropdownMenu onOpenChange={setMenuOpen}>
@@ -173,8 +212,8 @@ export function HostBadge({
             <DropdownMenuTrigger asChild>
               <ComposerHostTrigger
                 label={label}
-                status={badge?.status ?? "unknown"}
-                cloud={!!host?.sandbox_provider}
+                status={launchStatus && !hostStarting ? undefined : dotStatus}
+                cloud={!!launchStatus || !!host?.sandbox_provider}
                 data-testid="composer-host-select"
               />
             </DropdownMenuTrigger>
@@ -187,16 +226,13 @@ export function HostBadge({
             data-testid="composer-host-menu"
           >
             <div className="px-2 py-1 text-xs text-muted-foreground">
-              {host?.sandbox_provider ? "Cloud" : "My machines"}
+              {launchStatus || host?.sandbox_provider ? "Cloud" : "My machines"}
             </div>
             <DropdownMenuItem disabled className="gap-2" data-selected="true">
-              <span
-                className={cn(
-                  "size-2 shrink-0 rounded-full",
-                  STATUS_DOT_CLASS[badge?.status ?? "unknown"],
-                )}
-              />
-              <span>{badge?.label ?? "No host bound"}</span>
+              {(!launchStatus || hostStarting) && (
+                <HostStatusDot status={dotStatus} testId="composer-host-menu-status" />
+              )}
+              <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
             </DropdownMenuItem>
             {reconnectable && (
               <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
@@ -211,9 +247,9 @@ export function HostBadge({
                 Switch host…
               </SessionActionMenuItem>
             )}
-            {!badge && (
+            {(launchStatus || !badge) && (
               <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
-                This session has no host binding.
+                {launchStatus ?? "This session has no host binding."}
               </p>
             )}
           </DropdownMenuContent>
@@ -231,10 +267,9 @@ export function HostBadge({
   }
   if (!badge) return null;
 
-  // A resumable managed host that reports offline is idle-stopped, not
-  // disconnected — the next message resumes it, and `omnigent host` (what the
-  // reconnect dialog hands out) is the wrong instruction for it.
-  const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
+  // An offline resumable managed host is idle-stopped; reconnecting asks the
+  // server to resume it rather than handing out `omnigent host`.
+  const reconnectable = badge.status === "offline" && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
   const title = `Host ${badge.label}, ${statusWord}`;
   // The dot is decorative (aria-hidden), so the status would otherwise be

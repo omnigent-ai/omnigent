@@ -20,7 +20,7 @@ After preflight, load `resolve-investigate` in every mode. Apply it before the
 repro audit or choosing a fix. After `resolve-repro-audit` for reproduction-driven
 work, read
 [existing-fix.md](existing-fix.md) before choosing author or review. Skip discovery
-in review-remediation mode. Load `resolve-impact-assessment` for every mode.
+in review-remediation mode. Load `otto-impact-assessment` for every mode.
 
 ## Input contract
 

@@ -12,13 +12,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.egress.relay import start_relay
-
-
-def _pick_free_port() -> int:
-    """Return a free ephemeral TCP port. Hardcoded ports collide with TIME_WAIT."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from tests._helpers.live_server import find_free_port
 
 
 @pytest.fixture
@@ -61,7 +55,7 @@ async def test_relay_bridges_tcp_to_unix(short_tmp_parent: Path) -> None:
     # Start the relay (background daemon thread). The returned event
     # fires once the relay's asyncio.start_server() has bound the TCP
     # listener, so no time-based sleep is needed.
-    relay_port = _pick_free_port()
+    relay_port = find_free_port()
     relay_ready = start_relay(relay_port, str(sock_path))
     loop = asyncio.get_running_loop()
     fired = await loop.run_in_executor(None, relay_ready.wait, 10.0)
@@ -159,7 +153,7 @@ async def test_s3_relay_forwards_plain_connection_without_proxy_auth(
 
     srv = await asyncio.start_unix_server(_upstream, str(sock_path))
     try:
-        port = _pick_free_port()
+        port = find_free_port()
         ready = start_relay(port, str(sock_path))
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, ready.wait, 5.0)

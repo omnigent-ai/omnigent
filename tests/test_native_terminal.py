@@ -2,11 +2,127 @@
 
 from __future__ import annotations
 
+import json
+from contextlib import nullcontext
+
 import click
 import httpx
 import pytest
 
 from omnigent.native import native_terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness_name", ["Claude", "Codex"])
+@pytest.mark.parametrize("status_code", [202, 503])
+async def test_post_initial_prompt_sends_one_message(
+    monkeypatch: pytest.MonkeyPatch,
+    harness_name: str,
+    status_code: int,
+) -> None:
+    """Prompt submission preserves text/auth and surfaces rejection without replay."""
+    requests: list[httpx.Request] = []
+    auth = httpx.BasicAuth("test", "secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status_code, json={"detail": "try later"})
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(handler), **kwargs
+        ),
+    )
+    with (
+        pytest.raises(
+            click.ClickException,
+            match=(
+                f"{harness_name} initial prompt failed .*try later\n"
+                "Session conv/a b did not receive it"
+            ),
+        )
+        if status_code >= 400
+        else nullcontext()
+    ):
+        await native_terminal.post_initial_prompt(
+            base_url="https://example.test",
+            headers={"X-Test": "initial-prompt"},
+            session_id="conv/a b",
+            prompt="first line\n\n  indented line",
+            auth=auth,
+            harness_name=harness_name,
+        )
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert request.url.raw_path == b"/v1/sessions/conv%2Fa%20b/events"
+    assert request.headers["X-Test"] == "initial-prompt"
+    assert request.headers["Authorization"].startswith("Basic ")
+    assert json.loads(request.content) == {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "first line\n\n  indented line"},
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        (
+            httpx.ConnectError("connection refused"),
+            "Claude initial prompt could not be sent (ConnectError). "
+            "Session conv_abc123 did not receive it.",
+        ),
+        (
+            httpx.ConnectTimeout(""),
+            "Claude initial prompt could not be sent (ConnectTimeout). "
+            "Session conv_abc123 did not receive it.",
+        ),
+        (
+            httpx.ReadTimeout(""),
+            "Claude initial prompt was not confirmed (ReadTimeout). "
+            "Session conv_abc123 may not have received it.",
+        ),
+    ],
+    ids=["connect-error", "connect-timeout", "read-timeout"],
+)
+async def test_post_initial_prompt_reports_transport_failure_once(
+    monkeypatch: pytest.MonkeyPatch,
+    error: httpx.TransportError,
+    expected_message: str,
+) -> None:
+    """A transport failure says whether the session can have received the prompt."""
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        raise error
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(handler), **kwargs
+        ),
+    )
+    with pytest.raises(click.ClickException) as raised:
+        await native_terminal.post_initial_prompt(
+            base_url="https://example.test",
+            headers={},
+            session_id="conv_abc123",
+            prompt="hello",
+            auth=None,
+            harness_name="Claude",
+        )
+
+    assert raised.value.message == expected_message
+    assert len(attempts) == 1
 
 
 @pytest.mark.asyncio

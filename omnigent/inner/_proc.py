@@ -24,9 +24,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 import weakref
 from contextlib import suppress
+from pathlib import Path
 from typing import Protocol, TypedDict
 
 import psutil  # type: ignore[import-untyped]
@@ -135,6 +137,24 @@ def spawn_kwargs() -> SpawnKwargs:
     return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
 
+def pipe_supervised_command(command: str, *args: str) -> tuple[str, ...]:
+    """Retain a POSIX group leader while descendants hold captured output pipes.
+
+    Use with ``spawn_kwargs()`` and captured stdout/stderr. The supervisor
+    inherits stdin, cwd and env, and buffers output until EOF, like communicate.
+    Windows retains direct execution and its existing tree-cleanup behavior.
+    """
+    if not IS_POSIX:
+        return (command, *args)
+    return (
+        sys.executable,
+        "-I",
+        str(Path(__file__).with_name("_pipe_supervisor.py")),
+        command,
+        *args,
+    )
+
+
 def remember_process_group(process: _ProcessLike) -> None:
     """Remember the isolated group while its leader is still observable."""
     pid = process.pid
@@ -222,6 +242,21 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _process_start_stamp(proc: psutil.Process) -> float:
+    """Return ``proc``'s creation time on a clock that wall-clock steps can't move.
+
+    Linux ``create_time()`` adds ``/proc/stat`` btime, which shifts when NTP or a
+    hypervisor steps the clock; psutil 7 exposes the boot-relative start instead.
+    """
+    platform_create_time = getattr(getattr(proc, "_proc", None), "create_time", None)
+    if callable(platform_create_time):
+        with suppress(TypeError):  # psutil < 7 and non-Linux take no monotonic flag
+            stamp = platform_create_time(monotonic=True)
+            if isinstance(stamp, float):
+                return stamp
+    return proc.create_time()
+
+
 def _snapshot_identities(pid: int) -> dict[int, float]:
     """Snapshot a process tree using PID plus creation time identity."""
     identities: dict[int, float] = {}
@@ -229,7 +264,7 @@ def _snapshot_identities(pid: int) -> dict[int, float]:
         if proc.pid <= 1 or proc.pid == os.getpid():
             continue
         with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            identities[proc.pid] = proc.create_time()
+            identities[proc.pid] = _process_start_stamp(proc)
     return identities
 
 
@@ -259,7 +294,7 @@ def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
             continue
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() != create_time:
+            if _process_start_stamp(proc) != create_time:
                 continue
             if force:
                 proc.kill()
@@ -276,7 +311,7 @@ def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
     for pid, create_time in identities.items():
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() == create_time and _getpgid_fn(pid) == pgid:
+            if _process_start_stamp(proc) == create_time and _getpgid_fn(pid) == pgid:
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
@@ -372,6 +407,9 @@ def kill_tree(process: _ProcessLike | None) -> None:
     Like :func:`terminate_tree` but with ``SIGKILL`` (POSIX) /
     ``TerminateProcess`` (Windows). Use after a grace period when a graceful
     terminate did not take.
+
+    After the leader exits, unobserved descendants may survive: signaling
+    their former group requires a remembered live identity to avoid PID reuse.
     """
     if process is None:
         return

@@ -23,15 +23,18 @@ import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
 import yaml
 
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
@@ -69,6 +72,7 @@ def _spawn_host_daemon(
     live_server: str,
     mock_llm_server_url: str,
     interactive_shells: list[str] | None = None,
+    closed_console: str | None = None,
 ) -> _SpawnedHostDaemon:
     """
     Spawn an isolated host daemon for a single host e2e test.
@@ -92,6 +96,7 @@ def _spawn_host_daemon(
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
         ``"http://127.0.0.1:12345"``.
     :param interactive_shells: Optional deterministic host inventory for tests.
+    :param closed_console: Standard stream backed by an OS pipe with no reader.
     :returns: The spawned daemon handle and its host_id.
     """
     omni_dir = tmp_path / ".omnigent"
@@ -135,6 +140,19 @@ def _spawn_host_daemon(
             ),
             live_server,
             *interactive_shells,
+        ]
+    if closed_console is not None:
+        command = [
+            runner_executable(),
+            "-c",
+            "import os, runpy, sys; "
+            "descriptor = 1 if sys.argv.pop(1) == 'stdout' else 2; "
+            "reader, writer = os.pipe(); os.close(reader); "
+            "os.dup2(writer, descriptor); os.close(writer); "
+            "runpy.run_module('omnigent.host._daemon_entry', run_name='__main__')",
+            closed_console,
+            "--server",
+            live_server,
         ]
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
@@ -451,11 +469,13 @@ def test_host_name_only_config_generates_host_id(
             proc.wait()
 
 
+@pytest.mark.parametrize("closed_console", [None, "stdout", "stderr"])
 def test_host_launch_runner_and_session_round_trip(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
     mock_llm_server_url: str,
+    closed_console: str | None,
 ) -> None:
     """
     Full golden-path e2e: connect host, upload agent, create
@@ -474,6 +494,7 @@ def test_host_launch_runner_and_session_round_trip(
         tmp_path=tmp_path,
         live_server=live_server,
         mock_llm_server_url=mock_llm_server_url,
+        closed_console=closed_console,
     )
     host_proc = daemon.proc
     host_id = daemon.host_id
@@ -549,6 +570,9 @@ def test_host_launch_runner_and_session_round_trip(
         assert body["status"] == "completed", f"Session failed: {body.get('error')}"
         text = final_assistant_text(body)
         assert marker in text, f"Marker {marker!r} missing from response: {text!r}"
+        if closed_console == "stdout":
+            assert "Host console output is unavailable" in daemon.daemon_log.read_text()
+        assert host_proc.poll() is None
 
     finally:
         host_proc.send_signal(signal.SIGTERM)
@@ -1338,3 +1362,322 @@ def test_host_retry_session_recovers_killed_runner(
             except subprocess.TimeoutExpired:
                 host_proc.kill()
                 host_proc.wait()
+
+
+@pytest.mark.min_runner_version("0.20.0")
+@pytest.mark.min_server_version("0.20.0")
+def test_host_relaunch_recreates_deleted_workspace(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """A message sent after the workspace directory vanished still gets a reply.
+
+    A worktree tool or the agent deletes the session's workspace while the
+    runner is down. Against a REAL host and server, the next message recreates
+    the leaf directory, starts the runner there, answers the turn, and leaves
+    exactly one info-level ``workspace_recreated`` notice in the transcript.
+    """
+    marker_pre = "WORKSPACE_PRE_DELETE"
+    marker_post = "WORKSPACE_POST_RECREATE"
+    configure_mock_llm(mock_llm_server_url, [{"text": marker_pre}, {"text": marker_post}])
+
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    host_proc = daemon.proc
+    host_id = daemon.host_id
+    # A workspace of its own: tmp_path doubles as the daemon's HOME.
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+
+    try:
+        _wait_for_host_online(http_client, host_id, timeout=30.0)
+
+        agent_name = upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+        agent_id = lookup_agent_id(http_client, agent_name)
+        session_resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
+        session_resp.raise_for_status()
+        session_id = session_resp.json()["id"]
+
+        launch_resp = http_client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": str(workspace)},
+            timeout=60.0,
+        )
+        assert launch_resp.status_code == 200, launch_resp.text
+        runner_id = launch_resp.json()["runner_id"]
+
+        deadline = time.monotonic() + 30.0
+        runner_online = False
+        while time.monotonic() < deadline:
+            sr = http_client.get(f"/v1/runners/{runner_id}/status")
+            if sr.status_code == 200 and sr.json().get("online"):
+                runner_online = True
+                break
+            time.sleep(0.5)
+        assert runner_online, f"Runner {runner_id} never came online"
+        http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+        ).raise_for_status()
+
+        rid_pre = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_pre} and nothing else.",
+        )
+        body_pre = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_pre,
+            timeout=120,
+        )
+        assert body_pre["status"] == "completed"
+        assert marker_pre in final_assistant_text(body_pre)
+
+        # The runner dies and the workspace disappears, as when an external
+        # worktree tool prunes it between turns.
+        runner_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
+        assert runner_pid is not None, (
+            "could not find the launched runner pid in the daemon log:\n"
+            f"{daemon.daemon_log.read_text()}"
+        )
+        os.kill(runner_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 15.0
+        runner_offline = False
+        while time.monotonic() < deadline:
+            sr = http_client.get(f"/v1/runners/{runner_id}/status")
+            if sr.status_code == 200 and not sr.json().get("online"):
+                runner_offline = True
+                break
+            time.sleep(0.5)
+        assert runner_offline, f"Runner {runner_id} still online after SIGKILL"
+        shutil.rmtree(workspace)
+        assert not workspace.exists()
+
+        rid_post = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content=f"Reply with exactly {marker_post} and nothing else.",
+        )
+        body_post = poll_session_until_terminal(
+            http_client,
+            session_id=session_id,
+            response_id=rid_post,
+            timeout=120,
+        )
+        assert body_post["status"] == "completed", (
+            f"the turn should run in a recreated workspace, got {body_post.get('error')!r}"
+        )
+        assert marker_post in final_assistant_text(body_post)
+        assert workspace.is_dir(), "the host should have recreated the deleted workspace"
+
+        items = http_client.get(f"/v1/sessions/{session_id}/items").json()["data"]
+        error_items = [item for item in items if item.get("type") == "error"]
+        assert [item["code"] for item in error_items] == ["workspace_recreated"], error_items
+        assert error_items[0].get("level") == "info", error_items[0]
+        assert str(workspace) in error_items[0]["message"], error_items[0]["message"]
+
+    finally:
+        if host_proc.poll() is None:
+            host_proc.send_signal(signal.SIGTERM)
+            try:
+                host_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                host_proc.kill()
+                host_proc.wait()
+
+
+def _wait_for_runner_status(
+    client: httpx.Client, runner_id: str, *, online: bool, timeout: float = 30.0
+) -> None:
+    """Poll ``GET /v1/runners/{id}/status`` until the runner reports *online*.
+
+    :param client: HTTP client pointed at the server.
+    :param runner_id: Runner to watch, e.g. ``"runner_token_ab12..."``.
+    :param online: The ``online`` value to wait for.
+    :param timeout: Max seconds to wait.
+    :raises AssertionError: If the runner never reaches that state.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = client.get(f"/v1/runners/{runner_id}/status")
+        if status.status_code == 200 and bool(status.json().get("online")) is online:
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Runner {runner_id} did not reach online={online} within {timeout}s")
+
+
+def _kill_launched_runner(
+    client: httpx.Client, daemon: _SpawnedHostDaemon, runner_id: str
+) -> None:
+    """SIGKILL one host-launched runner, leaving its host connected.
+
+    :param client: HTTP client pointed at the server.
+    :param daemon: Host daemon that launched the runner.
+    :param runner_id: Runner to kill; its pid comes from the daemon log.
+    """
+    match = re.search(
+        rf"Launched runner {re.escape(runner_id)} for workspace .*? \(pid=(\d+)\)",
+        daemon.daemon_log.read_text(),
+    )
+    assert match is not None, f"no launch of {runner_id} in:\n{daemon.daemon_log.read_text()}"
+    os.kill(int(match.group(1)), signal.SIGKILL)
+    _wait_for_runner_status(client, runner_id, online=False, timeout=15.0)
+
+
+def _assert_round_trip(client: httpx.Client, session_id: str, marker: str) -> None:
+    """Send one message and assert the scripted reply comes back.
+
+    :param client: HTTP client pointed at the server.
+    :param session_id: Session to message.
+    :param marker: Reply text the mock LLM is configured to return.
+    """
+    response_id = send_user_message_to_session(
+        client,
+        session_id=session_id,
+        content=f"Reply with exactly {marker} and nothing else.",
+    )
+    body = poll_session_until_terminal(
+        client, session_id=session_id, response_id=response_id, timeout=120
+    )
+    assert body["status"] == "completed", f"turn failed: {body.get('error')}"
+    assert marker in final_assistant_text(body)
+
+
+def _shared_live_runner(client: httpx.Client, parent_id: str, side_chat_id: str) -> str:
+    """Assert a side chat and its parent are bound to one live runner.
+
+    :param client: HTTP client pointed at the server.
+    :param parent_id: The side chat's source session.
+    :param side_chat_id: The hostless side chat.
+    :returns: The shared runner id.
+    """
+    parent = client.get(f"/v1/sessions/{parent_id}").json()
+    side_chat = client.get(f"/v1/sessions/{side_chat_id}").json()
+    assert side_chat["host_id"] is None
+    assert side_chat["runner_id"] is not None
+    assert side_chat["runner_id"] == parent["runner_id"], (parent, side_chat)
+    assert side_chat["runner_online"] is True, side_chat
+    return str(side_chat["runner_id"])
+
+
+def test_host_side_chat_recovers_after_shared_runner_exits(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """A side chat whose shared runner died recovers through its parent.
+
+    A side chat has no host of its own: the web binds it to its parent's live
+    runner. With that runner killed and the host still up, the side chat's next
+    message relaunches the parent's runner on its host and moves both sessions
+    onto it. After another exit, Resume on the side chat does the same.
+    """
+    # Equal-length tokens: the mock routes on the newest one in the history.
+    markers = [f"SIDECHAT{i}{uuid.uuid4().hex[:12].upper()}" for i in range(5)]
+    for marker in markers:
+        configure_mock_llm(mock_llm_server_url, [{"text": marker}], match=marker)
+
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    try:
+        _wait_for_host_online(http_client, daemon.host_id, timeout=30.0)
+        agent_id = lookup_agent_id(
+            http_client, upload_agent(http_client, _write_smoke_agent_yaml(tmp_path))
+        )
+        created = http_client.post(
+            "/v1/sessions",
+            json={"agent_id": agent_id, "host_id": daemon.host_id, "workspace": str(tmp_path)},
+            timeout=60.0,
+        )
+        created.raise_for_status()
+        parent_id = created.json()["id"]
+        first_runner = created.json()["runner_id"]
+        _wait_for_runner_status(http_client, first_runner, online=True)
+        _assert_round_trip(http_client, parent_id, markers[0])
+
+        # Fork and bind the side chat the way the web's createSideChat does.
+        fork = http_client.post(
+            f"/v1/sessions/{parent_id}/fork", json={"title": "Side chat", "side_chat": True}
+        )
+        fork.raise_for_status()
+        side_chat_id = fork.json()["id"]
+        http_client.patch(
+            f"/v1/sessions/{side_chat_id}", json={"runner_id": first_runner}
+        ).raise_for_status()
+        _assert_round_trip(http_client, side_chat_id, markers[1])
+
+        _kill_launched_runner(http_client, daemon, first_runner)
+        _assert_round_trip(http_client, side_chat_id, markers[2])
+        recovered_runner = _shared_live_runner(http_client, parent_id, side_chat_id)
+        assert recovered_runner != first_runner
+        _assert_round_trip(http_client, parent_id, markers[3])
+
+        _kill_launched_runner(http_client, daemon, recovered_runner)
+        retry = http_client.post(
+            f"/v1/sessions/{side_chat_id}/events",
+            json={"type": "retry_session", "data": {}},
+            timeout=120.0,
+        )
+        assert retry.status_code in (200, 202), retry.text
+        assert retry.json().get("recovery") == "runner_relaunched", retry.json()
+        resumed_runner = _shared_live_runner(http_client, parent_id, side_chat_id)
+        assert resumed_runner not in (first_runner, recovered_runner)
+        _assert_round_trip(http_client, side_chat_id, markers[4])
+    finally:
+        if daemon.proc.poll() is None:
+            daemon.proc.send_signal(signal.SIGTERM)
+            try:
+                daemon.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.proc.kill()
+                daemon.proc.wait()
+
+
+def test_closed_console_preserves_real_host_auth_rejection(tmp_path: Path) -> None:
+    """An actual rejected upgrade retains the fatal exit code through Python shutdown."""
+    requests: list[str] = []
+
+    class RefusingServer(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), RefusingServer) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        daemon = _spawn_host_daemon(
+            tmp_path=tmp_path,
+            live_server=f"http://127.0.0.1:{server.server_port}",
+            mock_llm_server_url="http://127.0.0.1:9",
+            closed_console="stderr",
+        )
+        try:
+            assert daemon.proc.wait(timeout=45) == HOST_FATAL_EXIT_CODE
+            log = daemon.daemon_log.read_text()
+            assert any(path.endswith("/tunnel") for path in requests)
+            assert "HTTP 403" in log
+            assert "Host console output is unavailable" in log
+            assert "BrokenPipeError" not in log
+        finally:
+            if daemon.proc.poll() is None:
+                daemon.proc.terminate()
+                daemon.proc.wait(timeout=10)
+            server.shutdown()
+            thread.join(timeout=5)

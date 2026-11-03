@@ -1,0 +1,55 @@
+# feature-agent (local). See `description:` below for what it does.
+# Usage: python dev/feature.py https://linear.app/omnigent/issue/OMNI-1234/slug
+# The brain runs on the Claude Agent SDK; configure a provider first (`omnigent setup`).
+
+spec_version: 1
+name: feature_agent
+description: >-
+  Builds one feature from a Linear feature ticket on omnigent-ai/omnigent. It
+  writes down the requirements and target CUJs, chooses a design and records the
+  alternatives it rejected, implements it with tests at the lowest reliable
+  layer, and records at least one captioned demo per covered CUJ. It then opens
+  a ready-for-review PR whose description states the design, the alternatives,
+  and which CUJs are and are not covered, and drives that PR through CI and the
+  Polly/OCR review loop until every finding is settled. A ticket too big for one
+  feature, or a design choice that needs a human, stops before implementation
+  with a proposal for the ticket. It can also remediate trusted human change
+  requests on its own PRs. It does not merge.
+
+executor:
+  type: omnigent
+  context_window: 1000000
+  reasoning_effort: high
+  config:
+    harness: claude-sdk
+    permission_mode: bypassPermissions
+
+# AGENTS.md routes phases to bundled skills; detailed procedures load on demand.
+instructions: AGENTS.md
+
+# Shares only when invoked with `public: true` (`dev/feature.py --public`).
+agent_session_sharing: public
+
+async: true
+cancellable: true
+
+# Polly and OCR review published PRs; no child-session tools.
+spawn: false
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Same guardrails as resolve-agent: outward git/GitHub commands run unattended
+# (`dev/feature.py` confirms before launch) and the catastrophic set stays denied.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false

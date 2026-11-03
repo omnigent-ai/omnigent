@@ -3,7 +3,12 @@ import type { Agent } from "./useAgents";
 import { authenticatedFetch } from "@/lib/identity";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { installAgentBundle } from "@/lib/agentsApi";
+import {
+  getAgentConfig,
+  patchAgentConfig,
+  type AgentConfigPatch,
+  installAgentBundle,
+} from "@/lib/agentsApi";
 
 export interface ManagedAgent extends Agent {
   harness: string | null;
@@ -102,4 +107,26 @@ function refreshAgents(client: ReturnType<typeof useQueryClient>) {
   ]) {
     void client.invalidateQueries({ queryKey: [key] });
   }
+}
+
+export function useCustomAgentConfig(id: string) {
+  return useQuery({
+    queryKey: ["settings-agents", "config", id],
+    queryFn: ({ signal }) => getAgentConfig(id, signal),
+    gcTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+export function usePatchCustomAgent(id: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ etag, patch }: { etag: string | null; patch: AgentConfigPatch }) =>
+      patchAgentConfig(id, etag, patch),
+    retry: false,
+    gcTime: 0,
+    onSuccess: () => refreshAgents(client),
+  });
 }
