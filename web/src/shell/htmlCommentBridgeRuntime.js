@@ -213,9 +213,9 @@
     }
   }
 
-  // Restore the saved offset after a remount. Late-loading content can clamp it,
-  // so re-assert it each frame until the budget ends or the reader scrolls;
-  // scroll reports stay off meanwhile so clamps can't overwrite the saved value.
+  // Restore the saved offset after a remount, re-asserting it each frame because
+  // late content can clamp it. Only input that scrolls ends it early, not a click
+  // or the zoom shortcut; reports stay off so clamps can't overwrite the offset.
   const USER_SCROLL_EVENTS = ["wheel", "touchstart", "keydown"];
   const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
   let scrollRestore = null; // { top, deadline, y, height } while restoring
@@ -294,10 +294,8 @@
     });
   }
 
-  // Scroll the first active-comment range into view. Uses the range's client
-  // rect (Ranges have no scrollIntoView) to center it in the viewport, but only
-  // when off-screen so an already-visible highlight doesn't jump. During a
-  // restore, visibility is judged at the saved offset, not a clamped one.
+  // Center the first active range (Ranges have no scrollIntoView) only if it is
+  // off-screen; during a restore, judge that at the saved offset, not a clamp.
   function scrollActiveIntoView() {
     const r = activeRanges && activeRanges[0];
     if (!r) return;

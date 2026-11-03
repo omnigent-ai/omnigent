@@ -205,12 +205,10 @@ describe("HtmlCommentViewer", () => {
 });
 
 describe("HtmlCommentViewer scroll position", () => {
-  const requestedRestore = requestedScrollRestore;
-
   it("saves the frame's reported offset and restores it when the preview remounts", async () => {
     const key = "html-preview:conv_1:plan.html";
     const first = renderViewer("<body><p>plan</p></body>", false, false, key);
-    expect(requestedRestore()).toBeNull();
+    expect(requestedScrollRestore()).toBeNull();
     const { port, send } = await connectHtmlPreviewBridge(
       screen.getByTitle<HTMLIFrameElement>("HTML preview"),
     );
@@ -221,7 +219,7 @@ describe("HtmlCommentViewer scroll position", () => {
 
     // Switching back to the tab or session mounts a fresh preview for the file.
     renderViewer("<body><p>plan</p></body>", false, false, key);
-    expect(requestedRestore()).toMatchObject({ top: 760 });
+    expect(requestedScrollRestore()).toMatchObject({ top: 760 });
   });
 
   it("returns to the saved offset when the agent rewrites the file", () => {
@@ -240,7 +238,7 @@ describe("HtmlCommentViewer scroll position", () => {
         onSetActiveSelection={() => {}}
       />,
     );
-    expect(requestedRestore()).toMatchObject({ top: 512 });
+    expect(requestedScrollRestore()).toMatchObject({ top: 512 });
   });
 });
 

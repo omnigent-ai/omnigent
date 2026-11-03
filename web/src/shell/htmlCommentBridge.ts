@@ -322,13 +322,11 @@ const BRIDGE_HIGHLIGHT_STYLE =
  * (NOT a full HTML parse, which could subtly change how the artifact renders):
  * inject before `</body>` when present, else before `</html>`, else append.
  *
- * A positive `restoreScrollTop` tells the runtime to scroll the document back to
- * that offset as it lays out, so a remounted preview reopens where the reader was.
- *
  * @param html  Raw artifact HTML.
  * @param nonce Per-mount nonce shared with the parent for message validation.
  * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline scripts.
- * @param restoreScrollTop Saved vertical scroll offset to return to, or 0 for the top.
+ * @param restoreScrollTop Saved vertical offset the runtime returns to as the document
+ *   lays out, so a remounted preview reopens where the reader was; 0 keeps the top.
  */
 export function injectCommentBridge(
   html: string,
