@@ -56,6 +56,12 @@ import {
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
 
+/** Index of the match a step moves to; with none active, the first or last by direction. */
+function stepTarget(activeIndex: number, direction: 1 | -1, length: number): number {
+  if (activeIndex >= 0) return (activeIndex + direction + length) % length;
+  return direction > 0 ? 0 : length - 1;
+}
+
 /** Frames to wait for a section to mount before a pending jump gives up. */
 const REVEAL_RETRY_FRAMES = 30;
 
@@ -683,14 +689,7 @@ export function PullRequestChangesTab({
     // Matches for a query still being searched would navigate the previous results.
     if (!matches.length || deferredQuery !== query) return;
     // With no active match yet, the first step lands on the first or last match by direction.
-    const next =
-      matches[
-        activeIndex < 0
-          ? direction > 0
-            ? 0
-            : matches.length - 1
-          : (activeIndex + direction + matches.length) % matches.length
-      ];
+    const next = matches[stepTarget(activeIndex, direction, matches.length)];
     // A fresh object, so stepping to the sole match again is a new reveal request.
     setFindTarget({ ...next });
     if (next.target.kind === "path") setPendingReveal({ path: next.target.path });
@@ -726,8 +725,10 @@ export function PullRequestChangesTab({
   };
   const patchFileCount = files.filter((file) => filesByPath.has(file.path)).length;
   const withoutText = files.length - patchFileCount;
+  // Counts are meaningless until the patch has loaded and parsed.
+  const patchReady = !!prDiff.data?.patch && !parseError && !prDiff.isLoading;
   const coverageNote =
-    find.open && (changes.data?.has_more || withoutText > 0)
+    find.open && patchReady && (changes.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${changes.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 

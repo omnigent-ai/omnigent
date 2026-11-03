@@ -246,7 +246,7 @@ describe("PullRequestChangesTab", () => {
 
   it("handles Cmd+F only while focus is inside the Changes tab", () => {
     renderTab({ conversationId: "find-shortcut" });
-    expect(fireEvent.keyDown(document.body, { key: "f", metaKey: true })).toBe(true);
+    expect(fireEvent.keyDown(document.body, { key: "f", ctrlKey: true })).toBe(true);
     expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
 
     const header = sectionHeader("a.ts", true);

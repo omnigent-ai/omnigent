@@ -135,6 +135,8 @@ export interface FindHighlight {
 const FIND_HIGHLIGHT = "pr-find-active";
 /** Frames to wait for a diff row that is still rendering. */
 const ROW_RETRY_FRAMES = 30;
+/** How long a centre waits for a late-rendering diff, in milliseconds. */
+const CENTRE_WINDOW_MS = 5000;
 
 /** The diff's rows live in its open shadow root once @pierre/diffs has rendered. */
 // Scoped to the main diff: thread snippets render their own diffs in the same section.
@@ -344,13 +346,14 @@ export function PullRequestFileSection({
 
   // Centre the active find match once its row renders. A large diff can take longer than the
   // frame budget, so the next onPostRender centres it instead.
-  const pendingCentre = useRef(false);
+  // Set while a centre is still owed; expires so a much later repaint can't scroll the reader.
+  const pendingCentre = useRef(0);
   useEffect(() => {
     const section = ref.current;
     if (!highlight || !section || collapsed || !renderingDiff) return;
     let frame = 0;
     let frames = 0;
-    pendingCentre.current = true;
+    pendingCentre.current = performance.now() + CENTRE_WINDOW_MS;
     const centre = () => {
       const row = findDiffRow(highlight, section);
       if (!row) {
@@ -358,13 +361,13 @@ export function PullRequestFileSection({
         return;
       }
       paintFindMatch(row, highlight);
-      pendingCentre.current = false;
+      pendingCentre.current = 0;
       row.scrollIntoView({ block: "center" });
     };
     centre();
     return () => {
       cancelAnimationFrame(frame);
-      pendingCentre.current = false;
+      pendingCentre.current = 0;
       clearFindMatch();
     };
   }, [highlight, collapsed, renderingDiff]);
@@ -375,8 +378,8 @@ export function PullRequestFileSection({
     const row = highlight && section ? findDiffRow(highlight, section) : null;
     if (!highlight || !row) return;
     paintFindMatch(row, highlight);
-    if (pendingCentre.current) {
-      pendingCentre.current = false;
+    if (pendingCentre.current > performance.now()) {
+      pendingCentre.current = 0;
       row.scrollIntoView({ block: "center" });
     }
   }, [highlight]);

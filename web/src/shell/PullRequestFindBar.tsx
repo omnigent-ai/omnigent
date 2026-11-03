@@ -98,9 +98,13 @@ export function PullRequestFindBar({
   // Closing removes the input, so a reader's close returns focus to the trigger, keeping
   // Cmd/Ctrl+F inside the Changes tab.
   const restoreFocus = useRef(false);
+  // Focus follows the reader opening the bar, not a remount that finds it already open.
+  const wasOpen = useRef(open);
   useEffect(() => {
-    if (open) inputRef.current?.focus();
-    else if (restoreFocus.current) {
+    const opened = open && !wasOpen.current;
+    wasOpen.current = open;
+    if (opened) inputRef.current?.focus();
+    else if (!open && restoreFocus.current) {
       restoreFocus.current = false;
       trigger.current?.querySelector("button")?.focus();
     }

@@ -106,6 +106,7 @@ export function findMatches(
   opts: { matchCase: boolean; regex: boolean; limit: number },
 ): { matches: Match[]; truncated: boolean; invalid: boolean } {
   const matches: Match[] = [];
+  // Whitespace-only queries are blank, so a stray space doesn't match every line.
   if (!query.trim()) return { matches, truncated: false, invalid: false };
   let pattern: RegExp;
   try {
