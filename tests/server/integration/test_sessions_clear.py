@@ -237,11 +237,11 @@ async def create_placed_session(
     host: bool = True,
     user: str | None = None,
     turns: int = 2,
-) -> tuple[str, list[str]]:
+) -> str:
     """Create a session of *turns* turns with run settings and placement.
 
     :param user: Creating user on an app with permissions, e.g. ``"alice@example.com"``.
-    :returns: The session id and its item ids (Q1, A1, Q2, A2).
+    :returns: The session id.
     """
     agent = await create_test_agent(client, user=user)
     resp = await client.post(
@@ -284,7 +284,7 @@ async def create_placed_session(
         store.set_host_id(session_id, _HOST_ID, "/work/repo", "feature/parser")
     if runner_id is not None:
         store.replace_runner_id(session_id, runner_id)
-    return session_id, [item.id for item in store.list_items(session_id).data]
+    return session_id
 
 
 def message_texts(store: SqlAlchemyConversationStore, session_id: str) -> list[str]:
@@ -324,7 +324,7 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     resolve_harness_as(monkeypatch, "claude-sdk")
     live_runner.clear_status = runner_status
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store, turns=turns)
+    source_id = await create_placed_session(client, store, turns=turns)
     file_store = SqlAlchemyFileStore(db_uri)
     file_store.create("notes.txt", bytes=5, session_id=source_id)
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
@@ -383,7 +383,7 @@ async def test_claude_sdk_clear_copies_no_item_written_while_it_runs(
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store, turns=0)
+    source_id = await create_placed_session(client, store, turns=0)
     live_runner.on_clear = lambda: store.append(
         source_id,
         [
@@ -421,7 +421,7 @@ async def test_claude_sdk_clear_refuses_a_message_sent_while_it_moves_the_sessio
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store)
+    source_id = await create_placed_session(client, store)
     sent: list[httpx.Response] = []
 
     async def send_from_another_tab() -> None:
@@ -473,7 +473,7 @@ async def test_claude_sdk_clear_still_redirects_when_the_notice_is_lost(
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store)
+    source_id = await create_placed_session(client, store)
     monkeypatch.setattr(
         routes_core,
         "_persist_external_conversation_item",
@@ -516,7 +516,7 @@ async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_repl
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store, runner_id=runner_id)
+    source_id = await create_placed_session(client, store, runner_id=runner_id)
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
     if not host_live:
@@ -560,7 +560,7 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store, host=host)
+    source_id = await create_placed_session(client, store, host=host)
     live_runner.on_clear = lambda: app.state.tunnel_registry.deregister(_RUNNER_ID)
     before = len((await client.get("/v1/sessions")).json()["data"])
 
@@ -653,7 +653,7 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     resolve_harness_as(monkeypatch, "claude-sdk")
     auth_live_runner.clear_status = clear_status
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(
+    source_id = await create_placed_session(
         auth_client,
         store,
         runner_id={"none": None, "starting": "runner_gone"}.get(placement, _RUNNER_ID),
