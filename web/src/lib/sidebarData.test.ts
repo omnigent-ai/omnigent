@@ -101,6 +101,23 @@ describe("scope refresh", () => {
     expect(next.windowSize).toBe(60);
     expect(next.pages[0].last_id).toBe("b");
   });
+  it("keeps equal-updated_at rows in one order across Load more and the next refresh", () => {
+    // Same-second rows arrive in the server's tie order, which is not id order.
+    const first = [row("b", 100), row("c", 100), row("a", 100)];
+    const second = [row("e", 100), row("d", 100)];
+    const loaded = refreshScopeWindow(undefined, sessionRowsPage(first, true), 3);
+    const afterLoadMore = appendScopePage(loaded, sessionRowsPage(second, false), 3);
+    const refreshed = refreshScopeWindow(
+      afterLoadMore,
+      sessionRowsPage([...first, ...second], false),
+      6,
+    );
+    expect(refreshed.pages[0].data.map((session) => session.id)).toEqual(
+      afterLoadMore.pages[0].data.map((session) => session.id),
+    );
+    // The continuation cursor stays the server's last row, not the last displayed one.
+    expect(refreshed.pages[0].last_id).toBe("d");
+  });
 });
 
 it("uses creation time for scope boundaries, appended pages, and capped refreshes", () => {

@@ -29,12 +29,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import sys
 import threading
-import time
+from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _log = logging.getLogger(__name__)
 
@@ -59,16 +64,6 @@ def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
     return resp.json().get("pending_elicitations") or []
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> threading.Thread:
@@ -151,7 +146,105 @@ def test_ask_user_question_form_renders_and_submits(
             "error"
         ]
 
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("surface", ["chat", "inbox"])
+def test_devin_question_hook_round_trip_survives_reload(
+    page: Page,
+    seeded_session: tuple[str, str],
+    surface: str,
+) -> None:
+    """A native Devin hook collects a web answer and returns it in Devin's input shape."""
+    base_url, session_id = seeded_session
+    question = "Which color should the browser demo use?"
+    tool_input = {
+        "questions": [
+            {
+                "question": question,
+                "header": "Color",
+                "multi_select": False,
+                "options": [
+                    {"label": "Blue", "description": "A calm primary color"},
+                    {"label": "Green", "description": "A fresh primary color"},
+                ],
+            }
+        ]
+    }
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "ask_user_question",
+        "tool_input": tool_input,
+        "tool_use_id": "question-web-round-trip",
+        "prompt_id": "prompt-web-round-trip",
+    }
+    repo_root = Path(__file__).resolve().parents[3]
+    hook = subprocess.Popen(
+        [sys.executable, "-m", "omnigent.harnesses.devin_native.hook"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=repo_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(repo_root),
+            "_OMNIGENT_SERVER_URL": base_url,
+            "_OMNIGENT_SESSION_ID": session_id,
+            "_OMNIGENT_AUTH_HEADERS": "{}",
+        },
+    )
+    try:
+        assert hook.stdin is not None
+        hook.stdin.write(json.dumps(payload))
+        hook.stdin.close()
+        page.goto(f"{base_url}/c/{session_id}" if surface == "chat" else f"{base_url}/inbox")
+
+        card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').filter(has_text=question)
+        expect(card.locator(_FORM)).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+        expect(card.get_by_text("Devin needs your input")).to_be_visible()
+        expect(card.get_by_text(question, exact=True)).to_be_visible()
+        row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+        awaiting = row.locator('[data-testid="session-state-badge"][data-state="awaiting"]')
+        expect(awaiting).to_be_visible()
+        pending = _pending_elicitations(base_url, session_id)
+        assert len(pending) == 1
+
+        page.reload()
+        expect(card.locator(_FORM)).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+        assert (
+            _pending_elicitations(base_url, session_id)[0]["elicitation_id"]
+            == pending[0]["elicitation_id"]
+        )
+        card.get_by_role("radio", name="Green", exact=False).check()
+        card.locator(_SUBMIT).click()
+
+        if surface == "chat":
+            answered = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
+            expect(answered).to_contain_text("Green")
+        else:
+            expect(card).to_have_count(0)
+        hook.wait(timeout=20)
+        assert hook.stdout is not None and hook.stderr is not None
+        stdout, stderr = hook.stdout.read(), hook.stderr.read()
+        assert hook.returncode == 0, stderr
+        verdict = json.loads(stdout)["hookSpecificOutput"]
+        assert verdict["hookEventName"] == "PreToolUse"
+        assert verdict["permissionDecision"] == "allow"
+        assert verdict["updatedInput"] == {
+            **tool_input,
+            "answers": {question: {"selected": ["Green"]}},
+        }
+        poll_until(lambda: not _pending_elicitations(base_url, session_id))
+        expect(awaiting).to_have_count(0)
+    finally:
+        if hook.poll() is None:
+            hook.kill()
+            hook.wait(timeout=5)
+        for pipe in (hook.stdin, hook.stdout, hook.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 @pytest.mark.timeout(180)
@@ -185,7 +278,7 @@ def test_answered_question_stays_outside_the_worked_fold(
 
     # The turn is now blocked on the mock gate, its first tool call already
     # rendered — the window the question lands in.
-    _wait_for(lambda: httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"])
+    poll_until(lambda: httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"])
 
     result_holder: dict = {}
     hook_thread = _post_ask_user_question(base_url, session_id, result_holder)

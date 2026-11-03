@@ -13,8 +13,6 @@ if (unexpectedArgs.length > 0) {
   throw new Error(`Unknown arguments: ${unexpectedArgs.join(", ")}`);
 }
 
-const backgroundKeys = new Set(["shellBackground", "sidebarBackground"]);
-
 function selectorFor(palette, mode) {
   if (palette.id === "omni") {
     return mode === "light" ? ":root:not(.dark):not([data-theme])" : ".dark:not([data-theme])";
@@ -31,31 +29,21 @@ function rule(selector, declarations) {
 function paletteRules(palette, mode) {
   const selector = selectorFor(palette, mode);
   const tokens = palette.tokens[mode];
-  const declarations = Object.entries(PALETTE_TOKEN_CSS_NAMES)
-    .filter(([key]) => !backgroundKeys.has(key))
-    .map(([key, cssName]) => [`--${cssName}`, tokens[key]]);
-
-  return [
-    rule(selector, declarations),
-    rule(`${selector} .app-shell`, [["background", tokens.shellBackground]]),
-    rule(`${selector} .conversations-sidebar`, [["background", tokens.sidebarBackground]]),
-  ];
+  const declarations = Object.entries(PALETTE_TOKEN_CSS_NAMES).map(([key, cssName]) => [
+    `--${cssName}`,
+    tokens[key],
+  ]);
+  return [rule(selector, declarations)];
 }
 
 function customRules(mode) {
   const selector =
     mode === "light" ? ':root:not(.dark)[data-theme="custom"]' : '.dark[data-theme="custom"]';
-  const declarations = Object.entries(PALETTE_TOKEN_CSS_NAMES)
-    .filter(([key]) => !backgroundKeys.has(key))
-    .map(([, cssName]) => [`--${cssName}`, `var(--custom-${mode}-${cssName})`]);
-
-  return [
-    rule(selector, declarations),
-    rule(`${selector} .app-shell`, [["background", `var(--custom-${mode}-shell-background)`]]),
-    rule(`${selector} .conversations-sidebar`, [
-      ["background", `var(--custom-${mode}-sidebar-background)`],
-    ]),
-  ];
+  const declarations = Object.values(PALETTE_TOKEN_CSS_NAMES).map((cssName) => [
+    `--${cssName}`,
+    `var(--custom-${mode}-${cssName})`,
+  ]);
+  return [rule(selector, declarations)];
 }
 
 const rules = PALETTES.flatMap((palette) =>
