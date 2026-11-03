@@ -451,7 +451,12 @@ def test_unassociated_selection_is_rejected(tracked: str) -> None:
 
 def test_auth_failure_preserves_pr_list(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github, "_gh", lambda *_args, **_kwargs: (1, "", "not authenticated"))
+    accounts = [{"login": "alice", "host": "github.com", "active": True}]
+    monkeypatch.setattr(github, "_list_accounts", lambda _: (True, accounts))
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _: "alice")
     info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert info["accounts"] == accounts
+    assert info["selected_account"] == "alice"
     assert info["authenticated"] is False
     assert info["selected_pr_url"] == B
     assert len(info["prs"]) == 2
@@ -820,5 +825,8 @@ def test_enterprise_without_auth_retains_selection(
     monkeypatch.setattr(github, "_gh", gh)
     info = github.github_info(tracked, session_id="session", pr_url=url)
     assert info["selected_pr_url"] == url
+    assert info["authenticated"] is False
+    assert info["accounts"] == []
+    assert info["selected_account"] is None
     assert info["pr"] is None
     assert len(info["prs"]) == 3

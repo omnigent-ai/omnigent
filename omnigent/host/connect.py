@@ -2871,7 +2871,11 @@ class HostProcess:
             source: str, session_id: str
         ) -> tuple[HostImportedLocalSession | None, str | None]:
             from omnigent.session_import.local import load_local_session
-            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+            from omnigent.session_import.models import (
+                ImportSource,
+                SessionImportNotFoundError,
+                import_item_payload,
+            )
 
             try:
                 local = load_local_session(cast(ImportSource, source), session_id)
@@ -2888,16 +2892,10 @@ class HostProcess:
                 HostImportedLocalSession(
                     external_session_id=local.external_session_id,
                     workspace=local.workspace,
-                    items=[
-                        {
-                            "type": item.type,
-                            "response_id": item.response_id,
-                            "data": item.data.model_dump(mode="json", exclude_none=True),
-                        }
-                        for item in local.items
-                    ],
+                    items=[import_item_payload(item) for item in local.items],
                     title=local.title,
                     source=local.source,
+                    archived=local.archived,
                 ),
                 None,
             )
@@ -3698,7 +3696,11 @@ class HostProcess:
         from pathlib import Path
 
         from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+        from omnigent.workspace_fs import (
+            WorkspaceReader,
+            WorkspaceReaderError,
+            read_repository_branches,
+        )
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -3724,25 +3726,29 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
-        # Re-detect the repository every time: a workspace that gains or loses
-        # a .git after its first request needs a reader of the matching kind.
-        repo_root = detect_git_root(Path(expanded))
-        with self._fs_readers_lock:
-            cached = self._fs_readers.get(expanded)
-            if cached is None or cached[0] != repo_root:
-                cached = (repo_root, WorkspaceReader(Path(expanded)))
-                self._fs_readers[expanded] = cached
-                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
-                    self._fs_readers.popitem(last=False)
-            self._fs_readers.move_to_end(expanded)
-            reader = cached[1]
         from omnigent.runner import pr_resource
 
         try:
-            with pr_resource.server_tracking(
-                params.get("server_tracked"), params.get("default_pr_url")
-            ):
-                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            if frame.op == "repository_branches":
+                payload = read_repository_branches(
+                    Path(expanded), cast("list[dict[str, str]]", params["repositories"])
+                )
+            else:
+                # A workspace can gain or lose its .git while the host is running.
+                repo_root = detect_git_root(Path(expanded))
+                with self._fs_readers_lock:
+                    cached = self._fs_readers.get(expanded)
+                    if cached is None or cached[0] != repo_root:
+                        cached = (repo_root, WorkspaceReader(Path(expanded)))
+                        self._fs_readers[expanded] = cached
+                        while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                            self._fs_readers.popitem(last=False)
+                    self._fs_readers.move_to_end(expanded)
+                    reader = cached[1]
+                with pr_resource.server_tracking(
+                    params.get("server_tracked"), params.get("default_pr_url")
+                ):
+                    payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3808,12 +3814,15 @@ class HostProcess:
             )
 
         try:
+            warnings: list[str] = []
+            skills = self._skill_discovery.discover(frame, root, warnings=warnings)
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                skills=self._skill_discovery.discover(frame, root),
+                skills=skills,
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
+                warnings=warnings,
             )
         except Exception as exc:
             _logger.exception(
@@ -4115,6 +4124,20 @@ class HostProcess:
                     status="failed",
                     error="failed to resolve Claude SDK model options",
                 )
+            if listing.source == "cli":
+                # A CLI-login listing replays the CLI-login catalog's wire ids; serve
+                # its rows (display names, aliases, default) from the same launch, which
+                # also refreshes a stale catalog in the background.
+                from omnigent.harnesses.claude_native.main import claude_launch_catalog
+
+                rows = await claude_launch_catalog(None)
+                if rows:
+                    return HostModelOptionsResultFrame(
+                        request_id=frame.request_id,
+                        status="ok",
+                        models=with_source(rows),
+                        routable_models=[model.id for model in listing.models],
+                    )
             if not listing.models:
                 # Subscription / CLI-login providers list nothing endpoint-side.
                 # The SDK drives the claude CLI, so the CLI's own probed rows
@@ -4195,6 +4218,21 @@ class HostProcess:
             )
         if op == "github_info":
             return r.github_info(session_id, cast("str | None", params.get("pr_url")))
+        if op == "github_review_threads":
+            return r.github_review_threads(
+                session_id,
+                str(params.get("pr_url", "")),
+                str(params.get("after", "")),
+                str(params.get("head_sha", "")),
+                str(params.get("base_sha", "")),
+            )
+        if op == "github_review_thread_comments":
+            return r.github_review_thread_comments(
+                session_id,
+                str(params.get("pr_url", "")),
+                str(params.get("thread_id", "")),
+                str(params.get("after", "")),
+            )
         if op == "github_changes":
             return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_diff":
@@ -4208,7 +4246,12 @@ class HostProcess:
                 base_sha=cast("str | None", params.get("base_sha")),
             )
         if op == "github_pr_diff":
-            return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_pr_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
@@ -4334,6 +4377,22 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 add=params.get("add", []),
                 remove=params.get("remove", []),
+            )
+        if op == "github_review_thread_create":
+            return pr_resource.create_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                body=params.get("body"),
+                anchor=params.get("anchor"),
+            )
+        if op == "github_review_thread_reply":
+            return pr_resource.reply_to_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                thread_id=str(params.get("thread_id", "")),
+                body=params.get("body"),
             )
         if op == "github_comment_create":
             return pr_resource.create_pr_comment(

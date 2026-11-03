@@ -1,6 +1,6 @@
 // Trigger-template fields shown in place of the scheduled-task prompt.
 
-import { PlusIcon, XIcon } from "lucide-react";
+import { PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -15,6 +15,7 @@ import { Label } from "@/components/scheduled/Label";
 import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
+  OMNIGENT_ATTRIBUTION,
   TRIGGER_TEMPLATES,
   triggerOperatorLabel,
   triggerServiceName,
@@ -52,6 +53,9 @@ export function TriggerTemplateFields({
 }) {
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
+  const authorAction = (
+    template.events.find((event) => event.id === fields.event) ?? template.events[0]
+  ).authorAction;
   const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
 
   function setCondition(index: number, next: TriggerCondition) {
@@ -77,11 +81,8 @@ export function TriggerTemplateFields({
       <div className="flex flex-col gap-1.5">
         <Label>Trigger</Label>
         <p className="text-sm text-muted-foreground">
-          Each run starts a session for each of these {template.itemPlural} created since the
-          previous run that meets every condition by then. To allow for slow search indexing, the
-          window starts 5 minutes early, so one created just before the previous run can still
-          count. Older {template.itemPlural} don&apos;t, even if they change or start matching
-          later.
+          Runs your automation on all new {template.itemPlural} that match these conditions. Older{" "}
+          {template.itemPlural} are skipped, even if they are edited to match later.
         </p>
         <div
           className="flex flex-col gap-2 rounded-lg border border-border p-3"
@@ -302,16 +303,37 @@ export function TriggerTemplateFields({
           </p>
         ) : (
           <p className="text-sm text-muted-foreground">
-            Each run checks for new {template.itemPlural} and starts up to {MAX_SESSIONS_PER_RUN}{" "}
-            sessions.
+            Each run handles up to {MAX_SESSIONS_PER_RUN} new {template.itemPlural}, oldest first.
+            The rest are picked up on the next run.
           </p>
         )}
       </div>
 
-      <p className="text-sm text-muted-foreground" data-testid="task-trigger-untrusted-note">
-        Anyone who can write in what you watch can try to steer these sessions, which run with your
-        tools.
-        {fields.linkBack && ` Link-back posts to ${triggerServiceName(source)} with your account.`}
+      <p
+        className="flex items-start gap-1.5 text-sm text-warning"
+        data-testid="task-trigger-tools-note"
+      >
+        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          This only works if the agent has {template.toolsExample} where this task runs. Without
+          one, each run stops and says so in its reply.
+        </span>
+      </p>
+
+      <p
+        className="flex items-start gap-1.5 text-sm text-warning"
+        data-testid="task-trigger-untrusted-note"
+      >
+        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          Anyone who can {authorAction} can add instructions that the agent may follow. The agent
+          runs with your tools and your permissions. Make sure you trust them.
+        </span>
+      </p>
+
+      <p className="text-sm text-muted-foreground" data-testid="task-trigger-attribution-note">
+        {fields.linkBack && `Link-back posts to ${triggerServiceName(source)} with your account. `}
+        Anything posted with your account ends with &quot;{OMNIGENT_ATTRIBUTION}&quot;.
       </p>
 
       {renderedPrompt !== "" && (

@@ -180,35 +180,29 @@ def test_ask_on_os_tools_asks_for_goose_native_tools(
     assert expected_preview in result["reason"]
 
 
-# ── ask_on_os_tools: opencode native permission categories ────────────────────
+# ── ask_on_os_tools: opencode native permission actions ───────────────────────
 
 
 @pytest.mark.parametrize(
     "tool,args,expected_preview",
     [
-        ("bash", {"command": "rm -rf /"}, "rm -rf /"),
+        ("shell", {"command": "rm -rf /"}, "rm -rf /"),
         ("read", {"path": "/etc/passwd"}, "/etc/passwd"),
         ("edit", {"path": "main.py"}, "main.py"),
         ("grep", {"pattern": "secret"}, "secret"),
         ("glob", {"pattern": "**/*.py"}, "**/*.py"),
     ],
-    ids=["bash", "read", "edit", "grep", "glob"],
+    ids=["shell", "read", "edit", "grep", "glob"],
 )
 def test_ask_on_os_tools_asks_for_opencode_native_tools(
     tool: str,
     args: dict[str, str],
     expected_preview: str,
 ) -> None:
-    """opencode's permission categories trigger ASK via the SSE forwarder's
+    """opencode 2.x permission actions trigger ASK via the forwarder's
     ``permission.asked`` → policy-evaluate path.
 
-    The forwarder maps opencode's ``permission`` field (e.g. ``"bash"``) onto
-    the policy tool name. Without these in the OS-tool set, enabling "Require
-    Approval for File & Shell Operations" never prompted in an opencode session
-    (the policy returned ALLOW). ``grep`` / ``glob`` are the categories the
-    overlapping lowercase pi set does not cover.
-
-    :param tool: opencode permission category, e.g. ``"bash"``.
+    :param tool: opencode permission action, e.g. ``"shell"``.
     :param args: Tool arguments dict.
     :param expected_preview: Substring that must appear in the reason.
     """
@@ -216,6 +210,48 @@ def test_ask_on_os_tools_asks_for_opencode_native_tools(
     assert result["result"] == "ASK"
     assert tool in result["reason"]
     assert expected_preview in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "tool", ["webfetch", "skill", "subagent", "question", "external_directory"]
+)
+def test_ask_on_os_tools_ignores_non_file_opencode_actions(tool: str) -> None:
+    """Non file/shell opencode actions are not OS tools."""
+    assert ask_on_os_tools(tc(tool, {}))["result"] == "ALLOW"
+
+
+@pytest.mark.parametrize("tool", ["opencode_list_mcp_resources", "opencode_read_mcp_resource"])
+def test_ask_on_os_tools_asks_for_opencode_mcp_builtins(tool: str) -> None:
+    """OpenCode's own MCP builtins reach MCP servers without a relay tool name."""
+    result = ask_on_os_tools(tc(tool, {}))
+    assert result["result"] == "ASK"
+    assert tool in result["reason"]
+
+
+def test_opencode_os_tool_set_is_v2_action_names() -> None:
+    from omnigent.policies.builtins.safety import _OPENCODE_NATIVE_OS_TOOLS
+
+    assert (
+        frozenset(
+            {
+                "shell",
+                "edit",
+                "read",
+                "grep",
+                "glob",
+                "opencode_list_mcp_resources",
+                "opencode_read_mcp_resource",
+            }
+        )
+        == _OPENCODE_NATIVE_OS_TOOLS
+    )
+
+
+def test_block_skills_blocks_opencode_skill_action() -> None:
+    """opencode's ``skill`` permission action carries the skill id as ``skill``."""
+    policy = block_skills(["deploy"])
+    assert policy(tc("skill", {"skill": "deploy"}))["result"] == "DENY"
+    assert policy(tc("skill", {"skill": "review"}))["result"] == "ALLOW"
 
 
 # ── ask_on_os_tools: codex in-process harness observed shell tool ─────────────
@@ -602,17 +638,23 @@ def test_ask_on_scheduled_task_change_asks_for_create_with_preview(data_name: st
             "target": "sys_scheduled_task_create",
             "data": {
                 "name": data_name,
-                "arguments": {"name": "nightly triage", "rrule": "FREQ=DAILY;BYHOUR=9"},
+                "arguments": {
+                    "name": "nightly triage",
+                    "prompt": "Triage new issues.",
+                    "permission_mode": None,
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                },
             },
         }
     )
     assert result["result"] == "ASK"
     assert "nightly triage" in result["reason"]
     assert "rrule=FREQ=DAILY;BYHOUR=9" in result["reason"]
+    assert "Effective task permission mode: agent default (no task override)" in result["reason"]
 
 
-def test_ask_on_scheduled_task_change_keeps_settings_visible_behind_a_long_prompt() -> None:
-    """Launch settings stay in the reason however long the prompt is; the prompt is sized only."""
+def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -> None:
+    """Launch settings and every prompt character remain in the approval reason."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     prompt = "Summarize everything. " * 300
@@ -651,11 +693,10 @@ def test_ask_on_scheduled_task_change_keeps_settings_visible_behind_a_long_promp
         "project_name=Nightly triage",
         "permission_mode=bypassPermissions",
         "max_cost_usd=2.5",
-        f"prompt={len(prompt)} chars",
     ):
         assert setting in reason, reason
-    assert "Summarize everything." not in reason
-    assert len(reason) < 800
+    assert prompt in reason
+    assert "Effective task permission mode: bypassPermissions" in reason
 
 
 @pytest.mark.parametrize(
@@ -680,6 +721,8 @@ def test_ask_on_scheduled_task_change_bounds_the_preview(
     arguments = dict(extras)
     arguments["name"] = "N" * 100
     arguments["timezone"] = "UTC"
+    arguments["prompt"] = "Run the review."
+    arguments["permission_mode"] = None
     result = ask_on_scheduled_task_change(
         {
             "type": "tool_call",
@@ -691,8 +734,11 @@ def test_ask_on_scheduled_task_change_bounds_the_preview(
     assert result["result"] == "ASK"
     assert "'" + "N" * 57 + "...'" in reason
     assert reason.count("v" * 58) == 0
-    assert f" (timezone=UTC, {expected}). Approve?" in reason
-    assert len(reason) < 330
+    assert "Settings: name=" in reason
+    assert f"timezone=UTC, permission_mode=None, {expected}" in reason
+    settings = reason.split("Settings: ", 1)[1].split("\nFull automation instructions:", 1)[0]
+    # These known fields use at most 102 characters; extras have a 200-character budget.
+    assert len(settings) <= 302
 
 
 def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
@@ -703,18 +749,33 @@ def test_ask_on_scheduled_task_change_names_missing_identifiers() -> None:
         {
             "type": "tool_call",
             "target": "sys_scheduled_task_create",
-            "data": {"name": "sys_scheduled_task_create", "arguments": {"rrule": "FREQ=HOURLY"}},
+            "data": {
+                "name": "sys_scheduled_task_create",
+                "arguments": {
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                    "rrule": "FREQ=HOURLY",
+                },
+            },
         }
     )
     update = ask_on_scheduled_task_change(
         {
             "type": "tool_call",
             "target": "sys_scheduled_task_update",
-            "data": {"name": "sys_scheduled_task_update", "arguments": {"state": "paused"}},
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "prompt": "Run it.",
+                    "permission_mode": None,
+                    "state": "paused",
+                },
+            },
         }
     )
-    assert "'(unnamed)' (rrule=FREQ=HOURLY)" in create["reason"]
-    assert "(no id) (state=paused)" in update["reason"]
+    assert "scheduled task '(unnamed)'" in create["reason"]
+    assert update["result"] == "DENY"
+    assert "scheduled_task_id" in update["reason"]
 
 
 def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
@@ -729,6 +790,8 @@ def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
                 "name": "sys_scheduled_task_update",
                 "arguments": {
                     "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Triage new issues.",
+                    "permission_mode": "auto",
                     "state": "paused",
                 },
             },
@@ -760,8 +823,8 @@ def test_ask_on_scheduled_task_change_allows_non_tool_events() -> None:
     assert result["result"] == "ALLOW"
 
 
-def test_ask_on_scheduled_task_change_handles_missing_arguments() -> None:
-    """Missing or non-dict arguments still ASK, with a readable fallback preview."""
+def test_ask_on_scheduled_task_change_denies_missing_arguments() -> None:
+    """Missing or non-dict review arguments fail closed."""
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
     result = ask_on_scheduled_task_change(
@@ -771,8 +834,98 @@ def test_ask_on_scheduled_task_change_handles_missing_arguments() -> None:
             "data": {"name": "sys_scheduled_task_update", "arguments": "not-a-dict"},
         }
     )
-    assert result["result"] == "ASK"
-    assert "details unavailable" in result["reason"]
+    assert result["result"] == "DENY"
+    assert "scheduled_task_id" in result["reason"]
+
+
+@pytest.mark.parametrize("action", ["create", "update"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("prompt", value) for value in [None, "", " \n\t", 1, ["instructions"]]]
+    + [("permission_mode", value) for value in ["", " \n\t", 1, ["auto"]]],
+)
+def test_scheduled_task_approval_denies_invalid_review_values(
+    action: str, field: str, value: object
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": f"sys_scheduled_task_{action}",
+            "data": {
+                "arguments": {
+                    "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+                    "prompt": "Review every issue.",
+                    "permission_mode": None,
+                    field: value,
+                }
+            },
+        }
+    )
+    assert result["result"] == "DENY"
+    assert f"{field} must be a non-empty string" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("action", "missing_field", "agent_id"),
+    [
+        ("create", "prompt", None),
+        ("create", "permission_mode", None),
+        ("update", "prompt", None),
+        ("update", "permission_mode", None),
+        ("update", "permission_mode", "another-agent"),
+    ],
+)
+def test_legacy_scheduled_task_approval_identifies_omitted_fields(
+    action: str, missing_field: str, agent_id: str | None
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    arguments = {
+        "scheduled_task_id": "0123456789abcdef0123456789abcdef",
+        "prompt": "Review every issue.",
+        "permission_mode": "auto",
+    }
+    arguments.pop(missing_field)
+    if agent_id is not None:
+        arguments["agent_id"] = agent_id
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": f"sys_scheduled_task_{action}",
+            "data": {"arguments": arguments},
+        }
+    )
+    if action == "create" and missing_field == "prompt":
+        assert result["result"] == "DENY"
+    else:
+        assert result["result"] == "ASK"
+        if missing_field == "prompt":
+            expected_prompt = "(unchanged; not supplied by legacy caller)"
+            expected_permission = "auto"
+        else:
+            expected_prompt = "Review every issue."
+            if action == "create":
+                expected_permission = "agent default (no task override)"
+            elif agent_id is not None:
+                expected_permission = (
+                    "existing override retained if agent_id is unchanged; "
+                    "cleared to agent default (no task override) if agent_id changes "
+                    "(not supplied by legacy caller)"
+                )
+            else:
+                expected_permission = "unchanged (not supplied by legacy caller)"
+        assert (
+            f"Effective task permission mode: {expected_permission}"
+            in result["reason"].splitlines()
+        )
+        assert result["reason"].endswith(
+            f"Full automation instructions:\n{expected_prompt}\nApprove?"
+        )
+        if action == "update":
+            assert "Legacy partial update" in result["reason"]
+            assert "unchanged values were not supplied" not in result["reason"]
 
 
 # ── block_skills: native Skill tool (PreToolUse hook path) ─────────────────

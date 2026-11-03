@@ -27,25 +27,34 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, bind_host_is_loopback
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
-    validate_permission_mode_agent_support,
     validate_session_agent,
     validate_session_model_metadata,
-    validate_session_permission_mode,
 )
 from omnigent.server.routes._sessions.helpers import (
     _read_state_entry,
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
+from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.scheduled.harness_settings import (
+    validate_scheduled_permission_mode,
+    validate_scheduled_permission_support,
+)
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.server.scheduled.telemetry import log_task_created
+from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
@@ -77,8 +86,7 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
-    # Native-harness permission mode (Claude Code), e.g. "acceptEdits". The fire
-    # path derives the runner's --permission-mode launch arg from it.
+    # Native-harness permission or execution mode; validated against the agent.
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)
     # "continue" sends every run's prompt into one session: ``session_id`` when
@@ -283,6 +291,70 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def require_scheduled_task_agent_origin(
+    request: Request,
+    *,
+    owner: str,
+    auth_provider: AuthProvider | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Bind a runner-marked mutation to the owner's source session and runner."""
+    if auth_provider is None or owner == RESERVED_USER_LOCAL:
+        return
+    if ORCHESTRATION_SOURCE_HEADER not in request.headers:
+        # UI/API saves and older runners do not opt into source verification.
+        return
+    source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
+    if not source_id or permission_store is None:
+        raise OmnigentError(
+            "Agent automation changes require a source session",
+            code=ErrorCode.FORBIDDEN,
+        )
+    try:
+        source = require_owned_session(
+            source_id,
+            owner,
+            conversation_store,
+            permission_store,
+        )
+    except OmnigentError as exc:
+        raise OmnigentError(
+            "Agent automation changes require an owned source session",
+            code=ErrorCode.FORBIDDEN,
+        ) from exc
+    is_loopback = request.client is not None and bind_host_is_loopback(request.client.host)
+    allowed_tokens = request.app.state.runner_tunnel_tokens
+    try:
+        try:
+            expected_runner_id = _expected_runner_id_from_headers(
+                request.headers, allowed_tunnel_tokens=allowed_tokens
+            )
+        except ValueError:
+            if not is_loopback:
+                raise
+            expected_runner_id = _expected_runner_id_from_headers(request.headers)
+        if expected_runner_id is None and allowed_tokens is None and not is_loopback:
+            raise ValueError("runner tunnel token is required")
+    except ValueError as exc:
+        raise OmnigentError(
+            "Agent automation changes require an authorized runner token",
+            code=ErrorCode.FORBIDDEN,
+        ) from exc
+    if (
+        not source.runner_id
+        or (expected_runner_id is not None and expected_runner_id != source.runner_id)
+        or (
+            RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+            and source.runner_id.startswith("runner_token_")
+        )
+    ):
+        raise OmnigentError(
+            "Agent automation changes require the source session's bound runner",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
@@ -364,10 +436,8 @@ def create_scheduled_tasks_router(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
         )
-        # Gate permission_mode on the resolved agent's harness (Claude Code
-        # only), mirroring the web dialog's capability gate. A non-Claude agent
-        # carrying a mode would break the fire (unknown --permission-mode flag).
-        await validate_permission_mode_agent_support(
+        # Each harness has its own permission vocabulary and launch flags.
+        await validate_scheduled_permission_support(
             permission_mode=permission_mode,
             agent=agent,
             agent_cache=agent_cache,
@@ -377,6 +447,12 @@ def create_scheduled_tasks_router(
             if sandbox_config is None or not sandbox_config.managed_launch_supported:
                 raise OmnigentError(
                     "managed sandboxes are not configured on this server",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if sandbox_config.default.manages_profiles:
+                raise OmnigentError(
+                    "Scheduled fresh sandboxes cannot select a profile yet; "
+                    "use a connected host or a default provider without profiles",
                     code=ErrorCode.INVALID_INPUT,
                 )
             return agent, None, validated_model, validated_effort
@@ -486,9 +562,16 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        require_scheduled_task_agent_origin(
+            request,
+            owner=owner,
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
         await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
-        permission_mode = validate_session_permission_mode(body.permission_mode)
+        permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
             owner=owner,
@@ -565,6 +648,12 @@ def create_scheduled_tasks_router(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             raise
+        log_task_created(
+            task,
+            owner=owner,
+            source=request.headers.get("x-omnigent-automation-source"),
+            template=request.headers.get("x-omnigent-automation-template"),
+        )
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False
@@ -756,6 +845,13 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
+        require_scheduled_task_agent_origin(
+            request,
+            owner=owner,
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:
@@ -775,7 +871,7 @@ def create_scheduled_tasks_router(
         new_copy: Agent | None = None
         if agent_changed:
             # A harness switch invalidates the per-agent settings stored beside
-            # it: a model id is provider-bound and permission_mode is Claude-only.
+            # it: model ids and permission vocabularies belong to the harness.
             # Clear whichever the caller did not resend so a switched task never
             # fires the new harness with the old one's flags.
             for stale in ("model_override", "reasoning_effort", "permission_mode"):
@@ -790,7 +886,7 @@ def create_scheduled_tasks_router(
             if "reasoning_effort" in fields:
                 fields["reasoning_effort"] = reasoning_effort
         if "permission_mode" in fields:
-            new_mode = validate_session_permission_mode(fields["permission_mode"])
+            new_mode = validate_scheduled_permission_mode(fields["permission_mode"])
             fields["permission_mode"] = new_mode
             # Gate a newly-SET mode on the (immutable) agent's harness. Clearing
             # to null needs no gate — the fire path injects nothing for null.
@@ -802,7 +898,7 @@ def create_scheduled_tasks_router(
                     permission_store=permission_store,
                     conversation_store=conversation_store,
                 )
-                await validate_permission_mode_agent_support(
+                await validate_scheduled_permission_support(
                     permission_mode=new_mode,
                     agent=agent,
                     agent_cache=agent_cache,
