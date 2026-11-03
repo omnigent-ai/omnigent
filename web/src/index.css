@@ -16,6 +16,15 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+
+/* CSS-pixel floor, independent of viewport width and pointer capability. */
+@utility mobile-touch-target {
+  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
 
 @theme inline {
   --font-heading: var(--font-sans);
@@ -1424,6 +1433,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-features: "liga" 0, "calt" 0;
 }
 
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {
@@ -2494,6 +2512,9 @@ html[data-electron-mac] .breadcrumb-folder {
 .turn-fold-row-enter {
   display: grid;
   grid-template-rows: 0fr;
+}
+/* Starts with the trace's collapse (the fold closes a frame after it mounts). */
+[data-state="closed"] > .turn-fold-row-enter {
   animation: turn-fold-row-in 200ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }
 .turn-fold-row-enter > * {
@@ -2501,9 +2522,12 @@ html[data-electron-mac] .breadcrumb-folder {
   overflow: hidden;
 }
 @media (prefers-reduced-motion: reduce) {
-  .turn-fold-row-enter {
+  [data-state="closed"] > .turn-fold-row-enter {
     grid-template-rows: 1fr;
     animation: none;
+  }
+  [data-state="closed"] > .turn-fold-row-enter > * {
+    overflow: visible;
   }
 }
 

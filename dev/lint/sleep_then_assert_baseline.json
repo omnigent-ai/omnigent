@@ -50,7 +50,7 @@
   "tests/host/test_connect.py": 2,
   "tests/host/test_mcp_tools.py": 1,
   "tests/runner/test_app_sessions_native_supervision.py": 2,
-  "tests/runner/test_app_sessions_native_workflow_messages.py": 5,
+  "tests/runner/test_app_sessions_native_workflow_messages.py": 4,
   "tests/runner/test_claude_pending_prompt_queue.py": 2,
   "tests/runner/test_mcp_manager.py": 2,
   "tests/runner/test_native_interrupt_runner.py": 3,

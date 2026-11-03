@@ -48,6 +48,7 @@ def _managed_info_body() -> str:
             "needs_setup": False,
             "databricks_features": False,
             "managed_sandboxes_enabled": True,
+            "session_fork_workspaces": True,
             "sandbox_provider": "modal",
             "sandbox_providers": ["modal"],
             "server_version": "0.0.0-e2e",
@@ -128,18 +129,30 @@ def test_fork_dialog_refuses_credential_repo_url_inline(
 
     page.get_by_test_id("fork-session-host-select").click()
     page.get_by_test_id("fork-session-sandbox-option").click()
-    page.get_by_test_id("fork-session-advanced-toggle").click()
-
-    repo_input = page.get_by_test_id("fork-session-sandbox-repo-input")
-    expect(repo_input).to_have_value(_SOURCE_REPO_URL)
+    repository = dialog.get_by_test_id("fork-session-sandbox-repo-row")
+    expect(repository).to_have_count(1)
+    expect(repository.get_by_role("textbox", name="Branch for fixture-repo")).to_have_value(
+        _SOURCE_REPO_BRANCH
+    )
     submit = page.get_by_test_id("fork-session-submit")
     expect(submit).to_be_enabled()
 
+    dialog.get_by_role("button", name="Remove fixture-repo").click()
+    repo_input = page.get_by_test_id("fork-session-sandbox-repo-input")
+    add = page.get_by_test_id("fork-session-sandbox-repo-add")
     repo_input.fill(_CRED_HTTPS_URL)
+    expect(add).to_be_disabled()
     expect(submit).to_be_disabled()
     repo_input.fill(_CRED_SCP_URL)
+    expect(add).to_be_disabled()
     expect(submit).to_be_disabled()
+    repo_input.press("Enter")
+    expect(repository).to_have_count(0)
 
-    # A well-formed URL must re-enable Clone — the fix must not over-reject.
+    # Add a well-formed repository before cloning; pending input is never dropped.
     repo_input.fill(_SOURCE_REPO_URL)
+    expect(add).to_be_enabled()
+    expect(submit).to_be_disabled()
+    add.click()
+    expect(repository).to_have_count(1)
     expect(submit).to_be_enabled()
