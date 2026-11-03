@@ -1,7 +1,8 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
-const { isHostThisMachine } = require("../src/hostIdentity");
+const { performance } = require("node:perf_hooks");
+const { createHostThisMachineChecker, isHostThisMachine } = require("../src/hostIdentity");
 
 it("imports browser IPC and checks injected identities without desktop js-yaml", () => {
   execFileSync(process.execPath, [
@@ -90,4 +91,83 @@ describe("isHostThisMachine", () => {
       assert.equal(enrollmentReads, hostId && hostId === localId ? 1 : 0);
     });
   }
+});
+
+describe("cached host eligibility", () => {
+  it("expires grants with the production clock despite a backward wall-clock correction", (t) => {
+    let elapsed = 0;
+    let wallTime = 60_000;
+    let live = true;
+    let enrollmentReads = 0;
+    t.mock.method(performance, "now", () => elapsed);
+    t.mock.method(Date, "now", () => wallTime);
+    const check = createHostThisMachineChecker({
+      cli: {
+        readLocalHostId: () => "local",
+        liveDaemonRecordFor: () => {
+          enrollmentReads++;
+          return live ? { host_id: "local" } : null;
+        },
+      },
+    });
+    const context = { hostId: "local", serverUrl: "https://server.example" };
+    assert.equal(check(context), true);
+    live = false;
+    wallTime -= 60_000;
+    elapsed = 999;
+    assert.equal(check(context), true);
+    assert.equal(enrollmentReads, 1);
+    elapsed = 1001;
+    assert.equal(check(context), false);
+    assert.equal(enrollmentReads, 2);
+  });
+
+  it("reuses reads within one second, isolates host/server pairs, and expires grants and denials", () => {
+    let now = 0;
+    let localId = "local";
+    let live = true;
+    let identityReads = 0;
+    let enrollmentReads = 0;
+    const check = createHostThisMachineChecker({
+      now: () => now,
+      cli: {
+        readLocalHostId: () => {
+          identityReads++;
+          return localId;
+        },
+        liveDaemonRecordFor: () => {
+          enrollmentReads++;
+          return live ? { host_id: localId } : null;
+        },
+      },
+    });
+    const context = { hostId: "local", serverUrl: "https://server.example" };
+    assert.equal(check(context), true);
+    assert.equal(check(context), true);
+    now = 999;
+    live = false;
+    assert.equal(check(context), true);
+    assert.equal(identityReads, 1);
+    assert.equal(enrollmentReads, 1);
+    assert.equal(check({ ...context, serverUrl: "https://other.example" }), false);
+    assert.equal(check({ ...context, hostId: "remote" }), false);
+    assert.equal(identityReads, 3);
+    assert.equal(enrollmentReads, 2);
+    now = 1000;
+    assert.equal(check(context), false);
+    assert.equal(identityReads, 4);
+    assert.equal(enrollmentReads, 3);
+    live = true;
+    now = 1999;
+    assert.equal(check(context), false);
+    now = 2000;
+    assert.equal(check(context), true);
+    localId = "changed";
+    now = 3000;
+    assert.equal(check(context), false);
+    assert.equal(identityReads, 6);
+    assert.equal(enrollmentReads, 4);
+    assert.equal(check({ ...context, hostId: null }), false);
+    assert.equal(identityReads, 6);
+  });
 });
