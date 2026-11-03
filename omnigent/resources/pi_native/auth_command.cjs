@@ -3,10 +3,14 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 
 const configPath = process.argv[2];
-try {
-  fs.unlinkSync(`${configPath}.result.json`);
-} catch (_) {
-  // A previous attempt may have no result.
+const refreshing = process.argv[3] === "--refresh";
+let config;
+if (!refreshing) {
+  try {
+    fs.unlinkSync(`${configPath}.result.json`);
+  } catch (_) {
+    // A previous attempt may have no result.
+  }
 }
 const started = performance.now();
 let deadline = Infinity;
@@ -32,15 +36,35 @@ function finish(kind, token) {
   killHelper();
   chunks = [];
   try {
-    const result = {
-      kind,
-      piPid: Number(process.env.OMNIGENT_PI_NATIVE_PID),
-      at: Date.now(),
-      elapsedMs: Math.round(performance.now() - started),
-    };
-    const temp = `${configPath}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(result), { mode: 0o600 });
-    fs.renameSync(temp, `${configPath}.result.json`);
+    if (kind === "ok" && refreshing && config.refreshIntervalMs > 0) {
+      const cachedAt = Date.now();
+      let expiresAt = cachedAt + config.refreshIntervalMs;
+      // JWT expiry can shorten the configured cache lifetime, never extend it.
+      if (token.split(".").length === 3) {
+        try {
+          const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+          if (typeof payload.exp === "number") expiresAt = Math.min(expiresAt, payload.exp * 1000);
+        } catch (_) {
+          expiresAt = 0;
+        }
+      }
+      const temp = `${config.cachePath}.${process.pid}.tmp`;
+      fs.writeFileSync(temp, JSON.stringify({ token, cachedAt, expiresAt, cwd: process.cwd() }), {
+        mode: 0o600,
+      });
+      fs.renameSync(temp, config.cachePath);
+    }
+    if (!refreshing) {
+      const result = {
+        kind,
+        piPid: Number(process.env.OMNIGENT_PI_NATIVE_PID),
+        at: Date.now(),
+        elapsedMs: Math.round(performance.now() - started),
+      };
+      const temp = `${configPath}.${process.pid}.tmp`;
+      fs.writeFileSync(temp, JSON.stringify(result), { mode: 0o600 });
+      fs.renameSync(temp, `${configPath}.result.json`);
+    }
   } catch (_) {
     // A failed private-file write must never publish a token.
     process.exit(1);
@@ -60,11 +84,26 @@ process.on("exit", () => {
 });
 
 try {
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   if (typeof config.command !== "string" || !config.command.trim()) {
     return finish("invalid_command");
   }
-  deadline = started + config.timeoutMs;
+  if (!refreshing && config.refreshIntervalMs > 0) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(config.cachePath, "utf8"));
+      if (
+        cached.cwd === process.cwd() &&
+        cached.expiresAt > Date.now() &&
+        typeof cached.token === "string" &&
+        cached.token.trim()
+      ) {
+        return finish("ok", cached.token);
+      }
+    } catch (_) {
+      // An absent or invalid cache uses the bounded request-time helper.
+    }
+  }
+  deadline = started + (refreshing ? config.refreshTimeoutMs : config.timeoutMs);
   timer = setTimeout(() => finish("timeout"), Math.max(0, deadline - performance.now()));
   child = spawn(config.command, {
     shell: true,

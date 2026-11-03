@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import pytest
@@ -310,6 +311,32 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests off the network: the host's workspace probe answers "unknown".
+
+    Any CLI path that starts or checks a host daemon on a server URL probes
+    that server. Tests that need an answer patch the probe themselves.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.daemon_lifecycle.probe_workspace_id", lambda url, **_kwargs: None
+    )
+
+
+@pytest.fixture
+def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+
+    Searches then end only on the deterministic work budget. Tests of the time
+    limit patch this clock themselves, which overrides the frozen one.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     """
     Clear smart routing's per-session runner-catalog cache after every test.
@@ -328,6 +355,28 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     module = sys.modules.get("omnigent.server.smart_routing")
     if module is not None:
         module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_databricks_auth_memory() -> None:
+    """
+    Start every test without shared Databricks token sources or remembered profiles.
+
+    Both are meant to outlive a single client: the token sources are
+    process-global and keyed by server URL, which tests reuse, and the
+    remembered profiles live in the shared test data dir. Either would let one
+    test's resolution answer another's. The reset runs before the test, not
+    at teardown, where a test's ``Path.unlink`` patch can still be active.
+
+    :returns: None.
+    """
+    chat = sys.modules.get("omnigent.chat")
+    if chat is not None:
+        chat._databricks_auth_cache.clear()
+    executor = sys.modules.get("omnigent.inner.databricks_executor")
+    if executor is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_TEST_OMNIGENT_DATA_DIR / executor._REMEMBERED_PROFILES_FILE)
 
 
 @pytest.fixture(autouse=True)
@@ -392,6 +441,26 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture(autouse=True)
+def _no_configured_codex_app_server_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[], tuple[str, ...]]:
+    """
+    Run Codex directly unless a test configures an app-server wrapper.
+
+    The wrapper is read from the user's ``~/.omnigent/config.yaml``, so without
+    this every native Codex session launch would depend on the machine.
+
+    :param monkeypatch: Fixture used to stub the config read.
+    :returns: The real config reader, for a test that exercises it.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    real = app_server._configured_app_server_command
+    monkeypatch.setattr(app_server, "_configured_app_server_command", lambda: ())
+    return real
 
 
 @pytest.fixture()
@@ -498,6 +567,15 @@ def _isolate_origin_identity(
     if "origin_identity_probe" in request.fixturenames:
         return
     monkeypatch.setattr(debug_logging, "_probe_workspace_id", lambda api_base: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_databricks_org_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register the org pin with monkeypatch so direct os.environ writes are undone."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, "")
+    monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
 
 
 @pytest.fixture

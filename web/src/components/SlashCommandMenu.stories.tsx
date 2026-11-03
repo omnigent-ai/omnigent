@@ -1,8 +1,15 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { BUILTIN_SLASH_COMMANDS, SlashCommandMenu } from "./SlashCommandMenu";
 
+// The menu scrolls past 22rem; the session-gated built-ins would push the
+// Skills section out of frame, so show the commands every session gets.
+const SESSION_GATED_COMMANDS = new Set(["/btw", "/side", "/mcp", "/clear", "/permissions"]);
+const defaultCommands = Object.fromEntries(
+  Object.entries(BUILTIN_SLASH_COMMANDS).filter(([name]) => !SESSION_GATED_COMMANDS.has(name)),
+);
+
 const commands = {
-  ...BUILTIN_SLASH_COMMANDS,
+  ...defaultCommands,
   "/review": "Review the current change for correctness, maintainability, and test coverage.",
   "/simplify": "Make recently changed code easier to understand without changing behavior.",
   "/test": "Run focused tests and explain any failures.",
@@ -40,7 +47,7 @@ export const CommandsAndSkills: Story = {
 export const ActiveSkill: Story = {
   args: {
     query: "",
-    activeIndex: Object.keys(BUILTIN_SLASH_COMMANDS).length,
+    activeIndex: Object.keys(defaultCommands).length,
   },
 };
 
@@ -52,14 +59,14 @@ export const FilteredSkill: Story = {
 };
 
 export const LoadingSkills: Story = {
-  args: { query: "", activeIndex: 0, commands: BUILTIN_SLASH_COMMANDS, skillsStatus: "loading" },
+  args: { query: "", activeIndex: 0, commands: defaultCommands, skillsStatus: "loading" },
 };
 
 export const LoadingFilteredSkills: Story = {
   args: {
     query: "review",
     activeIndex: -1,
-    commands: BUILTIN_SLASH_COMMANDS,
+    commands: defaultCommands,
     skillsStatus: "loading",
   },
 };

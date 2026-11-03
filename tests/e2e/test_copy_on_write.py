@@ -67,6 +67,7 @@ def test_copy_on_write_shared_across_prompts_and_terminal(
             },
             "terminals": {"bash": {"command": "bash", "os_env": "inherit"}},
         },
+        operator_authored=True,
     )
     session = create_runner_bound_session(http_client, agent_name=name, runner_id=live_runner_id)
 

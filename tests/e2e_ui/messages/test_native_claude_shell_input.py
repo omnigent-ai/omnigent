@@ -7,7 +7,6 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
 
 from .test_message_render_parity import _ASSISTANT, _USER, _WORKING, _ensure_chat_view, _send
@@ -23,10 +22,6 @@ def _requires_mockable_claude() -> None:
     for binary in ("claude", "tmux"):
         if shutil.which(binary) is None:
             pytest.skip(f"requires the real {binary} executable")
-    if any(path.is_file() for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS):
-        pytest.skip(
-            "machine-managed Claude settings override mock auth; use an isolated container"
-        )
 
 
 @pytest.mark.nightly
