@@ -331,15 +331,20 @@ def test_get_session_activity(
     conversation_store.set_session_live_status(a.id, "waiting")
     conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
     conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="child", parent_conversation_id=a.id
+    )
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
 
     result = conversation_store.get_session_activity(
-        [a.id, b.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+        [a.id, b.id, child.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
     )
 
-    assert set(result) == {a.id, b.id}
+    assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
     assert result[a.id].live_status == "waiting"
     assert result[a.id].total_cost_usd == cost
+    assert result[child.id].total_cost_usd == 5.0
     # A session that never reported a status has none recorded.
     assert result[b.id].live_status is None
     assert result[b.id].total_cost_usd is None

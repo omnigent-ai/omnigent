@@ -594,15 +594,20 @@ describe("run history", () => {
     else expect(screen.getByTestId("run-cost")).toHaveTextContent(`Session cost ${label}`);
   });
 
-  it("explains that continued runs share the current session total", () => {
+  it("explains shared totals while preserving costs for different sessions", () => {
     setTask(task({ sessionMode: "continue" }));
     setRuns([
       run({ conversationId: "c_1", sessionCostUsd: 2 }),
       run({ id: "run_2", conversationId: "c_1", sessionCostUsd: 2 }),
+      run({ id: "run_3", conversationId: "c_2", sessionCostUsd: 3 }),
     ]);
     renderPage();
-    expect(screen.getAllByTestId("run-cost")).toHaveLength(2);
-    expect(screen.getByText(/current total for the shared session/)).toBeInTheDocument();
+    expect(screen.getAllByTestId("run-cost").map((element) => element.textContent)).toEqual([
+      "Session cost $2.00",
+      "Session cost $2.00",
+      "Session cost $3.00",
+    ]);
+    expect(screen.getByText(/Runs sharing a session show the same total/)).toBeInTheDocument();
   });
   it("renders the empty state when there are no runs", () => {
     setTask(task());

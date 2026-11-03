@@ -481,10 +481,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
       <h2 className="mb-2 text-sm font-medium text-muted-foreground">Run history</h2>
       {runs?.some((run) => run.sessionCostUsd != null) && (
         <p className="mb-2 text-xs text-muted-foreground">
-          {task.sessionMode === "continue"
-            ? "Session cost is the current total for the shared session, across all its runs. "
-            : "Session cost is the current recorded total. "}
-          Separate sub-agent sessions are excluded.
+          Session cost is each session’s current recorded total. Runs sharing a session show the
+          same total. Separate sub-agent sessions are excluded.
         </p>
       )}
       {runsLoading ? (
