@@ -244,6 +244,9 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert child.json()["runner_id"] == runner_id
     expect(pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
 
+    expect(pane.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
+
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     page.get_by_test_id("side-chat-input").fill(followup)
     expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
     page.get_by_test_id("side-chat-send").click()
@@ -270,6 +273,62 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert question in followup_input
     assert "First side answer." in followup_input
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
+
+
+def test_side_chat_keeps_reader_scrolled_up_when_follow_up_reply_finishes(
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+    page: Page,
+) -> None:
+    """Scrolling up during a follow-up reply keeps the earlier text in view after it finishes."""
+    base_url, session_id = seeded_session
+    token = f"scroll-side-{session_id}"
+    earlier = "\n\n".join(
+        f"Earlier side-chat paragraph {n}: content the reader scrolls back to." for n in range(30)
+    )
+    streamed = " ".join(f"followupword{n:03d}" for n in range(60))
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": earlier},
+            {"text": streamed, "block": True, "stream": True, "chunk_delay": 0.1},
+        ],
+        key=token,
+        match=token,
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+        _start_side_chat(page, "panel", f"{token}: explain in detail")
+        pane = page.locator(".side-chat-backdrop")
+        first_paragraph = pane.get_by_text("Earlier side-chat paragraph 0:")
+        expect(pane.get_by_text("Earlier side-chat paragraph 29:")).to_be_in_viewport(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        assert len(side_chat_forks) == 1
+
+        page.get_by_test_id("side-chat-input").fill(f"{token}: a follow-up question")
+        page.get_by_test_id("side-chat-send").click()
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The side-chat follow-up")
+        expect(pane.get_by_test_id("working-indicator")).to_be_visible()
+        pane.locator(":scope > div.overflow-y-auto").hover()
+        page.mouse.wheel(0, -900)
+        expect(first_paragraph).to_be_in_viewport()
+
+        # Release the reply only once the reader has scrolled up.
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+        expect(pane.get_by_text("followupword059", exact=False)).to_be_attached(timeout=30_000)
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        # The snap lands when the turn commits, so hold briefly past completion.
+        page.wait_for_timeout(1_000)
+        expect(
+            first_paragraph, "the side chat scrolled the reader back to the bottom"
+        ).to_be_in_viewport(timeout=1_000)
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
 
 
 def test_runner_bound_side_chat_closes_without_stopping_parent(
@@ -485,6 +544,8 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     expect(drawer.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     assert len(side_chat_forks) == 1
 
+    expect(drawer.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
+
     drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
     reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)
     expect(reply_popup).to_be_visible()
@@ -648,9 +709,12 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         _wait_for_blocked_reply(page, mock_llm_server_url, "The side chat")
 
         parent_items = _items(base_url, session_id)
-        page.get_by_test_id("side-chat-input").fill(followup)
+        side_input = page.get_by_test_id("side-chat-input")
+        side_input.fill(followup)
+        # A draft swaps Interrupt for Send, so Escape interrupts as in the main composer.
+        expect(interrupt).to_have_count(0)
         with page.expect_response(f"**/v1/sessions/{child_id}/events") as interrupted:
-            interrupt.click()
+            side_input.press("Escape")
         assert interrupted.value.ok
         assert interrupted.value.request.post_data_json["type"] == "interrupt"
         expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)

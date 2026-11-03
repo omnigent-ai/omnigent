@@ -5,6 +5,9 @@ PR, else the PR of the workspace's branch) and which git provider serves it,
 and keeps the session's tracked PRs and their cached titles. Every step that
 talks to a forge goes through that provider's
 :class:`~omnigent.runner.git_providers.PullRequestFacet`.
+
+Servers that track a session's PRs vouch for the PR a request targets
+(:func:`server_tracking`), so it is served even if this host never recorded it.
 """
 
 from __future__ import annotations
@@ -13,10 +16,11 @@ import logging
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -31,11 +35,13 @@ from omnigent.git_providers import (
     providers,
     resolve_remote,
 )
+from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
+    ReviewThreadsFacet,
     local_git,
     unsupported_remote_info,
 )
@@ -43,6 +49,11 @@ from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, Sessi
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
+
+# Whether the server vouches for the request's PR, and its first PR for requests that select none.
+_SERVER_TRACKING: ContextVar[tuple[bool, str | None]] = ContextVar(
+    "server_tracked_pull_request", default=(False, None)
+)
 
 # Cache failed lookups too so inaccessible PRs do not add work to every poll.
 _PR_TITLE_CACHE_SECONDS = 300.0
@@ -59,6 +70,27 @@ _MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 # Bounds one reviewer edit's request body; the panel sends one reviewer at a time.
 _MAX_REVIEWER_EDIT = 100
+# GitHub's limits on a pull request's title and description.
+_MAX_TITLE_CHARS = 256
+_MAX_BODY_CHARS = 65536
+# GitHub's image limit. Videos may be 100 MB there, but the server and host
+# tunnels each carry the file base64-encoded (a third larger) in one 100 MB frame.
+_MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# Leading bytes of each media type GitHub accepts as an attachment, with its extension.
+_ATTACHMENT_SIGNATURES: tuple[tuple[int, bytes, str, str], ...] = (
+    (0, b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (0, b"\xff\xd8\xff", "image/jpeg", "jpg"),
+    (0, b"GIF87a", "image/gif", "gif"),
+    (0, b"GIF89a", "image/gif", "gif"),
+    (0, b"\x1a\x45\xdf\xa3", "video/webm", "webm"),
+)
+# ISO media files (``ftyp`` at byte 4) name their format in the next four bytes;
+# only video brands count, so HEIC and AVIF photos aren't sent as MP4.
+_QUICKTIME_BRAND = b"qt  "
+_MP4_BRANDS = frozenset(
+    (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ")
+)
 
 _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
 _DISCOVERY_LOCK = Lock()
@@ -181,17 +213,51 @@ def _serving_facet(root: str, reference: PullRequestRef | None) -> PullRequestFa
     return _facet(_resolve(root, reference).provider)
 
 
+@contextmanager
+def server_tracking(server_tracked: object, default_pr_url: object = None) -> Iterator[None]:
+    """Serve the PR the server tracks for the session, even if this host never recorded it.
+
+    :param server_tracked: The request's ``server_tracked`` value; servers that
+        track the session's PRs send ``True`` (``"1"`` in a query string).
+    :param default_pr_url: The server's first PR, served when the request selects none.
+    """
+    tracked = server_tracked is True or server_tracked in ("1", "true")
+    default = default_pr_url if tracked and isinstance(default_pr_url, str) else None
+    token = _SERVER_TRACKING.set((tracked, default or None))
+    try:
+        yield
+    finally:
+        _SERVER_TRACKING.reset(token)
+
+
 def _selected_pr(session_id: str, pr_url: str) -> SessionPullRequest:
     reference = PullRequestRef.from_url(pr_url)
-    for entry in SessionPrRegistry(session_id).list():
+    tracked, _ = _SERVER_TRACKING.get()
+    try:
+        entries = SessionPrRegistry(session_id).list()
+    except ValueError:
+        if not tracked:
+            raise
+        entries = []
+    for entry in entries:
         if entry.url == reference.url:
             return entry
+    if tracked:
+        now = time.time()
+        return SessionPullRequest(
+            **reference.model_dump(),
+            relationship="attached",
+            source="server",
+            first_seen_at=now,
+            last_seen_at=now,
+        )
     raise ValueError("This pull request is not associated with the session")
 
 
 def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullRequest | None:
     if session_id is None:
         return None
+    pr_url = pr_url or _SERVER_TRACKING.get()[1]
     if pr_url:
         return _selected_pr(session_id, pr_url)
     entries = SessionPrRegistry(session_id).list()
@@ -365,6 +431,7 @@ def _associate_discovered_pr(
             registry.record(
                 [inferred], relationship="inferred", source="branch", timestamp=timestamp
             )
+            pr_reports.notify(registry.session_id)
             if any(entry.url == inferred.url for entry in registry.list()):
                 candidate["selected_pr_url"] = inferred.url
                 try:
@@ -413,7 +480,10 @@ def _background_discovery(
 
 
 def pr_info(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
 ) -> dict[str, Any]:
     """Read the selected session PR and discover untracked providers from all remotes.
 
@@ -433,8 +503,13 @@ def pr_info(
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
     entries = registry.list()
-    reference = _selected_pr(session_id, pr_url) if pr_url else entries[0] if entries else None
+    default_url = pr_url or _SERVER_TRACKING.get()[1]
+    reference = (
+        _selected_pr(session_id, default_url) if default_url else entries[0] if entries else None
+    )
     tracked_providers = {entry.provider for entry in entries}
+    if reference is not None:
+        tracked_providers.add(reference.provider)
     resolutions = (
         []
         if pr_url
@@ -782,6 +857,278 @@ def update_pr_reviewers(
     return facet.edit_reviewers(root, reference, add=add_refs, remove=remove_refs)
 
 
+def _comment_body(body: object) -> str:
+    """Validate Markdown consistently for conversation comments and review replies."""
+    if not isinstance(body, str):
+        raise ValueError("Expected body to be a string")
+    if not body.strip():
+        raise ValueError("A comment cannot be empty")
+    if len(body) > _MAX_BODY_CHARS:
+        raise ValueError(f"A comment can be at most {_MAX_BODY_CHARS} characters")
+    return body
+
+
+def _review_target(
+    session_id: str | None, pr_url: str | None, *, replying: bool = False, creating: bool = False
+) -> tuple[ReviewThreadsFacet, SessionPullRequest]:
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: (
+            capabilities.review_thread_creation
+            if creating
+            else capabilities.review_thread_replies
+            if replying
+            else capabilities.review_threads
+        ),
+        unselected="Select a pull request to read or reply to a conversation",
+        unsupported="Review conversations on {kind} are not supported",
+    )
+    if not isinstance(facet, ReviewThreadsFacet):
+        raise ValueError("This provider does not support review conversations")
+    return facet, reference
+
+
+def _review_identifier(value: str) -> str:
+    if not value or len(value) > 1024 or any(character.isspace() for character in value):
+        raise ValueError("Invalid review conversation identifier or cursor")
+    return value
+
+
+def pr_review_threads(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    after: str = "",
+    head_sha: str = "",
+    base_sha: str = "",
+) -> dict[str, Any]:
+    """Read published conversations, requiring pinned revisions for pagination."""
+    facet, reference = _review_target(session_id, pr_url)
+    if after and (not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha)):
+        raise ValueError("Expected full head and base commit SHAs")
+    return facet.review_threads(
+        root,
+        reference,
+        after=_review_identifier(after) if after else "",
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+
+
+def pr_review_thread_comments(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    thread_id: str,
+    after: str,
+) -> dict[str, Any]:
+    """Read additional replies from a conversation on the selected PR."""
+    facet, reference = _review_target(session_id, pr_url)
+    return facet.review_thread_comments(
+        root, reference, thread_id=_review_identifier(thread_id), after=_review_identifier(after)
+    )
+
+
+def reply_to_pr_review_thread(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    thread_id: str,
+    body: object = None,
+) -> dict[str, Any]:
+    """Post a validated reply through the selected PR's provider."""
+    comment_body = _comment_body(body)
+    facet, reference = _review_target(session_id, pr_url, replying=True)
+    return facet.reply_to_review_thread(
+        root, reference, thread_id=_review_identifier(thread_id), body=comment_body
+    )
+
+
+def create_pr_review_thread(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    body: object = None,
+    anchor: object = None,
+) -> dict[str, Any]:
+    """Publish a new conversation on a line or same-side range at a known revision."""
+    comment_body = _comment_body(body)
+    facet, reference = _review_target(session_id, pr_url, creating=True)
+    if not isinstance(anchor, dict):
+        raise ValueError("Select lines in the diff before commenting")
+    path = anchor.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise ValueError("Expected a repository-relative file path")
+    if not isinstance(anchor.get("side"), str) or anchor["side"] not in {"LEFT", "RIGHT"}:
+        raise ValueError("Select lines on one side of the diff")
+    line, start = anchor.get("line"), anchor.get("start_line")
+    if (
+        type(line) is not int
+        or line < 1
+        or (start is not None and (type(start) is not int or start < 1 or start >= line))
+    ):
+        raise ValueError("Expected a positive line or increasing line range")
+    for field in ("head_sha", "base_sha"):
+        if not isinstance(anchor.get(field), str) or not _COMMIT_SHA.fullmatch(anchor[field]):
+            raise ValueError("Expected full head and base commit SHAs")
+    return facet.create_review_thread(
+        root,
+        reference,
+        body=comment_body,
+        anchor={
+            key: anchor.get(key)
+            for key in ("path", "side", "line", "start_line", "head_sha", "base_sha")
+        },
+    )
+
+
+def create_pr_comment(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    body: object = None,
+) -> dict[str, Any]:
+    """Post a non-empty Markdown comment to the selected tracked PR."""
+    body = _comment_body(body)
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.comment_posting,
+        unselected="Select a pull request to post a comment",
+        unsupported="Posting comments on {kind} is not supported",
+    )
+    return facet.create_comment(root, reference, body=body)
+
+
+def _details_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[PullRequestFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must support details editing."""
+    return _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.details_editing,
+        unselected="Select a pull request to edit its title or description",
+        unsupported="Editing {kind} titles and descriptions is not supported",
+    )
+
+
+def update_pr_details(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    title: object = None,
+    body: object = None,
+) -> dict[str, Any]:
+    """Replace the selected PR's title and/or description.
+
+    :param title: The new title, or ``None`` to keep it; surrounding space is dropped.
+    :param body: The new description in markdown, or ``None`` to keep it.
+    :returns: A ``session.github.pr_details`` with the PR's resulting title and body.
+    :raises ValueError: On a blank or oversized title, an oversized body, neither
+        field set, without a selected tracked PR, or when the provider refuses.
+    """
+    if title is not None and not isinstance(title, str):
+        raise ValueError("Expected title to be a string")
+    if body is not None and not isinstance(body, str):
+        raise ValueError("Expected body to be a string")
+    if title is None and body is None:
+        raise ValueError("Expected a title or body to update")
+    if title is not None:
+        title = title.strip()
+        if not title:
+            raise ValueError("A pull request title cannot be empty")
+        if len(title) > _MAX_TITLE_CHARS:
+            raise ValueError(f"A pull request title can be at most {_MAX_TITLE_CHARS} characters")
+    if body is not None and len(body) > _MAX_BODY_CHARS:
+        raise ValueError(f"A pull request description can be at most {_MAX_BODY_CHARS} characters")
+    facet, reference = _details_target(session_id, pr_url)
+    return facet.edit_details(root, reference, title=title, body=body)
+
+
+def _attachment_media_type(content: bytes) -> tuple[str, str] | None:
+    """Return the ``(content_type, extension)`` the bytes start with, or ``None``."""
+    for offset, signature, content_type, extension in _ATTACHMENT_SIGNATURES:
+        if content[offset : offset + len(signature)] == signature:
+            return content_type, extension
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if content[4:8] == b"ftyp":
+        if content[8:12] == _QUICKTIME_BRAND:
+            return "video/quicktime", "mov"
+        if content[8:12] in _MP4_BRANDS:
+            return "video/mp4", "mp4"
+    return None
+
+
+def _attachment_name(name: object, extension: str) -> str:
+    """A file name for the upload, ending in ``extension`` as GitHub requires."""
+    stem = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if isinstance(name, str) else ""
+    stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+    stem = re.sub(r"[^\w.-]+", "-", stem).strip("-.")[:100] or "attachment"
+    return f"{stem}.{extension}"
+
+
+def upload_pr_attachment(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    name: object = None,
+    content: bytes = b"",
+) -> dict[str, Any]:
+    """Upload an image or video to embed in the selected PR's description.
+
+    The media type comes from the content, not the client, since GitHub stores
+    whatever type it is told.
+
+    :param name: The file's name; its extension is replaced to match the content.
+    :returns: A ``session.github.pr_attachment`` with the ``url`` to embed.
+    :raises ValueError: On an empty, unsupported, or oversized file, without a
+        selected tracked PR, or when the provider refuses the upload.
+    """
+    if not content:
+        raise ValueError("The attachment is empty")
+    media = _attachment_media_type(content)
+    if media is None:
+        raise ValueError("Attach a PNG, JPEG, GIF, or WebP image, or an MP4, MOV, or WebM video")
+    content_type, extension = media
+    limit = (
+        _MAX_VIDEO_ATTACHMENT_BYTES
+        if content_type.startswith("video/")
+        else _MAX_IMAGE_ATTACHMENT_BYTES
+    )
+    if len(content) > limit:
+        kind = "A video" if content_type.startswith("video/") else "An image"
+        raise ValueError(f"{kind} can be at most {limit // (1024 * 1024)} MB")
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.attachment_uploads,
+        unselected="Select a pull request to attach files to",
+        unsupported="Attaching files to a {kind} is not supported",
+    )
+    return facet.upload_attachment(
+        root,
+        reference,
+        name=_attachment_name(name, extension),
+        content_type=content_type,
+        content=content,
+    )
+
+
 def pr_changed_files(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
@@ -794,13 +1141,27 @@ def pr_changed_files(
 
 
 def pr_diff(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
     """Return the selected PR as one unified diff; empty when no provider serves it."""
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
+    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+        if (
+            not head_sha
+            or not base_sha
+            or not _COMMIT_SHA.fullmatch(head_sha)
+            or not _COMMIT_SHA.fullmatch(base_sha)
+        ):
+            raise ValueError("Expected full head and base commit SHAs")
+        return facet.review_diff(root, reference, head_sha=head_sha, base_sha=base_sha)
     return facet.pr_diff(root, reference)
 
 

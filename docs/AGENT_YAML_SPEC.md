@@ -899,9 +899,10 @@ is read the same way from a `config.yaml` bundle and a single-file agent YAML.
 `sys_agent_list` / `sys_agent_get`.
 
 The session read tools (`sys_session_list` / `sys_session_get_history` /
-`sys_session_get_info`), `sys_session_rename`, and `sys_cancel_task` have no
-key: any agent in a multi-agent session needs the reads, and async work handles
-point at the cancel tool.
+`sys_session_get_info`), `sys_session_rename`, `ui_open_file`, and `sys_cancel_task`
+have no key: any agent in a multi-agent session needs the reads, and async work
+handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
+session viewers to open a workspace-relative file without switching sessions.
 
 ## Complete example
 

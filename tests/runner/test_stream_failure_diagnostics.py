@@ -17,18 +17,21 @@ edges at the runner's HTTP boundary (``POST /v1/sessions/{id}/events``):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+from omnigent.server.schemas import CancelledEvent
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
@@ -104,7 +107,19 @@ def _make_app(
     harness_client = _StreamErrorHarnessClient(
         frames
         if frames is not None
-        else [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
+        else [
+            _sse(
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_drop",
+                        "model": "plain-agent",
+                        "created_at": 1,
+                        "status": "in_progress",
+                    },
+                }
+            )
+        ],
         cause=cause,
         before_drop=before_drop,
     )
@@ -128,8 +143,8 @@ def _register_terminal(registry: TerminalRegistry, conv_id: str, instance: Any) 
     registry._by_conversation.setdefault(conv_id, {})[("bash", "main")] = instance
 
 
-async def _failed_event_message(app: Any, conv_id: str) -> tuple[dict[str, Any], str]:
-    """Drive one failing streamed turn; return (failed event, error message)."""
+async def _streamed_events(app: Any, conv_id: str) -> list[dict[str, Any]]:
+    """Drive one streamed turn through the runner's HTTP boundary."""
     transport = httpx.ASGITransport(app=app)
     events: list[dict[str, Any]] = []
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
@@ -156,6 +171,12 @@ async def _failed_event_message(app: Any, conv_id: str) -> tuple[dict[str, Any],
                     if line.startswith("data:"):
                         with contextlib.suppress(json.JSONDecodeError):
                             events.append(json.loads(line[len("data:") :].strip()))
+    return events
+
+
+async def _failed_event_message(app: Any, conv_id: str) -> tuple[dict[str, Any], str]:
+    """Drive one failing streamed turn; return (failed event, error message)."""
+    events = await _streamed_events(app, conv_id)
     failed = [e for e in events if e.get("type") == "response.failed"]
     assert len(failed) == 1, f"expected exactly one response.failed event, got {events}"
     message = failed[0].get("error", {}).get("message", "")
@@ -278,7 +299,9 @@ async def test_oversized_pane_snapshot_is_bounded(tmp_path: Path) -> None:
     assert len(pane_block) <= 4100, len(pane_block)
 
 
-def _required_terminal_exit(session_was_idle: bool) -> TerminalExitEvent:
+def _required_terminal_exit(
+    session_was_idle: bool, expected_close: bool = False, closed_outside_omnigent: bool = False
+) -> TerminalExitEvent:
     """Build the exit the registry publishes when the session's Claude pane dies."""
     return TerminalExitEvent(
         session_id=_CONV_ID,
@@ -291,6 +314,8 @@ def _required_terminal_exit(session_was_idle: bool) -> TerminalExitEvent:
         cwd="/work",
         last_output="Waiting for the API key helper...\n",
         session_was_idle=session_was_idle,
+        expected_close=expected_close,
+        closed_outside_omnigent=closed_outside_omnigent,
     )
 
 
@@ -309,6 +334,51 @@ def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
         ):
             statuses.append(item)
     return statuses
+
+
+@pytest.mark.asyncio
+async def test_expected_close_of_the_pane_publishes_no_terminal_failure() -> None:
+    """A pane Omnigent closed to fail its turn adds no terminal-exit failure.
+
+    The delivery timeout's own error fails the turn. The exit that the reap
+    causes must not publish a second ``session.status: failed``, which would
+    show the person two failure banners and make the terminal exit the
+    first error.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    app = _make_app(cause="unused")
+    publish = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        publish(_required_terminal_exit(session_was_idle=False, expected_close=True))
+        statuses = _failed_statuses(_CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert statuses == []
+
+
+@pytest.mark.asyncio
+async def test_session_killed_outside_omnigent_names_that_cause() -> None:
+    """A Claude session killed outside Omnigent fails with that cause, not a bare exit."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.launch_failure import TERMINAL_CLOSED_OUTSIDE_OMNIGENT
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    app = _make_app(cause="unused")
+    publish = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        publish(_required_terminal_exit(session_was_idle=False, closed_outside_omnigent=True))
+        statuses = _failed_statuses(_CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert len(statuses) == 1
+    error = statuses[0]["error"]
+    assert error["code"] == "required_terminal_exited"
+    assert error["title"] == TERMINAL_CLOSED_OUTSIDE_OMNIGENT.title
+    assert error["message"].startswith(TERMINAL_CLOSED_OUTSIDE_OMNIGENT.title)
 
 
 @pytest.mark.asyncio
@@ -362,12 +432,22 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
 
 
 @pytest.mark.asyncio
-async def test_earlier_terminal_exit_does_not_relabel_a_later_stream_drop() -> None:
+@pytest.mark.parametrize("voluntary", [False, True])
+async def test_earlier_terminal_exit_does_not_relabel_a_later_stream_drop(
+    voluntary: bool,
+) -> None:
     """An exit recorded before the turn started is not blamed for its drop."""
     from omnigent.runner.app import _session_event_queues_ref
 
     app = _make_app(cause="stream dropped mid-turn")
-    app.state.session_resource_registry._terminal_exit_publisher(_required_terminal_exit(True))
+    exit_event = _required_terminal_exit(True)
+    if voluntary:
+        exit_event = replace(
+            exit_event,
+            exit_status=0,
+            last_output="Resume this session with:\nclaude --resume earlier-session",
+        )
+    app.state.session_resource_registry._terminal_exit_publisher(exit_event)
     try:
         failed, message = await _failed_event_message(app, _CONV_ID)
     finally:
@@ -375,3 +455,65 @@ async def test_earlier_terminal_exit_does_not_relabel_a_later_stream_drop() -> N
 
     assert failed["error"]["code"] == "connection_error", failed
     assert "stream dropped mid-turn" in message, message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_name", ["claude", "qwen", "antigravity"])
+@pytest.mark.parametrize("tracked_child", [False, True])
+@pytest.mark.parametrize("response_created", [False, True])
+async def test_clean_terminal_exit_cancels_its_live_stream(
+    terminal_name: str, tracked_child: bool, response_created: bool
+) -> None:
+    """Releasing a voluntarily exited pane must not turn its stream into a failure."""
+    from omnigent.runner.app import _session_event_queues_ref
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    exit_event = replace(
+        _required_terminal_exit(session_was_idle=False),
+        terminal_name=terminal_name,
+        terminal_id=f"terminal_{terminal_name}_main",
+        exit_status=0,
+        last_output=(
+            "Resume this session with:\nclaude --resume synthetic-session"
+            if terminal_name == "claude"
+            else "Goodbye!"
+        ),
+    )
+    app = _make_app(
+        cause="stream closed by harness release",
+        frames=None if response_created else [],
+        before_drop=lambda: publish["exit"](exit_event),
+    )
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    work = None
+    if tracked_child:
+        work = subagent_work.register_subagent_work(
+            parent_session_id="synthetic-parent",
+            child_session_id=_CONV_ID,
+            agent="worker",
+            title="worker",
+        )
+        subagent_work._session_inboxes_ref["synthetic-parent"] = asyncio.Queue()
+    try:
+        events = await _streamed_events(app, _CONV_ID)
+        statuses = _failed_statuses(_CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+        subagent_work.unregister_subagent_work(_CONV_ID)
+        subagent_work._session_inboxes_ref.pop("synthetic-parent", None)
+
+    assert [event for event in events if event.get("type") == "response.failed"] == []
+    cancelled = [event for event in events if event.get("type") == "response.cancelled"]
+    assert len(cancelled) == int(response_created)
+    if response_created:
+        response = CancelledEvent.model_validate(cancelled[0]).response
+        assert response.id == "resp_drop"
+        assert response.status == "cancelled"
+        assert response.model == "plain-agent"
+        assert response.created_at == 1
+    assert statuses == []
+    assert _CONV_ID not in app.state.live_response_id
+    assert _CONV_ID not in app.state.required_terminal_exit_errors
+    if work is not None:
+        assert work.status == "cancelled"
