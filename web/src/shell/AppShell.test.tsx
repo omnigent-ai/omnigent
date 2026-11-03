@@ -2256,8 +2256,8 @@ describe("Sidebar across the md breakpoint", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
   });
 
-  it("applies closed to a new session without preventing manual expansion or workspace use", () => {
-    mockViewportWidth(1280);
+  it("applies closed to a new session across resizing without preventing manual expansion or workspace use", () => {
+    const resize = mockViewportWidth(1280);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc?sidebar=closed", undefined, {
       rerenderable: true,
@@ -2270,10 +2270,15 @@ describe("Sidebar across the md breakpoint", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
 
+    resize(390);
     fireEvent.click(screen.getByTestId("nav-session"));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(screen.getByTestId("url-params")).toHaveTextContent("sidebar=closed&panel=agents");
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    resize(390);
+    resize(1280);
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 

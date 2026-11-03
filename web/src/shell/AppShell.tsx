@@ -411,7 +411,10 @@ function AppShellImpl() {
   // Retain closed for reloads. Reapply on navigation, while allowing manual
   // expansion and unrelated workspace query changes within the current page.
   useLayoutEffect(() => {
-    if (sidebarRequested === "closed" && !inSettings) setSidebarOpen(false);
+    if (sidebarRequested === "closed" && !inSettings) {
+      sidebarOpenBeforeNarrowRef.current = false;
+      setSidebarOpen(false);
+    }
   }, [sidebarRequested, location.pathname, inSettings, setSidebarOpen]);
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
