@@ -10,7 +10,7 @@ sign-ins does. This file is how that manager tells Omnigent.
 `~/.omnigent/mcp-auth-status.json`, or the absolute path in
 `OMNIGENT_MCP_AUTH_STATUS_FILE` when `$HOME` is read-only or sandboxed. The path is
 used as given, so a relative value resolves against the host process's working
-directory.
+directory; the host passes runners that resolved path.
 
 ## Format
 
@@ -41,7 +41,8 @@ server: Claude Code connects MCP servers only when the session starts, so at its
 turn the session reconnects a server that failed to connect before the sign-in. A server
 the CLI is still connecting, or whose reconnect fails, is checked again at the following turn.
 A reconnect that times out is not retried, so a hung server cannot stall every later turn;
-to try it again, set the entry back to `sign_in_required` and then to `connected`, or start a new session.
+to try it again, start a new session, or set the entry back to `sign_in_required`, send a
+turn so the session sees that state, and then set it to `connected`.
 
 ## Rules the reader enforces
 

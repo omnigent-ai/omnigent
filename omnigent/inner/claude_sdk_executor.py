@@ -926,6 +926,16 @@ def _claude_mcp_auth_statuses() -> dict[str, str]:
     }
 
 
+def _inventory_mcp_server_name(live_name: str) -> str:
+    """The host inventory's name for a server; the CLI adds ``plugin:<plugin>:`` to plugin ones."""
+    prefix, plugin_sep, rest = live_name.partition(":")
+    if prefix == "plugin" and plugin_sep:
+        _plugin, server_sep, server = rest.partition(":")
+        if server_sep and server:
+            return server
+    return live_name
+
+
 async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
     """Reconnect the named servers the CLI reports failed; return those to check again."""
     try:
@@ -936,32 +946,36 @@ async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) 
         logger.warning("Reading MCP status before reconnect failed", exc_info=True)
         return names
     retry: set[str] = set()
-    failed: list[str] = []
+    # (live CLI name, host inventory name) of each server to reconnect.
+    failed: list[tuple[str, str]] = []
     servers = response.get("mcpServers")
     for server in servers if isinstance(servers, list) else []:
-        name = server.get("name") if isinstance(server, Mapping) else None
-        if not isinstance(name, str) or name not in names:
+        live_name = server.get("name") if isinstance(server, Mapping) else None
+        if not isinstance(live_name, str):
+            continue
+        name = _inventory_mcp_server_name(live_name)
+        if name not in names:
             continue
         status = server.get("status")
         if status == "pending":
             retry.add(name)
         elif status in ("failed", "needs-auth"):
-            failed.append(name)
+            failed.append((live_name, name))
 
-    async def reconnect(name: str) -> None:
+    async def reconnect(live_name: str, name: str) -> None:
         try:
             await asyncio.wait_for(
-                client.reconnect_mcp_server(name), timeout=_MCP_RECONNECT_TIMEOUT_SECONDS
+                client.reconnect_mcp_server(live_name), timeout=_MCP_RECONNECT_TIMEOUT_SECONDS
             )
         except TimeoutError:
             # Not retried, so a server that hangs cannot stall every later turn.
-            logger.warning("Reconnecting MCP server %r timed out", name)
+            logger.warning("Reconnecting MCP server %r timed out", live_name)
         except Exception:
-            logger.warning("Reconnecting MCP server %r failed", name, exc_info=True)
+            logger.warning("Reconnecting MCP server %r failed", live_name, exc_info=True)
             retry.add(name)
 
     # Run together, so several hung servers delay the turn by one timeout at most.
-    await asyncio.gather(*(reconnect(name) for name in failed))
+    await asyncio.gather(*(reconnect(live_name, name) for live_name, name in failed))
     return retry
 
 

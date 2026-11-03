@@ -3754,6 +3754,8 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
         "docs": "pending",
         "slow": "failed",
         "stuck": "failed",
+        # The CLI names plugin servers ``plugin:<plugin>:<server>``; the host reports ``<server>``.
+        "plugin:figma:figjam": "failed",
         "linear": "connected",
         "jira": "failed",
         "codex-docs": "failed",
@@ -3810,7 +3812,13 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
 
     pending = "sign_in_required"
     report(
-        notes=pending, wiki=pending, docs=pending, slow=pending, stuck=pending, jira="connected"
+        notes=pending,
+        wiki=pending,
+        docs=pending,
+        slow=pending,
+        stuck=pending,
+        figjam=pending,
+        jira="connected",
     )
     client = await start_turn()
     assert await start_turn() is client
@@ -3822,6 +3830,7 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
         docs="connected",
         slow="connected",
         stuck="connected",
+        figjam="connected",
         linear="connected",
         jira="connected",
     )
@@ -3832,17 +3841,17 @@ async def test_reused_client_reconnects_mcp_servers_signed_in_after_connect(
     # A failed reconnect neither fails the turn nor stops the remaining servers.
     status_unavailable = False
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki", "slow", "stuck"]
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "plugin:figma:figjam"]
     # Hung reconnects overlap, so together they delay the turn by one timeout.
     assert {"slow", "stuck"} in hung_together
 
     # The failed and still-pending servers are checked again; the timed-out ones are not.
     live["docs"] = "failed"
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki", "slow", "stuck", "notes", "docs"]
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "plugin:figma:figjam", "notes", "docs"]
 
     assert await start_turn() is client
-    assert reconnects == ["notes", "wiki", "slow", "stuck", "notes", "docs"]
+    assert reconnects == ["notes", "wiki", "slow", "stuck", "plugin:figma:figjam", "notes", "docs"]
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:

@@ -1033,6 +1033,9 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    # Runners start in the session workspace, so resolve a relative override here.
+    if auth_status_file := env.get("OMNIGENT_MCP_AUTH_STATUS_FILE"):
+        env["OMNIGENT_MCP_AUTH_STATUS_FILE"] = str(Path(auth_status_file).expanduser().absolute())
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
