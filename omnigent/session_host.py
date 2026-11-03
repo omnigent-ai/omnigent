@@ -10,14 +10,19 @@ import httpx
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
 
 _session_hosts: dict[str, str] = {}
+_keyless_sessions: set[str] = set()
 
 
-def set_session_host(session_id: str, host_id: str | None) -> None:
-    """Record a session's host; an absent host clears stale routing."""
+def set_session_host(session_id: str, host_id: str | None, *, keyless: bool = False) -> None:
+    """Record the host and whether this session uses the default replica."""
     if host_id:
         _session_hosts[session_id] = host_id
     else:
         _session_hosts.pop(session_id, None)
+    if keyless:
+        _keyless_sessions.add(session_id)
+    else:
+        _keyless_sessions.discard(session_id)
 
 
 def get_session_host(session_id: str) -> str | None:
@@ -48,6 +53,7 @@ async def route_session_request(request: httpx.Request) -> None:
     base_path, separator, route = path.partition("/v1/sessions")
     if not separator or (route and not route.startswith("/")):
         return
+    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
     host_id = None
     if (
         not route
@@ -60,9 +66,13 @@ async def route_session_request(request: httpx.Request) -> None:
             body = None
         if isinstance(body, dict) and isinstance(body.get("host_id"), str):
             host_id = body["host_id"]
+        elif isinstance(body, dict) and body.get("host_type") == "managed":
+            return
     elif route.startswith("/"):
-        host_id = get_session_host(unquote(route.split("/")[1]))
-    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+        session_id = unquote(route.split("/")[1])
+        if session_id in _keyless_sessions:
+            return
+        host_id = get_session_host(session_id)
     request.headers.update(
         databricks_request_headers(
             str(request.url.copy_with(path=unquote(base_path), query=None)), host_id=host_id

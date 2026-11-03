@@ -1,0 +1,36 @@
+name: Build and validate a candidate
+goal: Produce a revision, repair it using independent evidence, and summarize the accepted result.
+max_parallel_members: 3
+teams:
+  - id: delivery
+    strategy: owner
+    lead: owner
+    members:
+      - id: owner
+        role: Own the outcome, request review when useful, and repair failed candidates.
+        agent_id: replace-with-registered-agent-id
+        placement:
+          kind: sandbox
+          provider: arclet
+      - id: reviewer
+        role: Review the owner's candidate and return concrete evidence.
+        agent_id: replace-with-registered-agent-id
+        placement:
+          kind: sandbox
+          provider: arclet
+nodes:
+  - id: implement
+    goal: Produce a result artifact with an immutable revision and satisfy the tests gate.
+    team: delivery
+    max_rounds: 3
+    gates:
+      - id: tests
+        kind: external
+        artifacts: [result]
+  - id: constraints
+    goal: Identify constraints independently while implementation awaits validation.
+    team: delivery
+  - id: summarize
+    goal: Summarize the validated result revision and the constraints.
+    team: delivery
+    depends_on: [implement, constraints]

@@ -1,0 +1,33 @@
+name: Investigate a slow service
+goal: Identify likely latency causes and produce an evidence-based action plan.
+max_parallel_members: 3
+max_nodes: 12
+member_timeout_seconds: 1800
+teams:
+  - id: investigation
+    lead: analyst
+    members:
+      - id: analyst
+        role: Analyze evidence, identify causes, and synthesize the team's findings.
+        agent_id: replace-with-registered-agent-id
+        placement:
+          kind: sandbox
+          provider: arclet
+      - id: reviewer
+        role: Challenge assumptions and identify missing evidence or risks.
+        agent_id: replace-with-registered-agent-id
+        placement:
+          kind: sandbox
+          provider: arclet
+nodes:
+  - id: investigate
+    goal: Examine the supplied latency evidence and identify hypotheses to validate.
+    team: investigation
+    allow_expansion: true
+  - id: constraints
+    goal: Identify operational constraints and the acceptable cost of proposed changes.
+    team: investigation
+  - id: plan
+    goal: Combine the evidence and constraints into a prioritized action plan.
+    team: investigation
+    depends_on: [investigate, constraints]

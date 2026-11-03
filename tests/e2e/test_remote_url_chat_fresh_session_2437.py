@@ -29,11 +29,13 @@ Run locally (mock LLM, no real API key needed)::
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -51,7 +53,9 @@ from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
+    get_mock_requests,
     poll_session_until_terminal,
+    release_mock_gate,
     reset_mock_llm,
     send_user_message_to_session,
 )
@@ -644,28 +648,95 @@ def test_run_one_shot_without_online_runner_fails_cleanly(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("interactive", [False, True], ids=["one-shot", "interactive"])
+@pytest.mark.parametrize(
+    "entry_point", ["one-shot", "interactive", "workflow", "workflow-parallel", "workflow-consult"]
+)
 def test_run_launches_a_runner_on_this_machines_host(
     mock_llm_server_url: str | None,
     tmp_path: Path,
-    interactive: bool,
+    entry_point: str,
 ) -> None:
     """With only a connected host (no runner), the CLI has the server launch one there.
 
     The CLI and ``omnigent host`` share a home, so the CLI is "this machine's"
-    host. Both entry points must answer through the launched runner. Only the
-    one-shot stops it on exit; interactive runners keep the host-owned lifecycle.
+    host. Each entry point answers through the launched runner. Workflow owners
+    reuse their session across CLI restarts and validation feedback. Parallel
+    contributors overlap; owner consultations launch the requested specialist. Only the
+    one-shot stops its runner on exit; other sessions keep the host-owned lifecycle.
     """
     suffix = uuid.uuid4().hex[:6]
     agent_name = f"host-launch-{suffix}"
     model = f"mock-{suffix}"
     marker = f"HOST_LAUNCH_OK_{suffix}"
+    interactive = entry_point == "interactive"
+    is_workflow = entry_point.startswith("workflow")
+    parallel = entry_point == "workflow-parallel"
+    consult = entry_point == "workflow-consult"
+    if is_workflow and mock_llm_server_url is None:
+        pytest.skip("Workflow launch assertions require scripted model replies")
     yaml_path = _write_agent_yaml(
         tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
     )
     reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(mock_llm_server_url, [{"text": marker}] * 4, key=model)
-    with isolated_local_server(tmp_path / "server", extra_args=["--agent", str(yaml_path)]) as url:
+    replies = (
+        [
+            {
+                "text": json.dumps(
+                    {
+                        "summary": marker,
+                        "artifacts": [
+                            {
+                                "id": "result",
+                                "kind": "report",
+                                "uri": "test://candidate",
+                                "revision": revision,
+                            }
+                        ],
+                    }
+                )
+            }
+            for revision in ("draft", "repaired", "report")
+        ]
+        if is_workflow
+        else [{"text": marker}] * 8
+    )
+    server_args = ["--agent", str(yaml_path)]
+    reviewer_model = f"mock-reviewer-{suffix}"
+    reviewer_name = f"reviewer-{suffix}"
+    if is_workflow:
+        reviewer_spec = _write_agent_yaml(
+            tmp_path,
+            agent_name=reviewer_name,
+            model=reviewer_model,
+            mock_llm_server_url=mock_llm_server_url,
+        )
+        server_args.extend(["--agent", str(reviewer_spec)])
+        configure_mock_llm(
+            mock_llm_server_url,
+            [
+                {"text": f"{marker}_REVIEWER_EVIDENCE", "block": parallel},
+                {"text": f"{marker}_REPORT_REVIEW"},
+            ],
+            key=reviewer_model,
+        )
+        if parallel:
+            replies.insert(0, {"text": f"{marker}_LEAD_EVIDENCE", "block": True})
+            replies.insert(3, {"text": f"{marker}_REPORT_EVIDENCE"})
+        elif consult:
+            replies.insert(
+                0,
+                {
+                    "text": json.dumps(
+                        {
+                            "summary": "Review the evidence",
+                            "status": "consult",
+                            "consult_members": ["reviewer"],
+                        }
+                    )
+                },
+            )
+    configure_mock_llm(mock_llm_server_url, replies, key=model)
+    with isolated_local_server(tmp_path / "server", extra_args=server_args) as url:
         with isolated_host(
             tmp_path / "host",
             url,
@@ -690,7 +761,221 @@ def test_run_launches_a_runner_on_this_machines_host(
                     if agent["name"] == agent_name
                 )
 
-                if interactive:
+                if is_workflow:
+                    reviewer_id = next(
+                        agent["id"]
+                        for agent in client.get("/v1/agents").json()["data"]
+                        if agent["name"] == reviewer_name
+                    )
+                    definition = tmp_path / "workflow.yaml"
+                    definition.write_text(
+                        _yaml.safe_dump(
+                            {
+                                "name": "Host workflow",
+                                "goal": "Produce an evidence summary",
+                                "teams": [
+                                    {
+                                        "id": "team",
+                                        "lead": "lead",
+                                        "strategy": "parallel" if parallel else "owner",
+                                        "members": [
+                                            {
+                                                "id": member,
+                                                "role": member,
+                                                "agent_id": registered_id
+                                                if member == "lead"
+                                                else reviewer_id,
+                                                "placement": {
+                                                    "kind": "host",
+                                                    "host_id": host.host_id,
+                                                    "workspace": os.getcwd(),
+                                                },
+                                            }
+                                            for member in ("lead", "reviewer")
+                                        ],
+                                    }
+                                ],
+                                "nodes": [
+                                    {
+                                        "id": "research",
+                                        "goal": "Research",
+                                        "team": "team",
+                                        "gates": [
+                                            {
+                                                "id": "tests",
+                                                "kind": "external",
+                                                "artifacts": ["result"],
+                                            }
+                                        ],
+                                    },
+                                    {
+                                        "id": "report",
+                                        "goal": "Report",
+                                        "team": "team",
+                                        "depends_on": ["research"],
+                                    },
+                                ],
+                            }
+                        )
+                    )
+                    report_path = tmp_path / "workflow-report.json"
+                    state_path = tmp_path / "workflow-state"
+
+                    def run_workflow(*arguments: str) -> subprocess.CompletedProcess[str]:
+                        return subprocess.run(
+                            [
+                                sys.executable,
+                                "-m",
+                                "omnigent.workflows",
+                                *arguments,
+                                "--state",
+                                str(state_path),
+                            ],
+                            env=isolated_process_env(
+                                host.home,
+                                {"TERM": "dumb", "OMNIGENT_FEATURES": "dynamic_workflows"},
+                                None,
+                            ),
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            timeout=180,
+                        )
+
+                    if parallel:
+                        with ThreadPoolExecutor(max_workers=1) as pool:
+                            running = pool.submit(
+                                run_workflow,
+                                str(definition),
+                                "--server",
+                                url,
+                                "--output",
+                                str(report_path),
+                            )
+                            try:
+                                poll_until(
+                                    lambda: all(
+                                        get_mock_requests(mock_llm_server_url, key=key)
+                                        for key in (model, reviewer_model)
+                                    ),
+                                    timeout_s=90,
+                                )
+                                assert not running.done(), (
+                                    "Both contributions must still be blocked"
+                                )
+                                concurrent = client.get(
+                                    "/v1/sessions", params={"visibility": "all", "limit": 10}
+                                ).json()["data"]
+                                assert len(concurrent) == 2, concurrent
+                                assert len({session["runner_id"] for session in concurrent}) == 2
+                                assert {session["agent_id"] for session in concurrent} == {
+                                    registered_id,
+                                    reviewer_id,
+                                }
+                                for key in (model, reviewer_model):
+                                    assert (
+                                        len(get_mock_requests(mock_llm_server_url, key=key)) == 1
+                                    )
+                            finally:
+                                release_mock_gate(mock_llm_server_url)
+                                release_mock_gate(mock_llm_server_url)
+                            proc = running.result(timeout=120)
+                    else:
+                        proc = run_workflow(
+                            str(definition), "--server", url, "--output", str(report_path)
+                        )
+                    assert proc.returncode == 3, (
+                        proc.stdout + proc.stderr + host.log_path.read_text()
+                    )
+                    waiting = json.loads(report_path.read_text())
+                    assert waiting["nodes"]["report"]["status"] == "pending"
+                    research = waiting["nodes"]["research"]
+                    expected_members = {"lead", "reviewer"} if parallel or consult else {"lead"}
+                    assert set(research["members"]) == expected_members
+                    assert len(
+                        {member["session_id"] for member in research["members"].values()}
+                    ) == len(expected_members)
+                    if parallel or consult:
+                        assert (
+                            research["contributions"]["reviewer"] == f"{marker}_REVIEWER_EVIDENCE"
+                        )
+                        if parallel:
+                            assert research["contributions"]["lead"] == f"{marker}_LEAD_EVIDENCE"
+                        owner_request = get_mock_requests(mock_llm_server_url, key=model)[-1]
+                        assert f"{marker}_REVIEWER_EVIDENCE" in json.dumps(owner_request["input"])
+                    initial_members = research["members"]
+                    owner_session = waiting["nodes"]["research"]["members"]["lead"]["session_id"]
+                    initial_round = 2 if consult else 1
+                    for round_number, passed in (
+                        (initial_round, False),
+                        (initial_round + 1, True),
+                    ):
+                        event_path = tmp_path / "gate-event.json"
+                        event_path.write_text(
+                            json.dumps(
+                                {
+                                    "id": f"tests-{round_number}",
+                                    "kind": "gate_result",
+                                    "node_id": "research",
+                                    "candidate_id": f"research-{round_number}",
+                                    "gate_id": "tests",
+                                    "outcome": {
+                                        "passed": passed,
+                                        "detail": "passed" if passed else "repair the draft",
+                                    },
+                                }
+                            )
+                        )
+                        queued = run_workflow("--event", str(event_path))
+                        assert queued.returncode == 0, queued.stdout + queued.stderr
+                        proc = run_workflow("--resume", "--output", str(report_path))
+                        assert proc.returncode == (0 if passed else 3), proc.stdout + proc.stderr
+                        resumed = json.loads(report_path.read_text())
+                        owner = resumed["nodes"]["research"]
+                        assert owner["members"]["lead"]["session_id"] == owner_session
+                        assert owner["candidate_id"] == f"research-{initial_round + 1}"
+                        assert len(owner["members"]["lead"]["turns"]) == (
+                            3 if parallel or consult else 2
+                        )
+                        if "reviewer" in initial_members:
+                            assert owner["members"]["reviewer"] == initial_members["reviewer"]
+                    report = json.loads(report_path.read_text())
+                    assert report["status"] == "succeeded"
+                    assert report["nodes"]["research"]["artifacts"][0]["revision"] == "repaired"
+                    assert all(node["summary"] == marker for node in report["nodes"].values())
+                    assert len(
+                        {
+                            member["session_id"]
+                            for node in report["nodes"].values()
+                            for member in node["members"].values()
+                        }
+                    ) == (4 if parallel else 3 if consult else 2)
+                    downstream = get_mock_requests(mock_llm_server_url, key=model)[-1]
+                    assert "dependency_results" in json.dumps(downstream["input"])
+                    assert "repaired" in json.dumps(downstream["input"])
+                    if parallel or consult:
+                        assert f"{marker}_REVIEWER_EVIDENCE" in _assistant_text(
+                            url, research["members"]["reviewer"]["session_id"]
+                        )
+                    else:
+                        assert get_mock_requests(mock_llm_server_url, key=reviewer_model) == []
+                    (tmp_path / "workflow-evidence.json").write_text(
+                        json.dumps(
+                            {
+                                "entry_point": entry_point,
+                                "status": report["status"],
+                                "nodes": report["nodes"],
+                                "model_requests": {
+                                    "lead": get_mock_requests(mock_llm_server_url, key=model),
+                                    "reviewer": get_mock_requests(
+                                        mock_llm_server_url, key=reviewer_model
+                                    ),
+                                },
+                            },
+                            indent=2,
+                        )
+                    )
+                elif interactive:
                     pexpect = pytest.importorskip("pexpect")
                     pyte = pytest.importorskip("pyte")
                     config = host.home / ".omnigent" / "config.yaml"
@@ -767,21 +1052,30 @@ def test_run_launches_a_runner_on_this_machines_host(
                 sessions = client.get(
                     "/v1/sessions", params={"visibility": "all", "limit": 10}
                 ).json()["data"]
-                assert len(sessions) == 1, sessions
-                assert sessions[0].get("host_id") == host.host_id, sessions
-                assert sessions[0]["agent_id"] == registered_id, sessions
-                assert sessions[0]["workspace"] == os.getcwd(), sessions
-                if interactive:
-                    assert marker in _assistant_text(url, sessions[0]["id"])
+                expected_sessions = 4 if parallel else 3 if consult else 2 if is_workflow else 1
+                assert len(sessions) == expected_sessions, sessions
+                assert all(session.get("host_id") == host.host_id for session in sessions), (
+                    sessions
+                )
+                expected_agents = (
+                    {registered_id, reviewer_id} if parallel or consult else {registered_id}
+                )
+                assert {session["agent_id"] for session in sessions} == expected_agents, sessions
+                assert all(session["workspace"] == os.getcwd() for session in sessions), sessions
+                if interactive or is_workflow:
+                    assert all(
+                        marker in _assistant_text(url, session["id"]) for session in sessions
+                    )
                     assert any(
                         runner.get("online") for runner in client.get("/v1/runners").json()["data"]
                     )
-                    response = client.post(
-                        f"/v1/sessions/{sessions[0]['id']}/events",
-                        json={"type": "stop_session", "data": {}},
-                        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
-                    )
-                    response.raise_for_status()
+                    for session in sessions:
+                        response = client.post(
+                            f"/v1/sessions/{session['id']}/events",
+                            json={"type": "stop_session", "data": {}},
+                            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+                        )
+                        response.raise_for_status()
                 # The one-shot or the test stops only its own launched runner.
                 poll_until(
                     lambda: (

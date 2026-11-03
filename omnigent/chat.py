@@ -34,6 +34,7 @@ from omnigent_client import (
     OmnigentClient,
     RegisteredAgent,
     RegisteredAgentCatalog,
+    SessionsNamespace,
     SessionToolCallInfo,
     ToolCallable,
     ToolCallInfo,
@@ -2970,6 +2971,16 @@ async def _persisted_turn_text(
     client: OmnigentClient,
     session_id: str,
 ) -> str | None:
+    """Read the current turn's durable output through an SDK client."""
+    return await _persisted_session_turn_text(client.sessions, session_id)
+
+
+async def _persisted_session_turn_text(
+    sessions: SessionsNamespace,
+    session_id: str,
+    *,
+    after_item_id: str | None = None,
+) -> str | None:
     """
     Read the latest turn's persisted assistant text from a session.
 
@@ -2996,9 +3007,11 @@ async def _persisted_turn_text(
     the target bug (a completed turn flipped to ``failed`` by a
     transport disconnect) always persists a ``completed`` item.
 
-    :param client: Connected SDK client bound to the session's server.
+    :param sessions: Sessions namespace bound to the session's server.
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
+    :param after_item_id: Optional transcript boundary captured before sending.
+        Ignore older output while the new user message is still queued.
     :returns: The current turn's assistant text, or ``None`` when this
         turn persisted no ``completed`` assistant text (a genuine
         failure the caller should surface).
@@ -3010,9 +3023,7 @@ async def _persisted_turn_text(
         # fetching ``asc`` would return the oldest items and miss this
         # turn entirely.
         recent: _ResponseOutput = (
-            await client.sessions.list_items(
-                session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
-            )
+            await sessions.list_items(session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc")
         ).data
     except ClientOmnigentError as exc:
         # The reconcile read is itself best-effort: if the items
@@ -3027,6 +3038,8 @@ async def _persisted_turn_text(
     # side of the current user message and is never collected.
     this_turn_assistant: _ResponseOutput = []
     for item in recent:
+        if after_item_id is not None and item.get("id") == after_item_id:
+            return None
         if item.get("type") != "message":
             continue
         role = item.get("role")

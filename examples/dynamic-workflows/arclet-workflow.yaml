@@ -1,0 +1,32 @@
+name: Investigate and propose a change
+goal: Produce an evidence-based recommendation.
+teams:
+- id: delivery
+  strategy: owner
+  lead: owner
+  members:
+  - id: owner
+    role: Own the outcome and repair failed candidates.
+    agent_id: replace-with-registered-agent-id
+    placement:
+      kind: sandbox
+      provider: arclet
+nodes:
+- id: investigate
+  team: delivery
+  goal: Investigate the problem and report evidence.
+- id: propose
+  team: delivery
+  goal: Propose a change. Return an artifact named result with its revision.
+  depends_on:
+  - investigate
+  gates:
+  - id: review
+    kind: external
+    artifacts:
+    - result
+- id: summarize
+  team: delivery
+  goal: Summarize the accepted recommendation.
+  depends_on:
+  - propose
