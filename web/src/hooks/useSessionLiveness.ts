@@ -296,9 +296,10 @@ export function useSessionHostConnecting(
     attempt.deadline = null;
     attempt.restartPending = false;
     attempt.launchPending = false;
-  } else if (turnEnded && attempt.turnOwned && sandboxStatus === null) {
+  } else if (turnEnded && attempt.turnOwned && sandboxStatus === null && !attempt.launchPending) {
     // A cancelled or failed send stops its relaunch; expire rather than clear,
-    // so only a new launch or turn reopens the window.
+    // so only a new launch or turn reopens the window. A launch that lands in
+    // the same update as the turn's end is independent and keeps its window.
     if (attempt.deadline !== null) attempt.deadline = Math.min(attempt.deadline, now);
     attempt.restartPending = false;
     attempt.launchPending = false;

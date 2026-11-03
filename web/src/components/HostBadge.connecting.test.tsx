@@ -308,4 +308,32 @@ describe("composer host chip while a session connects", () => {
     openHostMenu();
     expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
   });
+  it("gives a launch delivered with the turn's end its own full window", () => {
+    // A send owns the attempt on an asleep session; a snapshot then lands the
+    // turn's terminal status and a new launch marker in one update.
+    const idle = { sessionId: "conv_1", createdAtS: nowS() - 3_600, onReconnect: vi.fn() };
+    const { rerender } = render(<OpenSession {...idle} turnActive={false} />);
+    rerender(<OpenSession {...idle} turnActive />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+    act(() => vi.advanceTimersByTime(10_000));
+    const relaunched = { ...idle, launchedAt: Date.now() };
+    rerender(<OpenSession {...relaunched} turnActive={false} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+    act(() => vi.advanceTimersByTime(10_000));
+    hostOnlineMock.mockReturnValue(false);
+    rerender(<OpenSession {...relaunched} turnActive={false} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+    openHostMenu();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).toBeNull();
+    closeHostMenu();
+
+    act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 10) * 1000 - 1));
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+    act(() => vi.advanceTimersByTime(1));
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+    openHostMenu();
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+  });
 });
