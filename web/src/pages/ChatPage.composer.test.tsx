@@ -4172,6 +4172,11 @@ describe("Composer MCP status command", () => {
           "Couldn’t load this session’s agent, so only managed MCP servers are shown.",
         ) !== null,
       ).toBe(agentFailed);
+      expect(
+        screen.queryByText(
+          "Loading this session’s agent; only managed MCP servers are shown so far.",
+        ) !== null,
+      ).toBe(!agentLoaded && !agentFailed);
       expect(screen.getByRole("link", { name: "Go to Settings" })).toHaveAttribute(
         "href",
         "/settings/harnesses/claude-native?host=host_sdk",

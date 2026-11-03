@@ -18,6 +18,7 @@ from playwright.sync_api import Page, expect
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import reserve_port
+from tests._helpers.polling import poll_until
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import configure_mock_llm
 
@@ -209,9 +210,9 @@ class _SignInGate:
             thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
             thread.start()
             stack.callback(self._stop, server, thread)
-            deadline = time.monotonic() + 15
-            while not server.started and thread.is_alive() and time.monotonic() < deadline:
-                time.sleep(0.05)
+            poll_until(
+                lambda: server.started or not thread.is_alive(), timeout_s=15, interval_s=0.05
+            )
             assert server.started, "gated MCP server did not start"
             self._cleanup = stack.pop_all()
         return self
@@ -311,12 +312,13 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
             _write_auth_status(home, _USER_SERVER, "connected")
             _send(page, f"Read the note. {second}")
             _wait_reply(page, "turn two finished")
-            deadline = time.monotonic() + 15
-            items = ""
-            while _NOTE_TEXT not in items and time.monotonic() < deadline:
-                items = json.dumps(client.get(f"/v1/sessions/{session_id}/items").json())
-                time.sleep(0.5)
-
-    assert _NOTE_TEXT in items, (
-        "the session never reached the MCP server signed in after it started"
-    )
+            try:
+                poll_until(
+                    lambda: (
+                        _NOTE_TEXT
+                        in json.dumps(client.get(f"/v1/sessions/{session_id}/items").json())
+                    ),
+                    timeout_s=15,
+                )
+            except AssertionError:
+                pytest.fail("the session never reached the MCP server signed in after it started")

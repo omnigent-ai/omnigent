@@ -2612,8 +2612,10 @@ function ComposerImpl(
           ? "Loading MCP servers…"
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
-            : sessionHarness === "claude-sdk" && sessionAgent === undefined && sessionAgentFailed
-              ? "Couldn’t load this session’s agent, so only managed MCP servers are shown."
+            : sessionHarness === "claude-sdk" && sessionAgent === undefined
+              ? sessionAgentFailed
+                ? "Couldn’t load this session’s agent, so only managed MCP servers are shown."
+                : "Loading this session’s agent; only managed MCP servers are shown so far."
               : undefined;
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness

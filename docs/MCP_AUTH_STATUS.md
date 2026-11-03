@@ -40,6 +40,8 @@ Flipping a `claude` entry to `connected` also lets a running claude-sdk session 
 server: Claude Code connects MCP servers only when the session starts, so at its next
 turn the session reconnects a server that failed to connect before the sign-in. A server
 the CLI is still connecting, or whose reconnect fails, is checked again at the following turn.
+A reconnect that times out is not retried, so a hung server cannot stall every later turn;
+to try it again, set the entry back to `sign_in_required` and then to `connected`, or start a new session.
 
 ## Rules the reader enforces
 
