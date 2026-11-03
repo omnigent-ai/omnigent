@@ -216,8 +216,9 @@
   // Restore the saved offset after a remount. Late-loading content can clamp it,
   // so re-assert it each frame until the budget ends or the reader scrolls;
   // scroll reports stay off meanwhile so clamps can't overwrite the saved value.
-  const USER_SCROLL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"];
-  let scrollRestore = null; // { top, deadline } while restoring
+  const USER_SCROLL_EVENTS = ["wheel", "touchstart", "keydown"];
+  const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
+  let scrollRestore = null; // { top, deadline, y, height } while restoring
   let scrollRestoreFrame = 0;
 
   function settleScrollRestore() {
@@ -225,18 +226,31 @@
     scrollRestore = null;
     cancelAnimationFrame(scrollRestoreFrame);
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
-      window.removeEventListener(USER_SCROLL_EVENTS[i], settleScrollRestore, true);
+      window.removeEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, true);
     }
+  }
+
+  function onRestoreInput(e) {
+    if (e.type !== "keydown" || SCROLL_KEYS.indexOf(e.key) !== -1) settleScrollRestore();
+  }
+
+  // Scrollbar drags fire no input events, so treat any move that the layout
+  // didn't cause (the document height is unchanged) as the reader's.
+  function readerMovedDuringRestore() {
+    const height = document.documentElement.scrollHeight;
+    return height === scrollRestore.height && Math.abs(window.scrollY - scrollRestore.y) >= 1;
   }
 
   function applyScrollRestore() {
     if (!scrollRestore) return;
-    if (performance.now() >= scrollRestore.deadline) {
+    if (performance.now() >= scrollRestore.deadline || readerMovedDuringRestore()) {
       settleScrollRestore();
       return;
     }
     // "instant" overrides an artifact's `scroll-behavior: smooth`.
     window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
+    scrollRestore.y = window.scrollY;
+    scrollRestore.height = document.documentElement.scrollHeight;
     scrollRestoreFrame = requestAnimationFrame(applyScrollRestore);
   }
 
@@ -249,9 +263,14 @@
     }
     if (!saved || typeof saved.top !== "number" || !(saved.top > 0)) return;
     if (typeof saved.budgetMs !== "number" || !(saved.budgetMs > 0)) return;
-    scrollRestore = { top: saved.top, deadline: performance.now() + saved.budgetMs };
+    scrollRestore = {
+      top: saved.top,
+      deadline: performance.now() + saved.budgetMs,
+      y: window.scrollY,
+      height: document.documentElement.scrollHeight,
+    };
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
-      window.addEventListener(USER_SCROLL_EVENTS[i], settleScrollRestore, {
+      window.addEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, {
         capture: true,
         passive: true,
       });
@@ -265,6 +284,7 @@
   let scrollReportFrame = 0;
   let scrollReportMissed = false;
   function onScroll() {
+    if (scrollRestore && readerMovedDuringRestore()) settleScrollRestore();
     if (scrollRestore || scrollReportFrame) return;
     scrollReportFrame = requestAnimationFrame(function () {
       scrollReportFrame = 0;
@@ -276,15 +296,18 @@
 
   // Scroll the first active-comment range into view. Uses the range's client
   // rect (Ranges have no scrollIntoView) to center it in the viewport, but only
-  // when off-screen so an already-visible highlight doesn't jump.
+  // when off-screen so an already-visible highlight doesn't jump. During a
+  // restore, visibility is judged at the saved offset, not a clamped one.
   function scrollActiveIntoView() {
     const r = activeRanges && activeRanges[0];
     if (!r) return;
     const rect = r.getBoundingClientRect();
     if (!rect || (rect.width === 0 && rect.height === 0)) return;
     const vh = window.innerHeight || document.documentElement.clientHeight;
-    if (rect.top >= 0 && rect.bottom <= vh) return; // already fully visible
-    const target = window.pageYOffset + rect.top - vh / 2 + rect.height / 2;
+    const top = window.scrollY + rect.top;
+    const viewTop = scrollRestore ? scrollRestore.top : window.scrollY;
+    if (top >= viewTop && top + rect.height <= viewTop + vh) return; // already fully visible
+    const target = top - vh / 2 + rect.height / 2;
     settleScrollRestore();
     window.scrollTo({ top: target < 0 ? 0 : target, behavior: "smooth" });
   }

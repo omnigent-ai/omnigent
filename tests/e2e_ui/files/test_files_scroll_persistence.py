@@ -27,10 +27,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILE_COUNT = 80
 
 
-def _seed_file(base_url: str, session_id: str, path: str) -> None:
+def _seed_file(base_url: str, session_id: str, path: str, content: str | None = None) -> None:
     resp = httpx.put(
         f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-        json={"content": f"contents of {path}\n", "encoding": "utf-8"},
+        json={"content": content or f"contents of {path}\n", "encoding": "utf-8"},
         timeout=10.0,
     )
     resp.raise_for_status()
@@ -199,17 +199,9 @@ def seeded_html_sessions(
 ) -> Iterator[tuple[str, str, str]]:
     """Session A holds a long HTML artifact plus a notes file; B holds one file."""
     base_url, session_a, session_b = seeded_session_pair
-    for session_id, path, content in (
-        (session_a, "plan.html", _HTML_ARTIFACT),
-        (session_a, "notes.md", "# Notes\n\nShort notes file.\n"),
-        (session_b, "other_session_file.txt", "contents\n"),
-    ):
-        resp = httpx.put(
-            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-            json={"content": content, "encoding": "utf-8"},
-            timeout=10.0,
-        )
-        resp.raise_for_status()
+    _seed_file(base_url, session_a, "plan.html", _HTML_ARTIFACT)
+    _seed_file(base_url, session_a, "notes.md", "# Notes\n\nShort notes file.\n")
+    _seed_file(base_url, session_b, "other_session_file.txt")
     try:
         yield (base_url, session_a, session_b)
     finally:

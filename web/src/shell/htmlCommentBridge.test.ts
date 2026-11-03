@@ -301,23 +301,38 @@ describe("bridge runtime scroll position", () => {
     vi.useRealTimers();
   });
 
-  /** Fake frames and the clock, stub jsdom's unimplemented scrollTo, and track scrollY. */
-  function fakeScrolling() {
+  /**
+   * Fake frames and the clock, and give jsdom a scrollable page whose offset
+   * clamps to `pageHeight`, as a browser's does.
+   */
+  function fakeScrolling({ pageHeight = 100_000 } = {}) {
     vi.useFakeTimers({
       toFake: ["requestAnimationFrame", "cancelAnimationFrame", "performance"],
     });
     let scrollY = 0;
+    let height = pageHeight;
+    const clamp = (top: number) => Math.max(0, Math.min(top, height - window.innerHeight));
     vi.spyOn(window, "scrollY", "get").mockImplementation(() => scrollY);
+    vi.spyOn(document.documentElement, "scrollHeight", "get").mockImplementation(() => height);
     const scrollTo = vi
       .spyOn(window, "scrollTo")
       .mockImplementation((options?: ScrollToOptions | number) => {
-        if (typeof options === "object" && typeof options.top === "number") scrollY = options.top;
+        if (typeof options === "object" && typeof options.top === "number") {
+          scrollY = clamp(options.top);
+        }
       });
-    const scrollBy = (top: number) => {
-      scrollY = top;
+    const userScrollTo = (top: number) => {
+      scrollY = clamp(top);
       window.dispatchEvent(new Event("scroll"));
     };
-    return { scrollTo, scrollBy };
+    /** Resize the page as late content does; the browser may move the offset with it. */
+    const setPageHeight = (nextHeight: number, nextScrollY = scrollY) => {
+      height = nextHeight;
+      const previous = scrollY;
+      scrollY = clamp(nextScrollY);
+      if (scrollY !== previous) window.dispatchEvent(new Event("scroll"));
+    };
+    return { scrollTo, userScrollTo, setPageHeight };
   }
 
   function sentScrollOffsets(port: { postMessage: ReturnType<typeof vi.fn> }) {
@@ -331,27 +346,30 @@ describe("bridge runtime scroll position", () => {
   }
 
   const restoreTo = (top: number) => JSON.stringify({ top, budgetMs: BUDGET_MS });
+  const restoredTo = (top: number) => ({ left: 0, top, behavior: "instant" });
+  // jsdom's viewport is 768px tall, so a 1,000px page clamps the offset to 232.
+  const CLAMPING_PAGE_HEIGHT = 1_000;
 
   it("reports the reader's offset once per frame", () => {
-    const { scrollBy } = fakeScrolling();
+    const { userScrollTo } = fakeScrolling();
     const port = startRuntime();
 
-    scrollBy(120);
-    scrollBy(180);
+    userScrollTo(120);
+    userScrollTo(180);
     expect(sentScrollOffsets(port)).toEqual([]);
     vi.advanceTimersToNextFrame();
     expect(sentScrollOffsets(port)).toEqual([180]);
 
-    scrollBy(0);
+    userScrollTo(0);
     vi.advanceTimersToNextFrame();
     expect(sentScrollOffsets(port)).toEqual([180, 0]);
   });
 
   it("reports an offset the reader reached before the channel connected", () => {
-    const { scrollBy } = fakeScrolling();
+    const { userScrollTo } = fakeScrolling();
     const port = startRuntime({
       beforeConnect: () => {
-        scrollBy(900);
+        userScrollTo(900);
         vi.advanceTimersToNextFrame();
       },
     });
@@ -361,11 +379,11 @@ describe("bridge runtime scroll position", () => {
   });
 
   it("does not report a clamped offset when the channel connects mid-restore", () => {
-    const { scrollBy } = fakeScrolling();
+    const { setPageHeight } = fakeScrolling({ pageHeight: CLAMPING_PAGE_HEIGHT });
     const port = startRuntime({
       restoreScroll: restoreTo(640),
       beforeConnect: () => {
-        scrollBy(300); // the document is still too short for 640
+        setPageHeight(900); // the page shrinks, pulling the offset back to 132
         vi.advanceTimersToNextFrame();
       },
     });
@@ -374,16 +392,19 @@ describe("bridge runtime scroll position", () => {
   });
 
   it("re-asserts the saved offset each frame until the budget runs out", () => {
-    const { scrollTo, scrollBy } = fakeScrolling();
+    const { scrollTo, userScrollTo, setPageHeight } = fakeScrolling({
+      pageHeight: CLAMPING_PAGE_HEIGHT,
+    });
     const port = startRuntime({ restoreScroll: restoreTo(640) });
-    expect(scrollTo).toHaveBeenLastCalledWith({ left: 0, top: 640, behavior: "instant" });
+    expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));
+    expect(window.scrollY).toBe(232);
 
-    // Content still loading clamps the document back; the next frame retries.
-    scrollBy(200);
+    // Late content grows the page; the next frame reaches the saved offset.
+    setPageHeight(2_000);
     vi.advanceTimersToNextFrame();
     expect(scrollTo).toHaveBeenCalledTimes(2);
     expect(window.scrollY).toBe(640);
-    // The clamp is not reported, so it can't overwrite the saved offset.
+    // The clamped offset is not reported, so it can't overwrite the saved one.
     expect(sentScrollOffsets(port)).toEqual([]);
 
     vi.advanceTimersByTime(BUDGET_MS);
@@ -392,31 +413,66 @@ describe("bridge runtime scroll position", () => {
     expect(scrollTo).toHaveBeenCalledTimes(writes);
 
     // After the restore settles, the reader's own scrolling is reported again.
-    scrollBy(700);
+    userScrollTo(700);
     vi.advanceTimersToNextFrame();
     expect(sentScrollOffsets(port)).toEqual([700]);
   });
 
-  it.each(["wheel", "touchstart", "pointerdown", "keydown"])(
-    "stops restoring when the reader takes over with %s",
-    (type) => {
-      const { scrollTo, scrollBy } = fakeScrolling();
-      const port = startRuntime({ restoreScroll: restoreTo(640) });
-      document.body.dispatchEvent(new Event(type, { bubbles: true }));
+  it("keeps restoring when content growing above the reader moves the offset", () => {
+    const { scrollTo, setPageHeight } = fakeScrolling();
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
+    // Scroll anchoring shifts the offset by the 300px an image above it adds.
+    setPageHeight(100_300, 940);
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    expect(window.scrollY).toBe(640);
+    expect(sentScrollOffsets(port)).toEqual([]);
+  });
 
-      scrollBy(300);
-      vi.advanceTimersToNextFrame();
-      expect(scrollTo).toHaveBeenCalledTimes(1);
-      expect(window.scrollY).toBe(300);
-      expect(sentScrollOffsets(port)).toEqual([300]);
-    },
-  );
+  const dispatchToPage = (event: Event) => document.body.dispatchEvent(event);
+
+  it.each<[string, (userScrollTo: (top: number) => void) => void]>([
+    ["the wheel", () => dispatchToPage(new Event("wheel", { bubbles: true }))],
+    ["a touch", () => dispatchToPage(new Event("touchstart", { bubbles: true }))],
+    [
+      "a scroll key",
+      () => dispatchToPage(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true })),
+    ],
+    ["the scrollbar", (userScrollTo) => userScrollTo(300)],
+  ])("stops restoring when the reader takes over with %s", (_label, takeOver) => {
+    const { scrollTo, userScrollTo } = fakeScrolling();
+    const port = startRuntime({ restoreScroll: restoreTo(640) });
+    takeOver(userScrollTo);
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(1);
+
+    userScrollTo(360);
+    vi.advanceTimersToNextFrame();
+    expect(window.scrollY).toBe(360);
+    expect(sentScrollOffsets(port).at(-1)).toBe(360);
+  });
+
+  it.each<[string, Event]>([
+    ["a click", new Event("pointerdown", { bubbles: true })],
+    ["a modifier key", new KeyboardEvent("keydown", { key: "Control", bubbles: true })],
+    [
+      "the preview zoom shortcut",
+      new KeyboardEvent("keydown", { key: "=", ctrlKey: true, bubbles: true }),
+    ],
+  ])("keeps restoring through %s", (_label, event) => {
+    const { scrollTo } = fakeScrolling();
+    startRuntime({ restoreScroll: restoreTo(640) });
+    dispatchToPage(event);
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).toHaveBeenCalledTimes(2);
+    expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));
+  });
 
   interface RuntimePort {
     onmessage: ((event: { data: unknown }) => void) | null;
   }
 
-  /** Restore to 640 in a page whose one comment's highlight sits at `highlightTop`. */
+  /** Restore to 640 in a page whose one comment's highlight starts `highlightTop` px down. */
   function restoreWithComment(highlightTop: number, run: (port: RuntimePort) => void) {
     const rect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
     try {
@@ -427,7 +483,10 @@ describe("bridge runtime scroll position", () => {
       // jsdom has no layout, so place the commented text explicitly.
       Object.defineProperty(Range.prototype, "getBoundingClientRect", {
         configurable: true,
-        value: () => ({ top: highlightTop, bottom: highlightTop + 20, width: 60, height: 20 }),
+        value: () => {
+          const top = highlightTop - window.scrollY;
+          return { top, bottom: top + 20, width: 60, height: 20 };
+        },
       });
       const port = startRuntime({ restoreScroll: restoreTo(640) }) as unknown as RuntimePort;
       port.onmessage?.({
@@ -452,18 +511,18 @@ describe("bridge runtime scroll position", () => {
         active: commentId ? { comment_id: commentId, anchor_content: "revenue" } : null,
       },
     });
+  const smoothScroll = expect.objectContaining({ behavior: "smooth" });
 
   it.each([
-    ["an offscreen comment, scrolling to it", 4_000, true],
-    ["an already visible comment, leaving the page still", 100, false],
+    ["an offscreen comment, scrolling to it", 4_640, true],
+    ["an already visible comment, leaving the page still", 740, false],
   ])("stops restoring when the reader picks %s", (_label, highlightTop, scrollsToComment) => {
     const { scrollTo } = fakeScrolling();
     restoreWithComment(highlightTop, (port) => {
       activate(port, null); // the parent's initial sync on connect
       activate(port, "c1");
-      const smooth = expect.objectContaining({ behavior: "smooth" });
-      if (scrollsToComment) expect(scrollTo).toHaveBeenLastCalledWith(smooth);
-      else expect(scrollTo).not.toHaveBeenCalledWith(smooth);
+      if (scrollsToComment) expect(scrollTo).toHaveBeenLastCalledWith(smoothScroll);
+      else expect(scrollTo).not.toHaveBeenCalledWith(smoothScroll);
 
       const writes = scrollTo.mock.calls.length;
       vi.advanceTimersToNextFrame();
@@ -471,14 +530,34 @@ describe("bridge runtime scroll position", () => {
     });
   });
 
-  it("keeps restoring when the initial sync restates a visible active comment", () => {
+  it.each([
+    ["", undefined],
+    [" while late content clamps the page", CLAMPING_PAGE_HEIGHT],
+  ])(
+    "keeps restoring when the initial sync restates a comment visible at the saved offset%s",
+    (_label, pageHeight) => {
+      const { scrollTo } = fakeScrolling({ pageHeight });
+      // Clamped to 232, this highlight is below the viewport; at 640 it is in view.
+      restoreWithComment(1_300, (port) => {
+        activate(port, "c1");
+        expect(scrollTo).not.toHaveBeenCalledWith(smoothScroll);
+        const writes = scrollTo.mock.calls.length;
+        vi.advanceTimersToNextFrame();
+        expect(scrollTo).toHaveBeenCalledTimes(writes + 1);
+        expect(scrollTo).toHaveBeenLastCalledWith(restoredTo(640));
+      });
+    },
+  );
+
+  // A linked comment reaches the frame in this same first sync, so it must win.
+  it("scrolls to an active comment outside the saved view on the initial sync", () => {
     const { scrollTo } = fakeScrolling();
-    restoreWithComment(100, (port) => {
+    restoreWithComment(4_640, (port) => {
       activate(port, "c1");
+      expect(scrollTo).toHaveBeenLastCalledWith(smoothScroll);
       const writes = scrollTo.mock.calls.length;
       vi.advanceTimersToNextFrame();
-      expect(scrollTo).toHaveBeenCalledTimes(writes + 1);
-      expect(scrollTo).toHaveBeenLastCalledWith({ left: 0, top: 640, behavior: "instant" });
+      expect(scrollTo).toHaveBeenCalledTimes(writes);
     });
   });
 
@@ -487,7 +566,7 @@ describe("bridge runtime scroll position", () => {
     ["null", "null"],
     ["invalid JSON", "{"],
     ["a negative offset", JSON.stringify({ top: -10, budgetMs: BUDGET_MS })],
-    ["a string offset", '{"top":"640"}'],
+    ["a string offset", JSON.stringify({ top: "640", budgetMs: BUDGET_MS })],
     ["no budget", JSON.stringify({ top: 640 })],
     ["a zero budget", JSON.stringify({ top: 640, budgetMs: 0 })],
   ])("starts without restoring given %s", (_label, restoreScroll) => {
