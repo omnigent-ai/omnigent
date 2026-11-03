@@ -2214,6 +2214,7 @@ def register_events_routes(
                 )
                 == "claude-sdk"
             ):
+                source = conv
 
                 async def release_source_client() -> None:
                     # The runner drops the old session's live SDK client and
@@ -2225,6 +2226,11 @@ def register_events_routes(
                         {"type": _CLEAR_TYPE, "continue_in_new_session": True},
                         timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                     )
+                    if release is None and source.runner_id is not None:
+                        # Unreachable here may mean live on another replica.
+                        await _raise_if_runner_on_another_replica(
+                            source, request.app.state, conversation_store
+                        )
                     if release is not None and release.status_code == 409:
                         raise OmnigentError(
                             "Stop the current turn before running /clear.",

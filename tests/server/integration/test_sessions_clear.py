@@ -23,6 +23,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+import omnigent.runtime
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.managed_hosts import (
@@ -33,6 +34,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_agent, register_test_runner
 
@@ -341,21 +343,53 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert live_runner.superseded == [(source_id, new_id, "clear")]
 
 
-async def test_claude_sdk_clear_with_an_offline_runner_binds_the_host_only(
+@pytest.mark.parametrize(
+    ("runner_id", "host_live", "runner_reachable"),
+    [
+        pytest.param("runner_gone", False, True, id="offline"),
+        pytest.param("runner_gone", True, True, id="on-another-replica"),
+        pytest.param(_RUNNER_ID, True, False, id="moved-before-release"),
+    ],
+)
+async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_replica(
+    app: FastAPI,
     client: httpx.AsyncClient,
     db_uri: str,
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
+    runner_id: str,
+    host_live: bool,
+    runner_reachable: bool,
 ) -> None:
-    """A stopped runner leaves the new session on the host, which relaunches it on send."""
+    """An offline runner leaves the new session on the host, which relaunches it on send.
+
+    A runner absent here whose host is live elsewhere is on another replica, so
+    ``clear`` re-addresses there before anything is created.
+    """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
-    source_id, _items = await create_placed_session(client, store, runner_id="runner_gone")
+    source_id, _items = await create_placed_session(client, store, runner_id=runner_id)
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
+    if not host_live:
+        host_store.set_offline(_HOST_ID)
+    monkeypatch.setattr(app.state, "host_store", host_store)
+    if not runner_reachable:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+        monkeypatch.setattr(omnigent.runtime, "get_runner_client", lambda: None)
+    before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
     )
 
+    if host_live:
+        assert resp.status_code == 400, resp.text
+        assert "wrong_replica" in resp.text
+        assert len((await client.get("/v1/sessions")).json()["data"]) == before
+        assert clear_requests(live_runner) == []
+        assert live_runner.superseded == []
+        return
     assert resp.status_code == 202, resp.text
     fork = store.get_conversation(resp.json()["session_id"])
     assert fork is not None

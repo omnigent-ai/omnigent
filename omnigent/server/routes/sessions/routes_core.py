@@ -4593,7 +4593,8 @@ def register_core_routes(
             the fork exists, e.g. to free the source's live client.
         :returns: The fork's session id.
         :raises OmnigentError: When the caller does not own *source*, it is a
-            sub-agent or running a turn, or no runner or host can take the fork.
+            sub-agent or running a turn, or no runner or host can take the fork;
+            ``WRONG_REPLICA`` when its runner is live on another replica.
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access_and_level(
@@ -4614,6 +4615,16 @@ def register_core_routes(
             and runner_router is not None
             and runner_router.runner_is_online(source.runner_id)
         )
+        if not runner_online and source.runner_id is not None:
+            from omnigent.server.routes.sessions.routes_events import (
+                _raise_if_runner_on_another_replica,
+            )
+
+            # A runner live on another replica is not offline: re-address there
+            # rather than continue without it.
+            await _raise_if_runner_on_another_replica(
+                source, request.app.state, conversation_store
+            )
         host_bound = source.host_id is not None and source.workspace is not None
         if not runner_online and not host_bound:
             raise OmnigentError(
