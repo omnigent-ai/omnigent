@@ -4099,6 +4099,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         is_workspace_hosted_url,
         load_databricks_org_id,
         load_databricks_workspace_host,
+        pin_databricks_org_id,
         pinned_databricks_org_id,
         store_databricks_auth,
     )
@@ -4118,8 +4119,11 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         return
     if probe.status_code == 200:
         org_id = _verified_databricks_org_id(probe, org_id)
-        if org_id and is_workspace_hosted_url(server):
-            _persist_databricks_org_id(server, org_id)
+        if is_workspace_hosted_url(server):
+            if org_id:
+                _persist_databricks_org_id(server, org_id)
+            # Bind the verified response, not a later read of the shared login file.
+            pin_databricks_org_id(server, org_id)
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
     credential_rejected = False
@@ -4151,6 +4155,8 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         if refreshed_probe.status_code == 200:
             org_id = _verified_databricks_org_id(refreshed_probe, org_id)
             store_databricks_auth(server, workspace_host, org_id=org_id)
+            if is_workspace_hosted_url(server):
+                pin_databricks_org_id(server, org_id)
             return
     # User-facing: show the display form (the workspace /omnigent URL, with
     # ?o= when known), not the internal API mount; it round-trips through
@@ -13648,7 +13654,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"{DATABRICKS_EXTRA_INSTALL_HINT}"
         )
 
-    from omnigent.cli_auth import is_workspace_hosted_url
+    from omnigent.cli_auth import is_workspace_hosted_url, pin_databricks_org_id
 
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if org_id is None and auth_info is not None:
@@ -13719,6 +13725,8 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
     org_id = _verified_databricks_org_id(verify, org_id)
+    if is_workspace_hosted_url(server):
+        pin_databricks_org_id(server, org_id)
     user_id: str | None = None
     with contextlib.suppress(ValueError):
         raw_user = verify.json().get("user_id")
