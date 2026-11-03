@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from omnigent.host.frames import (
     CAP_MCP_LOGIN,
     CAP_MCP_TOOLS,
+    MCP_LOGIN_MAX_URL,
     HostMcpLoginFrame,
     HostMcpToolsFrame,
     HostMcpToolsResultFrame,
@@ -57,7 +58,7 @@ class McpLoginResponse(BaseModel):
     model_config = ConfigDict(strict=True)
     login_id: str = Field(max_length=64)
     state: Literal["pending", "succeeded", "failed", "expired", "cancelled"]
-    authorization_url: str | None = Field(default=None, max_length=8192)
+    authorization_url: str | None = Field(default=None, max_length=MCP_LOGIN_MAX_URL)
     error: str | None = Field(default=None, max_length=300)
 
 

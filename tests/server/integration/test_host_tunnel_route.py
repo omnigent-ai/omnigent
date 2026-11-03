@@ -2098,7 +2098,8 @@ async def test_host_tunnel_routes_mcp_tools_result_to_future(
 
     login: asyncio.Future[HostMcpLoginResultFrame] = loop.create_future()
     conn.pending_mcp_logins["req_login"] = login
-    conn.pending_mcp_logins["req_login_other"] = loop.create_future()
+    login_other: asyncio.Future[HostMcpLoginResultFrame] = loop.create_future()
+    conn.pending_mcp_logins["req_login_other"] = login_other
     login_result = HostMcpLoginResultFrame(
         request_id="req_login", status="ok", login_id="l1", state="succeeded"
     )
@@ -2106,7 +2107,7 @@ async def test_host_tunnel_routes_mcp_tools_result_to_future(
     signed_in = await asyncio.wait_for(login, timeout=budget(2.0))
     assert (signed_in.login_id, signed_in.state) == ("l1", "succeeded")
     assert list(conn.pending_mcp_logins) == ["req_login_other"]
-    assert not other.done()
+    assert not login_other.done()
 
 
 @pytest.mark.parametrize(

@@ -53,7 +53,7 @@ const props: McpSignInDialogProps = {
   host: { host_id: "host/1", name: "my-laptop", owner: "me", status: "online" },
   harness: "claude",
   harnessLabel: "Claude Code",
-  server: "plugin:toolkit:linear",
+  server: "linear",
   serverLabel: "Linear",
   plugin: "toolkit",
   sourceId: "a".repeat(64),
@@ -102,7 +102,7 @@ describe("McpSignInDialog", () => {
 
     expect(JSON.parse(String(calls("POST", BASE)[0][1]?.body))).toEqual({
       harness: "claude",
-      server: "plugin:toolkit:linear",
+      server: "linear",
       plugin: "toolkit",
       source_id: "a".repeat(64),
     });
@@ -118,6 +118,19 @@ describe("McpSignInDialog", () => {
     expect(props.onSignedIn).toHaveBeenCalledTimes(1);
     await tick();
     expect(calls("GET", `${BASE}/L1`)).toHaveLength(2);
+  });
+
+  it("keeps the pending sign-in when the host is renamed", async () => {
+    on("POST", BASE, () => json(login()));
+    on("GET", `${BASE}/L1`, () => json(login()));
+    const view = await renderDialog();
+
+    view.rerender(<McpSignInDialog {...props} host={{ ...props.host, name: "work-laptop" }} />);
+    await tick();
+
+    expect(calls("POST", BASE)).toHaveLength(1);
+    expect(calls("DELETE", `${BASE}/L1`)).toHaveLength(0);
+    expect(screen.getByRole("link", { name: /Open sign-in page/ })).toBeTruthy();
   });
 
   it("sends a pasted redirect address to the host and shows its rejection", async () => {

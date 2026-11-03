@@ -202,9 +202,11 @@ class HostMcpTools:
         self._sign_in_cache: TTLCache[tuple[str | None, ...], SignInState | None] = TTLCache(
             maxsize=128, ttl=SIGN_IN_CACHE_SECONDS
         )
+        self._cache_generation = 0
 
     def clear_cache(self) -> None:
         """Forget probe results, e.g. after the user signs in to a server."""
+        self._cache_generation += 1
         self._cache.clear()
         self._sign_in_cache.clear()
 
@@ -249,12 +251,14 @@ class HostMcpTools:
             budget = deadline - _STATUS_CLEANUP_SECONDS - loop.time()
             if budget <= 0:
                 return None
+            generation = self._cache_generation
             with self._subprocess_guard():
                 state = await harness_sign_in_state(
                     server, timeout=min(STATUS_TIMEOUT_SECONDS, budget)
                 )
-            # A shortened check may have guessed; let the next expansion ask again.
-            if budget >= STATUS_TIMEOUT_SECONDS:
+            # A shortened check may have guessed, and a check that spans a sign-in is
+            # stale; let the next expansion ask again.
+            if budget >= STATUS_TIMEOUT_SECONDS and generation == self._cache_generation:
                 self._sign_in_cache[key] = state
             return state
         finally:

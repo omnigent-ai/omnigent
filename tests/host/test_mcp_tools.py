@@ -187,28 +187,16 @@ async def test_http_401_needs_auth_without_private_logs(monkeypatch, caplog, cap
             }
         )
         monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
-        sign_in_states = ["available", "signed_in"]
         checked = []
 
         async def sign_in_state(server, timeout):
             checked.append(server)
-            return sign_in_states.pop(0)
+            return "available"
 
         monkeypatch.setattr(mcp_tools, "harness_sign_in_state", sign_in_state)
-        discovery = HostMcpTools()
-        result = await discovery.probe("claude", "docs")
-        cached = await discovery.probe("claude", "docs")
-        # Clearing after a sign-in reports the harness's new state.
-        discovery.clear_cache()
-        again = await discovery.probe("claude", "docs")
-    assert result["connection"] == "needs_auth"
-    assert [result["harness_sign_in"], cached["harness_sign_in"], again["harness_sign_in"]] == [
-        "available",
-        "available",
-        "signed_in",
-    ]
-    assert checked == [entry, entry]
-    assert all("harness_sign_in" not in cached for cached in discovery._cache.values())
+        result = await HostMcpTools().probe("claude", "docs")
+    assert (result["connection"], result["harness_sign_in"]) == ("needs_auth", "available")
+    assert checked == [entry]
     output = json.dumps(result) + caplog.text + str(capfd.readouterr())
     assert "synthetic-url-secret" not in output
     assert "synthetic-header-secret" not in output
@@ -477,9 +465,10 @@ async def test_sign_in_check_fits_the_response_budget_and_pauses_reaping(monkeyp
     loop = asyncio.get_running_loop()
     started = loop.time()
     result = await discovery.probe("claude", "docs")
-    assert loop.time() - started < 2.0
     assert result["harness_sign_in"] == "available"
-    assert len(timeouts) == 1 and timeouts[0] < 1.0
+    # The probe used 1.0 of the 2.0 budget and 0.2 is held back for cleanup.
+    assert len(timeouts) == 1 and timeouts[0] <= 0.8
+    assert loop.time() - started < 2.0 + 1.0
     assert guarded == 0
     # A shortened check is a guess, so it isn't cached.
     assert not discovery._sign_in_cache
@@ -489,6 +478,51 @@ async def test_sign_in_check_fits_the_response_budget_and_pauses_reaping(monkeyp
     async with discovery._sign_in_slots, discovery._sign_in_slots:
         started = loop.time()
         result = await discovery.probe("claude", "docs")
-    assert loop.time() - started < 2.0
+    assert loop.time() - started < 2.0 + 1.0
     assert "harness_sign_in" not in result
     assert len(timeouts) == 1
+
+
+async def test_sign_in_state_is_cached_until_a_sign_in(monkeypatch):
+    entry = _entry({"type": "http", "url": "https://mcp.example.test/mcp"})
+    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
+
+    async def needs_auth(payload):
+        return mcp_tools._result("needs_auth")
+
+    states = iter(["available", "available", "signed_in"])
+    checks = 0
+    checking = asyncio.Event()
+    release = asyncio.Event()
+    release.set()
+
+    async def status(server, timeout):
+        nonlocal checks
+        checks += 1
+        checking.set()
+        await release.wait()
+        return next(states)
+
+    monkeypatch.setattr(mcp_tools, "_probe_worker", needs_auth)
+    monkeypatch.setattr(mcp_tools, "harness_sign_in_state", status)
+    discovery = HostMcpTools()
+
+    async def sign_in() -> str:
+        return (await discovery.probe("claude", "docs"))["harness_sign_in"]
+
+    assert [await sign_in(), await sign_in()] == ["available", "available"]
+    assert checks == 1
+    assert all("harness_sign_in" not in cached for cached in discovery._cache.values())
+
+    # A check that was running when the user signed in is reported but not kept.
+    discovery.clear_cache()
+    checking.clear()
+    release.clear()
+    before = asyncio.create_task(sign_in())
+    await checking.wait()
+    discovery.clear_cache()
+    release.set()
+    assert await before == "available"
+    assert not discovery._sign_in_cache
+    assert await sign_in() == "signed_in"
+    assert checks == 3

@@ -79,7 +79,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
-# The host runs a harness's own ``mcp login`` for a configured server:
+# The host runs the harness's ``mcp login``:
 CAP_MCP_LOGIN = "mcp_login"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
@@ -1352,6 +1352,10 @@ class HostMcpLoginFrame:
     source_id: str | None = None
     login_id: str | None = None
     callback_url: str | None = None
+
+
+# Longest authorization URL a host publishes or the server relays.
+MCP_LOGIN_MAX_URL = 8192
 
 
 @dataclass
@@ -3487,7 +3491,7 @@ def _decode_mcp_login_result(msg: _JsonObject) -> HostMcpLoginResultFrame:
         if state is not None and state not in MCP_LOGIN_STATES:
             raise ValueError("unknown login state")
         url = _optional_nullable_str(msg, "authorization_url")
-        if url is not None and not is_sign_in_page_url(url):
+        if url is not None and (len(url) > MCP_LOGIN_MAX_URL or not is_sign_in_page_url(url)):
             raise ValueError("unsafe authorization URL")
         return HostMcpLoginResultFrame(
             request_id=request_id,

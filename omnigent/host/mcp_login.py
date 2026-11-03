@@ -23,6 +23,7 @@ from typing import Literal, TypedDict
 from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from omnigent._platform import IS_POSIX, resolve_cli_binary
+from omnigent.host.frames import MCP_LOGIN_MAX_URL
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.inner._proc import remember_process_group, spawn_kwargs
 from omnigent.inner._subprocess_lifecycle import terminate_subprocess
@@ -226,6 +227,8 @@ def find_authorization_url(output: str) -> tuple[str, SplitResult] | None:
     """The first acceptable authorization URL in terminal *output*."""
     text = _CSI.sub("", _OSC.sub("", output))
     for match in _URL.finditer(text):
+        if len(match[0]) > MCP_LOGIN_MAX_URL:
+            continue
         redirect = authorization_redirect(match[0])
         if redirect is not None:
             return match[0], redirect

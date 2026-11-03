@@ -73,7 +73,7 @@ class _Provider:
 
 @dataclass
 class OAuthMcpServer:
-    """``url`` is the MCP endpoint; ``approve`` plays the user consenting on the page."""
+    """``url`` is the MCP endpoint; the ``/approve`` page plays the user consenting."""
 
     url: str
     provider: _Provider

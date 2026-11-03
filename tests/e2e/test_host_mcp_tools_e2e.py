@@ -84,6 +84,7 @@ def test_host_mcp_tools(live_server: str, tmp_path: Path) -> None:
             "tools": [{"name": "read_docs", "description": "Read documentation."}],
             "connection": "connected",
             "truncated": False,
+            "harness_sign_in": None,
         }
         assert "synthetic-config-secret" not in response.text
         assert str(tmp_path) not in response.text

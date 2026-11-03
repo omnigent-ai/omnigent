@@ -75,6 +75,9 @@ export function McpSignInDialog({
   onSignedInRef.current = onSignedIn;
   const hostId = host.host_id;
   const hostName = host.name;
+  // A renamed host must not restart a sign-in the user may be partway through.
+  const hostNameRef = useRef(hostName);
+  hostNameRef.current = hostName;
 
   useEffect(() => {
     if (!open) return;
@@ -103,7 +106,7 @@ export function McpSignInDialog({
     };
     const fail = (error: unknown) => {
       if (!active || controller.signal.aborted) return;
-      setPhase({ kind: "error", message: requestErrorMessage(error, hostName) });
+      setPhase({ kind: "error", message: requestErrorMessage(error, hostNameRef.current) });
     };
     const pollFailed = (error: unknown) => {
       if (!active || controller.signal.aborted) return;
@@ -145,7 +148,7 @@ export function McpSignInDialog({
       window.clearTimeout(timer);
       if (loginId !== null) void cancelMcpLogin(hostId, loginId).catch(() => {});
     };
-  }, [open, attempt, hostId, hostName, harness, server, plugin, sourceId]);
+  }, [open, attempt, hostId, harness, server, plugin, sourceId]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -226,9 +229,8 @@ function PendingSteps({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const url = login.authorization_url;
-  if (!url || !isSafeSignInUrl(url)) {
-    return <p role="alert">The host returned an invalid sign-in link.</p>;
-  }
+  // ``settle`` only shows this phase for a safe link.
+  if (!url) return null;
   const submit = () => {
     const value = callbackUrl.trim();
     if (!value) return;

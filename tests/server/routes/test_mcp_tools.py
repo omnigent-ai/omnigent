@@ -287,17 +287,34 @@ async def test_owner_drives_mcp_login(
 
 
 @pytest.mark.parametrize(
-    "result,status",
+    "result,status,detail",
     [
-        (HostMcpLoginResultFrame("", "not_found", error="Sign-in not found"), 404),
-        (HostMcpLoginResultFrame("", "invalid", error="That isn't the address"), 400),
-        (HostMcpLoginResultFrame("", "busy", error="Too many sign-ins"), 503),
-        (HostMcpLoginResultFrame("", "failed", error="private detail"), 502),
-        (HostMcpLoginResultFrame("", "ok", login_id="x", state="bogus"), 502),
+        (
+            HostMcpLoginResultFrame("", "not_found", error="Sign-in not found"),
+            404,
+            "Sign-in not found",
+        ),
+        (
+            HostMcpLoginResultFrame("", "invalid", error="That isn't the address"),
+            400,
+            "That isn't the address",
+        ),
+        (HostMcpLoginResultFrame("", "busy", error="Too many sign-ins"), 503, "Too many sign-ins"),
+        # Host failure text stays on the host.
+        (
+            HostMcpLoginResultFrame("", "failed", error="private detail"),
+            502,
+            "host MCP sign-in failed",
+        ),
+        (
+            HostMcpLoginResultFrame("", "ok", login_id="x", state="bogus", error="private detail"),
+            502,
+            "host sent a malformed MCP sign-in reply",
+        ),
     ],
 )
 async def test_mcp_login_host_errors(
-    tools_app, result: HostMcpLoginResultFrame, status: int
+    tools_app, result: HostMcpLoginResultFrame, status: int, detail: str
 ) -> None:
     app, registry, _ = tools_app
     conn = _register(registry, CAP_MCP_LOGIN)
@@ -305,11 +322,7 @@ async def test_mcp_login_host_errors(
         task = asyncio.create_task(client.get(f"{_LOGIN_URL}/abc", headers=_OWNER))
         await _answer_login(conn, result)
         response = await task
-    assert response.status_code == status
-    if status in (400, 404, 503):
-        assert response.json()["detail"] == result.error
-    else:
-        assert "private detail" not in response.text
+    assert (response.status_code, response.json()["detail"]) == (status, detail)
 
 
 @pytest.mark.parametrize(

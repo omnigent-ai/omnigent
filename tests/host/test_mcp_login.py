@@ -12,6 +12,7 @@ import psutil
 import pytest
 
 from omnigent.host import mcp_login
+from omnigent.host.frames import MCP_LOGIN_MAX_URL
 from omnigent.host.mcp_inventory import ConfiguredMcpServer
 from omnigent.host.mcp_login import (
     HostMcpLogins,
@@ -38,6 +39,8 @@ log = Path(os.environ["FAKE_LOG"])
 log.write_text(json.dumps({{"argv": sys.argv[1:], "tty": sys.stdin.isatty(),
     "env": sorted(k for k in os.environ if k.startswith("OMNIGENT_")), "pid": os.getpid()}}))
 mode = os.environ.get("FAKE_MODE", "paste")
+if sys.argv[1:3] in (["mcp", "get"], ["mcp", "list"]) and mode == "status_hang":
+    time.sleep(60)
 if sys.argv[1:3] == ["mcp", "get"]:
     print("demo:\\n  Type: http\\n  Status: " + os.environ["FAKE_STATUS"])
     sys.exit(int(os.environ.get("FAKE_EXIT", "0")))
@@ -114,6 +117,8 @@ _LOOPBACK_AUTH_URL = f"http://127.0.0.1:9/authorize?redirect_uri={_REDIRECT}"
         ("https://auth.example.test/authorize?client_id=c\n", None),
         ("https://auth.example.test/a?redirect_uri=https%3A%2F%2Fevil.test%2Fcb\n", None),
         (f"https://user:pw@auth.example.test/a?redirect_uri={_REDIRECT}\n", None),
+        # The server won't relay a link longer than this, so the host doesn't offer it.
+        (f"{_AUTH_URL}&pad={'a' * MCP_LOGIN_MAX_URL}\n", None),
     ],
 )
 def test_find_authorization_url(output: str, expected: str | None) -> None:
@@ -397,3 +402,13 @@ async def test_harness_sign_in_state(
     assert await harness_sign_in_state(_server(harness=harness)) == expected
     argv = json.loads(fake_cli.read_text())["argv"]
     assert argv == (["mcp", "get", "demo"] if harness == "claude" else ["mcp", "list", "--json"])
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex"])
+async def test_hanging_status_check_offers_sign_in_and_stops_the_cli(
+    fake_cli: Path, monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    monkeypatch.setenv("FAKE_MODE", "status_hang")
+    server = _server(harness=harness)
+    assert await harness_sign_in_state(server, timeout=budget(1.0)) == "available"
+    assert _exited(json.loads(fake_cli.read_text())["pid"])

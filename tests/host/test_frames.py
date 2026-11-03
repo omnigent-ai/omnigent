@@ -10,6 +10,7 @@ import pytest
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    MCP_LOGIN_MAX_URL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -2851,6 +2852,7 @@ def test_mcp_tools_result_drops_unknown_sign_in_state():
         {"authorization_url": "javascript:alert(1)"},
         {"authorization_url": "https://user:pass@auth.example.test/"},
         {"authorization_url": "https://auth.example.test/\nfoo"},
+        {"authorization_url": "https://auth.example.test/?" + "a" * MCP_LOGIN_MAX_URL},
     ],
 )
 def test_mcp_login_result_rejects_unsafe_replies(fields):
