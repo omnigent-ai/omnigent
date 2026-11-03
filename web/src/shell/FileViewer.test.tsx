@@ -1090,9 +1090,11 @@ describe("FileViewer Address All", () => {
   ])("sends drafts from %s in one message", (_label, fileComments, expectedIds) => {
     const mutate = vi.fn();
     useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
-    // The session-wide list may lag behind this file's list, e.g. still showing c4 as a draft.
+    // The session-wide list may lag behind this file's list: c4 is still a draft there,
+    // the new draft c1 is missing, and the deleted draft c5 remains.
     const staleSessionComments = [
-      ...fileComments.map((c) => ({ ...c, status: "draft" as const })),
+      ...fileComments.filter((c) => c.id !== "c1").map((c) => ({ ...c, status: "draft" as const })),
+      makeComment("c5"),
       otherDraft,
       otherSent,
     ];
