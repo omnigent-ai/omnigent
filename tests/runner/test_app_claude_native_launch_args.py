@@ -1703,4 +1703,7 @@ def test_claude_terminal_env_keeps_a_user_api_timeout(
 
     terminal_env = build_native_claude_terminal_env(config)
 
-    assert terminal_env.get("API_TIMEOUT_MS", "600000") == "600000"
+    if source == "provider":
+        assert terminal_env["API_TIMEOUT_MS"] == "600000"
+    else:
+        assert "API_TIMEOUT_MS" not in terminal_env

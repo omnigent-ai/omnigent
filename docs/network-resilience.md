@@ -44,7 +44,8 @@ is pinned as a strict expected failure (`xfail(strict=True)`, or `known_gap` on
 the single check), so a fix that makes it pass must also remove the marker.
 The one exception is R8: it is a race, so its marker does not turn stale when
 a run happens to pass. Outages beyond the short default run only with
-`OMNIGENT_E2E_RESILIENCE_FULL=1`.
+`OMNIGENT_E2E_RESILIENCE_FULL=1`, except S4's unanswered model call: it always
+runs at 120 s because it must outlast Claude Code's request timeout.
 
 | Scenario | Phase / action | Outage | claude-native | codex-native |
 | --- | --- | --- | --- | --- |
@@ -70,6 +71,10 @@ a run happens to pass. Outages beyond the short default run only with
 | S7 | before the first call, mid-stream | 10 s / 60 s | pass | pass |
 | S7 | before the first call | 180 s | pass | pass |
 | S7 | mid-stream | 180 s | gap: [R7](#r7-a-turn-that-lost-the-model-has-no-retry) | pass |
+
+Native Claude terminals retry a model request that gets no response headers
+within `RetryPolicy`'s 120 s per-request timeout. To give a slower gateway more
+time, set `API_TIMEOUT_MS` in the provider config or the runner environment.
 
 ## Findings
 

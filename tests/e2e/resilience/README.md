@@ -29,6 +29,9 @@ uv run --no-sync pytest tests/e2e/resilience -v
 OMNIGENT_E2E_RESILIENCE_FULL=1 uv run --no-sync pytest tests/e2e/resilience/scenarios -n 2  # 60 s/120 s outages
 ```
 
+The default run still includes S4's 120 s unanswered model call, which must
+outlast Claude Code's request timeout.
+
 To poke at the UI by hand, start a lab with a fault console:
 
 ```sh
