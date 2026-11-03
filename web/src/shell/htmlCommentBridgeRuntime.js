@@ -27,6 +27,7 @@
   let port = null;
   let comments = []; // [{ id, anchor_content, occ }]
   let active = null; // { anchor_content, occ } | null
+  let activeSynced = false; // whether the parent has sent its first setActive
   let activeRanges = []; // ranges matching the active comment (for scroll-into-view)
   let ranges = []; // [{ id, range }] for click hit-testing
 
@@ -435,10 +436,17 @@
           const nextKey = next ? next.comment_id || next.anchor_content + "#" + next.occ : null;
           active = next;
           repaint();
+          // The parent's first setActive restates its selection after a remount;
+          // later ones are explicit picks, which take over from a pending restore.
+          const explicit = activeSynced;
+          activeSynced = true;
           // Only scroll when a comment becomes newly active (e.g. clicked in the
           // panel), so list refreshes that keep the same active comment don't
           // yank the reader's scroll position.
-          if (nextKey && nextKey !== prevKey) scrollActiveIntoView();
+          if (nextKey && nextKey !== prevKey) {
+            if (explicit) settleScrollRestore();
+            scrollActiveIntoView();
+          }
         }
       };
       send({ type: T.ready });

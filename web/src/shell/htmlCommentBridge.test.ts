@@ -412,45 +412,72 @@ describe("bridge runtime scroll position", () => {
     },
   );
 
-  it("lets a newly active comment scroll the preview instead of the restore", () => {
-    const { scrollTo } = fakeScrolling();
+  type RuntimePort = { onmessage: ((event: { data: unknown }) => void) | null };
+
+  /** Restore to 640 in a page whose one comment's highlight sits at `highlightTop`. */
+  function restoreWithComment(highlightTop: number, run: (port: RuntimePort) => void) {
     const rect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
     try {
       document.body.innerHTML = "<p>Quarterly revenue</p>";
       // jsdom lacks the Custom Highlight API the runtime tracks active ranges with.
       vi.stubGlobal("CSS", { highlights: new Map() });
       vi.stubGlobal("Highlight", Set);
-      // jsdom has no layout: place the commented text far below the viewport.
+      // jsdom has no layout, so place the commented text explicitly.
       Object.defineProperty(Range.prototype, "getBoundingClientRect", {
         configurable: true,
-        value: () => ({ top: 4_000, bottom: 4_020, width: 60, height: 20 }),
+        value: () => ({ top: highlightTop, bottom: highlightTop + 20, width: 60, height: 20 }),
       });
-      const port = startRuntime({ restoreScroll: restoreTo(640) }) as unknown as {
-        onmessage: ((event: { data: unknown }) => void) | null;
-      };
+      const port = startRuntime({ restoreScroll: restoreTo(640) }) as unknown as RuntimePort;
       port.onmessage?.({
         data: {
           type: BRIDGE_MSG.setComments,
           comments: [{ id: "c1", anchor_content: "revenue", occ: 0 }],
         },
       });
-      port.onmessage?.({
-        data: {
-          type: BRIDGE_MSG.setActive,
-          active: { comment_id: "c1", anchor_content: "revenue" },
-        },
-      });
-      expect(scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ behavior: "smooth" }));
-
-      const writes = scrollTo.mock.calls.length;
-      vi.advanceTimersToNextFrame();
-      expect(scrollTo).toHaveBeenCalledTimes(writes);
+      run(port);
     } finally {
       if (rect) Object.defineProperty(Range.prototype, "getBoundingClientRect", rect);
       else delete (Range.prototype as Partial<Range>).getBoundingClientRect;
       vi.unstubAllGlobals();
       document.body.innerHTML = "";
     }
+  }
+
+  const activate = (port: RuntimePort, commentId: string | null) =>
+    port.onmessage?.({
+      data: {
+        type: BRIDGE_MSG.setActive,
+        active: commentId ? { comment_id: commentId, anchor_content: "revenue" } : null,
+      },
+    });
+
+  it.each([
+    ["an offscreen comment, scrolling to it", 4_000, true],
+    ["an already visible comment, leaving the page still", 100, false],
+  ])("stops restoring when the reader picks %s", (_label, highlightTop, scrollsToComment) => {
+    const { scrollTo } = fakeScrolling();
+    restoreWithComment(highlightTop, (port) => {
+      activate(port, null); // the parent's initial sync on connect
+      activate(port, "c1");
+      const smooth = expect.objectContaining({ behavior: "smooth" });
+      if (scrollsToComment) expect(scrollTo).toHaveBeenLastCalledWith(smooth);
+      else expect(scrollTo).not.toHaveBeenCalledWith(smooth);
+
+      const writes = scrollTo.mock.calls.length;
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).toHaveBeenCalledTimes(writes);
+    });
+  });
+
+  it("keeps restoring when the initial sync restates a visible active comment", () => {
+    const { scrollTo } = fakeScrolling();
+    restoreWithComment(100, (port) => {
+      activate(port, "c1");
+      const writes = scrollTo.mock.calls.length;
+      vi.advanceTimersToNextFrame();
+      expect(scrollTo).toHaveBeenCalledTimes(writes + 1);
+      expect(scrollTo).toHaveBeenLastCalledWith({ left: 0, top: 640, behavior: "instant" });
+    });
   });
 
   it.each([

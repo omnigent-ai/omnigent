@@ -11,6 +11,7 @@ asserts the position survives.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from collections.abc import Iterator
@@ -170,16 +171,23 @@ def test_open_file_scroll_survives_session_switch(
     assert restored == 250
 
 
-# A long HTML artifact: the restored offset lands well below the first screen.
+def _plan_steps(first: int, last: int) -> str:
+    return "".join(
+        f"<section><h2>Step {i}</h2><p>Details for step {i} of the plan.</p></section>"
+        for i in range(first, last + 1)
+    )
+
+
+# A long HTML artifact whose later steps arrive after load, so the browser clamps
+# the restored offset until the page grows tall enough to reach it.
 _HTML_ARTIFACT = (
     "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Plan</title>"
     "<style>body{font-family:sans-serif;margin:24px}section{min-height:220px}</style>"
     "</head><body><h1>Migration plan</h1>"
-    + "".join(
-        f"<section><h2>Step {i}</h2><p>Details for step {i} of the plan.</p></section>"
-        for i in range(1, 41)
-    )
-    + "</body></html>"
+    + _plan_steps(1, 8)
+    + "<script>setTimeout(() => document.body.insertAdjacentHTML('beforeend', "
+    + json.dumps(_plan_steps(9, 40))
+    + "), 400);</script></body></html>"
 )
 
 _HTML_PREVIEW = 'iframe[title="HTML preview"]'
@@ -251,7 +259,11 @@ def _expect_html_scroll(page: Page, expected: int) -> None:
     expect(preview.get_by_role("heading", name="Step 25", exact=True)).to_be_in_viewport(
         timeout=15_000
     )
-    expect(preview.locator("html")).to_have_js_property("scrollTop", expected, timeout=10_000)
+    frame = page.locator(_HTML_PREVIEW).element_handle().content_frame()
+    assert frame is not None
+    frame.wait_for_function(
+        "expected => Math.round(window.scrollY) === expected", arg=expected, timeout=10_000
+    )
 
 
 def test_html_preview_scroll_survives_tab_switch(
