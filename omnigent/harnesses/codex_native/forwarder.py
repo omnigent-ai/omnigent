@@ -3663,7 +3663,7 @@ async def _handle_event(
         and control_state is not None
         and (
             control_state.session_id != route_session_id
-            or control_state.thread_id != event_thread_id
+            or (event_thread_id is not None and control_state.thread_id != event_thread_id)
             or (
                 event_turn_id in control_state.output_limit_turn_ids
                 and control_state.output_limit_owner_scope
@@ -5153,7 +5153,10 @@ async def _handle_terminal_turn_boundary_inner(
             handled=True, edge=_terminal_turn_status_edge(None, method, params)
         )
     elif completed is not None and (
-        completed.thread_id != _thread_id_from_params(params)
+        (
+            _thread_id_from_params(params) is not None
+            and completed.thread_id != _thread_id_from_params(params)
+        )
         or (
             _terminal_turn_id_from_params(params) in completed.output_limit_turn_ids
             and completed.output_limit_owner_scope

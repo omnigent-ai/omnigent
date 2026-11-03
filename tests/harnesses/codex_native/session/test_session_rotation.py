@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ import pytest
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
+    write_bridge_state,
 )
 from tests.harnesses.codex_native.session._support import (
     _agent_message_event,
@@ -81,8 +82,10 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     assert state.thread_id == "thread_old"
 
 
+@pytest.mark.parametrize("retained_recovery", [False, True])
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    retained_recovery: bool,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -96,6 +99,23 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
+    if retained_recovery:
+        previous = read_bridge_state(tmp_path)
+        assert previous is not None
+        write_bridge_state(
+            tmp_path,
+            replace(
+                previous,
+                output_limit_turn_ids=("retired_source", "retired_continuation"),
+                output_limit_client_message_id="retired_delivery",
+                output_limit_owner_scope=(
+                    previous.session_id,
+                    previous.thread_id,
+                    previous.socket_path,
+                    previous.codex_home,
+                ),
+            ),
+        )
     fake_client = _FakeCodexAppServerClient()
     requests: list[tuple[str, str, dict[str, Any] | None]] = []
     posted_events: list[tuple[str, dict[str, Any]]] = []
