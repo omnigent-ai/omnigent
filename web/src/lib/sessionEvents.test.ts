@@ -958,6 +958,31 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(legacy.codexPersistModes).toEqual([]);
   });
 
+  it("prefers server-advertised Codex persistence modes over MCP metadata", () => {
+    const mcpParams = {
+      mode: "form",
+      message: 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+      phase: "codex_mcp_elicitation",
+      policy_name: "codex_native_mcp_elicitation",
+      content_preview: "{}",
+      requestedSchema: {},
+      _meta: { codex_approval_kind: "mcp_tool_call", persist: ["always"] },
+    };
+    const [sessionOnly] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp_session_only",
+      params: { ...mcpParams, codex_persist_modes: ["session"] },
+    }) as ElicitationRequest[];
+    const [oneTimeOnly] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_mcp_one_time_only",
+      params: { ...mcpParams, codex_persist_modes: [] },
+    }) as ElicitationRequest[];
+
+    expect(sessionOnly.codexPersistModes).toEqual(["session"]);
+    expect(oneTimeOnly.codexPersistModes).toEqual([]);
+  });
+
   it("lifts agy permission action description and advertised persist pattern", () => {
     const out = parse("response.elicitation_request", {
       type: "response.elicitation_request",

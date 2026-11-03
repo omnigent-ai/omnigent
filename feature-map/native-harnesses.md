@@ -196,7 +196,8 @@ before entering the harness menu. Then start a new CLI or web session.
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices. Codex file-change cards on both
 surfaces offer **Approve for this session**, as do Codex MCP tool approvals
-asked as a question.
+asked as a question. When that question also offers "Allow and don't ask me
+again", the card adds **Always allow**, which answers with that option.
 
 **Devin questions:** start Devin from the CLI or the new-session picker and ask
 it to use `ask_user_question` with selectable options. Answer in Chat or open Inbox
