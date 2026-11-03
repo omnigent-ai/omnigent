@@ -6078,16 +6078,17 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     return _claude_prompt_rendered(pane)
 
 
-def claude_pane_last_notice(bridge_dir: Path) -> str:
+def claude_pane_failure_tail(bridge_dir: Path) -> str:
     """
-    Return the pane's last visible line, sanitized, for a not-ready report.
+    Return the pane's last lines as the block a not-ready reply ends with.
 
-    Escape sequences and non-printable characters are removed and the line is
-    capped, so the reply can quote it without carrying raw terminal output.
+    Reads the pane the way :func:`claude_pane_ready` does and formats it with
+    :func:`_format_terminal_failure_tail`, so a control that gives up on a
+    terminal names its output the same way every other readiness failure does.
 
     :param bridge_dir: Bridge directory path.
-    :returns: The last non-blank line, e.g. ``"Plugin dev mode is active"``, or
-        ``""`` when the pane cannot be read or shows no text.
+    :returns: The block :func:`_format_terminal_failure_tail` builds, or ``""``
+        when the pane is not advertised or shows no text.
     """
     payload = _read_json_file(bridge_dir / _TMUX_FILE)
     if not isinstance(payload, dict):
@@ -6096,16 +6097,7 @@ def claude_pane_last_notice(bridge_dir: Path) -> str:
     tmux_target = payload.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return ""
-    try:
-        pane = _capture_pane(socket_path, tmux_target)
-    except (RuntimeError, OSError):
-        return ""
-    lines = [line.strip() for line in pane.splitlines() if line.strip()]
-    if not lines:
-        return ""
-    notice = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", lines[-1])
-    notice = "".join(char for char in notice if char.isprintable()).strip()
-    return notice[:160]
+    return _format_terminal_failure_tail(_capture_pane(socket_path, tmux_target))
 
 
 def claude_pane_text_ready(pane: str) -> bool:

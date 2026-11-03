@@ -16380,15 +16380,15 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
 
 
-def test_claude_pane_last_notice_returns_the_sanitized_last_line(
+def test_claude_pane_failure_tail_ends_like_other_readiness_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The not-ready reply quotes the pane's last visible line without escape codes.
+    """The not-ready reply ends with the terminal-output block other refusals use.
 
     Failure on main: the helper does not exist, so a not-ready model switch has
-    no pane line to name.
+    no pane text to name.
     """
-    pane = "Welcome\n\n\x1b[1;31m! Plugin dev mode is active\x1b[0m\n   \n"
+    pane = "Welcome\n\n! Plugin dev mode is active\n   \n"
     monkeypatch.setattr(
         claude_native_bridge,
         "_read_json_file",
@@ -16396,14 +16396,14 @@ def test_claude_pane_last_notice_returns_the_sanitized_last_line(
     )
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _socket, _target: pane)
 
-    assert claude_native_bridge.claude_pane_last_notice(tmp_path) == (
-        "! Plugin dev mode is active"
+    assert claude_native_bridge.claude_pane_failure_tail(tmp_path) == (
+        " Last terminal output:\nWelcome\n! Plugin dev mode is active"
     )
 
 
-def test_claude_pane_last_notice_is_empty_without_a_readable_pane(
+def test_claude_pane_failure_tail_is_empty_without_an_advertised_pane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unadvertised or unreadable pane yields no notice rather than an error."""
+    """An unadvertised pane yields no block rather than an error."""
     monkeypatch.setattr(claude_native_bridge, "_read_json_file", lambda _path: None)
-    assert claude_native_bridge.claude_pane_last_notice(tmp_path) == ""
+    assert claude_native_bridge.claude_pane_failure_tail(tmp_path) == ""

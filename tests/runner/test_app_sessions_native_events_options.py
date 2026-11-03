@@ -4166,7 +4166,7 @@ async def test_events_model_change_reports_a_terminal_still_starting(
 ) -> None:
     """A switch to a recreated terminal that never becomes ready is not sent.
 
-    The reply says the terminal is still starting and quotes its last line,
+    The reply says the terminal is still starting and ends with its output,
     instead of a generic runner failure. Failure on main: the switch waits in the
     prompt wait with the heal's budget already spent and answers the generic error.
     """
@@ -4181,7 +4181,9 @@ async def test_events_model_change_reports_a_terminal_still_starting(
     )
     monkeypatch.setattr(claude_native_bridge, "claude_pane_ready", lambda _bridge_dir: False)
     monkeypatch.setattr(
-        claude_native_bridge, "claude_pane_last_notice", lambda _bridge_dir: "Plugin dev mode"
+        claude_native_bridge,
+        "claude_pane_failure_tail",
+        lambda _bridge_dir: " Last terminal output:\nPlugin dev mode",
     )
 
     resp = await _post_model_change_through_a_boot(
@@ -4196,4 +4198,4 @@ async def test_events_model_change_reports_a_terminal_still_starting(
     body = resp.json()
     assert body["error"] == "claude_native_model_failed"
     assert body["detail"].startswith("The Claude terminal is still starting")
-    assert body["detail"].endswith("Last terminal line: Plugin dev mode")
+    assert body["detail"].endswith("Retry in a moment. Last terminal output:\nPlugin dev mode")

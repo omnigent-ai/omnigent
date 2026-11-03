@@ -1343,7 +1343,7 @@ def build_native_controls(
             ClaudeInjectionCancelled,
             ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
-            claude_pane_last_notice,
+            claude_pane_failure_tail,
             confirm_dialog_if_open,
             inject_slash_command,
             read_claude_status_model,
@@ -1384,13 +1384,11 @@ def build_native_controls(
         if not await _prepare_claude_native_pane_for_injection(
             conv_id, bridge_dir, wait_budget_s=deadline.remaining_s()
         ):
-            notice = await asyncio.to_thread(claude_pane_last_notice, bridge_dir)
+            tail = await asyncio.to_thread(claude_pane_failure_tail, bridge_dir)
             detail = (
                 "The Claude terminal is still starting, so the switch was not sent. "
-                "Retry in a moment."
+                "Retry in a moment." + tail
             )
-            if notice:
-                detail += f" Last terminal line: {notice}"
             return JSONResponse(
                 status_code=503,
                 content={"error": "claude_native_model_failed", "detail": detail},
