@@ -170,21 +170,32 @@ async def _open_upstream(
     """
     proxies = urllib.request.getproxies_environment()
     proxy = proxies.get("https" if ssl_ctx else "http") or proxies.get("all")
-    p = urlparse(proxy if "://" in proxy else f"http://{proxy}") if proxy else None
-    if p and (p.scheme != "http" or not p.hostname):  # https:// would need TLS-in-TLS
-        logger.error("Unsupported upstream proxy scheme %r; connecting directly", p.scheme)
-        p = None
     # Missing from typeshed stubs; present at runtime.
     bypass = urllib.request.proxy_bypass_environment  # type: ignore[missing-attribute]
-    if not p or bypass(f"{host}:{port}", proxies):
+    if proxy and bypass(f"{host}:{port}", proxies):
+        proxy = None
+    try:
+        parsed_proxy = urlparse(proxy if "://" in proxy else f"http://{proxy}") if proxy else None
+        if parsed_proxy and (parsed_proxy.scheme != "http" or not parsed_proxy.hostname):
+            logger.error(
+                "Unsupported upstream proxy scheme %r; connecting directly", parsed_proxy.scheme
+            )
+            parsed_proxy = None
+        proxy_port = (parsed_proxy.port or 80) if parsed_proxy else 80
+    except ValueError:
+        # URL parsing errors can contain the credential-bearing authority.
+        raise OSError("Invalid upstream proxy configuration") from None
+    if parsed_proxy is None:
         return await asyncio.open_connection(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )
-    reader, writer = await asyncio.open_connection(p.hostname, p.port or 80)
+    reader, writer = await asyncio.open_connection(parsed_proxy.hostname, proxy_port)
     try:
         auth = b""
-        if p.username:  # basic auth only; no NTLM/Kerberos
-            cred = f"{unquote(p.username)}:{unquote(p.password or '')}".encode()
+        if parsed_proxy.username:  # basic auth only; no NTLM/Kerberos
+            cred = (
+                f"{unquote(parsed_proxy.username)}:{unquote(parsed_proxy.password or '')}".encode()
+            )
             auth = b"Proxy-Authorization: Basic " + base64.b64encode(cred) + b"\r\n"
         target = (
             f"{connect_host}:{port}" if ":" not in connect_host else f"[{connect_host}]:{port}"
@@ -193,10 +204,12 @@ async def _open_upstream(
         await writer.drain()
         head = await reader.readuntil(b"\r\n\r\n")
         version, _, rest = head.split(b"\r\n", 1)[0].partition(b" ")
-        code = rest[:3]
-        if not (version.startswith(b"HTTP/1.") and code.isdigit() and code.startswith(b"2")):
+        code = rest.partition(b" ")[0]
+        if version not in (b"HTTP/1.0", b"HTTP/1.1") or len(code) != 3 or not code.isdigit():
+            raise OSError("upstream proxy refused CONNECT: invalid response")
+        if not code.startswith(b"2"):
             # Status code only: the proxy's reason text is untrusted.
-            raise OSError(f"upstream proxy refused CONNECT: {code.decode(errors='replace')[:3]}")
+            raise OSError(f"upstream proxy refused CONNECT: {code.decode('ascii')}")
         if ssl_ctx:
             await writer.start_tls(ssl_ctx, server_hostname=host)
     except BaseException:

@@ -36,29 +36,21 @@ async def test_http_goes_through_connect_tunnel(monkeypatch):
     assert "Proxy-Authorization: Basic dXNlcjpwQHNz" in seen[0]
 
 
-async def test_refused_connect_raises(monkeypatch):
-    async def proxy(reader, writer):
-        await reader.readuntil(b"\r\n\r\n")
-        writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-        await writer.drain()
-        writer.close()
-
-    server, port = await _serve(proxy)
-    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{port}")
-    with pytest.raises(OSError, match="403"):
-        await _open_upstream("example.test", "203.0.113.5", 80)
-    server.close()
-
-
-async def test_no_proxy_connects_directly(monkeypatch):
+@pytest.mark.parametrize("no_proxy_entry", ["localhost", "localhost:{port}"])
+@pytest.mark.parametrize(
+    "proxy_url",
+    ["http://127.0.0.1:1", "http://user:se\uff0fcret@proxy.example:8080"],
+    ids=["unreachable-proxy", "malformed-proxy"],
+)
+async def test_no_proxy_connects_directly(monkeypatch, no_proxy_entry, proxy_url):
     async def target(reader, writer):
         writer.write(b"direct")
         await writer.drain()
         writer.close()
 
     server, port = await _serve(target)
-    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")  # would fail if used
-    monkeypatch.setenv("no_proxy", "localhost")
+    monkeypatch.setenv("http_proxy", proxy_url)
+    monkeypatch.setenv("no_proxy", no_proxy_entry.format(port=port))
     reader, writer = await _open_upstream("localhost", "127.0.0.1", port)
     assert await reader.read() == b"direct"
     writer.close()
@@ -116,8 +108,20 @@ async def test_unsupported_proxy_scheme_logs_error_and_connects_directly(
     assert "secret" not in caplog.text
 
 
-@pytest.mark.parametrize("reply", [b"garbage 200 OK", b"HTTP/1.1 502 secret-reason"])
-async def test_bad_connect_reply_is_rejected_without_echoing_reason(monkeypatch, reply):
+@pytest.mark.parametrize(
+    ("reply", "expected_error"),
+    [
+        (b"garbage 200 secret-reason", "refused CONNECT"),
+        (b"HTTP/1.x 200 secret-reason", "refused CONNECT"),
+        (b"HTTP/1.1 2000 secret-reason", "refused CONNECT"),
+        (b"HTTP/1.1 20 secret-reason", "refused CONNECT"),
+        (b"HTTP/1.1 403 secret-reason", "refused CONNECT: 403"),
+        (b"HTTP/1.1 502 secret-reason", "refused CONNECT: 502"),
+    ],
+)
+async def test_bad_connect_reply_is_rejected_without_echoing_reason(
+    monkeypatch, reply, expected_error
+):
     async def proxy(reader, writer):
         await reader.readuntil(b"\r\n\r\n")
         writer.write(reply + b"\r\n\r\n")
@@ -126,7 +130,7 @@ async def test_bad_connect_reply_is_rejected_without_echoing_reason(monkeypatch,
 
     server, port = await _serve(proxy)
     monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{port}")
-    with pytest.raises(OSError, match="refused CONNECT") as exc:
+    with pytest.raises(OSError, match=expected_error) as exc:
         await _open_upstream("example.test", "203.0.113.5", 80)
     server.close()
     assert "reason" not in str(exc.value)
@@ -163,21 +167,6 @@ async def test_schemeless_proxy_is_read_as_http(monkeypatch):
     writer.close()
     server.close()
     assert seen[0].startswith(b"CONNECT 203.0.113.5:80")
-
-
-async def test_no_proxy_entry_with_port_bypasses_proxy(monkeypatch):
-    async def target(reader, writer):
-        writer.write(b"direct")
-        await writer.drain()
-        writer.close()
-
-    server, port = await _serve(target)
-    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")  # would fail if used
-    monkeypatch.setenv("no_proxy", f"localhost:{port}")
-    reader, writer = await _open_upstream("localhost", "127.0.0.1", port)
-    assert await reader.read() == b"direct"
-    writer.close()
-    server.close()
 
 
 async def test_all_proxy_is_fallback(monkeypatch):
