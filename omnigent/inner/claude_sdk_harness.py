@@ -121,6 +121,8 @@ _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+# Workspace the gateway requests select on a host that serves several.
+_ENV_GATEWAY_WORKSPACE_ID = "HARNESS_CLAUDE_SDK_GATEWAY_WORKSPACE_ID"
 # Shell command the Claude CLI invokes to retrieve a bearer token.
 # Set by the Omnigent workflow layer when executor.auth: {type: api_key, …} is
 # declared.  Passed into ClaudeSDKExecutor.api_key_helper so it reaches
@@ -296,6 +298,7 @@ def _build_claude_sdk_executor() -> Executor:
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
         or None,
+        gateway_workspace_id=os.environ.get(_ENV_GATEWAY_WORKSPACE_ID) or None,
         retry_policy=_resolve_retry_policy(),
         bundle_dir=bundle_dir,
         agent_name=agent_name,

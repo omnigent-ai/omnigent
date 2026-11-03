@@ -56,6 +56,7 @@ from omnigent.spec.types import (
     LLMConfig,
     ProviderAuth,
 )
+from tests._helpers.ucode_state import shared_host_ucode_state, write_ucode_state
 
 _CATALOG_DEFAULTS = {
     ("anthropic", "claude"): "catalog-anthropic-default",
@@ -1500,7 +1501,7 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
             return_value="https://workspace.databricks.com",
         ),
         patch(
-            "omnigent.runtime.workflow.read_ucode_state",
+            "omnigent.onboarding.ucode_state.read_ucode_state",
             return_value=UcodeWorkspaceState(
                 workspace_url="https://workspace.databricks.com",
                 agents={
@@ -1523,6 +1524,7 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
     )
     assert "HARNESS_CODEX_GATEWAY" not in env
     assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
+    assert "HARNESS_CODEX_GATEWAY_WORKSPACE_ID" not in env
 
     from omnigent.inner import codex_harness
     from omnigent.inner.codex_executor import CodexExecutor
@@ -1556,6 +1558,120 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
     assert "sh -c arbitrary" not in generated
 
 
+_SHARED_HOST = "https://shared.example.com"
+_SHARED_WORKSPACE_ID = "1965859176160743"
+
+
+def _use_shared_host_ucode_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, profile_workspace_id: str | None
+) -> None:
+    """Point the workflow at ucode state for a host serving several workspaces."""
+    state_file = write_ucode_state(
+        tmp_path / "state.json", shared_host_ucode_state(_SHARED_HOST, _SHARED_WORKSPACE_ID)
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_file)
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.get_workspace_url_for_profile", lambda profile: _SHARED_HOST
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._profile_workspace_id", lambda profile: profile_workspace_id
+    )
+
+
+@pytest.mark.parametrize(
+    ("harness_type", "base_url_key", "workspace_id_key"),
+    [
+        (
+            "claude-sdk",
+            "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL",
+            "HARNESS_CLAUDE_SDK_GATEWAY_WORKSPACE_ID",
+        ),
+        ("pi", "HARNESS_PI_GATEWAY_BASE_URL", "HARNESS_PI_GATEWAY_WORKSPACE_ID"),
+        (
+            "openai-agents-sdk",
+            "HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL",
+            "HARNESS_OPENAI_AGENTS_GATEWAY_WORKSPACE_ID",
+        ),
+    ],
+)
+@pytest.mark.parametrize("profile_workspace_id", [_SHARED_WORKSPACE_ID, None])
+def test_ucode_harness_env_selects_the_workspace_on_a_shared_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness_type: str,
+    base_url_key: str,
+    workspace_id_key: str,
+    profile_workspace_id: str | None,
+) -> None:
+    """ucode's shared-host entry gives each harness its gateway and the workspace selector."""
+    from omnigent.runtime.workflow import configure_agent_harness_with_ucode
+
+    _use_shared_host_ucode_state(monkeypatch, tmp_path, profile_workspace_id=profile_workspace_id)
+    env: dict[str, str] = {}
+
+    configure_agent_harness_with_ucode(env, "shared", harness_type=harness_type)  # type: ignore[arg-type]
+
+    assert env[base_url_key].startswith(f"{_SHARED_HOST}/ai-gateway/")
+    assert env[workspace_id_key] == _SHARED_WORKSPACE_ID
+
+
+def test_ucode_harness_env_refuses_another_workspaces_shared_host_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A profile pinned to another workspace gets no ucode route from the bare-host copy."""
+    from omnigent.runtime.workflow import configure_agent_harness_with_ucode
+
+    _use_shared_host_ucode_state(monkeypatch, tmp_path, profile_workspace_id="42")
+    env: dict[str, str] = {}
+
+    configure_agent_harness_with_ucode(env, "shared", harness_type="claude-sdk")
+
+    assert env == {}
+
+
+def test_codex_shared_host_broker_signs_with_the_workspace_selector(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Signer-backed Codex on a shared host carries the workspace into the signer config."""
+    from omnigent.inner import codex_harness
+    from omnigent.inner.codex_executor import CodexExecutor
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.model_signer import SignerLaunchConfig
+
+    _write_config(config_home, {})
+    _use_shared_host_ucode_state(monkeypatch, tmp_path, profile_workspace_id=_SHARED_WORKSPACE_ID)
+    spec = _make_spec(
+        harness="codex",
+        model="system.ai.gpt-test",
+        auth=DatabricksAuth(profile="shared"),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_SIGNER_ENDPOINT"] == f"{_SHARED_HOST}/ai-gateway/codex/v1"
+    assert env["HARNESS_CODEX_GATEWAY_WORKSPACE_ID"] == _SHARED_WORKSPACE_ID
+
+    captured: dict[str, object] = {}
+    original_init = CodexExecutor.__init__
+
+    def _capture_init(self: CodexExecutor, **kwargs: object) -> None:
+        captured.update(kwargs)
+        original_init(self, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as env_patch:
+        for name in tuple(os.environ):
+            env_patch.delenv(name)
+        for name, value in {**env, "OMNIGENT_CODEX_PATH": "/bin/true"}.items():
+            env_patch.setenv(name, value)
+        with patch.object(CodexExecutor, "__init__", _capture_init):
+            codex_harness._build_codex_executor()
+
+    signer = captured["signer_launch_config"]
+    assert isinstance(signer, SignerLaunchConfig)
+    assert signer.to_jsonable()["workspace_id"] == _SHARED_WORKSPACE_ID
+
+
 @pytest.mark.parametrize("declares_os_env", [False, True])
 def test_codex_databricks_broker_contains_specs_that_do_not_opt_in(
     config_home: Path,
@@ -1586,7 +1702,7 @@ def test_codex_databricks_broker_contains_specs_that_do_not_opt_in(
             return_value="https://workspace.databricks.com",
         ),
         patch(
-            "omnigent.runtime.workflow.read_ucode_state",
+            "omnigent.onboarding.ucode_state.read_ucode_state",
             return_value=UcodeWorkspaceState(
                 workspace_url="https://workspace.databricks.com",
                 agents={"codex": UcodeAgentState(model="databricks-gpt-5", base_url=endpoint)},

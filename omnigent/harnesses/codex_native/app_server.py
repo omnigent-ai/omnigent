@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.databricks_ai_gateway import workspace_selector_headers
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
@@ -3690,8 +3691,8 @@ def _databricks_launch_materialization(
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
-    base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
-        host, profile
+    base_url, auth_command, auth_refresh_interval_ms, auth_config, http_headers = (
+        _databricks_codex_gateway(host, profile)
     )
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
@@ -3700,6 +3701,7 @@ def _databricks_launch_materialization(
             auth_command=auth_command,
             auth_refresh_interval_ms=auth_refresh_interval_ms,
             auth_config=auth_config,
+            http_headers=http_headers,
         ),
         model=resolved_model,
         host=host,
@@ -3708,9 +3710,9 @@ def _databricks_launch_materialization(
 
 def _databricks_codex_gateway(
     host: str, profile: str
-) -> tuple[str, str, int | None, dict[str, object] | None]:
+) -> tuple[str, str, int | None, dict[str, object] | None, dict[str, str]]:
     """
-    Return the Codex gateway URL, shell helper, cadence and structured auth for *host*.
+    Return the Codex gateway URL, shell helper, cadence, structured auth and headers.
 
     ucode state is the source of truth for the gateway and auth; the
     profile-derived gateway is the fallback.
@@ -3718,12 +3720,19 @@ def _databricks_codex_gateway(
     :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
     :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
-        an auth command, else the profile-derived gateway with default auth settings.
+        an auth command, with the workspace selector headers a host serving several
+        workspaces needs; else the profile-derived gateway with default auth settings.
     """
-    from omnigent.onboarding.ucode_state import read_ucode_state
+    from omnigent.inner.databricks_executor import databrickscfg_workspace_id_for_profile
+    from omnigent.onboarding.ucode_state import (
+        gateway_workspace_id,
+        read_ucode_state_for_workspace,
+    )
 
     try:
-        workspace_state = read_ucode_state(host)
+        workspace_state = read_ucode_state_for_workspace(
+            host, databrickscfg_workspace_id_for_profile(profile)
+        )
     except (OSError, ValueError):  # unreadable ucode state keeps the profile path
         # Host logging mirrors WARNINGs to the terminal; frames are debug-only.
         _logger.warning(
@@ -3733,13 +3742,23 @@ def _databricks_codex_gateway(
         )
         workspace_state = None
     agent = workspace_state.agent("codex") if workspace_state is not None else None
-    if agent is not None and agent.base_url and agent.auth_command:
-        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms, agent.auth
+    if workspace_state is not None and agent is not None and agent.base_url and agent.auth_command:
+        workspace_id = gateway_workspace_id(
+            workspace_state, agent, host=host, urls=[agent.base_url]
+        )
+        return (
+            agent.base_url,
+            agent.auth_command,
+            agent.auth_refresh_interval_ms,
+            agent.auth,
+            workspace_selector_headers(workspace_id),
+        )
     return (
         _databricks_codex_base_url(host),
         _databricks_codex_auth_command(host, profile),
         None,
         None,
+        {},
     )
 
 

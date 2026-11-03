@@ -131,6 +131,8 @@ _ENV_AGENT_NAME = "HARNESS_CODEX_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CODEX_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CODEX_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+# Workspace the gateway requests select on a host that serves several.
+_ENV_GATEWAY_WORKSPACE_ID = "HARNESS_CODEX_GATEWAY_WORKSPACE_ID"
 _ENV_SIGNER_PROVIDER = "HARNESS_CODEX_SIGNER_PROVIDER"
 _ENV_SIGNER_ENDPOINT = "HARNESS_CODEX_SIGNER_ENDPOINT"
 _ENV_MODEL_EGRESS = "HARNESS_CODEX_MODEL_EGRESS"
@@ -366,6 +368,7 @@ def _resolve_signer_launch_config() -> SignerLaunchConfig | None:
         trusted_session_endpoint=endpoint,
         operator_model_egress=model_egress,
         auth_profile=profile,
+        workspace_id=os.environ.get(_ENV_GATEWAY_WORKSPACE_ID, "").strip() or None,
     )
 
 
@@ -423,6 +426,9 @@ def _build_codex_executor() -> Executor:
         gateway_auth_refresh_interval_ms=None
         if signer_launch_config is not None
         else os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS) or None,
+        gateway_workspace_id=None
+        if signer_launch_config is not None
+        else os.environ.get(_ENV_GATEWAY_WORKSPACE_ID) or None,
         retry_policy=_resolve_retry_policy(),
         bundle_dir=bundle_dir,
         agent_name=agent_name,

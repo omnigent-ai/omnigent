@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
 
+from omnigent.databricks_ai_gateway import numeric_workspace_id, workspace_selector_headers
+
 from .egress.ca import ensure_ca, ensure_ca_bundle
 from .egress.certs import HostCertCache
 from .egress.proxy import EgressProxy, _parse_http_headers
@@ -39,6 +41,8 @@ from .model_signing import SigningRejected, reconstruct_signed_request
 
 _CONFIG_KEYS = frozenset({"binding_id", "endpoint", "routes"})
 _UCODE_CONFIG_KEYS = _CONFIG_KEYS | {"auth_profile"}
+# A ucode workspace on a host serving several workspaces also names its workspace.
+_UCODE_SELECTED_CONFIG_KEYS = _UCODE_CONFIG_KEYS | {"workspace_id"}
 _ROUTE_KEYS = frozenset({"method", "host", "path"})
 _TEST_BINDING = "test-fake-provider-v1"
 _UCODE_BINDING = "databricks-ucode-v1"
@@ -231,6 +235,9 @@ def _parse_strict_response_head(status_line: bytes, headers_raw: bytes) -> _Pars
 class _SignerRelay(EgressProxy):
     """Exact-route MITM relay whose credential exists only in this process."""
 
+    # Trusted headers added to every signed request, e.g. a workspace selector.
+    _route_headers: tuple[tuple[str, str], ...] = ()
+
     def __init__(
         self,
         *,
@@ -242,6 +249,7 @@ class _SignerRelay(EgressProxy):
         ca_key_path: Path,
         ca_bundle_path: Path,
         provider_port: int | None,
+        route_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(
             parse_rules([f"{route.method} {route.host}{route.path}"]),
@@ -256,6 +264,7 @@ class _SignerRelay(EgressProxy):
             raise ValueError("signer relay requires exactly one credential source")
         self._credential_source = credential_source or _StaticCredential(bearer_token or "")
         self._provider_port = provider_port
+        self._route_headers = route_headers
         self._tls_sni_by_task: dict[asyncio.Task[object], str | None] = {}
         self._tls_sni_by_object: weakref.WeakKeyDictionary[
             ssl.SSLObject | ssl.SSLSocket, str | None
@@ -332,6 +341,7 @@ class _SignerRelay(EgressProxy):
                 target=path,
                 headers=headers,
                 body=body,
+                route_headers=self._route_headers,
             )
         except SigningRejected:
             await self._send_forbidden(client_writer, "")
@@ -352,6 +362,7 @@ class _SignerRelay(EgressProxy):
             target=path,
             headers=headers,
             body=body,
+            route_headers=self._route_headers,
         )
         if port != 443:
             await self._send_forbidden(client_writer, "")
@@ -849,7 +860,7 @@ def _fake_responses_payload(
     return body, b"text/event-stream"
 
 
-def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None]:
+def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None, str | None]:
     with os.fdopen(fd, "rb", closefd=True) as stream:
         raw = stream.read(_MAX_CONFIG_BYTES + 1)
     if len(raw) > _MAX_CONFIG_BYTES:
@@ -858,8 +869,12 @@ def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None]:
     if not isinstance(payload, dict):
         raise ValueError("signer config fields are invalid")
     binding_id = payload.get("binding_id")
-    expected_keys = _UCODE_CONFIG_KEYS if binding_id == _UCODE_BINDING else _CONFIG_KEYS
-    if set(payload) != expected_keys:
+    allowed_keys = (
+        (_UCODE_CONFIG_KEYS, _UCODE_SELECTED_CONFIG_KEYS)
+        if binding_id == _UCODE_BINDING
+        else (_CONFIG_KEYS,)
+    )
+    if set(payload) not in allowed_keys:
         raise ValueError("signer config fields are invalid")
     if binding_id not in (_TEST_BINDING, _UCODE_BINDING):
         raise ValueError("provider binding is unavailable")
@@ -890,7 +905,12 @@ def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None]:
     ):
         raise ValueError("signer authority must be exact POST trusted /responses")
     auth_profile = str(payload["auth_profile"]) if binding_id == _UCODE_BINDING else None
-    return str(binding_id), route, auth_profile
+    workspace_id = None
+    if "workspace_id" in payload:
+        workspace_id = numeric_workspace_id(payload["workspace_id"])
+        if workspace_id is None:
+            raise ValueError("signer workspace selector is invalid")
+    return str(binding_id), route, auth_profile, workspace_id
 
 
 def _pick_relay_port() -> int:
@@ -915,7 +935,7 @@ def _remove_owned_directory(path: Path | None, identity: tuple[int, int] | None)
 
 
 async def _run(config_fd: int) -> int:
-    binding_id, route, auth_profile = _load_config(config_fd)
+    binding_id, route, auth_profile, workspace_id = _load_config(config_fd)
     credential_lifecycle: CredentialLifecycle | None = None
     if binding_id == _UCODE_BINDING:
         assert auth_profile is not None
@@ -982,6 +1002,7 @@ async def _run(config_fd: int) -> int:
             ca_key_path=ca_key,
             ca_bundle_path=ca_bundle,
             provider_port=provider_port,
+            route_headers=tuple(workspace_selector_headers(workspace_id).items()),
         )
         socket_path = public_dir / "relay.sock"
         await relay.start_unix(socket_path)

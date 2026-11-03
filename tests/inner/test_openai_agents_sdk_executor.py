@@ -1926,6 +1926,38 @@ def test_get_openai_client_host_override_uses_ucode_auth_command(monkeypatch):
     assert captured["base_url"] == "https://example.databricks.com/ai-gateway/codex/v1"
     assert captured["api_key"] != "should-not-be-used"
     assert isinstance(captured["http_client"], httpx.AsyncClient)
+    assert "X-Databricks-Org-Id" not in captured["default_headers"]
+
+
+def test_get_openai_client_host_override_selects_the_workspace_on_a_shared_host(monkeypatch):
+    """A host serving several workspaces gets the selector as a default header.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.inner.openai_agents_sdk_executor as oa_exec
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.setattr(oa_exec, "IS_WINDOWS", False)
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        _get_openai_async_client(
+            host_override="https://shared.example.com",
+            base_url_override="https://shared.example.com/ai-gateway/codex/v1",
+            databricks_auth_command="printf token",
+            workspace_id="123",
+        )
+
+    assert captured["default_headers"] == {
+        "X-Databricks-Org-Id": "123",
+        "X-Databricks-Workspace-Id": "123",
+    }
 
 
 def test_get_openai_client_host_override_mints_profile_token_on_windows(monkeypatch):

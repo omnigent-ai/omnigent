@@ -49,6 +49,7 @@ from omnigent.databricks_ai_gateway import (
     is_databricks_ai_gateway_url,
     is_ug_route,
     with_gateway_attribution_lines,
+    with_workspace_selector_lines,
 )
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
@@ -1259,6 +1260,7 @@ def _resolve_gateway_env(
     base_url_override: str | None = None,
     auth_command_override: str | None = None,
     auth_refresh_interval_ms: int | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, str]:
     """Build Claude Code gateway env from the gateway transport values.
 
@@ -1292,6 +1294,9 @@ def _resolve_gateway_env(
         e.g. ``"databricks auth token --host ..."`` or ``"printf %s sk-..."``.
     :param auth_refresh_interval_ms: Refresh TTL in milliseconds, e.g.
         ``900000``.
+    :param workspace_id: Workspace the requests select on a host serving
+        several workspaces, e.g. ``"123"``. Populated from
+        ``HARNESS_CLAUDE_SDK_GATEWAY_WORKSPACE_ID``.
     :returns: Environment values plus an internal apiKeyHelper command
         consumed by :meth:`ClaudeSDKExecutor.run_turn`, or ``{}`` when
         no credentials are available.
@@ -1376,6 +1381,9 @@ def _resolve_gateway_env(
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+    gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_workspace_selector_lines(
+        gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV], workspace_id
+    )
     return gateway_env
 
 
@@ -1707,6 +1715,7 @@ class ClaudeSDKExecutor(Executor):
         base_url_override: str | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
+        gateway_workspace_id: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
@@ -1757,6 +1766,9 @@ class ClaudeSDKExecutor(Executor):
             gateway_auth_refresh_interval_ms: Refresh TTL as a string,
                 e.g. ``"900000"``. Set from
                 ``HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS``.
+            gateway_workspace_id: Workspace the gateway requests select on a
+                host serving several workspaces, e.g. ``"123"``. Set from
+                ``HARNESS_CLAUDE_SDK_GATEWAY_WORKSPACE_ID``.
             bundle_dir: Materialized agent-bundle root, when the agent
                 ships its own ``skills/`` directory. Used to expose
                 bundled skills to Claude via ``--plugin-dir <bundle>``
@@ -1909,6 +1921,7 @@ class ClaudeSDKExecutor(Executor):
                 base_url_override=base_url_override,
                 auth_command_override=self._gateway_auth_command,
                 auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
+                workspace_id=gateway_workspace_id,
             )
             if not gateway_env:
                 raise OSError(

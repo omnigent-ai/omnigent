@@ -44,6 +44,7 @@ from omnigent.databricks_ai_gateway import (
     CODEX_AGENT,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
+    workspace_selector_headers,
 )
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_egress import (
@@ -2192,6 +2193,7 @@ def _databricks_codex_config_overrides(
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
     auth_config: Mapping[str, object] | None = None,
+    http_headers: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2205,6 +2207,8 @@ def _databricks_codex_config_overrides(
         e.g. ``900000``.
     :param auth_config: ucode's structured auth command, args and timeout.
         Invalid or missing values retain the legacy shell helper and defaults.
+    :param http_headers: Static headers for every request, e.g. the workspace
+        selector on a host serving several workspaces.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
@@ -2225,6 +2229,10 @@ def _databricks_codex_config_overrides(
         configured_timeout = auth_config.get("timeout_ms")
         if type(configured_timeout) is int and configured_timeout > 0:
             timeout_ms = configured_timeout
+    headers = ",".join(
+        f"{json.dumps(name)}={json.dumps(value)}"
+        for name, value in sorted((http_headers or {}).items())
+    )
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2237,8 +2245,7 @@ def _databricks_codex_config_overrides(
             f"args={json.dumps(args)},"
             f"timeout_ms={timeout_ms},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
-            "},"
-            'wire_api="responses"}'
+            "}," + (f"http_headers={{{headers}}}," if headers else "") + 'wire_api="responses"}'
         ),
     ]
 
@@ -4593,6 +4600,7 @@ class CodexExecutor(Executor):
         base_url_override: str | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
+        gateway_workspace_id: str | None = None,
         enable_web_search: bool = True,
         disable_native_tools: bool = False,
         retry_policy: RetryPolicy | None = None,
@@ -4645,6 +4653,9 @@ class CodexExecutor(Executor):
         :param gateway_auth_refresh_interval_ms: Refresh cadence as a string,
             e.g. ``"900000"``. Set from
             ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS``.
+        :param gateway_workspace_id: Workspace the gateway requests select on a
+            host serving several workspaces, e.g. ``"123"``. Set from
+            ``HARNESS_CODEX_GATEWAY_WORKSPACE_ID``.
         :param enable_web_search: Leave Codex's built-in ``web_search`` tool
             enabled.  Set ``False`` to force the model to use only
             Omnigent-bridged tools.
@@ -4837,6 +4848,7 @@ class CodexExecutor(Executor):
                     base_url=base_url,
                     auth_command=auth_command,
                     auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
+                    http_headers=workspace_selector_headers(gateway_workspace_id),
                 )
             )
         if not enable_web_search and signer_launch_config is None:

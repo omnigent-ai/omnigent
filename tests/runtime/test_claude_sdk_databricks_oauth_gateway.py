@@ -93,7 +93,7 @@ def oauth_databrickscfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
         lambda profile: WORKSPACE_HOST,
     )
     monkeypatch.setattr(
-        "omnigent.runtime.workflow.read_ucode_state",
+        "omnigent.onboarding.ucode_state.read_ucode_state",
         lambda workspace_url: None,
     )
     return cfg_path

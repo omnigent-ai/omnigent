@@ -501,6 +501,32 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks", providers)
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
+        self.assertFalse(any("headers" in provider for provider in providers.values()))
+
+    def test_shared_host_providers_select_the_workspace(self):
+        """Every provider on a host serving several workspaces carries the selector."""
+        host = "https://shared.example.com"
+        result = _build_models_json(
+            host,
+            "tok",
+            {"claude": f"{host}/ai-gateway/anthropic", "openai": f"{host}/ai-gateway/codex/v1"},
+            workspace_id="123",
+        )
+        selector = {"X-Databricks-Org-Id": "123", "X-Databricks-Workspace-Id": "123"}
+        for provider in result["providers"].values():
+            self.assertEqual(provider.get("headers"), selector, provider["baseUrl"])
+
+    def test_workspace_selector_stays_off_other_hosts(self):
+        """A provider URL on another host never receives the selector."""
+        result = _build_models_json(
+            "https://shared.example.com",
+            "tok",
+            {"claude": "https://elsewhere.example.com/anthropic"},
+            workspace_id="123",
+        )
+        anthropic = result["providers"]["databricks-anthropic"]
+        self.assertEqual(anthropic["baseUrl"], "https://elsewhere.example.com/anthropic")
+        self.assertNotIn("headers", anthropic)
 
     def test_dynamic_model_declared_image_capable(self):
         # #515: a dynamically-registered model must advertise image input, or

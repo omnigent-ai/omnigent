@@ -1874,6 +1874,26 @@ class TestResolveGatewayEnv(unittest.TestCase):
             "x-databricks-use-coding-agent-mode: true",
         )
 
+    def test_host_override_selects_the_workspace_on_a_shared_host(self):
+        """A host serving several workspaces gets the selector on every request."""
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        env = _resolve_gateway_env(
+            host_override="https://shared.example.com",
+            base_url_override="https://shared.example.com/ai-gateway/anthropic",
+            auth_command_override="printf token",
+            workspace_id="123",
+        )
+
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "X-Databricks-Org-Id: 123",
+                "X-Databricks-Workspace-Id: 123",
+            ],
+        )
+
     def test_generic_provider_gateway_omits_databricks_header(self):
         """Non-Databricks gateways must not receive the Databricks mode header."""
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -2088,6 +2108,7 @@ class TestSystemMessages(unittest.TestCase):
             base_url_override=None,
             auth_command_override=None,
             auth_refresh_interval_ms=None,
+            workspace_id=None,
         ):
             return {
                 "ANTHROPIC_BASE_URL": base_url_override or "https://host/ai-gateway/anthropic",

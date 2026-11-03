@@ -59,6 +59,19 @@ def _ucode_config() -> SignerLaunchConfig:
     )
 
 
+def test_ucode_launch_config_carries_a_numeric_workspace_selector() -> None:
+    """Only a ucode signer may select a workspace, and only by numeric id."""
+    import dataclasses
+
+    selected = dataclasses.replace(_ucode_config(), workspace_id="123")
+    assert selected.to_jsonable()["workspace_id"] == "123"
+    assert "workspace_id" not in _ucode_config().to_jsonable()
+    with pytest.raises(ValueError, match="workspace selector"):
+        dataclasses.replace(_ucode_config(), workspace_id="12a")
+    with pytest.raises(ValueError, match="workspace selector"):
+        dataclasses.replace(_config("test-fake-provider-v1"), workspace_id="123")
+
+
 def _write_child(path: Path) -> None:
     path.write_text(
         """

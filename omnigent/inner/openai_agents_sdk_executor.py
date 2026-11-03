@@ -30,7 +30,10 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 import httpx
 
 from omnigent._platform import IS_WINDOWS
-from omnigent.databricks_ai_gateway import gateway_request_tag_headers
+from omnigent.databricks_ai_gateway import (
+    gateway_request_tag_headers,
+    workspace_selector_headers,
+)
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
@@ -437,6 +440,7 @@ def _get_openai_async_client(
     host_override: str | None = None,
     databricks_auth_command: str | None = None,
     model: str | None = None,
+    workspace_id: str | None = None,
 ) -> AsyncOpenAIClient:
     """Construct an AsyncOpenAI client for direct or Databricks-hosted use.
 
@@ -471,6 +475,8 @@ def _get_openai_async_client(
         explicit ``profile`` selects Databricks regardless of this value.
         Without a profile, only legacy ``"databricks-"`` names enable
         ambient Databricks credential fallback.
+    :param workspace_id: Workspace the gateway requests select on a host
+        serving several workspaces, e.g. ``"123"``; used with *host_override*.
     :raises DatabricksAuthError: When an explicit ``profile`` is given,
         authentication fails, and no ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``
         env-var fallbacks are available.
@@ -522,7 +528,10 @@ def _get_openai_async_client(
             gateway_auth = _ShellCommandBearerAuth(databricks_auth_command)
         return AsyncOpenAI(
             base_url=_gateway_base_url_for_model(base_url_override, model),
-            default_headers=gateway_request_tag_headers(base_url_override),
+            default_headers={
+                **gateway_request_tag_headers(base_url_override),
+                **workspace_selector_headers(workspace_id),
+            },
             api_key=_OPENAI_KEY_PLACEHOLDER,
             http_client=httpx.AsyncClient(auth=gateway_auth),
             **retry_kwargs,
@@ -1316,6 +1325,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         base_url_override: str | None = None,
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
+        gateway_workspace_id: str | None = None,
         reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
     ) -> None:
         """Create an OpenAIAgentsSDKExecutor.
@@ -1362,6 +1372,9 @@ class OpenAIAgentsSDKExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND``.
+        :param gateway_workspace_id: Workspace the gateway requests select on a
+            host serving several workspaces, e.g. ``"123"``. Set from
+            ``HARNESS_OPENAI_AGENTS_GATEWAY_WORKSPACE_ID``.
         :param reasoning_item_id_policy: Optional Responses API replay policy.
             ``"preserve"`` retains reasoning item IDs; ``"omit"`` is available
             for legacy providers that reject orphaned reasoning items. ``None``
@@ -1383,6 +1396,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                 host_override=gateway_host,
                 databricks_auth_command=gateway_auth_command,
                 model=model,
+                workspace_id=gateway_workspace_id,
             )
         )
         if client is None:

@@ -162,7 +162,7 @@ def _ucode_state_for_pi(
         lambda profile: "https://example.databricks.com",
     )
     monkeypatch.setattr(
-        "omnigent.runtime.workflow.read_ucode_state",
+        "omnigent.onboarding.ucode_state.read_ucode_state",
         lambda workspace_url: state,
     )
 

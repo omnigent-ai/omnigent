@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
@@ -293,4 +294,57 @@ def with_gateway_attribution_lines(
                 lines.append(line)
         attribution.update(with_ci_request_tags(tag_headers))
     lines.extend(f"{name}: {value}" for name, value in attribution.items())
+    return "\n".join(lines)
+
+
+# Request headers that select one workspace on a host serving several of them
+# (an account custom URL such as ``https://isaac.databricks.com``). Without them
+# that host redirects gateway requests to its sign-in page.
+WORKSPACE_SELECTOR_HEADERS: Final[tuple[str, ...]] = (
+    "X-Databricks-Org-Id",
+    "X-Databricks-Workspace-Id",
+)
+_NUMERIC_WORKSPACE_ID = re.compile(r"[0-9]{1,20}")
+
+
+def numeric_workspace_id(value: object) -> str | None:
+    """Return *value* when it is a numeric Databricks workspace id, else ``None``.
+
+    :param value: Untrusted input, e.g. a ``workspace_id`` read from ucode's state.
+    :returns: The id, e.g. ``"1965859176160743"``, or ``None``.
+    """
+    if isinstance(value, str) and _NUMERIC_WORKSPACE_ID.fullmatch(value):
+        return value
+    return None
+
+
+def workspace_selector_headers(workspace_id: str | None) -> dict[str, str]:
+    """Return the headers that select *workspace_id*, or ``{}`` for a non-numeric id.
+
+    :param workspace_id: Workspace id, e.g. ``"1965859176160743"``, or ``None``.
+    :returns: e.g. ``{"X-Databricks-Org-Id": "123", "X-Databricks-Workspace-Id": "123"}``.
+    """
+    selected = numeric_workspace_id(workspace_id)
+    return dict.fromkeys(WORKSPACE_SELECTOR_HEADERS, selected) if selected else {}
+
+
+def with_workspace_selector_lines(custom_headers: str | None, workspace_id: str | None) -> str:
+    """Add the workspace selector to Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
+
+    Existing selector lines are replaced, so the block names exactly one workspace.
+
+    :param custom_headers: The newline-separated ``Name: value`` block, or ``None``.
+    :param workspace_id: Workspace id to select; a non-numeric id adds nothing.
+    :returns: The block with the selector lines last.
+    """
+    selector = workspace_selector_headers(workspace_id)
+    if not selector:
+        return custom_headers or ""
+    names = {name.lower() for name in WORKSPACE_SELECTOR_HEADERS}
+    lines = [
+        line
+        for line in (custom_headers or "").splitlines()
+        if line and line.partition(":")[0].strip().lower() not in names
+    ]
+    lines.extend(f"{name}: {value}" for name, value in selector.items())
     return "\n".join(lines)

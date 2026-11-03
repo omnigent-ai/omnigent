@@ -522,6 +522,37 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     )
 
 
+def test_ucode_config_for_profile_selects_the_workspace_on_a_shared_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile on a host serving several workspaces sends that workspace's selector."""
+    from tests._helpers.ucode_state import shared_host_ucode_state, write_ucode_state
+
+    host = "https://shared.example.com"
+    state_file = write_ucode_state(tmp_path / "state.json", shared_host_ucode_state(host, "123"))
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_file)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: host,
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor.databrickscfg_workspace_id_for_profile",
+        lambda profile: "123",
+    )
+
+    config = claude_native._ucode_config_for_profile("shared", refresh_models=False)
+
+    assert config is not None
+    assert config.env["ANTHROPIC_BASE_URL"] == f"{host}/ai-gateway/anthropic"
+    assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        "x-databricks-use-coding-agent-mode: true",
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent, ug",
+        "X-Databricks-Org-Id: 123",
+        "X-Databricks-Workspace-Id: 123",
+    ]
+
+
 def _ucode_state_with_auth_command(auth_command: str) -> Any:
     """Build a one-agent ucode workspace state carrying *auth_command*."""
     from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState

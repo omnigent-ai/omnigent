@@ -82,6 +82,7 @@ def test_executor_factory_reads_databricks_profile_env(
         "https://example.databricks.com/ai-gateway/codex/v1",
     )
     monkeypatch.setenv("HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND", "printf token")
+    monkeypatch.setenv("HARNESS_OPENAI_AGENTS_GATEWAY_WORKSPACE_ID", "123")
     monkeypatch.delenv("HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY", raising=False)
 
     captured: dict[str, Any] = {}
@@ -98,9 +99,11 @@ def test_executor_factory_reads_databricks_profile_env(
         base_url_override: str | None = None,
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
+        gateway_workspace_id: str | None = None,
         reasoning_item_id_policy: str | None = None,
     ) -> None:
         captured["client"] = client
+        captured["gateway_workspace_id"] = gateway_workspace_id
         captured["profile"] = profile
         captured["api_key"] = api_key
         captured["use_responses"] = use_responses
@@ -121,6 +124,7 @@ def test_executor_factory_reads_databricks_profile_env(
     assert captured["gateway_host"] == "https://example.databricks.com"
     assert captured["base_url_override"] == "https://example.databricks.com/ai-gateway/codex/v1"
     assert captured["gateway_auth_command"] == "printf token"
+    assert captured["gateway_workspace_id"] == "123"
     assert captured["reasoning_item_id_policy"] is None
     # ``use_responses`` defaults True when env var absent.
     assert captured["use_responses"] is True

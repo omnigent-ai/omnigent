@@ -188,3 +188,28 @@ def test_body_size_is_checked_before_signing() -> None:
             body=b'{"payload":"too large"}',
             max_body_bytes=8,
         )
+
+
+def test_route_headers_are_added_and_client_copies_are_dropped() -> None:
+    """The signer adds its trusted route headers; a client cannot pick another workspace."""
+    request = reconstruct_signed_request(
+        route=_ROUTE,
+        placeholder=_PLACEHOLDER,
+        bearer_token=_TOKEN,
+        method="POST",
+        connect_host=_HOST,
+        sni_host=_HOST,
+        request_host=_HOST,
+        target=_PATH,
+        headers=[
+            ("Authorization", f"Bearer {_PLACEHOLDER}"),
+            ("Content-Type", "application/json"),
+            ("X-Databricks-Org-Id", "666"),
+        ],
+        body=b'{"model":"test"}',
+        route_headers=(("X-Databricks-Org-Id", "123"), ("X-Databricks-Workspace-Id", "123")),
+    )
+
+    assert [value for name, value in request.headers if name == "X-Databricks-Org-Id"] == ["123"]
+    assert request.header("X-Databricks-Workspace-Id") == "123"
+    assert request.header("Authorization") == f"Bearer {_TOKEN}"

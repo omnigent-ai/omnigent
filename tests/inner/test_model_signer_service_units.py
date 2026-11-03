@@ -94,19 +94,32 @@ def _config(**overrides: Any) -> dict[str, Any]:
 
 
 def test_load_config_accepts_the_test_binding(tmp_path: Path) -> None:
-    binding, route, profile = svc._load_config(_config_fd(_config(), tmp_path))
+    binding, route, profile, workspace_id = svc._load_config(_config_fd(_config(), tmp_path))
     assert binding == svc._TEST_BINDING
     assert route == _ROUTE
     assert profile is None
+    assert workspace_id is None
 
 
 def test_load_config_accepts_the_ucode_binding_with_a_profile(tmp_path: Path) -> None:
-    binding, route, profile = svc._load_config(
+    binding, route, profile, workspace_id = svc._load_config(
         _config_fd(_config(binding_id=svc._UCODE_BINDING, auth_profile="work"), tmp_path)
     )
     assert binding == svc._UCODE_BINDING
     assert route.host == "api.example.test"
     assert profile == "work"
+    assert workspace_id is None
+
+
+def test_load_config_accepts_a_ucode_workspace_selector(tmp_path: Path) -> None:
+    """A ucode workspace on a host serving several workspaces names its workspace."""
+    *_, workspace_id = svc._load_config(
+        _config_fd(
+            _config(binding_id=svc._UCODE_BINDING, auth_profile="work", workspace_id="123"),
+            tmp_path,
+        )
+    )
+    assert workspace_id == "123"
 
 
 @pytest.mark.parametrize(
@@ -117,6 +130,11 @@ def test_load_config_accepts_the_ucode_binding_with_a_profile(tmp_path: Path) ->
         (_config(extra=1), "fields are invalid"),
         (_config(binding_id="unknown-binding"), "fields are invalid|unavailable"),
         (_config(binding_id=svc._UCODE_BINDING), "fields are invalid"),
+        (_config(workspace_id="123"), "fields are invalid"),
+        (
+            _config(binding_id=svc._UCODE_BINDING, auth_profile="work", workspace_id="12a"),
+            "workspace selector is invalid",
+        ),
         (_config(routes=[]), "exactly one route"),
         (_config(routes=[{"method": "POST"}]), "route fields are invalid"),
         (_config(endpoint="http://api.example.test/v1"), "exact POST trusted"),
@@ -144,6 +162,8 @@ def test_load_config_accepts_the_ucode_binding_with_a_profile(tmp_path: Path) ->
         "extra-key",
         "unknown-binding",
         "ucode-without-profile",
+        "test-binding-with-workspace",
+        "non-numeric-workspace",
         "no-routes",
         "route-missing-keys",
         "http-endpoint",

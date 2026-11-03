@@ -24,6 +24,7 @@ retain configuration, fault injection and behavioral assertions.
 | Provider resolution without the developer's config, overlay or ambient credentials | `isolate_provider_resolution` in [providers.py](providers.py) | [Host model options](../host/test_connect.py) |
 | Hermetic stdio ACP agent process | `FAKE_ACP_AGENT_SCRIPT`, `FAKE_ACP_AGENT_REPLY` in [acp_agent.py](acp_agent.py) | [Files tab survives an ACP reply](../e2e_ui/files/test_files_tab_survives_acp_reply.py) |
 | Codex home with rollouts, `history_base` lineage and thread store | `CodexRollout`, `write_codex_thread_store` in [codex_rollout.py](codex_rollout.py) | [Codex import history](../e2e/test_host_import_codex_history_e2e.py) |
+| ucode `state.json` for a host serving several workspaces | `shared_host_ucode_state`, `write_ucode_state` in [ucode_state.py](ucode_state.py), with caller-owned host, id and path | [Shared-host lookup](../onboarding/test_ucode_state.py) |
 
 ## Session inputs stay explicit
 

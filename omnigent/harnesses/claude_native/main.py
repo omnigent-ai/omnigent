@@ -89,6 +89,7 @@ from omnigent.databricks_ai_gateway import (
     is_databricks_ai_gateway_url,
     is_ug_route,
     with_gateway_attribution_lines,
+    with_workspace_selector_lines,
 )
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
@@ -3037,13 +3038,19 @@ def _ucode_config_for_profile(
     if not profile:
         return None
 
+    from omnigent.inner.databricks_executor import databrickscfg_workspace_id_for_profile
     from omnigent.onboarding.databricks_config import get_workspace_url_for_profile
-    from omnigent.onboarding.ucode_state import read_ucode_state
+    from omnigent.onboarding.ucode_state import (
+        gateway_workspace_id,
+        read_ucode_state_for_workspace,
+    )
 
     workspace_url = get_workspace_url_for_profile(profile)
     if workspace_url is None:
         return None
-    workspace_state = read_ucode_state(workspace_url)
+    workspace_state = read_ucode_state_for_workspace(
+        workspace_url, databrickscfg_workspace_id_for_profile(profile)
+    )
     if workspace_state is None:
         return None
     agent_state = workspace_state.agent(_UCODE_CLAUDE_AGENT_NAME)
@@ -3128,8 +3135,13 @@ def _ucode_config_for_profile(
         # The gateway rejects the advisor tool on the Opus route, and Omnigent
         # does not offer one, so a user-set advisor model would fail every turn.
         _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
-        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
-            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_workspace_selector_lines(
+            with_gateway_attribution_lines(
+                _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
+            ),
+            gateway_workspace_id(
+                workspace_state, agent_state, host=workspace_url, urls=[base_url]
+            ),
         ),
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks

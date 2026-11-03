@@ -336,6 +336,32 @@ class TestCodexExecutor(unittest.TestCase):
                 "databricks auth token --host" in item for item in executor._codex_config_overrides
             )
         )
+        self.assertFalse(any("http_headers" in item for item in executor._codex_config_overrides))
+
+    def test_constructor_shared_host_gateway_selects_the_workspace(self):
+        """The generated provider sends the workspace selector a shared host needs."""
+        import tomllib
+
+        with (
+            patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            executor = CodexExecutor(
+                gateway=True,
+                gateway_host="https://shared.example.com",
+                base_url_override="https://shared.example.com/ai-gateway/codex/v1",
+                gateway_auth_command="printf token",
+                gateway_workspace_id="123",
+                model="system.ai.gpt-test",
+            )
+
+        parsed = tomllib.loads("\n".join(executor._codex_config_overrides))
+        provider = parsed["model_providers"]["omnigent_databricks"]
+        self.assertEqual(
+            provider["http_headers"],
+            {"X-Databricks-Org-Id": "123", "X-Databricks-Workspace-Id": "123"},
+        )
+        self.assertEqual(provider["base_url"], "https://shared.example.com/ai-gateway/codex/v1")
 
     def test_constructor_databricks_flag_with_host_override_requires_base_url(self):
         with (

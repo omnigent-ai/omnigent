@@ -77,6 +77,7 @@ def test_executor_factory_reads_env_vars(
     )
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_WORKSPACE_ID", "123")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_PERMISSION_MODE", "acceptEdits")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET", "claude_code")
@@ -97,9 +98,11 @@ def test_executor_factory_reads_env_vars(
         base_url_override: str | None,
         gateway_auth_command: str | None,
         gateway_auth_refresh_interval_ms: str | None,
+        gateway_workspace_id: str | None,
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
+        captured["gateway_workspace_id"] = gateway_workspace_id
         captured["os_env"] = os_env
         captured["model"] = model
         captured["permission_mode"] = permission_mode
@@ -126,6 +129,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["base_url_override"] == "https://example.databricks.com/ai-gateway/anthropic"
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
+    assert captured["gateway_workspace_id"] == "123"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["permission_mode"] == "acceptEdits"
     assert captured["system_prompt_preset"] == "claude_code"

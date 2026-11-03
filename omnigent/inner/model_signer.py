@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from omnigent.databricks_ai_gateway import numeric_workspace_id
+
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .model_auth import (
@@ -54,6 +56,7 @@ class SignerLaunchConfig:
     endpoint: str
     routes: tuple[FrozenModelRoute, ...]
     auth_profile: str | None = None
+    workspace_id: str | None = None
 
     def __post_init__(self) -> None:
         endpoint = urlsplit(self.endpoint)
@@ -79,6 +82,11 @@ class SignerLaunchConfig:
             _validated_authority(f"https://{endpoint.hostname}", self.auth_profile)
         elif self.auth_profile is not None:
             raise ValueError("test signer must not carry an authentication profile")
+        if self.workspace_id is not None and (
+            self.binding_id != "databricks-ucode-v1"
+            or numeric_workspace_id(self.workspace_id) is None
+        ):
+            raise ValueError("signer workspace selector must be a numeric ucode workspace id")
 
     @classmethod
     def from_trusted_authority(
@@ -89,6 +97,7 @@ class SignerLaunchConfig:
         trusted_session_endpoint: str,
         operator_model_egress: Sequence[str],
         auth_profile: str | None = None,
+        workspace_id: str | None = None,
     ) -> SignerLaunchConfig:
         """Build a signer launch from the explicit three-way authority intersection."""
         return cls(
@@ -100,6 +109,7 @@ class SignerLaunchConfig:
                 operator_model_egress=operator_model_egress,
             ),
             auth_profile=auth_profile,
+            workspace_id=workspace_id,
         )
 
     def to_jsonable(self) -> dict[str, object]:
@@ -114,6 +124,8 @@ class SignerLaunchConfig:
         }
         if self.auth_profile is not None:
             payload["auth_profile"] = self.auth_profile
+        if self.workspace_id is not None:
+            payload["workspace_id"] = self.workspace_id
         return payload
 
 

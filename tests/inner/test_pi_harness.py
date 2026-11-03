@@ -109,6 +109,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_PI_GATEWAY_OPENAI_WIRE_API", "responses")
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "1234")
+    monkeypatch.setenv("HARNESS_PI_GATEWAY_WORKSPACE_ID", "123")
     monkeypatch.setenv("HARNESS_PI_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_PI_PATH", "/usr/local/bin/pi")
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
@@ -130,9 +131,11 @@ def test_executor_factory_reads_env_vars(
         openai_wire_api: str | None,
         gateway_auth_command: str | None,
         gateway_auth_refresh_interval_ms: str | None,
+        gateway_workspace_id: str | None,
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
+        captured["gateway_workspace_id"] = gateway_workspace_id
         captured["os_env"] = os_env
         captured["model"] = model
         captured["pi_path"] = pi_path
@@ -165,6 +168,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["openai_wire_api"] == "responses"
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["gateway_auth_refresh_interval_ms"] == "1234"
+    assert captured["gateway_workspace_id"] == "123"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["pi_path"] == "/usr/local/bin/pi"
     # Default os_env when no HARNESS_PI_OS_ENV is set: the

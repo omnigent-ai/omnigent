@@ -73,7 +73,11 @@ from omnigent.onboarding.provider_config import (
     load_config,
     load_providers,
 )
-from omnigent.onboarding.ucode_state import UcodeAgentState, read_ucode_state
+from omnigent.onboarding.ucode_state import (
+    UcodeAgentState,
+    gateway_workspace_id,
+    read_ucode_state_for_workspace,
+)
 from omnigent.runtime import (
     get_artifact_store,
     get_conversation_store,
@@ -180,6 +184,8 @@ class UcodeHarnessConfig:
     :param refresh_key: Optional harness gateway auth refresh interval env var.
     :param catalog_family: Normalized Databricks catalog family used when
         neither the spec nor ucode state names a model.
+    :param workspace_id_key: Optional harness env var naming the workspace the
+        gateway requests select on a host serving several workspaces.
     """
 
     agent_name: str
@@ -191,6 +197,7 @@ class UcodeHarnessConfig:
     auth_key: str | None
     refresh_key: str | None
     catalog_family: str
+    workspace_id_key: str | None = None
 
 
 _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
@@ -204,6 +211,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         auth_key="HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="claude",
+        workspace_id_key="HARNESS_CLAUDE_SDK_GATEWAY_WORKSPACE_ID",
     ),
     "codex": UcodeHarnessConfig(
         agent_name="codex",
@@ -215,6 +223,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         auth_key="HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="openai",
+        workspace_id_key="HARNESS_CODEX_GATEWAY_WORKSPACE_ID",
     ),
     "pi": UcodeHarnessConfig(
         agent_name="pi",
@@ -226,6 +235,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         auth_key="HARNESS_PI_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="claude",
+        workspace_id_key="HARNESS_PI_GATEWAY_WORKSPACE_ID",
     ),
     "openai-agents-sdk": UcodeHarnessConfig(
         agent_name="codex",
@@ -237,6 +247,7 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         auth_key="HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND",
         refresh_key=None,
         catalog_family="openai",
+        workspace_id_key="HARNESS_OPENAI_AGENTS_GATEWAY_WORKSPACE_ID",
     ),
     "qwen": UcodeHarnessConfig(
         agent_name="qwen",
@@ -304,6 +315,13 @@ def _get_runner_client_for_compaction(
     return routed.client if routed else None
 
 
+def _profile_workspace_id(profile: str) -> str | None:
+    """Return the ``workspace_id`` a Databricks CLI profile records, e.g. ``"123"``."""
+    from omnigent.inner.databricks_executor import databrickscfg_workspace_id_for_profile
+
+    return databrickscfg_workspace_id_for_profile(profile)
+
+
 def configure_agent_harness_with_ucode(
     env: dict[str, str],
     profile: str | None,
@@ -326,7 +344,7 @@ def configure_agent_harness_with_ucode(
     workspace_url = get_workspace_url_for_profile(profile)
     if workspace_url is None:
         return
-    state = read_ucode_state(workspace_url)
+    state = read_ucode_state_for_workspace(workspace_url, _profile_workspace_id(profile))
     if state is None:
         return
     config = _UCODE_HARNESS_CONFIGS[harness_type]
@@ -345,6 +363,12 @@ def configure_agent_harness_with_ucode(
         refresh_key=config.refresh_key,
         workspace_url=state.workspace_host,
     )
+    gateway_urls = [env[config.base_url_key]] if config.base_url_key in env else []
+    if config.base_urls_key and config.base_urls_key in env:
+        gateway_urls.extend(agent_state.base_urls.values())
+    workspace_id = gateway_workspace_id(state, agent_state, host=workspace_url, urls=gateway_urls)
+    if config.workspace_id_key and workspace_id is not None:
+        env[config.workspace_id_key] = workspace_id
     # When ucode caches no model, resolve a Databricks endpoint so the CLI
     # cannot fall back to a direct-provider model the gateway rejects.
     if config.model_key not in env:
@@ -404,7 +428,11 @@ def _configure_brokered_codex_with_ucode(
             code=ErrorCode.INVALID_INPUT,
         )
     workspace_url = get_workspace_url_for_profile(profile)
-    state = read_ucode_state(workspace_url) if workspace_url is not None else None
+    state = (
+        read_ucode_state_for_workspace(workspace_url, _profile_workspace_id(profile))
+        if workspace_url is not None
+        else None
+    )
     agent_state = state.agent("codex") if state is not None else None
     endpoint = agent_state.base_url if agent_state is not None else None
     if state is None or endpoint is None:
@@ -436,6 +464,10 @@ def _configure_brokered_codex_with_ucode(
     env["HARNESS_CODEX_GATEWAY_HOST"] = state.workspace_host
     env["HARNESS_CODEX_DATABRICKS_PROFILE"] = profile
     env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(model_egress)
+    assert workspace_url is not None
+    workspace_id = gateway_workspace_id(state, agent_state, host=workspace_url, urls=[endpoint])
+    if workspace_id is not None:
+        env["HARNESS_CODEX_GATEWAY_WORKSPACE_ID"] = workspace_id
 
 
 def _inject_ucode_agent_state(

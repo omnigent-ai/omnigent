@@ -56,7 +56,12 @@ from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
-from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
+from omnigent.databricks_ai_gateway import (
+    PI_AGENT,
+    gateway_attribution_headers,
+    is_ug_route,
+    workspace_selector_headers,
+)
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
@@ -832,6 +837,7 @@ def _build_models_json(
     catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
+    workspace_id: str | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
@@ -859,6 +865,8 @@ def _build_models_json(
         wire surfaces. Missing GPT metadata defaults to Responses.
     :param openai_wire_api: Configured wire for a generic OpenAI-compatible
         provider. ``None`` defaults generic providers to Chat Completions.
+    :param workspace_id: Workspace the providers on *host* select when it
+        serves several workspaces, e.g. ``"123"``.
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
@@ -1019,11 +1027,15 @@ def _build_models_json(
                 model_entry = pi_model_with_thinking_defaults(model_entry)
             entry = dict(model_entry)
             provider["models"] = [*provider["models"], entry]
+    selector = workspace_selector_headers(workspace_id)
+    host_origin = _urlparse(h)[:2]
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
             provider_config["headers"] = gateway_attribution_headers(
                 PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
             )
+        if selector and _urlparse(provider_config["baseUrl"])[:2] == host_origin:
+            provider_config["headers"] = {**provider_config.get("headers", {}), **selector}
     return config
 
 
@@ -2128,6 +2140,7 @@ class PiExecutor(Executor):
         openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
+        gateway_workspace_id: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
@@ -2181,6 +2194,9 @@ class PiExecutor(Executor):
             ``HARNESS_PI_GATEWAY_AUTH_COMMAND``.
         :param gateway_auth_refresh_interval_ms: Token cache lifetime in milliseconds;
             defaults to 15 minutes. Zero resolves credentials on every request.
+        :param gateway_workspace_id: Workspace the gateway requests select on a
+            host serving several workspaces, e.g. ``"123"``. Set from
+            ``HARNESS_PI_GATEWAY_WORKSPACE_ID``.
         :param retry_policy: The spec's ``llm.retry`` budget. Threads
             ``policy.pi.settings()`` into Pi's ``.pi/settings.json``
             before subprocess spawn — Pi natively does exponential
@@ -2226,6 +2242,7 @@ class PiExecutor(Executor):
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
         self._base_url_override = base_url_override
         self._base_urls_override = base_urls_override
+        self._gateway_workspace_id = gateway_workspace_id
         if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
             raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
         self._openai_wire_api = openai_wire_api
@@ -2949,6 +2966,7 @@ class PiExecutor(Executor):
                 catalog_models=self._gateway_model_entries or (),
                 model_wire_apis=wire_catalog,
                 openai_wire_api=self._openai_wire_api,
+                workspace_id=self._gateway_workspace_id,
             )
 
         if state.rpc is not None:

@@ -16,6 +16,8 @@ from omnigent.databricks_ai_gateway import (
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
     with_gateway_attribution_lines,
+    with_workspace_selector_lines,
+    workspace_selector_headers,
 )
 
 _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
@@ -320,3 +322,28 @@ def test_ug_configured_workspace_marks_a_provider_without_a_ug_user_agent(
         "Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
+
+
+@pytest.mark.parametrize("workspace_id", [None, "", "12a", "1 2", "-1", "1" * 21])
+def test_workspace_selector_headers_need_a_numeric_id(workspace_id: str | None) -> None:
+    assert workspace_selector_headers(workspace_id) == {}
+
+
+def test_workspace_selector_headers_name_both_selectors() -> None:
+    assert workspace_selector_headers("1965859176160743") == {
+        "X-Databricks-Org-Id": "1965859176160743",
+        "X-Databricks-Workspace-Id": "1965859176160743",
+    }
+
+
+def test_workspace_selector_lines_replace_any_earlier_selector() -> None:
+    """The block names exactly one workspace; unrelated lines keep their order."""
+    block = "x-databricks-org-id: 42\nDatabricks-Custom-Coding-Agent: claude-code"
+
+    assert with_workspace_selector_lines(block, "123").splitlines() == [
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "X-Databricks-Org-Id: 123",
+        "X-Databricks-Workspace-Id: 123",
+    ]
+    assert with_workspace_selector_lines(block, None) == block
+    assert with_workspace_selector_lines(None, "abc") == ""

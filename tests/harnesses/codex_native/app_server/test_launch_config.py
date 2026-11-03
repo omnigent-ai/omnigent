@@ -212,6 +212,58 @@ def test_build_codex_native_server_takes_gateway_and_auth_from_ucode_state(
     assert json.dumps(_UCODE_AUTH) in overrides
     assert "refresh_interval_ms=60000" in overrides
     assert "databricks auth token" not in overrides
+    assert "http_headers" not in overrides
+
+
+def test_build_codex_native_server_selects_the_workspace_on_a_shared_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A profile on a host serving several workspaces gets ucode's route and its selector."""
+    import tomllib
+
+    from tests._helpers.ucode_state import shared_host_ucode_state, write_ucode_state
+
+    host = "https://shared.example.com"
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        f"[shared]\nhost = {host}\nworkspace_id = 123\nauth_type = databricks-cli\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    state_path = write_ucode_state(tmp_path / "state.json", shared_host_ucode_state(host, "123"))
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
+
+    def _discovery_offline(_profile: str | None) -> object:
+        raise RuntimeError("model discovery is offline in this test")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        _discovery_offline,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model="system.ai.gpt-test",
+        profile="shared",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    provider = tomllib.loads("\n".join(app_server.config_overrides))["model_providers"][
+        "omnigent_databricks"
+    ]
+    assert provider["base_url"] == f"{host}/ai-gateway/codex/v1"
+    assert provider["http_headers"] == {
+        "X-Databricks-Org-Id": "123",
+        "X-Databricks-Workspace-Id": "123",
+    }
 
 
 def test_build_codex_native_server_defaults_cadence_without_one_in_ucode_state(

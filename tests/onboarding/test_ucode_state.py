@@ -9,9 +9,12 @@ from unittest.mock import patch
 
 from omnigent.onboarding.ucode_state import (
     UcodeWorkspaceState,
+    gateway_workspace_id,
     read_current_ucode_state,
     read_ucode_state,
+    read_ucode_state_for_workspace,
 )
+from tests._helpers.ucode_state import shared_host_ucode_state, write_ucode_state
 
 _WORKSPACE_URL = "https://example.databricks.com"
 
@@ -261,3 +264,133 @@ def test_workspace_host_does_not_depend_on_claude_url() -> None:
         available_tools=[],
     )
     assert state.workspace_host == "https://example.cloud.databricks.com"
+
+
+_SHARED_HOST = "https://shared.example.com"
+_SHARED_WORKSPACE_ID = "1965859176160743"
+
+
+def test_shared_host_state_records_workspace_and_selector_headers(tmp_path: Path) -> None:
+    """A shared-host entry parses its workspace id and only the selector headers."""
+    payload = shared_host_ucode_state(_SHARED_HOST, _SHARED_WORKSPACE_ID)
+    claude = payload["workspaces"][_SHARED_HOST]["agents"]["claude"]  # type: ignore[index]
+    claude["headers"] = {
+        "x-databricks-workspace-id": _SHARED_WORKSPACE_ID,
+        "X-Databricks-Org-Id": "not-a-number",
+        "Authorization": "Bearer must-not-forward",
+    }
+    state_file = write_ucode_state(tmp_path / "state.json", payload)
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        state = read_ucode_state(_SHARED_HOST)
+
+    assert state is not None
+    assert state.workspace_host == _SHARED_HOST
+    assert state.workspace_id == _SHARED_WORKSPACE_ID
+    assert state.agent("claude").headers == {"X-Databricks-Workspace-Id": _SHARED_WORKSPACE_ID}
+    assert state.agent("codex").headers == {
+        "X-Databricks-Org-Id": _SHARED_WORKSPACE_ID,
+        "X-Databricks-Workspace-Id": _SHARED_WORKSPACE_ID,
+    }
+
+
+def test_read_ucode_state_for_workspace_picks_the_profiles_workspace(tmp_path: Path) -> None:
+    """The ``?w=`` block wins; a bare-host copy of another workspace is refused."""
+    payload = shared_host_ucode_state(_SHARED_HOST, _SHARED_WORKSPACE_ID)
+    other = shared_host_ucode_state(_SHARED_HOST, "42")
+    payload["workspaces"][f"{_SHARED_HOST}?w=42"] = other["workspaces"][f"{_SHARED_HOST}?w=42"]  # type: ignore[index]
+    state_file = write_ucode_state(tmp_path / "state.json", payload)
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        selected = read_ucode_state_for_workspace(_SHARED_HOST + "/", "42")
+        copy = read_ucode_state_for_workspace(_SHARED_HOST, _SHARED_WORKSPACE_ID)
+        unselected = read_ucode_state_for_workspace(_SHARED_HOST, None)
+        mismatched = read_ucode_state_for_workspace(_SHARED_HOST, "7")
+
+    assert selected is not None and selected.workspace_id == "42"
+    assert copy is not None and copy.workspace_id == _SHARED_WORKSPACE_ID
+    # Without a profile workspace id the bare-host copy is what ucode itself resolves.
+    assert unselected is not None and unselected.workspace_id == _SHARED_WORKSPACE_ID
+    assert mismatched is None
+
+
+def test_read_ucode_state_for_workspace_keeps_single_workspace_hosts(tmp_path: Path) -> None:
+    """A profile ``workspace_id`` on a single-workspace host still finds its entry."""
+    state_file = _write_state(tmp_path, _VALID_STATE)
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        state = read_ucode_state_for_workspace(_WORKSPACE_URL, "123")
+
+    assert state is not None
+    assert state.workspace_id is None
+    assert (
+        gateway_workspace_id(
+            state,
+            state.agent("claude"),
+            host=_WORKSPACE_URL,
+            urls=[f"{_WORKSPACE_URL}/ai-gateway/anthropic"],
+        )
+        is None
+    )
+
+
+def _shared_state(tmp_path: Path, **block_overrides: object) -> UcodeWorkspaceState:
+    """Parse a shared-host entry whose bare-host block takes *block_overrides*."""
+    payload = shared_host_ucode_state(_SHARED_HOST, _SHARED_WORKSPACE_ID)
+    payload["workspaces"][_SHARED_HOST].update(block_overrides)  # type: ignore[index]
+    state_file = write_ucode_state(tmp_path / "state.json", payload)
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        state = read_ucode_state(_SHARED_HOST)
+    assert state is not None
+    return state
+
+
+def test_gateway_workspace_id_selects_only_on_the_profile_host(tmp_path: Path) -> None:
+    """The selector applies only to HTTPS URLs on the profile host the entry records."""
+    state = _shared_state(tmp_path)
+    claude = state.agent("claude")
+    on_host = [f"{_SHARED_HOST}/ai-gateway/anthropic"]
+
+    assert gateway_workspace_id(state, claude, host=_SHARED_HOST, urls=on_host) == (
+        _SHARED_WORKSPACE_ID
+    )
+    assert (
+        gateway_workspace_id(state, claude, host="https://other.example.com", urls=on_host) is None
+    )
+    assert (
+        gateway_workspace_id(
+            state, claude, host=_SHARED_HOST, urls=[*on_host, "https://evil.example/ai-gateway"]
+        )
+        is None
+    )
+    assert (
+        gateway_workspace_id(
+            state, claude, host=_SHARED_HOST, urls=["http://shared.example.com/ai-gateway"]
+        )
+        is None
+    )
+    assert gateway_workspace_id(state, claude, host=_SHARED_HOST, urls=[]) is None
+
+
+def test_gateway_workspace_id_refuses_inconsistent_entries(tmp_path: Path) -> None:
+    """An entry for another host, or naming another workspace, selects nothing."""
+    on_host = [f"{_SHARED_HOST}/ai-gateway/codex/v1"]
+    elsewhere = _shared_state(tmp_path, workspace="https://evil.example")
+    assert (
+        gateway_workspace_id(elsewhere, elsewhere.agent("codex"), host=_SHARED_HOST, urls=on_host)
+        is None
+    )
+
+    mismatched = _shared_state(tmp_path)
+    codex = mismatched.agent("codex")
+    codex.headers = {"X-Databricks-Org-Id": "42"}
+    assert gateway_workspace_id(mismatched, codex, host=_SHARED_HOST, urls=on_host) is None
+
+    unselected = _shared_state(tmp_path, workspace_id="not-a-number")
+    assert unselected.workspace_id is None
+    assert (
+        gateway_workspace_id(
+            unselected, unselected.agent("codex"), host=_SHARED_HOST, urls=on_host
+        )
+        is None
+    )
