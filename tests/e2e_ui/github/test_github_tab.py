@@ -1202,12 +1202,7 @@ def test_changes_find_reveals_collapsed_and_filtered(
         # The highlight survives a diff re-render in the other layout.
         panel.get_by_role("button", name="Switch to split view", exact=True).click()
         # The re-render detaches the old row; the highlight must be repainted on the new one.
-        page.wait_for_function(
-            """() => [...(CSS.highlights.get("pr-find-active") ?? [])].some((range) =>
-                range.startContainer.isConnected && range.toString() === "added"
-                && range.startContainer.parentElement.closest("[data-line]")
-                    ?.getAttribute("data-line") === "4")"""
-        )
+        wait_for_highlight("4")
         assert highlighted() == [{"text": "added", "line": "4"}]
         panel.get_by_role("button", name="Switch to unified view", exact=True).click()
 

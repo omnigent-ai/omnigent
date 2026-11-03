@@ -424,6 +424,9 @@ export function PullRequestChangesTab({
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
   const visiblePaths = useMemo(() => visibleFiles.map((file) => file.path), [visibleFiles]);
+  // The toolbar, and with it the find bar, renders only when there is something to show.
+  const toolbarShown =
+    files.length > 0 || reviews.isFetching || (reviews.page?.data ?? []).some((t) => !t.resolved);
 
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
@@ -701,6 +704,7 @@ export function PullRequestChangesTab({
   const onTabKeyDown = (event: React.KeyboardEvent) => {
     // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.
     if (
+      !toolbarShown ||
       !hasCommandModifier(event) ||
       event.altKey ||
       event.shiftKey ||
@@ -847,7 +851,7 @@ export function PullRequestChangesTab({
           {coverageNote}
         </p>
       )}
-      {(files.length > 0 || unresolved.length > 0 || reviews.isFetching) && (
+      {toolbarShown && (
         <ChangesToolbar
           showFileControls={files.length > 0}
           sidebarCollapsed={sidebarCollapsed}

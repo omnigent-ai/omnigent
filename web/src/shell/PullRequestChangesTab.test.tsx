@@ -255,6 +255,13 @@ describe("PullRequestChangesTab", () => {
     expect(findInput()).toHaveFocus();
   });
 
+  it("leaves the shortcut to the browser when no toolbar, and so no find bar, is shown", () => {
+    renderTab({ conversationId: "find-no-toolbar", files: [], patch: "" });
+    const tab = document.querySelector<HTMLElement>('[data-slot="tabs-content"]')!;
+    expect(fireEvent.keyDown(tab, { key: "f", ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
+  });
+
   it("keeps Ctrl+F as the caret key in a comment on macOS, and Cmd+F opens Find", () => {
     vi.stubGlobal("navigator", { platform: "MacIntel", userAgent: "Mac" });
     renderTab({ conversationId: "find-mac" });

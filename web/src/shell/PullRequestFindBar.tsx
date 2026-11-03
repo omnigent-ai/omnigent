@@ -56,6 +56,27 @@ function OptionToggle({
   );
 }
 
+function findStatus({
+  query,
+  invalid,
+  total,
+  position,
+  truncated,
+}: {
+  query: string;
+  invalid: boolean;
+  total: number;
+  position: number;
+  truncated: boolean;
+}): string {
+  if (!query.trim()) return "";
+  if (invalid) return "Invalid";
+  if (total === 0) return "No results";
+  const count = `${total}${truncated ? "+" : ""}`;
+  // Position is 0 for the moment between a query change and the viewport seeding its match.
+  return position === 0 ? `${count} matches` : `${position} of ${count}`;
+}
+
 export function PullRequestFindBar({
   find,
   inputRef,
@@ -103,13 +124,7 @@ export function PullRequestFindBar({
     );
   }
 
-  const status = !query.trim()
-    ? ""
-    : invalid
-      ? "Invalid"
-      : total === 0
-        ? "No results"
-        : `${position} of ${total}${truncated ? "+" : ""}`;
+  const status = findStatus({ query, invalid, total, position, truncated });
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1.5 text-ui">
@@ -121,6 +136,8 @@ export function PullRequestFindBar({
         value={query}
         onChange={(event) => onQueryChange(event.target.value)}
         onKeyDown={(event) => {
+          // IME composition keys (CJK input) confirm text, not find.
+          if (event.nativeEvent.isComposing) return;
           if (event.key === "Enter") {
             event.preventDefault();
             onStep(event.shiftKey ? -1 : 1);
