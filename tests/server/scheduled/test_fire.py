@@ -2590,7 +2590,7 @@ async def test_continue_sends_the_prompt_into_the_session(worktree: bool) -> Non
         session.labels = {
             fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
             WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(session.workspace),
-            fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
+            fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
         }
     conv_store = _ExistingConversationStore(session)
     perm = FakePermissionStore()
@@ -2785,7 +2785,9 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
                 git_branch="main",
                 labels={
                     fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
-                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/repo"
+                    ),
                 },
             ),
             {"base_branch": "HEAD"},
@@ -2797,7 +2799,9 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
                 workspace="/repo-worktrees/test",
                 labels={
                     fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
-                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/other"),
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/other"
+                    ),
                     WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
                 },
             ),
@@ -2811,7 +2815,9 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
                 host_id="host_2",
                 labels={
                     fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
-                    fire_mod._WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/repo"
+                    ),
                     WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
                 },
             ),
@@ -3397,9 +3403,9 @@ async def test_random_worktree_is_created_per_new_session(
             stored = persisted.create_conversation(**saved)
             conv = persisted.get_conversation(stored.id)
             assert conv is not None
-            assert conv.labels[fire_mod._WORKTREE_SOURCE_LABEL_KEY] == worktree_root_fingerprint(
-                source
-            )
+            assert conv.labels[
+                fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY
+            ] == worktree_root_fingerprint(source)
             continuing = replace(task, session_mode="continue", session_id=conv.id)
             assert (
                 await fire_mod.continued_session_problem(
@@ -3507,3 +3513,86 @@ async def test_random_worktree_failure_preserves_host_error(
     assert store.runs[0]["error_code"] == (
         "host_offline" if unavailable else "worktree_create_failed"
     )
+
+
+@pytest.mark.parametrize("stage", ["worktree", "project", "insert", "presentation"])
+async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import threading
+
+    from omnigent.server.routes import _host_worktree
+    from omnigent.server.routes._sessions import helpers
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    thread_release = threading.Event()
+    removing = asyncio.Event()
+    removed = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    conversations = FakeConversationStore()
+    insert = conversations.create_conversation
+
+    async def create_worktree(**kwargs: Any) -> _host_worktree.CreatedWorktree:
+        if stage == "worktree":
+            entered.set()
+            await release.wait()
+        return _host_worktree.CreatedWorktree("/repo-worktrees/new", "new")
+
+    def create_conversation(**kwargs: Any) -> _FakeConversation:
+        if stage == "insert":
+            loop.call_soon_threadsafe(entered.set)
+            assert thread_release.wait(5)
+        return insert(**kwargs)
+
+    async def project(*args: Any) -> None:
+        if stage == "project":
+            entered.set()
+            await release.wait()
+
+    async def presentation(*args: Any) -> dict[str, str]:
+        if stage == "presentation":
+            entered.set()
+            await release.wait()
+        return {}
+
+    async def remove(**kwargs: Any) -> None:
+        assert kwargs["worktree_path"] == "/repo-worktrees/new"
+        assert kwargs["delete_branch"] is True
+        removing.set()
+        await finish_cleanup.wait()
+        removed.set()
+
+    monkeypatch.setattr(_host_worktree, "create_worktree_on_host", create_worktree)
+    monkeypatch.setattr(conversations, "create_conversation", create_conversation)
+    monkeypatch.setattr(fire_mod, "_fire_project_id", project)
+    monkeypatch.setattr(fire_mod, "_presentation_labels", presentation)
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    deps = _deps(
+        FakeScheduledTaskStore(),
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({"host_1"}),
+    )
+    task = _task(base_branch="HEAD")
+    pending = asyncio.create_task(
+        fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        pending.cancel()
+        release.set()
+        thread_release.set()
+        await asyncio.wait_for(removing.wait(), 5)
+        # A second cancellation must not interrupt the compensating host operation.
+        pending.cancel()
+        finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 5)
+        assert removed.is_set()
+        assert conversations.deleted == ["conv_1"]
+    finally:
+        release.set()
+        thread_release.set()
+        finish_cleanup.set()
+        await asyncio.gather(pending, return_exceptions=True)

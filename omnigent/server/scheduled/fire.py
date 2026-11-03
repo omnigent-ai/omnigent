@@ -120,13 +120,13 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
 )
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
-_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
 
 # How long to wait for a freshly launched runner to connect before giving up on
 # dispatching the prompt this fire. The session + grant are already persisted, so
@@ -908,7 +908,7 @@ async def continued_session_problem(
         task.base_branch is not None
         and conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) == task.id
         and task.workspace is not None
-        and conv.labels.get(_WORKTREE_SOURCE_LABEL_KEY)
+        and conv.labels.get(SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY)
         == worktree_root_fingerprint(task.workspace)
         and conv.git_branch is not None
         and conv.workspace is not None
@@ -1427,6 +1427,31 @@ def _session_labels(task: ScheduledTask) -> dict[str, str]:
 async def _create_session(
     deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
 ) -> Conversation:
+    # Host operations and database threads can commit after caller cancellation.
+    creation = asyncio.create_task(_create_session_resources(deps, task, labels=labels))
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+
+        async def settle_and_discard() -> None:
+            try:
+                conv = await creation
+            except Exception:
+                _logger.exception("scheduled fire: cancelled session creation failed")
+            else:
+                await _discard_session(deps, conv)
+
+        cleanup = asyncio.create_task(settle_and_discard())
+        while not cleanup.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(cleanup)
+        cleanup.result()
+        raise
+
+
+async def _create_session_resources(
+    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     from omnigent.server.routes._host_worktree import (
         WORKTREE_ROOT_LABEL_KEY,
@@ -1463,7 +1488,7 @@ async def _create_session(
             raise _CannotLaunchScheduledFire(
                 str(exc), error_code="worktree_create_failed"
             ) from exc
-        labels[_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
+        labels[SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY] = worktree_root_fingerprint(workspace)
         workspace = worktree.workspace or worktree.worktree_path
         labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(worktree.worktree_path)
     conv: Conversation | None = None

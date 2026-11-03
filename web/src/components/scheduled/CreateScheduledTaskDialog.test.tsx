@@ -2994,10 +2994,11 @@ describe("automation harness settings", () => {
 });
 
 describe("automation random worktree", () => {
-  it.each(["host", "host-roundtrip", "directory-roundtrip"])(
-    "clears a saved worktree choice when switching hosts (%s)",
+  it.each(["host", "host-roundtrip", "directory-roundtrip", "sandbox-roundtrip"])(
+    "preserves worktree choices across target and directory transitions (%s)",
     async (transition) => {
-      const roundTrip = transition !== "host";
+      const directoryChanged =
+        transition === "host-roundtrip" || transition === "directory-roundtrip";
       vi.mocked(hostsHook.useHosts).mockReturnValue({
         data: [
           { host_id: "host_1", name: "laptop", status: "online" },
@@ -3005,17 +3006,25 @@ describe("automation random worktree", () => {
         ],
       } as ReturnType<typeof hostsHook.useHosts>);
       render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({
-            hostId: "host_1",
-            workspace: "/home/me/repo",
-            baseBranch: "HEAD",
-          })}
-        />,
+        <CapabilitiesProvider
+          info={{
+            ...SERVER_INFO_OFFLINE_FALLBACK,
+            managed_sandboxes_enabled: true,
+            scheduled_task_worktrees: true,
+          }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              hostId: "host_1",
+              workspace: "/home/me/repo",
+              baseBranch: "HEAD",
+            })}
+          />
+        </CapabilitiesProvider>,
       );
-      if (roundTrip) {
+      if (directoryChanged) {
         gitWorkspace.path = "/ordinary-folder";
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
@@ -3023,17 +3032,28 @@ describe("automation random worktree", () => {
       gitWorkspace.available = false;
       if (transition !== "directory-roundtrip") {
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
-        fireEvent.click(screen.getByRole("option", { name: "desktop" }));
+        fireEvent.click(
+          screen.getByRole("option", {
+            name: transition === "sandbox-roundtrip" ? /Sandbox/ : "desktop",
+          }),
+        );
       } else {
         // Reselect the ordinary folder to render the negative discovery result.
         fireEvent.click(screen.getByTestId("task-workspace-browse"));
         fireEvent.click(screen.getByRole("button", { name: "pick-workspace" }));
       }
       expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
-      if (transition === "host-roundtrip") {
+      if (transition === "host-roundtrip" || transition === "sandbox-roundtrip") {
+        if (transition === "sandbox-roundtrip") gitWorkspace.available = true;
         fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
         fireEvent.click(screen.getByRole("option", { name: "laptop" }));
-        expect(screen.queryByRole("checkbox", { name: "Random worktree" })).not.toBeInTheDocument();
+        if (transition === "sandbox-roundtrip") {
+          expect(screen.getByRole("checkbox", { name: "Random worktree" })).toBeChecked();
+        } else {
+          expect(
+            screen.queryByRole("checkbox", { name: "Random worktree" }),
+          ).not.toBeInTheDocument();
+        }
       }
       if (transition === "directory-roundtrip") {
         gitWorkspace.available = true;
@@ -3045,10 +3065,12 @@ describe("automation random worktree", () => {
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalled());
       expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-        hostId: roundTrip ? "host_1" : "host_2",
+        hostId: transition === "host" ? "host_2" : "host_1",
         workspace: transition === "host-roundtrip" ? "/ordinary-folder" : "/home/me/repo",
-        baseBranch: null,
       });
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      if (transition === "sandbox-roundtrip") expect(input).not.toHaveProperty("baseBranch");
+      else expect(input.baseBranch).toBeNull();
     },
   );
 

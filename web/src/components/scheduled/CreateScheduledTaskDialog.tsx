@@ -409,20 +409,22 @@ export function CreateScheduledTaskDialog({
         ? nextSandbox
         : !nextSandbox && nextHostId === editingTask?.hostId;
     const restore = isEdit && effectiveAgentId === editingTask?.agentId && originalTarget;
+    const nextTarget = nextSandbox ? "managed_sandbox" : "connected_host";
+    let nextWorkspace = workspace;
+    if (nextSandbox !== sandboxMode) {
+      nextWorkspace = editingTask?.executionTarget === nextTarget ? savedWorkspace : "";
+    }
     setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
     setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
     setBaseBranch(
-      restore && !nextSandbox && workspace === editingTask?.workspace
+      restore && !nextSandbox && nextWorkspace === savedWorkspace
         ? (editingTask?.baseBranch ?? null)
         : null,
     );
     setSandboxMode(nextSandbox);
     setHostId(nextHostId);
     // Host directories and sandbox repository URLs are different workspace inputs.
-    if (nextSandbox !== sandboxMode) {
-      const nextTarget = nextSandbox ? "managed_sandbox" : "connected_host";
-      setWorkspace(editingTask?.executionTarget === nextTarget ? savedWorkspace : "");
-    }
+    setWorkspace(nextWorkspace);
     setWorkspaceBrowserOpen(false);
   }
   function handleModelChange(model: string) {
@@ -443,13 +445,14 @@ export function CreateScheduledTaskDialog({
     workspace || null,
   );
   const isGitWorkspace = (worktrees?.length ?? 0) > 0;
-  const worktreeStatus = workspaceHostOffline
-    ? "Connect your host to verify this directory."
-    : worktreesChecking
-      ? "Checking whether this directory is a Git repository."
-      : worktrees === undefined
-        ? "Repository verification is unavailable."
-        : "The selected directory is not a Git repository.";
+  let worktreeStatus = "The selected directory is not a Git repository.";
+  if (workspaceHostOffline) {
+    worktreeStatus = "Connect your host to verify this directory.";
+  } else if (worktreesChecking) {
+    worktreeStatus = "Checking whether this directory is a Git repository.";
+  } else if (worktrees === undefined) {
+    worktreeStatus = "Repository verification is unavailable.";
+  }
   useEffect(() => {
     if (workspaceHostOffline) setWorkspaceBrowserOpen(false);
   }, [workspaceHostOffline]);
