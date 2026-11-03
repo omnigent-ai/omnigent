@@ -4010,8 +4010,9 @@ async def _recover_subagent_missing_parent_inbox(
         )
         if not 200 <= response.status_code < 300:
             return None
-        # A completion repairs only its root runtime; it does not resume other
-        # children or clear the parent's independently recorded failure state.
+        # The recheck gates only the remaining recovery work (relay, re-post); a
+        # delivery the runner confirms is final. Initializing repairs just the root
+        # runtime: other children stay put and the parent's failure state stands.
         current_parent = await asyncio.to_thread(eligible_parent)
         if current_parent is None or current_parent.agent_id != parent.agent_id:
             return None
@@ -4019,17 +4020,10 @@ async def _recover_subagent_missing_parent_inbox(
         await _ensure_runner_relay_ready(
             parent_id, runner_id, client, conversation_store, conversation=current_parent
         )
-        current_parent = await asyncio.to_thread(eligible_parent)
-        if current_parent is None or current_parent.agent_id != parent.agent_id:
-            return None
         initializer.require_generation(runner_id, client, generation)
         response = await client.post(
             f"/v1/sessions/{child_conv.id}/events", json=forward_body, timeout=5.0
         )
-        current_parent = await asyncio.to_thread(eligible_parent)
-        if current_parent is None or current_parent.agent_id != parent.agent_id:
-            return None
-        initializer.require_generation(runner_id, client, generation)
         if response.status_code == 204:
             return _RunnerForwardResult(status_code=204, body=response.text)
     except (httpx.HTTPError, ConnectionError, OmnigentError, SQLAlchemyError):

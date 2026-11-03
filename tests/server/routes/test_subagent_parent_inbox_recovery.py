@@ -129,7 +129,7 @@ async def test_other_rejections_do_not_initialize_parent(recovery: Any, response
     assert recovery.requests == []
 
 
-@pytest.mark.parametrize("phase", ["before_init", "after_init", "after_relay", "after_delivery"])
+@pytest.mark.parametrize("phase", ["before_init", "after_init"])
 @pytest.mark.parametrize(
     "guard",
     [
@@ -198,15 +198,11 @@ async def test_parent_recovery_preserves_lifecycle_and_ownership(
     finally:
         sessions._interrupt_fenced_sessions.discard(recovery.parent.id)
     assert [path for path, _ in recovery.requests] == (
-        []
-        if phase == "before_init"
-        else ["/v1/sessions", "/v1/sessions/child/events"]
-        if phase == "after_delivery"
-        else ["/v1/sessions"]
+        [] if phase == "before_init" else ["/v1/sessions"]
     )
 
 
-@pytest.mark.parametrize("phase", ["after_init", "after_relay", "after_delivery"])
+@pytest.mark.parametrize("phase", ["after_init", "after_relay"])
 async def test_parent_recovery_never_acknowledges_a_replacement_generation(
     recovery: Any,
     phase: str,
@@ -216,16 +212,41 @@ async def test_parent_recovery_never_acknowledges_a_replacement_generation(
 
     setattr(recovery, phase, reconnect)
     assert await recover(recovery) is None
-    paths = [path for path, _ in recovery.requests]
-    assert paths == (
-        ["/v1/sessions", "/v1/sessions/child/events"]
-        if phase == "after_delivery"
-        else ["/v1/sessions"]
-    )
+    assert [path for path, _ in recovery.requests] == ["/v1/sessions"]
 
 
-@pytest.mark.parametrize("init_status", [201, 302, 410, 503])
-@pytest.mark.parametrize("delivery_status", [204, 200, 202, 302, 503])
+@pytest.mark.parametrize("change", ["archived", "reconnected"])
+async def test_confirmed_delivery_is_acknowledged_despite_later_changes(
+    recovery: Any,
+    change: str,
+) -> None:
+    """A runner-confirmed delivery cannot be undone, so it never turns into a retry."""
+
+    def after_delivery() -> None:
+        if change == "archived":
+            recovery.rows[recovery.parent.id] = replace(recovery.parent, archived=True)
+        else:
+            recovery.generation += 1
+
+    recovery.after_delivery = after_delivery
+    result = await recover(recovery)
+    assert result is not None and result.status_code == 204
+    assert [path for path, _ in recovery.requests] == ["/v1/sessions", "/v1/sessions/child/events"]
+
+
+@pytest.mark.parametrize(
+    ("init_status", "delivery_status"),
+    [
+        (201, 204),
+        (201, 200),
+        (201, 202),
+        (201, 302),
+        (201, 503),
+        (302, 204),
+        (410, 204),
+        (503, 204),
+    ],
+)
 async def test_only_successful_init_and_confirmed_delivery_are_acknowledged(
     recovery: Any,
     init_status: int,
