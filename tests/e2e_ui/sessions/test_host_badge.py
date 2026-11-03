@@ -448,7 +448,19 @@ def _patch_switch_targets(page: Page, session_id: str, *, target_host_id: str) -
             status=200,
             headers={"content-type": "application/json"},
             body=json.dumps(
-                {"entries": [{"path": "/home/e2e/repo", "name": "repo", "is_dir": True}]}
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "name": "repo",
+                            "path": "/home/e2e/repo",
+                            "type": "directory",
+                            "bytes": None,
+                            "modified_at": 0,
+                        }
+                    ],
+                    "has_more": False,
+                }
             ),
         )
 
@@ -539,12 +551,8 @@ def test_host_badge_switches_the_session_to_another_host(
     directory = page.get_by_test_id("workspace-path-input")
     expect(directory).to_be_visible(timeout=15_000)
     directory.fill("/home/e2e/repo")
-    # Dismiss the path field's suggestion dropdown and wait for it to go before
-    # submitting. It is rendered in flow, so closing it lifts the footer ~24px:
-    # a mousedown on the submit button closes the dropdown, the button moves out
-    # from under the pointer, and the mouseup never lands on it.
-    page.get_by_test_id("switch-host-dialog").get_by_text("Switch host", exact=True).first.click()
-    expect(page.get_by_test_id("workspace-path-dropdown")).to_have_count(0)
+    # Users submit straight from the path field, while its suggestions are open.
+    expect(page.get_by_test_id("workspace-path-dropdown")).to_be_visible(timeout=15_000)
 
     switch = page.get_by_test_id("switch-host-button")
     expect(switch).to_be_enabled(timeout=15_000)

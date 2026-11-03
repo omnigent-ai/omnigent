@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FolderIcon, FolderOpenIcon } from "lucide-react";
 
+import { useScheduleEscape } from "@/components/scheduled/useScheduleEscape";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { isNavigablePath } from "./WorkspacePicker";
 
@@ -180,6 +181,7 @@ export function WorkspacePathField({
   const items = [...filteredRecent, ...matches];
   const showLoading = dropdownOpen && isLoading && matches.length === 0;
   const hasContent = filteredRecent.length > 0 || matches.length > 0 || showLoading;
+  const listVisible = dropdownOpen && hasContent;
 
   // DOM id of the highlighted row, for aria-activedescendant. The
   // first filteredRecent.length items are "recent", the rest "match"
@@ -191,18 +193,39 @@ export function WorkspacePathField({
         ? `workspace-recent-${highlight}`
         : `workspace-match-${highlight - filteredRecent.length}`;
 
-  // Close on click outside while open.
+  // Close on a click outside while open. Wait for the click, not the press:
+  // the list is inline, so collapsing it on mousedown moves the controls
+  // below and the mouseup misses the button being clicked.
   useEffect(() => {
     if (!open) return;
+    let pressedOutside = false;
+    function isOutside(e: MouseEvent) {
+      return containerRef.current !== null && !containerRef.current.contains(e.target as Node);
+    }
     function onDown(e: MouseEvent) {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+      pressedOutside = isOutside(e);
+    }
+    function onClick(e: MouseEvent) {
+      if (pressedOutside && isOutside(e)) {
         setOpen(false);
         setHighlight(-1);
       }
     }
     document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
+    document.addEventListener("click", onClick);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("click", onClick);
+    };
   }, [open]);
+
+  // Escape closes the visible list before an enclosing dialog sees it.
+  useScheduleEscape(listVisible, () => {
+    if (!containerRef.current?.contains(document.activeElement)) return false;
+    setOpen(false);
+    setHighlight(-1);
+    return true;
+  });
 
   // Keep the keyboard-highlighted row visible when it scrolls past
   // the dropdown's fold.
@@ -248,12 +271,6 @@ export function WorkspacePathField({
           onCommit?.(trimmed);
         }
       }
-    } else if (e.key === "Escape") {
-      if (open) {
-        e.preventDefault();
-        setOpen(false);
-        setHighlight(-1);
-      }
     }
   }
 
@@ -296,7 +313,7 @@ export function WorkspacePathField({
         </button>
       </div>
 
-      {dropdownOpen && hasContent && (
+      {listVisible && (
         <div
           id="workspace-path-listbox"
           role="listbox"

@@ -13,6 +13,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { splitTypedPath, WorkspacePathField } from "./WorkspacePathField";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
@@ -280,6 +281,34 @@ describe("WorkspacePathField", () => {
     expect(onCommit).not.toHaveBeenCalled();
   });
 
+  it("closes only the suggestions, not the surrounding dialog, on Escape", () => {
+    mockListing(ENTRIES);
+    const onOpenChange = vi.fn();
+    render(
+      <Dialog open onOpenChange={onOpenChange}>
+        <DialogContent>
+          <DialogTitle>Switch host</DialogTitle>
+          <DialogDescription>Pick a directory.</DialogDescription>
+          <WorkspacePathField
+            hostId="host_1"
+            value={VALUE}
+            onChange={vi.fn()}
+            onBrowse={vi.fn()}
+            recent={[]}
+          />
+        </DialogContent>
+      </Dialog>,
+    );
+    const input = screen.getByTestId("workspace-path-input");
+    fireEvent.focus(input);
+    expect(screen.getByTestId("workspace-path-dropdown")).toBeTruthy();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(screen.queryByTestId("workspace-path-dropdown")).toBeNull();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
   it("suppresses the dropdown while the tree browser is open", () => {
     // dropdownDisabled (the tree browser is showing) must hide the
     // autocomplete so the two pickers don't stack.
@@ -296,5 +325,60 @@ describe("WorkspacePathField", () => {
     );
     fireEvent.focus(screen.getByTestId("workspace-path-input"));
     expect(screen.queryByTestId("workspace-path-dropdown")).toBeNull();
+  });
+
+  it("keeps the suggestions open through an outside press and closes them on the click", () => {
+    // The list is inline, so closing it on the press would move a button
+    // below it before the mouseup and the click would miss.
+    mockListing(ENTRIES);
+    render(
+      <>
+        <WorkspacePathField
+          hostId="host_1"
+          value={VALUE}
+          onChange={vi.fn()}
+          onBrowse={vi.fn()}
+          recent={[]}
+        />
+        <button type="button">Switch</button>
+      </>,
+    );
+    fireEvent.focus(screen.getByTestId("workspace-path-input"));
+    const outside = screen.getByRole("button", { name: "Switch" });
+
+    fireEvent.mouseDown(outside);
+    expect(screen.getByTestId("workspace-path-dropdown")).toBeTruthy();
+
+    fireEvent.mouseUp(outside);
+    fireEvent.click(outside);
+    expect(screen.queryByTestId("workspace-path-dropdown")).toBeNull();
+  });
+
+  it("lets Escape close the surrounding dialog once the suggestions are closed", () => {
+    mockListing(ENTRIES);
+    const onOpenChange = vi.fn();
+    render(
+      <Dialog open onOpenChange={onOpenChange}>
+        <DialogContent>
+          <DialogTitle>Switch host</DialogTitle>
+          <DialogDescription>Pick a directory.</DialogDescription>
+          <WorkspacePathField
+            hostId="host_1"
+            value={VALUE}
+            onChange={vi.fn()}
+            onBrowse={vi.fn()}
+            recent={[]}
+          />
+        </DialogContent>
+      </Dialog>,
+    );
+    const input = screen.getByTestId("workspace-path-input");
+    fireEvent.focus(input);
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByTestId("workspace-path-dropdown")).toBeNull();
+    expect(onOpenChange).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });
