@@ -462,6 +462,7 @@ def test_codex_provider_auth_diagnosis_ignores_unrelated_errors(message: str) ->
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        "Selected model is at capacity. Please try a different model.",
         # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
         _GATEWAY_499_OUTPUT,
         "API Error: 499",
@@ -514,6 +515,12 @@ def test_transient_messages_do_not_override_specific_failure_codes(code: str) ->
         classify_native_turn_error(
             code,
             "API Error: The response stopped arriving. The response above may be incomplete.",
+        )
+        == code
+    )
+    assert (
+        classify_native_turn_error(
+            code, "Selected model is at capacity. Please try a different model."
         )
         == code
     )
