@@ -9,7 +9,7 @@ import {
   useSessionLiveness,
 } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
-import type { Session } from "@/lib/types";
+import type { SandboxStatus, Session } from "@/lib/types";
 
 // Drive the two split signals directly so the test pins the derivation
 // truth table, not the provider plumbing (covered by its own test).
@@ -482,5 +482,54 @@ describe("useSessionHostConnecting", () => {
       expect(result.current).toBe(false);
       unmount();
     }
+  });
+  it("ends a send's attempt when that turn ends, and only a new marker reopens it", () => {
+    const { result, rerender } = renderConnecting({
+      liveness: { kind: "runner_asleep" },
+      markers: { turnActive: false },
+    });
+    rerender({ liveness: starting, markers: { turnActive: true } });
+    expect(result.current).toBe(true);
+    advance(5_000);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { turnActive: true } });
+    expect(result.current).toBe(true);
+  });
+
+  it("keeps connecting through a cancelled send while a sandbox launch is in flight", () => {
+    const provisioning = { stage: "provisioning" } as const;
+    const { result, rerender } = renderHook(
+      ({ liveness, sandbox, turnActive }) =>
+        useSessionHostConnecting(SID, liveness, sandbox, { turnActive }),
+      {
+        initialProps: {
+          liveness: { kind: "host_asleep" } as SessionLiveness,
+          sandbox: null as SandboxStatus | null,
+          turnActive: false,
+        },
+      },
+    );
+    // The send owns the attempt, then wakes a sandbox whose launch outlives the turn.
+    rerender({ liveness: starting, sandbox: null, turnActive: true });
+    rerender({ liveness: starting, sandbox: provisioning, turnActive: true });
+    advance(5_000);
+    rerender({ liveness: { kind: "host_asleep" }, sandbox: provisioning, turnActive: false });
+    expect(result.current).toBe(true);
+  });
+
+  it("keeps a cold boot connecting when the first send fails", () => {
+    // Mounted mid-send on a fresh session: the boot, not the turn, owns the attempt.
+    const { result, rerender } = renderConnecting({
+      liveness: starting,
+      markers: { turnActive: true },
+    });
+    advance(5_000);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(true);
+    advance(GRACE_MS - 5_000);
+    expect(result.current).toBe(false);
   });
 });

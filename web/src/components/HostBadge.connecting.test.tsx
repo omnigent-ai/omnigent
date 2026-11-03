@@ -257,4 +257,55 @@ describe("composer host chip while a session connects", () => {
     act(() => vi.advanceTimersByTime(1));
     expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
   });
+  it("drops connecting as soon as a cancelled or failed send goes back to idle", () => {
+    // An older session whose runner is asleep on a live host.
+    const idle = { sessionId: "conv_1", createdAtS: nowS() - 3_600, onReconnect: vi.fn() };
+    const { rerender } = render(<OpenSession {...idle} turnActive={false} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, online");
+
+    rerender(<OpenSession {...idle} turnActive />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+    // The send is cancelled (or fails): the store returns to idle.
+    act(() => vi.advanceTimersByTime(5_000));
+    rerender(<OpenSession {...idle} turnActive={false} />);
+    expect(within(trigger()).queryByText("Connecting…")).toBeNull();
+
+    // A host-down poll lands well inside what would have been the window.
+    act(() => vi.advanceTimersByTime(5_000));
+    hostOnlineMock.mockReturnValue(false);
+    rerender(<OpenSession {...idle} turnActive={false} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+    openHostMenu();
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+  });
+
+  it("keeps a host-switch launch connecting when a send during it is cancelled", () => {
+    const base = {
+      sessionId: "conv_1",
+      createdAtS: nowS() - 3_600,
+      launchedAt: Date.now(),
+      onReconnect: vi.fn(),
+    };
+    const { rerender } = render(<OpenSession {...base} turnActive={false} />);
+    act(() => vi.advanceTimersByTime(2_000));
+    rerender(<OpenSession {...base} turnActive />);
+    act(() => vi.advanceTimersByTime(3_000));
+    rerender(<OpenSession {...base} turnActive={false} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+
+    act(() => vi.advanceTimersByTime(5_000));
+    hostOnlineMock.mockReturnValue(false);
+    rerender(<OpenSession {...base} turnActive={false} />);
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, connecting");
+    openHostMenu();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).toBeNull();
+    closeHostMenu();
+
+    // The send renewed the window at t=2, so it ends at t=2 + grace.
+    act(() => vi.advanceTimersByTime((STARTING_GRACE_S - 8) * 1000));
+    expect(trigger()).toHaveAccessibleName("Host mac-laptop, offline");
+    openHostMenu();
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+  });
 });

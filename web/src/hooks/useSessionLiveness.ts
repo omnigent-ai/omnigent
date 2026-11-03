@@ -239,6 +239,10 @@ interface HostConnectingAttempt {
   turnActive: boolean;
   /** A new launch or turn began; the next visible attempt gets a fresh window. */
   restartPending: boolean;
+  /** The pending restart came from a host-switch launch, not only a turn. */
+  launchPending: boolean;
+  /** Only a turn started the current attempt, so that turn ending ends it. */
+  turnOwned: boolean;
   /** Monotonic ms when the current attempt ends; `null` when there is none. */
   deadline: number | null;
 }
@@ -252,8 +256,10 @@ interface HostConnectingAttempt {
  * of monotonic time from that observation, ended by a timer even if nothing
  * else re-renders, so a host that never comes up falls back to its offline
  * status and Reconnect. The runner coming online, a launch stopped on a
- * failure or user action, or a session switch ends it early; otherwise it
- * holds to its bound, since liveness's own grace reads skewable server time.
+ * failure or user action, or a session switch ends it early, as does the
+ * end of the turn that alone started it while no sandbox launch is in flight.
+ * Otherwise it holds to its bound, since liveness's own grace reads skewable
+ * server time.
  */
 export function useSessionHostConnecting(
   sessionId: string | undefined,
@@ -272,24 +278,38 @@ export function useSessionHostConnecting(
       launchedAt,
       turnActive,
       restartPending: false,
+      launchPending: false,
+      turnOwned: false,
       deadline: null,
     };
   }
   const attempt = attemptRef.current;
-  if (
-    (launchedAt !== null && launchedAt !== attempt.launchedAt) ||
-    (turnActive && !attempt.turnActive)
-  ) {
-    attempt.restartPending = true;
-  }
+  const newLaunch = launchedAt !== null && launchedAt !== attempt.launchedAt;
+  const newTurn = turnActive && !attempt.turnActive;
+  const turnEnded = !turnActive && attempt.turnActive;
+  if (newLaunch || newTurn) attempt.restartPending = true;
+  if (newLaunch) attempt.launchPending = true;
   attempt.launchedAt = launchedAt;
   attempt.turnActive = turnActive;
+  const now = monotonicNowMs();
   if (stopped || liveness.kind === "online") {
     attempt.deadline = null;
     attempt.restartPending = false;
-  } else if (attemptVisible && (attempt.deadline === null || attempt.restartPending)) {
-    attempt.deadline = monotonicNowMs() + STARTING_GRACE_S * 1000;
+    attempt.launchPending = false;
+  } else if (turnEnded && attempt.turnOwned && sandboxStatus === null) {
+    // A cancelled or failed send stops its relaunch; expire rather than clear,
+    // so only a new launch or turn reopens the window.
+    if (attempt.deadline !== null) attempt.deadline = Math.min(attempt.deadline, now);
     attempt.restartPending = false;
+    attempt.launchPending = false;
+  } else if (attemptVisible && (attempt.deadline === null || attempt.restartPending)) {
+    // A turn sent during another live attempt (cold boot or host switch) doesn't own it.
+    const independentAttemptLive =
+      attempt.deadline !== null && now < attempt.deadline && !attempt.turnOwned;
+    attempt.turnOwned = attempt.restartPending && !attempt.launchPending && !independentAttemptLive;
+    attempt.deadline = now + STARTING_GRACE_S * 1000;
+    attempt.restartPending = false;
+    attempt.launchPending = false;
   }
   const deadline = attempt.deadline;
   // Re-render at the deadline; an early fire re-arms only for the monotonic remainder.
