@@ -443,6 +443,10 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
+in a visible workspace rail. With no closable visible tab it returns to the
+new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
+excluded from tab dispatch and retain the window-close behavior.
 With Settings → General → **Open sub-agents in the Workspace panel** on, a
 plain click on a sub-agent (transcript link, composer indicator, Agents row or
 graph node) opens it as a tab in the same strip, marked with a bot icon, and
@@ -1017,6 +1021,14 @@ plain `uv run pytest`, which starts a private server for the test.
   (`POST /v1/projects`), file six or more sessions into it with
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
+
+For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
+session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
+siblings stay open. If stopping the side chat fails, its tab, draft and queued
+messages must remain. Narrow the desktop window below 768 pixels and repeat:
+the hidden rail's tabs stay open and the app returns to the new-session page.
+Native accelerator delivery requires an Electron run; component tests cover
+selection, visibility, and stop failure.
 
 ## Gotchas
 

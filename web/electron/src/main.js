@@ -2580,9 +2580,24 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
-  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+  win.webContents.on("did-navigate", () => {
     const state = windows.get(win);
-    if (state && isMainFrame && !isInPlace) state.closeTabSupported = false;
+    if (state) {
+      state.closeTabSupported = false;
+      state.closeTabUnresponsive = false;
+    }
+  });
+  win.webContents.on("render-process-gone", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabSupported = false;
+  });
+  win.webContents.on("unresponsive", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabUnresponsive = true;
+  });
+  win.webContents.on("responsive", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabUnresponsive = false;
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
@@ -5342,7 +5357,7 @@ function focusAndRestore(win) {
 function closeTabOrWindow(win) {
   if (!win || win.isDestroyed()) return;
   const state = windows.get(win);
-  if (state?.closeTabSupported && state.origin) {
+  if (state?.closeTabSupported && !state.closeTabUnresponsive && state.origin) {
     try {
       win.webContents.send("omnigent:close-tab");
       return;

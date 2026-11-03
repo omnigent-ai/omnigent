@@ -1,3 +1,4 @@
+import { Suspense, type ReactNode } from "react";
 import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -82,6 +83,43 @@ describe("useCloseTabShortcut", () => {
     request();
     expect(shell.onCloseTabRequest).toHaveBeenCalledOnce();
     expect(shell.closeWindow).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the committed closer when a new render suspends", () => {
+    const { request } = stubCloseTabShell();
+    const committed = vi.fn(() => true);
+    const suspended = vi.fn(() => true);
+    const pending = new Promise<void>(() => {});
+    const { rerender } = renderHook(
+      ({ close, suspend }: { close: () => boolean; suspend: boolean }) => {
+        useCloseTabShortcut(close, true);
+        if (suspend) throw pending;
+      },
+      {
+        initialProps: { close: committed, suspend: false },
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <Suspense fallback={null}>{children}</Suspense>
+        ),
+      },
+    );
+    rerender({ close: suspended, suspend: true });
+    request();
+    expect(committed).toHaveBeenCalledOnce();
+    expect(suspended).not.toHaveBeenCalled();
+  });
+
+  it("removes its listener when opting in throws", () => {
+    const { shell, request } = stubCloseTabShell();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    shell.setCloseTabSupported.mockImplementation(() => {
+      throw new Error("disconnected");
+    });
+    const closeSelectedTab = vi.fn(() => true);
+    const { unmount } = renderHook(() => useCloseTabShortcut(closeSelectedTab, true));
+    unmount();
+    request();
+    expect(closeSelectedTab).not.toHaveBeenCalled();
+    warning.mockRestore();
   });
 
   it("never opts in on a shell that predates the bridge", () => {

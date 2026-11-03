@@ -680,17 +680,20 @@ export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
 export function onCloseTabRequest(callback: () => void): () => void {
   const electron = electronApi();
   if (!electron?.onCloseTabRequest || !electron.setCloseTabSupported) return () => {};
+  let unsubscribe: (() => void) | undefined;
   try {
-    const unsubscribe = electron.onCloseTabRequest(callback);
+    unsubscribe = electron.onCloseTabRequest(callback);
     electron.setCloseTabSupported(true);
+    const off = unsubscribe;
     return () => {
       try {
         electron.setCloseTabSupported?.(false);
       } finally {
-        unsubscribe();
+        off();
       }
     };
   } catch (err) {
+    unsubscribe?.();
     console.warn("[nativeBridge] close-tab subscription failed:", err);
     return () => {};
   }

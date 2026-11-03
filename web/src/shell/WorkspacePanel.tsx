@@ -28,6 +28,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -1159,6 +1160,7 @@ function WorkspacePanelImpl({
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
+  const closeFileTabRef = useRef<(() => void) | null>(null);
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) onCloseFile(selectedFilePath);
   }, [onCloseFile, selectedFilePath]);
@@ -1190,8 +1192,9 @@ function WorkspacePanelImpl({
   // Mirrors the tab strip's own `active` rules, so Close Tab closes exactly
   // the tab drawn as selected.
   const closeSelectedTab = (): boolean => {
+    if (pending || !open || (!contained && isMobile) || (!maximized && width <= 0)) return false;
     if (selectedFilePath !== null) {
-      onCloseFile(selectedFilePath);
+      closeFileTabRef.current?.();
       return true;
     }
     if (terminalShown && selectedTerminalKey !== null) {
@@ -1210,20 +1213,23 @@ function WorkspacePanelImpl({
       void closeSideChat(sideChats.selected);
       return true;
     }
-    const panel = visibleOpenPanels.find((tab) => tab === rightRailTab);
+    const panel =
+      selectedTerminalKey === null
+        ? visibleOpenPanels.find((tab) => tab === rightRailTab)
+        : undefined;
     if (panel !== undefined) {
       onClosePanel(panel);
       return true;
     }
     return false;
   };
-  if (closeSelectedTabRef) closeSelectedTabRef.current = closeSelectedTab;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!closeSelectedTabRef) return;
+    closeSelectedTabRef.current = closeSelectedTab;
     return () => {
-      closeSelectedTabRef.current = null;
+      if (closeSelectedTabRef.current === closeSelectedTab) closeSelectedTabRef.current = null;
     };
-  }, [closeSelectedTabRef]);
+  });
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
     activePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -1883,6 +1889,7 @@ function WorkspacePanelImpl({
                 position={filePosition}
                 onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
                 onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                closeTabRef={closeFileTabRef}
                 onNavigateTo={openFileViewer}
                 permissionLevel={permissionLevel}
                 onCommentsOpenChange={onCommentsOpenChange}

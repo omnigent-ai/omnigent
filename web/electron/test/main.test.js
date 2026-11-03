@@ -5809,13 +5809,40 @@ describe("Close Tab menu item", () => {
     assert.equal(closes(), 1);
   });
 
+  it("closes the window after its renderer exits", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.api.createWindow();
+    h.setUrl(server);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+    h.emit("render-process-gone", { reason: "crashed" });
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 0);
+    assert.equal(closes(), 1);
+  });
+
+  it("falls back while unresponsive and resumes tab closing after recovery", (t) => {
+    const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
+    h.api.createWindow();
+    h.setUrl(server);
+    h.ipc.get("omnigent:set-close-tab-supported")(pageEvent, true);
+    h.emit("unresponsive");
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 0);
+    assert.equal(closes(), 1);
+
+    h.emit("responsive");
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 1);
+    assert.equal(closes(), 1);
+  });
+
   it("lets the page close its own window", (t) => {
     const { h, pageEvent, closes } = loadCloseTabHarness(t);
     h.ipc.get("omnigent:close-window")(pageEvent);
     assert.equal(closes(), 1);
   });
 
-  it("drops the opt-in on a main-frame navigation but not an in-page one", (t) => {
+  it("keeps the opt-in until a new main-frame document commits", (t) => {
     const { h, pageEvent, closes, closeTabRequests, clickMenuItem } = loadCloseTabHarness(t);
     h.api.createWindow();
     h.setUrl(server);
@@ -5825,9 +5852,14 @@ describe("Close Tab menu item", () => {
     clickMenuItem("close_tab");
     assert.equal(closeTabRequests(), 1);
 
-    h.emit("did-start-navigation", `${server}/`, false, true);
+    h.emit("did-start-navigation", `${server}/download`, false, true);
     clickMenuItem("close_tab");
-    assert.equal(closeTabRequests(), 1);
+    assert.equal(closeTabRequests(), 2);
+    assert.equal(closes(), 0);
+
+    h.emit("did-navigate", `${server}/`, 200, "OK");
+    clickMenuItem("close_tab");
+    assert.equal(closeTabRequests(), 2);
     assert.equal(closes(), 1);
   });
 });

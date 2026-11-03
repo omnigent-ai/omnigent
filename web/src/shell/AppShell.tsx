@@ -2502,7 +2502,7 @@ function AppShellImpl() {
   const closeSelectedRailTabRef = useRef<(() => boolean) | null>(null);
   useCloseTabShortcut(
     () => workspacePanelVisible && (closeSelectedRailTabRef.current?.() ?? false),
-    conversationId != null,
+    conversationId !== undefined,
   );
 
   return (
