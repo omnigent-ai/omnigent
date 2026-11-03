@@ -1451,6 +1451,7 @@ def _seed_same_workspace_daemon(
             log_path=str(tmp_path / "existing.log"),
             started_at=int(time.time()) - age_s,
             host_id="a" * 32,
+            org_pin=f"{_WORKSPACE_API}?o=1",
         )
     )
 
@@ -2027,6 +2028,7 @@ def _seed_yielding_spawn(
                 started_at=int(time.time()),
                 host_id="a" * 32,
                 workspace_id="1",
+                org_pin=f"{winner_target}?o=1",
             )
         )
 
@@ -2158,6 +2160,7 @@ def test_ensure_host_daemon_reports_a_config_change_when_another_url_serves(
                 started_at=int(time.time()),
                 host_id="a" * 32,
                 workspace_id="1",
+                org_pin=f"{_WORKSPACE_API}?o=1",
             )
         )
         monkeypatch.setattr(

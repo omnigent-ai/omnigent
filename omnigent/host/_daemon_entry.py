@@ -69,7 +69,11 @@ def main() -> None:
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
 
-    from omnigent.cli_auth import pinned_databricks_org_id
+    from omnigent.cli_auth import (
+        PINNED_DATABRICKS_ORG_ENV_VAR,
+        pin_databricks_org_id,
+        pinned_databricks_org_id,
+    )
     from omnigent.host.daemon_lifecycle import (
         DAEMON_CONFIG_SIG_ENV_VAR,
         DaemonLifecycleLock,
@@ -81,6 +85,10 @@ def main() -> None:
     from omnigent.util.server_url import is_workspace_hosted_url
 
     workspace_hosted = not args.local and is_workspace_hosted_url(args.server)
+    if workspace_hosted:
+        from omnigent.util.server_url import ServerUrl
+
+        pin_databricks_org_id(args.server, ServerUrl.from_api_base(args.server).org_id)
     daemon_target = normalize_daemon_target(
         None if args.local else args.server,
         org_id=pinned_databricks_org_id(args.server) if workspace_hosted else None,
@@ -121,6 +129,7 @@ def main() -> None:
             host_id=identity.host_id,
             config_sig=os.environ.get(DAEMON_CONFIG_SIG_ENV_VAR),
             workspace_id=workspace_id,
+            org_pin=os.environ.get(PINNED_DATABRICKS_ORG_ENV_VAR) if workspace_hosted else None,
         )
         write_daemon_record(record, update_legacy_pidfile=True)
 
