@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -274,6 +275,7 @@ export interface BackgroundTaskInfo {
 }
 
 export interface Session {
+  sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
   id: string;
   agentId: string;
@@ -582,6 +584,13 @@ export interface SkillSummary {
   description: string;
   /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
   display_name?: string | null;
+}
+
+/** A host's discovered catalog plus the sources it could not read. */
+export interface SkillsCatalog {
+  skills: SkillSummary[];
+  /** User-facing notes, e.g. a failed `codex plugin list`; empty when complete. */
+  warnings: string[];
 }
 
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";
