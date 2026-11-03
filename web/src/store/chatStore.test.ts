@@ -7400,8 +7400,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const rewindFetch = fetchMock.getMockImplementation()!;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
-        const content = /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/.exec(url);
-        if (content) return Promise.resolve(contents[content[1]!]!);
+        const fileId = url.match(
+          /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/,
+        )?.[1];
+        if (fileId) return Promise.resolve(contents[fileId]!);
         if (url.endsWith("/resources/files")) uploads.push(url);
         if (url.endsWith("/v1/sessions/conv_new/events") && init?.method === "POST")
           posted.push(JSON.parse(String(init.body)));
