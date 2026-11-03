@@ -67,7 +67,7 @@ def _pill(page: Page, count: int) -> Locator:
 
 
 @pytest.mark.browser_context_args(has_touch=True)
-@pytest.mark.parametrize("width", [390, 1024])
+@pytest.mark.parametrize("width", [320, 390, 1024])
 def test_touch_screens_reveal_timestamps_and_pending_steering(
     page: Page, chat_session_contract: ChatSessionContract, width: int
 ) -> None:
@@ -106,6 +106,13 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     expect(notice).to_be_visible()
     page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
     assert notice.evaluate(opacity) >= 0.39
+    footer = notice.locator("..")
+    pending_timestamp = footer.get_by_test_id("message-timestamp")
+    notice_box = notice.bounding_box()
+    timestamp_box = pending_timestamp.bounding_box()
+    assert notice_box is not None and timestamp_box is not None
+    assert notice_box["y"] == pytest.approx(timestamp_box["y"], abs=1)
+    assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
 
 
 def test_bare_idle_clears_the_live_working_indicator(

@@ -951,7 +951,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </MessageContent>
         </div>
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex max-w-full mobile-app:flex-wrap items-center justify-end gap-3 pt-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40">
+        <div className="flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40">
           {bubble.pending && bubble.awaitingAgent && (
             <span
               className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
