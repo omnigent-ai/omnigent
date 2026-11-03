@@ -98,43 +98,73 @@ async def test_question_buffers_messages_and_resumes_fifo(
     app, harness = _build_app()
     sid = uuid.uuid4().hex
     inspected_dirs: list[Path] = []
+    queued_run = ScheduledRunLogContext(
+        task_id="queued-task",
+        run_id="queued-run",
+        task_workspace_id=7,
+        scheduled_at=1000,
+        target="connected_host",
+        session_mode="continue",
+    )
+    harness.on_dispatch = lambda: logging.getLogger("omnigent.runner.test").info(
+        "dispatch after question"
+    )
 
     async def bridge_id(**_: Any) -> str:
         return "label-owned-bridge"
 
     def inspect(bridge_dir: Path) -> bool:
         inspected_dirs.append(bridge_dir)
+        logging.getLogger("omnigent.runner.test").info("pending question probe")
         return pending_prompt["pending"]
 
     monkeypatch.setattr(runner_app, "_claude_native_bridge_id_for_session", bridge_id)
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", inspect)
-    async with _runner_client(app) as client:
-        created = await client.post(
-            "/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex}
-        )
-        assert created.status_code == 201
-        first = await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
-        waiter = app.state.claude_prompt_waiters[sid]
-        second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
-        assert first.status_code == second.status_code == 202
-        assert first.json()["status"] == second.json()["status"] == "buffered"
-        assert app.state.claude_prompt_waiters[sid] is waiter
-        assert sid not in app.state.active_turns
-        assert app.state.has_active_work()
-        await asyncio.sleep(0.04)
-        assert harness.posted_bodies == []
-        assert len(app.state.session_message_buffers[sid]) == 2
-
-        pending_prompt["pending"] = False
-        await _until(
-            lambda: (
-                len(harness.posted_bodies) == 2
-                and sid not in app.state.active_turns
-                and sid not in app.state.claude_prompt_waiters
+    with capture_debug_rows("runner") as rows:
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex}
             )
-        )
+            assert created.status_code == 201
+            first = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json=_message("first"),
+                headers={SCHEDULED_RUN_HEADER: queued_run.model_dump_json()},
+            )
+            waiter = app.state.claude_prompt_waiters[sid]
+            second = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
+            assert first.status_code == second.status_code == 202
+            assert first.json()["status"] == second.json()["status"] == "buffered"
+            assert app.state.claude_prompt_waiters[sid] is waiter
+            assert sid not in app.state.active_turns
+            assert app.state.has_active_work()
+            probe_start = len(rows)
+            await _until(
+                lambda: any(
+                    row["message"] == "pending question probe" for row in rows[probe_start:]
+                )
+            )
+            waiter_probes = [
+                row for row in rows[probe_start:] if row["message"] == "pending question probe"
+            ]
+            assert waiter_probes
+            for row in waiter_probes:
+                assert row["attributes"].get("run_id") is None
+                assert row["attributes"].get("task_id") is None
+                assert row["session_id"] == sid
+            assert harness.posted_bodies == []
+            assert len(app.state.session_message_buffers[sid]) == 2
+
+            pending_prompt["pending"] = False
+            await _until(
+                lambda: (
+                    len(harness.posted_bodies) == 2
+                    and sid not in app.state.active_turns
+                    and sid not in app.state.claude_prompt_waiters
+                )
+            )
 
     assert not app.state.session_message_buffers.get(sid)
     assert set(inspected_dirs) == {
@@ -143,6 +173,11 @@ async def test_question_buffers_messages_and_resumes_fifo(
     first_body, second_body = harness.posted_bodies
     assert first_body["content"][-1]["content"][0]["text"] == "first"
     assert second_body["content"][-1]["content"][0]["text"] == "second"
+
+    dispatches = [row for row in rows if row["message"] == "dispatch after question"]
+    assert [row["attributes"].get("run_id") for row in dispatches] == [queued_run.run_id, None]
+    assert [row["attributes"].get("task_id") for row in dispatches] == [queued_run.task_id, None]
+    assert all(row["session_id"] == sid for row in dispatches)
 
 
 @pytest.mark.asyncio

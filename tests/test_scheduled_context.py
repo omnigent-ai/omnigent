@@ -2,19 +2,24 @@
 
 import asyncio
 import json
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame, encode_host_frame
+from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.transports.tcp import create_tcp_client
+from omnigent.runner.transports.uds import create_uds_client
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.scheduled_context import (
     SCHEDULED_RUN_HEADER,
-    add_scheduled_run_header,
     current_scheduled_run,
     parse_scheduled_run,
     scheduled_run_scope,
 )
+from omnigent.server._runner_transport import build_uds_runner
 
 
 @pytest.mark.parametrize("value", [None, "not json", "{}", {"run_id": "incomplete"}, 42])
@@ -28,7 +33,10 @@ def test_invalid_metadata_is_ignored(value):
 
 
 @pytest.mark.asyncio
-async def test_shared_runner_client_isolates_concurrent_scheduled_and_interactive_requests():
+@pytest.mark.parametrize("transport_kind", ["tunnel", "tcp", "uds", "server_uds"])
+async def test_runner_client_factories_isolate_scheduled_and_interactive_requests(
+    transport_kind, monkeypatch, tmp_path
+):
     seen = {}
 
     async def receive(request):
@@ -36,11 +44,21 @@ async def test_shared_runner_client_isolates_concurrent_scheduled_and_interactiv
         seen[request.url.path] = parse_scheduled_run(request.headers.get(SCHEDULED_RUN_HEADER))
         return httpx.Response(200)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(receive),
-        base_url="http://runner",
-        event_hooks={"request": [add_scheduled_run_header]},
-    ) as client:
+    socket_path = str(tmp_path / "runner.sock")
+    if transport_kind == "tunnel":
+        router = RunnerRouter(registry=TunnelRegistry(), conversation_store=Mock())
+        client = router._client_for_runner("runner")
+        assert router._client_for_runner("runner") is client
+    elif transport_kind == "tcp":
+        client = create_tcp_client("http://runner")
+    elif transport_kind == "uds":
+        client = create_uds_client(socket_path)
+    else:
+        client, _ = build_uds_runner(socket_path)
+
+    async with httpx.MockTransport(receive) as transport, client:
+        # Keep the factory's hooks; replace only network I/O, including proxy routes.
+        monkeypatch.setattr(client, "_transport_for_url", lambda _: transport)
 
         async def send(run_id):
             run = ScheduledRunLogContext(
