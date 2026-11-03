@@ -669,9 +669,11 @@ function FileViewerBody({
     [allComments, fileContent, remapFormatted],
   );
   // Address All sends drafts from every file; this file's own query supplies its drafts.
+  // Until the session list loads, a send would silently skip other files' drafts.
   const addressableCommentIds = useMemo(() => {
+    if (!sessionCommentsQuery.data) return [];
     const ids = new Set(openComments.map((c) => c.id));
-    for (const c of sessionCommentsQuery.data ?? []) {
+    for (const c of sessionCommentsQuery.data) {
       if (c.status === "draft" && c.path !== path) ids.add(c.id);
     }
     return [...ids];
@@ -1918,7 +1920,7 @@ function FileViewerBody({
             canAddress={canEdit && sender !== null}
             addressCount={addressableCommentIds.length}
             onAddressAll={() => {
-              if (!sender) return;
+              if (!sender || addressableCommentIds.length === 0) return;
               sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {

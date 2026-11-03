@@ -1104,11 +1104,38 @@ describe("FileViewer Address All", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
     fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
 
+    expect(mutate).toHaveBeenCalledTimes(1);
     expect(mutate).toHaveBeenCalledWith({ comment_ids: expectedIds });
     expect(screen.getByTestId("comments-panel")).toHaveAttribute(
       "data-address-count",
       String(expectedIds.length),
     );
+  });
+
+  it.each([
+    ["loading", { data: undefined, isPending: true }],
+    ["failed", { data: undefined, isError: true }],
+  ])("sends nothing until the session list loads (%s)", (_label, unavailableSessionQuery) => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    let sessionQuery = unavailableSessionQuery as ReturnType<typeof useComments>;
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      path ? makeCommentsQuery([makeComment("c1")]) : sessionQuery,
+    );
+
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-address-count", "0");
+
+    sessionQuery = makeCommentsQuery([makeComment("c1"), otherDraft]);
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1", "c2"] });
   });
 });
 
