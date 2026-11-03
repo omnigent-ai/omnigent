@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStor
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import FakeSandboxLauncher
 
@@ -249,10 +251,27 @@ async def test_schedule_validation_keeps_requests_responsive(
 
 async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
-    resp = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    headers = {
+        **_headers(),
+        "x-omnigent-automation-source": "ui",
+        "x-omnigent-automation-template": "jira",
+    }
+    with capture_debug_rows("server") as rows:
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(name="private-name", prompt="private-prompt"),
+            headers=headers,
+        )
     assert resp.status_code == 200, resp.text
+    [event] = [row for row in rows if row["event_name"] == "scheduled_task_created"]
+    assert event["user_id"] == "alice@example.com"
+    assert event["attributes"]["task_id"] == resp.json()["id"]
+    assert event["attributes"]["creation_source"] == "ui"
+    assert event["attributes"]["template_id"] == "jira"
+    assert "private-name" not in json.dumps(event)
+    assert "private-prompt" not in json.dumps(event)
     created = resp.json()
-    assert created["name"] == "nightly triage"
+    assert created["name"] == "private-name"
     assert created["rrule"] == _VALID_RRULE
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
@@ -546,12 +565,15 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(rrule="FREQ=SECONDLY"),
-        headers=_headers(),
-    )
+    with capture_debug_rows("server") as rows:
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(rrule="FREQ=SECONDLY"),
+            headers=_headers(),
+        )
     assert resp.status_code == 400, resp.text
+
+    assert not [row for row in rows if row["event_name"] == "scheduled_task_created"]
 
 
 async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
@@ -1459,16 +1481,18 @@ async def test_schedule_search_failure_returns_400_and_rolls_back(
         raise RRuleSearchError("search budget exceeded")
 
     monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", fail_actual_schedule)
-    if operation == "create":
-        response = await auth_client.post(
-            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
-        )
-    else:
-        response = await auth_client.patch(
-            f"/v1/scheduled-tasks/{existing.id}",
-            json={"rrule": "FREQ=DAILY;BYHOUR=12"},
-            headers=_headers(),
-        )
+    with capture_debug_rows("server") as rows:
+        if operation == "create":
+            response = await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+            )
+        else:
+            response = await auth_client.patch(
+                f"/v1/scheduled-tasks/{existing.id}",
+                json={"rrule": "FREQ=DAILY;BYHOUR=12"},
+                headers=_headers(),
+            )
+    assert not any(row["event_name"] == "scheduled_task_created" for row in rows)
     assert response.status_code == 400, response.text
     assert "Could not calculate the next run time for this schedule." in response.text
     expected_outcome = (

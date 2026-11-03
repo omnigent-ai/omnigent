@@ -651,6 +651,58 @@ The design's success metrics come from these events:
 
 Failure stages come from the executor's `error_code`.
 
+### Adoption and creation funnel
+
+`scheduled_task_created` is an INFO server event emitted after task persistence,
+for UI, API, and agent-tool creates. Its top-level `user_id` is the authenticated
+owner (`local` for auth-disabled servers); attributes are `task_id`,
+`task_workspace_id`, `creation_source` (`ui`, `agent`, or `api`), `template_id`,
+`target`, and `session_mode`. Rejected creates emit no creation event. As with
+run logs, delivery is best-effort; reconcile current inventory against the store.
+
+Requests without a recognized source header are classified as `api`, including
+older web and agent clients. During a mixed-version rollout, `creation_source`
+therefore does not precisely distinguish direct API usage from those clients.
+
+UI events use the host-provided `OmnigentHostConfig.analytics` sink:
+
+| Metric | Measurement |
+| --- | --- |
+| Feature visitors | Distinct host-identified users on `page_view` with `pageId=tasks`, `tasks.templates`, or `tasks.detail`. |
+| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` in the reporting window. |
+| Automations created per person | Distinct `task_id` per owner on `scheduled_task_created`, including tasks later deleted while events remain retained. |
+| Active tasks and active owners | Use `scheduled_tasks` filtered to `state=active`; group by workspace and owner. This is a current snapshot, not historical daily activity. |
+| Template selections | `click` with `componentId=tasks.template.<id>`, from both the empty-state preview and Templates tab. |
+| Successful template use | `scheduled_task_created` grouped by `template_id`; distinct owners gives template users. |
+| UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
+| UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
+
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`,
+`follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
+unattributed/older clients. The current gallery offers Jira, Slack, and GitHub;
+the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
+its prompt is edited. No task name, prompt, Jira query, channel, or repository
+text is recorded in these events. Attribution headers are diagnostic client claims;
+they never determine ownership or authorization.
+
+The host sink supplies user/workspace identity for UI analytics. Without that
+sink (for example standalone web), UI events are no-ops; server creation logging
+still works when INFO capture is enabled. A browser failure can follow a
+committed server creation if the response is lost: use server task IDs for
+creation counts, and UI outcomes for the browser funnel. Do not add both streams
+together. Page visits, creators, and owners of active tasks answer different
+questions; report them separately. Existing owners are not retroactively
+counted as new creators.
+
+To verify, configure a host analytics capture, visit Automations and its Templates
+tab, create one custom task and one template task, then cancel another form.
+Expect page views, one template click per selection, successful creation
+interactions and one server creation event per saved task, and no creation event
+for the cancelled form. Check task ID and owner against the store; delete the
+probe tasks afterward. Run `tests/server/integration/test_scheduled_tasks_routes.py`
+and `web/src/lib/scheduledTasksApi.test.ts` for rejected-create and attribution
+coverage.
+
 ## Code
 
 - [dispatch_scheduler.py](dispatch_scheduler.py): polling, heartbeats, and
