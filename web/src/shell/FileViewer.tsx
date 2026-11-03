@@ -11,6 +11,7 @@
 
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
+import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -29,6 +30,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from "react";
 import {
   AlertTriangleIcon,
@@ -101,7 +103,7 @@ import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
+import { type ChangedSort, groupChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
   MONACO_SPLIT_BREAKPOINT,
@@ -348,8 +350,9 @@ interface FileViewerProps {
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
   viewport?: "desktop" | "mobile";
-  /** Called when the user presses Escape to close the active file tab. */
+  /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
+  closeTabRef?: RefObject<(() => void) | null>;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
@@ -391,6 +394,7 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
+  closeTabRef,
   onNavigateTo,
   permissionLevel,
   frameless,
@@ -436,18 +440,27 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const onScreen = open && isActiveViewport && mediaActive;
-  // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
-    visible: onScreen,
-  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const isDeletedFile =
+    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  // Video playback reads the complete binary on demand, never the capped JSON preview.
+  const fileQuery = useFileContent(
+    conversationId,
+    isVideoFile(path) || isDeletedFile ? null : path,
+    {
+      visible: onScreen,
+    },
+  );
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
   // matches the Changes list position. Memoized so the sort runs only when the
   // changed-files list or sort order changes, not on every viewer re-render.
   const navigableFiles = useMemo(
-    () => [...(changedFiles.data?.data ?? [])].sort(compareChangedFiles(sort)).map((f) => f.path),
+    () =>
+      groupChangedFiles(changedFiles.data?.data ?? [], sort).flatMap((group) =>
+        group.files.map((file) => file.path),
+      ),
     [changedFiles.data?.data, sort],
   );
   const currentNavIdx = navigableFiles.indexOf(path);
@@ -733,6 +746,15 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
+  useLayoutEffect(() => {
+    if (!open || !onCloseTab || !closeTabRef) return;
+    const close = () => guardDirty(onCloseTab);
+    closeTabRef.current = close;
+    return () => {
+      if (closeTabRef.current === close) closeTabRef.current = null;
+    };
+  }, [open, onCloseTab, closeTabRef, guardDirty]);
+
   // Escape closes the active file tab (when search is not open).
   useEffect(() => {
     if (!open || !onCloseTab) return;
@@ -797,9 +819,8 @@ function FileViewerBody({
     !isVideo &&
     !isModel &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
-  const isDeletedFile =
-    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
   const revealTarget = useRevealTarget(path);
+  const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -816,8 +837,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
+  const effectiveDiffActive = diffActive || isDeletedFile;
   const requestedDiff =
-    open && isActiveViewport && diffActive && !isImage && !isPdf && !isVideo && !isModel;
+    open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
   const linkedDiff =
     requestedDiff &&
@@ -913,7 +935,7 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
@@ -1139,6 +1161,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
+    /** Keep the default action directly available beside its app picker. */
+    splitMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
@@ -1256,7 +1280,7 @@ function FileViewerBody({
       setCommentsOpen((prev) => !prev);
     },
   });
-  if (!isPdf && isDiffAvailable) {
+  if (!isPdf && !isDeletedFile && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",
@@ -1356,6 +1380,15 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (openInActions.length) {
+    toolbarActions.push({
+      key: "open-in",
+      label: "Open in…",
+      icon: null,
+      menu: openInActions,
+      splitMenu: true,
+    });
+  }
 
   const showNavButtons = currentNavIdx !== -1 && navigableFiles.length > 1 && !!onNavigateTo;
   const {
@@ -1385,7 +1418,9 @@ function FileViewerBody({
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
     toolbarActions.map((action) =>
-      action.menu ? (
+      action.splitMenu && action.menu ? (
+        <OpenInSplitButton key={action.key} actions={action.menu} interactive={interactive} />
+      ) : action.menu ? (
         // A settings menu: one trigger opening a list of independent items
         // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
         // as the user flips them; actions close it on select.
@@ -1626,37 +1661,58 @@ function FileViewerBody({
               )}
             </span>
           )}
-          {/* Responsive action switcher: inline icon buttons until they no
-              longer fit (decided by useToolbarOverflow from the header width),
-              then a single "⋯" menu with the same options. The offscreen clone
-              below measures the full row's natural width. */}
+          {/* Collapse overflowing actions into "⋯", keeping the Open in split
+              button visible. The offscreen clone measures the full row. */}
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
-                    <MoreHorizontalIcon className="size-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-auto min-w-40">
-                  {toolbarActions.map((action) =>
-                    action.options ? (
-                      // A mutually-exclusive picker (e.g. view mode) collapses to
-                      // a nested submenu so its "selected choice" semantics — one
-                      // highlighted option — stay intact.
-                      <DropdownMenuSub key={action.key}>
-                        <DropdownMenuSubTrigger className="whitespace-nowrap">
-                          {action.icon}
-                          {action.tooltip ?? action.label}
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent>
-                          {action.options.map((option) => (
+              <>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
+                      <MoreHorizontalIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-auto min-w-40">
+                    {toolbarActions
+                      .filter((action) => !action.splitMenu)
+                      .map((action) =>
+                        action.options ? (
+                          // Keep view-mode choices grouped in a submenu.
+                          <DropdownMenuSub key={action.key}>
+                            <DropdownMenuSubTrigger className="whitespace-nowrap">
+                              {action.icon}
+                              {action.tooltip ?? action.label}
+                            </DropdownMenuSubTrigger>
+                            <DropdownMenuSubContent>
+                              {action.options.map((option) => (
+                                <DropdownMenuItem
+                                  key={option.key}
+                                  className={cn(
+                                    "whitespace-nowrap",
+                                    option.active && "bg-muted dark:bg-muted/50",
+                                  )}
+                                  onSelect={(e) => {
+                                    if (option.keepOpen) e.preventDefault();
+                                    option.onSelect();
+                                  }}
+                                >
+                                  {option.icon}
+                                  {option.label}
+                                  {option.active && !option.noActiveCheck && (
+                                    <CheckIcon className="ml-auto size-4" />
+                                  )}
+                                </DropdownMenuItem>
+                              ))}
+                            </DropdownMenuSubContent>
+                          </DropdownMenuSub>
+                        ) : action.menu ? (
+                          // The settings menu's items are already independent
+                          // toggles/actions, so flatten them straight into this "⋯"
+                          // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                          action.menu.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              className={cn(
-                                "whitespace-nowrap",
-                                option.active && "bg-muted dark:bg-muted/50",
-                              )}
+                              className="whitespace-nowrap"
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();
                                 option.onSelect();
@@ -1668,42 +1724,22 @@ function FileViewerBody({
                                 <CheckIcon className="ml-auto size-4" />
                               )}
                             </DropdownMenuItem>
-                          ))}
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                    ) : action.menu ? (
-                      // The settings menu's items are already independent
-                      // toggles/actions, so flatten them straight into this "⋯"
-                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
-                      action.menu.map((option) => (
-                        <DropdownMenuItem
-                          key={option.key}
-                          className="whitespace-nowrap"
-                          onSelect={(e) => {
-                            if (option.keepOpen) e.preventDefault();
-                            option.onSelect();
-                          }}
-                        >
-                          {option.icon}
-                          {option.label}
-                          {option.active && !option.noActiveCheck && (
-                            <CheckIcon className="ml-auto size-4" />
-                          )}
-                        </DropdownMenuItem>
-                      ))
-                    ) : (
-                      <DropdownMenuItem
-                        key={action.key}
-                        className="whitespace-nowrap"
-                        onSelect={action.onSelect}
-                      >
-                        {action.icon}
-                        {action.tooltip ?? action.label}
-                      </DropdownMenuItem>
-                    ),
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
+                          ))
+                        ) : (
+                          <DropdownMenuItem
+                            key={action.key}
+                            className="whitespace-nowrap"
+                            onSelect={action.onSelect}
+                          >
+                            {action.icon}
+                            {action.tooltip ?? action.label}
+                          </DropdownMenuItem>
+                        ),
+                      )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <OpenInSplitButton actions={openInActions} />
+              </>
             ) : (
               renderActionButtons(true)
             )}
@@ -1781,6 +1817,13 @@ function FileViewerBody({
             !diffQuery.data ? (
               <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
+              </div>
+            ) : diffQuery.data.baseline_state === "unknown" ? (
+              <div
+                role="status"
+                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
+              >
+                Original content unavailable
               </div>
             ) : (
               // Keep viewer state on resize without computing the CSS-hidden copy's diff.
