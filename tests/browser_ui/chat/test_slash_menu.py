@@ -307,3 +307,32 @@ def test_native_file_paste_closes_the_slash_menu(page: Page, chat_session_contra
     expect(page.get_by_text("notes.txt")).to_be_visible()
     expect(page.locator(_ROWS)).to_have_count(0)
     expect(composer).to_have_value("/")
+
+
+def test_permissions_command_opens_the_codex_approval_picker(
+    page: Page, chat_session_contract
+) -> None:
+    handle = chat_session_contract
+    handle.harness = "codex-native"
+    handle.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    handle.contract.json(f"/v1/sessions/{handle.session_id}/codex_goal", {"goal": None})
+    page.goto(handle.url)
+    composer = _composer(page)
+    expect(page.get_by_test_id("composer-permission-chip")).to_be_visible()
+
+    composer.fill("/perm")
+    expect(page.get_by_test_id("slash-menu-item-permissions")).to_have_attribute(
+        "data-active", "true"
+    )
+    composer.press("Enter")
+    expect(page.get_by_test_id("composer-permission-menu")).to_be_visible()
+    expect(composer).to_have_value("")
+    page.get_by_test_id("composer-permission-option-approve-for-me").click()
+
+    # The menu closes after the pick and leaves the page interactive.
+    expect(page.get_by_test_id("composer-permission-menu")).to_have_count(0)
+    composer.click()
+    composer.press_sequentially("still typing")
+    expect(composer).to_have_value("still typing")
+    assert handle.session_patches == [{"approval_mode": "approve-for-me"}]
+    assert handle.event_posts == []
