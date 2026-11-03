@@ -44,6 +44,8 @@ export interface CommentsPanelProps {
   onClickComment: (comment: Comment) => void;
   /** When false, "Address All" is disabled (no agent registered). */
   canAddress: boolean;
+  /** Draft comments "Address All" sends, including other files'. Defaults to `comments.length`. */
+  addressCount?: number;
   addressPending: boolean;
   /**
    * When false, the add-comment form and all edit/delete buttons are hidden
@@ -81,6 +83,7 @@ export function CommentsPanel({
   onDeleteComment,
   onClickComment,
   canAddress,
+  addressCount = comments.length,
   addressPending,
   canEdit = true,
   pendingBodyRef,
@@ -184,11 +187,16 @@ export function CommentsPanel({
             variant="outline"
             size="xs"
             className="rounded-full px-3 gap-1.5"
-            disabled={!canAddress || comments.length === 0 || addressPending}
+            disabled={!canAddress || addressCount === 0 || addressPending}
             onClick={onAddressAll}
           >
             <WandSparklesIcon className="size-3.5" />
             Address All
+            {addressCount > 0 && (
+              <span className="rounded-full bg-muted px-1.5 text-[10px] tabular-nums">
+                {addressCount}
+              </span>
+            )}
           </Button>
         )}
       </div>

@@ -558,3 +558,37 @@ describe("CommentsPanel active-comment reveal", () => {
     expect(onClickComment).toHaveBeenCalledWith(addressed);
   });
 });
+
+describe("CommentsPanel Address All", () => {
+  it.each([
+    ["drafts only in other files", [], 2, "2", true],
+    ["this file's drafts by default", [makeComment("c1")], undefined, "1", true],
+    ["no drafts anywhere", [], 0, "", false],
+  ])(
+    "enables the button from the session count with %s",
+    (_label, comments, count, badge, enabled) => {
+      const onAddressAll = vi.fn();
+      render(
+        <CommentsPanel
+          comments={comments}
+          addressedComments={[]}
+          activeSelection={null}
+          onAddComment={vi.fn()}
+          onAddressAll={onAddressAll}
+          onEditComment={vi.fn()}
+          onDeleteComment={vi.fn()}
+          onClickComment={vi.fn()}
+          canAddress
+          addressCount={count}
+          addressPending={false}
+        />,
+      );
+
+      const button = screen.getByRole("button", { name: /^Address All/ });
+      fireEvent.click(button);
+      expect(button).toHaveProperty("disabled", !enabled);
+      expect(onAddressAll).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      expect(button.textContent).toBe(`Address All${badge}`);
+    },
+  );
+});

@@ -470,6 +470,7 @@ function FileViewerBody({
       ? navigableFiles[currentNavIdx + 1]
       : null;
   const commentsQuery = useComments(conversationId, path);
+  const sessionCommentsQuery = useComments(conversationId);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
   const deleteComment = useDeleteComment(conversationId);
@@ -667,6 +668,14 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
+  // Address All sends drafts from every file; this file's own query supplies its drafts.
+  const addressableCommentIds = useMemo(() => {
+    const ids = new Set(openComments.map((c) => c.id));
+    for (const c of sessionCommentsQuery.data ?? []) {
+      if (c.status === "draft" && c.path !== path) ids.add(c.id);
+    }
+    return [...ids];
+  }, [openComments, sessionCommentsQuery.data, path]);
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
     // Comment navigation supersedes a citation, including clicks outside the editor.
@@ -1907,10 +1916,10 @@ function FileViewerBody({
               );
             }}
             canAddress={canEdit && sender !== null}
+            addressCount={addressableCommentIds.length}
             onAddressAll={() => {
               if (!sender) return;
-              const ids = openComments.map((c) => c.id);
-              sender.mutate({ comment_ids: ids });
+              sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
               handleSetActiveSelection({

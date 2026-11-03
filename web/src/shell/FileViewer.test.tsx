@@ -81,6 +81,7 @@ vi.mock("./CommentsPanel", () => ({
     comments,
     addressedComments,
     activeSelection,
+    addressCount,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
@@ -90,8 +91,13 @@ vi.mock("./CommentsPanel", () => ({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     addressedComments?: any[];
     activeSelection?: { comment_id?: string } | null;
+    addressCount?: number;
   }) => (
-    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+    <div
+      data-testid="comments-panel"
+      data-active-comment-id={activeSelection?.comment_id ?? ""}
+      data-address-count={addressCount}
+    >
       {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
@@ -1070,6 +1076,39 @@ describe("FileViewer addressed selection", () => {
 
     expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1"] });
     expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
+  });
+});
+
+describe("FileViewer Address All", () => {
+  const otherDraft = { ...makeComment("c2"), path: "other.py" };
+  const otherSent = { ...makeComment("c3", "addressed"), path: "other.py" };
+  const sentHere = makeComment("c4", "addressed");
+
+  it.each([
+    ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"]],
+    ["only other files", [sentHere], ["c2"]],
+  ])("sends drafts from %s in one message", (_label, fileComments, expectedIds) => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    // The session-wide list may lag behind this file's list, e.g. still showing c4 as a draft.
+    const staleSessionComments = [
+      ...fileComments.map((c) => ({ ...c, status: "draft" as const })),
+      otherDraft,
+      otherSent,
+    ];
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      makeCommentsQuery(path ? fileComments : staleSessionComments),
+    );
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: expectedIds });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute(
+      "data-address-count",
+      String(expectedIds.length),
+    );
   });
 });
 
