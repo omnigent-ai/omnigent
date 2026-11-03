@@ -15,6 +15,7 @@
 import { XIcon } from "lucide-react";
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
@@ -117,7 +118,11 @@ export function MobilePanelDrawer({
       </header>
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <MobilePanelHeaderContext.Provider value={headerTargets}>
-          {(open || keepMounted) && children}
+          {(open || keepMounted) && (
+            <RenderErrorBoundary name={title} resetKey={open ? "open" : "closed"}>
+              {children}
+            </RenderErrorBoundary>
+          )}
         </MobilePanelHeaderContext.Provider>
       </div>
     </aside>
