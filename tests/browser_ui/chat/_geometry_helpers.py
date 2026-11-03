@@ -179,18 +179,22 @@ def settled_geometry(page: Page, timeout_s: float = 15.0) -> dict:
 
 
 def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
-    return page.evaluate(
-        """distance => {
+    # Scrolling can remeasure virtual rows and change scrollHeight synchronously.
+    return page.wait_for_function(
+        """({distance, tolerance}) => {
           const ta = document.querySelector('textarea[aria-label="Message the agent"]');
           const scroller = ta.closest('form').parentElement.querySelector('[role="log"] > div');
           scroller.dispatchEvent(new WheelEvent('wheel', {deltaY: -100}));
           scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight - distance;
           scroller.dispatchEvent(new Event('scroll'));
-          return {scrollTop: Math.round(scroller.scrollTop), distanceFromBottom: Math.round(
-            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)};
+          const actualDistance = Math.round(
+            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop);
+          return Math.abs(actualDistance - distance) <= tolerance && {
+            scrollTop: Math.round(scroller.scrollTop), distanceFromBottom: actualDistance};
         }""",
-        distance,
-    )
+        arg={"distance": distance, "tolerance": TOLERANCE},
+        timeout=5_000,
+    ).json_value()
 
 
 @contextmanager
