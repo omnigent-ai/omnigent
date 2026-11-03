@@ -264,6 +264,7 @@ class ChatSessionContract:
     skills: list[dict[str, Any]] = field(default_factory=list)
     skill_requests: list[dict[str, Any]] = field(default_factory=list)
     session_patches: list[dict[str, Any]] = field(default_factory=list)
+    sidebar_sessions: list[dict[str, Any]] = field(default_factory=list)
     _items: list[dict[str, Any]] = field(default_factory=list)
     _session_updates: dict[str, Any] = field(default_factory=dict)
     _health_updates: dict[str, Any] = field(default_factory=dict)
@@ -307,6 +308,16 @@ class ChatSessionContract:
     def set_items(self, items: Sequence[Mapping[str, Any]]) -> None:
         """Replace history with copies of the supplied wire items."""
         self._items = [dict(item) for item in items]
+
+    def seed_sidebar_sessions(self, titles: Sequence[str]) -> None:
+        """List extra idle sessions after this one in the sidebar, newest first."""
+        for index, title in enumerate(titles, start=len(self.sidebar_sessions) + 1):
+            row = self._session()
+            row.update(id=f"{self.session_id}-row-{index}", title=title)
+            row.update(created_at=row["created_at"] - index, updated_at=row["updated_at"] - index)
+            self.sidebar_sessions.append(row)
+            # Rows fetch their latest item for the preview line.
+            self.contract.json(f"/v1/sessions/{row['id']}/items", list_payload([]))
 
     def update_session(self, **fields: Any) -> None:
         """Merge wire fields into subsequent mocked session snapshots."""
@@ -475,7 +486,10 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         },
     )
     contract.json("/v1/sessions/projects", [])
-    contract.json("/v1/sessions", lambda _request: list_payload([handle._session()]))
+    contract.json(
+        "/v1/sessions",
+        lambda _request: list_payload([handle._session(), *handle.sidebar_sessions]),
+    )
     session_api = f"/v1/sessions/{handle.session_id}"
     contract.json(session_api, lambda _request: handle._session())
 

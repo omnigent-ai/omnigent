@@ -184,6 +184,11 @@ the header menu), and each place is a separate entry point.
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
   the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
   a flat Display filter and the tooltip keeps its plain layout.
+- `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
+  drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
+  a third of its width, or after a quick flick, closes it; a shorter drag springs
+  back. List scrolling, row taps, long-press reordering and horizontal scrollers
+  keep their own touch handling.
 
 ## How to get to it (user POV)
 
@@ -422,6 +427,12 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
+**Closing the mobile drawer by swipe:** at phone width, open the sidebar with
+the header's Open sidebar button or, in the iOS app, a right swipe from the
+left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
+third of the drawer's width or after a quick flick it closes on the current
+chat, otherwise it springs back. Settings and desktop widths don't use it.
+
 **Databricks Sandbox and Arclet sessions:** Fork is enabled in the header,
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
@@ -462,6 +473,10 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
+in a visible workspace rail. With no closable visible tab it returns to the
+new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
+excluded from tab dispatch and retain the window-close behavior.
 With Settings → General → **Open sub-agents in the Workspace panel** on, a
 plain click on a sub-agent (transcript link, composer indicator, Agents row or
 graph node) opens it as a tab in the same strip, marked with a bot icon, and
@@ -589,6 +604,12 @@ plain `uv run pytest`, which starts a private server for the test.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
+- **`mobile-drawer-swipe`:**
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_swipe_left_closes_open_drawer`,
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`.
+  These touch-drive the built SPA in desktop Chromium at a phone viewport with
+  mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
+  hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
@@ -1044,6 +1065,14 @@ plain `uv run pytest`, which starts a private server for the test.
   (`POST /v1/projects`), file six or more sessions into it with
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
+
+For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
+session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
+siblings stay open. If stopping the side chat fails, its tab, draft and queued
+messages must remain. Narrow the desktop window below 768 pixels and repeat:
+the hidden rail's tabs stay open and the app returns to the new-session page.
+Native accelerator delivery requires an Electron run; component tests cover
+selection, visibility, and stop failure.
 
 ## Gotchas
 

@@ -187,9 +187,21 @@ records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
 never finds a recorded session it cannot continue. Of two first runs, the one that records
 second deletes its unused session and records `skipped`.
+Sandbox tasks accept an optional repository URL in `workspace`, validated with
+the same repository grammar as a new sandbox session. The selected repository is
+passed to sandbox launch and recorded in the session's repository labels for
+relaunch. `host_id` remains forbidden. The API advertises this support as
+`scheduled_task_sandbox_workspaces`; older servers reject sandbox workspaces.
+Selecting Provider default clears a repository pin with `workspace: null`.
+Edits also clear legacy directory pins without resetting an unchanged continued
+session, since those pins already use the provider default.
+Switching execution targets clears the old workspace unless the request supplies
+a replacement, since connected-host paths and repository URLs are different inputs.
+
 A sandbox task's first run starts its sandbox under the task's host ID. If that
 host already exists, left by a reset session, the new session joins it in that
-session's workspace, or replaces its sandbox when that session is unknown.
+session's workspace, or replaces its sandbox when that session is unknown or
+the selected repository changed.
 
 Known failures record `failed` with the same `error_code` as legacy fires, such as
 `host_offline` or `launch_failed`. A managed launch records where it failed instead:
@@ -602,11 +614,21 @@ can share a timestamp with a scheduled run without being duplicates.
 The executor scopes ordinary server logs and child tasks with occurrence IDs,
 `target`, and `session_mode`. Managed startup inputs persist these fields in
 `startup_options` and restore them on the delivering replica, including after a
-restart. They are not forwarded as prompt content. Correlation is limited to
-server-side work; host and runner logs still join by their existing session and
-runner identifiers. Session-wide server relays clear occurrence context so later
-interactive traffic is not attributed to the automation. Legacy timers and saved
-inputs created before this instrumentation do not have the new delivery correlation.
+restart. They are not forwarded as prompt content. Host launch frames and runner HTTP requests carry the same context. The host
+scopes launch logs and the runner scopes request logs; shared clients stamp each
+request separately, and interactive requests clear the occurrence fields. Buffered inputs
+retain their own occurrence (or explicit absence) through queue drains and sign-in
+retries. Telemetry does not change live steering or SDK queue coalescing. An
+interactive correction can still steer an active automation turn. Ordinary execution
+logs retain the initiating turn's context. A batch combining different input
+contexts has no single turn occurrence. These logs do not divide model output or
+execution cost among inputs.
+Session-wide relays and prompt/sign-in watchers clear occurrence context. Host
+exit watchers retain launch attribution only for confirmed pre-connect failures. No
+process-wide run ID is installed: continued sessions can serve multiple runs and
+interactive turns. Unrelated host heartbeats and process-lifecycle logs still
+join by host, runner, or session ID. Legacy timers and saved inputs created before this instrumentation do
+not have the new delivery correlation.
 
 | Event | Logged when | Extra attributes |
 | --- | --- | --- |

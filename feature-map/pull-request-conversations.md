@@ -40,6 +40,11 @@ request's Changes subtab. Top-level comments remain in Comments.
 A session with one PR opens its details directly. With multiple PRs, select a
 request from the list first; **All pull requests** returns to that list.
 
+With a pointer, hovering the composer's PR link previews each PR's status. The
+icon beside each title opens that PR in a new browser tab without opening the
+panel. `tests/e2e_ui/github/test_composer_pr_status.py` covers the preview,
+its links and the touch and keyboard paths.
+
 On each surface, **Try again** retries failed panel content. Switching sessions
 also clears a failed panel. Healthy chat drafts stay mounted; content inside a
 failed panel is recreated on recovery.

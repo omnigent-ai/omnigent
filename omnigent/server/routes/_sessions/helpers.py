@@ -6373,6 +6373,7 @@ async def _launch_runner_on_host_locked(
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.scheduled_context import current_scheduled_run
 
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
@@ -6436,6 +6437,7 @@ async def _launch_runner_on_host_locked(
             HostLaunchRunnerFrame(
                 request_id=request_id,
                 binding_token=binding_token,
+                scheduled_run=current_scheduled_run(),
                 workspace=conv.workspace,
                 session_id=conv.id,
                 # Canonical harness (see _resolve_harness) so the host runs the
@@ -10760,10 +10762,15 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
-    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, CREATED_BY_SESSION_LABEL_KEY):
+    for key in (
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        CREATED_BY_SESSION_LABEL_KEY,
+    ):
         if key in labels:
             raise OmnigentError(
                 f"label {key!r} is server-internal and cannot be set by clients",

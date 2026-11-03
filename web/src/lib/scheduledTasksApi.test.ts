@@ -15,6 +15,7 @@ import {
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
+  listAutomationFailures,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -138,6 +139,7 @@ describe("listScheduledTaskRuns", () => {
       conversationStatus: null,
       viewerLastSeen: null,
       viewerUnread: null,
+      sessionCostUsd: null,
     });
   });
 
@@ -158,6 +160,7 @@ describe("listScheduledTaskRuns", () => {
             conversation_status: "idle",
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
+            session_cost_usd: 0,
           },
         ],
       }),
@@ -168,6 +171,7 @@ describe("listScheduledTaskRuns", () => {
       conversationStatus: "idle",
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
+      sessionCostUsd: 0,
     });
   });
 });
@@ -236,11 +240,13 @@ describe("createScheduledTask", () => {
       timezone: "UTC",
       hostId: "host_1",
       workspace: "/home/me/repo",
+      baseBranch: "HEAD",
     });
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.timezone).toBe("UTC");
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe("/home/me/repo");
+    expect(body.base_branch).toBe("HEAD");
   });
 
   it("sends a project id and omits a null one", async () => {
@@ -324,5 +330,51 @@ describe("error path", () => {
     expect(err).toBeInstanceOf(ScheduledTaskApiError);
     expect(err.status).toBe(500);
     expect(err.code).toBeNull();
+  });
+});
+
+it("requests bounded automation Inbox pages and preserves empty continuations", async () => {
+  fetchMock.mockResolvedValue(mockResponse({ data: [], next_cursor: "100:task" }));
+  expect(await listAutomationFailures(null)).toEqual({ data: [], nextCursor: "100:task" });
+  expect(String(fetchMock.mock.calls[0]![0])).toBe("/v1/scheduled-tasks/inbox?limit=50");
+  fetchMock.mockResolvedValue(
+    mockResponse({
+      data: [
+        {
+          task_id: "task",
+          task_name: "Report",
+          run_id: "run",
+          scheduled_at: 100,
+          finished_at: null,
+          error_code: "host_offline",
+        },
+      ],
+      next_cursor: null,
+    }),
+  );
+  expect(await listAutomationFailures("100:task")).toEqual({
+    data: [
+      {
+        taskId: "task",
+        taskName: "Report",
+        runId: "run",
+        scheduledAt: 100,
+        finishedAt: null,
+        errorCode: "host_offline",
+      },
+    ],
+    nextCursor: null,
+  });
+  expect(String(fetchMock.mock.calls[1]![0])).toBe(
+    "/v1/scheduled-tasks/inbox?limit=50&after=100%3Atask",
+  );
+});
+
+describe("random worktree setting", () => {
+  it.each([null, "HEAD"])("round trips an explicit %s update", async (baseBranch) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, base_branch: baseBranch }));
+    const task = await updateScheduledTask("st_1", { baseBranch });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
+    expect(task.baseBranch).toBe(baseBranch);
   });
 });

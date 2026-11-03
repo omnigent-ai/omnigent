@@ -159,9 +159,18 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
 
 
-async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog) -> None:
+async def test_scan_pages_past_unowned_tasks_and_ownership_errors(
+    store, caplog, monkeypatch
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
     caplog.set_level(logging.INFO)
-    tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
+    clock = FakeClock()
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: int(clock.now()))
+    tasks = []
+    for seed in range(3):
+        tasks.append(_task(store, str(seed), host_id=uuid.uuid4().hex))
+        clock.advance(1)
     clock = FakeClock(max(task.next_run_at for task in tasks))
     ordered = store.list_due_tasks(int(clock.now()))
     own = ordered[-1]
@@ -192,7 +201,10 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog)
     assert {event["task_id"] for event in observed} == {task.id for task in tasks}
     assert all(event["observed_at"] == int(clock.now()) for event in observed)
     assert all(event["rrule"] == tasks[0].rrule for event in observed)
-    assert all(event["schedule_anchor"] == tasks[0].created_at for event in observed)
+    created_at_by_task_id = {task.id: task.created_at for task in tasks}
+    assert all(
+        event["schedule_anchor"] == created_at_by_task_id[event["task_id"]] for event in observed
+    )
 
     await scheduler.poll_once()
     await _drain(scheduler)
