@@ -854,23 +854,18 @@ export function ChatPage() {
     launchedAt: runnerLaunchedAt,
   });
 
-  // Browser tab title: "● Title" while the main session is working so
-  // background tabs signal parent activity without duplicating child-session
-  // badges from the sidebar/Agents rail. An open-but-untitled session
-  // (no synthesized title yet) reads as "New session" to match its
-  // sidebar row; the landing page (no active session) stays "Omnigent".
-  // Sub-agent (child) sessions are absent from the sidebar list, so
-  // ``activeConv`` is null and the title would otherwise read "New session";
-  // name the tab after the sub-agent instead, mirroring the header.
-  const subAgentTabTitle =
+  // Browser tab title mirrors the header; "● " flags main-session work in background tabs.
+  // Sessions missing from the loaded sidebar rows use their snapshot (sub-agent name for
+  // children), and untitled sessions read "New session" to match their sidebar row.
+  const sessionTabTitle =
     activeSession?.parentSessionId != null
       ? (boundAgentBySession?.name ?? boundAgentName ?? subAgentLabel ?? null)
-      : null;
+      : (activeSession?.title ?? null);
   useEffect(() => {
     const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : appName;
-    const base = truncateTitle(activeConv?.title ?? subAgentTabTitle ?? fallback);
+    const base = truncateTitle(activeConv?.title || sessionTabTitle || fallback);
     document.title = showsWorking ? `● ${base}` : base;
-  }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
+  }, [activeConv?.title, sessionTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const llmModel = useChatStore((s) => s.llmModel);
