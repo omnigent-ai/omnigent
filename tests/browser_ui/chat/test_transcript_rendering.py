@@ -13,6 +13,7 @@ from playwright.sync_api import Locator, Page, Route, expect
 from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
+    list_payload,
     message_item,
     tool_call_items,
 )
@@ -570,9 +571,11 @@ _ISSUE_DESCRIPTION = (
     "1. Show added and removed line counts.\n2. Show display names for MCP servers."
 )
 
+_LONG_TOOL_PATH = "/workspace/" + "long_directory/" * 12 + "notes.md"
+
 
 def _seed_tool_calls(chat: ChatSessionContract) -> None:
-    """One settled turn: a plan update, an MCP lookup, and a failing MCP call."""
+    """One settled turn with a plan, MCP outcomes, a long read and a counted edit."""
     response_id = "tool-rows-response"
     issue = {
         "id": "OMNI-12243",
@@ -612,6 +615,24 @@ def _seed_tool_calls(chat: ChatSessionContract) -> None:
             _PR_ERROR,
             response_id=response_id,
         ),
+        *tool_call_items(
+            "call-read",
+            "Read",
+            {"file_path": _LONG_TOOL_PATH},
+            "# File opened from a tool row",
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-long-edit",
+            "Edit",
+            {
+                "file_path": _LONG_TOOL_PATH,
+                "old_string": "old line\n",
+                "new_string": "new line\nsecond line\n",
+            },
+            f"The file {_LONG_TOOL_PATH} has been updated successfully.",
+            response_id=response_id,
+        ),
         message_item(
             "tool-rows-assistant", "assistant", "The PR already exists.", response_id=response_id
         ),
@@ -619,15 +640,41 @@ def _seed_tool_calls(chat: ChatSessionContract) -> None:
     chat.set_items(list(reversed(chronological)))
 
 
-@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize(
+    ("width", "app_kind"),
+    [
+        pytest.param(1280, None, id="desktop"),
+        pytest.param(390, None, id="mobile-browser"),
+        pytest.param(
+            320,
+            "android",
+            id="android-app-320",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+        pytest.param(
+            390,
+            "ios",
+            id="ios-app-390",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+    ],
+)
 def test_tool_rows_read_as_actions_with_their_outcome(
     page: Page,
     chat_session_contract: ChatSessionContract,
     width: int,
+    app_kind: str | None,
 ) -> None:
     """Tool rows show a humanized title and MCP server, with details behind the expand."""
     chat = chat_session_contract
     _seed_tool_calls(chat)
+    environment_api = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(environment_api, {"metadata": {"root": "/browser-workspace"}})
+    for resource in ("changes", "filesystem"):
+        chat.contract.json(f"{environment_api}/{resource}", list_payload([]))
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/comments", [])
+    if app_kind:
+        page.add_init_script(f"window.omnigentNative = {json.dumps({'kind': app_kind})}")
     page.set_viewport_size({"width": width, "height": 844})
     page.goto(chat.url)
 
@@ -635,7 +682,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     worked = page.get_by_role("button", name=re.compile(r"^Worked"))
     expect(worked).to_have_attribute("aria-expanded", "false")
     worked.click()
-    page.get_by_text("Called 3 tools", exact=True).click()
+    page.get_by_text("Read 1 file, edited 1 file, called 3 other tools", exact=True).click()
 
     plan = page.get_by_role("button", name=re.compile(r"^Manage todo list"))
     expect(plan).to_contain_text("write · 2 items")
@@ -705,6 +752,57 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         "codes => codes.map(code => getComputedStyle(code).fontSize)"
     )
     assert set(code_sizes) == {label_size}, (label_size, code_sizes)
+
+    issue.click()
+    read = page.get_by_role("button", name=f"Read {_LONG_TOOL_PATH}", exact=True)
+    edit = page.get_by_role("button", name=re.compile(r"^Edit "))
+    counts = edit.get_by_test_id("tool-line-counts")
+    expect(counts).to_have_text("+2 -1")
+    for row in (read, edit):
+        link = row.get_by_role("link", name=_LONG_TOOL_PATH, exact=True)
+        row.scroll_into_view_if_needed()
+        geometry = link.evaluate("""link => {
+            const path = link.getBoundingClientRect();
+            const title = link.parentElement.getBoundingClientRect();
+            const verb = link.parentElement.firstElementChild.getBoundingClientRect();
+            const count = link.closest('button').querySelector('[data-testid="tool-line-counts"]');
+            return {path: path.toJSON(), title: title.toJSON(), verb: verb.toJSON(),
+                counts: count?.getBoundingClientRect().toJSON(),
+                visiblePathWidth: Math.min(path.right, title.right) - path.left};
+        }""")
+        # The path must retain a readable prefix beside its verb, not disappear atomically.
+        assert geometry["visiblePathWidth"] >= 44, geometry
+        if app_kind:
+            assert geometry["path"]["height"] >= 44, geometry
+            assert geometry["path"]["width"] >= 44, geometry
+            assert geometry["path"]["left"] >= geometry["verb"]["right"], geometry
+            assert geometry["path"]["right"] <= geometry["title"]["right"] + 1, geometry
+        if geometry["counts"]:
+            assert geometry["counts"]["left"] >= geometry["title"]["right"], geometry
+            assert geometry["counts"]["right"] <= width, geometry
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    file_content = "# File opened from a tool row"
+    chat.contract.json(
+        f"{environment_api}/filesystem/{_LONG_TOOL_PATH.lstrip('/')}",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": _LONG_TOOL_PATH,
+            "content": file_content,
+            "content_type": "text/markdown",
+            "encoding": "utf-8",
+            "bytes": len(file_content),
+        },
+    )
+    link = edit.get_by_role("link", name=_LONG_TOOL_PATH, exact=True)
+    if app_kind:
+        link.tap()
+    else:
+        link.click()
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text(
+        "File opened from a tool row"
+    )
+    expect(edit).to_have_attribute("aria-expanded", "false")
 
 
 _PATCH_CHANGES = [
