@@ -51,6 +51,7 @@ from omnigent.debug_logging import (
     publish_origin_identity,
     runner_log_scope,
 )
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.errors import (
     ErrorCategory,
     ErrorImpact,
@@ -228,6 +229,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -1968,7 +1970,10 @@ class HostProcess:
         log_runner_id = (
             token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
         )
-        with runner_log_scope(frame.session_id, log_runner_id):
+        with (
+            runner_log_scope(frame.session_id, log_runner_id),
+            scheduled_run_scope(frame.scheduled_run, session_id=frame.session_id),
+        ):
             _logger.info(
                 "Runner launch requested",
                 extra=debug_event(
@@ -2220,7 +2225,11 @@ class HostProcess:
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
         )
-        watcher = asyncio.create_task(self._watch_runner(runner_id))
+        launch_context = current_scheduled_run()
+        with scheduled_run_scope(None, session_id=frame.session_id):
+            watcher = asyncio.create_task(
+                self._watch_runner(runner_id, launch_context=launch_context)
+            )
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
         connect_watchdog = asyncio.create_task(
@@ -2598,7 +2607,9 @@ class HostProcess:
             status=status,
         )
 
-    async def _watch_runner(self, runner_id: str) -> None:
+    async def _watch_runner(
+        self, runner_id: str, *, launch_context: ScheduledRunLogContext | None = None
+    ) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
         Polls the runner subprocess until it exits. An exit while the
@@ -2613,6 +2624,7 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
+        :param launch_context: Occurrence retained only for confirmed pre-connect failures.
         :returns: None. Returns silently for intentional stops and clean
             (exit-code-0) shutdowns.
         """
@@ -2637,50 +2649,56 @@ class HostProcess:
                 had_connected = await asyncio.to_thread(handle.connect_marker.exists)
             except OSError:
                 _logger.warning("Could not read connect marker for %s", runner_id, exc_info=True)
-        if handle.proc.returncode == 0:
-            if had_connected is not False:
-                # Post-connect code 0 includes graceful idle-reaper exits.
-                _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+        # Only a confirmed pre-connect exit belongs to the launching occurrence.
+        with scheduled_run_scope(
+            launch_context if had_connected is False else None, session_id=handle.session_id
+        ):
+            if handle.proc.returncode == 0:
+                if had_connected is not False:
+                    # Post-connect code 0 includes graceful idle-reaper exits.
+                    _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+                    return
+                # Pre-connect code 0 is a failed launch; send its cause to the server.
+                error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+                _logger.info(
+                    "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+                    runner_id,
+                )
+                await self._report_runner_exit(runner_id, error, had_connected=had_connected)
                 return
-            # Pre-connect code 0 is a failed launch; send its cause to the server.
             error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-            _logger.info(
-                "Runner %s exited cleanly (code 0) before connecting; reporting exit",
+            # A credential refusal before connecting needs renewed sign-in.
+            # Other exits remain runner faults; the log tail carries the cause.
+            auth_rejected = (
+                handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE
+                and had_connected is not True
+            )
+            if auth_rejected:
+                error = (
+                    "The server rejected this host's credentials, so the runner could not "
+                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{self._login_hint_url()}` "
+                    f"on this host, then retry. Details: {error}"
+                )
+            _logger.warning(
+                "Runner %s died unexpectedly: %s",
                 runner_id,
+                error,
+                extra=debug_event(
+                    "runner_died",
+                    session_id=handle.session_id,
+                    stage="runner_process",
+                    runner_id=runner_id,
+                    error_category=(
+                        ErrorCategory.CONFIG if auth_rejected else ErrorCategory.RUNNER
+                    ).value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=(
+                        ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
+                    ).value,
+                ),
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
-            return
-        error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        # A credential refusal before connecting needs renewed sign-in.
-        # Other exits remain runner faults; the log tail carries the cause.
-        auth_rejected = (
-            handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
-        )
-        if auth_rejected:
-            error = (
-                "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-                f"on this host, then retry. Details: {error}"
-            )
-        _logger.warning(
-            "Runner %s died unexpectedly: %s",
-            runner_id,
-            error,
-            extra=debug_event(
-                "runner_died",
-                session_id=handle.session_id,
-                stage="runner_process",
-                runner_id=runner_id,
-                error_category=(
-                    ErrorCategory.CONFIG if auth_rejected else ErrorCategory.RUNNER
-                ).value,
-                error_impact=ErrorImpact.BLOCKING.value,
-                error_phase=(
-                    ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
-                ).value,
-            ),
-        )
-        await self._report_runner_exit(runner_id, error, had_connected=had_connected)
 
     async def _watch_runner_connect(
         self, runner_id: str, *, exit_watcher: asyncio.Task[None]
@@ -4234,7 +4252,12 @@ class HostProcess:
                 str(params.get("after", "")),
             )
         if op == "github_changes":
-            return r.github_changes(session_id, cast("str | None", params.get("pr_url")))
+            return r.github_changes(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                base_sha=cast("str | None", params.get("base_sha")),
+            )
         if op == "github_diff":
             return r.github_file_diff(
                 cast("str | None", params.get("base")),

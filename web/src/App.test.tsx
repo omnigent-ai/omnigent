@@ -3,6 +3,7 @@ import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { RoutingProvider, basenamedRouting, reactRouterRouting } from "@/lib/routing";
 
 vi.mock("@/lib/analytics", () => ({
   useOmnigentPageView: vi.fn(),
@@ -29,9 +30,16 @@ vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
-  const { useLocation } = await import("react-router-dom");
+  const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
-    SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
+    SettingsPage: () => {
+      const { pathname, search, hash } = useLocation();
+      return (
+        <div data-testid="settings-location" data-navigation-type={useNavigationType()}>
+          {pathname + search + hash}
+        </div>
+      );
+    },
   };
 });
 vi.mock("@/extensions/ExtensionPageHost", () => ({
@@ -72,6 +80,7 @@ vi.mock("@/extensions/ExtensionProvider", () => ({
 }));
 
 import App from "./App";
+import { useOmnigentPageView } from "@/lib/analytics";
 
 const chunkError = vi.hoisted(
   () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
@@ -163,6 +172,7 @@ describe("ordinary page render failures", () => {
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("offers recovery at $path without reloading", async ({ path, basename, needsSetup }) => {
+    vi.mocked(useOmnigentPageView).mockClear();
     render(
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, accounts_enabled: needsSetup, needs_setup: needsSetup }}
@@ -183,6 +193,7 @@ describe("ordinary page render failures", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(reload).not.toHaveBeenCalled();
+    if (!needsSetup) expect(useOmnigentPageView).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -352,6 +363,34 @@ describe("Automation detail release feature route", () => {
 });
 
 describe("Settings routes", () => {
+  describe.each(["", "/embed"])("redirects under '%s'", (basename) => {
+    it.each([
+      ["/settings", "/settings/general"],
+      ["/members", "/settings/members"],
+      ["/policies", "/settings/policies"],
+    ])("preserves URL context through the routing adapter: %s", async (from, to) => {
+      const useHostNavigate = vi.fn(reactRouterRouting.useNavigate);
+      const routing = basenamedRouting(basename, {
+        ...reactRouterRouting,
+        useNavigate: useHostNavigate,
+      });
+      render(
+        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+          <MemoryRouter initialEntries={[`${basename}${from}?o=123&view=compact#details`]}>
+            <RoutingProvider value={routing}>
+              <App basename={basename} />
+            </RoutingProvider>
+          </MemoryRouter>
+        </CapabilitiesProvider>,
+      );
+
+      const location = await screen.findByTestId("settings-location");
+      expect(location.textContent).toBe(`${basename}${to}?o=123&view=compact#details`);
+      expect(location).toHaveAttribute("data-navigation-type", "REPLACE");
+      expect(useHostNavigate).toHaveBeenCalled();
+    });
+  });
+
   it("redirects bare settings to the canonical General section", async () => {
     renderRoute("/settings");
 

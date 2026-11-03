@@ -65,6 +65,8 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -4883,6 +4885,7 @@ async def _execute_scheduled_task_tool(
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Runner-local handler for the ``sys_scheduled_task_*`` family.
@@ -4897,6 +4900,7 @@ async def _execute_scheduled_task_tool(
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
+    :param conversation_id: Session whose approved tool call is being dispatched.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -4905,6 +4909,13 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
+        action = "create" if tool_name == "sys_scheduled_task_create" else "update"
+        error = scheduled_task_review_error(args, action=action)
+        if error:
+            return json.dumps({"error": f"{tool_name}: {error}"})
     if "project_name" in args and "project_id" in args:
         return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
     raw_project_name = args.get("project_name")
@@ -4915,6 +4926,9 @@ async def _execute_scheduled_task_tool(
     project_name = raw_project_name if isinstance(raw_project_name, str) else None
     wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
         "project_name" in args or "project_id" in args
+    )
+    mutation_headers = (
+        {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
     )
 
     try:
@@ -4939,7 +4953,12 @@ async def _execute_scheduled_task_tool(
                 return refusal
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
-            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
+            resp = await server_client.post(
+                "/v1/scheduled-tasks",
+                json=payload,
+                timeout=30.0,
+                headers={**(mutation_headers or {}), "x-omnigent-automation-source": "agent"},
+            )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
             if not task_id:
@@ -4969,7 +4988,9 @@ async def _execute_scheduled_task_tool(
                             server_client, project_name
                         )
                 if resp is None:
-                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                    resp = await server_client.patch(
+                        task_url, json=payload, headers=mutation_headers, timeout=30.0
+                    )
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -7161,6 +7182,7 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(

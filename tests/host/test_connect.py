@@ -1252,6 +1252,10 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     tmp_path: Path,
 ) -> None:
     """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from omnigent.host.frames import decode_host_frame, encode_host_frame
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
 
     def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
@@ -1264,10 +1268,24 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
         binding_token="token_disk_full",
         workspace=str(tmp_path),
         session_id="session_disk_full",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task",
+            run_id="run",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="new",
+        ),
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        result = await host._handle_launch(frame)
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    with capture_debug_rows("host") as rows:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            result = await host._handle_launch(decoded)
+    row = next(row for row in rows if row["event_name"] == "runner_launch_failed")
+    assert row["attributes"]["run_id"] == "run"
+    assert row["attributes"]["task_id"] == "task"
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed"
@@ -2043,6 +2061,9 @@ async def test_watch_runner_reports_unexpected_exit(
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+    from tests.debug_log_helpers import capture_debug_rows
+
     host = _make_host_process()
     maintenance_reasons: list[str] = []
     host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
@@ -2076,24 +2097,34 @@ async def test_watch_runner_reports_unexpected_exit(
         request_id="req_watch",
         binding_token="tok_watch",
         workspace=str(workspace),
+        session_id="watched-session",
+        scheduled_run=ScheduledRunLogContext(
+            task_id="task-A",
+            run_id="A",
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        ),
     )
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-        result = await host._handle_launch(frame)
-    assert result.status == "launched", result.error
+    with capture_debug_rows("host") as rows:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
 
-    handle = host._runners[token_bound_runner_id("tok_watch")]
-    assert handle.connect_marker is not None
-    if marker_state == "connected":
-        handle.connect_marker.touch()
-    elif marker_state == "unavailable":
-        handle.connect_marker = None
-    elif marker_state == "unreadable":
-        handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
-            exists=Mock(side_effect=[OSError("marker unavailable"), False])
-        )
+        handle = host._runners[token_bound_runner_id("tok_watch")]
+        assert handle.connect_marker is not None
+        if marker_state == "connected":
+            handle.connect_marker.touch()
+        elif marker_state == "unavailable":
+            handle.connect_marker = None
+        elif marker_state == "unreadable":
+            handle.connect_marker = SimpleNamespace(  # type: ignore[assignment]
+                exists=Mock(side_effect=[OSError("marker unavailable"), False])
+            )
 
-    # Wait for the watcher to observe the death and send its report.
-    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+        # Wait for the watcher to observe the death and send its report.
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # Exactly one report; a second would double-record server-side.
     assert len(tunnel.sent) == 1
@@ -2106,6 +2137,20 @@ async def test_watch_runner_reports_unexpected_exit(
     expected = {"connected": True, "not_connected": False}.get(marker_state)
     assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
+
+    [spawned] = [row for row in rows if row["event_name"] == "runner_spawned"]
+    assert spawned["attributes"]["run_id"] == "A"
+    [died] = [row for row in rows if row["event_name"] == "runner_died"]
+    assert died["session_id"] == "watched-session"
+    assert died["attributes"]["runner_id"] == report.runner_id
+    assert died["hostname"] == spawned["hostname"]
+    assert died["hostname"]
+    if marker_state == "not_connected":
+        assert died["attributes"]["run_id"] == "A"
+        assert died["attributes"]["task_id"] == "task-A"
+    else:
+        assert "run_id" not in died["attributes"]
+        assert "task_id" not in died["attributes"]
 
 
 @pytest.mark.parametrize("connected", [False, True])
@@ -8110,9 +8155,11 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
         old = time.time() - model_catalog_store.CATALOG_STALE_AFTER_S - 60
         os.utime(model_catalog_store.catalog_path("claude-native", fingerprint), (old, old))
     probed_configs: list[object] = []
+    release_probe = asyncio.Event()
 
     async def _probe(claude_config: object) -> list[dict[str, object]]:
         probed_configs.append(claude_config)
+        await release_probe.wait()
         return rows
 
     def _fake_listing(spec: object, harness: str) -> ModelListing:
@@ -8136,19 +8183,25 @@ async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
 
     monkeypatch.setattr(host, "_probed_claude_model_options", _unexpected_probe)
 
-    result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_sdk_store", harness="claude-sdk"),
-    )
-
-    assert result == HostModelOptionsResultFrame(
-        request_id="req_sdk_store",
-        status="ok",
-        models=rows,
-        routable_models=["claude-sonnet-5"],
-    )
-    refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
-    if refresh is not None:
-        await refresh
+    try:
+        # The probe stays blocked, so a reply proves the picker never waits on the refresh.
+        result = await asyncio.wait_for(
+            host._handle_model_options(
+                HostModelOptionsFrame(request_id="req_sdk_store", harness="claude-sdk"),
+            ),
+            timeout=10,
+        )
+        assert result == HostModelOptionsResultFrame(
+            request_id="req_sdk_store",
+            status="ok",
+            models=rows,
+            routable_models=["claude-sonnet-5"],
+        )
+    finally:
+        release_probe.set()
+        refresh = model_catalog_store._inflight.get(("claude-native", fingerprint))
+        if refresh is not None:
+            await refresh
     assert probed_configs == ([None] if stale else [])
     assert not model_catalog_store.catalog_is_stale("claude-native", fingerprint)
     _cleanup_host(host)

@@ -14,6 +14,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `touch-targets`: native iOS/Android apps and browsers with a coarse primary
+  pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
+  The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
+  compact controls regardless of viewport width.
 - `prompt-link`: opening the new-session page with `?prompt=`
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
@@ -90,6 +94,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `permissions-command`: in Codex native sessions, `/permissions` opens the
+  composer's approval-mode menu instead of Codex's own popup. Other sessions,
+  including Claude Code (whose `/permissions` edits tool rules) and Devin, don't
+  list it and send it as text. States: non-owner or change in flight (error, no
+  menu), arguments rejected.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
@@ -270,8 +279,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
   Design mode, and click an element. Type an instruction in the floating popup
   and use Send or Enter.
-- Change Settings → Always steer to choose whether busy-session follow-ups
-  queue or send immediately. Existing queued messages retain FIFO ordering.
+- Change Settings → Always steer (on by default) to choose whether
+  busy-session follow-ups queue or send immediately. Existing queued messages
+  retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
 
@@ -409,6 +419,11 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **`touch-targets`, new-session and in-session composers:**
+  `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
+  uses the built SPA with mocked APIs (no server required), comparing touch and
+  mouse input at phone, tablet, and desktop widths.
+
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
   away: its tooltip should stay visible. Check dismissal by outside click,
@@ -533,6 +548,12 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/lib/permissionModeCycle.test.ts`.
   `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
   page leaves the launch mode unchanged and does not prevent focus traversal.
+- **`permissions-command`:** with a real Codex CLI (nightly),
+  `tests/e2e_ui/chat/test_codex_native_permissions_command.py::test_permissions_command_opens_codex_approval_picker`.
+  `tests/browser_ui/chat/test_slash_menu.py::test_permissions_command_opens_the_codex_approval_picker`
+  checks that the menu closes after a pick. Gating, the owner check, arguments,
+  and the plain-text fallback on Claude Code, Devin, and claude-sdk are in
+  `web/src/pages/ChatPage.composer.test.tsx`.
 - **`plan-mode`:** with a real Codex CLI and a mock model, creation in Plan mode
   and subsequent composer toggles preserve the preset and agent instructions in
   `tests/e2e_ui/chat/test_codex_plan_mode_instructions.py::test_codex_plan_mode_creation_and_toggles_preserve_instructions`.
@@ -773,6 +794,9 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
 
 ## Gotchas
+
+- Test touch sizing with a real touch device or browser touch emulation; resizing
+  a mouse browser alone does not enable it.
 
 - The Arclet dbcert preflight needs both the updated desktop shell and web UI,
   with Databricks-internal features enabled for the managed server. Browsers,

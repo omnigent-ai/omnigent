@@ -69,6 +69,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -286,14 +287,19 @@ export function SideChatPane({
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
 
-  // Keep the newest content in view. A side chat is short and non-virtualized,
-  // so a bottom sentinel scrolled on each change is enough.
+  // Keep the newest content in view until the reader scrolls up; sending
+  // follows the tail again. A side chat is short and non-virtualized, so a
+  // bottom sentinel scrolled on each change is enough.
   const transcriptRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const followTail = useRef(true);
   useEffect(() => {
-    if (!fullSession || followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [bubbles.length, activeResponse, fullSession]);
+    if (followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [bubbles.length, activeResponse]);
+  const followSentMessage = useCallback(() => {
+    followTail.current = true;
+    bottomRef.current?.scrollIntoView({ block: "end" });
+  }, []);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
   const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
@@ -422,6 +428,7 @@ export function SideChatPane({
                 pending={pending}
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}
+                onSend={followSentMessage}
               />
             )}
           </div>
@@ -451,6 +458,7 @@ function SideChatComposer({
   pending,
   starting,
   onStart,
+  onSend,
 }: {
   fullSession: boolean;
   childId: string;
@@ -464,6 +472,8 @@ function SideChatComposer({
   pending: boolean;
   starting: boolean;
   onStart?: (text: string) => Promise<void>;
+  /** Called when a live tab sends or queues a follow-up. */
+  onSend: () => void;
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -667,7 +677,10 @@ function SideChatComposer({
   };
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const pasted = clipboardFiles(event.clipboardData);
-    if (!pasted.length) return;
+    if (!pasted.length) {
+      insertPastedText(event);
+      return;
+    }
     event.preventDefault();
     if (!ready) return;
     if (pending) {
@@ -813,6 +826,7 @@ function SideChatComposer({
       : null;
     const runSkill = (match: { command: string; args: string }) => {
       clearComposer(childId);
+      onSend();
       void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
       }).finally(refreshLabels);
@@ -850,12 +864,14 @@ function SideChatComposer({
       )
     ) {
       clearComposer(childId);
+      onSend();
       enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
+    onSend();
     void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
   };
 

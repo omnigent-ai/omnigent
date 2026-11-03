@@ -605,6 +605,95 @@ def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) ->
         manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    ("initial_reply", "late_reply"),
+    [
+        (b"", b'{"pid":123456}\n'),
+        (b'{"pid":', b"123456}\n"),
+        (b"invalid\n", b'{"pid":123456}\n'),
+        (b"[]\n", b'{"pid":123456}\n'),
+        (b"\xff\n", b'{"pid":123456}\n'),
+    ],
+    ids=["timeout", "partial-timeout", "malformed", "non-object", "invalid-utf8"],
+)
+def test_failed_control_channel_never_assigns_a_late_reply(
+    tmp_path: Path, initial_reply: bytes, late_reply: bytes
+) -> None:
+    """A concurrent launch must not receive an earlier fork's delayed PID."""
+    client, peer = socket.socketpair()
+    manager = ZygoteManager()
+    manager._sock = client
+    client.settimeout(0.02)
+    try:
+        peer.sendall(initial_reply)
+        with pytest.raises(ZygoteUnavailable):
+            manager.fork_runner(_fork_env(0), str(tmp_path / "first.log"), str(tmp_path))
+        assert json.loads(peer.recv(65536))["cmd"] == "fork"
+        peer.sendall(late_reply)
+
+        with pytest.raises(ZygoteUnavailable):
+            manager.fork_runner(_fork_env(0), str(tmp_path / "second.log"), str(tmp_path))
+        peer.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            peer.recv(1)
+        assert client.fileno() >= 0
+    finally:
+        manager.stop()
+        peer.close()
+
+
+def test_failed_control_channel_preserves_live_children(
+    manager: ZygoteManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Losing control replies cannot stop the shared parent or fail live runners."""
+    child = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    original_socket = manager._sock
+    try:
+        with monkeypatch.context() as fault:
+
+            def timeout(_socket: socket.socket) -> dict[str, object]:
+                raise TimeoutError("control reply timed out")
+
+            fault.setattr(manager, "_read_reply", timeout)
+            assert child.poll() is None
+
+        assert manager._sock is original_socket
+        assert original_socket is not None and original_socket.fileno() >= 0
+        assert manager.is_running()
+        assert _proc.process_alive(child.pid)
+        assert child.poll() is None
+        with pytest.raises(ZygoteUnavailable):
+            manager.start()
+        child.kill()
+        assert _wait_exit(child) == _ZYGOTE_LOST_EXIT_CODE
+        manager.stop()
+        manager.start()
+        fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "fresh.log"), str(tmp_path))
+        assert _wait_exit(fresh) == 7
+    finally:
+        child.kill()
+
+
+def test_fork_refusal_keeps_control_channel_usable(tmp_path: Path) -> None:
+    """A complete refusal reply leaves later fork replies aligned."""
+    client, peer = socket.socketpair()
+    manager = ZygoteManager()
+    manager._sock = client
+    client.settimeout(1)
+    try:
+        peer.sendall(b'{"error":"fork refused"}\n')
+        with pytest.raises(ZygoteUnavailable, match="fork refused"):
+            manager.fork_runner(_fork_env(0), str(tmp_path / "first.log"), str(tmp_path))
+        assert json.loads(peer.recv(65536))["cmd"] == "fork"
+        peer.sendall(b'{"pid":123456}\n')
+        child = manager.fork_runner(_fork_env(0), str(tmp_path / "second.log"), str(tmp_path))
+        assert child.pid == 123456
+        assert json.loads(peer.recv(65536))["cmd"] == "fork"
+    finally:
+        manager.stop()
+        peer.close()
+
+
 def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -> None:
     """Each fork's env fully replaces the child environment (no cross-leak).
 

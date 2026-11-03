@@ -977,6 +977,16 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
     )
 
 
+def _head_repository_url(reference: PullRequestRef, head: object, owner: object) -> str | None:
+    """The source (possibly fork) repository's web URL; ``None`` once the fork is deleted."""
+    # Older gh reports headRepository as only {id, name}, so the owner comes separately.
+    name = head.get("name") if isinstance(head, dict) else None
+    login = owner.get("login") if isinstance(owner, dict) else None
+    if isinstance(name, str) and name and isinstance(login, str) and login:
+        return f"https://{reference.host}/{login}/{name}"
+    return None
+
+
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info: dict[str, Any] = {
         "object": "session.github.info",
@@ -995,7 +1005,11 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info["selected_account"] = preferred or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
-    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    data = _pr_json(
+        root,
+        reference,
+        _PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
+    )
     if data is None:
         return info
     author = data.get("author")
@@ -1013,6 +1027,9 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "head_ref": data.get("headRefName"),
         "head_sha": data.get("headRefOid"),
         "base_sha": data.get("baseRefOid"),
+        "head_repository_url": _head_repository_url(
+            reference, data.get("headRepository"), data.get("headRepositoryOwner")
+        ),
         **_checks_fields(data),
         "body": data.get("body") or None,
         **_comments_payload(data),
@@ -1260,9 +1277,29 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
                 "status": _GH_STATUS_MAP.get(str(entry.get("status")), "modified"),
                 "lines_added": entry.get("additions"),
                 "lines_removed": entry.get("deletions"),
+                "previous_path": entry.get("previous_filename"),
             }
         )
     return {"object": "list", "data": data, "has_more": False}
+
+
+def _pr_changed_files_at_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """List changed files at the displayed revision; flag a list GitHub truncated."""
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        pr = _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+        result = _pr_changed_files(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+    total = pr.get("changed_files")
+    total_count = total if isinstance(total, int) else None
+    shown = len(result["data"])
+    if total_count is not None and shown < total_count:
+        result["has_more"] = True
+        result["warning"] = (
+            f"The provider lists at most {shown} files; {total_count - shown} files are not shown."
+        )
+    return {**result, "total_count": total_count, "head_sha": head_sha, "base_sha": base_sha}
 
 
 def github_file_diff(
@@ -1374,20 +1411,21 @@ def _pr_patch_at_revision(
     root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
 ) -> dict[str, Any]:
     """Reject a patch if the PR moves before or during its fetch."""
-
-    def check_revision() -> None:
-        pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
-        if (
-            _api_string(pr, "head", "sha") != head_sha
-            or _api_string(pr, "base", "sha") != base_sha
-        ):
-            raise ValueError("The pull request changed; refresh before viewing its conversations.")
-
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
-        check_revision()
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
         result = _pr_patch(root, reference)
-        check_revision()
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
     return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+
+def _check_pr_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """Return the PR's REST payload, raising when its head or base moved."""
+    pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+    if _api_string(pr, "head", "sha") != head_sha or _api_string(pr, "base", "sha") != base_sha:
+        raise ValueError("The pull request changed; refresh before viewing its conversations.")
+    return pr
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
