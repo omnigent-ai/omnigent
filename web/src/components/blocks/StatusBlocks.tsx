@@ -109,6 +109,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+  host_disk_full: "The host's disk is full, so the agent can't save the conversation.",
 };
 
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";

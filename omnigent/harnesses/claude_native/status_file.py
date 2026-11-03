@@ -351,6 +351,16 @@ def session_has_live_process(session_id: str, *, config_dir: Path | None = None)
     return next(_live_session_records(session_id, config_dir), None) is not None
 
 
+def session_pids(session_id: str, *, config_dir: Path | None = None) -> list[int]:
+    """Return the live Claude processes the registry names for *session_id*.
+
+    :param session_id: Claude session uuid, matched case-insensitively.
+    :param config_dir: Explicit Claude config dir override (tests).
+    :returns: Their pids, e.g. ``[4242]``; empty when none is live.
+    """
+    return [pid for pid, _record in _live_session_records(session_id, config_dir)]
+
+
 def _is_recorded_process(pid: int, proc_start: object) -> bool:
     """Whether *pid* is still the live process a registry record describes.
 
@@ -478,7 +488,7 @@ class SessionStatusPoller:
             return
         if self._path is None:
             self._try_resolve()
-            if self._path is None:
+            if self._path is None or self._exhausted:
                 return
         self._read_and_publish()
 
@@ -553,6 +563,8 @@ class SessionStatusPoller:
 
         ``None`` unless the last read was ``waiting`` and carried a reason.
         """
+        if self._exhausted:
+            return None
         status = self._last_status
         if status is None or status.raw_status != "waiting":
             return None
@@ -572,6 +584,8 @@ class SessionStatusPoller:
             return
         self._last_mtime = mtime
         status = read_session_status(self._path)
+        if self._exhausted:
+            return
         if status is None:
             # An unrecognized literal — the file is an undocumented internal
             # detail whose vocabulary can grow. We are now blind to this
