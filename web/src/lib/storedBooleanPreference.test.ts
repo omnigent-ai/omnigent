@@ -65,5 +65,12 @@ describe.each([false, true])("createStoredBooleanPreference defaulting to %s", (
       window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
     });
     expect(result.current).toBe(otherValue);
+
+    // A same-tab write that bypasses `write` (settings import) is announced by notifyChanged.
+    act(() => {
+      localStorage.removeItem(STORAGE_KEY);
+      preference.notifyChanged();
+    });
+    expect(result.current).toBe(defaultValue);
   });
 });
