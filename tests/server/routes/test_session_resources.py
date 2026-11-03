@@ -9916,6 +9916,103 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
     }
 
 
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap", "darwin_seatbelt", "none"])
+@pytest.mark.asyncio
+async def test_offline_environment_reach_does_not_require_server_sandbox(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+) -> None:
+    """Remote file metadata uses declared grants without a server-side sandbox."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources
+
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(
+            type=sandbox_type,
+            read_paths=["../reference"],
+            write_paths=["../scratch"],
+            write_files=["../notes.txt"],
+        )
+        if sandbox_type is not None
+        else None,
+    )
+    monkeypatch.setattr(
+        routes_resources,
+        "_load_agent_spec_for_session",
+        lambda _conv, _store: SimpleNamespace(os_env=spec),
+    )
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"]["reachable"] == {
+        "unconfined": sandbox_type == "none",
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}]
+        + (
+            [
+                {"path": "/Users/dev/scratch", "access": "write", "origin": "write_paths"},
+                {"path": "/Users/dev/notes.txt", "access": "write", "origin": "write_files"},
+                {"path": "/Users/dev/reference", "access": "read", "origin": "read_paths"},
+            ]
+            if sandbox_type is not None
+            else []
+        ),
+    }
+
+
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap"])
+@pytest.mark.asyncio
+async def test_offline_confined_browsing_preserves_declared_grants(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+) -> None:
+    """Missing server sandbox tools cannot expand the remote browsing grants."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(
+        routes_resources,
+        "_load_agent_spec_for_session",
+        lambda _conv, _store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=["../reference"])
+                if sandbox_type is not None
+                else None,
+            )
+        ),
+    )
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+    requests: list[str] = []
+
+    async def read_from_host(**kwargs: Any) -> dict[str, Any]:
+        requests.append(kwargs["workspace"])
+        return {"object": "list", "data": []}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read_from_host)
+    prefix = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem"
+    allowed_path = "/Users/dev/reference" if sandbox_type is not None else _OFFLINE_WORKSPACE
+    allowed = await offline_env_client.get(f"{prefix}{allowed_path}?base=host")
+    denied = await offline_env_client.get(f"{prefix}/Users/dev/unrelated?base=host")
+
+    assert allowed.status_code == 200, allowed.text
+    assert denied.status_code == 403, denied.text
+    assert requests == [allowed_path]
+
+
 @pytest.mark.asyncio
 async def test_github_info_falls_back_to_host_when_runner_offline(
     offline_env_client: httpx.AsyncClient,
