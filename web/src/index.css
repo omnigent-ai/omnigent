@@ -16,13 +16,28 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
-@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
 
-/* CSS-pixel floor, independent of viewport width and pointer capability. */
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
     min-width: 44px;
     min-height: 44px;
+  }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
+  @media (pointer: coarse) and (hover: none) {
+    &:is(:root, :root *) {
+      min-width: 44px;
+      min-height: 44px;
+    }
   }
 }
 
@@ -486,6 +501,11 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
@@ -508,7 +528,7 @@
   width: calc(100% - 24px);
   margin-inline: 12px;
   margin-bottom: -0.5px;
-  padding: 6px 8px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
   background-color: var(--composer-header-bg);
   border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
   border-bottom: none;
@@ -1058,9 +1078,10 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. */
+ * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
-  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
@@ -1103,6 +1124,10 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-header {
+    --omnigent-header-top-overlap: 0.5rem;
+  }
+
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
