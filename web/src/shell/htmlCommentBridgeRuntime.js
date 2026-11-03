@@ -247,8 +247,8 @@
       return;
     }
     if (!saved || typeof saved.top !== "number" || !(saved.top > 0)) return;
-    const budget = typeof saved.budgetMs === "number" ? saved.budgetMs : 0;
-    scrollRestore = { top: saved.top, deadline: performance.now() + budget };
+    if (typeof saved.budgetMs !== "number" || !(saved.budgetMs > 0)) return;
+    scrollRestore = { top: saved.top, deadline: performance.now() + saved.budgetMs };
     for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
       window.addEventListener(USER_SCROLL_EVENTS[i], settleScrollRestore, {
         capture: true,
@@ -259,13 +259,17 @@
   }
 
   // Report the reader's offset, at most once per frame, so the parent can
-  // restore it on the next mount.
+  // restore it on the next mount. A report made before the channel connects
+  // is replayed on connect.
   let scrollReportFrame = 0;
+  let scrollReportMissed = false;
   function onScroll() {
     if (scrollRestore || scrollReportFrame) return;
     scrollReportFrame = requestAnimationFrame(function () {
       scrollReportFrame = 0;
-      if (!scrollRestore) send({ type: T.scroll, top: window.scrollY });
+      if (scrollRestore) return;
+      scrollReportMissed = !port;
+      send({ type: T.scroll, top: window.scrollY });
     });
   }
 
@@ -438,6 +442,7 @@
         }
       };
       send({ type: T.ready });
+      if (scrollReportMissed) onScroll();
     }
   });
 

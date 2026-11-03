@@ -109,9 +109,8 @@ export function HtmlCommentViewer({
   const loadBridgeExternally = isEmbedded && !HtmlPreviewFrame;
 
   // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
-  // which re-runs the bridge and (via the new nonce) re-establishes
-  // the channel — clearing any stale highlights from the previous content.
-  // The frame reopens at the reader's last offset for this file.
+  // re-running the bridge and clearing stale highlights; the frame reopens at the
+  // reader's saved offset for this file.
   const { nonce, srcDoc } = useMemo(() => {
     const n = genNonce();
     return {

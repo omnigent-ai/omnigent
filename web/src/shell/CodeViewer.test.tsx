@@ -8,7 +8,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
-import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -864,6 +864,30 @@ describe("CodeViewer HTML preview sandbox", () => {
     );
     expect(zoomBox().style.transform).toBe("");
     port.close();
+  });
+
+  it.each([
+    ["another file", "scroll-b.html", "conv_1"],
+    ["the same path in another conversation", "scroll-a.html", "conv_2"],
+  ])("does not carry a preview's scroll offset to %s", async (_, otherPath, otherConversation) => {
+    const html = "<html><head></head><body><p>report</p></body></html>";
+    const opened = (path: string, conversationId: string) =>
+      viewerElement(html, true, path, { viewMode: "preview", conversationId });
+    const { rerender } = render(opened("scroll-a.html", "conv_1"));
+    const { port, send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 760 });
+    // Port messages arrive in order, so a visible zoom means the offset was handled.
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+    await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+    port.close();
+
+    rerender(opened(otherPath, otherConversation));
+    expect(requestedScrollRestore()).toBeNull();
+    rerender(opened("scroll-a.html", "conv_1"));
+    expect(requestedScrollRestore()).toMatchObject({ top: 760 });
   });
 });
 

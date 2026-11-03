@@ -4,7 +4,7 @@ import { EmbeddedProvider } from "@/lib/embedded";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
 import type { Comment } from "@/hooks/useComments";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
-import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
 import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
@@ -205,15 +205,7 @@ describe("HtmlCommentViewer", () => {
 });
 
 describe("HtmlCommentViewer scroll position", () => {
-  /** The saved offset the frame was asked to restore, or null for none. */
-  function requestedRestore(): { top: number } | null {
-    const srcDoc = screen.getByTitle<HTMLIFrameElement>("HTML preview").getAttribute("srcdoc");
-    const doc = new DOMParser().parseFromString(srcDoc ?? "", "text/html");
-    const value = doc
-      .querySelector("script[data-omni-nonce]")
-      ?.getAttribute("data-omni-restore-scroll");
-    return value ? (JSON.parse(value) as { top: number }) : null;
-  }
+  const requestedRestore = requestedScrollRestore;
 
   it("saves the frame's reported offset and restores it when the preview remounts", async () => {
     const key = "html-preview:conv_1:plan.html";
@@ -230,12 +222,6 @@ describe("HtmlCommentViewer scroll position", () => {
     // Switching back to the tab or session mounts a fresh preview for the file.
     renderViewer("<body><p>plan</p></body>", false, false, key);
     expect(requestedRestore()).toMatchObject({ top: 760 });
-  });
-
-  it("keeps each file's offset to itself", () => {
-    saveScrollTop("html-preview:conv_1:a.html", 420);
-    renderViewer("<body><p>b</p></body>", false, false, "html-preview:conv_1:b.html");
-    expect(requestedRestore()).toBeNull();
   });
 
   it("returns to the saved offset when the agent rewrites the file", () => {

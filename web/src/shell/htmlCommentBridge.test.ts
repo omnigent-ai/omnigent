@@ -347,11 +347,30 @@ describe("bridge runtime scroll position", () => {
     expect(sentScrollOffsets(port)).toEqual([180, 0]);
   });
 
-  it("starts at the top without a saved offset", () => {
-    const { scrollTo } = fakeScrolling();
-    startRuntime();
+  it("reports an offset the reader reached before the channel connected", () => {
+    const { scrollBy } = fakeScrolling();
+    const port = startRuntime({
+      beforeConnect: () => {
+        scrollBy(900);
+        vi.advanceTimersToNextFrame();
+      },
+    });
+    expect(sentScrollOffsets(port)).toEqual([]);
     vi.advanceTimersToNextFrame();
-    expect(scrollTo).not.toHaveBeenCalled();
+    expect(sentScrollOffsets(port)).toEqual([900]);
+  });
+
+  it("does not report a clamped offset when the channel connects mid-restore", () => {
+    const { scrollBy } = fakeScrolling();
+    const port = startRuntime({
+      restoreScroll: restoreTo(640),
+      beforeConnect: () => {
+        scrollBy(300); // the document is still too short for 640
+        vi.advanceTimersToNextFrame();
+      },
+    });
+    vi.advanceTimersToNextFrame();
+    expect(sentScrollOffsets(port)).toEqual([]);
   });
 
   it("re-asserts the saved offset each frame until the budget runs out", () => {
@@ -434,15 +453,21 @@ describe("bridge runtime scroll position", () => {
     }
   });
 
-  it.each(["null", "{", JSON.stringify({ top: -10, budgetMs: BUDGET_MS }), '{"top":"640"}'])(
-    "ignores a malformed restore request %s",
-    (restoreScroll) => {
-      const { scrollTo } = fakeScrolling();
-      startRuntime({ restoreScroll });
-      vi.advanceTimersToNextFrame();
-      expect(scrollTo).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    ["no saved offset", undefined],
+    ["null", "null"],
+    ["invalid JSON", "{"],
+    ["a negative offset", JSON.stringify({ top: -10, budgetMs: BUDGET_MS })],
+    ["a string offset", '{"top":"640"}'],
+    ["no budget", JSON.stringify({ top: 640 })],
+    ["a zero budget", JSON.stringify({ top: 640, budgetMs: 0 })],
+  ])("starts without restoring given %s", (_label, restoreScroll) => {
+    const { scrollTo } = fakeScrolling();
+    startRuntime({ restoreScroll });
+    vi.advanceTimersToNextFrame();
+    expect(scrollTo).not.toHaveBeenCalled();
+    expect(runtimeListeners.some(([, type]) => type === "wheel")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
