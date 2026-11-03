@@ -610,6 +610,53 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_forward_status_events_defers_hooks_written_after_cutoff(tmp_path: Path) -> None:
+    """
+    Hook records written after the cutoff wait for the next poll.
+
+    The record ending exactly at the cutoff is forwarded. The later ``Stop`` keeps
+    its cursor, so the next call forwards it once.
+    """
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "claude-session"})
+    cutoff = (bridge_dir / forwarder._HOOKS_FILE).stat().st_size
+    record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "claude-session"})
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+
+    async def forward(client: httpx.AsyncClient, state: Any, cutoff_offset: int | None) -> Any:
+        return await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            hooks_cutoff_byte_offset=cutoff_offset,
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        hook_state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_abc"
+        )
+        deferred_state = await forward(client, hook_state, cutoff)
+        assert [body["data"]["status"] for body in bodies] == ["idle"]
+
+        await forward(client, deferred_state, None)
+
+    assert [body["data"]["status"] for body in bodies] == ["idle", "idle"]
+
+
+@pytest.mark.asyncio
 async def test_forwarder_publishes_no_status_for_assistant_output(tmp_path: Path) -> None:
     """
     Assistant output forwards items and publishes NO session status.
