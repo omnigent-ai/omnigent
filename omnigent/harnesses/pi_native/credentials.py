@@ -12,8 +12,8 @@ into a *managed* Pi config dir (selected via ``PI_CODING_AGENT_DIR``), so the
 runner-owned ``pi`` process authenticates exactly like the configured harness —
 mirroring how codex-native routes through the Databricks Unity Gateway.
 
-The managed config dir is per-session (like codex-native's managed
-``CODEX_HOME``), so this never mutates the user's global ``~/.pi/agent``.
+Model-provider configuration is per-session. Linked user resources remain
+shared, including MCP configuration and refreshed OAuth tokens.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from copy import deepcopy
@@ -253,6 +253,9 @@ class PiProviderConfig:
         Metadata for the picker only — never rendered into ``models.json`` — and
         ``None`` for the Databricks / cli-config / subscription paths, which
         resolve their models elsewhere.
+    :param auth_refresh_interval_ms: Recorded Codex auth cache lifetime; zero
+        retains request-time command execution.
+    :param auth_timeout_ms: Recorded timeout for refreshing outside Pi's deadline.
     """
 
     provider_id: str
@@ -281,6 +284,8 @@ class PiProviderConfig:
     curated_models: bool = False
     model_allowlist: tuple[str, ...] | None = None
     inference_bound: bool = False
+    auth_refresh_interval_ms: int = 0
+    auth_timeout_ms: int = 20_000
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -438,16 +443,18 @@ class PiProviderConfig:
         )
 
 
-def global_pi_agent_dir() -> Path:
+def global_pi_agent_dir(
+    *, env: Mapping[str, str] | None = None, workspace: Path | None = None
+) -> Path:
     """Return Pi's own agent config root (``~/.pi/agent`` by default).
 
     Honours Pi's ``PI_CODING_AGENT_DIR`` override so the pre-launch catalog
     reads the same login the launched Pi would.
     """
-    override = os.environ.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
-    if override:
-        return Path(override)
-    return Path.home() / ".pi" / "agent"
+    source_env = os.environ if env is None else env
+    override = source_env.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
+    root = Path(override).expanduser() if override else Path.home() / ".pi" / "agent"
+    return workspace / root if workspace is not None and not root.is_absolute() else root
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
@@ -1119,10 +1126,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
 
             ws = resolve_databricks_workspace(None)
             auth_cmd = _databricks_codex_auth_command(ws.host, None)
-            transport = CodexConfigTransport(
-                base_url=transport.base_url,
-                auth_command=auth_cmd,
-            )
+            transport = replace(transport, auth_command=auth_cmd)
             _LOGGER.info(
                 "pi-native: cli-config provider %r has no auth command; "
                 "using SDK-derived auth for %s",
@@ -1366,10 +1370,15 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
-    return _databricks_gateway_pi_provider(
+    provider = _databricks_gateway_pi_provider(
         gateway_base_url=transport.base_url,
         model=model,
         auth_command=transport.auth_command,
+    )
+    return replace(
+        provider,
+        auth_refresh_interval_ms=transport.auth_refresh_interval_ms,
+        auth_timeout_ms=transport.auth_timeout_ms,
     )
 
 
@@ -1891,12 +1900,22 @@ def write_pi_models_config(
         rendered = provider.to_models_config()
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(agent_dir, 0o700)
+    # Relaunches must not refresh token commands from retired providers.
+    for config_path in (agent_dir / AUTH_DIR_NAME).glob("auth-*.json"):
+        if not config_path.name.endswith(".result.json"):
+            config_path.unlink(missing_ok=True)
     rendered = deepcopy(rendered)
     for provider_id, config in rendered["providers"].items():
         api_key = config.get("apiKey")
         # Windows Pi can use a configured PowerShell; preserve its own resolver.
         if os.name == "posix" and isinstance(api_key, str) and api_key.startswith("!"):
-            config["apiKey"] = wrap_auth_command(agent_dir, provider_id, api_key[1:])
+            config["apiKey"] = wrap_auth_command(
+                agent_dir,
+                provider_id,
+                api_key[1:],
+                refresh_interval_ms=provider.auth_refresh_interval_ms,
+                refresh_timeout_ms=provider.auth_timeout_ms,
+            )
     models_path = agent_dir / "models.json"
     # 0o600: the apiKey may be a literal token (key-kind providers).
     fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1946,6 +1965,7 @@ def pi_native_provider_launch(
     reasoning_effort: str | None = None,
     *,
     selection: str | None = None,
+    global_agent_dir: Path | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1957,6 +1977,7 @@ def pi_native_provider_launch(
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
+    :param global_agent_dir: User root resolved against the session workspace.
     :returns: The launch env, CLI args and any effort warning.
     :raises ValueError: If no generated provider serves the selected model.
     """
@@ -2000,7 +2021,13 @@ def pi_native_provider_launch(
     enabled_refs = _enabled_model_refs(rendered)
     if provider.curated_models and enabled_refs:
         overlay["enabledModels"] = enabled_refs
-    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
+    prepare_managed_pi_agent_dir(
+        agent_dir,
+        overlay=overlay,
+        global_agent_dir=global_agent_dir
+        if global_agent_dir is not None
+        else global_pi_agent_dir(),
+    )
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     if os.name == "posix" and any(
         config.get("apiKey", "").startswith("!") for config in rendered["providers"].values()
