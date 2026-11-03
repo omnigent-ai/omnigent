@@ -78,7 +78,7 @@ def _record_settings_open(page: Page, open_settings: Callable[[], None]) -> list
     expect(
         page.get_by_role("main").get_by_role("heading", name="General", exact=True)
     ).to_be_visible(timeout=30_000)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- sample trailing frames
     samples = page.evaluate("window.__settingsTransitionProbe.stop()")
     assert samples, "the per-frame probe captured no frames"
     return samples

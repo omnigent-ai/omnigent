@@ -3,8 +3,25 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalNativeHarness,
   harnessAccountKey,
+  nativePermissionOptions,
   permissionModeConcept,
 } from "./nativeHarnessModes";
+
+describe("nativePermissionOptions", () => {
+  it.each([
+    ["claude-native", ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]],
+    ["codex-native", ["default", "full-access", "read-only", "bypass"]],
+    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"]],
+    ["antigravity-native", ["default", "skip"]],
+    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"]],
+    ["unknown-harness", []],
+    [null, []],
+    [undefined, []],
+  ] as const)("returns the create-time permission vocabulary for %s", (harness, values) => {
+    const options = nativePermissionOptions(harness);
+    expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
+  });
+});
 
 describe("permissionModeConcept", () => {
   it("maps Claude and Codex vocabularies onto shared concepts", () => {

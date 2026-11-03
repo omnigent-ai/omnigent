@@ -1,21 +1,27 @@
 import { lazy, Suspense, useEffect, type ComponentType, type ReactNode } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
-import { useNavigate, useParams } from "@/lib/routing";
+import { Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
 import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
+import { useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
-// Binds a page to its analytics page-view id; re-fires per pathname, so a page
-// kept mounted across `/` ↔ `/c/:id` still emits one view per destination.
-// SettingsPage stays unwrapped: SettingsRoute reports its section-derived id.
+// Bind a page component to its analytics page-view id. Declaring the id here,
+// beside the component, keeps the route table clean and means no route ships
+// without one. Re-fires on pathname change (see useOmnigentPageView), so a page
+// kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
+// one view per destination under the same id.
+//
+// SettingsRoute and TasksPage own their page-view IDs because their section
+// depends on route/query parameters.
 function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
   return function WithPageView(props: P) {
     useOmnigentPageView(id);
@@ -52,13 +58,14 @@ const InboxPage = withPageView(
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
-const TasksPage = withPageView(
-  "tasks",
-  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
-);
+const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+);
+const TaskDetailPage = withPageView(
+  "tasks.detail",
+  lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -79,19 +86,29 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
 }
 
+function AppRedirect({ to }: { to: string }) {
+  const navigate = useNavigate();
+  const { search, hash } = useLocation();
+  useEffect(() => {
+    navigate({ pathname: to, search, hash }, { replace: true });
+  }, [navigate, to, search, hash]);
+  return null;
+}
+
 // Bare /settings renders General at once and canonicalizes the URL afterwards.
-// A <Navigate> hop would commit an empty outlet beside the swapped settings nav
-// and hold that blank frame while the lazy page loads; the view counts once.
-function SettingsRoute() {
+// A redirect-only route would commit an empty outlet beside the swapped settings
+// nav and hold that blank frame while the lazy page loads; the view counts once.
+function SettingsRoute({ canonicalPath }: { canonicalPath: string }) {
   const { section: sectionSegment } = useParams();
   const { section } = useSettingsRoute();
-  const navigate = useNavigate();
   const canonical = sectionSegment !== undefined;
   useOmnigentPageView(canonical ? `settings.${section}` : null);
-  useEffect(() => {
-    if (!canonical) navigate("/settings/general", { replace: true });
-  }, [canonical, navigate]);
-  return <SettingsPage />;
+  return (
+    <>
+      {!canonical && <AppRedirect to={canonicalPath} />}
+      <SettingsPage />
+    </>
+  );
 }
 
 interface AppProps {
@@ -208,6 +225,18 @@ function AppRoutes({ basename }: AppProps) {
           />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
+            path={`${prefix}/tasks/templates`}
+            element={<TasksPage key="templates" templatesOnly />}
+          />
+          <Route
+            path={`${prefix}/tasks/:taskId`}
+            element={
+              <FeatureGatedPage feature="automations_v2">
+                <TaskDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
             path={`${prefix}/usage`}
             element={
               <FeatureGatedPage feature="usage_page">
@@ -215,9 +244,15 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
-          {/* Settings renders in the chat outlet so the conversations sidebar stays put;
-              bare /settings shows General and is replaced with /settings/general. */}
-          <Route path={`${prefix}/settings/:section?/:subSection?`} element={<SettingsRoute />} />
+          {/* Settings renders into the chat outlet so the conversations
+              sidebar stays put — entering settings only swaps the card's
+              content (the section nav) and the main area. The active section
+              is carried in the URL (/settings/<section>); bare /settings
+              shows General and is replaced with /settings/general. */}
+          <Route
+            path={`${prefix}/settings/:section?/:subSection?`}
+            element={<SettingsRoute canonicalPath={`${prefix}/settings/general`} />}
+          />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
@@ -228,11 +263,11 @@ function AppRoutes({ basename }: AppProps) {
               the sections self-gate to admins. */}
           <Route
             path={`${prefix}/members`}
-            element={<Navigate to={`${prefix}/settings/members`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/members`} />}
           />
           <Route
             path={`${prefix}/policies`}
-            element={<Navigate to={`${prefix}/settings/policies`} replace />}
+            element={<AppRedirect to={`${prefix}/settings/policies`} />}
           />
           <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
         </Route>
@@ -242,9 +277,12 @@ function AppRoutes({ basename }: AppProps) {
 }
 
 export default function App(props: AppProps = {}) {
+  const { pathname } = useLocation();
   return (
     <ChunkLoadErrorBoundary>
-      <AppRoutes {...props} />
+      <RenderErrorBoundary name="this page" resetKey={pathname}>
+        <AppRoutes {...props} />
+      </RenderErrorBoundary>
     </ChunkLoadErrorBoundary>
   );
 }

@@ -134,17 +134,22 @@ def test_credential_repo_url_never_leaves_the_browser(page: Page, live_server: s
 
     Drives the reported journey end to end: paste
     ``https://user:token@github.com/org/repo`` into the repository field, add
-    it (Enter), and start the session. Expected: the field refuses the URL
-    inline, so no request ever contains the token. Pre-fix the client gate
+    it (Enter), and try to start the session. The pending invalid URL blocks
+    submission until explicitly cleared, so no request contains the token. Pre-fix the client gate
     accepts the URL, the repo is added, and the create request carries the
     token to the server — which rejects it with a 422 only AFTER the secret
     left the browser.
     """
     leaked: list[str] = []
+    creates: list[str] = []
 
     def record_leak(request: Request) -> None:
         if _TOKEN_MARKER in (request.post_data or "") or _TOKEN_MARKER in request.url:
             leaked.append(f"{request.method} {request.url}")
+        if request.method == "POST" and request.url.split("?")[0].rstrip("/").endswith(
+            "/v1/sessions"
+        ):
+            creates.append(request.post_data or "")
 
     page.on("request", record_leak)
     _route_managed_sandbox_deployment(page)
@@ -152,10 +157,22 @@ def test_credential_repo_url_never_leaves_the_browser(page: Page, live_server: s
 
     repo_input = page.get_by_test_id("new-chat-landing-repo-input")
     repo_input.fill(_CRED_HTTPS_URL)
+    expect(page.get_by_test_id("new-chat-landing-repo-add")).to_be_disabled()
     repo_input.press("Enter")
+    expect(page.get_by_test_id("new-chat-landing-repo-row")).to_have_count(0)
     page.keyboard.press("Escape")
 
     page.get_by_test_id("new-chat-landing-input").fill("Audit this repository.")
+    submit = page.get_by_test_id("new-chat-landing-submit")
+    expect(submit).to_be_disabled()
+    assert creates == []
+    assert leaked == []
+
+    page.get_by_test_id("new-chat-landing-repo-chip").click()
+    expect(repo_input).to_have_value(_CRED_HTTPS_URL)
+    repo_input.clear()
+    page.keyboard.press("Escape")
+    expect(submit).to_be_enabled()
     with page.expect_response(
         lambda response: (
             response.request.method == "POST"
@@ -163,8 +180,9 @@ def test_credential_repo_url_never_leaves_the_browser(page: Page, live_server: s
         ),
         timeout=30_000,
     ) as create_info:
-        page.get_by_test_id("new-chat-landing-submit").click()
+        submit.click()
     create_status = create_info.value.status
+    assert len(creates) == 1
 
     # Let the create's outcome render so a failure is visible on screen (and
     # in recordings) before the verdict below.

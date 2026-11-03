@@ -348,9 +348,9 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
-    :param preserve_session: The executor is idle and safe to reuse after this
-        failure. Set only when no prompt or tool work remains in progress.
-        Defaults to ``False`` so failed turns receive normal teardown.
+    :param preserve_session: The executor released its per-call resources and is
+        safe to reuse without teardown. Native submission bridges may preserve
+        independently running work after a lost reply. Defaults to ``False``.
     :param code: Semantic failure code the turn error should carry, e.g.
         ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
         fall back to its generic classification of the failure.
@@ -726,6 +726,10 @@ class Executor:
 
     def supports_live_message_queue(self) -> bool:
         """Whether ``enqueue_session_message()`` is expected to work during a running turn."""
+        return False
+
+    def preserves_message_content_blocks(self) -> bool:
+        """Whether fresh and queued input must retain original content block boundaries."""
         return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
