@@ -21,7 +21,8 @@ firing:
    task's ``user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
    (single-user / OSS). Without the grant the run is invisible.
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
-   (a seeded prompt with no launched runner would just sit as history).
+   (a seeded prompt with no launched runner would just sit as history). The
+   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
 #. **Records the run** — stamps ``last_run_at`` + ``last_run_conversation_id`` on
    the task row and writes a ``scheduled_task_runs`` history row.
 
@@ -77,6 +78,7 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -84,7 +86,6 @@ from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
-    validate_session_permission_mode,
 )
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.scheduled.dispatch_scheduler import (
@@ -92,9 +93,16 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentityRevoked,
     StartupLease,
 )
+from omnigent.server.scheduled.harness_settings import (
+    scheduled_agent_harness,
+    validate_scheduled_permission_mode,
+)
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.schemas import SessionEventInput
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
@@ -169,7 +177,7 @@ class _FireResult(Enum):
 
 
 class _CannotLaunchScheduledFire(RuntimeError):
-    """A fire cannot start because its execution target is not usable."""
+    """A fire cannot start because its target or launch settings are not usable."""
 
     def __init__(self, message: str, *, error_code: str) -> None:
         super().__init__(message)
@@ -327,11 +335,26 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
+# Follows the prompt in every message a fire sends. No one watches a run, so a
+# question or a permission request stalls it instead of reaching a person. Only
+# the sent message carries it: the task keeps the prompt its owner wrote, so the
+# automation pages never show it.
+UNATTENDED_RUN_NOTE = (
+    "Note: an Omnigent automation sent this message, and no one is watching this run. "
+    "No one can answer questions, approve requests or give input, so work toward the "
+    "goal above on your own. Don't ask questions, wait for confirmation or stop to "
+    "request permission. When something is unclear, make a reasonable choice and keep "
+    "going. If an action needs approval or is denied, skip it and say so in your reply. "
+    "End with a reply that says what you did, what you assumed and anything you couldn't do."
+)
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
+    text = f"{prompt.rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
     return SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        data={"role": "user", "content": [{"type": "input_text", "text": text}]},
     )
 
 
@@ -609,6 +632,10 @@ async def _run_fire_for_task(
     try:
         effective = await _own_task_agent(deps, effective)
         conv = await _create_session(deps, effective)
+    except _CannotLaunchScheduledFire as exc:
+        _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+        await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
+        return
     except Exception:
         _logger.exception("scheduled fire: failed to create session for task %s", task.id)
         await recorder.finish(
@@ -1117,56 +1144,38 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
-_PERMISSION_MODE_HARNESS = "claude-native"
-
-
-async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
-    """Derive the native-terminal ``--permission-mode`` args for a task.
-
-    Mirrors how the interactive New Chat dialog builds ``terminal_launch_args``:
-    a set permission mode becomes ``["--permission-mode", <value>]``, which the
-    runner appends to Claude Code's argv. ``None`` (agent default) sets nothing.
-
-    Fail-safe on harness: only Claude Code accepts ``--permission-mode``, so the
-    flag is injected ONLY when the task's agent is confirmed ``claude-native``.
-    If the harness can't be resolved (no cache / bundle / a load error), the flag
-    is omitted rather than injected — a session that just uses the agent's own
-    default is strictly safer than one launched with an unknown flag. This makes
-    the Claude-only guarantee hold regardless of whether the create/update/fire
-    capability gates ran, so a mis-stamped non-Claude row can never break a fire.
-    """
+async def _permission_mode_launch_options(
+    deps: FireDeps, task: ScheduledTask
+) -> tuple[list[str] | None, dict[str, str]]:
+    """Translate a saved mode, failing if its harness or launch options cannot be resolved."""
     if task.permission_mode is None:
-        return None
-    if deps.agent_cache is None:
-        return None
-    from omnigent.harness_aliases import canonicalize_harness
-
-    try:
-        agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-        if agent is None or getattr(agent, "bundle_location", None) is None:
-            return None
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
-        executor = getattr(loaded.spec, "executor", None)
-        raw_harness = (executor.config.get("harness") or executor.type) if executor else None
-        harness = canonicalize_harness(raw_harness) or raw_harness
-    except Exception:
-        _logger.exception(
-            "scheduled fire: could not resolve harness for task %s; omitting --permission-mode",
-            task.id,
+        return None, {}
+    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+    harness = await scheduled_agent_harness(agent, deps.agent_cache)
+    if harness is None:
+        raise _CannotLaunchScheduledFire(
+            "Cannot resolve the agent's harness to apply the saved permission setting. "
+            "Restore access to the agent and retry.",
+            error_code="permission_harness_unresolved",
         )
-        return None
-    if harness != _PERMISSION_MODE_HARNESS:
-        return None
-    return ["--permission-mode", task.permission_mode]
+    args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(task.permission_mode)
+    if args is None:
+        raise _CannotLaunchScheduledFire(
+            f"Saved permission setting {task.permission_mode!r} is not supported by {harness!r}. "
+            "Edit the automation to choose a supported permission or clear the override.",
+            error_code="permission_mode_unsupported",
+        )
+    labels = {}
+    if harness == "codex-native" and task.permission_mode == "bypass":
+        labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+    return list(args) or None, labels
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:
     """Read ``executor.reasoning_effort`` from the task's agent spec.
 
-    Fail-safe like :func:`_permission_mode_launch_args`: a task with no explicit
-    effort inherits the spec default, and any load failure yields ``None`` (the
-    harness default) rather than breaking the fire. The spec value is validated
-    at spec load, so it needs no re-validation here.
+    A task with no explicit effort inherits the spec default; a load failure
+    uses the harness default. The spec value is validated at load time.
     """
     if deps.agent_cache is None:
         return None
@@ -1313,14 +1322,15 @@ def _session_labels(task: ScheduledTask) -> dict[str, str]:
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
+    launch_args, permission_labels = await _permission_mode_launch_options(deps, task)
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
-        terminal_launch_args=await _permission_mode_launch_args(deps, task),
-        labels=_session_labels(task),
+        terminal_launch_args=launch_args,
+        labels={**_session_labels(task), **permission_labels},
         project_id=await _fire_project_id(deps, task),
     )
     reasoning_effort = task.reasoning_effort
@@ -1568,11 +1578,8 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
-        validate_session_permission_mode(task.permission_mode)
-        # NB: the harness gate for permission_mode is enforced fail-safe in
-        # _permission_mode_launch_args (the flag is injected only for a confirmed
-        # claude-native agent), so a mis-stamped non-Claude row degrades to "no
-        # flag" rather than failing the whole fire here.
+        validate_scheduled_permission_mode(task.permission_mode)
+        # An unresolvable or incompatible mode fails session creation.
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (
