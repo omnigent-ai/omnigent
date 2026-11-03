@@ -42,6 +42,11 @@ export interface MessageItem extends BaseItem {
   stream_message_id?: string;
   /** Assistant-only harness label as stored, e.g. Codex `commentary`; may be newer than this client. */
   phase?: string;
+  /**
+   * On a native terminal's mirror, the `stable_id` of the web send it delivered.
+   * The mirror keeps its own id; the server sets this only when the link is exact.
+   */
+  web_stable_id?: string;
 }
 
 /** Codex `MessagePhase`: progress narration vs. (partial or final) answer text. */

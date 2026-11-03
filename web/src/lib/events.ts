@@ -783,6 +783,11 @@ export interface SessionInputConsumedEvent {
    * that matched no pending entry (e.g. typed directly in the TUI).
    */
   clearedPendingId?: string | null;
+  /**
+   * The web send a native mirror delivered, set by the server only when the
+   * mirror drained that send's pending entry by an exact match (`web_stable_id`).
+   */
+  webStableId?: string;
 }
 
 /**

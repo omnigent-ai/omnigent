@@ -5478,9 +5478,10 @@ describe("Composer reply quotes", () => {
   });
 
   it.each([false, true])(
-    "on a native terminal, retracts a restored send once its mirror commits (edited: %s)",
+    "on a native terminal, retracts a restored send once the mirror naming it commits (edited: %s)",
     (edited) => {
-      // The mirror carries its own item id, never the send's stable id.
+      // The mirror keeps its own item id; the server names the send it delivered.
+      const stableId = "e".repeat(32);
       useChatStore.setState({ isNativeTerminalSession: true });
       render(<Composer {...composerProps()} />);
       act(() =>
@@ -5489,8 +5490,7 @@ describe("Composer reply quotes", () => {
             conversationId: "conv_test",
             text: "file a single PR",
             files: [],
-            stableId: "e".repeat(32),
-            mirrorable: true,
+            stableId,
           },
         }),
       );
@@ -5500,9 +5500,14 @@ describe("Composer reply quotes", () => {
       act(() =>
         handleSessionEvent({
           type: "session_input_consumed",
-          itemId: (edited ? "f" : "9").repeat(32),
+          itemId: "f".repeat(32),
           itemType: "message",
-          data: { role: "user", content: [{ type: "input_text", text: "file a single PR" }] },
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "file a single PR" }],
+            web_stable_id: stableId,
+          },
+          webStableId: stableId,
         }),
       );
 

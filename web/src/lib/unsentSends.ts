@@ -9,13 +9,6 @@ export interface UnsentSend {
   replyDraft?: StoredReplyDraft;
   /** The sender (`getCurrentUserId`), so another account in this tab can't recover it. */
   authorId: string;
-  /**
-   * A native terminal's newest committed item when the message POST went out
-   * (`null`: an empty transcript). Its mirror carries no stable id, so only a
-   * user message after this item can prove the send, and only when no other
-   * outstanding send said the same thing; otherwise this stays unset.
-   */
-  afterItemId?: string | null;
 }
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
@@ -36,15 +29,10 @@ if (typeof window !== "undefined") {
 function parseSend(entry: unknown): UnsentSend | null {
   const draft = readComposerDraft(entry);
   if (!draft?.text || typeof entry !== "object" || entry === null) return null;
-  const { stableId, authorId, afterItemId } = entry as {
-    stableId?: unknown;
-    authorId?: unknown;
-    afterItemId?: unknown;
-  };
+  const { stableId, authorId } = entry as { stableId?: unknown; authorId?: unknown };
   // A record with no sender can't be matched to the viewer.
   if (typeof stableId !== "string" || typeof authorId !== "string") return null;
-  const anchored = typeof afterItemId === "string" || afterItemId === null;
-  return { ...draft, stableId, authorId, ...(anchored ? { afterItemId } : {}) };
+  return { ...draft, stableId, authorId };
 }
 
 function parseQueue(entry: unknown): UnsentSend[] | null {

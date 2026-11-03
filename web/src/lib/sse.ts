@@ -839,12 +839,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // the nested item data. Keep only a real string so null carries no author.
     const createdBy = p.created_by;
     const clearedPendingId = p.cleared_pending_id;
+    const webStableId = payload.web_stable_id;
     return {
       type: "session_input_consumed",
       itemId,
       itemType,
       isMeta: payload.is_meta === true,
       ...(typeof createdBy === "string" ? { createdBy } : {}),
+      ...(typeof webStableId === "string" && webStableId ? { webStableId } : {}),
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
     } satisfies SessionInputConsumedEvent;

@@ -120,7 +120,6 @@ import {
   peekUnsentSend,
   rememberQueuedSends,
   rememberUnsentSend,
-  type UnsentSend,
 } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
@@ -928,23 +927,7 @@ export interface ConversationState {
      * is left, so the composer adds it after newer input instead of dropping it.
      */
     recovered?: boolean;
-    /**
-     * Its message POST was dispatched, so on a native terminal a newer mirror
-     * saying the same thing can prove it delivered (see `sendProvenByNativeMirror`).
-     * Never set for a send that failed before dispatch, e.g. in its upload.
-     */
-    mirrorable?: boolean;
   } | null;
-  /**
-   * Native user messages already judged as proof for a send, newest last. Each
-   * is judged once (see `judgeNativeMirrors`), so no merge can spend it twice.
-   */
-  judgedNativeMirrorIds: readonly string[];
-  /**
-   * Sends a native mirror once matched alongside another identical send. That
-   * mirror may have been theirs, so no later one, replayed or not, proves them.
-   */
-  textProofIneligibleIds: readonly string[];
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
    * call can reuse it instead of generating a fresh UUID, preventing a
@@ -965,8 +948,6 @@ export interface ConversationState {
     replyDraft?: StoredReplyDraft;
     /** Carried over from `failedSendDraft.serverRefused`; see there. */
     serverRefused?: boolean;
-    /** Carried over from `failedSendDraft.mirrorable`; see there. */
-    mirrorable?: boolean;
     delivered: boolean;
   } | null;
   /**
@@ -1744,18 +1725,11 @@ const sendChains = new Map<string | symbol, SendChain>();
 
 /**
  * Sends whose POST has not settled, by stable id, flagged `true` once a live
- * `session_input_consumed` named the id or a native mirror proved the send
- * (see `judgeNativeMirrors`). Read by `send()`'s failure path: that
+ * `session_input_consumed` named the id. Read by `send()`'s failure path: that
  * acknowledgement proves THIS attempt was taken even when the POST's answer is
  * lost and an earlier refused attempt's item already sits in the transcript.
  */
 const inFlightSends = new Map<string, boolean>();
-
-/**
- * Stable ids of sends whose message POST is out and unsettled, by bubble temp
- * id: a native mirror can prove only these (see `outstandingNativeSendsOf`).
- */
-const dispatchedSendsByTempId = new Map<string, string>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -2198,8 +2172,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
-  judgedNativeMirrorIds: [],
-  textProofIneligibleIds: [],
   pendingRetryStableId: null,
   restoredSendDraft: null,
   sendLatchedAt: null,
@@ -2830,8 +2802,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
-    // Set the moment the message POST goes out; until then no mirror can be its.
-    let messageDispatched = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2911,22 +2881,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      // A reload loses the bubbles a mirror could also belong to, so anchor the
-      // record only while no other outstanding send says the same thing.
-      const recorded = peekUnsentSend(sessionId);
-      const dispatchedInto = setterForState(sessionId);
-      if (
-        recorded?.stableId === stableId &&
-        dispatchedInto?.isNativeTerminalSession &&
-        !outstandingNativeSendsOf(dispatchedInto, sessionId, tempId).some(
-          (other) => other.stableId !== stableId && other.text === nativeMirrorText(text),
-        )
-      ) {
-        const afterItemId = dispatchedInto.blocks.findLast((b) => b.ctx.itemId)?.ctx.itemId;
-        rememberUnsentSend(sessionId, { ...recorded, afterItemId: afterItemId ?? null });
-      }
-      messageDispatched = true;
-      dispatchedSendsByTempId.set(tempId, stableId);
       const postResult = await postEvent(
         sessionId,
         {
@@ -3081,7 +3035,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             stableId,
             serverRefused,
             ...(unsettled ? { unsettled: true } : {}),
-            ...(messageDispatched ? { mirrorable: true } : {}),
             ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
           },
         });
@@ -3104,8 +3057,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       // A delivered send needs no card. One the server never answered may still
       // arrive, so its card names the send for the commit that retracts it.
-      const sentText =
-        messageDispatched && failGet().isNativeTerminalSession ? messageContentText(content) : "";
+      const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
       const failureCard: ErrorBlock | null = deliveredDespiteFailure
         ? null
         : {
@@ -3146,7 +3098,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
-      dispatchedSendsByTempId.delete(tempId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -5025,8 +4976,7 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
-    const nativeTranscript = isNativeTerminalSessionFn(session) ? snapshotBlocks : null;
-    const unsentDraft = hydratePending ? unsentSendToRestore(id, items, nativeTranscript) : null;
+    const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
@@ -5823,21 +5773,17 @@ async function rehydrateWindowOnReconnect(
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  const freshItemIds = new Set(fresh.items.map((it) => it.id));
+  const freshItemIds = committedSendIdsOf(fresh.items);
+  // A mirror naming its web send proves only that send, never another by text.
+  const gapUserTexts = committedUserTextsOf(
+    freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId) && !b.ctx.webStableId),
+  );
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    // Gap messages the live stream already delivered during the fetch were judged then.
-    const gapMirrors = nativeMirrorsOf(
-      freshBlocks.filter(
-        (b) =>
-          b.ctx.itemId && !preGapIds.has(b.ctx.itemId) && !hasCommittedItem(s.blocks, b.ctx.itemId),
-      ),
-    );
-    const judged = judgeNativeMirrors(s, id, gapMirrors, session);
-    const delivered = new Set([...freshItemIds, ...judged.proven]);
     const currentBlocks = withoutDeliveredSendFailureCards(
       withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
-      delivered,
+      freshItemIds,
+      gapUserTexts,
       session,
     );
     const tail = currentBlocks.filter((b) => {
@@ -5866,10 +5812,9 @@ async function rehydrateWindowOnReconnect(
       ) ?? merged;
     return {
       ...statusPatch,
-      ...judged.patch,
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
-      ...reconcileSendDraftWithSnapshot(s, delivered, session),
+      ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -6000,7 +5945,7 @@ async function reconcileOnReconnect(
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  const snapshotItemIds = new Set(items.map((it) => it.id));
+  const snapshotItemIds = committedSendIdsOf(items);
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
@@ -6011,15 +5956,12 @@ async function reconcileOnReconnect(
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
-    const judged = judgeNativeMirrors(s, id, nativeMirrorsOf(unseen), session);
-    const delivered = new Set([...snapshotItemIds, ...judged.proven]);
     const patch: Partial<ChatState> = {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
-      ...judged.patch,
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
-      ...reconcileSendDraftWithSnapshot(s, delivered, session),
+      ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -6052,7 +5994,12 @@ async function reconcileOnReconnect(
       nextBlocks =
         at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
-    nextBlocks = withoutDeliveredSendFailureCards(nextBlocks, delivered, session);
+    nextBlocks = withoutDeliveredSendFailureCards(
+      nextBlocks,
+      snapshotItemIds,
+      committedUserTextsOf(unseen.filter((b) => !b.ctx.webStableId)),
+      session,
+    );
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -7461,7 +7408,27 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
 }
 
 export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
-  return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
+  // A native mirror commits under its own id; the server names the web send it delivered.
+  return (
+    itemId !== "" &&
+    blocks.some((block) => block.ctx.itemId === itemId || block.ctx.webStableId === itemId)
+  );
+}
+
+/**
+ * The ids a snapshot commits sends under: each item's own id and, for a native
+ * mirror, the web send the server says it delivered (`web_stable_id`).
+ *
+ * @param items - Snapshot items.
+ */
+function committedSendIdsOf(
+  items: readonly { id: string; web_stable_id?: unknown }[],
+): Set<string> {
+  return new Set(
+    items.flatMap((item) =>
+      typeof item.web_stable_id === "string" ? [item.id, item.web_stable_id] : [item.id],
+    ),
+  );
 }
 
 /**
@@ -7548,7 +7515,6 @@ export function takeFailedSendDraft(
       files: failed.files,
       replyDraft: failed.replyDraft,
       serverRefused: failed.serverRefused,
-      ...(failed.mirrorable ? { mirrorable: true } : {}),
       delivered: false,
     };
   setterFor(conversationId)(patch);
@@ -7659,20 +7625,17 @@ async function sendVerdictFromServer(
  * reloaded or closed mid-send, e.g. while the server held the POST for a
  * sandbox wake, which persists nothing until the wake ends. Only the sender
  * gets the text back, and only if the snapshot holds no item under its stable
- * id, nor (on a native terminal) a mirror of it newer than the send. Other
- * matching text is no proof: `pending_inputs` entries carry no stable id, and
- * another message can say the same thing. Messages the page still held in its
- * queue come back the same way, joined after any such send.
+ * id. Matching text is no proof: `pending_inputs` entries and native mirrors
+ * carry no stable id, and another message can say the same thing. Messages the
+ * page still held in its queue come back the same way, joined after any such send.
  *
  * @param conversationId - The session being bound.
  * @param items - The snapshot's committed items.
- * @param nativeTranscript - The snapshot's blocks on a native terminal, else `null`.
  * @returns The draft to restore, or `null`.
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
-  nativeTranscript: AnyBlock[] | null,
+  items: readonly { id: string; web_stable_id?: unknown }[],
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
@@ -7685,7 +7648,7 @@ function unsentSendToRestore(
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
-    restoreUnsentSendOnceIdentified(conversationId, items, nativeTranscript);
+    restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
   if (unsent !== null) forgetUnsentSend(conversationId, unsent.stableId);
@@ -7695,13 +7658,9 @@ function unsentSendToRestore(
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
-  const mirrored =
-    unsent !== null &&
-    nativeTranscript !== null &&
-    snapshotProvesUnsentSend(nativeTranscript, unsent, queued);
-  const sends = [...(unsent === null || mirrored ? [] : [unsent]), ...queued].filter(
+  const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) => send.authorId === viewerId && !committedSendIdsOf(items).has(send.stableId),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -7719,38 +7678,7 @@ function unsentSendToRestore(
     ...(replyDraft ? { replyDraft } : {}),
     serverRefused: false,
     recovered: true,
-    // Only a POST that went out can have a mirror to retract it later.
-    ...(sends.length === 1 && first === unsent && unsent.afterItemId !== undefined
-      ? { mirrorable: true }
-      : {}),
   };
-}
-
-/**
- * Whether a native snapshot holds a user message after the send's anchor that
- * proves it, among the messages recovered with it (see `sendProvenByNativeMirror`).
- *
- * @returns `false` when the send has no anchor or it left the snapshot.
- */
-function snapshotProvesUnsentSend(
-  blocks: AnyBlock[],
-  send: UnsentSend,
-  others: readonly UnsentSend[],
-): boolean {
-  if (send.afterItemId === undefined) return false;
-  let start = 0;
-  if (send.afterItemId !== null) {
-    start = blocks.findLastIndex((block) => block.ctx.itemId === send.afterItemId) + 1;
-    if (start === 0) return false;
-  }
-  const outstanding = [send, ...others].map((recovered) => ({
-    text: nativeMirrorText(recovered.text),
-    stableId: recovered.stableId,
-    provable: recovered === send,
-  }));
-  return nativeMirrorsOf(blocks.slice(start)).some(
-    (mirror) => sendProvenByNativeMirror(mirror.text, outstanding) !== null,
-  );
 }
 
 /**
@@ -7760,19 +7688,17 @@ function snapshotProvesUnsentSend(
  *
  * @param conversationId - The session whose bind put the restore off.
  * @param items - That bind's snapshot items.
- * @param nativeTranscript - That bind's blocks on a native terminal, else `null`.
  */
 function restoreUnsentSendOnceIdentified(
   conversationId: string,
-  items: readonly { id: string }[],
-  nativeTranscript: AnyBlock[] | null,
+  items: readonly { id: string; web_stable_id?: unknown }[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
     if (getCurrentUserId() === null) return;
     unsubscribe();
     // An evicted session keeps the record for its next bind.
     if (isConversationDisposed(conversationId)) return;
-    const draft = unsentSendToRestore(conversationId, items, nativeTranscript);
+    const draft = unsentSendToRestore(conversationId, items);
     if (draft === null) return;
     setterFor(conversationId)((state) =>
       state.failedSendDraft === null ? { failedSendDraft: draft } : {},
@@ -7824,186 +7750,37 @@ function reconcileSendDraftWithSnapshot(
   return { ...patch, ...retractDeliveredSendDraft({ ...s, ...patch }, itemIds, "persisted") };
 }
 
-/** `text` normalized as a native mirror's text and a card's `unansweredSend.text` are. */
-function nativeMirrorText(text: string): string {
-  return messageContentText([{ type: "input_text", text }]);
-}
-
-/** A send in a native session whose mirror may still commit. */
-export interface OutstandingNativeSend {
-  /** Normalized text (see `nativeMirrorText`). */
-  text: string;
-  /** Unknown for a bubble whose POST already settled, or a joined draft. */
-  stableId?: string;
-  /** Its message POST went out and the server did not refuse it. */
-  provable: boolean;
-}
-
 /**
- * Which outstanding send a newly committed native user message proves delivered.
- * A native mirror carries its own item id, so only its text links it to a send,
- * and only when exactly one outstanding send says the same thing: guessing
- * between several could discard a retry the user still needs.
+ * Drop the failure cards of unanswered sends that have since committed.
  *
- * @param mirrorText - The committed message's normalized text.
- * @param outstanding - Every outstanding send of the session.
- * @returns The one matching send if its POST went out, else `null`.
- */
-export function sendProvenByNativeMirror(
-  mirrorText: string,
-  outstanding: readonly OutstandingNativeSend[],
-): OutstandingNativeSend | null {
-  const matching = sendsMatchingNativeMirror(mirrorText, outstanding);
-  const [only] = matching;
-  return matching.length === 1 && only?.provable === true && only.stableId ? only : null;
-}
-
-/** The outstanding sends that say what a native mirror says. */
-function sendsMatchingNativeMirror(
-  mirrorText: string,
-  outstanding: readonly OutstandingNativeSend[],
-): OutstandingNativeSend[] {
-  const text = withoutAttachedMarkers(mirrorText);
-  return text === "" ? [] : outstanding.filter((send) => send.text === text);
-}
-
-/**
- * A native session's outstanding sends, one entry each: bubbles not yet
- * mirrored, failure cards, the failed and restored drafts, and this tab's
- * records of unanswered and queued sends, which a bind may not have recovered yet.
- */
-function outstandingNativeSendsOf(
-  s: ChatState,
-  conversationId: string | null,
-  exceptTempId?: string,
-): OutstandingNativeSend[] {
-  const sends: OutstandingNativeSend[] = [];
-  const eligible = (stableId: string) => !s.textProofIneligibleIds.includes(stableId);
-  for (const bubble of s.pendingUserMessages) {
-    const text = messageContentText(bubble.content);
-    if (bubble.tempId === exceptTempId || text === "") continue;
-    const stableId = dispatchedSendsByTempId.get(bubble.tempId);
-    sends.push({
-      text,
-      ...(stableId ? { stableId } : {}),
-      provable: stableId !== undefined && eligible(stableId),
-    });
-  }
-  for (const block of s.blocks) {
-    const send = block.type === "error" ? block.unansweredSend : undefined;
-    if (!send?.text || sends.some((other) => other.stableId === send.stableId)) continue;
-    sends.push({ text: send.text, stableId: send.stableId, provable: eligible(send.stableId) });
-  }
-  const restored = s.restoredSendDraft?.delivered === false ? s.restoredSendDraft : null;
-  for (const draft of [restored, s.failedSendDraft]) {
-    if (!draft || sends.some((send) => draft.stableId && send.stableId === draft.stableId))
-      continue;
-    sends.push({
-      text: nativeMirrorText(draft.text),
-      ...(draft.stableId ? { stableId: draft.stableId } : {}),
-      provable:
-        draft.mirrorable === true &&
-        draft.serverRefused !== true &&
-        (draft.stableId === undefined || eligible(draft.stableId)),
-    });
-  }
-  if (conversationId !== null) {
-    const unsent = peekUnsentSend(conversationId);
-    for (const record of [...(unsent ? [unsent] : []), ...peekQueuedSends(conversationId)]) {
-      if (sends.some((send) => send.stableId === record.stableId)) continue;
-      sends.push({
-        text: nativeMirrorText(record.text),
-        stableId: record.stableId,
-        provable: false,
-      });
-    }
-  }
-  return sends;
-}
-
-/** Native user messages as judged by `judgeNativeMirrors`. */
-function nativeMirrorsOf(blocks: AnyBlock[]): { itemId: string; text: string }[] {
-  return blocks.flatMap((block) =>
-    block.type === "user_message" && block.ctx.itemId
-      ? [{ itemId: block.ctx.itemId, text: messageContentText(block.content) }]
-      : [],
-  );
-}
-
-/** Judged ids kept per session: older messages are far behind any merge window. */
-const MAX_JUDGED_NATIVE_MIRRORS = 256;
-
-/**
- * Judge newly committed native user messages (see `sendProvenByNativeMirror`),
- * each once whatever the verdict: one ambiguous now must not prove a send later.
- *
- * @param s - The conversation's current state.
- * @param mirrors - The messages, oldest first.
- * @param snapshot - Their snapshot, if any; a send it records refused isn't proven.
- * @returns The proven sends' stable ids, and the patch recording the judged ids.
- */
-function judgeNativeMirrors(
-  s: ChatState,
-  conversationId: string | null,
-  mirrors: readonly { itemId: string; text: string }[],
-  snapshot?: Session,
-): { proven: Set<string>; patch: Partial<ChatState> } {
-  const proven = new Set<string>();
-  const unjudged = mirrors.filter((mirror) => !s.judgedNativeMirrorIds.includes(mirror.itemId));
-  if (!s.isNativeTerminalSession || unjudged.length === 0) return { proven, patch: {} };
-  let outstanding = outstandingNativeSendsOf(s, conversationId);
-  const ineligible = new Set(s.textProofIneligibleIds);
-  for (const mirror of unjudged) {
-    const matching = sendsMatchingNativeMirror(mirror.text, outstanding);
-    if (matching.length > 1) {
-      for (const { stableId } of matching) if (stableId) ineligible.add(stableId);
-      outstanding = outstanding.map((send) =>
-        matching.includes(send) ? { ...send, provable: false } : send,
-      );
-      continue;
-    }
-    const send = sendProvenByNativeMirror(mirror.text, outstanding);
-    if (send?.stableId === undefined) continue;
-    if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) continue;
-    proven.add(send.stableId);
-    // The send's own POST may still be open; its catch reads this.
-    if (inFlightSends.has(send.stableId)) inFlightSends.set(send.stableId, true);
-    outstanding = outstanding.filter((other) => other !== send);
-  }
-  const judged = [...s.judgedNativeMirrorIds, ...unjudged.map((mirror) => mirror.itemId)];
-  const patch: Partial<ChatState> = {
-    judgedNativeMirrorIds: judged.slice(-MAX_JUDGED_NATIVE_MIRRORS),
-  };
-  if (ineligible.size > s.textProofIneligibleIds.length) {
-    patch.textProofIneligibleIds = [...ineligible];
-    // A reload must not trust the anchor of a send that became ineligible.
-    const unsent = conversationId === null ? null : peekUnsentSend(conversationId);
-    if (unsent?.afterItemId !== undefined && ineligible.has(unsent.stableId)) {
-      const { afterItemId: _dropped, ...unanchored } = unsent;
-      rememberUnsentSend(conversationId!, unanchored);
-    }
-  }
-  return { proven, patch };
-}
-
-/**
- * Drop the failure cards of unanswered sends that have since been delivered.
- * A send the snapshot records the runner refusing keeps its card.
+ * A send commits under its stable id, except on a native terminal: the mirror
+ * has its own id and prepends markers for uploads, so a new message whose text
+ * is otherwise the send's delivers it, one send per message. Older messages
+ * don't count, as they can say the same thing. A send the snapshot records the
+ * runner refusing keeps its card.
  *
  * @param blocks - The conversation's blocks.
- * @param deliveredIds - Committed item ids and sends proven by a native mirror.
+ * @param committedIds - Ids of items known committed.
+ * @param newUserTexts - Normalized texts of user messages new since the cards.
  * @param snapshot - The snapshot that supplied the commits, if any.
  * @returns `blocks` itself when no card is dropped.
  */
 function withoutDeliveredSendFailureCards(
   blocks: AnyBlock[],
-  deliveredIds: ReadonlySet<string>,
+  committedIds: ReadonlySet<string>,
+  newUserTexts: readonly string[],
   snapshot?: Session,
 ): AnyBlock[] {
+  const unclaimedTexts = newUserTexts.map(withoutAttachedMarkers);
   const kept = blocks.filter((block) => {
     const send = block.type === "error" ? block.unansweredSend : undefined;
-    if (send === undefined || !deliveredIds.has(send.stableId)) return true;
-    return snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId);
+    if (send === undefined) return true;
+    if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) return true;
+    if (committedIds.has(send.stableId)) return false;
+    const claimed = send.text === undefined ? -1 : unclaimedTexts.indexOf(send.text);
+    if (claimed === -1) return true;
+    unclaimedTexts.splice(claimed, 1);
+    return false;
   });
   return kept.length === blocks.length ? blocks : kept;
 }
@@ -8056,6 +7833,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  webStableId?: string,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -8066,6 +7844,8 @@ function committedUserBlock(
       timestamp: 0,
       responseId: "",
       itemId,
+      // Lets a failed send's catch find the mirror that delivered it.
+      ...(webStableId !== undefined ? { webStableId } : {}),
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
@@ -8875,22 +8655,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
-      if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      // A native mirror keeps its own id; the server names the web send it delivered.
+      const deliveredIds = [event.itemId, ...(event.webStableId ? [event.webStableId] : [])];
+      for (const id of deliveredIds) if (inFlightSends.has(id)) inFlightSends.set(id, true);
       applyToConversation((s) => {
-        const committedIds = new Set([event.itemId]);
-        // A late copy of an item already shown is not a new message.
-        const content = hasCommittedItem(s.blocks, event.itemId)
-          ? null
-          : userContentFromEvent(event);
-        const mirror =
-          content === null ? [] : [{ itemId: event.itemId, text: messageContentText(content) }];
-        const judged = judgeNativeMirrors(s, sourceConversationId, mirror);
-        // The card and the draft retract on the same proof.
-        const delivered = new Set([...committedIds, ...judged.proven]);
-        const blocks = withoutDeliveredSendFailureCards(s.blocks, delivered);
+        const committedIds = new Set(deliveredIds);
+        // A late copy of an item already shown is not a new message, and a
+        // mirror naming its send proves no other send by its text.
+        const content =
+          hasCommittedItem(s.blocks, event.itemId) || event.webStableId
+            ? null
+            : userContentFromEvent(event);
+        const blocks = withoutDeliveredSendFailureCards(
+          s.blocks,
+          committedIds,
+          content === null ? [] : [messageContentText(content)],
+        );
         return {
-          ...judged.patch,
-          ...retractDeliveredSendDraft(s, delivered, "consumed"),
+          ...retractDeliveredSendDraft(s, committedIds, "consumed"),
           ...(blocks === s.blocks ? {} : { blocks }),
         };
       });
@@ -9001,6 +8783,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  event.webStableId,
                 ),
               ],
             };
@@ -9037,6 +8820,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
+                event.webStableId,
               ),
             ],
           };
@@ -9048,7 +8832,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              event.webStableId,
+            ),
           ],
         };
       });

@@ -106,6 +106,29 @@ describe("parseEvent — response.failed", () => {
   });
 });
 
+describe("parseEvent — session.input.consumed", () => {
+  const envelope = (data: Record<string, unknown>) => ({
+    type: "session.input.consumed",
+    data: { item_id: "msg_mirror", type: "message", data },
+  });
+
+  it("surfaces the web send a native mirror delivered", () => {
+    const event = parseEvent(
+      "session.input.consumed",
+      envelope({ role: "user", content: [], web_stable_id: "a".repeat(32) }),
+    );
+    expect(event).toMatchObject({ type: "session_input_consumed", webStableId: "a".repeat(32) });
+  });
+
+  it.each([undefined, "", 42])("names no send for web_stable_id %s", (webStableId) => {
+    const event = parseEvent(
+      "session.input.consumed",
+      envelope({ role: "user", content: [], web_stable_id: webStableId }),
+    );
+    expect(event).not.toHaveProperty("webStableId");
+  });
+});
+
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {
     // Ordinary in-process task streaming: only `delta` is present, and

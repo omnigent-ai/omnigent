@@ -45,6 +45,8 @@ export interface BlockContext {
   timestamp: number;
   responseId: string;
   itemId: string | null;
+  /** The web send this native mirror delivered (its item's `web_stable_id`). */
+  webStableId?: string;
   createdBy?: string;
   /** Server-side creation time (unix epoch seconds), when the item came
    *  from history hydration. A DIFFERENT clock from `timestamp` (page-
