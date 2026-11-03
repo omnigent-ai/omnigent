@@ -1408,6 +1408,10 @@ class ClaudeNativeToolRelay:
         self._httpd = httpd
         self._advertised_url = advertised_url
         self._relay_info = relay_info
+        # Held in memory, not re-read from tool_relay.json: the bridge dir is
+        # writable by the session user, so editing the file must not widen
+        # what the relay runs.
+        self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
 
     def update_tools(self, tools: list[_JsonObject], tool_executor: ToolExecutor) -> None:
@@ -1423,6 +1427,7 @@ class ClaudeNativeToolRelay:
         }
         _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
         self._relay_info = relay_info
+        self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
 
     def close(self) -> None:
@@ -1449,6 +1454,24 @@ class ClaudeNativeToolRelay:
                 relay_file.unlink()
         self._httpd.shutdown()
         self._httpd.server_close()
+
+
+def _relay_info_tool_names(relay_info: _JsonObject) -> frozenset[str]:
+    """
+    Return the tool names listed in a relay advertisement.
+
+    :param relay_info: Relay advertisement, e.g.
+        ``{"tools": [{"name": "list_comments", ...}]}``.
+    :returns: Listed names, e.g. ``frozenset({"list_comments"})``.
+    """
+    tools = relay_info.get("tools")
+    if not isinstance(tools, list):
+        return frozenset()
+    return frozenset(
+        name
+        for name in (tool.get("name") for tool in tools if isinstance(tool, dict))
+        if isinstance(name, str) and name
+    )
 
 
 def _ensure_secure_dir(target: Path) -> None:
@@ -7536,6 +7559,18 @@ def start_tool_relay(
     token = secrets.token_urlsafe(32)
 
     async def _execute_current_tool(name: str, arguments: _JsonObject) -> object:
+        # The token proves only that the caller runs as the session user,
+        # which any command the agent runs does. The MCP bridge forwards only
+        # advertised names, so refuse the rest. Check and pick the executor in
+        # one loop step: update_tools swaps both on this loop.
+        if name not in relay._advertised_tool_names:
+            _logger.warning(
+                "tool relay refused unadvertised tool %r for session=%s",
+                name,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return {"error": f"unknown tool: {name!r}"}
         return await relay._tool_executor(name, arguments)
 
     handler_cls = _tool_relay_handler_factory(
