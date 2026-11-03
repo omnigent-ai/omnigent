@@ -2721,9 +2721,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
-    // A reply already streaming belongs to an earlier input, not this send.
+    // A reply already streaming, or owed to an earlier unacknowledged send, is not this send's.
     const sentWhileIdle =
-      !alreadyStreaming && !sentMidTurn && !targetState?.blocks.some(isLiveProvisionalBlock);
+      !alreadyStreaming &&
+      !sentMidTurn &&
+      !targetState?.blocks.some(isLiveProvisionalBlock) &&
+      !targetState?.pendingUserMessages.length;
     if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
@@ -7306,10 +7309,14 @@ export async function pumpStreamEvents(
         // fall through and append as a normal block.
       }
 
+      let repliesToPendingSend: string | undefined;
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
-          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
+          const preview = get().blocks[provIdx]!;
+          ignoreLivePreview(preview, ignoredMessages);
+          // A reply that settles before its send's ack keeps its place below that send.
+          if (preview.type === "text_done") repliesToPendingSend = preview.answersPendingSend;
           // The done item has no message id. Native messages are sequential,
           // so remove the oldest preview and let the committed item follow
           // the normal reducer path.
@@ -7387,8 +7394,12 @@ export async function pumpStreamEvents(
       // tool_call boundaries + create_session first-activity, from live blocks.
       // Only fresh (non-deduped) blocks reach here, so each is observed once;
       // history hydration takes the `reduceSync` path and never runs this loop.
-      onLiveBlock(id, block);
-      buffer.push(block);
+      const fresh =
+        repliesToPendingSend !== undefined && block.type === "text_done"
+          ? { ...block, answersPendingSend: repliesToPendingSend }
+          : block;
+      onLiveBlock(id, fresh);
+      buffer.push(fresh);
       if (!paintedFirstContent) {
         // First content of the response — paint it immediately so the
         // user sees the first token without waiting a frame.

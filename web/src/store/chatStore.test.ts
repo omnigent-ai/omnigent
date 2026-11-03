@@ -17223,6 +17223,18 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
+  /** A `session.input.consumed` frame committing one user-role text item. */
+  function inputConsumed(itemId: string, text: string, clearedPendingId?: string): string {
+    return sse("session.input.consumed", {
+      data: {
+        item_id: itemId,
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text }] },
+        ...(clearedPendingId !== undefined ? { cleared_pending_id: clearedPendingId } : {}),
+      },
+    });
+  }
+
   /** Role and text of each bubble in the order the transcript renders them. */
   function renderedTranscript(): { role: string; text: string }[] {
     const state = useChatStore.getState();
@@ -17284,15 +17296,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       await tick();
       expect(renderedTranscript()).toEqual(expected);
 
-      sink.push(
-        sse("session.input.consumed", {
-          data: {
-            item_id: "item_new_user",
-            type: "message",
-            data: { role: "user", content: [{ type: "input_text", text: "new question" }] },
-          },
-        }),
-      );
+      sink.push(inputConsumed("item_new_user", "new question"));
       await tick();
       expect(renderedTranscript()).toEqual(expected);
 
@@ -17338,15 +17342,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       await tick();
       expect(renderedTranscript()).toEqual(expected);
 
-      sink.push(
-        sse("session.input.consumed", {
-          data: {
-            item_id: "item_first_user",
-            type: "message",
-            data: { role: "user", content: [{ type: "input_text", text: "new question" }] },
-          },
-        }),
-      );
+      sink.push(inputConsumed("item_first_user", "new question"));
       await tick();
       expect(renderedTranscript()).toEqual(expected);
 
@@ -17373,15 +17369,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       }),
     );
     sink.push(nativeDelta("m_1", 0, "first answer", true));
-    sink.push(
-      sse("session.input.consumed", {
-        data: {
-          item_id: "item_first_user",
-          type: "message",
-          data: { role: "user", content: [{ type: "input_text", text: "first question" }] },
-        },
-      }),
-    );
+    sink.push(inputConsumed("item_first_user", "first question"));
     sink.push(nativeDelta("m_2", 0, " continued", true));
     await tick();
 
@@ -17394,16 +17382,95 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  /** A `session.input.consumed` frame committing one user-role text item. */
-  function inputConsumed(itemId: string, text: string): string {
-    return sse("session.input.consumed", {
-      data: {
-        item_id: itemId,
-        type: "message",
-        data: { role: "user", content: [{ type: "input_text", text }] },
-      },
+  it("keeps the question above both previews when a second one streams before the first commits", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_order_two_previews",
+      blocks: [],
+      isNativeTerminalSession: true,
+      abortController: new AbortController(),
     });
-  }
+    const { sink, controller } = startPump("conv_live_order_two_previews");
+    await useChatStore.getState().send("my question", "agent_xyz");
+    sink.push(
+      sse("session.status", {
+        conversation_id: "conv_live_order_two_previews",
+        status: "running",
+        response_id: null,
+      }),
+    );
+    sink.push(nativeDelta("m_1", 0, "first part", true));
+    sink.push(nativeDelta("m_2", 0, " second part", true));
+    sink.push(messageDone("ci_1", "resp_1", "first part", "m_1"));
+    await tick();
+    const questionThenReply = () => {
+      const transcript = renderedTranscript();
+      expect(transcript.map((entry) => entry.role)).toEqual(["user", "assistant"]);
+      expect(transcript[0]!.text).toBe("my question");
+    };
+    questionThenReply();
+
+    sink.push(inputConsumed("item_my_user", "my question"));
+    await tick();
+    questionThenReply();
+
+    controller.abort();
+  });
+
+  it.each([
+    ["by name", true],
+    ["in FIFO order", false],
+  ])(
+    "keeps a send made after an unacknowledged steer below the steer and its reply when the steer is acknowledged %s",
+    async (_label, namedAck) => {
+      useChatStore.setState({
+        conversationId: "conv_live_order_steer",
+        blocks: [],
+        isNativeTerminalSession: true,
+        abortController: new AbortController(),
+      });
+      const { sink, controller } = startPump("conv_live_order_steer");
+      const status = (value: "running" | "idle") =>
+        sse("session.status", {
+          conversation_id: "conv_live_order_steer",
+          status: value,
+          response_id: null,
+        });
+      sink.push(status("running"));
+      await tick();
+      await useChatStore.getState().send("steered question", "agent_xyz");
+      const steerTempId = useChatStore.getState().pendingUserMessages[0]!.tempId;
+      sink.push(status("idle"));
+      await tick();
+      await useChatStore.getState().send("queued question", "agent_xyz");
+      const expectQueuedLast = () => {
+        const transcript = renderedTranscript();
+        expect(transcript.at(-1)).toEqual({ role: "user", text: "queued question" });
+        expect(transcript).toContainEqual({ role: "user", text: "steered question" });
+      };
+
+      sink.push(status("running"));
+      sink.push(nativeDelta("m_steer_1", 0, "steered answer", true));
+      await tick();
+      expectQueuedLast();
+
+      sink.push(
+        inputConsumed("item_steer_user", "steered question", namedAck ? steerTempId : undefined),
+      );
+      await tick();
+      expectQueuedLast();
+
+      sink.push(messageDone("ci_steer_1", "resp_steer", "steered answer", "m_steer_1"));
+      sink.push(nativeDelta("m_steer_2", 0, " continued", true));
+      await tick();
+      expect(renderedTranscript()).toEqual([
+        { role: "user", text: "steered question" },
+        { role: "assistant", text: "steered answer continued" },
+        { role: "user", text: "queued question" },
+      ]);
+
+      controller.abort();
+    },
+  );
 
   it.each([
     ["before its reply streams", false],
@@ -17482,7 +17549,9 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(status("running"));
     sink.push(nativeDelta("m_2", 0, "second answer", true));
     await tick();
-    expect(renderedTranscript().slice(-2)).toEqual([
+    expect(renderedTranscript()).toEqual([
+      { role: "user", text: "first question" },
+      { role: "assistant", text: "first answer" },
       { role: "user", text: "second question" },
       { role: "assistant", text: "second answer" },
     ]);
