@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import pytest
@@ -357,6 +358,28 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_databricks_auth_memory() -> None:
+    """
+    Start every test without shared Databricks token sources or remembered profiles.
+
+    Both are meant to outlive a single client: the token sources are
+    process-global and keyed by server URL, which tests reuse, and the
+    remembered profiles live in the shared test data dir. Either would let one
+    test's resolution answer another's. The reset runs before the test, not
+    at teardown, where a test's ``Path.unlink`` patch can still be active.
+
+    :returns: None.
+    """
+    chat = sys.modules.get("omnigent.chat")
+    if chat is not None:
+        chat._databricks_auth_cache.clear()
+    executor = sys.modules.get("omnigent.inner.databricks_executor")
+    if executor is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_TEST_OMNIGENT_DATA_DIR / executor._REMEMBERED_PROFILES_FILE)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_claude_native_state(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
@@ -418,6 +441,26 @@ def _isolate_codex_native_state(
     """
     state_dir = tmp_path_factory.mktemp("codex-native-state")
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
+
+
+@pytest.fixture(autouse=True)
+def _no_configured_codex_app_server_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[], tuple[str, ...]]:
+    """
+    Run Codex directly unless a test configures an app-server wrapper.
+
+    The wrapper is read from the user's ``~/.omnigent/config.yaml``, so without
+    this every native Codex session launch would depend on the machine.
+
+    :param monkeypatch: Fixture used to stub the config read.
+    :returns: The real config reader, for a test that exercises it.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    real = app_server._configured_app_server_command
+    monkeypatch.setattr(app_server, "_configured_app_server_command", lambda: ())
+    return real
 
 
 @pytest.fixture()
