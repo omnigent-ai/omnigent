@@ -25,6 +25,11 @@ from fastapi import FastAPI
 
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.managed_hosts import (
+    REQUESTED_HOST_ID_LABEL_KEY,
+    managed_repo_labels,
+    read_managed_repo_workspaces,
+)
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -288,13 +293,17 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
 
     The runner gets a marked request, so only a server that continues the work
     makes it release the client; an older runner's 204 still continues. The new
-    session keeps the source's host, workspace, branch, runner and run
-    settings; the source keeps its history and gets a notice plus a redirect.
+    session keeps the source's host, workspace, branch, runner, sandbox
+    repositories and run settings; the source keeps its history and gets a
+    notice plus a redirect.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     live_runner.clear_status = runner_status
     store = SqlAlchemyConversationStore(db_uri)
     source_id, _items = await create_placed_session(client, store)
+    repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
+    sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
+    store.set_labels(source_id, sandbox_labels)
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
@@ -321,6 +330,9 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert (fork.model_override, fork.reasoning_effort) == ("claude-opus-4-7", "high")
     assert fork.terminal_launch_args == ["--permission-mode", "acceptEdits"]
     assert fork.labels["team"] == "core"
+    # A relaunch of the shared sandbox still re-clones the repositories.
+    assert {key: fork.labels.get(key) for key in sandbox_labels} == sandbox_labels
+    assert read_managed_repo_workspaces(fork.labels) == repos
     # Untitled, so the first message names it like any new chat.
     assert fork.title is None
     assert message_texts(store, source_id)[:4] == ["Q1", "A1", "Q2", "A2"]

@@ -3915,11 +3915,14 @@ def register_core_routes(
         body: SessionForkRequest,
         *,
         before_item_id: str | None = None,
+        keep_sandbox_labels: bool = False,
     ) -> SessionResponse:
         """Fork *source_id* as :func:`fork_session` documents.
 
         :param before_item_id: Internal cutoff for rewind and clear: copy only
             the items before this one, e.g. ``"msg_abc123"``.
+        :param keep_sandbox_labels: Copy the source's managed-sandbox labels,
+            for a fork that stays in the source's sandbox.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4179,6 +4182,16 @@ def register_core_routes(
             from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
             extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.host_id
+        # A fork staying in the source's sandbox keeps what its relaunch
+        # re-clones (repositories) and how its host routes.
+        if keep_sandbox_labels:
+            from omnigent.server.managed_hosts import MANAGED_SANDBOX_LABEL_NAMESPACE
+
+            extra_labels.update(
+                (key, value)
+                for key, value in source.labels.items()
+                if key.startswith(MANAGED_SANDBOX_LABEL_NAMESPACE)
+            )
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
@@ -4562,10 +4575,11 @@ def register_core_routes(
         """
         Continue *source* in a fork on the same placement, superseding it.
 
-        The fork keeps the source's agent, labels and run settings and only
-        the history before *before_item_id*. It is bound to the source's host
-        and workspace and to its live runner, and the source gets a notice
-        linking to it plus a ``session.superseded`` redirect for live viewers.
+        The fork keeps the source's agent, labels (managed-sandbox ones
+        included) and run settings and only the history before
+        *before_item_id*. It is bound to the source's host and workspace and
+        to its live runner, and the source gets a notice linking to it plus a
+        ``session.superseded`` redirect for live viewers.
 
         :param request: The incoming request, whose caller must own *source*.
         :param source: Session to supersede.
@@ -4615,6 +4629,7 @@ def register_core_routes(
             source.id,
             SessionForkRequest(title=title),
             before_item_id=before_item_id,
+            keep_sandbox_labels=True,
         )
         if source.host_id is not None and source.workspace is not None:
             await asyncio.to_thread(

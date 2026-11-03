@@ -363,7 +363,8 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # silently truncated at the 256-char label-value cap, losing repos on relaunch.
 # Per-session state: a fork never inherits them (the store drops the whole
 # ``<base>.`` family, and the fork's own launch re-stamps whatever it resolves),
-# while an in-place agent switch keeps them — the sandbox is unchanged.
+# while an in-place agent switch or a continuation in the same sandbox (claude-sdk
+# ``/clear``) keeps them — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 # Server-owned routing id from a managed create's or fork's ``host_id``:
