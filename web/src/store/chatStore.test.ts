@@ -15013,6 +15013,47 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
+  it("keeps a turn that starts while a missed turn end's reconnect reads history", async () => {
+    const id = "conv_recycle_next_turn";
+    let releaseItems!: (down: boolean) => void;
+    const itemsHeld = new Promise<boolean>((resolve) => {
+      releaseItems = resolve;
+    });
+    let itemsDown: () => boolean | Promise<boolean> = () => false;
+    const pump = await startMissedEventPump(id, "idle", { itemsDown: () => itemsDown() });
+    pump.bound.set({ pendingUserMessages: [], boundAgentId: "agent_xyz" });
+    const reply = assistantMessage("resp_live", "It's published now");
+    seedSessionItems(id, [pump.before, reply]);
+    itemsDown = () => itemsHeld;
+
+    await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.sinks).toHaveLength(2);
+    pump.sinks[1]!.push(
+      sse("session.status", { conversation_id: id, status: "running", response_id: "resp_next" }),
+    );
+    await drainAsync();
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_follow_up", text: "then tag the release", conversationId: id },
+      ],
+    });
+    releaseItems(false);
+    await drainAsync();
+
+    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+    expect(pump.bound.get().activeResponse).toMatchObject({
+      responseId: "resp_next",
+      state: "streaming",
+    });
+    expect(pump.bound.get().status).toBe("streaming");
+    expect(pump.bound.get().sessionStatus).toBe("running");
+    useChatStore.getState().maybeFlushQueuedHead();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_follow_up"]);
+
+    await pump.stop();
+  });
+
   /** Fail item reads, then let the turn-end recycle and its catch-ups settle idle. */
   async function settleMissedEndWhileItemsDown(
     id: string,
@@ -15095,17 +15136,19 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   it("keeps a fresh send latch when the snapshot predates its turn", async () => {
     const pump = await startMissedEventPump("conv_fresh_latch", "idle");
+    const latchedAt = Date.now();
     pump.bound.set({
       pendingUserMessages: [],
       activeResponse: null,
       sessionStatus: "idle",
-      sendLatchedAt: Date.now(),
+      sendLatchedAt: latchedAt,
     });
 
     await advanceWithHeartbeats(pump.sinks[0]!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
 
     expect(pump.bound.get().status).toBe("streaming");
+    expect(pump.bound.get().sendLatchedAt).toBe(latchedAt);
     expect(pump.sinks).toHaveLength(1);
 
     await pump.stop();

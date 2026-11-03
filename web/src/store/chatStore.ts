@@ -1471,7 +1471,12 @@ function sideChatSettingsPending(conversationId: string): boolean {
 // Any semantic stream event makes a snapshot already in flight potentially
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
-conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+// Live turn edges only: a reopened stream's connect replay carries none.
+const streamTurnEdgeRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => {
+  streamEventRevisions.delete(id);
+  streamTurnEdgeRevisions.delete(id);
+});
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
@@ -5930,7 +5935,8 @@ type ReconnectBackfill = "applied" | "failed" | "skipped";
  * state (`hasMoreHistory` / `oldestItemId`) untouched — a reconnect is not a
  * re-hydrate. Swallows fetch errors, resolving "failed" so the caller can
  * retry. All writes are `historyGeneration`-guarded so a window reset
- * mid-fetch voids them. `settleStatus: false` skips the status patch.
+ * mid-fetch voids them. `settleStatus: false` skips the status patch, as
+ * does a live turn edge that arrives during the reads.
  */
 async function reconcileOnReconnect(
   id: string,
@@ -5942,6 +5948,7 @@ async function reconcileOnReconnect(
   if (queryClient === null) return "skipped";
   const stateBeforeFetch = get();
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
+  const turnEdgesBeforeFetch = streamTurnEdgeRevisions.get(id) ?? 0;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -5977,8 +5984,11 @@ async function reconcileOnReconnect(
   }
   if (stale()) return "skipped";
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  // A turn edge the live stream delivered during these reads is newer than the snapshot.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
-    settleStatus ? reconnectStatusPatch(session, s, launchBeforeFetch, stateBeforeFetch) : {};
+    settleStatus && (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch
+      ? reconnectStatusPatch(session, s, launchBeforeFetch, stateBeforeFetch)
+      : {};
 
   // Page backwards until the fetched window reaches the pre-gap transcript
   // or the conversation start. A single newest page is not enough: a gap
@@ -9324,12 +9334,17 @@ async function* tapSessionEvents(
   beforeTurnEdge?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    const turnEdge = event.type === "session_status" || event.type === "session_interrupted";
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+      if (turnEdge) {
+        streamTurnEdgeRevisions.set(
+          conversationId,
+          (streamTurnEdgeRevisions.get(conversationId) ?? 0) + 1,
+        );
+      }
     }
-    if (event.type === "session_status" || event.type === "session_interrupted") {
-      beforeTurnEdge?.();
-    }
+    if (turnEdge) beforeTurnEdge?.();
     if (event.type === "elicitation_resolved") {
       bumpElicitationVerdictRevision(conversationId, event.elicitationId);
     }
