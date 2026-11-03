@@ -365,12 +365,16 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     one_line_box = description.bounding_box()
     assert one_line_box is not None
     one_line_height = one_line_box["height"]
+    review_pr = page.get_by_test_id("slash-menu-item-review-pr")
+    rows_before_hover = [review_pr.bounding_box(), triage.bounding_box()]
 
     # Hovering the cut-off row shows its whole description in a tooltip.
     triage.hover()
     tooltip = page.get_by_test_id("slash-menu-tooltip-triage")
     expect(tooltip).to_be_visible()
     expect(tooltip).to_have_text(_LONG_SKILL_DESCRIPTION)
+    # The tooltip floats over the menu, so hovering neither resizes nor moves rows.
+    assert [review_pr.bounding_box(), triage.bounding_box()] == rows_before_hover
     page.mouse.move(0, 0, steps=5)
     expect(tooltip).to_have_count(0)
 
@@ -389,9 +393,7 @@ def test_slash_menu_shows_full_skill_description(page: Page, chat_session_contra
     page.wait_for_timeout(800)
     expect(tooltip).to_have_count(0)
     composer.press("ArrowUp")
-    expect(page.get_by_test_id("slash-menu-item-review-pr")).to_have_attribute(
-        "data-active", "true"
-    )
+    expect(review_pr).to_have_attribute("data-active", "true")
     assert description.evaluate(_IS_CUT_OFF)
     composer.press("ArrowDown")
     composer.press("Enter")

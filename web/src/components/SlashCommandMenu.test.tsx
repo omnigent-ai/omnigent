@@ -1,6 +1,6 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type McpServerRow,
   matchSlashCommandInvocation,
@@ -179,9 +179,18 @@ describe("full skill descriptions", () => {
   const commands = { "/help": "Show help", "/triage": triage, "/review": "Review code" };
   const description = (name: string) => screen.getByTestId(`slash-menu-description-${name}`);
 
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
   afterEach(() => {
     vi.useRealTimers();
   });
+
+  function advanceTimers(milliseconds: number) {
+    act(() => {
+      vi.advanceTimersByTime(milliseconds);
+    });
+  }
 
   /** Make a row's one-line description report overflow, as layout would when it is cut off. */
   function overflowDescription(name: string, scrollWidth: number) {
@@ -206,24 +215,19 @@ describe("full skill descriptions", () => {
   });
 
   it("shows a cut-off description in full in a hover tooltip after a short delay", () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     render(<SlashCommandMenu {...props} commands={commands} activeIndex={0} />);
     overflowDescription("triage", 900);
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
     // A pointer passing over rows shouldn't flash tooltips; the menu waits 400 ms.
-    act(() => {
-      vi.advanceTimersByTime(399);
-    });
+    advanceTimers(399);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
-    act(() => {
-      vi.advanceTimersByTime(1);
-    });
+    advanceTimers(1);
     const tooltip = screen.getByTestId("slash-menu-tooltip-triage");
     expect(tooltip).toHaveTextContent(triage);
     expect(tooltip).toHaveClass("max-h-64", "overflow-y-auto", "items-start");
   });
 
-  it("shows no tooltip when the description already fits or the row is highlighted", async () => {
+  it("shows no tooltip when the description already fits or the row is highlighted", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
@@ -232,32 +236,29 @@ describe("full skill descriptions", () => {
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
     overflowDescription("triage", 900);
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
-    await new Promise((resolve) => {
-      setTimeout(resolve, 700);
-    });
+    advanceTimers(500);
     expect(screen.queryByTestId("slash-menu-tooltip-review")).toBeNull();
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 
-  it("closes an open tooltip when its row becomes highlighted", async () => {
+  it("closes an open tooltip when its row becomes highlighted", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
     overflowDescription("triage", 900);
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
-    await screen.findByTestId("slash-menu-tooltip-triage", {}, { timeout: 2000 });
+    advanceTimers(400);
+    expect(screen.getByTestId("slash-menu-tooltip-triage")).toBeInTheDocument();
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
-    await waitFor(() => expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull());
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
     // Arrowing away again does not bring back a tooltip the pointer has left.
     fireEvent.pointerLeave(screen.getByTestId("slash-menu-item-triage"));
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 700);
-    });
+    advanceTimers(500);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 
-  it("drops a pending tooltip when its row is highlighted before the delay ends", async () => {
+  it("drops a pending tooltip when its row is highlighted before the delay ends", () => {
     const { rerender } = render(
       <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
     );
@@ -265,9 +266,7 @@ describe("full skill descriptions", () => {
     fireEvent.pointerMove(screen.getByTestId("slash-menu-item-triage"));
     // The pointer stays on the row, so only the highlight can keep the tooltip closed.
     rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 700);
-    });
+    advanceTimers(500);
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
 });
