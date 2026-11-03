@@ -4913,6 +4913,15 @@ def create_app(
             if startup_inputs is not None:
                 startup_inputs.host_changed(app, _host_id)
 
+        async def _on_host_connected(host_id: str, owner: str | None) -> None:
+            from omnigent.server.routes.sessions.routes_events import (
+                forget_host_sign_in_rejection,
+            )
+
+            # A host that reconnects may have signed in again.
+            forget_host_sign_in_rejection(host_id)
+            await _on_hosts_changed(host_id, owner)
+
         app.include_router(
             create_host_tunnel_router(
                 host_registry,
@@ -4920,7 +4929,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_host_connect=_on_hosts_changed,
+                on_host_connect=_on_host_connected,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 harness_install=app.state.harness_install,

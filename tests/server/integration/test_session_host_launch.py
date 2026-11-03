@@ -70,6 +70,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.budgets import Deadline, budget
 from tests.server.helpers import create_test_agent
 from tests.server.helpers import websocket_scope as _websocket_scope
@@ -1886,10 +1887,12 @@ async def _relaunch_then_report_exit(
     daemon_report: str,
     *,
     headers: dict[str, str] | None = None,
+    event: dict[str, object] | None = None,
 ) -> httpx.Response:
     """Relaunch, then send a pre-connect exit report over the host tunnel.
 
     The exit report should settle the pending send before its timeout.
+    *event* replaces the default user message, e.g. a ``retry_session``.
     """
 
     async def _launch_then_report() -> None:
@@ -1905,7 +1908,8 @@ async def _relaunch_then_report_exit(
         return await client.post(
             f"/v1/sessions/{session_id}/events",
             headers=headers,
-            json={
+            json=event
+            or {
                 "type": "message",
                 "data": {"role": "user", "content": [{"type": "input_text", "text": "hi?"}]},
             },
@@ -2476,6 +2480,51 @@ async def test_native_message_relaunch_holds_send_until_the_host_signs_in(
     assert after is not None and after.runner_id == held_runner.runner_id
     outcomes = [event.attributes["outcome"] for event in _runner_client_wait_events(caplog)]
     assert outcomes[-1] == "host_sign_in_held"
+
+    # A reconnecting host may have signed in again, so its next send relaunches.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+    await comm.wait(timeout=budget(5.0))
+    assert routes_events._host_sign_in_rejections.get(_HOST_ID) is not None
+    await _connect_host(app)
+    await poll_until_async(lambda: routes_events._host_sign_in_rejections.get(_HOST_ID) is None)
+
+
+async def test_retry_session_names_the_host_sign_in_after_a_refused_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovery whose runner the server refused on the host's sign-in names it.
+
+    The runner's exit no longer fails the idle session with the host's report,
+    so the refused recovery carries the sign-in instruction instead.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    # Recovery waits out the facade's connect timeout; the exit report lands
+    # well within it. The fake host never answers the wait's status probes.
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(sessions_module, "_HOST_RUNNER_STATUS_TIMEOUT_S", 0.05)
+    comm = await _connect_host(app)
+    session_id = await _native_host_session(client, app, db_uri, comm)
+
+    response = await _relaunch_then_report_exit(
+        client,
+        comm,
+        session_id,
+        _SIGN_IN_EXIT_REPORT,
+        event={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 503, response.text
+    error = response.json()["error"]
+    assert error["code"] == "host_sign_in_required"
+    assert error["message"] == (
+        "The server rejected this host's credentials, so the runner could not connect. "
+        "Sign in again with `omnigent login https://example.test` on this host, then retry."
+    )
 
 
 async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_while_connected(
