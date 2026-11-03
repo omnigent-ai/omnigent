@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from functools import cache
 
@@ -217,3 +218,24 @@ def skip_if_harness_cli_missing(harness: str) -> None:
             f"{harness!r} harness requires a runnable {binary!r} CLI; "
             f"{reason}. Install/fix it to run this row. Other harness rows continue."
         )
+
+
+# ── Sandbox availability gate ───────────────────────────────
+
+
+@cache
+def bwrap_namespace_unavailable_reason() -> str | None:
+    """Return ``None`` when bwrap can spawn a namespace here, else a skip reason."""
+    if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+        return "Linux with bubblewrap is required"
+    probe = subprocess.run(
+        ["bwrap", "--ro-bind", "/", "/", "true"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if probe.returncode == 0:
+        return None
+    detail = (probe.stderr or probe.stdout).strip().splitlines()
+    return detail[0] if detail else f"bwrap exited {probe.returncode}"

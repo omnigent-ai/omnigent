@@ -299,7 +299,7 @@ def test_transport_timeouts_keep_the_timeout_status():
 
     timeout = httpx.ReadTimeout("synthetic-private-URL")
     assert mcp_tools._failure_status(timeout) == "timeout"
-    assert mcp_tools._failure_status(ExceptionGroup("transport", [timeout])) == "timeout"  # noqa: F821
+    assert mcp_tools._failure_status(ExceptionGroup("transport", [timeout])) == "timeout"
 
 
 async def test_plugin_identity_selects_marketplace_and_never_probes_disabled(
