@@ -8568,12 +8568,10 @@ async def test_sys_session_create_config_bundle_refuses_nested_symlink_deref(
                 )
 
 
-@pytest.mark.parametrize("walk_beneath", [True, False], ids=["dir_fd", "path_fallback"])
-def test_bundle_local_agent_source_packs_nested_links_as_links(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walk_beneath: bool
-) -> None:
-    """Both walks pack a nested symlink as a link member, not its target's
-    bytes; the server accepts the clean bundle and refuses the linked one."""
+def test_bundle_local_agent_source_packs_nested_links_as_links(tmp_path: Path) -> None:
+    """A nested symlink is packed as a link member, not its target's bytes;
+    the server accepts the clean bundle and refuses the linked one, and a
+    prebuilt bundle passes through unchanged."""
     import io
     import tarfile
 
@@ -8581,9 +8579,8 @@ def test_bundle_local_agent_source_packs_nested_links_as_links(
     from omnigent.runner import tool_dispatch
     from omnigent.server.bundles import validate_agent_bundle
 
-    if walk_beneath and not tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
+    if not tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
         pytest.skip("platform lacks dir_fd traversal")
-    monkeypatch.setattr(tool_dispatch, "_BUNDLE_WALK_BENEATH_SUPPORTED", walk_beneath)
 
     secret = tmp_path / "runner-secret.txt"
     secret.write_text("RUNNER_SECRET_SENTINEL\n")
@@ -8599,6 +8596,9 @@ def test_bundle_local_agent_source_packs_nested_links_as_links(
 
     clean_bundle = tool_dispatch._bundle_local_agent_source(root, agent_dir)
     assert validate_agent_bundle(clean_bundle).name == "helper"
+    prebuilt = root / "helper.tar.gz"
+    prebuilt.write_bytes(clean_bundle)
+    assert tool_dispatch._bundle_local_agent_source(root, prebuilt) == clean_bundle
 
     (agent_dir / "sub" / "leak").symlink_to(secret)
     bundle = tool_dispatch._bundle_local_agent_source(root, agent_dir)
@@ -8617,11 +8617,15 @@ def test_bundle_local_agent_source_packs_nested_links_as_links(
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX symlinks and FIFOs")
 def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A component swapped for a symlink after resolution fails the walk,
-    and a FIFO is refused without blocking."""
+    """A component swapped for a symlink after resolution, or a directory
+    replaced between its inspection and opening, fails the walk, and a FIFO
+    is refused without blocking."""
     from omnigent.runner import tool_dispatch
+
+    if not tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
+        pytest.skip("platform lacks dir_fd traversal")
 
     root = tmp_path / "work"
     root.mkdir()
@@ -8629,9 +8633,28 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
     outside.mkdir()
     (outside / "config.yaml").write_text("name: RUNNER_SECRET_SENTINEL\n")
     (root / "agentdir").symlink_to(outside, target_is_directory=True)
-    if tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
-        with pytest.raises(OSError):
-            tool_dispatch._bundle_local_agent_source(root, root / "agentdir" / "config.yaml")
+    with pytest.raises(OSError):
+        tool_dispatch._bundle_local_agent_source(root, root / "agentdir" / "config.yaml")
+
+    swap_dir = root / "swap_agent"
+    (swap_dir / "sub").mkdir(parents=True)
+    (swap_dir / "config.yaml").write_text("name: helper\n")
+    real_stat = os.stat
+    swapped: list[bool] = []
+
+    def stat_then_replace_sub(name: str, *args: object, **kwargs: object) -> os.stat_result:
+        result = real_stat(name, *args, **kwargs)
+        if name == "sub" and not swapped:
+            swapped.append(True)
+            (swap_dir / "sub").rename(tmp_path / "moved_sub")
+            (swap_dir / "sub").symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(os, "stat", stat_then_replace_sub)
+    with pytest.raises(OSError):
+        tool_dispatch._bundle_local_agent_source(root, swap_dir)
+    monkeypatch.undo()
+    assert swapped
 
     agent_dir = root / "fifo_agent"
     agent_dir.mkdir()
@@ -8639,6 +8662,39 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
     os.mkfifo(agent_dir / "pipe")
     with pytest.raises(OSError, match="unsupported file type"):
         tool_dispatch._bundle_local_agent_source(root, agent_dir)
+
+
+@pytest.mark.parametrize("config_path", ["agentdir", "agentdir/config.yaml"])
+@pytest.mark.asyncio
+async def test_sys_session_create_config_bundle_fails_closed_without_dir_fd_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_path: str
+) -> None:
+    """Without ``dir_fd`` traversal a path walk could be redirected by a
+    directory swapped mid-walk, so bundling is refused before any upload."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(tool_dispatch, "_BUNDLE_WALK_BENEATH_SUPPORTED", False)
+    cwd = tmp_path / "work"
+    (cwd / "agentdir").mkdir(parents=True)
+    (cwd / "agentdir" / "config.yaml").write_text("name: helper\nprompt: hi\n")
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": config_path}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=cwd,
+        )
+
+    assert "safe directory traversal is unavailable" in json.loads(output)["error"]
 
 
 @pytest.mark.asyncio

@@ -3714,7 +3714,6 @@ _BUNDLE_FILE_OPEN_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_BINARY", 0)
 )
 
 
@@ -3735,6 +3734,7 @@ def _bundle_local_agent_source(root: Path, source: Path) -> bytes:
     The source is agent-controlled, so no symlink is followed: nested
     links are packed as link members, which the server refuses, and a
     component swapped for a symlink after resolution fails the walk.
+    Platforms without ``dir_fd`` traversal are refused outright.
 
     :param root: Resolved os_env cwd containing ``source``, e.g.
         ``Path("/work")``.
@@ -3742,22 +3742,20 @@ def _bundle_local_agent_source(root: Path, source: Path) -> bytes:
         or bundle file under ``root``, e.g.
         ``Path("/work/.omnigent/agent-configs/helper.yaml")``.
     :returns: Gzipped tarball bytes for the multipart ``bundle`` part.
-    :raises OSError: If a component is missing or was swapped for a
-        symlink, or the source contains a special file such as a FIFO.
+    :raises OSError: If the platform lacks ``dir_fd`` traversal, a
+        component is missing or was swapped for a symlink, or the source
+        contains a special file such as a FIFO.
     """
+    if not _BUNDLE_WALK_BENEATH_SUPPORTED:
+        raise OSError("safe directory traversal is unavailable on this platform")
     parts = source.relative_to(root).parts
-    parent_fd: int | None = None
-    if _BUNDLE_WALK_BENEATH_SUPPORTED:
-        parent_fd = os.open(root, _BUNDLE_DIR_OPEN_FLAGS)
-        name = parts[-1] if parts else "."
-    else:
-        name = str(source)
+    name = parts[-1] if parts else "."
+    parent_fd = os.open(root, _BUNDLE_DIR_OPEN_FLAGS)
     try:
-        if parent_fd is not None:
-            for part in parts[:-1]:
-                next_fd = os.open(part, _BUNDLE_DIR_OPEN_FLAGS, dir_fd=parent_fd)
-                os.close(parent_fd)
-                parent_fd = next_fd
+        for part in parts[:-1]:
+            next_fd = os.open(part, _BUNDLE_DIR_OPEN_FLAGS, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
         entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if stat.S_ISREG(entry.st_mode) and source.suffix.lower() not in {".yaml", ".yml"}:
             return _read_bundle_file(name, parent_fd)[0]
@@ -3768,39 +3766,27 @@ def _bundle_local_agent_source(root: Path, source: Path) -> bytes:
             )
         return buf.getvalue()
     finally:
-        if parent_fd is not None:
-            os.close(parent_fd)
+        os.close(parent_fd)
 
 
-def _add_bundle_entry(
-    tf: tarfile.TarFile,
-    name: str,
-    dir_fd: int | None,
-    arcname: str,
-) -> None:
+def _add_bundle_entry(tf: tarfile.TarFile, name: str, dir_fd: int, arcname: str) -> None:
     """
     Add one bundle-source entry to ``tf``, recursing into directories.
 
     :param tf: Open tarball being written.
-    :param name: Name relative to ``dir_fd``, or a full path when
-        ``dir_fd`` is ``None`` (platforms without ``dir_fd`` support).
+    :param name: Entry name relative to ``dir_fd``.
     :param dir_fd: Descriptor of the already-opened parent directory.
     :param arcname: Bundle member name, ``""`` for the root directory,
         e.g. ``"skills/review/SKILL.md"``.
     """
     entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-    if stat.S_ISLNK(entry.st_mode) or (dir_fd is None and os.path.isjunction(name)):
+    if stat.S_ISLNK(entry.st_mode):
         link = tarfile.TarInfo(arcname)
         link.type = tarfile.SYMTYPE
         link.linkname = os.readlink(name, dir_fd=dir_fd)
         tf.addfile(link)
         return
     if stat.S_ISDIR(entry.st_mode):
-        if dir_fd is None:
-            for child in sorted(os.listdir(name)):
-                child_arcname = f"{arcname}/{child}" if arcname else child
-                _add_bundle_entry(tf, os.path.join(name, child), None, child_arcname)
-            return
         child_dir_fd = os.open(name, _BUNDLE_DIR_OPEN_FLAGS, dir_fd=dir_fd)
         try:
             for child in sorted(os.listdir(child_dir_fd)):
@@ -3819,7 +3805,7 @@ def _add_bundle_entry(
     tf.addfile(member, io.BytesIO(data))
 
 
-def _read_bundle_file(name: str, dir_fd: int | None) -> tuple[bytes, os.stat_result]:
+def _read_bundle_file(name: str, dir_fd: int) -> tuple[bytes, os.stat_result]:
     """
     Read a regular file without following a final symlink.
 
