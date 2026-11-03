@@ -193,10 +193,7 @@ ElicitationHandler: TypeAlias = Callable[
     Awaitable[bool],
 ]
 
-# AskUserQuestion bridge wired in by ExecutorAdapter. Given the tool input,
-# it renders the questions as a clickable elicitation form and returns the
-# tool input with the user's selections merged under ``answers`` (Claude
-# then returns those as the tool result), or the reason to deny the call.
+# Adapter bridge: shows AskUserQuestion as a form; returns input+``answers`` or a deny reason.
 AskQuestionHandler: TypeAlias = Callable[
     [ToolArgs],
     Awaitable[dict[str, Any] | str],
@@ -1235,10 +1232,8 @@ def _claude_settings_payload(
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
-    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
-    relative value is relative to the CLI's working directory.
+    The file is located by
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1246,14 +1241,10 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
-    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = settings.get("env") if isinstance(settings, dict) else None
+    from omnigent.onboarding.ambient import read_claude_user_settings
+
+    settings = read_claude_user_settings(cwd)
+    env = settings.get("env") if settings is not None else None
     if not isinstance(env, dict):
         return {}
     return {
@@ -1846,10 +1837,7 @@ class ClaudeSDKExecutor(Executor):
         # the Omnigent elicitation system rather than silently allowed.
         # ``None`` until the adapter installs it on first use.
         self._elicitation_handler: ElicitationHandler | None = None
-        # AskUserQuestion bridge wired in by ExecutorAdapter. When set, the
-        # in-process PreToolUse hook for ``AskUserQuestion`` routes the call
-        # through the Omnigent elicitation form and feeds the user's answers
-        # back via ``updatedInput``. ``None`` until the adapter installs it.
+        # AskUserQuestion bridge installed by ExecutorAdapter; None until wired.
         self._ask_question_handler: AskQuestionHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
@@ -2471,11 +2459,8 @@ class ClaudeSDKExecutor(Executor):
             tools.append("AskUserQuestion")
         return tools
 
-    # Human-answer wait: a person may take a while to pick. The Python SDK
-    # awaits the hook callback without its own cap (see
-    # ``claude_agent_sdk/_internal/query.py`` bare ``await callback(...)``),
-    # so the ceiling is this forwarded value. Mirrors the native path's
-    # ``_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S`` (24h).
+    # The SDK awaits hook callbacks with no cap, so this is the human-answer
+    # ceiling; it matches the native path's 24h permission-hook timeout.
     _ASK_QUESTION_HOOK_TIMEOUT_S: float = 86400.0
 
     def _install_ask_user_question_hook(
@@ -2530,12 +2515,21 @@ class ClaudeSDKExecutor(Executor):
                 # deny deterministically rather than fall through to consent.
                 return _deny("AskUserQuestion unavailable via Omnigent")
             tool_input = payload.get("tool_input") or {}
-            policy_result = await self._evaluate_tool_call_policy("AskUserQuestion", tool_input)
-            if getattr(policy_result, "behavior", None) == "deny":
-                return _deny(
-                    getattr(policy_result, "message", "") or "Denied by Omnigent TOOL_CALL policy"
+            # A raised hook reaches the CLI as "no opinion" and falls back to
+            # native handling; deny instead. Cancellation still propagates.
+            try:
+                policy_result = await self._evaluate_tool_call_policy(
+                    "AskUserQuestion", tool_input
                 )
-            updated_input = await handler(tool_input)
+                if getattr(policy_result, "behavior", None) == "deny":
+                    return _deny(
+                        getattr(policy_result, "message", "")
+                        or "Denied by Omnigent TOOL_CALL policy"
+                    )
+                updated_input = await handler(tool_input)
+            except Exception:
+                logger.exception("AskUserQuestion hook failed; denying the call")
+                return _deny("AskUserQuestion failed in Omnigent; ask in plain text instead.")
             if isinstance(updated_input, str):
                 return _deny(updated_input)
             return {
