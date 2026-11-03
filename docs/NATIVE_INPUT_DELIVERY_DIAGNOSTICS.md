@@ -125,6 +125,12 @@ The executor keeps the terminal for recovery and reports this refusal so the
 server can persist the queued web input. A question or permission prompt
 discovered after Enter may belong to a delivered message and remains uncertain.
 
+Claude's parent transcript identity ignores hooks marked with a child
+`agent_id` or a `subagents/` transcript, including child `SessionStart` hooks.
+Turn-completion detection also excludes native session IDs outside the
+bridge's recorded parent identities, even without a distinctive child path.
+A child's stop must not end its parent's delivery wait.
+
 ## Verification
 
 Run the deterministic persistence check from the repository root:

@@ -14,6 +14,18 @@ export function isArcaHost(
   );
 }
 
+/** Prefer the remembered Arca, then an Isaac-seeded Arca with a live connection. */
+export function findConnectedArcaHost(
+  hosts: readonly Host[],
+  storedArcaHostId: string | null,
+): Host | undefined {
+  const connectedHosts = hosts.filter((host) => host.status === "online" && !host.sandbox_provider);
+  return (
+    connectedHosts.find((host) => host.host_id === storedArcaHostId) ??
+    connectedHosts.find((host) => isArcaHost(host, storedArcaHostId))
+  );
+}
+
 /** The host id last connected via Run on Arca, or null. */
 export function readArcaHostId(): string | null {
   try {

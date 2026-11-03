@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -178,6 +178,8 @@ class _LoopbackCodex:
                 result = {"thread": {"id": params["threadId"]}}
             elif method == "thread/list/loaded":
                 result = {"data": list(self.loaded_threads), "nextCursor": None}
+            elif method == "thread/goal/get":
+                result = {"goal": None}
             else:
                 assert method == "initialize"
             await websocket.send(json.dumps({"id": message["id"], "result": result}))
@@ -374,6 +376,101 @@ async def test_connected_codex_model_change_before_idle_reap(
     )
     native_session.assert_applied(response)
     assert native_session.codex.launches == 1
+
+
+async def test_goal_read_after_idle_reap_does_not_wake_codex(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    await session.reap(clear_bridge=False)
+
+    response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"goal": None}
+    assert session.codex.launches == 1
+    assert session.codex.requests == []
+    assert session.terminals.get(session.session_id, "codex", "main") is None
+
+
+async def test_goal_read_forwards_to_a_live_codex_backend(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+
+    response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"goal": None}
+    assert ("thread/goal/get", {"threadId": session.codex.thread_id}) in session.codex.requests
+    assert session.codex.launches == 1
+
+
+@pytest.mark.parametrize("guard", ["pane", "backend", "startup-failure", "changed-bridge"])
+async def test_goal_read_preserves_failure_for_a_loaded_or_failed_bridge(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    guard: str,
+) -> None:
+    session = native_session
+    await session.reap(clear_bridge=False)
+    if guard == "pane":
+        session.terminals._by_conversation[session.session_id] = {
+            ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path)
+        }
+    elif guard == "backend":
+        native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = SimpleNamespace(
+            close=AsyncMock()
+        )
+    elif guard == "startup-failure":
+        bridge.record_app_server_stopped(session.codex.bridge_dir)
+    else:
+        state = bridge.read_bridge_state(session.codex.bridge_dir)
+        assert state is not None
+
+        async def replace_before_refusal(_rpc: app_server.CodexAppServerClient) -> None:
+            bridge.write_bridge_state(
+                session.codex.bridge_dir, replace(state, thread_id="replacement-thread")
+            )
+            raise ConnectionRefusedError("The old listener disappeared during replacement")
+
+        monkeypatch.setattr(app_server.CodexAppServerClient, "connect", replace_before_refusal)
+
+    response = await client.get(f"/v1/sessions/{session.session_id}/codex_goal")
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "codex_native_goal_failed"
+    assert session.codex.launches == 1
+    assert session.codex.requests == []
+
+
+@pytest.mark.parametrize(
+    ("method", "suffix", "body"),
+    [
+        ("PUT", "", {"objective": "Keep testing"}),
+        ("PATCH", "/status", {"status": "paused"}),
+        ("DELETE", "", None),
+    ],
+)
+async def test_goal_mutations_keep_refusal_after_idle_reap(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    method: str,
+    suffix: str,
+    body: dict[str, str] | None,
+) -> None:
+    session = native_session
+    await session.reap(clear_bridge=False)
+
+    response = await client.request(
+        method, f"/v1/sessions/{session.session_id}/codex_goal{suffix}", json=body
+    )
+
+    assert response.status_code == 503, response.text
+    assert session.codex.launches == 1
+    assert session.codex.requests == []
 
 
 @pytest.mark.parametrize("backend", ["running", "exited", "forwarder-ended", "unowned"])
