@@ -260,14 +260,14 @@ def test_local_launch_prompt_is_not_forwarded_as_a_value_flags_argument(
     )
 
 
-def test_caller_prompt_file_and_inline_prompt_reach_claude_after_omnigent(
+def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
     isolated_mock_llm_server_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Real Claude receives Omnigent's instructions, then the caller's file, then the caller's prompt.
+    Real Claude receives the caller's file, then Omnigent's instructions, then the caller's prompt.
 
-    ``augment_claude_args`` copies the caller's file into a later file flag and keeps the
-    caller's inline flag, so this relies on Claude placing file text before inline text.
+    ``augment_claude_args`` leaves the caller's file flag and adds an inline flag with Omnigent's
+    text before the caller's, so this relies on Claude 2.1.295+ applying both prompt flags.
 
     :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
     :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
@@ -292,7 +292,7 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_after_omnigent(
         python_executable=sys.executable,
         append_system_prompt="OMNIGENT-MARKER session instructions",
     )
-    flag_index = augmented.index("--append-system-prompt-file", len(caller_args))
+    flag_index = augmented.index("--append-system-prompt", len(caller_args))
 
     output = _run_real_claude(
         ["-p", "hello", *caller_args, *augmented[flag_index : flag_index + 2]],
@@ -312,8 +312,7 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_after_omnigent(
     ]
     prompt = next((text for text in system_texts if "OMNIGENT-MARKER" in text), None)
     assert prompt is not None, f"Claude sent no request carrying Omnigent's prompt:\n{output}"
-    positions = [
-        prompt.index(marker) for marker in ("OMNIGENT-MARKER", "FILE-MARKER", "INLINE-MARKER")
-    ]
+    markers = ("FILE-MARKER", "OMNIGENT-MARKER", "INLINE-MARKER")
+    positions = [prompt.index(marker) for marker in markers]
     assert positions == sorted(positions), prompt
-    assert prompt.count("FILE-MARKER") == 1, prompt
+    assert [prompt.count(marker) for marker in markers] == [1, 1, 1], prompt

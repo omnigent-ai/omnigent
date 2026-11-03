@@ -557,8 +557,6 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
-_APPEND_SYSTEM_PROMPT_FILE = "append-system-prompt.md"
-_CALLER_PROMPT_FILE_MAX_BYTES = 1024 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -2885,7 +2883,6 @@ def augment_claude_args(
     model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
     workspace: Path | None = None,
-    launch_cwd: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
@@ -2925,8 +2922,6 @@ def augment_claude_args(
         wiring. ``None`` (e.g. the ``omnigent claude`` CLI's minimal
         spec) adds no plugin args.
     :param workspace: Session workspace used to discover portable ``.agents`` skills.
-    :param launch_cwd: Directory Claude starts in when a launcher changes it from
-        *workspace*; a relative ``--append-system-prompt-file`` is read from it.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -2936,8 +2931,8 @@ def augment_claude_args(
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
         (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt[-file]`` flag, placed before a
-        caller-supplied prompt instead of replacing it.
+        Code's native ``--append-system-prompt`` flag, placed before a
+        caller-supplied inline prompt instead of replacing it.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2980,12 +2975,7 @@ def augment_claude_args(
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
     args.extend(["--settings", str(settings_path)])
-    args = _merge_append_system_prompt(
-        args,
-        append_system_prompt,
-        bridge_dir=bridge_dir,
-        cwd=launch_cwd or workspace or Path.cwd(),
-    )
+    args = _merge_append_system_prompt(args, append_system_prompt)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -3164,104 +3154,49 @@ _CLAUDE_VALUE_FLAGS = frozenset(
 )
 
 
-def _last_claude_option_values(args: list[str], flags: frozenset[str]) -> dict[str, str]:
-    """Return the last value Claude Code parses for each of ``flags``.
+def _last_claude_option_value(args: list[str], flag: str) -> str | None:
+    """Return the last value Claude Code parses for ``flag``, or ``None`` when absent.
 
     Tokens owned by another required-value option are skipped, e.g. the
     literal ``--append-system-prompt`` in ``--system-prompt --append-system-prompt``.
+    An unconsumed ``--`` ends the options, so later tokens are positional.
 
     :param args: Claude CLI arguments, e.g. ``["--append-system-prompt=Be brief."]``.
-    :param flags: Required-value options to read, e.g. ``{"--append-system-prompt"}``.
-    :returns: Each present flag's last value, which may be empty.
+    :param flag: Required-value option to read, e.g. ``"--append-system-prompt"``.
+    :returns: The flag's last value, which may be empty.
     """
-    values: dict[str, str] = {}
+    value: str | None = None
     idx = 0
     while idx < len(args):
         arg = args[idx]
-        flag, joined, joined_value = arg.partition("=")
-        if joined and flag in flags:
-            values[flag] = joined_value
+        if arg == "--":
+            break
+        name, joined, joined_value = arg.partition("=")
+        if joined and name == flag:
+            value = joined_value
         elif arg in _CLAUDE_VALUE_FLAGS:
-            if arg in flags and idx + 1 < len(args):
-                values[arg] = args[idx + 1]
+            if arg == flag and idx + 1 < len(args):
+                value = args[idx + 1]
             idx += 1
         idx += 1
-    return values
+    return value
 
 
-def _read_caller_prompt_file(path: Path) -> str | None:
-    """Return a caller prompt file's text when it is safe to copy outside Claude's sandbox.
+def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]:
+    """Append an ``--append-system-prompt`` that puts ``extra`` before the caller's.
 
-    A sandboxed agent could swap a workspace path for a link to a host file, so
-    no component is followed. ``O_NONBLOCK`` keeps a FIFO from hanging the open.
-
-    :param path: Absolute, normalized path, e.g. ``Path("/workspace/profile.md")``.
-    :returns: The file's text, or ``None`` for a link, a non-regular or
-        hard-linked file, a file over the size limit, or an unreadable path.
-    """
-    *parents, name = path.parts
-    if IS_WINDOWS or not parents:
-        return None
-    try:
-        dir_fd = os.open(parents[0], os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            for part in parents[1:]:
-                next_fd = os.open(
-                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
-                )
-                os.close(dir_fd)
-                dir_fd = next_fd
-            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-        finally:
-            os.close(dir_fd)
-        with os.fdopen(file_fd, "rb") as handle:
-            info = os.fstat(handle.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                return None
-            raw = handle.read(_CALLER_PROMPT_FILE_MAX_BYTES + 1)
-    except OSError:
-        return None
-    if len(raw) > _CALLER_PROMPT_FILE_MAX_BYTES:
-        return None
-    return raw.decode("utf-8", errors="replace")
-
-
-def _merge_append_system_prompt(
-    args: list[str],
-    extra: str | None,
-    *,
-    bridge_dir: Path,
-    cwd: Path,
-) -> list[str]:
-    """Append a prompt flag that puts ``extra`` before the caller's appended prompt.
-
-    Claude Code keeps only the last value of each prompt flag, so Omnigent's
-    flag repeats the caller's value after ``extra``. A caller prompt file is
-    copied into Omnigent's own file, because older Claude Code rejects a file
-    combined with ``--append-system-prompt``; a file that is unsafe to copy is
-    left for Claude to read. Caller tokens are never rewritten.
+    Claude Code keeps only the last value of the flag, so Omnigent's flag
+    repeats the caller's value after ``extra``. Caller tokens, including an
+    ``--append-system-prompt-file``, are never rewritten. Claude Code 2.1.295+
+    applies such a file before the inline prompt; 2.1.278 refuses to start with both.
 
     :param args: Claude CLI argument list to mutate-and-return.
     :param extra: Instructions Omnigent appends, e.g. the agent's instructions.
-    :param bridge_dir: Owner-only bridge directory for Omnigent's prompt file.
-    :param cwd: Directory Claude resolves a relative prompt file against.
     :returns: ``args`` ending with a prompt flag whose value carries both prompts.
     """
     if not extra:
         return args
-    values = _last_claude_option_values(
-        args, frozenset({"--append-system-prompt", "--append-system-prompt-file"})
-    )
-    if caller_file := values.get("--append-system-prompt-file"):
-        # Claude resolves the path from its cwd, collapsing ``..`` without expanding ``~``.
-        file_prompt = _read_caller_prompt_file(Path(os.path.abspath(cwd / caller_file)))
-        if file_prompt is not None:
-            # Claude places a caller's inline prompt after this file's text.
-            prompt_path = bridge_dir / _APPEND_SYSTEM_PROMPT_FILE
-            _write_private_file(prompt_path, f"{extra}\n\n{file_prompt}" if file_prompt else extra)
-            args.extend(["--append-system-prompt-file", str(prompt_path)])
-            return args
-    existing = values.get("--append-system-prompt")
+    existing = _last_claude_option_value(args, "--append-system-prompt")
     args.extend(["--append-system-prompt", f"{extra}\n\n{existing}" if existing else extra])
     return args
 

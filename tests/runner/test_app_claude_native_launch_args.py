@@ -18,7 +18,6 @@ import logging
 import os
 import shlex
 import subprocess
-from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -1320,15 +1319,12 @@ def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
     assert sorted(path.name for path in workspace.iterdir()) == []
 
 
-def _claude_auto_create_session_init(
-    session_id: str, workspace: Path, terminal_launch_args: list[str] | None = None
-):
+def _claude_auto_create_session_init(session_id: str, workspace: Path):
     """
     Build the session-init envelope ``_auto_create_claude_terminal`` consumes.
 
     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
-    :param terminal_launch_args: Caller Claude args, e.g. ``["--verbose"]``.
     :returns: A :class:`RunnerSessionInitEnvelope` rooted at *workspace*.
     """
     from omnigent.runner.session_init_protocol import (
@@ -1342,12 +1338,7 @@ def _claude_auto_create_session_init(
         server_version="test",
         session_id=session_id,
         agent_id="agent",
-        snapshot=RunnerSessionInitSnapshot(
-            created_at=0,
-            updated_at=0,
-            workspace=str(workspace),
-            terminal_launch_args=terminal_launch_args,
-        ),
+        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(workspace)),
     )
 
 
@@ -1357,8 +1348,6 @@ async def _auto_create_claude_terminal_for_test(
     session_id: str,
     workspace: Path,
     registry: object,
-    agent_spec: object | None = None,
-    terminal_launch_args: list[str] | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1367,8 +1356,6 @@ async def _auto_create_claude_terminal_for_test(
     :param session_id: Session id, e.g. ``"conv_seed_launch_env"``.
     :param workspace: Session workspace, e.g. the ``bridge_dir`` fixture.
     :param registry: Session resource registry double.
-    :param agent_spec: Session agent spec, or ``None``.
-    :param terminal_launch_args: Caller Claude args, e.g. ``["--verbose"]``.
     :returns: None. Raises whatever the auto-create path raises.
     """
     from unittest.mock import AsyncMock, Mock
@@ -1387,8 +1374,7 @@ async def _auto_create_claude_terminal_for_test(
         registry,
         Mock(),
         server_client=AsyncMock(spec=httpx.AsyncClient),
-        agent_spec=agent_spec,
-        session_init=_claude_auto_create_session_init(session_id, workspace, terminal_launch_args),
+        session_init=_claude_auto_create_session_init(session_id, workspace),
         auth_token_factory=lambda: None,
         resolve_launch_config=AsyncMock(return_value=None),
     )
@@ -1645,58 +1631,6 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     data = json.loads((workspace / expected).read_text())
     assert data["projects"][str((workspace / "sub").resolve())]["hasTrustDialogAccepted"] is True
     assert not (tmp_path / "home" / ".claude.json").exists()
-
-
-@pytest.mark.posix_only
-async def test_auto_create_claude_terminal_reads_caller_prompt_file_from_env_chdir(
-    bridge_dir: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A relative caller prompt file is read from the directory ``env -C`` starts Claude in."""
-    from unittest.mock import Mock
-
-    from omnigent.runner.resource_registry import SessionResourceRegistry
-    from omnigent.spec.types import AgentSpec, ExecutorSpec
-
-    workspace = tmp_path / "workspace"
-    (workspace / "sub").mkdir(parents=True)
-    (workspace / "profile.md").write_text("ROOT")
-    (workspace / "sub" / "profile.md").write_text("SUB")
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.setattr(
-        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
-    )
-    monkeypatch.setattr(
-        "omnigent.harness_startup_config.resolve_harness_args",
-        lambda _harness, cli_args, cfg=None: ["-C", "sub", "claude", *cli_args],
-    )
-    registry = Mock(spec=SessionResourceRegistry)
-    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
-    registry.launch_required_terminal.side_effect = RuntimeError("stop before launch")
-
-    with pytest.raises(RuntimeError, match="stop before launch"):
-        await _auto_create_claude_terminal_for_test(
-            monkeypatch,
-            session_id="conv_prompt_file_chdir",
-            workspace=workspace,
-            registry=registry,
-            agent_spec=AgentSpec(
-                spec_version=1,
-                name="claude_code",
-                instructions="OMNIGENT",
-                executor=ExecutorSpec(),
-            ),
-            terminal_launch_args=["--append-system-prompt-file", "profile.md"],
-        )
-
-    args = registry.launch_required_terminal.await_args.kwargs["spec"].args
-    assert args[:5] == ["-C", "sub", "claude", "--append-system-prompt-file", "profile.md"]
-    prompt_files = [
-        value for flag, value in pairwise(args) if flag == "--append-system-prompt-file"
-    ]
-    assert Path(prompt_files[-1]).read_text() == "OMNIGENT\n\nSUB"
 
 
 @pytest.mark.parametrize(

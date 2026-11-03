@@ -4340,8 +4340,15 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
             ("--append-system-prompt", "Review.", "--agent-name", "--append-system-prompt=Name."),
             "Keep framework metadata separate.\n\nReview.",
         ),
+        (("--append-system-prompt-file", "profile.md"), "Keep framework metadata separate."),
+        (("--append-system-prompt-file=profile.md",), "Keep framework metadata separate."),
         (
-            ("--append-system-prompt-file", "missing.md", "--append-system-prompt", "Review."),
+            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+            "Keep framework metadata separate.\n\nReview.",
+        ),
+        (("--", "--append-system-prompt=Positional."), "Keep framework metadata separate."),
+        (
+            ("--system-prompt", "--", "--append-system-prompt", "Review."),
             "Keep framework metadata separate.\n\nReview.",
         ),
     ],
@@ -4357,15 +4364,23 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
         "owned-joined-literal",
         "owned-by-newer-claude-option",
         "owned-by-teammate-option",
-        "unreadable-file-keeps-caller-prompt",
+        "caller-file-separate-value",
+        "caller-file-joined-value",
+        "caller-file-and-prompt",
+        "after-end-of-options",
+        "end-of-options-owned-by-option",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     user_args: tuple[str, ...],
     expected_prompt: str,
 ) -> None:
     """Caller tokens stay intact; Omnigent's later prompt flag carries the caller's prompt."""
+    # A readable caller prompt file is still left for Claude to read.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
     omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
@@ -4383,143 +4398,6 @@ def test_augment_claude_args_appends_caller_system_prompt(
     assert omnigent_args.count("--append-system-prompt") == 1
     omnigent_args[omnigent_args.index("--append-system-prompt") + 1] = expected_prompt
     assert args == [*user_args, *omnigent_args]
-
-
-@pytest.mark.posix_only
-@pytest.mark.parametrize(
-    ("user_args", "expected_prompt"),
-    [
-        (
-            ("--append-system-prompt-file", "profile.md"),
-            "Keep framework metadata separate.\n\nReviewer profile.\n",
-        ),
-        (
-            ("--append-system-prompt-file=profile.md",),
-            "Keep framework metadata separate.\n\nReviewer profile.\n",
-        ),
-        (
-            ("--append-system-prompt-file", "empty.md", "--append-system-prompt-file=profile.md"),
-            "Keep framework metadata separate.\n\nReviewer profile.\n",
-        ),
-        (
-            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Be brief."),
-            "Keep framework metadata separate.\n\nReviewer profile.\n",
-        ),
-        (("--append-system-prompt-file", "empty.md"), "Keep framework metadata separate."),
-    ],
-    ids=[
-        "separate-value",
-        "joined-value",
-        "repeated-files-last-wins",
-        "inline-prompt-stays-after-file",
-        "empty-file",
-    ],
-)
-def test_augment_claude_args_copies_caller_system_prompt_file(
-    tmp_path: Path,
-    user_args: tuple[str, ...],
-    expected_prompt: str,
-) -> None:
-    """Omnigent's later prompt file holds its instructions, then the caller's file."""
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
-    (workspace / "empty.md").write_text("", encoding="utf-8")
-    bridge_dir = tmp_path / "bridge"
-    omnigent_args = augment_claude_args(
-        (),
-        bridge_dir=bridge_dir,
-        workspace=workspace,
-        python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
-    )
-
-    args = augment_claude_args(
-        user_args,
-        bridge_dir=bridge_dir,
-        workspace=workspace,
-        python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
-    )
-
-    prompt_index = omnigent_args.index("--append-system-prompt")
-    prompt_file = bridge_dir / "append-system-prompt.md"
-    omnigent_args[prompt_index : prompt_index + 2] = [
-        "--append-system-prompt-file",
-        str(prompt_file),
-    ]
-    assert args == [*user_args, *omnigent_args]
-    assert prompt_file.read_text(encoding="utf-8") == expected_prompt
-    assert prompt_file.stat().st_mode & 0o777 == 0o600
-
-
-@pytest.mark.posix_only
-@pytest.mark.parametrize(
-    "user_args",
-    [
-        ("--append-system-prompt-file", "missing.md"),
-        ("--append-system-prompt-file=",),
-        ("--system-prompt", "--append-system-prompt-file", "profile.md"),
-        ("--append-subagent-system-prompt-file", "--append-system-prompt-file", "profile.md"),
-        ("--append-system-prompt-file", "profile.fifo"),
-        ("--append-system-prompt-file", "linked.md"),
-        ("--append-system-prompt-file", "linked-dir/secret.md"),
-        ("--append-system-prompt-file", "hard-linked.md"),
-        ("--append-system-prompt-file", "oversized.md"),
-    ],
-    ids=[
-        "unreadable-file",
-        "empty-path",
-        "owned-by-another-option",
-        "owned-by-subagent-file",
-        "fifo",
-        "symlinked-file",
-        "symlinked-directory",
-        "hard-linked-file",
-        "oversized-file",
-    ],
-)
-def test_augment_claude_args_keeps_inline_prompt_without_readable_caller_file(
-    tmp_path: Path,
-    user_args: tuple[str, ...],
-) -> None:
-    """Without a caller file that is safe to copy, Omnigent keeps its inline prompt flag."""
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
-    secret = tmp_path / "outside" / "secret.md"
-    secret.parent.mkdir()
-    secret.write_text("Sandbox-excluded secret.\n", encoding="utf-8")
-    faults: dict[str, Callable[[], object]] = {
-        "profile.fifo": lambda: os.mkfifo(workspace / "profile.fifo"),
-        "linked.md": lambda: (workspace / "linked.md").symlink_to(secret),
-        "linked-dir/secret.md": lambda: (workspace / "linked-dir").symlink_to(secret.parent),
-        "hard-linked.md": lambda: os.link(secret, workspace / "hard-linked.md"),
-        "oversized.md": lambda: (workspace / "oversized.md").write_bytes(
-            b"x" * (claude_native_bridge._CALLER_PROMPT_FILE_MAX_BYTES + 1)
-        ),
-    }
-    if make_fault := faults.get(user_args[-1]):
-        make_fault()
-    bridge_dir = tmp_path / "bridge"
-    omnigent_args = augment_claude_args(
-        (),
-        bridge_dir=bridge_dir,
-        workspace=workspace,
-        python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
-    )
-
-    args = augment_claude_args(
-        user_args,
-        bridge_dir=bridge_dir,
-        workspace=workspace,
-        python_executable="/venv/bin/python",
-        append_system_prompt="Keep framework metadata separate.",
-    )
-
-    assert args == [*user_args, *omnigent_args]
-    assert not (bridge_dir / "append-system-prompt.md").exists()
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:

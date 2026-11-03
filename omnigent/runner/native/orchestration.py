@@ -9806,8 +9806,38 @@ async def _auto_create_claude_terminal(
         # Its dead-owner cleanup also reclaims these generated skill links.
         bundle_dir = bridge_dir / "skill-bundle"
         _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
-    # Config ``harness.claude-native.{command,args}`` wraps the launch, e.g. ``isaac -- <args>``;
-    # its args prepend the augmented args. cli_native.py uses the same resolver.
+    claude_args = augment_claude_args(
+        base_claude_args,
+        bridge_dir=bridge_dir,
+        workspace=Path(workspace),
+        ap_server_url=server_url,
+        ap_auth_headers=_runner_headers,
+        bundle_dir=bundle_dir,
+        agent_name=agent_name,
+        skills_filter=skills_filter,
+        api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        model_overrides=claude_config.model_overrides if claude_config is not None else None,
+        subagent_router_dir=subagent_router_dir,
+        append_system_prompt="\n\n".join(
+            x
+            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
+            if x
+        )
+        or None,
+        allowed_tools=routed_spawn_tools,
+        # The route-turn hook is registered only when this session can
+        # actually route; otherwise every submit would pay its round trip.
+        turn_routing=_claude_turn_router is not None,
+    )
+
+    # Apply the per-harness startup command/args override from config
+    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
+    # downstream integration can wrap this managed-host launch — e.g. Databricks'
+    # ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
+    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
+    # appended above, so the ``--`` stays first). Identity by default. This is
+    # the same resolver the local-CLI native launch uses (see cli_native.py), so
+    # both terminal-creation paths honour one config surface.
     from omnigent.config import load_effective_config  # noqa: FlagLocalImports
     from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
         resolve_harness_args,
@@ -9816,8 +9846,7 @@ async def _auto_create_claude_terminal(
 
     _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
-    # Claude's cwd and environment depend only on the wrapper prefix, so seed with the base args.
-    launch_args = resolve_harness_args("claude-native", tuple(base_claude_args), cfg=_harness_cfg)
+    launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
     # name resolves against this process's inherited PATH (same lookup tmux's
@@ -9871,8 +9900,10 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
-        ensure_claude_workspace_trusted(launch_cwd, env=_claude_terminal_launch_env(env_spec))
+        ensure_claude_workspace_trusted(
+            _claude_terminal_launch_cwd(env_spec, agent_os_env),
+            env=_claude_terminal_launch_env(env_spec),
+        )
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.
@@ -9898,33 +9929,6 @@ async def _auto_create_claude_terminal(
         if cancelled is not None:
             raise cancelled from seed_error
         raise
-    claude_args = augment_claude_args(
-        base_claude_args,
-        bridge_dir=bridge_dir,
-        workspace=Path(workspace),
-        launch_cwd=launch_cwd,
-        ap_server_url=server_url,
-        ap_auth_headers=_runner_headers,
-        bundle_dir=bundle_dir,
-        agent_name=agent_name,
-        skills_filter=skills_filter,
-        api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
-        model_overrides=claude_config.model_overrides if claude_config is not None else None,
-        subagent_router_dir=subagent_router_dir,
-        append_system_prompt="\n\n".join(
-            x
-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
-            if x
-        )
-        or None,
-        allowed_tools=routed_spawn_tools,
-        # The route-turn hook is registered only when this session can
-        # actually route; otherwise every submit would pay its round trip.
-        turn_routing=_claude_turn_router is not None,
-    )
-    env_spec = dataclasses.replace(
-        env_spec, args=resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
-    )
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
         "env_keys=%s cwd=%s scrollback=%d",
