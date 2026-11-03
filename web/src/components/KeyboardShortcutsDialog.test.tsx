@@ -17,8 +17,10 @@ const supportsDesktopCommands = vi.fn(() => false);
 const contentSearchEnabled = vi.fn(() => false);
 const gridsEnabled = vi.fn(() => false);
 const splitTerminalEnabled = vi.fn(() => false);
+const siblingSessionsEnabled = vi.fn(() => false);
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
+    sibling_sessions: siblingSessionsEnabled(),
     features: {
       workspace_content_search: contentSearchEnabled(),
       grid_sessions_display_ui: gridsEnabled(),
@@ -44,6 +46,7 @@ beforeEach(() => {
   contentSearchEnabled.mockReturnValue(false);
   gridsEnabled.mockReturnValue(false);
   splitTerminalEnabled.mockReturnValue(false);
+  siblingSessionsEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -134,6 +137,14 @@ describe("KeyboardShortcutsDialog", () => {
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+  });
+
+  it("shows Add Agent only when sibling sessions are available", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Add an agent to this session")).toBeNull();
+    siblingSessionsEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Add an agent to this session")).toEqual(["Ctrl", "Alt", "A"]);
   });
 
   it("keeps native new-session keys and updates the Settings reference", () => {

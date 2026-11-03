@@ -219,7 +219,8 @@ the header menu), and each place is a separate entry point.
 
 - For siblings, open an owned active session's sidebar kebab, right-click menu,
   or header menu and choose **Add Agent**. Mobile row/header menus offer
-  the same action. Select a host in the composer and send the first message.
+  the same action. On desktop, Cmd/Ctrl+Alt+A opens **Add Agent** for the active
+  session. Select a host in the composer and send the first message.
 
 **Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
@@ -1175,6 +1176,9 @@ model. It covers desktop kebab/right-click/header and mobile long-press/header
 composer navigation, shared/fresh compute, pin/project/fork actions, archive/undo,
 and survivor messaging after representative deletion. Set `OMNIGENT_DEMO_DIR`
 outside the checkout to retain recordings.
+The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
+`web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
+its discoverability.
 
 ## Gotchas
 

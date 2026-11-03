@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
@@ -99,6 +99,11 @@ const SECOND_CONVERSATION: Conversation = {
   git_branch: "feature/release-planning",
 };
 
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
+}
+
 function menuTree(
   overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
@@ -120,6 +125,7 @@ function menuTree(
             onFork={mocks.fork}
             {...overrides}
           />
+          <LocationProbe />
         </MemoryRouter>
       </CapabilitiesProvider>
     </QueryClientProvider>
@@ -214,6 +220,31 @@ describe("HeaderConversationMenu", () => {
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
 
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
+  });
+
+  it("opens Add Agent with Ctrl+Alt+A and ignores held, composing, and AltGraph keys", () => {
+    renderMenu();
+    const addAgentKey = (init: KeyboardEventInit = {}) =>
+      new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        code: "KeyA",
+        ctrlKey: true,
+        altKey: true,
+        ...init,
+      });
+
+    fireEvent(window, addAgentKey({ repeat: true }));
+    fireEvent(window, addAgentKey({ isComposing: true }));
+    const altGraph = addAgentKey();
+    vi.spyOn(altGraph, "getModifierState").mockImplementation((key) => key === "AltGraph");
+    fireEvent(window, altGraph);
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+
+    const accepted = addAgentKey();
+    fireEvent(window, accepted);
+    expect(accepted.defaultPrevented).toBe(true);
+    expect(screen.getByTestId("location")).toHaveTextContent("/?sibling=conv-1");
   });
 
   it("runs pin and mark-unread actions for the active session", () => {
@@ -341,6 +372,7 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Add Agent" })).toBeNull();
     const item = screen.getByRole("menuitem", { name: "Unarchive" });
     expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
 

@@ -2058,6 +2058,22 @@ describe("Sidebar sections", () => {
     expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
+
+  it("keeps the family chevron inside the representative session surface", () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { family }),
+      conv("conv_sibling", "Codex", { family }),
+    ]);
+    renderSidebar();
+
+    const link = screen.getByText("conv_parent").closest("a")!;
+    const surface = link.parentElement!;
+    const chevron = screen.getByRole("button", { name: "Collapse session family" });
+    expect(surface).toHaveClass("relative");
+    expect(surface).toContainElement(chevron);
+    expect(link).not.toContainElement(chevron);
+  });
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the

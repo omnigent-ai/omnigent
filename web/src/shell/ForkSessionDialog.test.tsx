@@ -115,13 +115,18 @@ function host(overrides: Partial<Host> = {}): Host {
   } as Host;
 }
 
-// Mirrors fetchHosts: pickers never see server-managed sandbox hosts; only
-// includeSandbox callers (the action-restrictions lookup) do.
+// Mirrors fetchHosts: pickers hide managed sandboxes except for an explicitly
+// reusable source host; includeSandbox callers see the full list.
 function setHosts(hosts: Host[]): void {
   useHostsMock.mockImplementation(
     (options) =>
       ({
-        data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        data: options?.includeSandbox
+          ? hosts
+          : hosts.filter(
+              (candidate) =>
+                !candidate.sandbox_provider || candidate.host_id === options?.sourceHostId,
+            ),
       }) as ReturnType<typeof useHosts>,
   );
 }
@@ -345,17 +350,18 @@ describe("ForkSessionDialog", () => {
     renderDialog({
       sourceHostId: "host_1",
       sourceWorkspace: "/Users/a/repo",
-      info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      info: {
+        managed_sandboxes_enabled: true,
+        sandbox_providers: ["lakebox", "arclet"],
+        sibling_sessions: true,
+      },
     });
 
     expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
     expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     openHostSelect();
     expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-    // A source's own sandbox host is never offered as an existing destination.
-    if (provider !== null) {
-      expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
-    }
+    expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
   });
@@ -2117,7 +2123,7 @@ describe("ForkSessionDialog", () => {
           isLoading: false,
           error: null,
         } as unknown as ReturnType<typeof useSession>);
-        // The source Arclet is filtered from the picker; another machine is a target.
+        // The source Arclet and another machine are both valid targets.
         setHosts([
           host({ sandbox_provider: "arclet" }),
           host({ host_id: "host_2", name: "laptop" }),
@@ -2127,14 +2133,18 @@ describe("ForkSessionDialog", () => {
         } as unknown as Awaited<ReturnType<typeof forkSession>>);
         renderDialog({
           ...CODING,
-          info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_providers: ["lakebox", "arclet"],
+            sibling_sessions: true,
+          },
         });
 
         await act(async () => {});
         expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
         openHostSelect();
         expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-        expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+        expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
         fireEvent.click(screen.getByTestId(row));
         expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
 

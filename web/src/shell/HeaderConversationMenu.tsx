@@ -25,6 +25,7 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
+import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   ARCHIVE_SESSION_KEYS,
@@ -72,6 +73,9 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
+import { useIsEmbedded } from "@/lib/embedded";
+import { getEmbedRoot } from "@/lib/host";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
@@ -126,6 +130,7 @@ export function HeaderConversationMenu({
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
+  const isEmbedded = useIsEmbedded();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
@@ -144,6 +149,8 @@ export function HeaderConversationMenu({
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
   const isArchived = conversation.archived === true;
+  const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
+  const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
@@ -170,6 +177,31 @@ export function HeaderConversationMenu({
     setDeleteOpen(false);
     setDeleteBranch(false);
   }, [conversation.id, conversation.title]);
+
+  useEffect(() => {
+    if (!canAddAgent) return;
+    const handleAddAgent = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        !hasCommandModifier(event) ||
+        !event.altKey ||
+        event.shiftKey ||
+        event.getModifierState("AltGraph") ||
+        event.code !== "KeyA"
+      ) {
+        return;
+      }
+      const embedRoot = getEmbedRoot();
+      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
+      event.preventDefault();
+      event.stopPropagation();
+      navigate(addAgentPath);
+    };
+    window.addEventListener("keydown", handleAddAgent);
+    return () => window.removeEventListener("keydown", handleAddAgent);
+  }, [addAgentPath, canAddAgent, isEmbedded, navigate]);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -333,11 +365,12 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      {!isArchived && info !== "loading" && info.sibling_sessions && (
+      {canAddAgent && (
         <DropdownMenuItem
           data-testid="add-sibling-session"
           className={itemClass}
-          onSelect={() => navigate(`/?sibling=${encodeURIComponent(conversation.id)}`)}
+          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+          onSelect={() => navigate(addAgentPath)}
         >
           <PlusIcon className="size-3.5" />
           Add Agent

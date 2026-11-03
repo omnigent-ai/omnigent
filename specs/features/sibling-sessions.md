@@ -44,7 +44,8 @@ Additional requirements:
 - The action opens the normal new-session composer with source context. It
   offers normal hosts/new sandboxes plus only the clicked member's ephemeral
   host, preselected. The family can span hosts; the picker does not offer every
-  ephemeral host used by the family. Desktop and mobile menus use this composer.
+  ephemeral host used by the family. Desktop and mobile menus use this composer;
+  Cmd/Ctrl+Alt+A opens it for the active desktop session.
 - Each sibling starts a fresh conversation. No copied-history option is offered;
   users who want copied history use ordinary Fork.
 - Siblings have a curved decorative elbow beside their indentation. They never
@@ -153,9 +154,10 @@ fresh compute; it cannot recover uncommitted files from a destroyed filesystem.
   creation yields one family in single and split database configurations.
 - Concurrent recovery attempts yield one new sandbox. Stale cleanup cannot
   destroy a replacement generation or revoke its credential.
-- Desktop row, right-click and header menus, and mobile long-press/header menus, open
-  the same fresh-conversation composer. Reloads retain nesting and project/pin
-  membership. Real subagent presentation stays separate.
+- Desktop row, right-click and header menus, the Cmd/Ctrl+Alt+A shortcut, and
+  mobile long-press/header menus open the same fresh-conversation composer.
+  Reloads retain nesting and project/pin membership. Real subagent presentation
+  stays separate.
 
 ## Verification
 
