@@ -132,6 +132,8 @@ const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 beforeEach(() => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+  vi.spyOn(sessionsApi, "listSideChats").mockResolvedValue([]);
+  vi.spyOn(sessionsApi, "removeListedSideChat").mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -1458,6 +1460,45 @@ describe("WorkspacePanel mobile side chats", () => {
 
     expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+});
+
+describe("WorkspacePanel side chats from the user's other devices", () => {
+  it("opens a tab for each side chat the server lists", async () => {
+    vi.mocked(sessionsApi.listSideChats).mockResolvedValue([{ id: "conv_remote", createdAt: 1 }]);
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Side chat 1" }));
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_remote");
+    expect(sessionsApi.listSideChats).toHaveBeenCalledWith("conv_ws");
+  });
+
+  it("stops listing a side chat closed here, and keeps it open if that fails", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      selectedSideChatId: "conv_side_b",
+    });
+    vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
+    const remove = vi
+      .mocked(sessionsApi.removeListedSideChat)
+      .mockRejectedValueOnce(new Error("offline"));
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Side chat 2" }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
+    );
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Side chat 2" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
+    );
+    expect(remove.mock.calls).toEqual([
+      ["conv_ws", "conv_side_b"],
+      ["conv_ws", "conv_side_b"],
+    ]);
   });
 });
 

@@ -41,7 +41,10 @@ the header menu), and each place is a separate entry point.
   closing one stops only that chat. Starting one from a stopped generic hosted
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
-  message or Resume.
+  message or Resume. Its creator sees the open side chat as a Workspace tab in
+  their other browsers and devices, without the parent history it copied.
+  Closing it in one removes the tab from the others when they next load the
+  session or regain focus.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or

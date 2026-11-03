@@ -135,6 +135,15 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
+# The newest item a side chat copied from its parent, or "" when it copied none,
+# so a device that didn't create the side chat can still hide that history.
+SIDE_CHAT_HISTORY_LABEL_KEY = "omnigent.side_chat.history_item_id"
+
+# Stored on the PARENT, one per open side chat: ``omnigent.side_chats.<child_id>``
+# whose value is the creator (see :func:`side_chat_entry_owner`). It lets the
+# creator's other devices list the side chat; session reads never expose it.
+SIDE_CHAT_ENTRY_LABEL_PREFIX = "omnigent.side_chats."
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -169,6 +178,26 @@ def pinned_label_key(user_id: str | None) -> str:
         # 64 hex chars — well within the budget and collision-safe.
         suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
     return f"{PINNED_LABEL_KEY}.{suffix}"
+
+
+def side_chat_entry_label_key(side_chat_id: str) -> str:
+    """
+    The parent-session label key recording one open side chat.
+
+    :param side_chat_id: The side chat's conversation id, e.g. ``"conv_abc"``.
+    :returns: ``"omnigent.side_chats.<side_chat_id>"``.
+    """
+    return f"{SIDE_CHAT_ENTRY_LABEL_PREFIX}{side_chat_id}"
+
+
+def side_chat_entry_owner(user_id: str | None) -> str:
+    """
+    The value a side-chat entry label stores for its creator.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user mode.
+    :returns: The user id, or the ``local`` sentinel without auth.
+    """
+    return user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -241,6 +270,7 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
 }

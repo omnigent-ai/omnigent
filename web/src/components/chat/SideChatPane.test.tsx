@@ -1278,6 +1278,85 @@ describe("side chat sealed by the server", () => {
   });
 });
 
+describe("history a generic side chat copied from its parent", () => {
+  const message = (id: string, role: "user" | "assistant", text: string) => ({
+    id,
+    response_id: `turn_${id}`,
+    type: "message" as const,
+    role,
+    status: "completed" as const,
+    content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+  });
+  const sideChatTurn = [
+    message("item_side_q", "user", "Side question"),
+    message("item_side_a", "assistant", "Side answer"),
+  ];
+  const showChild = (items: ReturnType<typeof message>[]) =>
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "openai-agents",
+      sessionStatus: "idle",
+      blocks: itemsToBlocks(items),
+    });
+
+  it("stays hidden on a device that didn't create the side chat", async () => {
+    mockSession.labels = { "omnigent.side_chat.history_item_id": "item_parent_a" };
+    let resolveOlder: (page: sessionsApi.SessionItemsPage) => void = () => {};
+    const fetchOlder = vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOlder = resolve;
+      }),
+    );
+    showChild([
+      message("item_parent_q", "user", "Parent question"),
+      message("item_parent_a", "assistant", "Parent answer"),
+      ...sideChatTurn,
+    ]);
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByText("Parent question")).toBeNull();
+    expect(screen.queryByText("Side question")).toBeNull();
+    await act(async () =>
+      resolveOlder({
+        items: [message("item_parent_q", "user", "Parent question")],
+        hasMore: false,
+      }),
+    );
+
+    expect(await screen.findByText("Side question")).toBeInTheDocument();
+    expect(screen.getByText("Side answer")).toBeInTheDocument();
+    expect(screen.queryByText("Parent question")).toBeNull();
+    expect(screen.queryByText("Parent answer")).toBeNull();
+    expect(fetchOlder).toHaveBeenCalledWith(childId, {
+      olderThan: "item_parent_a",
+      limit: sessionsApi.INITIAL_WINDOW_ITEMS,
+    });
+    expect(JSON.parse(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)!)).toEqual([
+      "item_parent_a",
+      "item_parent_q",
+    ]);
+  });
+
+  it("is empty when the parent had no history, so the first question shows", () => {
+    mockSession.labels = { "omnigent.side_chat.history_item_id": "" };
+    const fetchOlder = vi.spyOn(sessionsApi, "fetchSessionItemsPage");
+    showChild(sideChatTurn);
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.getByText("Side question")).toBeInTheDocument();
+    expect(fetchOlder).not.toHaveBeenCalled();
+  });
+
+  it("shows the whole transcript when the copied history can't be read", async () => {
+    mockSession.labels = { "omnigent.side_chat.history_item_id": "item_parent_a" };
+    vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockRejectedValue(new Error("offline"));
+    showChild([message("item_parent_a", "assistant", "Parent answer"), ...sideChatTurn]);
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(await screen.findByText("Side question")).toBeInTheDocument();
+    expect(screen.getByText("Parent answer")).toBeInTheDocument();
+  });
+});
+
 describe("side-chat scroll position", () => {
   const earlierAnswer = itemsToBlocks([
     {

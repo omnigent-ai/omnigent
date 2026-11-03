@@ -1,4 +1,4 @@
-"""Items and child-session routes."""
+"""Items, child-session and side-chat routes."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ from fastapi import (
     APIRouter,
     Query,
     Request,
+    Response,
 )
 
+from omnigent.entities import Conversation
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -43,8 +45,16 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SideChatList,
+    SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import (
+    SIDE_CHAT_ENTRY_LABEL_PREFIX,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+    side_chat_entry_label_key,
+    side_chat_entry_owner,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -204,3 +214,97 @@ def register_items_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    async def _readable_session(
+        request: Request, session_id: str
+    ) -> tuple[str | None, Conversation]:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        return user_id, conv
+
+    # ── /sessions/{session_id}/side_chats ────────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/side_chats",
+        response_model=None,
+        responses={200: {"model": SideChatList}},
+    )
+    async def list_side_chats(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=100),
+        after: str | None = Query(default=None),
+    ) -> PaginatedList:
+        """
+        List the side chats the caller has open on a session.
+
+        Side chats stay out of the session list, so this is how a client that
+        didn't create one (another device or browser) finds it for the
+        Workspace rail. Only the caller's own side chats are returned, ordered
+        by id; ``created_at`` gives their creation order.
+
+        :param request: Inbound HTTP request; carries the caller identity.
+        :param session_id: The parent session, e.g. ``"conv_abc123"``.
+        :param limit: Maximum number of side chats to return (1-100).
+        :param after: Cursor — return side chats whose id sorts after this one.
+        :returns: A :class:`PaginatedList` of :class:`SideChatSummary` objects.
+        :raises OmnigentError: 403 if the caller lacks READ on ``session_id``;
+            404 if no session exists there.
+        """
+        user_id, parent = await _readable_session(request, session_id)
+        owner = side_chat_entry_owner(user_id)
+        side_chat_ids = sorted(
+            key.removeprefix(SIDE_CHAT_ENTRY_LABEL_PREFIX)
+            for key, value in parent.labels.items()
+            if key.startswith(SIDE_CHAT_ENTRY_LABEL_PREFIX) and value == owner
+        )
+        if after is not None:
+            side_chat_ids = [
+                side_chat_id for side_chat_id in side_chat_ids if side_chat_id > after
+            ]
+        page_ids = side_chat_ids[:limit]
+        side_chats = await asyncio.to_thread(conversation_store.get_conversations, page_ids)
+        data = [
+            SideChatSummary(id=side_chat.id, created_at=side_chat.created_at)
+            for side_chat_id in page_ids
+            if (side_chat := side_chats.get(side_chat_id)) is not None
+            and side_chat.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY) == session_id
+        ]
+        return PaginatedList(
+            data=data,
+            first_id=page_ids[0] if page_ids else None,
+            last_id=page_ids[-1] if page_ids else None,
+            has_more=len(side_chat_ids) > limit,
+        )
+
+    @router.delete(
+        "/sessions/{session_id}/side_chats/{side_chat_id}",
+        status_code=204,
+    )
+    async def remove_side_chat(request: Request, session_id: str, side_chat_id: str) -> Response:
+        """
+        Stop listing one of the caller's side chats on a session.
+
+        Called when the side chat's tab is closed, so the caller's other
+        clients drop it too. The side chat's own session is left as is.
+        Idempotent: a side chat that isn't listed for the caller is a no-op.
+
+        :param request: Inbound HTTP request; carries the caller identity.
+        :param session_id: The parent session, e.g. ``"conv_abc123"``.
+        :param side_chat_id: The side chat's session id, e.g. ``"conv_def456"``.
+        :returns: An empty ``204 No Content`` response.
+        :raises OmnigentError: 403 if the caller lacks READ on ``session_id``;
+            404 if no session exists there.
+        """
+        user_id, parent = await _readable_session(request, session_id)
+        key = side_chat_entry_label_key(side_chat_id)
+        if parent.labels.get(key) == side_chat_entry_owner(user_id):
+            await asyncio.to_thread(conversation_store.delete_label, session_id, key)
+        return Response(status_code=204)

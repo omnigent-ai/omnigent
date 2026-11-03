@@ -148,6 +148,62 @@ describe("side-chat soft tabs", () => {
   });
 });
 
+describe("side chats the server lists", () => {
+  it("open as tabs without taking the selection", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("conv_local"));
+
+    act(() => result.current.sync(["conv_remote"]));
+
+    expect(result.current.tabs).toEqual(["conv_local", "conv_remote"]);
+    expect(result.current.selected).toBe("conv_local");
+    expect(readSessionWorkspaceState("session-a").syncedSideChats).toEqual(["conv_remote"]);
+  });
+
+  it("close when another device closes them, leaving tabs the list never named", () => {
+    const subagentTab = subagentTabId("conv_child");
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.sync(["conv_a", "conv_b"]));
+    act(() => result.current.open("conv_unlisted"));
+    act(() => result.current.open(subagentTab));
+    act(() => result.current.select("conv_b"));
+
+    act(() => result.current.sync(["conv_a"]));
+
+    expect(result.current.tabs).toEqual(["conv_a", "conv_unlisted", subagentTab]);
+    expect(result.current.selected).toBe("conv_a");
+  });
+
+  it("stay closed when a list fetched before the close still names them", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.sync(["conv_a"]));
+    act(() => result.current.close("conv_a"));
+
+    act(() => result.current.sync(["conv_a"]));
+
+    expect(result.current.tabs).toEqual([]);
+  });
+
+  it("keep a side chat opened here before the list includes it, without duplicating it", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("conv_new"));
+
+    act(() => result.current.sync([]));
+    act(() => result.current.sync(["conv_new"]));
+
+    expect(result.current.tabs).toEqual(["conv_new"]);
+    expect(result.current.selected).toBe("conv_new");
+  });
+
+  it("leave storage untouched when the list is unchanged", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+
+    act(() => result.current.sync([]));
+
+    expect(localStorage.getItem(SESSION_WORKSPACE_STATE_KEY)).toBeNull();
+  });
+});
+
 describe("sub-agent tabs", () => {
   const subagentTab = subagentTabId("conv_child");
 

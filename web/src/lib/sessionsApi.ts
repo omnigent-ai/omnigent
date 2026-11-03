@@ -964,6 +964,59 @@ export async function createSideChat(
   return { childSessionId: fork.id };
 }
 
+/** One of the caller's generic side chats, as listed on its parent session. */
+export interface ListedSideChat {
+  id: string;
+  /** Unix epoch seconds. */
+  createdAt: number;
+}
+
+/**
+ * The caller's open generic side chats on a session, oldest first, so a
+ * device that didn't create them can show their tabs.
+ * `GET /v1/sessions/{id}/side_chats`, following every page.
+ *
+ * @param sessionId - The parent conversation, e.g. "conv_abc123".
+ * @returns The side chats, or none when the server predates the endpoint.
+ */
+export async function listSideChats(sessionId: string): Promise<ListedSideChat[]> {
+  const sideChats: ListedSideChat[] = [];
+  // Each page needs the previous page's last_id, so the fetches are sequential.
+  /* oxlint-disable no-await-in-loop */
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: "100" });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/side_chats?${params}`,
+    );
+    if (res.status === 404 && after === null) return [];
+    const page = await readJsonOrThrow<{
+      data: { id: string; created_at: number }[];
+      has_more: boolean;
+      last_id: string | null;
+    }>(res);
+    for (const entry of page.data) sideChats.push({ id: entry.id, createdAt: entry.created_at });
+    if (!page.has_more || page.last_id == null) break;
+    after = page.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return sideChats.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+}
+
+/**
+ * Stop listing a closed side chat on its parent, so the caller's other devices
+ * close its tab too. `DELETE /v1/sessions/{id}/side_chats/{sideChatId}`; a
+ * server without the endpoint has nothing to remove.
+ */
+export async function removeListedSideChat(sessionId: string, sideChatId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/side_chats/${encodeURIComponent(sideChatId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 404) throw await apiErrorFromResponse(res);
+}
+
 /**
  * Bind an existing (unbound) session to a host + working directory and
  * launch its runner: ``POST /v1/hosts/{hostId}/runners``.

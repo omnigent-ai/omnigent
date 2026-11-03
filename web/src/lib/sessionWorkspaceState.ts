@@ -42,9 +42,11 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
-  /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
-   *  by design: side chats are ephemeral and vanish when the app is closed. */
+  /** Ordered list of open side-chat tabs (child conversation ids). */
   openSideChats?: string[];
+  /** The server's side-chat list at the last sync, so a side chat closed on
+   *  another device can be told apart from one this browser opened itself. */
+  syncedSideChats?: string[];
   /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
   openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
@@ -132,6 +134,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
     state.selectedBrowserId = record.selectedBrowserId;
   }
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
+  if (Array.isArray(record.syncedSideChats))
+    state.syncedSideChats = uniqueIds(record.syncedSideChats);
   if (Array.isArray(record.openSubagentTabs))
     state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {

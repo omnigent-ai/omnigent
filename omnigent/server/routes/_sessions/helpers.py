@@ -319,6 +319,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
+    SIDE_CHAT_ENTRY_LABEL_PREFIX,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -10763,13 +10764,17 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         CREATED_BY_SESSION_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        SIDE_CHAT_HISTORY_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
+    side_chat_entry = next((k for k in labels if k.startswith(SIDE_CHAT_ENTRY_LABEL_PREFIX)), None)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
+        SIDE_CHAT_HISTORY_LABEL_KEY,
+        side_chat_entry,
     ):
         if key in labels:
             raise OmnigentError(
@@ -11334,8 +11339,14 @@ def _child_session_summary_from_conversation(
     # Child sessions aren't pinnable (the pin affordance lives on top-level
     # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
     # defensively so a shared child's summary can never expose another viewer's
-    # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    # pin key. No collapse-to-canonical here: there's no pin to surface. Side-chat
+    # entries are private to their creator for the same reason.
+    raw_labels = {
+        k: v
+        for k, v in conv.labels.items()
+        if not k.startswith(f"{PINNED_LABEL_KEY}.")
+        and not k.startswith(SIDE_CHAT_ENTRY_LABEL_PREFIX)
+    }
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None

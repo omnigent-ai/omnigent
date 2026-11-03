@@ -9787,6 +9787,75 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "SideChatList": {
+        "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SideChatSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SideChatList",
+        "type": "object"
+      },
+      "SideChatSummary": {
+        "description": "One side chat the caller has open on a session.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when the side chat was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "The side chat's session id, e.g. `\"conv_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "title": "SideChatSummary",
+        "type": "object"
+      },
       "SkillContentResponse": {
         "properties": {
           "content": {
@@ -19268,6 +19337,127 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/side_chats": {
+      "get": {
+        "description": "List the side chats the caller has open on a session.\n\nSide chats stay out of the session list, so this is how a client that\ndidn't create one (another device or browser) finds it for the\nWorkspace rail. Only the caller's own side chats are returned, ordered\nby id; `created_at` gives their creation order.\n\n**Returns:** A `PaginatedList` of `SideChatSummary` objects.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "operationId": "list_side_chats_v1_sessions__session_id__side_chats_get",
+        "parameters": [
+          {
+            "description": "The parent session, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of side chats to return (1-100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor \u2014 return side chats whose id sorts after this one.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SideChatList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Side Chats",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/side_chats/{side_chat_id}": {
+      "delete": {
+        "description": "Stop listing one of the caller's side chats on a session.\n\nCalled when the side chat's tab is closed, so the caller's other\nclients drop it too. The side chat's own session is left as is.\nIdempotent: a side chat that isn't listed for the caller is a no-op.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "operationId": "remove_side_chat_v1_sessions__session_id__side_chats__side_chat_id__delete",
+        "parameters": [
+          {
+            "description": "The parent session, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The side chat's session id, e.g. `\"conv_def456\"`.",
+            "in": "path",
+            "name": "side_chat_id",
+            "required": true,
+            "schema": {
+              "title": "Side Chat Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Side Chat",
+        "tags": [
+          "sessions"
         ]
       }
     },

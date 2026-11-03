@@ -12,7 +12,7 @@ import {
 } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
-import { useIsMutating, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
 import {
   type Bubble,
@@ -90,7 +90,7 @@ import {
   serializeReplyDraft,
   snapshotReplyDraft,
 } from "@/lib/replyDraft";
-import { interrupt } from "@/lib/sessionsApi";
+import { INITIAL_WINDOW_ITEMS, fetchSessionItemsPage, interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
@@ -202,6 +202,9 @@ export function SideChatPane({
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
   const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
+  // The newest item the fork copied ("" for none), recorded by the server so a
+  // device that didn't create this side chat hides the same history.
+  const historyItemId = session?.labels?.["omnigent.side_chat.history_item_id"];
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -219,14 +222,36 @@ export function SideChatPane({
     };
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
-  // Capture once, when the fork's load has actually completed — even if it is
-  // EMPTY (a parent with no history), so the side chat's first message isn't
-  // mistaken for inherited history and hidden. Snapshot the inherited item ids
-  // and persist so later mounts/reloads hide the same set, not new turns.
-  if (
-    boundaryRef.current.ids === null &&
-    !pending &&
-    filterHistory &&
+  const needsBoundary = boundaryRef.current.ids === null && !pending && filterHistory;
+  // The loaded window holds at most this many items older than the copied one.
+  const copiedHistory = useQuery({
+    queryKey: ["side_chat_history", childId, historyItemId],
+    queryFn: async () => {
+      const page = await fetchSessionItemsPage(childId, {
+        olderThan: historyItemId,
+        limit: INITIAL_WINDOW_ITEMS,
+      });
+      return [historyItemId as string, ...page.items.map((item) => item.id)];
+    },
+    enabled: needsBoundary && Boolean(historyItemId),
+    staleTime: Infinity,
+    retry: false,
+  });
+  if (needsBoundary && historyItemId !== undefined) {
+    const ids =
+      historyItemId === "" ? new Set<string>() : copiedHistory.data && new Set(copiedHistory.data);
+    if (ids) {
+      boundaryRef.current.ids = ids;
+      writeInheritedBoundary(childId, ids);
+    }
+  } else if (
+    // Older servers don't record the copied history: capture once, when the
+    // fork's load has actually completed — even if it is EMPTY (a parent with
+    // no history), so the side chat's first message isn't mistaken for
+    // inherited history and hidden. Snapshot the inherited item ids and
+    // persist so later mounts/reloads hide the same set, not new turns.
+    needsBoundary &&
+    session !== null &&
     boundaryRef.current.loadSeen &&
     !loadingConversation &&
     conversationLoadError === null
@@ -240,16 +265,19 @@ export function SideChatPane({
     writeInheritedBoundary(childId, ids);
   }
   const inherited = boundaryRef.current.ids;
-  const visibleBlocks = useMemo(
-    () =>
-      inherited === null
-        ? blocks
-        : blocks.filter((b) => {
-            const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
-            return !(typeof id === "string" && inherited.has(id));
-          }),
-    [blocks, inherited],
-  );
+  // Hide the transcript until the copied history is known rather than flash it;
+  // if it can't be fetched, show everything.
+  const awaitingBoundary =
+    inherited === null && needsBoundary && Boolean(historyItemId) && !copiedHistory.isError;
+  const visibleBlocks = useMemo(() => {
+    if (awaitingBoundary) return [];
+    if (inherited === null) return blocks;
+    return blocks.filter((b) => {
+      const id = (b as { ctx?: { itemId?: string | null } }).ctx?.itemId;
+      // Derived block ids (`<item id>:<suffix>`) belong to their item.
+      return !(typeof id === "string" && (inherited.has(id) || inherited.has(id.split(":")[0])));
+    });
+  }, [blocks, inherited, awaitingBoundary]);
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
@@ -302,7 +330,12 @@ export function SideChatPane({
   }, []);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
-  const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
+  const isEmpty =
+    bubbles.length === 0 &&
+    !loadingConversation &&
+    !awaitingBoundary &&
+    !loadFailed &&
+    !showsWorking;
 
   const startSideChat = async (text: string) => {
     if (!onStart) return;

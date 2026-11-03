@@ -414,6 +414,7 @@ from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_ENTRY_LABEL_PREFIX,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -1164,10 +1165,14 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
       ``omnigent.sandbox.repo`` as the space-joined list so clients that read
       the bare key (e.g. the fork dialog) see every repo.
 
+    Side-chat entries (``omnigent.side_chats.<child>``) are dropped outright:
+    they name each user's private side chats, which only the side-chat list
+    endpoint returns, and only to their creator.
+
     :param labels: The stored conversation labels.
     :param user_id: The requesting viewer, or ``None`` in single-user mode.
     :returns: A copy with the pin and sandbox-repo families collapsed to their
-        canonical bare keys.
+        canonical bare keys and side-chat entries removed.
     """
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
@@ -1180,6 +1185,7 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
         and not k.startswith(f"{PINNED_LABEL_KEY}.")
         and k != MANAGED_REPO_LABEL_KEY
         and not k.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
+        and not k.startswith(SIDE_CHAT_ENTRY_LABEL_PREFIX)
     }
     if my_pin is not None:
         cleaned[PINNED_LABEL_KEY] = my_pin

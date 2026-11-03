@@ -18,6 +18,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   type CSSProperties,
   type KeyboardEvent,
@@ -67,6 +68,7 @@ import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
+import { listedSideChatsQueryKey, useListedSideChats } from "@/hooks/useListedSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
@@ -74,7 +76,7 @@ import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagent
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
-import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { createSideChat, removeListedSideChat, stopSession } from "@/lib/sessionsApi";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -899,6 +901,16 @@ function WorkspacePanelImpl({
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
+  const queryClient = useQueryClient();
+  const listedSideChats = useListedSideChats(conversationId);
+  const { sync: syncSideChats } = sideChats;
+  useEffect(() => {
+    if (listedSideChats !== null) syncSideChats(listedSideChats);
+  }, [listedSideChats, syncSideChats]);
+  const refreshListedSideChats = useCallback(
+    () => void queryClient.invalidateQueries({ queryKey: listedSideChatsQueryKey(conversationId) }),
+    [queryClient, conversationId],
+  );
   const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
   useEffect(() => {
     onHasSubagentTabsChange?.(hasSubagentTabs);
@@ -948,10 +960,18 @@ function WorkspacePanelImpl({
         // Generic already rekeyed its own tab; this just re-selects it (idempotent).
         sideChats.open(childId);
       }
+      refreshListedSideChats();
     }
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();
-  }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
+  }, [
+    sideChatToOpen,
+    conversationId,
+    sideChats,
+    onRightRailTabChange,
+    clearSideChatToOpen,
+    refreshListedSideChats,
+  ]);
   const sideChatSelected =
     rightRailTab === "sidechat" &&
     selectedFilePath === null &&
@@ -1136,6 +1156,7 @@ function WorkspacePanelImpl({
     if (!childId.startsWith("pending:")) {
       try {
         await stopSession(childId);
+        await removeListedSideChat(conversationId, childId);
       } catch {
         useChatStore.getState().restoreQueuedMessages(queued);
         toast.error("Couldn't close side chat. Try again.");
@@ -1148,6 +1169,7 @@ function WorkspacePanelImpl({
     useChatStore.getState().clearSideChatComposer(childId);
     useChatStore.getState().clearSideChatDraft(childId);
     sideChats.close(childId);
+    if (!childId.startsWith("pending:")) refreshListedSideChats();
   };
 
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its

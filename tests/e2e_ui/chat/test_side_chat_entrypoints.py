@@ -14,8 +14,9 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, Route, expect
+from playwright.sync_api import Browser, Locator, Page, Route, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
 
@@ -167,6 +168,48 @@ def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("button", name="Open new", exact=True).click()
     expect(page.get_by_role("menuitem", name="Side chat", exact=True)).to_be_visible()
+
+
+def test_side_chat_is_listed_when_the_session_opens_in_another_browser(
+    page: Page,
+    browser: Browser,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """A side chat started in one client is listed when another client opens the session."""
+    base_url, session_id = seeded_session
+    parent_question = f"cross-client-main-{session_id}: what is a tag?"
+    parent_reply = "A tag names one commit."
+    question = f"cross-client-side-{session_id}: what does semver mean?"
+    reply = "Semver is MAJOR.MINOR.PATCH versioning."
+    configure_mock_llm(mock_llm_server_url, [{"text": parent_reply}], match=parent_question)
+    configure_mock_llm(mock_llm_server_url, [{"text": reply}], match=question)
+    page.goto(f"{base_url}/c/{session_id}")
+    _send_parent(page, parent_question, parent_reply)
+    _start_side_chat(page, "panel", question)
+    expect(page.locator(".side-chat-backdrop").get_by_text(reply, exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_role("tab", name="Side chat 1", exact=True)).to_be_visible()
+    assert len(side_chat_forks) == 1
+
+    # A fresh context has none of the first client's localStorage, like another device.
+    with user_page(browser, headers={}) as other_page:
+        other_page.goto(f"{base_url}/c/{session_id}")
+        expect(other_page.get_by_placeholder("Send a message…")).to_be_visible()
+        open_right_rail(other_page)
+        other_rail = other_page.get_by_role("complementary", name="Workspace")
+        expect(
+            other_rail.get_by_role("tab", name=re.compile(r"^Side chat")),
+            "the side chat created in the first client is not listed in the second",
+        ).to_have_count(1, timeout=15_000)
+        other_rail.get_by_role("tab", name="Side chat 1", exact=True).click()
+        other_pane = other_page.locator(".side-chat-backdrop")
+        expect(other_pane.get_by_text(question, exact=True)).to_be_visible(timeout=15_000)
+        expect(other_pane.get_by_text(reply, exact=True)).to_be_visible()
+        expect(other_pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
 
 
 @pytest.mark.parametrize("entrypoint", ["slash", "panel"])

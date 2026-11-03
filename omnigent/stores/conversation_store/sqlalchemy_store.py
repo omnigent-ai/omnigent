@@ -103,6 +103,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SIDE_CHAT_ENTRY_LABEL_PREFIX,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -5649,13 +5650,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             # that combination reflects lost metadata, not a chat-only
             # session. Other workspace-less sources resume in-process like
             # a brand-new chat session.
-            # Per-user pin keys (``omnigent.pinned.<user>``) and per-repo sandbox
-            # labels (``omnigent.sandbox.repo.<index>``) are dynamic-suffix, so
-            # they're never in the exact-match drop sets — drop them by prefix
-            # instead. A fork is a NEW conversation; inheriting the source's pins
-            # would show the clone as pinned for the forker AND carry every other
-            # user's pin key along as dead data, and inheriting the repo labels
-            # would re-clone the source's repos even into a fork asked for empty.
+            # Per-user pin keys (``omnigent.pinned.<user>``), per-repo sandbox
+            # labels (``omnigent.sandbox.repo.<index>``) and the source's side-chat
+            # entries are dynamic-suffix, so they're never in the exact-match drop
+            # sets — drop them by prefix instead. A fork is a NEW conversation;
+            # inheriting the source's pins would show the clone as pinned for the
+            # forker AND carry every other user's pin key along as dead data, and
+            # inheriting the repo labels would re-clone the source's repos even
+            # into a fork asked for empty.
             source_labels = _fetch_labels(session, source_conversation_id)
             source_workspace_missing = (
                 source_labels.get("omnigent.last_task_error_code") == ErrorCode.WORKSPACE_MISSING
@@ -5672,6 +5674,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
+                and not key.startswith(SIDE_CHAT_ENTRY_LABEL_PREFIX)
                 and not (source_workspace_missing and key.startswith("omnigent.last_task_error_"))
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None

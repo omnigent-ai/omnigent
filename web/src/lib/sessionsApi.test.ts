@@ -24,9 +24,11 @@ import {
   importLocalSessions,
   interrupt,
   listRunners,
+  listSideChats,
   openSessionStream,
   postEvent,
   continueFailedTurn,
+  removeListedSideChat,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1715,6 +1717,76 @@ describe("stopSession", () => {
     expect(url).toBe("/v1/sessions/conv_abc/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
     expect(out.queued).toBe(false);
+  });
+});
+
+describe("listSideChats", () => {
+  it("follows every page and returns the side chats oldest first", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        data: [
+          { id: "conv_b", created_at: 30 },
+          { id: "conv_c", created_at: 10 },
+        ],
+        has_more: true,
+        last_id: "conv_c",
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        data: [{ id: "conv_d", created_at: 20 }],
+        has_more: false,
+        last_id: "conv_d",
+      }),
+    );
+
+    const sideChats = await listSideChats("conv_parent");
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/conv_parent/side_chats?limit=100",
+      "/v1/sessions/conv_parent/side_chats?limit=100&after=conv_c",
+    ]);
+    expect(sideChats).toEqual([
+      { id: "conv_c", createdAt: 10 },
+      { id: "conv_d", createdAt: 20 },
+      { id: "conv_b", createdAt: 30 },
+    ]);
+  });
+
+  it("lists nothing when the server predates the endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ detail: "Not Found" }, { ok: false, status: 404 }),
+    );
+
+    await expect(listSideChats("conv_parent")).resolves.toEqual([]);
+  });
+});
+
+describe("removeListedSideChat", () => {
+  it("deletes the side chat from its parent's list", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 204 } as Response);
+
+    await removeListedSideChat("conv_parent", "conv_side");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_parent/side_chats/conv_side");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("has nothing to remove on a server without the endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ detail: "Not Found" }, { ok: false, status: 404 }),
+    );
+
+    await expect(removeListedSideChat("conv_parent", "conv_side")).resolves.toBeUndefined();
+  });
+
+  it("rejects when the server can't remove it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ detail: "boom" }, { ok: false, status: 500, statusText: "Server Error" }),
+    );
+
+    await expect(removeListedSideChat("conv_parent", "conv_side")).rejects.toThrow("boom");
   });
 });
 

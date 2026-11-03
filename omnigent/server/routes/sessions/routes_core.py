@@ -231,11 +231,14 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_HISTORY_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
+    side_chat_entry_label_key,
+    side_chat_entry_owner,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
@@ -4482,6 +4485,21 @@ def register_core_routes(
             limit=100,
             order="desc",
         )
+        if body.side_chat:
+            # Lets the creator's other devices list this side chat and hide the
+            # history it copied, which they have no local record of.
+            history_item_id = fork_items.data[0].id if fork_items.data else ""
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                new_conv.id,
+                {SIDE_CHAT_HISTORY_LABEL_KEY: history_item_id},
+            )
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                source_id,
+                {side_chat_entry_label_key(new_conv.id): side_chat_entry_owner(user_id)},
+            )
+            new_conv.labels[SIDE_CHAT_HISTORY_LABEL_KEY] = history_item_id
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
         return _build_session_response(
             new_conv,

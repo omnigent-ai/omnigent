@@ -10,6 +10,8 @@ interface SideChatTabsState {
   subagentTabs: string[];
   /** The selected tab of either kind, or null when another rail view is active. */
   selected: string | null;
+  /** The server's side-chat list at the last {@link useSideChats} `sync`. */
+  synced: string[];
 }
 
 type TabsChange = (current: SideChatTabsState) => SideChatTabsState;
@@ -27,15 +29,31 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
     tabs,
     subagentTabs,
     selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
+    synced: saved.syncedSideChats ?? [],
+  };
+}
+
+/** Remove `childId`'s tab, handing a selection to its left neighbour in the strip. */
+function withoutTab(current: SideChatTabsState, childId: string): SideChatTabsState {
+  const strip = [...current.tabs, ...current.subagentTabs];
+  const index = strip.indexOf(childId);
+  if (index === -1) return current;
+  const remaining = strip.filter((id) => id !== childId);
+  const selected =
+    current.selected === childId ? (remaining[Math.max(0, index - 1)] ?? null) : current.selected;
+  return {
+    ...current,
+    tabs: current.tabs.filter((id) => id !== childId),
+    subagentTabs: current.subagentTabs.filter((id) => id !== childId),
+    selected,
   };
 }
 
 /**
- * Per-session side-chat tabs for the Workspace rail — a browser-local list of
- * child conversation ids, mirroring {@link useBrowserTabs}. The references live
- * in `sessionWorkspaceState` (localStorage), never on the server, so they are
- * per-device and per-browser: they persist across app restarts and reloads but
- * do not follow the user to another device.
+ * Per-session side-chat tabs for the Workspace rail — a list of child
+ * conversation ids, mirroring {@link useBrowserTabs}. The tabs live in
+ * `sessionWorkspaceState` (localStorage); `sync` merges in the generic side
+ * chats the server lists for the user, so those follow them to other devices.
  *
  * Opening (`open`) just records an already-created child id as a tab — the
  * child itself is created by the server (Codex's native ephemeral fork, or the
@@ -63,15 +81,18 @@ export function useSideChats(conversationId: string) {
       const pending =
         unsaved.current?.conversationId === conversationId ? unsaved.current.changes : [];
       const changes = [...pending, mutate];
-      const next = changes.reduce(
-        (current, change) => change(current),
-        readSideChatTabsState(conversationId),
-      );
+      const stored = readSideChatTabsState(conversationId);
+      const next = changes.reduce((current, change) => change(current), stored);
+      if (next === stored) {
+        setState(next);
+        return;
+      }
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
+        syncedSideChats: next.synced.length > 0 ? next.synced : undefined,
       });
       // Past the cap, keep only the result so a long storage outage can't grow the replay.
       const kept = changes.length > MAX_UNSAVED_CHANGES ? [() => next] : changes;
@@ -138,21 +159,28 @@ export function useSideChats(conversationId: string) {
    *  fork dies with its process, and a generic child stays hidden server-side.
    *  A closed selected tab hands the selection to its left neighbour in the strip. */
   const close = useCallback(
-    (childId: string) =>
+    (childId: string) => update((current) => withoutTab(current, childId)),
+    [update],
+  );
+
+  /** Reconcile with the server's side-chat list (oldest first): open tabs for
+   *  side chats new to the list without changing the selection, and close
+   *  those another device removed from it. Tabs the list never named (Codex
+   *  forks, pending tabs, older side chats) are left alone. */
+  const sync = useCallback(
+    (listed: string[]) =>
       update((current) => {
-        const strip = [...current.tabs, ...current.subagentTabs];
-        const index = strip.indexOf(childId);
-        if (index === -1) return current;
-        const remaining = strip.filter((id) => id !== childId);
-        const selected =
-          current.selected === childId
-            ? (remaining[Math.max(0, index - 1)] ?? null)
-            : current.selected;
-        return {
-          tabs: current.tabs.filter((id) => id !== childId),
-          subagentTabs: current.subagentTabs.filter((id) => id !== childId),
-          selected,
-        };
+        const synced = new Set(current.synced);
+        const listedSet = new Set(listed);
+        let next = current;
+        for (const id of current.synced) {
+          if (!listedSet.has(id)) next = withoutTab(next, id);
+        }
+        const added = listed.filter((id) => !synced.has(id) && !next.tabs.includes(id));
+        const sameList =
+          listed.length === current.synced.length && listed.every((id) => synced.has(id));
+        if (next === current && added.length === 0 && sameList) return current;
+        return { ...next, tabs: [...next.tabs, ...added], synced: listed };
       }),
     [update],
   );
@@ -166,6 +194,7 @@ export function useSideChats(conversationId: string) {
     openPending,
     rekey,
     close,
+    sync,
     select,
   };
 }

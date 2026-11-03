@@ -227,12 +227,16 @@ describe("sessionWorkspaceState", () => {
       JSON.stringify([
         {
           id: "conv_c",
-          state: { openSubagentTabs: ["subagent:a", "", 7, "subagent:a", "subagent:b"] },
+          state: {
+            openSubagentTabs: ["subagent:a", "", 7, "subagent:a", "subagent:b"],
+            syncedSideChats: ["conv_x", 7, "conv_x"],
+          },
         },
       ]),
     );
     expect(readSessionWorkspaceState("conv_c")).toEqual({
       openSubagentTabs: ["subagent:a", "subagent:b"],
+      syncedSideChats: ["conv_x"],
     });
   });
 });
