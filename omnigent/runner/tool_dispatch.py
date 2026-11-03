@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import io
 import json
@@ -33,10 +34,10 @@ import tarfile
 import tempfile
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, BinaryIO, Protocol, cast
 
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
@@ -3758,7 +3759,8 @@ def _bundle_local_agent_source(root: Path, source: Path) -> bytes:
             parent_fd = next_fd
         entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if stat.S_ISREG(entry.st_mode) and source.suffix.lower() not in {".yaml", ".yml"}:
-            return _read_bundle_file(name, parent_fd)[0]
+            with _open_bundle_file(name, parent_fd) as (handle, _):
+                return handle.read()
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
             _add_bundle_entry(
@@ -3797,19 +3799,21 @@ def _add_bundle_entry(tf: tarfile.TarFile, name: str, dir_fd: int, arcname: str)
         return
     if not stat.S_ISREG(entry.st_mode):
         raise OSError(f"agent config contains an unsupported file type: {arcname}")
-    data, opened = _read_bundle_file(name, dir_fd)
-    member = tarfile.TarInfo(arcname)
-    member.size = len(data)
-    member.mtime = int(opened.st_mtime)
-    member.mode = stat.S_IMODE(opened.st_mode)
-    tf.addfile(member, io.BytesIO(data))
+    with _open_bundle_file(name, dir_fd) as (handle, opened):
+        member = tarfile.TarInfo(arcname)
+        member.size = opened.st_size
+        member.mtime = int(opened.st_mtime)
+        member.mode = stat.S_IMODE(opened.st_mode)
+        tf.addfile(member, handle)
 
 
-def _read_bundle_file(name: str, dir_fd: int) -> tuple[bytes, os.stat_result]:
+@contextlib.contextmanager
+def _open_bundle_file(name: str, dir_fd: int) -> Iterator[tuple[BinaryIO, os.stat_result]]:
     """
-    Read a regular file without following a final symlink.
+    Open a regular file without following a final symlink.
 
-    :returns: The file bytes and the ``fstat`` of the opened file.
+    :yields: The open file and its ``fstat``, so callers stream the
+        verified descriptor instead of reopening the path.
     :raises OSError: If the file is a symlink or not a regular file.
     """
     fd = os.open(name, _BUNDLE_FILE_OPEN_FLAGS, dir_fd=dir_fd)
@@ -3817,7 +3821,7 @@ def _read_bundle_file(name: str, dir_fd: int) -> tuple[bytes, os.stat_result]:
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode):
             raise OSError(f"agent config contains an unsupported file type: {name}")
-        return handle.read(), opened
+        yield handle, opened
 
 
 async def _post_child_first_message(

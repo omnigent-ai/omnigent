@@ -89,6 +89,7 @@ from omnigent.runner.app import (
 from omnigent.runner.policy_proxy import (
     _evaluate_policy_via_omnigent,
 )
+from omnigent.runner.tool_dispatch import _BUNDLE_WALK_BENEATH_SUPPORTED
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
@@ -8414,6 +8415,12 @@ def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
     return parts
 
 
+requires_bundle_walk = pytest.mark.skipif(
+    not _BUNDLE_WALK_BENEATH_SUPPORTED, reason="platform lacks dir_fd traversal"
+)
+
+
+@requires_bundle_walk
 @pytest.mark.asyncio
 async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     tmp_path: Path,
@@ -8500,6 +8507,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     assert handle["agent_name"] == "helper"
 
 
+@requires_bundle_walk
 @pytest.mark.asyncio
 async def test_sys_session_create_config_bundle_refuses_nested_symlink_deref(
     tmp_path: Path,
@@ -8568,6 +8576,7 @@ async def test_sys_session_create_config_bundle_refuses_nested_symlink_deref(
                 )
 
 
+@requires_bundle_walk
 def test_bundle_local_agent_source_packs_nested_links_as_links(tmp_path: Path) -> None:
     """A nested symlink is packed as a link member, not its target's bytes;
     the server accepts the clean bundle and refuses the linked one, and a
@@ -8578,9 +8587,6 @@ def test_bundle_local_agent_source_packs_nested_links_as_links(tmp_path: Path) -
     from omnigent.errors import OmnigentError
     from omnigent.runner import tool_dispatch
     from omnigent.server.bundles import validate_agent_bundle
-
-    if not tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
-        pytest.skip("platform lacks dir_fd traversal")
 
     secret = tmp_path / "runner-secret.txt"
     secret.write_text("RUNNER_SECRET_SENTINEL\n")
@@ -8615,17 +8621,16 @@ def test_bundle_local_agent_source_packs_nested_links_as_links(tmp_path: Path) -
         validate_agent_bundle(bundle)
 
 
+@requires_bundle_walk
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX symlinks and FIFOs")
 def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A component swapped for a symlink after resolution, or a directory
-    replaced between its inspection and opening, fails the walk, and a FIFO
-    is refused without blocking."""
+    replaced between its inspection and opening, fails the walk, and a FIFO,
+    present up front or swapped in after inspection, is refused without
+    blocking."""
     from omnigent.runner import tool_dispatch
-
-    if not tool_dispatch._BUNDLE_WALK_BENEATH_SUPPORTED:
-        pytest.skip("platform lacks dir_fd traversal")
 
     root = tmp_path / "work"
     root.mkdir()
@@ -8662,6 +8667,68 @@ def test_bundle_local_agent_source_refuses_swapped_component_and_special_files(
     os.mkfifo(agent_dir / "pipe")
     with pytest.raises(OSError, match="unsupported file type"):
         tool_dispatch._bundle_local_agent_source(root, agent_dir)
+
+    (agent_dir / "pipe").unlink()
+    notes = agent_dir / "notes.txt"
+    notes.write_text("notes\n")
+
+    def stat_then_replace_notes(name: str, *args: object, **kwargs: object) -> os.stat_result:
+        result = real_stat(name, *args, **kwargs)
+        if name == "notes.txt" and notes.is_file():
+            notes.unlink()
+            os.mkfifo(notes)
+        return result
+
+    errors: list[BaseException] = []
+
+    def bundle_agent_dir() -> None:
+        try:
+            tool_dispatch._bundle_local_agent_source(root, agent_dir)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(os, "stat", stat_then_replace_notes)
+    worker = threading.Thread(target=bundle_agent_dir, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        # Opening the write end releases a reader blocked on the FIFO.
+        os.close(os.open(notes, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(timeout=10)
+        pytest.fail("opening a FIFO swapped in after inspection blocked")
+    monkeypatch.undo()
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert "unsupported file type" in str(errors[0])
+
+
+@requires_bundle_walk
+def test_bundle_local_agent_source_streams_file_contents(tmp_path: Path) -> None:
+    """Each file is streamed into the archive instead of being held in
+    memory uncompressed."""
+    import io
+    import tarfile
+    import tracemalloc
+
+    from omnigent.runner import tool_dispatch
+
+    agent_dir = tmp_path / "agentdir"
+    agent_dir.mkdir()
+    (agent_dir / "config.yaml").write_text("name: helper\n")
+    size = 32 * 1024 * 1024
+    with open(agent_dir / "weights.bin", "wb") as sparse_file:
+        sparse_file.truncate(size)
+
+    tracemalloc.start()
+    try:
+        bundle = tool_dispatch._bundle_local_agent_source(tmp_path, agent_dir)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < size // 4
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        assert tf.getmember("weights.bin").size == size
 
 
 @pytest.mark.parametrize("config_path", ["agentdir", "agentdir/config.yaml"])
