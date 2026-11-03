@@ -3140,10 +3140,12 @@ function ComposerImpl(
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
   const showSide = supportsSideChat(sessionHarness, canStartSideChat);
-  const slashCommands = useMemo(
+  // The built-ins this session offers; a gated-off one leaves a same-named
+  // custom command to run as a skill.
+  const offeredBuiltinCommands = useMemo(
     () =>
       buildSlashCommandMap(
-        skills,
+        [],
         showEffort,
         showModel,
         showCompact,
@@ -3157,7 +3159,6 @@ function ComposerImpl(
         showRewind,
       ),
     [
-      skills,
       showEffort,
       showModel,
       showCompact,
@@ -3170,6 +3171,17 @@ function ComposerImpl(
       showCodexApprovalMode,
       showRewind,
     ],
+  );
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(
+        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
+    [skills, skillPrefix],
+  );
+  const slashCommands = useMemo(
+    () => ({ ...offeredBuiltinCommands, ...skillCommands }),
+    [offeredBuiltinCommands, skillCommands],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
@@ -3714,13 +3726,6 @@ function ComposerImpl(
     }
   };
 
-  const skillCommands = useMemo(
-    () =>
-      Object.fromEntries(
-        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
-      ),
-    [skills, skillPrefix],
-  );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   const registryEnabled =
@@ -4144,12 +4149,7 @@ function ComposerImpl(
       // executed locally. It must reach the vendor TUI as plaintext so Claude
       // Code opens its side chat and the forwarder relays the answer to the
       // web overlay; fall through to the plaintext send path below.
-      if (
-        cmd !== "/btw" &&
-        cmd !== "/side" &&
-        cmd in BUILTIN_SLASH_COMMANDS &&
-        cmd in slashCommands
-      ) {
+      if (cmd !== "/btw" && cmd !== "/side" && cmd in offeredBuiltinCommands) {
         runCommand(() =>
           executeSlashCommand(
             cmd,
