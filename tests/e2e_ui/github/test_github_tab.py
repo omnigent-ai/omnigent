@@ -452,21 +452,37 @@ def test_composer_pr_link_opens_github_tab(
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    expected_bar_height = 28 if is_mobile else 37
-    expected_center_offset = 14 if is_mobile else 19
-    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
+    pr_center = centers["composer-pr-link.icon"]
+    if not is_mobile:
+        assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
+        assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+        assert pr_center == pytest.approx(reference_center, abs=0.5)
     for name, center in centers.items():
-        assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
+        row_center = (
+            pr_center
+            if name.startswith(("composer-pr-link.", "composer-context-ring."))
+            else reference_center
+        )
+        assert center == pytest.approx(row_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
     directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
     branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
     assert directory_bounds is not None and branch_bounds is not None
-    selector_gaps = (
+    selector_gaps = [
         branch_bounds["x"] - directory_bounds["x"] - directory_bounds["width"],
-        pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"],
-    )
+    ]
+    if abs(pr_center - reference_center) <= 0.5:
+        selector_gaps.append(pr_bounds["x"] - branch_bounds["x"] - branch_bounds["width"])
+    else:
+        assert is_mobile
+        assert pr_bounds["y"] >= branch_bounds["y"] + branch_bounds["height"]
+        assert pr_bounds["x"] == pytest.approx(directory_bounds["x"], abs=0.5)
+    for rect in (directory_bounds, branch_bounds, pr_bounds, context_bounds):
+        assert rect["x"] >= bar_bounds["x"]
+        assert rect["x"] + rect["width"] <= bar_bounds["x"] + bar_bounds["width"]
+        assert rect["y"] >= bar_bounds["y"]
+        assert rect["y"] + rect["height"] <= bar_bounds["y"] + bar_bounds["height"]
     expected_selector_gap = 2 if is_mobile else 8
     for gap in selector_gaps:
         assert gap == pytest.approx(expected_selector_gap, abs=0.1), selector_gaps
