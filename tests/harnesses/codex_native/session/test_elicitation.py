@@ -954,6 +954,7 @@ def test_forwarder_publishes_codex_async_question_and_steers_answer(
                 "threadId": "thread_123",
                 "turnId": "turn_123",
                 "itemId": "call-async-1",
+                "isBlocking": False,
                 "questions": [
                     {
                         "id": "0",

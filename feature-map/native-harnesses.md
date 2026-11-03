@@ -257,8 +257,9 @@ separate. See [sessions](./sessions.md) for all side-chat entry points.
 **Codex async question:** in Default mode, ask Codex to call
 `request_user_input_async`. The question card stays open after the turn ends;
 answer it in Chat or Inbox and confirm Codex's next turn uses the answer.
-Answering in the terminal closes the card. An open question is not restored
-after the forwarder reconnects.
+Cancel dismisses the card without stopping Codex. Answering in the terminal
+closes the card. An open question is not restored after the forwarder
+reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test

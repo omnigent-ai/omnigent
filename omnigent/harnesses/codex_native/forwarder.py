@@ -2263,14 +2263,13 @@ class _CodexElicitationTaskTracker:
 
         :returns: None after all background hook tasks have finished.
         """
-        if not self._pending:
-            return
         tasks = list(self._pending)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._pending.clear()
         self._posted_resolutions.clear()
+        self._started_async_questions.clear()
         self._unanswered_async_questions.clear()
 
     async def _run_one(
@@ -5568,6 +5567,7 @@ def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage
             "threadId": question.thread_id,
             "turnId": question.turn_id,
             "itemId": question.item_id,
+            "isBlocking": False,
             "questions": [
                 {
                     "id": str(index),
