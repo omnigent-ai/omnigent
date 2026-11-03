@@ -281,6 +281,14 @@ describe("PullRequestChangesTab", () => {
     expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
   });
 
+  it("ignores Enter that confirms an IME composition in the find bar", () => {
+    renderTab({ conversationId: "find-ime-enter" });
+    openFind("a");
+    expect(screen.getByText("1 of 7")).toBeInTheDocument();
+    fireEvent.keyDown(findInput(), { key: "Enter", isComposing: true });
+    expect(screen.getByText("1 of 7")).toBeInTheDocument();
+  });
+
   it("keeps Ctrl+F as the caret key in a comment on macOS, and Cmd+F opens Find", () => {
     vi.stubGlobal("navigator", { platform: "MacIntel", userAgent: "Mac" });
     renderTab({ conversationId: "find-mac" });

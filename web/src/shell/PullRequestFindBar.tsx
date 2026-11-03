@@ -141,7 +141,8 @@ export function PullRequestFindBar({
         onChange={(event) => onQueryChange(event.target.value)}
         onKeyDown={(event) => {
           // IME composition keys (CJK input) confirm text, not find.
-          if (event.nativeEvent.isComposing) return;
+          // Safari can report the composition-confirming Enter with keyCode 229 only.
+          if (event.nativeEvent.isComposing || event.keyCode === 229) return;
           if (event.key === "Enter") {
             event.preventDefault();
             onStep(event.shiftKey ? -1 : 1);
