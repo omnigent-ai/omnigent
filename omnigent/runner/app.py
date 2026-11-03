@@ -71,7 +71,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
-from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -1824,10 +1824,12 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        *,
+        failure_detail: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if status == "failed":
-            # Structured status has no provider detail when its terminal hook is lost.
+            # A lost terminal hook may still leave a cause in the program-status report.
             event["error"] = {
                 "code": "native_failure_detail_unavailable",
                 "message": (
@@ -1835,11 +1837,33 @@ def create_runner_app(
                     "arrive. Open the terminal to inspect the error before retrying."
                 ),
             }
+            if failure_detail:
+                from omnigent.harnesses.claude_native.failure_telemetry import (
+                    claude_failure_context,
+                )
+
+                raw_context: dict[str, object] = {
+                    **claude_failure_context({}, error_text=failure_detail),
+                    "failure_source": "claude_program_status",
+                    "detail_source": "program_status_error",
+                }
+                # An API error envelope decodes to its cause; the raw report is only the fallback.
+                raw_context.setdefault("native_error_message", failure_detail)
+                context = normalize_failure_context(raw_context)
+                detail = context.get("native_error_message")
+                if isinstance(detail, str):
+                    event["error"] = {"code": "native_turn_error", "message": detail}
+                    event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_failure_publisher(
+        lambda session_id, detail: _publish_session_status(
+            session_id, "failed", failure_detail=detail
+        )
+    )
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
