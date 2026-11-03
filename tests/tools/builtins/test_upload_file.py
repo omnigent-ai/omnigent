@@ -216,11 +216,14 @@ def test_upload_file_refuses_directory_swapped_for_symlink_after_check(
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "deep.txt").write_text("host secret")
+    created: list[dict[str, Any]] = []
     stored: list[bytes] = []
-    monkeypatch.setattr(
-        "omnigent.runtime.get_file_store",
-        lambda: SimpleNamespace(create=lambda **_: SimpleNamespace(id="file_1")),
-    )
+
+    def _create(**fields: Any) -> SimpleNamespace:
+        created.append(fields)
+        return SimpleNamespace(id="file_1")
+
+    monkeypatch.setattr("omnigent.runtime.get_file_store", lambda: SimpleNamespace(create=_create))
     monkeypatch.setattr(
         "omnigent.runtime.get_artifact_store",
         lambda: SimpleNamespace(put=lambda _key, data: stored.append(data)),
@@ -238,6 +241,7 @@ def test_upload_file_refuses_directory_swapped_for_symlink_after_check(
     result = UploadFileTool().invoke('{"path": "output/deep.txt"}', tool_ctx)
 
     assert result.startswith("Error"), result
+    assert created == [], "upload_file created a file record for the swapped symlink path"
     assert stored == [], "upload_file stored a file read through the swapped symlink"
 
 
@@ -266,6 +270,7 @@ def test_safe_open_refuses_path_swapped_for_symlink_after_check(
 
 
 @pytest.mark.posix_only
+@pytest.mark.timeout(10)
 def test_safe_open_refuses_fifo_without_blocking(workspace: Path) -> None:
     """A FIFO is refused as not a regular file instead of blocking the open."""
     os.mkfifo(workspace / "pipe")
