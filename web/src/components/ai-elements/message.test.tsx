@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
@@ -381,4 +382,26 @@ describe("MessageResponse code-block copy", () => {
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
   });
+});
+
+it("keeps named message actions keyboard operable and respects disabled actions", async () => {
+  const user = userEvent.setup();
+  const copy = vi.fn();
+  const fork = vi.fn();
+  render(
+    <MessageActions>
+      <MessageAction label="Copy response" onClick={copy}>
+        <span aria-hidden>C</span>
+      </MessageAction>
+      <MessageAction label="Fork response" disabled onClick={fork}>
+        <span aria-hidden>F</span>
+      </MessageAction>
+    </MessageActions>,
+  );
+  await user.tab();
+  expect(screen.getByRole("button", { name: "Copy response" })).toHaveFocus();
+  await user.keyboard("{Enter}");
+  expect(copy).toHaveBeenCalledOnce();
+  await user.click(screen.getByRole("button", { name: "Fork response" }));
+  expect(fork).not.toHaveBeenCalled();
 });

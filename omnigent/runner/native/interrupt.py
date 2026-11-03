@@ -16,11 +16,13 @@ only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution), codex interrupt
 (MCP-startup + app-server ``turn/interrupt``), and opencode interrupt (native
-``POST /session/{id}/abort``) keep dedicated methods; claude stop is likewise
+``POST /api/session/{id}/interrupt``) keep dedicated methods; claude stop is likewise
 special-cased and codex/pi alias stop to their interrupt handler.
 
-Coverage note: opencode-native stop and both antigravity-native paths return
-``None`` and fall through to the in-process cancel.
+Coverage note: antigravity-native has no handler here and :meth:`interrupt` /
+:meth:`stop` return ``None`` for it, so the caller falls through to the
+in-process turn cancel. opencode-native interrupts through its server's
+``POST /api/session/{id}/interrupt`` and aliases stop to interrupt.
 """
 
 from __future__ import annotations
@@ -308,8 +310,8 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
     wrapper label:
 
     * ``"stop"`` — Claude's dedicated stop, or a key in :data:`_UNIFORM_STOP`
-    * ``"best_effort"`` — remaining native agents (Codex/Pi alias stop to
-      interrupt; Antigravity/OpenCode have no stop handler)
+    * ``"best_effort"`` — remaining native agents (Codex/Pi/OpenCode alias
+      stop to interrupt; Antigravity has no stop handler)
     * ``"inprocess"`` — no native agent for this label
 
     :param wrapper_label: The work entry's ``omnigent.wrapper`` value.
@@ -329,6 +331,8 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
 # hook, so this timer is the liveness floor that keeps the parent from
 # hanging; a confirmed completion that lands later still corrects the record.
 _NATIVE_INTERRUPT_CANCEL_GRACE_S = 20.0
+_CODEX_INTERRUPT_TIMEOUT_S = 5.0
+_CODEX_INTERRUPT_CLOSE_TIMEOUT_S = 1.0
 
 
 class NativeInterruptRunner:
@@ -389,8 +393,8 @@ class NativeInterruptRunner:
     async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
 
-        codex/pi have no distinct stop — they route to their interrupt handler,
-        exactly as the original dispatch chain did.
+        codex/pi/opencode have no distinct stop — they route to their interrupt
+        handler.
 
         :returns: A response when this harness has a stop handler, else ``None``
             so the caller falls through to the in-process turn cancel.
@@ -401,7 +405,7 @@ class NativeInterruptRunner:
         key = agent.key
         if key == "claude":
             return await self._claude_stop(conv_id)
-        if key in ("codex", "pi"):
+        if key in ("codex", "pi", "opencode"):
             return await self.interrupt(harness_name, conv_id)
         spec = _UNIFORM_STOP.get(key)
         if spec is None:
@@ -750,82 +754,83 @@ class NativeInterruptRunner:
             client_name="omnigent-codex-native-runner",
         )
         try:
-            await codex_client.connect()
-            if pending_mcp:
-                try:
-                    await codex_client.request(
-                        "turn/interrupt",
-                        {"threadId": state.thread_id, "turnId": ""},
-                    )
-                except Exception:  # the local cancel already took effect.
-                    self._logger.warning(
-                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
-                        conv_id,
-                        state.thread_id,
-                        exc_info=True,
-                    )
-            if state.active_turn_id is not None:
-                try:
-                    await codex_client.request(
-                        "turn/interrupt",
-                        {
-                            "threadId": state.thread_id,
-                            "turnId": state.active_turn_id,
-                        },
-                    )
-                except CodexAppServerResponseError as exc:
-                    if not is_stale_active_turn_error(exc):
-                        raise
-
-                    if is_no_active_turn_error(exc):
-                        # The turn ended and no idle edge is coming. Clear it only
-                        # if still recorded and publish idle under the bridge lock,
-                        # so a turn starting mid-interrupt is not masked by this idle.
-                        def _publish_idle() -> None:
-                            # Runs under the bridge state lock: stay quick, do not
-                            # touch bridge state, and never raise (the clear is done).
-                            try:
-                                self._publish_event(
-                                    conv_id, {"type": "session.status", "status": "idle"}
-                                )
-                                self._resource_registry.note_external_session_status(
-                                    conv_id, "idle"
-                                )
-                            except Exception:  # the clear already succeeded.
-                                self._logger.warning(
-                                    "Codex-native idle publish failed for session=%s",
-                                    conv_id,
-                                    exc_info=True,
-                                )
-
-                        cleared = clear_active_turn_id_if_matches(
-                            bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+            async with asyncio.timeout(_CODEX_INTERRUPT_TIMEOUT_S):
+                await codex_client.connect()
+                if pending_mcp:
+                    try:
+                        await codex_client.request(
+                            "turn/interrupt",
+                            {"threadId": state.thread_id, "turnId": ""},
                         )
-                        self._logger.info(
-                            "Codex-native interrupt reconciled an already-ended turn "
-                            "for session=%s thread=%s turn=%s cleared=%s: %s",
+                    except Exception:  # the local cancel already took effect.
+                        self._logger.warning(
+                            "Codex-native MCP startup interrupt failed for session=%s thread=%s",
                             conv_id,
                             state.thread_id,
-                            state.active_turn_id,
-                            cleared,
-                            exc.message,
+                            exc_info=True,
                         )
-                    else:
-                        # A newer turn replaced the one we targeted and is still
-                        # live, so leave its recorded id in place and publish no
-                        # idle; the forwarder owns the newer turn's lifecycle.
-                        self._logger.info(
-                            "Codex-native interrupt targeted a superseded turn for "
-                            "session=%s thread=%s turn=%s; a newer turn is live: %s",
-                            conv_id,
-                            state.thread_id,
-                            state.active_turn_id,
-                            exc.message,
+                if state.active_turn_id is not None:
+                    try:
+                        await codex_client.request(
+                            "turn/interrupt",
+                            {
+                                "threadId": state.thread_id,
+                                "turnId": state.active_turn_id,
+                            },
                         )
-                    # The targeted turn ended or was superseded, so skip the
-                    # deferred parent-wake cancel. A dropped sub-agent completion
-                    # can still leave its parent waiting; reconciled separately.
-                    return Response(status_code=204)
+                    except CodexAppServerResponseError as exc:
+                        if not is_stale_active_turn_error(exc):
+                            raise
+
+                        if is_no_active_turn_error(exc):
+                            # The turn ended and no idle edge is coming. Clear it only
+                            # if still recorded and publish idle under the bridge lock,
+                            # so a turn starting mid-interrupt is not masked by this idle.
+                            def _publish_idle() -> None:
+                                # Runs under the bridge state lock: stay quick, do not
+                                # touch bridge state, and never raise (the clear is done).
+                                try:
+                                    self._publish_event(
+                                        conv_id, {"type": "session.status", "status": "idle"}
+                                    )
+                                    self._resource_registry.note_external_session_status(
+                                        conv_id, "idle"
+                                    )
+                                except Exception:  # the clear already succeeded.
+                                    self._logger.warning(
+                                        "Codex-native idle publish failed for session=%s",
+                                        conv_id,
+                                        exc_info=True,
+                                    )
+
+                            cleared = clear_active_turn_id_if_matches(
+                                bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+                            )
+                            self._logger.info(
+                                "Codex-native interrupt reconciled an already-ended turn "
+                                "for session=%s thread=%s turn=%s cleared=%s: %s",
+                                conv_id,
+                                state.thread_id,
+                                state.active_turn_id,
+                                cleared,
+                                exc.message,
+                            )
+                        else:
+                            # A newer turn replaced the one we targeted and is still
+                            # live, so leave its recorded id in place and publish no
+                            # idle; the forwarder owns the newer turn's lifecycle.
+                            self._logger.info(
+                                "Codex-native interrupt targeted a superseded turn for "
+                                "session=%s thread=%s turn=%s; a newer turn is live: %s",
+                                conv_id,
+                                state.thread_id,
+                                state.active_turn_id,
+                                exc.message,
+                            )
+                        # The targeted turn ended or was superseded, so skip the
+                        # deferred parent-wake cancel. A dropped sub-agent completion
+                        # can still leave its parent waiting; reconciled separately.
+                        return Response(status_code=204)
         except Exception as exc:  # surface active-turn interrupt failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
@@ -845,7 +850,9 @@ class NativeInterruptRunner:
             )
         finally:
             with contextlib.suppress(Exception):
-                await codex_client.close()
+                await asyncio.wait_for(
+                    codex_client.close(), timeout=_CODEX_INTERRUPT_CLOSE_TIMEOUT_S
+                )
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
@@ -871,13 +878,13 @@ class NativeInterruptRunner:
             directory=state.workspace,
         )
         try:
-            # OpenCode answers true even when idle, so the answer is not checked. Record
-            # before closing the client: the abort's idle edge usually follows within ms.
-            await client.abort(state.opencode_session_id)
+            # Record before closing the client: the forwarder publishes the idle edge
+            # from session.execution.interrupted, usually within milliseconds.
+            await client.interrupt(state.opencode_session_id)
             self._defer_parent_wake_after_native_interrupt(conv_id)
         except (OpenCodeClientError, httpx.HTTPError) as exc:
             self._logger.warning(
-                "OpenCode-native abort failed for session=%s opencode_session=%s",
+                "OpenCode-native interrupt failed for session=%s opencode_session=%s",
                 conv_id,
                 state.opencode_session_id,
                 exc_info=True,

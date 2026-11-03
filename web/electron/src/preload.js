@@ -100,6 +100,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
   /**
+   * Subscribe to Close Tab (CmdOrCtrl+W). Main sends it only after the page
+   * opts in via `setCloseTabSupported(true)`. Returns an unsubscribe function.
+   * @param {() => void} callback
+   * @returns {() => void}
+   */
+  onCloseTabRequest: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("omnigent:close-tab", listener);
+    return () => ipcRenderer.removeListener("omnigent:close-tab", listener);
+  },
+  /**
+   * Opt this page in to (or out of) handling Close Tab; main otherwise closes
+   * the window. Reset by every main-frame navigation.
+   * @param {boolean} supported
+   */
+  setCloseTabSupported: (supported) =>
+    ipcRenderer.send("omnigent:set-close-tab-supported", supported === true),
+  /** Close this window (Close Tab with nothing left to close). */
+  closeWindow: () => ipcRenderer.send("omnigent:close-window"),
+  /**
    * Subscribe to the find bar opening (Cmd/Ctrl+F or Edit > Find…), so the
    * page can render content it would otherwise virtualize away. Returns an
    * unsubscribe function.

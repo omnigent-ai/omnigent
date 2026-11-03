@@ -528,6 +528,8 @@ def test_github_changed_files_maps_pr_file_statuses(monkeypatch: pytest.MonkeyPa
     assert by_path["src/fileA.py"]["status"] == "modified"
     assert by_path["fileB.py"]["status"] == "deleted"
     assert by_path["new/name.py"]["status"] == "renamed"
+    assert by_path["new/name.py"]["previous_path"] == "old/name.py"
+    assert by_path["src/fileA.py"]["previous_path"] is None
     # Line counts and the display name come straight from the PR file entry.
     assert by_path["newfile.py"]["lines_added"] == 1
     assert by_path["src/fileA.py"]["name"] == "fileA.py"
@@ -1204,6 +1206,8 @@ _PR_WITHOUT_CHECKS = {
     "headRefName": "feature",
     "headRefOid": "a" * 40,
     "baseRefOid": "b" * 40,
+    "headRepository": {"id": "R_1", "name": "repo"},
+    "headRepositoryOwner": {"id": "U_1", "login": "contributor"},
     "body": "Description",
     "comments": [],
     "reviews": [
@@ -1290,6 +1294,7 @@ def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
     assert info["pr"] is not None, calls
     assert info["pr"]["title"] == "Add thing"
     assert info["pr"]["head_sha"] == "a" * 40
+    assert info["pr"]["head_repository_url"] == "https://github.com/contributor/repo"
     assert not (info["pr"].get("checks") or {}).get("total")
     assert info["pr"]["checks_supported"] is False
     assert info["pr"]["body"] == "Description"
@@ -1405,3 +1410,36 @@ def test_busy_pr_reads_latest_comments_without_losing_feed_on_failure(monkeypatc
     shaped = github_resource._shape_comments(old + latest)
     assert len(shaped) == 100
     assert shaped[-1]["body"] == "new-99"
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "head", "owner", "expected"),
+    [
+        (
+            "https://github.com/acme/repo/pull/1",
+            {"id": "R_1", "name": "repo"},
+            {"id": "U_1", "login": "acme"},
+            "https://github.com/acme/repo",
+        ),
+        (
+            "https://github.com/acme/repo/pull/1",
+            {"id": "R_2", "name": "repo-fork"},
+            {"id": "U_2", "login": "contributor"},
+            "https://github.com/contributor/repo-fork",
+        ),
+        (
+            "https://ghe.example.com/acme/repo/pull/1",
+            {"id": "R_2", "name": "repo"},
+            {"id": "U_2", "login": "contributor"},
+            "https://ghe.example.com/contributor/repo",
+        ),
+        # gh reports a deleted fork as null.
+        ("https://github.com/acme/repo/pull/1", None, None, None),
+        ("https://github.com/acme/repo/pull/1", {"id": "R_2", "name": "repo"}, None, None),
+    ],
+)
+def test_head_repository_url(
+    pr_url: str, head: object, owner: object, expected: str | None
+) -> None:
+    reference = PullRequestRef.from_url(pr_url)
+    assert github_resource._head_repository_url(reference, head, owner) == expected

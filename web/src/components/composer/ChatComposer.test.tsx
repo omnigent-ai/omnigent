@@ -215,11 +215,11 @@ describe("ChatComposer", () => {
   it("uses the same button size in send and interrupt states", () => {
     const { rerender } = render(<ComposerSendButton label="Send" />);
     const send = screen.getByRole("button", { name: "Send" });
-    expect(send).toHaveClass("size-8");
+    expect(send).toHaveClass("size-8", "mobile-touch-target");
     expect(send.className).toContain("md:size-7");
     rerender(<ComposerSendButton label="Interrupt" interrupt />);
     const interrupt = screen.getByRole("button", { name: "Interrupt" });
-    expect(interrupt).toHaveClass("size-8");
+    expect(interrupt).toHaveClass("size-8", "mobile-touch-target");
     expect(interrupt.className).toContain("md:size-7");
   });
 

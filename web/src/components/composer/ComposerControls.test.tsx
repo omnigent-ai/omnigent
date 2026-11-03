@@ -6,6 +6,7 @@ import {
   ComposerWorkspaceTrigger,
   ComposerHarnessTrigger,
   ComposerPermissionPicker,
+  HostStatusDot,
 } from "./ComposerControls";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
@@ -41,15 +42,40 @@ describe("shared composer controls", () => {
 
   it.each([
     ["offline", true],
+    ["starting", true],
     ["online", false],
     ["unknown", false],
     [undefined, false],
-  ] as const)("renders the offline outline for host status %s", (status, hasIndicator) => {
-    render(<ComposerHostTrigger label="This machine" status={status} />);
-    const indicator = screen.queryByTestId("composer-host-status");
-    if (hasIndicator) expect(indicator).toHaveClass("border-[1.5px]", "border-muted-foreground");
-    else expect(indicator).toBeNull();
-    expect(screen.getByRole("button", { name: "This machine" })).toBeInTheDocument();
+  ] as const)(
+    "renders the host indicator only for offline or starting status (%s)",
+    (status, hasIndicator) => {
+      render(<ComposerHostTrigger label="This machine" status={status} />);
+      const indicator = screen.queryByTestId("composer-host-status");
+      if (hasIndicator) {
+        expect(indicator).toHaveAttribute("data-status", status);
+        expect(indicator).toHaveClass("border-[1.5px]", "border-muted-foreground");
+        if (status === "starting") expect(indicator).toHaveClass("animate-spin");
+      } else expect(indicator).toBeNull();
+      expect(screen.getByRole("button", { name: "This machine" })).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["online", ["bg-success"], ["border-[1.5px]", "animate-spin"]],
+    ["offline", ["border-[1.5px]"], ["bg-success", "animate-spin", "bg-destructive"]],
+    ["unknown", ["border-[1.5px]"], ["bg-success", "animate-spin"]],
+    [
+      "starting",
+      ["border-[1.5px]", "border-t-transparent", "animate-spin", "motion-reduce:animate-none"],
+      ["bg-success"],
+    ],
+  ] as const)("draws a %s host status dot", (status, present, absent) => {
+    render(<HostStatusDot status={status} testId="dot" />);
+    const dot = screen.getByTestId("dot");
+    expect(dot).toHaveAttribute("data-status", status);
+    expect(dot).toHaveAttribute("aria-hidden");
+    expect(dot).toHaveClass("size-2", "rounded-full", ...present);
+    for (const className of absent) expect(dot).not.toHaveClass(className);
   });
 
   it("lets workspace labels use half the bar instead of a fixed pixel cap", () => {
