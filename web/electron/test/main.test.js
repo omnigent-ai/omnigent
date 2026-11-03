@@ -158,6 +158,7 @@ function loadNavigationHarness({
   internalFeatures = false,
   cliPath = null,
   hostConnectResult = { ok: true },
+  serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
   network = null,
@@ -169,6 +170,7 @@ function loadNavigationHarness({
   deepLinks = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
   clipboardWriteText = async () => {},
+  localHostNow = Date.now,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -280,6 +282,9 @@ function loadNavigationHarness({
       // away watch, workspace bounce): keep them all, like a real emitter.
       if (!listeners.has(eventName)) listeners.set(eventName, []);
       listeners.get(eventName).push(listener);
+    },
+    prependListener(eventName, listener) {
+      listeners.set(eventName, [listener, ...(listeners.get(eventName) ?? [])]);
     },
     emit(eventName, ...args) {
       for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
@@ -648,8 +653,11 @@ function loadNavigationHarness({
     },
     "./hostIdentity": {
       ...require("../src/hostIdentity"),
-      isHostThisMachine: (context) =>
-        require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
+      createHostThisMachineChecker: () =>
+        require("../src/hostIdentity").createHostThisMachineChecker({
+          cli: localHostCli,
+          now: localHostNow,
+        }),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -662,7 +670,7 @@ function loadNavigationHarness({
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => ({ ok: true }),
+      ensureServerAuth: async () => serverAuthResult,
       ensureHostConnected: async () => hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
@@ -691,7 +699,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -2802,7 +2810,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -3881,6 +3889,26 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
   });
 
+  it("reconnects behind the overlay when the workspace never responds", async (t) => {
+    let loads = 0;
+    const h = browserHarness(t, [25], {
+      loadURL: () => (loads++ === 0 ? new Promise(() => {}) : Promise.resolve()),
+    });
+    h.api.setServerResponseTimeoutMs(20);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, undefined, { loadUrl: page }), {
+      code: "ERR_TIMED_OUT",
+    });
+    assert.equal(h.overlay.hint, "Check your network connection.");
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+    await until(
+      () => h.calls.loadURL.length === 2 && h.api.windows.get(h.win).origin === origin,
+      "the reopened page",
+    );
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.overlay.hint, null);
+  });
+
   it("keeps the overlay up when a background session retry fails", async (t) => {
     const h = browserHarness(t, [20, 20], {
       ensureSession: async () => {
@@ -4944,7 +4972,24 @@ describe("onboarding runner IPC", () => {
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
     assert.equal(result.ok, false);
-    assert.match(result.error, /omnigent CLI was not found/);
+    assert.equal(result.errorMessage, "The omnigent CLI was not found.");
+    assert.equal(result.errorAction, "Install it or set its path.");
+    assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
+  });
+
+  it("passes separate authentication message and action fields to the setup page", async (t) => {
+    const errorMessage = "Sign-in to https://host.example/ml/omnigents didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const legacyError = `${errorMessage} ${errorAction}`;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: { ok: false, error: legacyError, errorMessage, errorAction },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(result), { ok: false, error: legacyError, errorMessage, errorAction });
   });
 
   // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
@@ -5078,10 +5123,134 @@ it("dismisses native loading feedback when the server document fails", async (t)
     },
   });
   t.after(h.cleanup);
+  let stops = 0;
+  h.webContents.stop = () => {
+    stops++;
+  };
+  h.api.setServerResponseTimeoutMs(20);
   await assert.rejects(h.api.loadServerUrl(h.win, "https://example.com/"), /connection lost/);
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+  await wait(40);
+  assert.equal(stops, 0);
+  assert.deepEqual(h.calls.loadFile, []);
+});
+
+describe("server response deadline (src/main.js)", () => {
+  const server = "http://127.0.0.1:6767";
+
+  function stalledHarness(t, loadServer) {
+    const h = loadNavigationHarness({ serverUrl: server, loadServer });
+    t.after(h.cleanup);
+    h.stops = 0;
+    h.webContents.stop = () => {
+      h.stops++;
+    };
+    h.api.setServerResponseTimeoutMs(20);
+    return h;
+  }
+
+  it("gives the server 30s to respond", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    assert.equal(h.api.serverResponseTimeoutMs(), 30_000);
+  });
+
+  it("returns to setup with a timeout when the server accepts but never responds", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const h = stalledHarness(t, () => new Promise(() => {}));
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_TIMED_OUT" });
+    await wait(0);
+    assert.equal(h.stops, 1);
+    assert.equal(h.calls.loadFile.length, 1);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.deepEqual(
+      [params.get("error"), params.get("url")],
+      ["ERR_TIMED_OUT (-7)", `${server}/`],
+    );
+    const shown = h.calls.loading.find((call) => call.action === "show");
+    assert.equal(shown.label, "Opening Omnigent…");
+    assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+    const recorded = (name) =>
+      events.filter(([event]) => event === name).map(([, fields]) => fields);
+    assert.deepEqual(
+      recorded("navigation_failed").map(({ origin, code }) => [origin, code]),
+      [[server, "net_7"]],
+    );
+    assert.deepEqual(
+      recorded("connection_result").map(({ outcome, code }) => [outcome, code]),
+      [["failed", "ERR_TIMED_OUT"]],
+    );
+  });
+
+  it("keeps loading a server document that responded before the deadline", async (t) => {
+    let finishLoad;
+    const h = stalledHarness(t, (url) => {
+      h.emit("did-navigate", url, 200, "OK");
+      return new Promise((resolve) => {
+        finishLoad = resolve;
+      });
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await wait(60);
+    assert.equal(h.stops, 0);
+    assert.deepEqual(h.calls.loadFile, []);
+    finishLoad();
+    assert.equal(await pending, server);
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+  });
+
+  it("stops a superseded load at once without returning to setup", async (t) => {
+    let stalled;
+    const reachedLoad = new Promise((resolve) => {
+      stalled = resolve;
+    });
+    const h = stalledHarness(t, () => {
+      stalled();
+      return new Promise(() => {});
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await reachedLoad;
+    // A newer attempt that has not navigated yet, e.g. still signing in.
+    h.api.pinWindow(h.win, "https://other.example");
+    assert.equal(h.stops, 1);
+    await assert.rejects(pending, { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 1);
+    assert.deepEqual(h.calls.loadFile, []);
+  });
+
+  const setupError = (h) => new URLSearchParams(h.calls.loadFile[0][1].search).get("error");
+
+  it("keeps a failed load's own error and setup fallback", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-fail-load", -102, "ERR_CONNECTION_REFUSED", url, true);
+      await wait(0);
+      throw Object.assign(new Error("ERR_CONNECTION_REFUSED (-102)"), {
+        code: "ERR_CONNECTION_REFUSED",
+      });
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_CONNECTION_REFUSED" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "ERR_CONNECTION_REFUSED (-102)");
+  });
+
+  it("leaves an HTTP error page to the setup fallback without stopping it", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-navigate", url, 500, "Internal Server Error");
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "500 Internal Server Error");
+  });
 });
 
 describe("OIDC system-browser sign-in wiring", () => {
@@ -5700,9 +5869,11 @@ describe("main-owned local host eligibility", () => {
 
   it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
     let live = true;
+    let now = 0;
     const serverUrl = "https://server.example";
     const h = loadNavigationHarness({
       serverUrl,
+      localHostNow: () => now,
       localHostCli: {
         readLocalHostId: () => "local",
         liveDaemonRecordFor: (target) => {
@@ -5735,6 +5906,7 @@ describe("main-owned local host eligibility", () => {
       false,
     );
     live = false;
+    now = 1000;
     assert.equal(
       context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
         .hostIsThisMachine,
