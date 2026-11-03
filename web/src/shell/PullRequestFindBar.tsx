@@ -2,7 +2,7 @@
 // computed by the tab (they depend on the visible files); this bar shows the
 // query, the position and the hidden-file hint, and forwards the reader's actions.
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react";
 import type { FindState } from "./useChangesViewState";
 import { IconButton } from "./PullRequestFileSection";
@@ -73,15 +73,33 @@ export function PullRequestFindBar({
   onShowHidden,
 }: PullRequestFindBarProps) {
   const { open, query } = find;
+  const trigger = useRef<HTMLSpanElement>(null);
+  // Closing removes the input, so a reader's close returns focus to the trigger, keeping
+  // Cmd/Ctrl+F inside the Changes tab.
+  const restoreFocus = useRef(false);
   useEffect(() => {
     if (open) inputRef.current?.focus();
+    else if (restoreFocus.current) {
+      restoreFocus.current = false;
+      trigger.current?.querySelector("button")?.focus();
+    }
   }, [open, inputRef]);
+  const close = () => {
+    restoreFocus.current = true;
+    onClose();
+  };
 
   if (!open) {
     return (
-      <IconButton label="Find in changes" onClick={onOpen} className="size-5 text-muted-foreground">
-        <SearchIcon className="size-3.5" />
-      </IconButton>
+      <span ref={trigger}>
+        <IconButton
+          label="Find in changes"
+          onClick={onOpen}
+          className="size-5 text-muted-foreground"
+        >
+          <SearchIcon className="size-3.5" />
+        </IconButton>
+      </span>
     );
   }
 
@@ -108,7 +126,7 @@ export function PullRequestFindBar({
             onStep(event.shiftKey ? -1 : 1);
           } else if (event.key === "Escape") {
             event.preventDefault();
-            onClose();
+            close();
           }
         }}
         placeholder="Find in changes…"
@@ -156,7 +174,7 @@ export function PullRequestFindBar({
       >
         <ChevronDownIcon className="size-3.5" />
       </IconButton>
-      <IconButton label="Close find" onClick={onClose} className="size-5 text-muted-foreground">
+      <IconButton label="Close find" onClick={close} className="size-5 text-muted-foreground">
         <XIcon className="size-3.5" />
       </IconButton>
     </div>

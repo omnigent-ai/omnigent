@@ -1167,6 +1167,16 @@ def test_changes_find_reveals_collapsed_and_filtered(
     expect(panel.get_by_text("1 of 2", exact=True)).to_be_visible()
     expect(file.locator("diffs-container")).to_have_count(1)
 
+    def wait_for_highlight(line: str) -> None:
+        # Painting runs in an effect after the counter updates, so poll for the new range.
+        page.wait_for_function(
+            """([line]) => [...(CSS.highlights.get("pr-find-active") ?? [])].some((range) =>
+                range.startContainer.isConnected && range.toString() === "added"
+                && range.startContainer.parentElement.closest("[data-line]")
+                    ?.getAttribute("data-line") === line)""",
+            arg=[line],
+        )
+
     def highlighted() -> list[dict[str, str | None]]:
         return page.evaluate(
             """() => [...(CSS.highlights.get("pr-find-active") ?? [])].map((range) => ({
@@ -1178,11 +1188,13 @@ def test_changes_find_reveals_collapsed_and_filtered(
 
     first = file.locator('[data-line="2"][data-line-type="change-addition"]')
     expect(first).to_be_in_viewport()
+    wait_for_highlight("2")
     assert highlighted() == [{"text": "added", "line": "2"}]
     page.screenshot(path=str(tmp_path / f"find-{entry}-first-match.png"))
 
     find.press("Enter")
     expect(panel.get_by_text("2 of 2", exact=True)).to_be_visible()
+    wait_for_highlight("4")
     assert highlighted() == [{"text": "added", "line": "4"}]
     expect(file.locator('[data-line="4"][data-line-type="change-addition"]')).to_be_in_viewport()
 
@@ -1201,6 +1213,7 @@ def test_changes_find_reveals_collapsed_and_filtered(
 
     find.press("Escape")
     expect(find).to_have_count(0)
+    page.wait_for_function("() => !CSS.highlights.has('pr-find-active')")
     assert highlighted() == []
 
     # Ctrl/Cmd+F reopens the bar from inside the Changes tab.

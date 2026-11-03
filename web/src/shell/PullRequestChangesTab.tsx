@@ -676,7 +676,8 @@ export function PullRequestChangesTab({
   }, [activeFilePath, findTarget, reveal]);
 
   const stepMatch = (direction: 1 | -1) => {
-    if (!matches.length) return;
+    // Matches for a query still being searched would navigate the previous results.
+    if (!matches.length || deferredQuery !== query) return;
     const next =
       matches[activeIndex < 0 ? 0 : (activeIndex + direction + matches.length) % matches.length];
     // A fresh object, so stepping to the sole match again is a new reveal request.

@@ -240,18 +240,6 @@ describe("PullRequestChangesTab", () => {
     expect(screen.queryByText(/in hidden files/)).toBeNull();
   });
 
-  it("collapses a revealed file when the reader collapses it again", () => {
-    renderTab({ conversationId: "find-recollapse" });
-    fireEvent.click(sectionHeader("b.ts", true));
-    openFind("needle");
-    expect(diffOf("b.ts")).not.toBeNull();
-
-    fireEvent.click(sectionHeader("b.ts", true));
-
-    expect(diffOf("b.ts")).toBeNull();
-    expect(sectionHeader("b.ts", false)).toBeInTheDocument();
-  });
-
   it("handles Cmd+F only while focus is inside the Changes tab", () => {
     renderTab({ conversationId: "find-shortcut" });
     expect(fireEvent.keyDown(document.body, { key: "f", metaKey: true })).toBe(true);
@@ -264,15 +252,17 @@ describe("PullRequestChangesTab", () => {
   });
 
   it("keeps the query and the nearest match when the patch refreshes", () => {
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
     const { rerender } = renderTab({ conversationId: "find-refresh" });
     openFind("needle");
     expect(screen.getByText("1 of 2")).toBeInTheDocument();
+    expect(scroll.mock.contexts).toContain(rowOf("b.ts", 2));
 
     rerender(A + addedFile("b.ts", ["new top", "gamma", "needle here"]) + C);
 
     expect(findInput()).toHaveValue("needle");
     expect(screen.getByText("1 of 2")).toBeInTheDocument();
-    expect(rowOf("b.ts", 3)).not.toBeNull();
+    expect(scroll.mock.contexts).toContain(rowOf("b.ts", 3));
   });
 
   it("steps through matches with Enter and Shift+Enter, wrapping at the ends", () => {
@@ -297,12 +287,30 @@ describe("PullRequestChangesTab", () => {
     expect(screen.getByText("Invalid")).toBeInTheDocument();
   });
 
-  it("closes on Escape", () => {
+  it("closes on Escape, returns focus to the trigger, and reopens on the shortcut", () => {
     renderTab({ conversationId: "find-escape" });
     openFind("needle");
     fireEvent.keyDown(findInput(), { key: "Escape" });
     expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
     expect(screen.getByRole("button", { name: "Find in changes" })).toBeInTheDocument();
+    const trigger = screen.getByRole("button", { name: "Find in changes" });
+    expect(trigger).toHaveFocus();
+
+    fireEvent.keyDown(trigger, { key: "f", ctrlKey: true });
+    expect(findInput()).toHaveFocus();
+  });
+
+  it("applies Match case and regular expressions", () => {
+    renderTab({ conversationId: "find-options" });
+    openFind("NEEDLE");
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Match case" }));
+    expect(screen.getByText("No results")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
+    fireEvent.change(findInput(), { target: { value: "needle (here|at)" } });
+    expect(screen.getByText("1 of 2")).toBeInTheDocument();
   });
 
   it("re-reveals and re-centres a sole match on explicit navigation", () => {
@@ -312,6 +320,7 @@ describe("PullRequestChangesTab", () => {
     expect(diffOf("c.ts")).not.toBeNull();
     fireEvent.click(sectionHeader("c.ts", true));
     expect(diffOf("c.ts")).toBeNull();
+    expect(sectionHeader("c.ts", false)).toBeInTheDocument();
     const scrollsBefore = scroll.mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Next match" }));

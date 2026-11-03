@@ -37,4 +37,19 @@ describe("useChangesViewState", () => {
     act(() => result.current.clearReveal("a.ts"));
     expect(result.current.revealedPaths.has("a.ts")).toBe(false);
   });
+
+  it("keeps find choices across remounts and isolates them per PR", () => {
+    const prUrl = "https://github.com/o/r/pull/3";
+    const first = renderHook(() => useChangesViewState("view-state-find", prUrl));
+    act(() => first.result.current.setFind({ open: true, query: "needle", matchCase: true }));
+    first.unmount();
+
+    const remounted = renderHook(() => useChangesViewState("view-state-find", prUrl)).result
+      .current;
+    expect(remounted.find).toEqual({ open: true, query: "needle", matchCase: true, regex: false });
+
+    const other = renderHook(() => useChangesViewState("view-state-find-other", prUrl)).result
+      .current;
+    expect(other.find).toEqual({ open: false, query: "", matchCase: false, regex: false });
+  });
 });

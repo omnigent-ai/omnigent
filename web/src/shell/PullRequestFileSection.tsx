@@ -340,13 +340,15 @@ export function PullRequestFileSection({
     return { annotations: inlineAnnotations, unplaced: unplacedThreads };
   }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
 
-  // Centre the active find match once its row renders. Diff re-renders replace the rows,
-  // so onPostRender repaints the range without scrolling again.
+  // Centre the active find match once its row renders. A large diff can take longer than the
+  // frame budget, so the next onPostRender centres it instead.
+  const pendingCentre = useRef(false);
   useEffect(() => {
     const section = ref.current;
     if (!highlight || !section || collapsed || !renderingDiff) return;
     let frame = 0;
     let frames = 0;
+    pendingCentre.current = true;
     const centre = () => {
       const row = findDiffRow(highlight, section);
       if (!row) {
@@ -354,19 +356,27 @@ export function PullRequestFileSection({
         return;
       }
       paintFindMatch(row, highlight);
+      pendingCentre.current = false;
       row.scrollIntoView({ block: "center" });
     };
     centre();
     return () => {
       cancelAnimationFrame(frame);
+      pendingCentre.current = false;
       clearFindMatch();
     };
   }, [highlight, collapsed, renderingDiff]);
   // Stable across selection drags: the diff re-renders when a callback option changes identity.
+  // Diff re-renders replace the rows, so this repaints the range on the new ones.
   const repaintHighlight = useCallback(() => {
     const section = ref.current;
     const row = highlight && section ? findDiffRow(highlight, section) : null;
-    if (highlight && row) paintFindMatch(row, highlight);
+    if (!highlight || !row) return;
+    paintFindMatch(row, highlight);
+    if (pendingCentre.current) {
+      pendingCentre.current = false;
+      row.scrollIntoView({ block: "center" });
+    }
   }, [highlight]);
   const newConversation = anchor && (
     <section
