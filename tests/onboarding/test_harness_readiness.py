@@ -20,8 +20,8 @@ from omnigent.harness_availability import (
     HARNESS_VERSION_TOO_LOW,
 )
 from omnigent.onboarding.harness_readiness import (
-    PROBE_UNANSWERED,
     _READINESS_PROBE_MAX_WORKERS,
+    PROBE_UNANSWERED,
     _binary_availability_reason,
     _databricks_credential_source,
     configured_harness_map,
@@ -933,10 +933,7 @@ def test_binary_availability_reason_distinguishes_probe_unanswered(
         hreadiness, "harness_cli_probe_outcome", lambda _key, **_kw: PROBE_UNANSWERED
     )
     monkeypatch.setattr(hi, "harness_cli_binary", lambda _key: "/usr/bin/pi")
-    assert (
-        hreadiness._binary_availability_reason("pi")
-        == HARNESS_PROBE_UNANSWERED
-    )
+    assert hreadiness._binary_availability_reason("pi") == HARNESS_PROBE_UNANSWERED
 
 
 def test_harness_is_configured_allows_probe_unanswered(
@@ -959,6 +956,8 @@ def test_harness_is_configured_still_blocks_version_too_low(
         lambda _harness: HARNESS_VERSION_TOO_LOW,
     )
     assert hreadiness.harness_is_configured("pi") is False
+
+
 def test_antigravity_native_requires_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
