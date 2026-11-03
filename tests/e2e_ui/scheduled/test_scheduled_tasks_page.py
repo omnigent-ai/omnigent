@@ -496,8 +496,12 @@ def test_scheduled_task_row_run_controls(
     server-side run record rather than a visible badge.
     """
     agent_id = _builtin_agent_id(live_server, "hello_world")
+    scheduled_time = datetime.now(UTC) + timedelta(hours=2)
     task_id = _create_task(
-        live_server, agent_id, "Run-now target", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+        live_server,
+        agent_id,
+        "Run-now target",
+        f"FREQ=DAILY;BYHOUR={scheduled_time.hour};BYMINUTE={scheduled_time.minute}",
     )
 
     _open_automations_page(page, live_server)
@@ -1021,9 +1025,11 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
         expect(templates_tab).to_have_css("outline-style", "none")
         page.keyboard.press("ArrowLeft")
         expect(yours_tab).to_be_focused()
+        expect(yours_tab).to_have_attribute("aria-selected", "true")
         expect(yours_tab).to_have_css("outline-style", "solid")
         page.keyboard.press("ArrowRight")
         expect(templates_tab).to_be_focused()
+        expect(templates_tab).to_have_attribute("aria-selected", "true")
         expect(templates_tab).to_have_css("outline-style", "solid")
         templates_tab.click()
         expect(templates_tab).to_have_css("outline-style", "none")
