@@ -248,6 +248,22 @@ describe("full skill descriptions", () => {
     });
     expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
   });
+
+  it("drops a pending tooltip when its row is highlighted before the delay ends", async () => {
+    const { rerender } = render(
+      <SlashCommandMenu {...props} commands={commands} activeIndex={0} />,
+    );
+    overflowDescription("triage", 900);
+    const row = screen.getByTestId("slash-menu-item-triage");
+    fireEvent.pointerMove(row);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={1} />);
+    fireEvent.pointerLeave(row);
+    rerender(<SlashCommandMenu {...props} commands={commands} activeIndex={2} />);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 700);
+    });
+    expect(screen.queryByTestId("slash-menu-tooltip-triage")).toBeNull();
+  });
 });
 
 describe("skill display names", () => {

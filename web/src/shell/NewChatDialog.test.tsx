@@ -9315,7 +9315,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByTestId("slash-menu-item-cross-review")).not.toBeInTheDocument();
   });
 
-  it("shows the highlighted skill's full description as the user arrows through the menu", () => {
+  it("wraps the highlighted skill's description to up to four lines as the user arrows through the menu", () => {
     const triage =
       "Given the current conversation's context (a bug, error, crash, regression, or test " +
       "failure), file a ticket with reproduction steps and the owning team.";
@@ -9333,6 +9333,7 @@ describe("NewChatLandingScreen skills menu", () => {
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
     expect(screen.getByTestId("slash-menu-item-triage")).toHaveAttribute("data-active", "true");
     expect(description).toHaveTextContent(triage);
+    expect(description).toHaveClass("line-clamp-4");
     expect(description).not.toHaveClass("truncate");
   });
 
