@@ -496,8 +496,12 @@ def test_scheduled_task_row_run_controls(
     server-side run record rather than a visible badge.
     """
     agent_id = _builtin_agent_id(live_server, "hello_world")
+    scheduled_time = datetime.now(UTC) + timedelta(hours=2)
     task_id = _create_task(
-        live_server, agent_id, "Run-now target", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+        live_server,
+        agent_id,
+        "Run-now target",
+        f"FREQ=DAILY;BYHOUR={scheduled_time.hour};BYMINUTE={scheduled_time.minute}",
     )
 
     _open_automations_page(page, live_server)
