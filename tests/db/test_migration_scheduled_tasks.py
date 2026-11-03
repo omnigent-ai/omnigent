@@ -88,7 +88,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["session_mode"]["nullable"] is False
     assert columns["session_id"]["nullable"] is True
     cols = set(columns)
-    assert cols == {
+    assert cols - {"max_duration_seconds"} == {
         "workspace_id",
         "id",
         "name",
@@ -129,7 +129,15 @@ def test_scheduled_task_runs_columns(db_engine: Engine) -> None:
         assert isinstance(columns[name]["type"], timestamp_type)
         assert columns[name]["nullable"] is (name != "scheduled_at")
     cols = set(columns)
-    assert cols == {
+    assert cols - {
+        "completion_kind",
+        "outcome",
+        "outcome_summary",
+        "heartbeat_at",
+        "last_activity_at",
+        "deadline_at",
+        "runtime_state",
+    } == {
         "workspace_id",
         "id",
         "scheduled_task_id",
@@ -967,3 +975,34 @@ def test_mutation_receipt_schema_and_rollback(db_engine: Engine) -> None:
     command.downgrade(config, "d0a1f879a01d")
     assert "scheduled_task_requests" not in sa.inspect(db_engine).get_table_names()
     command.upgrade(config, "head")
+
+
+def test_run_observation_migration_is_additive_and_reversible(db_engine: Engine) -> None:
+    config = _build_alembic_config(str(db_engine.url))
+    task_columns = {
+        column["name"]: column for column in sa.inspect(db_engine).get_columns("scheduled_tasks")
+    }
+    run_columns = {
+        column["name"]: column
+        for column in sa.inspect(db_engine).get_columns("scheduled_task_runs")
+    }
+    assert task_columns["max_duration_seconds"]["nullable"]
+    observations = {
+        "completion_kind",
+        "outcome",
+        "outcome_summary",
+        "heartbeat_at",
+        "last_activity_at",
+        "deadline_at",
+        "runtime_state",
+    }
+    assert all(run_columns[name]["nullable"] for name in observations)
+    assert isinstance(run_columns["outcome_summary"]["type"], sa.LargeBinary)
+    command.downgrade(config, "b4e2a8d06f19")
+    assert observations.isdisjoint(
+        column["name"] for column in sa.inspect(db_engine).get_columns("scheduled_task_runs")
+    )
+    command.upgrade(config, "a3d91e7b6c20")
+    assert observations <= {
+        column["name"] for column in sa.inspect(db_engine).get_columns("scheduled_task_runs")
+    }
