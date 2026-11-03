@@ -1,8 +1,9 @@
 """E2E: clicking the collapsed-sidebar toggle must pin the sidebar open.
 
-Hovering the "Open sidebar" toggle for 400ms mounts the peek card over it, so
-clicks at any point of the hover-peek must still open the sidebar on the same
-session. Pure client-side interaction on the seeded session page — no LLM turn.
+Hovering the "Open sidebar" toggle for 400ms opens the peek card, so clicks at
+any point of the hover-peek must still reach the toggle and open the sidebar on
+the same session. Pure client-side interaction on the seeded session page — no
+LLM turn.
 """
 
 from __future__ import annotations
@@ -136,7 +137,7 @@ def test_click_while_peek_covers_toggle_opens_sidebar(
     dwell_ms: int,
     press_ms: int,
 ) -> None:
-    """A click on the toggle opens the sidebar even once the peek card can take pointer events."""
+    """A click on the toggle opens the sidebar while the peek card fades in or is shown."""
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": 1280, "height": 800})
     page.clock.install()
