@@ -136,4 +136,25 @@ describe("SessionTitleInstructionsControl", () => {
     await loadedInput();
     expect(getMock).toHaveBeenCalledTimes(2);
   });
+
+  it("still confirms a save that finishes after the user leaves Settings", async () => {
+    let finishSave: (value: { instructions: string; max_chars: number }) => void = () => {};
+    saveMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishSave = resolve;
+        }),
+    );
+    const view = renderControl();
+    fireEvent.change(await loadedInput(), { target: { value: "Use French titles." } });
+    fireEvent.click(screen.getByTestId("session-title-instructions-save"));
+    await waitFor(() => expect(saveMock).toHaveBeenCalledTimes(1));
+
+    view.unmount();
+    finishSave({ instructions: "Use French titles.", max_chars: 4000 });
+
+    await waitFor(() =>
+      expect(vi.mocked(toast.success)).toHaveBeenCalledWith("Title instructions saved"),
+    );
+  });
 });

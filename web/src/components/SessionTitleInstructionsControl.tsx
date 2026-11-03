@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { SettingsLabel } from "@/components/SettingsLabel";
@@ -25,35 +25,42 @@ export function SessionTitleInstructionsControl() {
   const labelId = useId();
   const descriptionId = useId();
   const counterId = useId();
+  // Guards every async state update, from the initial load, Retry and Save.
+  const mountedRef = useRef(false);
 
-  const load = useCallback(async (isCurrent: () => boolean) => {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const load = useCallback(async () => {
     setLoadState("loading");
     try {
       const current = await getSessionTitleInstructions();
-      if (!isCurrent()) return;
+      if (!mountedRef.current) return;
       setSaved(current.instructions ?? "");
       setDraft(current.instructions ?? "");
       setMaxChars(current.max_chars);
       setLoadState("ready");
     } catch {
-      if (isCurrent()) setLoadState("error");
+      if (mountedRef.current) setLoadState("error");
     }
   }, []);
 
   useEffect(() => {
-    let current = true;
-    void load(() => current);
-    return () => {
-      current = false;
-    };
+    void load();
   }, [load]);
 
   const persist = useCallback(async (next: string | null) => {
     setSaving(true);
     try {
       const result = await saveSessionTitleInstructions(next);
-      setSaved(result.instructions ?? "");
-      setDraft(result.instructions ?? "");
+      if (mountedRef.current) {
+        setSaved(result.instructions ?? "");
+        setDraft(result.instructions ?? "");
+      }
       toast.success(
         result.instructions ? "Title instructions saved" : "Title instructions cleared",
       );
@@ -61,7 +68,7 @@ export function SessionTitleInstructionsControl() {
       const reason = error instanceof Error ? error.message : String(error);
       toast.error(`Couldn't save title instructions: ${reason}`);
     } finally {
-      setSaving(false);
+      if (mountedRef.current) setSaving(false);
     }
   }, []);
 
@@ -112,7 +119,7 @@ export function SessionTitleInstructionsControl() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => void load(() => true)}
+              onClick={() => void load()}
               data-testid="session-title-instructions-retry"
               componentId="settings.general.session_title_instructions.retry"
             >
