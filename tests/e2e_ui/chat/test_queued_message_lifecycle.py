@@ -75,10 +75,10 @@ _TRACK_REPLY_ACTIONS = """
     const bubble = [...document.querySelectorAll(
       '[data-testid="message-bubble"][data-role="assistant"]')].find(
       (b) => (b.textContent || '').includes(reply));
-    const link = bubble && bubble.querySelector('[data-testid="copy-message-link"]');
-    if (link) {
+    const action = bubble && bubble.querySelector('[data-testid="message-more-actions"]');
+    if (action) {
       window.__replyActionOpacity.push(
-        Number(getComputedStyle(link.parentElement.parentElement).opacity));
+        Number(getComputedStyle(action.parentElement.parentElement).opacity));
     }
   };
   const frame = () => {

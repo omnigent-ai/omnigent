@@ -1,16 +1,16 @@
 """E2E: hover-revealed timestamps on chat message bubbles.
 
-Chat bubbles show their send/receive time next to the Copy/Fork controls.
-Earlier rows reveal on hover; the final message row stays fully visible.
+Chat bubbles show their send/receive time next to the message controls.
+Timestamps reveal on hover; the final message keeps its primary controls visible.
 This drives the full browser → SPA → server stack: send a message, wait for
 the mock-LLM reply, and assert for both the user and the assistant bubble that
 
-  - the timestamp rides inside the existing 24px action row (no new row),
+  - the timestamp shares the compact action row (no new row),
   - it matches a locale time format (``h:MM AM`` style),
   - the earlier user row is transparent at rest, while the final assistant
     row rests at full opacity,
   - the ordering matches the design target (user: timestamp → Copy at the
-    right edge; assistant: Copy/Fork → timestamp at the left edge),
+    right edge; assistant: Copy/More → timestamp at the left edge),
   - the stamp survives a full page reload (server-stamped path, not a
     re-stamped render time),
   - on a touch-sized viewport the row rests at 40% opacity so the actions
@@ -109,8 +109,8 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     # At rest on a desktop viewport the row is fully transparent — the
     # timestamp must not permanently occupy visual space.
     expect(user_row).to_have_css("opacity", "0")
-    # The row exists at the design's 24px height even while hidden.
-    assert round(user_row.bounding_box()["height"]) == 24
+    # The compact user footer reserves its 20px height while hidden.
+    assert round(user_row.bounding_box()["height"]) == 20
 
     user_bubble.hover()
     expect(user_row).to_have_css("opacity", "1")
@@ -129,14 +129,16 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     assistant_row = _action_row(assistant_ts)
 
     # The assistant response is the final message, so its actions use their
-    # fully visible hover color at rest.
+    # fully visible hover color at rest, while its timestamp waits for hover.
     expect(assistant_row).to_have_css("opacity", "1")
+    expect(assistant_ts).to_have_css("opacity", "0")
     assert round(assistant_row.bounding_box()["height"]) == 24
 
     assistant_bubble.hover()
     expect(assistant_row).to_have_css("opacity", "1")
+    expect(assistant_ts).to_have_css("opacity", "1")
 
-    # Design order: Copy/Fork → timestamp at the bubble's left edge.
+    # Design order: Copy/More → timestamp at the bubble's left edge.
     assistant_copy = assistant_bubble.get_by_role("button", name="Copy", exact=True)
     assert assistant_copy.bounding_box()["x"] < assistant_ts.bounding_box()["x"]
 
