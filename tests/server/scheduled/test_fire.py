@@ -2025,9 +2025,21 @@ async def _drain_managed_launches() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("launch_outcome", ["bound", "tracker_failed", "raised"])
+@pytest.mark.parametrize(
+    ("launch_outcome", "workspace", "expected_repositories"),
+    [
+        ("bound", None, []),
+        ("tracker_failed", None, []),
+        ("raised", None, []),
+        ("bound", "https://github.com/example/runtime", ["https://github.com/example/runtime"]),
+        ("bound", "/home/me", []),
+    ],
+)
 async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
-    monkeypatch: pytest.MonkeyPatch, launch_outcome: str
+    monkeypatch: pytest.MonkeyPatch,
+    launch_outcome: str,
+    workspace: str | None,
+    expected_repositories: list[str],
 ) -> None:
     """A managed fire saves its prompt before provisioning; a failed launch fails the run."""
     from omnigent.server.managed_hosts import ManagedLaunchTracker
@@ -2050,11 +2062,15 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     direct_dispatch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
     monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", direct_dispatch)
-    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(execution_target="managed_sandbox", workspace=workspace)}
+    )
+    conversations = FakeConversationStore()
     on_fire = build_on_fire(
         _deps(
             store,
             sandbox_config=config,
+            conversation_store=conversations,
             managed_launches=ManagedLaunchTracker(),
             startup_inputs=startup,
         )
@@ -2077,7 +2093,10 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
         assert call.kwargs["sandbox_config"] is config
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
-        assert call.kwargs["repos"] == ()
+        assert [repo.url for repo in call.kwargs["repos"]] == expected_repositories
+    assert len(conversations.created) == 2
+    for created in conversations.created:
+        assert fire_mod.read_managed_repo_workspaces(created["labels"]) == expected_repositories
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
     # The saved prompt is delivered by the host's replica, never directly here.
     direct_dispatch.assert_not_awaited()
@@ -2807,15 +2826,21 @@ async def test_a_sandbox_task_continues_only_a_session_on_its_own_host(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_exists", [False, True])
+@pytest.mark.parametrize(
+    ("host_exists", "repository"),
+    [(False, None), (True, None), (True, "https://github.com/example/runtime")],
+)
 async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
-    monkeypatch: pytest.MonkeyPatch, host_exists: bool
+    monkeypatch: pytest.MonkeyPatch, host_exists: bool, repository: str | None
 ) -> None:
     """An existing host, left by a reset session, gets a new sandbox, not a second host row."""
     from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, ManagedLaunchTracker
     from omnigent.server.routes import sessions
 
-    task = _sandbox_continue_task()
+    task = _sandbox_continue_task(
+        workspace=repository,
+        last_run_conversation_id="conv_prev" if repository else None,
+    )
     own = continued_sandbox_host_id(task.id, task.workspace_id)
     existing = _FakeHost(own, "local", sandbox_provider="agent_sandbox")
 
@@ -2824,7 +2849,14 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
     managed_launch = AsyncMock(side_effect=launch)
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
-    conv_store = FakeConversationStore()
+    conv_store = _ExistingConversationStore()
+    if repository:
+        earlier = _continued_session(
+            host_id=own,
+            workspace="/sandbox/ws",
+            labels=fire_mod.managed_repo_labels(["https://github.com/example/universe"]),
+        )
+        conv_store.existing[earlier.id] = earlier
     store = FakeScheduledTaskStore(rows={"task_1": task})
     on_fire = build_on_fire(
         _deps(
@@ -2842,6 +2874,7 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
     await _drain_managed_launches()
 
     [call] = managed_launch.await_args_list
+    assert [repo.url for repo in call.kwargs["repos"]] == ([repository] if repository else [])
     assert call.kwargs["host_id"] == own
     assert call.kwargs["relaunch_host"] is (existing if host_exists else None)
     # A relaunch keeps routing the sandbox by the task's host id.
@@ -2850,16 +2883,22 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,
+    repository: str | None,
 ) -> None:
     """After a reset, the next session runs on the same sandbox, woken like a user message."""
     from omnigent.server.routes import sessions
 
-    task = _sandbox_continue_task(last_run_conversation_id="conv_prev")
+    task = _sandbox_continue_task(last_run_conversation_id="conv_prev", workspace=repository)
     own = continued_sandbox_host_id(task.id, task.workspace_id)
     conv_store = _ExistingConversationStore(
-        _continued_session(host_id=own, workspace="/sandbox/ws")
+        _continued_session(
+            host_id=own,
+            workspace="/sandbox/ws",
+            labels=fire_mod.managed_repo_labels([repository] if repository else []),
+        )
     )
     managed_launch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
@@ -2880,6 +2919,29 @@ async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_work
     assert [conv.host_id for conv in launched] == [own]
     managed_launch.assert_not_awaited()
     assert [run["status"] for run in store.runs] == ["running"]
+
+    assert fire_mod.read_managed_repo_workspaces(created["labels"]) == (
+        [repository] if repository else []
+    )
+    if repository:
+        changed = replace(task, workspace="https://github.com/example/other")
+        deps = _deps(store, conversation_store=conv_store, host_store=hosts)
+        assert await fire_mod._continued_host_binding(deps, changed) is None
+        problem = await fire_mod.continued_session_problem(
+            task,
+            _continued_session(host_id=own, workspace="/sandbox/ws", labels=created["labels"]),
+            host_store=hosts,
+            permission_store=None,
+        )
+        assert problem is None
+        problem = await fire_mod.continued_session_problem(
+            changed,
+            _continued_session(host_id=own, workspace="/sandbox/ws", labels=created["labels"]),
+            host_store=hosts,
+            permission_store=None,
+        )
+        assert problem is not None
+        assert problem[1] == "continued_session_incompatible"
 
 
 @pytest.mark.asyncio

@@ -187,9 +187,21 @@ records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
 never finds a recorded session it cannot continue. Of two first runs, the one that records
 second deletes its unused session and records `skipped`.
+Sandbox tasks accept an optional repository URL in `workspace`, validated with
+the same repository grammar as a new sandbox session. The selected repository is
+passed to sandbox launch and recorded in the session's repository labels for
+relaunch. `host_id` remains forbidden. The API advertises this support as
+`scheduled_task_sandbox_workspaces`; older servers reject sandbox workspaces.
+Selecting Provider default clears a repository pin with `workspace: null`.
+Edits also clear legacy directory pins without resetting an unchanged continued
+session, since those pins already use the provider default.
+Switching execution targets clears the old workspace unless the request supplies
+a replacement, since connected-host paths and repository URLs are different inputs.
+
 A sandbox task's first run starts its sandbox under the task's host ID. If that
 host already exists, left by a reset session, the new session joins it in that
-session's workspace, or replaces its sandbox when that session is unknown.
+session's workspace, or replaces its sandbox when that session is unknown or
+the selected repository changed.
 
 Known failures record `failed` with the same `error_code` as legacy fires, such as
 `host_offline` or `launch_failed`. A managed launch records where it failed instead:

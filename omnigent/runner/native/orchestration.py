@@ -1956,7 +1956,11 @@ async def _auto_create_opencode_terminal(
     # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
     # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
     config = maybe_merge_user_provider_config(config)
-    write_opencode_provider_config(xdg_config_home, config)
+    write_opencode_provider_config(
+        xdg_config_home,
+        config,
+        client_surface=resource_registry.client_surface(session_id),
+    )
 
     # The per-session DB imports $XDG_DATA_HOME/opencode/auth.json once when it is
     # created; seed it with the user's auth.json and v2 SQLite credentials.
@@ -2946,6 +2950,7 @@ async def _auto_create_pi_terminal(
                 launch_config.reasoning_effort,
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
+                client_surface=resource_registry.client_surface(session_id),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -8091,6 +8096,33 @@ async def _claude_legacy_prompt_consumed(
     return has_prior_history
 
 
+def _without_claude_session_id_arg(args: list[str]) -> list[str]:
+    """Drop a pass-through ``--session-id`` that a cold ``--resume`` would conflict with.
+
+    Claude exits with code 1 when ``--session-id`` accompanies ``--resume``
+    without ``--fork-session``; the id only named the session's first launch.
+
+    :param args: Pass-through Claude args, e.g. ``["--session-id", "<uuid>", "--verbose"]``.
+    :returns: *args* without ``--session-id <value>`` / ``--session-id=<value>``,
+        unchanged when ``--fork-session`` is present.
+    """
+    if "--fork-session" in args:
+        return args
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == "--session-id":
+            skip_value = True
+            continue
+        if arg.startswith("--session-id="):
+            continue
+        kept.append(arg)
+    return kept
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -8157,7 +8189,10 @@ def _build_claude_native_base_args(
         skip_leading_prompt = (
             skip_initial_prompt and _claude_legacy_launch_prompt(terminal_launch_args) is not None
         )
-        args.extend(terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args)
+        passthrough = terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args
+        if resume_external_session_id:
+            passthrough = _without_claude_session_id_arg(passthrough)
+        args.extend(passthrough)
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
     # or the joined ``--model=X`` form).
@@ -9837,10 +9872,13 @@ async def _auto_create_claude_terminal(
         ),
         command=launch_command,
         args=launch_args,
-        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL etc.) when
-        # derived; empty provider config still forces ENABLE_TOOL_SEARCH=true.
-        # Unattended: no CLI client watches this pane, so ucode must not prompt.
-        env=build_native_claude_terminal_env(claude_config, unattended=True),
+        # Keep provider/tool routing and usage attribution without prompting
+        # in a pane that has no attached CLI client.
+        env=build_native_claude_terminal_env(
+            claude_config,
+            unattended=True,
+            client_surface=resource_registry.client_surface(session_id),
+        ),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
