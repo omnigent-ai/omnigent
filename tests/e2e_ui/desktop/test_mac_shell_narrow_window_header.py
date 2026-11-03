@@ -35,7 +35,7 @@ _WINDOW_CONTROLS_STRIP = {"x": 0, "y": 0, "width": 88, "height": 48}
 
 # Electron applies app-region rects in document order, ignoring stacking, opacity
 # and pointer-events, so the last rendered region over a point decides dragging.
-_UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT = """
+_EMPTY_TITLE_BAR_POINTS_SCRIPT = """
 (stripHeight) => {
   const appRegion = (element) => getComputedStyle(element).getPropertyValue("-webkit-app-region");
   const regions = [...document.querySelectorAll("*")].flatMap((element) => {
@@ -46,23 +46,32 @@ _UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT = """
     const hasRegion = region === "drag" || region === "no-drag";
     return hasRegion && rendered ? [{ element, region, rect }] : [];
   });
+  let empty = 0;
   const undraggable = [];
   for (let x = 4; x < window.innerWidth; x += 16) {
     for (const y of [8, 24, stripHeight - 4]) {
       const isEmpty = document.elementsFromPoint(x, y).every((el) => appRegion(el) !== "no-drag");
+      if (!isEmpty) continue;
+      empty += 1;
       const covering = regions.filter(
         ({ rect }) => x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom,
       ).at(-1);
-      if (isEmpty && covering?.region !== "drag") {
+      if (covering?.region !== "drag") {
         const element = covering?.element;
         const coveredBy = element ? element.dataset.testid || element.tagName : null;
         undraggable.push({ x, y, coveredBy });
       }
     }
   }
-  return undraggable;
+  return { empty, undraggable };
 }
 """
+
+
+def _undraggable_empty_title_bar_points(page: Page) -> list[dict[str, object]]:
+    sample = page.evaluate(_EMPTY_TITLE_BAR_POINTS_SCRIPT, _WINDOW_CONTROLS_STRIP["height"])
+    assert sample["empty"] > 0, "no empty title-bar points were sampled"
+    return sample["undraggable"]
 
 
 def _intersects_window_controls(box: dict[str, float] | None) -> bool:
@@ -200,8 +209,7 @@ def test_narrow_window_title_bar_stays_draggable(
 ) -> None:
     base_url, session_id = seeded_session
     page = _open_session_in_mac_shell(request, base_url, session_id)
-    strip_height = _WINDOW_CONTROLS_STRIP["height"]
-    wide_points = page.evaluate(_UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT, strip_height)
+    wide_points = _undraggable_empty_title_bar_points(page)
     assert wide_points == [], (
         f"empty title-bar points not draggable at {_WIDE_VIEWPORT['width']}px: {wide_points}"
     )
@@ -210,14 +218,14 @@ def test_narrow_window_title_bar_stays_draggable(
     expect(page.locator('aside[aria-label="Conversations"]')).to_have_attribute(
         "data-collapsed", "true"
     )
+    # The drawer slide and scrim fade can end a frame apart; sample once both have settled.
     page.wait_for_function(
-        "() => document.querySelector('aside[aria-label=\"Conversations\"]')"
-        ".getBoundingClientRect().right <= 0"
+        "() => !document.getAnimations().some((animation) => animation instanceof CSSTransition)"
     )
     expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     _hold_for_recording(page)
 
-    narrow_points = page.evaluate(_UNDRAGGABLE_EMPTY_TITLE_BAR_POINTS_SCRIPT, strip_height)
+    narrow_points = _undraggable_empty_title_bar_points(page)
     assert narrow_points == [], (
         f"empty title-bar points not draggable at {_NARROW_VIEWPORT['width']}px: {narrow_points}"
     )
