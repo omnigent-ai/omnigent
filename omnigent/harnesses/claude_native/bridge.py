@@ -2885,6 +2885,7 @@ def augment_claude_args(
     model_overrides: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
     workspace: Path | None = None,
+    launch_cwd: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
     append_system_prompt: str | None = None,
@@ -2924,6 +2925,8 @@ def augment_claude_args(
         wiring. ``None`` (e.g. the ``omnigent claude`` CLI's minimal
         spec) adds no plugin args.
     :param workspace: Session workspace used to discover portable ``.agents`` skills.
+    :param launch_cwd: Directory Claude starts in when a launcher changes it from
+        *workspace*; a relative ``--append-system-prompt-file`` is read from it.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -2981,7 +2984,7 @@ def augment_claude_args(
         args,
         append_system_prompt,
         bridge_dir=bridge_dir,
-        cwd=workspace if workspace is not None else Path.cwd(),
+        cwd=launch_cwd or workspace or Path.cwd(),
     )
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
@@ -3070,13 +3073,18 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-# Claude Code options with a required value: Claude consumes the next token as
-# that value even when it starts with a dash (``--system-prompt --append-system-prompt``).
+# Required-value options of Claude Code 2.1.278-2.1.317. Claude consumes the next token
+# as the value even when it starts with a dash (``--system-prompt --append-system-prompt``).
 _CLAUDE_VALUE_FLAGS = frozenset(
     {
         "-n",
         "--add-dir",
+        "--advisor",
         "--agent",
+        "--agent-color",
+        "--agent-id",
+        "--agent-name",
+        "--agent-type",
         "--agents",
         "--allowed-tools",
         "--allowedTools",
@@ -3084,41 +3092,74 @@ _CLAUDE_VALUE_FLAGS = frozenset(
         "--append-subagent-system-prompt-file",
         "--append-system-prompt",
         "--append-system-prompt-file",
+        "--attach-serve",
         "--autocompact",
         "--betas",
+        "--channels",
         "--client-data-url",
+        "--correlation-id",
+        "--dangerously-load-development-channels",
         "--debug-file",
+        "--deep-link-cwd-b64",
+        "--deep-link-last-fetch",
+        "--deep-link-repo",
         "--disallowed-tools",
         "--disallowedTools",
         "--effort",
         "--environment",
         "--fallback-model",
+        "--fast-mode",
         "--file",
+        "--forward-home-settings",
+        "--inherit-permission-mode",
         "--input-format",
         "--json-schema",
+        "--managed-settings",
         "--max-budget-usd",
         "--max-thinking-tokens",
         "--max-turns",
         "--mcp-config",
+        "--messaging-socket-path",
         "--model",
         "--name",
+        "--on-branch",
         "--output-format",
+        "--parent-session-id",
         "--permission-mode",
         "--permission-prompt-tool",
         "--permission-prompts",
         "--plan-mode-instructions",
         "--plugin-dir",
+        "--plugin-dir-no-mcp",
         "--plugin-url",
+        "--pool",
         "--prefill",
+        "--prefill-b64",
+        "--proactivity",
+        "--project-config-root",
+        "--ref",
         "--remote-control-session-name-prefix",
+        "--resume-drops-turn",
         "--resume-session-at",
+        "--rewind-files",
+        "--runner-declares",
+        "--sdk-url",
+        "--session-began-as-copy",
         "--session-id",
         "--setting-sources",
         "--settings",
         "--system-prompt",
         "--system-prompt-file",
         "--system-prompt-snapshot",
+        "--task-budget",
+        "--team-name",
+        "--teammate-mode",
+        "--thinking",
+        "--thinking-display",
         "--tools",
+        "--watch-artifact",
+        "--watch-artifact-no-autoreact",
+        "--workload",
     }
 )
 

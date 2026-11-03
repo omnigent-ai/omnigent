@@ -4337,8 +4337,12 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
             "Keep framework metadata separate.",
         ),
         (
-            ("--unlisted-option", "--append-system-prompt", "--model", "sonnet"),
-            "Keep framework metadata separate.\n\n--model",
+            ("--append-system-prompt", "Review.", "--agent-name", "--append-system-prompt=Name."),
+            "Keep framework metadata separate.\n\nReview.",
+        ),
+        (
+            ("--append-system-prompt-file", "missing.md", "--append-system-prompt", "Review."),
+            "Keep framework metadata separate.\n\nReview.",
         ),
     ],
     ids=[
@@ -4352,7 +4356,8 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
         "owned-flag-before-omnigent-options",
         "owned-joined-literal",
         "owned-by-newer-claude-option",
-        "unlisted-owner-keeps-caller-args",
+        "owned-by-teammate-option",
+        "unreadable-file-keeps-caller-prompt",
     ],
 )
 def test_augment_claude_args_appends_caller_system_prompt(
@@ -4451,7 +4456,7 @@ def test_augment_claude_args_copies_caller_system_prompt_file(
     [
         ("--append-system-prompt-file", "missing.md"),
         ("--append-system-prompt-file=",),
-        ("--system-prompt", "--append-system-prompt-file", "--model", "sonnet"),
+        ("--system-prompt", "--append-system-prompt-file", "profile.md"),
         ("--append-subagent-system-prompt-file", "--append-system-prompt-file", "profile.md"),
         ("--append-system-prompt-file", "profile.fifo"),
         ("--append-system-prompt-file", "linked.md"),
@@ -4477,18 +4482,22 @@ def test_augment_claude_args_keeps_inline_prompt_without_readable_caller_file(
 ) -> None:
     """Without a caller file that is safe to copy, Omnigent keeps its inline prompt flag."""
     workspace = tmp_path / "workspace"
-    outside = tmp_path / "outside"
     workspace.mkdir()
-    outside.mkdir()
     (workspace / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
-    (outside / "secret.md").write_text("Sandbox-excluded secret.\n", encoding="utf-8")
-    os.mkfifo(workspace / "profile.fifo")
-    (workspace / "linked.md").symlink_to(outside / "secret.md")
-    (workspace / "linked-dir").symlink_to(outside)
-    os.link(outside / "secret.md", workspace / "hard-linked.md")
-    (workspace / "oversized.md").write_bytes(
-        b"x" * (claude_native_bridge._CALLER_PROMPT_FILE_MAX_BYTES + 1)
-    )
+    secret = tmp_path / "outside" / "secret.md"
+    secret.parent.mkdir()
+    secret.write_text("Sandbox-excluded secret.\n", encoding="utf-8")
+    faults: dict[str, Callable[[], object]] = {
+        "profile.fifo": lambda: os.mkfifo(workspace / "profile.fifo"),
+        "linked.md": lambda: (workspace / "linked.md").symlink_to(secret),
+        "linked-dir/secret.md": lambda: (workspace / "linked-dir").symlink_to(secret.parent),
+        "hard-linked.md": lambda: os.link(secret, workspace / "hard-linked.md"),
+        "oversized.md": lambda: (workspace / "oversized.md").write_bytes(
+            b"x" * (claude_native_bridge._CALLER_PROMPT_FILE_MAX_BYTES + 1)
+        ),
+    }
+    if make_fault := faults.get(user_args[-1]):
+        make_fault()
     bridge_dir = tmp_path / "bridge"
     omnigent_args = augment_claude_args(
         (),
