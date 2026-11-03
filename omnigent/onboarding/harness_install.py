@@ -131,10 +131,28 @@ _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
 _ANTIGRAVITY_MIN_VERSION = "1.1.13"
 
-# OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
-# installed via the ``opencode-ai`` npm package. No login/logout/status argv
-# is wired yet — readiness is binary-only until an auth check exists.
+# OpenCode native harness CLI (``opencode serve`` plus the ``--server`` TUI),
+# installed via the ``@opencode/cli`` npm package. No login/logout/status argv
+# is wired yet — readiness is binary-only until an auth check exists. Pinned
+# exactly: OpenCode ships 2.0.x patches often, so a range would install an
+# untested release.
 OPENCODE_KEY = "opencode"
+_OPENCODE_PACKAGE = "@opencode/cli@2.0.32"
+# v1 ``opencode-ai`` links the same global ``opencode`` bin and npm refuses to
+# overwrite another package's bin (EEXIST). Omnigent doesn't remove packages it
+# didn't install, so setup stops with a message instead of uninstalling it.
+_OPENCODE_INSTALL_HINT = f"npm install -g {_OPENCODE_PACKAGE}"
+# An install script that stops on purpose prints its reason on a stderr line
+# starting with this prefix, so the setup UI can show that reason verbatim.
+_INSTALLER_REASON_PREFIX = "omnigent-setup: "
+_OPENCODE_INSTALL_SCRIPT = (
+    "if npm ls -g opencode-ai --depth=0 >/dev/null 2>&1; then "
+    f'echo "{_INSTALLER_REASON_PREFIX}OpenCode 1.x (opencode-ai) is installed and owns the global '
+    "'opencode' binary. Omnigent does not remove packages; run "
+    "'npm rm -g opencode-ai' yourself, then rerun setup.\" >&2; "
+    "exit 1; "
+    f"fi; npm install -g {_OPENCODE_PACKAGE}"
+)
 
 # Goose authenticates against its own config (``goose configure`` → keyring /
 # ``~/.config/goose/config.yaml``) with no Omnigent-managed credential, and ships
@@ -218,17 +236,15 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
         min_version=_PI_MIN_VERSION,
     ),
-    # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
-    # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
-    # version the runtime version-check (``check_opencode_version``,
-    # >=1.17.7,<1.19.0) then rejects. ``~1.18.0`` resolves to the latest 1.18.x.
-    # The same version bounds are enforced in setup via ``min_version`` /
-    # ``max_version_exclusive`` so the install/upgrade prompt fires before
-    # the runtime gate does.
+    # Pin the install to the supported 2.0.x line. The same bounds are enforced
+    # in setup via ``min_version`` / ``max_version_exclusive`` so the
+    # install/upgrade prompt fires before the runtime gate does.
     OPENCODE_KEY: HarnessInstallSpec(
         "OpenCode",
         "opencode",
-        "opencode-ai@~1.18.0",
+        _OPENCODE_PACKAGE,
+        install_hint=_OPENCODE_INSTALL_HINT,
+        install_command=("bash", "-c", _OPENCODE_INSTALL_SCRIPT),
         min_version=OPENCODE_MIN_VERSION,
         max_version_exclusive=OPENCODE_MAX_VERSION_EXCLUSIVE,
     ),
@@ -549,11 +565,14 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     ),
     OPENCODE_KEY: SetupStep(
         kind="auth",
-        title="Sign in to OpenCode",
-        detail="OpenCode manages its own credentials — sign in on the host.",
+        # Optional: OpenCode's free models run without a login, so the step is
+        # informational (``status_key=None``) and never blocks readiness.
+        title="Sign in to a provider (optional)",
+        detail="OpenCode's free models work without signing in. Sign in on the host "
+        "to use your own providers.",
         action="command",
         command="opencode auth login",
-        status_key="authed",
+        status_key=None,
     ),
     PI_KEY: SetupStep(
         kind="auth",
@@ -956,7 +975,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     resolvable **and**, when the harness declares ``min_version`` /
     ``max_version_exclusive`` in its install spec, the binary's
     ``--version`` output satisfies that range. This prevents an outdated
-    native CLI (e.g. an OpenCode release outside the supported 1.17.x band)
+    native CLI (e.g. an OpenCode release outside the supported 2.x band)
     from being treated as ready during setup.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or
@@ -1149,10 +1168,14 @@ def _installer_failure_reason(returncode: int, stderr_tail: str) -> str:
     :param returncode: The installer's exit status.
     :param stderr_tail: The tail of the installer's stderr, possibly empty.
     :returns: A cause naming what the user can fix when the output identifies
-        one, else ``"installer exited with code <n>"``. The bare exit code is
+        one (an :data:`_INSTALLER_REASON_PREFIX` line first, then npm error
+        codes), else ``"installer exited with code <n>"``. The bare exit code is
         the fallback rather than an error, because a vendor installer's output
         is not npm-shaped and still has to produce *some* reason.
     """
+    for line in reversed(stderr_tail.splitlines()):
+        if line.startswith(_INSTALLER_REASON_PREFIX):
+            return line.removeprefix(_INSTALLER_REASON_PREFIX).strip()
     for code in _NPM_ERROR_CODE_RE.findall(stderr_tail):
         explanation = _NPM_FAILURE_REASONS.get(code)
         if explanation is not None:
@@ -1224,9 +1247,10 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
-    :param installed: Whether the CLI resolves after the attempt, via the same
-        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
-        common global install dirs), not bare ``PATH`` alone.
+    :param installed: Whether the CLI is ready after the attempt by the same
+        :func:`harness_cli_installed` check readiness uses: it resolves via the
+        :func:`resolve_cli_binary` ladder (``PATH`` plus the common global
+        install dirs) and its version is in the supported range.
     :param reason: Human-readable failure reason when ``installed`` is False;
         ``None`` on success.
     """
@@ -1251,10 +1275,11 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
-        resolves via :func:`resolve_cli_binary` (including the no-op where it
-        was already present), otherwise ``(False, reason)`` naming the failure
-        (manual-only spec, missing installer, timeout, OS error, a diagnosed or
-        bare non-zero exit, or a post-install binary-not-found).
+        resolves via :func:`resolve_cli_binary` and passes its version range
+        (including the no-op where it was already present), otherwise
+        ``(False, reason)`` naming the failure (manual-only spec, missing
+        installer, timeout, OS error, a diagnosed or bare non-zero exit, a
+        post-install binary-not-found, or a CLI still outside its range).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
@@ -1281,7 +1306,9 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
     # via the ladder — the spurious "failed" toast next to a green "ready" tick.
     resolved = resolve_cli_binary(spec.binary)
-    if resolved is not None:
+    # A failed upgrade leaves the outdated binary resolving, so success also needs
+    # the version check readiness applies.
+    if resolved is not None and harness_cli_installed(key):
         # Put the resolving dir on ``PATH`` for this process so the setup
         # wizard's *later* steps — harness_login / harness_cli_logged_in /
         # harness_logout — which shell out with the bare binary name and only
@@ -1295,20 +1322,27 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         return HarnessInstallResult(True, None)
     if returncode != 0:
         return HarnessInstallResult(False, _installer_failure_reason(returncode, stderr_tail))
+    if resolved is not None:
+        version, required = harness_cli_version(key)
+        found = f"{version} (requires {required})" if version and required else "unsupported"
+        return HarnessInstallResult(
+            False, f"installer completed but {spec.binary!r} is still {found}"
+        )
     return HarnessInstallResult(
         False, f"installer completed but {spec.binary!r} could not be found"
     )
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it is now ready to use.
 
     Thin wrapper over :func:`try_install_harness_cli` that discards the failure
     reason, preserving the boolean contract the setup wizard relies on.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
-        ``False`` if the installer is missing or the install failed.
+    :returns: ``True`` when the CLI resolves and is version-compatible after
+        the install attempt, ``False`` if the installer is missing or the
+        install failed, including an upgrade that left the old version.
     :raises KeyError: If *key* has no install spec.
     """
     return try_install_harness_cli(key).installed

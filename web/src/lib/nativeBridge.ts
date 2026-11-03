@@ -27,6 +27,18 @@
  */
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
+// Mirrors SESSION_HOST_PROTOCOL in electron/src/hostIdentity.js.
+export const SESSION_HOST_PROTOCOL = 1;
+
+export interface BrowserHostOptions {
+  sourceHostId?: string | null;
+  sessionHostProtocol?: number;
+}
+
+export function navigationHostOptions(hostId: string | null): BrowserHostOptions {
+  return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
+}
+
 export interface BrowserRecentSessionInput {
   type: "keydown" | "keyup";
   key: "Tab" | "Control" | "Escape";
@@ -89,6 +101,11 @@ interface NativeShellApi {
    * returns an unsubscribe.
    */
   onOpenPath?: (callback: (path: string) => void) => () => void;
+  /**
+   * Subscribe to the desktop find bar opening, from the shortcut or the Edit
+   * menu. Absent on older shells / outside Electron; returns an unsubscribe.
+   */
+  onFindOpened?: (callback: () => void) => () => void;
   /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
@@ -226,14 +243,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
   /**
    * Hide/show the active embedded browser view while a DOM overlay is open.
    * The native view paints above the renderer, so this is how overlays
@@ -793,6 +809,21 @@ export function onOpenPath(callback: (path: string) => void): () => void {
     return native.onOpenPath(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onOpenPath failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to the desktop find bar opening. A no-op outside the Electron
+ * shell or under a shell too old to send it.
+ */
+export function onFindOpened(callback: () => void): () => void {
+  const native = nativeApi();
+  if (!native?.onFindOpened) return () => {};
+  try {
+    return native.onFindOpened(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onFindOpened failed:", err);
     return () => {};
   }
 }

@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
 from typing import Protocol
+from weakref import WeakValueDictionary
 
 import httpx
 
@@ -116,6 +117,8 @@ class RunnerSession:
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
     :param generation: Process-unique connection generation for initialization readiness.
+    :param superseded: Whether a newer tunnel replaced this connection, retained
+        after that replacement disconnects so delayed cleanup cannot own its outage.
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
@@ -139,6 +142,7 @@ class RunnerSession:
     owner: str | None
     last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     generation: int = field(default_factory=lambda: next(_connection_generations))
+    superseded: bool = field(default=False, init=False)
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
@@ -276,6 +280,9 @@ class TunnelRegistry:
         if max_connect_waiters_total < 1:
             raise ValueError("max_connect_waiters_total must be at least 1")
         self._sessions: dict[str, RunnerSession] = {}
+        # Deregistered routes can still be joining initializer cleanup. Keep their
+        # replacement identity without retaining finished connections or runner ids.
+        self._latest_sessions: WeakValueDictionary[str, RunnerSession] = WeakValueDictionary()
         self._connect_waits: dict[str, RunnerConnectWaitState] = {}
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
@@ -324,6 +331,10 @@ class TunnelRegistry:
             last_frame_monotonic=time.monotonic(),
         )
         with self._lock:
+            previous = self._latest_sessions.get(runner_id)
+            if previous is not None:
+                previous.superseded = True
+            self._latest_sessions[runner_id] = session
             old = self._sessions.pop(runner_id, None)
             if old is not None:
                 self.record_close(old, code=4000, reason="tunnel replaced")

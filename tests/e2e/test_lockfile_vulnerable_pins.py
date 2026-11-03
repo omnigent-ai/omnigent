@@ -123,9 +123,23 @@ def test_uv_lock_mlflow_at_fixed_version(name: str) -> None:
 
 
 def test_uv_lock_msgpack_at_fixed_version() -> None:
-    # msgpack is transitive (via locust in the loadtest group).
+    # msgpack is transitive (via locust in the loadtest extra).
     _assert_no_vulnerable_pin(
         "uv.lock", "msgpack", _uv_versions("msgpack"), "1.2.3", "CVE-2026-114613"
+    )
+
+
+def test_uv_lock_brotli_at_fixed_version() -> None:
+    # brotli is transitive (via locust's geventhttpclient in the loadtest extra).
+    _assert_no_vulnerable_pin(
+        "uv.lock", "brotli", _uv_versions("brotli"), "1.2.1", "CVE-2026-111497"
+    )
+
+
+def test_uv_lock_virtualenv_at_fixed_version() -> None:
+    # virtualenv is transitive (via pre-commit in the lint and dev groups).
+    _assert_no_vulnerable_pin(
+        "uv.lock", "virtualenv", _uv_versions("virtualenv"), "21.14.13", "CVE-2026-115586"
     )
 
 

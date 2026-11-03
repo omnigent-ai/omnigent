@@ -83,7 +83,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
 export type MessageActionsProps = ComponentProps<"div">;
 
 export const MessageActions = ({ className, children, ...props }: MessageActionsProps) => (
-  <div className={cn("flex items-center gap-3", className)} {...props}>
+  <div className={cn("flex items-center gap-3 mobile-app:gap-0", className)} {...props}>
     {children}
   </div>
 );
@@ -107,7 +107,11 @@ export const MessageAction = ({
       size={size}
       type="button"
       variant={variant}
-      className={cn("text-muted-foreground hover:text-foreground", className)}
+      className={cn(
+        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        "text-muted-foreground hover:text-foreground",
+        className,
+      )}
       {...props}
     >
       {children}
@@ -589,7 +593,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
-function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
@@ -632,7 +636,7 @@ export const MessageResponse = memo(
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+      () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
       [components],
     );
 

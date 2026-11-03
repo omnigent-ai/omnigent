@@ -24,6 +24,7 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
+    "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
@@ -40,6 +41,8 @@ __all__ = [
 CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 # A Codex turn failed because the model provider's token command gave Codex no token.
 CODEX_PROVIDER_AUTH_FAILED = "codex_provider_auth_failed"
+# A runner that connected and then exited, as opposed to one that never came up.
+RUNNER_PROCESS_CRASH = "runner_process_crash"
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,11 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -144,6 +152,23 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
+        FailureDiagnosis(
+            title="Claude session is already running in the background",
+            cause=(
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
+            ),
+            remediation=(
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
+            ),
         ),
     ),
     _TerminalMatcher(
@@ -208,6 +233,24 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
 )
 
 
+# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
+# ``killall tmux`` run anywhere on the host stops that server too.
+TERMINAL_CLOSED_OUTSIDE_OMNIGENT = FailureDiagnosis(
+    title="Claude Code's terminal was closed outside Omnigent",
+    cause=(
+        "Claude Code's tmux session, or the tmux server running it, was ended and Omnigent "
+        "did not end it. A tmux command such as `tmux kill-session`, `tmux kill-server` or "
+        "`killall tmux`, or another tool on the host, closes it this way."
+    ),
+    remediation=(
+        "Send your message again to relaunch Claude Code. Don't use `killall tmux` or kill "
+        "tmux sessions you didn't start; give your own tmux its own server with "
+        "`tmux -L <name>` and stop it with `tmux -L <name> kill-server`."
+    ),
+    category=ErrorCategory.USER,
+)
+
+
 def classify_terminal_failure(
     *,
     command: str | None,
@@ -256,6 +299,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
@@ -620,6 +664,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "The agent CLI on the host is too old for the selected model. Update it on the "
         "host, then start a new session."
     ),
+    "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
