@@ -10,6 +10,7 @@
 // at fire time; supply them only as a validated pair.
 
 import { authenticatedFetch } from "./identity";
+import { startTimedInteraction } from "./analyticsEmit";
 
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
@@ -49,7 +50,7 @@ export interface ScheduledTask {
   modelOverride: string | null;
   reasoningEffort: string | null;
   /**
-   * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
+   * Harness-specific permission or execution mode, e.g. `acceptEdits`, or `null`
    * to use the agent's configured default. The server derives the runner's
    * `--permission-mode` launch arg from it at fire time.
    */
@@ -117,8 +118,22 @@ export interface ScheduledTaskRun {
   viewerUnread: boolean | null;
 }
 
+/** Fixed analytics labels; keep in sync with omnigent/server/scheduled/telemetry.py. */
+export const AUTOMATION_TEMPLATE_IDS = [
+  "custom",
+  "jira",
+  "slack",
+  "github",
+  "follow-up-monitor",
+  "pr-sweep",
+  "news-digest",
+] as const;
+export type AutomationTemplateId = (typeof AUTOMATION_TEMPLATE_IDS)[number];
+
 /** Body for `POST /v1/scheduled-tasks`. */
 export interface CreateScheduledTaskInput {
+  /** Diagnostic creation attribution, sent as headers for older-server compatibility. */
+  templateId?: AutomationTemplateId;
   name: string;
   prompt: string;
   rrule: string;
@@ -126,7 +141,7 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
-  /** Native-harness permission mode (Claude Code); omit for the agent default. */
+  /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
@@ -350,12 +365,25 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
-  const res = await authenticatedFetch("/v1/scheduled-tasks", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+  const templateId = input.templateId ?? "custom";
+  const interaction = startTimedInteraction("create_scheduled_task", undefined, templateId);
+  try {
+    const res = await authenticatedFetch("/v1/scheduled-tasks", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-omnigent-automation-source": "ui",
+        "x-omnigent-automation-template": templateId,
+      },
+      body: JSON.stringify(body),
+    });
+    const task = taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+    interaction.complete();
+    return task;
+  } catch (error) {
+    interaction.fail();
+    throw error;
+  }
 }
 
 /**
