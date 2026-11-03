@@ -412,10 +412,13 @@ describe("Composer session drafts", () => {
     const rename = document.createElement("input");
     rename.setAttribute("data-inline-rename", "");
     document.body.append(rename);
-    rename.focus();
-    act(() => useChatStore.setState({ conversationId: "conv_draft" }));
-    expect(rename).toHaveFocus();
-    rename.remove();
+    try {
+      rename.focus();
+      act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+      expect(rename).toHaveFocus();
+    } finally {
+      rename.remove();
+    }
   });
 
   it("restores attached files when switching back to a conversation", async () => {

@@ -230,13 +230,14 @@ function renderSidebar(
   { open = true, header }: { open?: boolean; header?: ReactElement } = {},
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  let sidebarOpen = open;
   // Build a FRESH element tree per render: re-rendering the identical element
   // reference lets React bail out without re-invoking the sidebar, which
   // would swallow a `mockConversations` swap applied mid-test.
   const makeUi = () => {
     const sidebar = (
       <>
-        <Sidebar open={open} onClose={vi.fn()} />
+        <Sidebar open={sidebarOpen} onClose={vi.fn()} />
         {header}
       </>
     );
@@ -264,7 +265,13 @@ function renderSidebar(
   const view = render(makeUi());
   // Re-render so a test can apply a new `mockConversations` list mid-flight
   // (e.g. simulating a reorder pushed between user clicks).
-  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
+  return Object.assign(view, {
+    rerenderSidebar: () => view.rerender(makeUi()),
+    setSidebarOpen: (next: boolean) => {
+      sidebarOpen = next;
+      view.rerender(makeUi());
+    },
+  });
 }
 
 beforeEach(() => {
@@ -559,6 +566,51 @@ describe("rename shortcut", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("moves an edit left open in a closed sidebar to the header title", () => {
+    const { setSidebarOpen } = renderSidebar("conv_1", undefined, { header });
+    pressRenameShortcut();
+    expect(screen.getByTestId("rename-conversation-input")).toHaveFocus();
+
+    setSidebarOpen(false);
+    pressRenameShortcut();
+
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("falls back to the header title while the session's project folder is collapsed", () => {
+    mocks.projects = ["Moonshot"];
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar(undefined, undefined, { header });
+    expect(screen.getByRole("button", { name: /^Moonshot/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("falls back to the header title in selection mode, then edits the row after it", () => {
+    renderSidebar("conv_1", undefined, { header });
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    const headerInput = screen.getByTestId("header-title-input");
+    expect(headerInput).toHaveFocus();
+    fireEvent.keyDown(headerInput, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
+
+    pressRenameShortcut();
+
+    expect(screen.getByTestId("rename-conversation-input")).toHaveFocus();
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
   });
 
   it("falls back to the header title when the row belongs to someone else", () => {

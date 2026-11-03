@@ -5263,17 +5263,16 @@ function ConversationRowImpl({
   useEffect(() => {
     if (!canRenameInline) return;
     return registerSidebarRename(conversation.id, () => {
-      if (isEditing) return true;
       const row = rowRef.current;
       if (!row?.isConnected || isInClosedSidebar(row)) return false;
-      setIsEditing(true);
+      if (!isEditing) setIsEditing(true);
       return true;
     });
   }, [canRenameInline, conversation.id, isEditing]);
 
   if (isEditing) {
     return (
-      <li>
+      <li ref={rowRef}>
         <SidebarEditRow
           // Prefer the just-committed name so a rename reopened before the
           // prop catches up starts from what the row shows.
