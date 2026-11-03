@@ -5,6 +5,8 @@ request's Changes subtab. Top-level comments remain in Comments.
 
 ## Sub-features
 
+- `request-selection`: A single PR opens its details directly; multiple PRs open
+  a list with navigation back from details.
 - `inline-threads`: Published conversations on old/new lines, both diff layouts,
   separate conversations at the same line and multiline range labels.
 - `suggestions`: Fenced suggestions show referenced lines as removals and the
@@ -29,14 +31,14 @@ request's Changes subtab. Top-level comments remain in Comments.
 
 ## How to get to it (user POV)
 
-- `rail`: Open a session, expand Workspace, choose Pull Requests, select a request
-  from the list, then open Changes.
-- `composer-desktop`: Click the desktop composer's PR link, select a request,
-  then open Changes.
-- `composer-mobile`: Tap the composer's PR link, select a request in the drawer,
-  then open Changes.
+- `rail`: Open a session, expand Workspace, choose Pull Requests, then open Changes.
+- `composer-desktop`: Click the desktop composer's PR link, then open Changes.
+- `composer-mobile`: Tap the composer's PR link, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
-  select a request, then open Changes.
+  then open Changes.
+
+A session with one PR opens its details directly. With multiple PRs, select a
+request from the list first; **All pull requests** returns to that list.
 
 On each surface, **Try again** retries failed panel content. Switching sessions
 also clears a failed panel. Healthy chat drafts stay mounted; content inside a
@@ -47,6 +49,13 @@ failed panel is recreated on recovery.
 Preconditions: Build this checkout and launch the isolated instance with
 [Verify Omnigent](skills/verify-omnigent/SKILL.md). No live GitHub credentials
 are needed for the browser journeys; their PR responses are stubbed.
+
+`tests/e2e_ui/github/test_github_tab.py::test_github_tab_shows_summary_checks_and_file_tree`
+covers single-PR details through `rail` and `canvas`.
+`tests/e2e_ui/github/test_github_tab.py::test_composer_pr_link_opens_github_tab`
+covers single and multiple PRs through the desktop and mobile composers.
+`tests/e2e_ui/github/test_session_pr_selection.py::test_session_pr_selection_and_unlink`
+covers linking and unlinking across multiple, single and empty PR states.
 
 Run `tests/e2e_ui/github/test_github_tab.py::test_reply_to_inline_review_conversation`
 through the instance with recording enabled. Its four variants cover `rail`,
