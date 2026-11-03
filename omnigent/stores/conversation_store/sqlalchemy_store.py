@@ -1401,7 +1401,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         }
 
     def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
-        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        """One ``SELECT`` per database for the ids' activity and usage."""
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
@@ -1416,12 +1416,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             return {}
         with self._session("get_session_activity") as session:
             meta_rows = session.execute(
-                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                select(
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.live_status,
+                    SqlConversationMetadata.session_usage,
+                ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_([row.id for row in updated]),
                 )
             ).all()
         statuses = {row.id: row.live_status for row in meta_rows}
+        costs = {
+            row.id: json.loads(row.session_usage).get("total_cost_usd")
+            for row in meta_rows
+            if row.session_usage
+        }
         activity: dict[str, SessionActivity] = {}
         for row in updated:
             status = statuses.get(row.id)
@@ -1430,7 +1439,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             except ValueError:
                 # A newer replica's status must not drop the rest of the batch.
                 live_status = None
-            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+            activity[row.id] = SessionActivity(
+                updated_at=row.updated_at,
+                live_status=live_status,
+                total_cost_usd=costs.get(row.id),
+            )
         return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:

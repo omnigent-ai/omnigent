@@ -375,6 +375,18 @@ function ForkDialogProbe() {
       </button>
       <button
         type="button"
+        data-testid="fork-probe-edit-message"
+        onClick={() =>
+          fork.openForkDialog({
+            sourceSessionId: fork.currentSessionId ?? undefined,
+            editMessage: { itemId: "user_original", text: "Original prompt" },
+          })
+        }
+      >
+        edit-message
+      </button>
+      <button
+        type="button"
         data-testid="fork-probe-recover-workspace"
         onClick={() =>
           fork.openForkDialog({ sourceSessionId: "conv_abc", workspaceRecovery: true })
@@ -4625,6 +4637,36 @@ describe("AppShell clone/fork action", () => {
     expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "true");
   });
 
+  it("keeps an edit pinned to its source and preserves the draft after session navigation", async () => {
+    const source = sessionSnapshot({ id: "conv_abc", title: "Original source" });
+    const other = sessionSnapshot({ id: "conv_other", title: "Other source", permissionLevel: 1 });
+    mockConversations([
+      { id: "conv_abc", permission_level: 4 },
+      { id: "conv_other", permission_level: 1 },
+    ]);
+    useSessionMock.mockImplementation((id) => ({
+      session: id === "conv_abc" ? source : id === "conv_other" ? other : null,
+      isLoading: false,
+      error: null,
+    }));
+    renderShell("/c/conv_abc", serverInfo({ session_message_edit: true }), {
+      sessionNavTo: "/c/conv_other",
+    });
+    fireEvent.click(screen.getByTestId("fork-probe-edit-message"));
+    const editor = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(editor, { target: { value: "Original prompt with more context" } });
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue(
+        "Original prompt with more context",
+      ),
+    );
+    expect(screen.getByRole("textbox", { name: "Message" })).toBe(editor);
+    expect(screen.getByRole("button", { name: "Save & resend" })).toBeEnabled();
+  });
+
   it("opens the fork dialog (name suggested from the source title) when clicked", () => {
     mockConversations([]);
     useSessionMock.mockReturnValue({
@@ -5089,7 +5131,7 @@ describe("AppShell clone/fork action", () => {
     );
   });
 
-  it("offers host + directory when forking a child, taken from its parent", () => {
+  it.each([false, true])("offers the parent host and directory for a child: edit=%s", (editing) => {
     // A sub-agent records no workspace or host of its own, so without the
     // parent's the dialog drops to its no-directory mode and the promoted
     // session lands unbound — a different, smaller dialog than every other
@@ -5120,14 +5162,16 @@ describe("AppShell clone/fork action", () => {
       error: null,
     });
 
-    renderShell("/c/conv_child");
-    fireEvent.click(screen.getByTestId("fork-probe-open"));
+    renderShell("/c/conv_child", serverInfo({ session_message_edit: true }));
+    fireEvent.click(screen.getByTestId(editing ? "fork-probe-edit-message" : "fork-probe-open"));
 
     const dialog = screen.getByTestId("fork-session-dialog");
     expect(within(dialog).getByText("Host")).toBeInTheDocument();
     // "Clone" alone is the no-directory form: the fork would be created
     // unbound instead of started on a host.
-    expect(within(dialog).getByRole("button", { name: "Clone & start" })).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: editing ? "Save & resend" : "Clone & start" }),
+    ).toBeInTheDocument();
   });
 });
 

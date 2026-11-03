@@ -6227,14 +6227,29 @@
             "title": "Scheduled Task Harness Settings",
             "type": "boolean"
           },
+          "scheduled_task_inbox": {
+            "default": false,
+            "title": "Scheduled Task Inbox",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
             "type": "boolean"
           },
+          "scheduled_task_sandbox_workspaces": {
+            "default": true,
+            "title": "Scheduled Task Sandbox Workspaces",
+            "type": "boolean"
+          },
           "scheduled_task_session_modes": {
             "default": true,
             "title": "Scheduled Task Session Modes",
+            "type": "boolean"
+          },
+          "scheduled_task_worktrees": {
+            "default": true,
+            "title": "Scheduled Task Worktrees",
             "type": "boolean"
           },
           "server_version": {

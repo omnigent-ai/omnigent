@@ -37,7 +37,8 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import type { MessageEdit } from "./ForkDialogContext";
+import { MESSAGE_EDIT_ACCESS_REQUIRED, type MessageEdit } from "./ForkDialogContext";
+import { isEditorLevel } from "@/lib/permissionsApi";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -751,8 +752,14 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
   const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
     hostId: props.sourceHostId,
   });
-  if (forkDisabledReason) {
-    const loading = forkDisabledReason === SESSION_ACTIONS_LOADING;
+  const { session } = useSession(props.editMessage ? props.sourceSessionId : null);
+  const disabledReason =
+    forkDisabledReason ??
+    (props.editMessage && session && !isEditorLevel(session.permissionLevel)
+      ? MESSAGE_EDIT_ACCESS_REQUIRED
+      : undefined);
+  if (disabledReason) {
+    const loading = disabledReason === SESSION_ACTIONS_LOADING;
     return (
       <>
         <p
@@ -760,14 +767,14 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
           className="text-sm text-muted-foreground"
           data-testid="fork-session-unavailable"
         >
-          {forkDisabledReason}
+          {disabledReason}
         </p>
         <DialogFooter>
           <Button variant="ghost" onClick={props.onClose}>
             Cancel
           </Button>
           {!loading && (
-            <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
+            <DisabledActionTooltip reason={disabledReason} label="Clone session">
               <Button data-testid="fork-session-submit" disabled>
                 {props.editMessage
                   ? "Save & resend"

@@ -215,14 +215,17 @@ describe("UserBubble edit message", () => {
     expect(screen.queryByRole("button", { name: "Edit message" })).not.toBeInTheDocument();
   });
 
-  it("keeps the disabled explanation accessible", () => {
+  it.each([
+    { disabledReason: "Checking session capabilities…" },
+    { editDisabledReason: "You need edit access to edit messages." },
+  ])("keeps the disabled explanation accessible for %o", (restriction) => {
     const openForkDialog = vi.fn();
     render(
       <ForkDialogContextProvider
         value={{
           canFork: true,
           canEditMessages: true,
-          disabledReason: "Checking session capabilities…",
+          ...restriction,
           openForkDialog,
         }}
       >
@@ -260,6 +263,7 @@ describe("UserBubble edit message", () => {
           canFork: true,
           canEditMessages: true,
           disabledReason: "Unable to check session capabilities. Reload to try again.",
+          editDisabledReason: "You need edit access to edit messages.",
           openForkDialog,
         }}
       >

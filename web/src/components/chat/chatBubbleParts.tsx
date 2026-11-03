@@ -748,7 +748,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const editDisabledReason =
     scopedConversationId && scopedConversationId !== forkDialog?.currentSessionId
       ? undefined
-      : forkDialog?.disabledReason;
+      : (forkDialog?.editDisabledReason ?? forkDialog?.disabledReason);
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an

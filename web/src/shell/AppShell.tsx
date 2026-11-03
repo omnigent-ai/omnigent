@@ -38,7 +38,7 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isElectronShell,
@@ -156,6 +156,7 @@ import {
   ForkDialogContextProvider,
   type ForkDialogContextValue,
   type MessageEdit,
+  MESSAGE_EDIT_ACCESS_REQUIRED,
 } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
@@ -2461,11 +2462,19 @@ function AppShellImpl() {
       canFork: canClone,
       canEditMessages: serverInfo !== "loading" && serverInfo.session_message_edit === true,
       disabledReason: forkDisabledReason,
+      editDisabledReason: isEditorLevel(permissionLevel)
+        ? forkDisabledReason
+        : MESSAGE_EDIT_ACCESS_REQUIRED,
       openForkDialog: (opts) => {
-        const sourceSessionId =
-          opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
-            ? opts.sourceSessionId
+        const requestedSourceSessionId = opts?.sourceSessionId ?? serverConversationId ?? null;
+        const scopedSourceSessionId =
+          requestedSourceSessionId && requestedSourceSessionId !== serverConversationId
+            ? requestedSourceSessionId
             : null;
+        // A message edit keeps its source if the shell switches conversations.
+        const sourceSessionId = opts?.editMessage
+          ? requestedSourceSessionId
+          : scopedSourceSessionId;
         // A scoped source resolves its own restrictions in the form, independently
         // of the session currently displayed by the shell.
         if (forkDisabledReason && !sourceSessionId) return;
@@ -2476,14 +2485,28 @@ function AppShellImpl() {
           void queryClient.resetQueries({ queryKey: ["session", sourceSessionId], exact: true });
         }
         setForkSourceSessionId(sourceSessionId);
-        setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
+        setForkHostSessionId(
+          scopedSourceSessionId
+            ? (serverConversationId ?? null)
+            : opts?.editMessage
+              ? (activeSession?.parentSessionId ?? null)
+              : null,
+        );
         setForkUpToResponseId(opts?.upToResponseId ?? null);
         setForkMessageEdit(opts?.editMessage);
         setForkWorkspaceRecovery(opts?.workspaceRecovery ?? false);
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, queryClient, serverConversationId, serverInfo],
+    [
+      activeSession?.parentSessionId,
+      canClone,
+      forkDisabledReason,
+      permissionLevel,
+      queryClient,
+      serverConversationId,
+      serverInfo,
+    ],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&

@@ -7,6 +7,8 @@
 
 import { createContext, useContext } from "react";
 
+export const MESSAGE_EDIT_ACCESS_REQUIRED = "You need edit access to edit messages.";
+
 export interface MessageEdit {
   itemId: string;
   text: string;
@@ -23,6 +25,8 @@ export interface ForkDialogContextValue {
   canFork: boolean;
   /** Advertised by servers that support editing and resubmitting submitted prompts. */
   canEditMessages?: boolean;
+  /** Current-source edit restriction; scoped editors check their own source. */
+  editDisabledReason?: string;
   /** Visible but unavailable: callers disable the action and explain why. */
   disabledReason?: string;
   /**

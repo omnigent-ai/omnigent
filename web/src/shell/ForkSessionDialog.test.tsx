@@ -570,6 +570,31 @@ describe("ForkSessionDialog", () => {
     );
   });
 
+  it.each([false, true])(
+    "keeps read-only cloning available but blocks message edits: edit=%s",
+    (editing) => {
+      useSessionMock.mockReturnValue({
+        session: { id: "conv_src", hostId: null, permissionLevel: 1, labels: {} },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      renderDialog({
+        editMessage: editing ? { itemId: "user_original", text: "Original prompt" } : undefined,
+        bareForm: true,
+      });
+
+      const submit = screen.getByRole("button", { name: editing ? "Save & resend" : "Clone" });
+      if (editing) {
+        expect(submit).toBeDisabled();
+        fireEvent.click(submit);
+        expect(forkSessionMock).not.toHaveBeenCalled();
+        expect(screen.queryByRole("textbox", { name: "Message" })).not.toBeInTheDocument();
+      } else {
+        expect(submit).toBeEnabled();
+      }
+    },
+  );
+
   it("does not resubmit an empty revision or create anything on cancel", () => {
     const { onClose } = renderDialog({
       editMessage: { itemId: "user_original", text: "Original prompt" },

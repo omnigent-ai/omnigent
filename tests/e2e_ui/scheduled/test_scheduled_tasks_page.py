@@ -1001,7 +1001,7 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     live_server: str,
     entry: str,
 ) -> None:
-    """Gallery and empty-state preview save the same hourly continuing task."""
+    """Gallery and preview save a task and keep suggestions available afterward."""
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     _open_automations_page(page, live_server)
     if entry == "templates":
@@ -1062,3 +1062,6 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     assert created["rrule"].startswith("FREQ=HOURLY"), created
     # The prompt's details are covered by the dialog and renderer tests.
     assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
+    expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
+    page.get_by_test_id("suggestion-trigger-slack").click()
+    expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
