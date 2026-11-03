@@ -6293,3 +6293,138 @@ async def test_events_codex_stop_targets_its_continuation_if_ack_wins_owner_chec
     fenced = codex_native_bridge.read_bridge_state(bridge_dir)
     assert fenced.interrupt_generation == 1
     assert fenced.interrupted_turn_id == "owned_continuation"
+
+
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("fault", ["disconnect", "rejection", "timeout"])
+async def test_events_idle_stop_and_lost_automatic_cancel_ack_stay_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_type: str, fault: str
+) -> None:
+    """A 204 idle Stop does not certify a later automatic request has stopped."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+
+    session_id = uuid.uuid4().hex
+    started = asyncio.Event()
+    release = asyncio.Event()
+    requests = []
+
+    class Native(_RecordingCodexAppServerClient):
+        supports_user_message_ids = True
+
+        async def request(self, method, params):
+            requests.append((method, params))
+            if method == "turn/start":
+                started.set()
+                await release.wait()
+                monkeypatch.setattr(
+                    codex_native_forwarder, "_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS", 0.05
+                )
+                return {"result": {"turn": {"id": "automatic_turn"}}}
+            if fault == "timeout":
+                await asyncio.Event().wait()
+            if fault == "rejection":
+                raise CodexAppServerResponseError(
+                    {"code": -32000, "message": "native cancellation rejected"}
+                )
+            raise ConnectionError("native cancellation acknowledgement lost")
+
+    native = Native("ws://127.0.0.1:43221", "omnigent-codex-native-runner")
+    app, _, bridge_dir = _build_codex_native_runner_for_stale_turn(
+        monkeypatch,
+        tmp_path,
+        session_id,
+        active_turn_id="turn_source",
+        thread_id="thread_codex",
+        socket_path=native.transport,
+        fake_client=native,
+    )
+    state = codex_native_forwarder._CodexForwarderState()
+    ap_client = _RecordingClient()
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test_agent"}
+        )
+        assert response.status_code == 201
+        completion = asyncio.create_task(
+            _forward_codex_recovery_event(
+                ap_client,
+                native,
+                state,
+                bridge_dir,
+                session_id=session_id,
+                thread_id="thread_codex",
+                method="turn/completed",
+                params={
+                    "threadId": "thread_codex",
+                    "turn": {
+                        "id": "turn_source",
+                        "status": "failed",
+                        "error": {
+                            "message": "Incomplete response returned, reason: max_output_tokens"
+                        },
+                    },
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            stopped = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": event_type}
+            )
+            assert stopped.status_code == 204
+            assert not native.connected
+        finally:
+            release.set()
+            await asyncio.wait_for(completion, timeout=2)
+        assert codex_native_bridge.read_bridge_state(bridge_dir).active_turn_id is None
+        assert (
+            codex_native_bridge.read_bridge_state(bridge_dir).output_limit_cancellation_state
+            == "unconfirmed"
+        )
+        errors = [
+            body["data"]
+            for _, body in ap_client.posts
+            if body["type"] == "external_conversation_item"
+            and body["data"]["item_type"] == "error"
+        ]
+        assert errors and "may still be running" in errors[0]["item_data"]["message"]
+        reconnected = codex_native_forwarder._CodexForwarderState()
+        await _forward_codex_recovery_event(
+            ap_client,
+            native,
+            reconnected,
+            bridge_dir,
+            session_id=session_id,
+            thread_id="thread_codex",
+            method="turn/started",
+            params={"threadId": "thread_codex", "turn": {"id": "automatic_turn"}},
+        )
+        assert codex_native_bridge.read_bridge_state(bridge_dir).active_turn_id is None
+        assert [method for method, _ in requests] == ["turn/start", "turn/interrupt"]
+        assert any(
+            body["type"] == "external_session_status" and body["data"]["status"] == "running"
+            for _, body in ap_client.posts
+        )
+        assert not any(
+            body["type"] == "external_session_status" and body["data"]["status"] == "idle"
+            for _, body in ap_client.posts
+        )
+        await _forward_codex_recovery_event(
+            ap_client,
+            native,
+            reconnected,
+            bridge_dir,
+            session_id=session_id,
+            thread_id="thread_codex",
+            method="turn/completed",
+            params={
+                "threadId": "thread_codex",
+                "turn": {"id": "automatic_turn", "status": "interrupted"},
+            },
+        )
+        assert (
+            codex_native_bridge.read_bridge_state(bridge_dir).output_limit_cancellation_state
+            == "completed"
+        )
+        assert codex_native_bridge.read_bridge_state(bridge_dir).active_turn_id is None
+        await reconnected.close_child_streams()

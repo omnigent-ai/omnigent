@@ -1817,6 +1817,46 @@ async def test_output_limit_start_acknowledgement_cannot_replace_newer_control(
     assert current.thread_id == ("new_thread" if change == "new_thread" else "thread_123")
     assert current.session_id == ("new_session" if change == "new_session" else "conv_x")
 
+    # Buffered activity from the cancelled automatic turn cannot reclaim control.
+    preserved = read_bridge_state(tmp_path)
+    for method, params in [
+        ("turn/started", {"threadId": "thread_123", "turn": {"id": "turn_continuation"}}),
+        (
+            "item/agentMessage/delta",
+            {
+                "threadId": "thread_123",
+                "turnId": "turn_continuation",
+                "itemId": "cancelled_message",
+                "delta": "late text",
+            },
+        ),
+        (
+            "item/reasoning/textDelta",
+            {
+                "threadId": "thread_123",
+                "turnId": "turn_continuation",
+                "itemId": "cancelled_reasoning",
+                "delta": "late reasoning",
+            },
+        ),
+        (
+            "turn/completed",
+            {
+                "threadId": "thread_123",
+                "turn": {"id": "turn_continuation", "status": "interrupted"},
+            },
+        ),
+    ]:
+        await _forward_output_limit_event(client, codex, state, tmp_path, method, params)
+        observed = read_bridge_state(tmp_path)
+        assert (
+            replace(
+                observed, output_limit_cancellation_state=preserved.output_limit_cancellation_state
+            )
+            == preserved
+        )
+    assert len(codex.requests) == 2
+
 
 @pytest.mark.parametrize("change", ["stop", "new_turn", "new_thread"])
 async def test_output_limit_drain_cannot_start_after_newer_control(
@@ -2271,3 +2311,408 @@ async def test_output_limit_peer_without_delivery_identity_keeps_original_failur
     assert codex.requests == []
     assert state.pending_output_limit_errors == {}
     assert client.posts[-1][1]["data"]["output"] == _OUTPUT_LIMIT_ERROR["message"]
+
+
+@pytest.mark.parametrize("fault", ["disconnect", "rejection", "timeout"])
+@pytest.mark.parametrize("newer_owner", ["stop", "new_turn", "new_thread", "new_session"])
+async def test_output_limit_failed_cancel_keeps_uncertainty_and_newer_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str, newer_owner: str
+) -> None:
+    """Lost cancellation delivery cannot disappear or certify that native work stopped."""
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    state = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    monkeypatch.setattr(fwd, "_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS", 0.05)
+
+    async def request(method: str, params: dict) -> dict:
+        codex.requests.append((method, params))
+        if method == "turn/start":
+            if newer_owner == "stop":
+                assert await executor.interrupt_session("conv_x") is False
+            elif newer_owner == "new_turn":
+                update_active_turn_id(tmp_path, "new_user_turn")
+            elif newer_owner == "new_thread":
+                update_thread_id(tmp_path, "new_thread", active_turn_id="new_user_turn")
+            else:
+                current = read_bridge_state(tmp_path)
+                write_bridge_state(tmp_path, replace(current, session_id="new_session"))
+            return {"result": {"turn": {"id": "automatic_turn"}}}
+        if fault == "timeout":
+            await asyncio.Event().wait()
+        if fault == "rejection":
+            raise CodexAppServerResponseError(
+                {"code": -32000, "message": "native cancellation rejected"}
+            )
+        raise ConnectionError("native cancellation acknowledgement lost")
+
+    monkeypatch.setattr(codex, "request", request)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_a", "status": "failed", "error": _OUTPUT_LIMIT_ERROR},
+        },
+    )
+    preserved = read_bridge_state(tmp_path)
+    errors = [
+        body["data"]
+        for _, body in client.posts
+        if body["type"] == "external_conversation_item" and body["data"]["item_type"] == "error"
+    ]
+    assert errors and "may still be running" in errors[0]["item_data"]["message"]
+    assert state.output_limit_interrupt_attempts["automatic_turn"] == "unconfirmed"
+    if newer_owner in {"stop", "new_turn"}:
+        assert preserved.output_limit_cancellation_state == "unconfirmed"
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/started",
+        {"threadId": "thread_123", "turn": {"id": "automatic_turn"}},
+    )
+    assert read_bridge_state(tmp_path) == preserved
+    assert [method for method, _ in codex.requests] == ["turn/start", "turn/interrupt"]
+    assert all(
+        body["data"].get("status") != "idle"
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    )
+    await state.close_child_streams()
+
+
+async def test_output_limit_reconnect_requires_native_terminal_cancellation_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay retains uncertainty and live output without speculatively adopting the turn."""
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    original = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def request(method: str, params: dict) -> dict:
+        codex.requests.append((method, params))
+        if method == "turn/start":
+            assert await executor.interrupt_session("conv_x") is False
+            return {"result": {"turn": {"id": "automatic_turn"}}}
+        raise ConnectionError("native cancellation acknowledgement lost")
+
+    monkeypatch.setattr(codex, "request", request)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        original,
+        tmp_path,
+        "turn/completed",
+        {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_a", "status": "failed", "error": _OUTPUT_LIMIT_ERROR},
+        },
+    )
+    reconnected = fwd._CodexForwarderState()
+    await fwd._post_resume_turn_status(
+        client,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        turns=[{"id": "automatic_turn", "status": "inProgress", "items": []}],
+    )
+    assert read_bridge_state(tmp_path).active_turn_id is None
+    assert read_bridge_state(tmp_path).output_limit_cancellation_state == "unconfirmed"
+    await _forward_output_limit_event(
+        client,
+        codex,
+        reconnected,
+        tmp_path,
+        "turn/started",
+        {"threadId": "thread_123", "turn": {"id": "automatic_turn"}},
+    )
+    await _forward_output_limit_event(
+        client,
+        codex,
+        reconnected,
+        tmp_path,
+        "item/agentMessage/delta",
+        {
+            "threadId": "thread_123",
+            "turnId": "automatic_turn",
+            "itemId": "live_auto",
+            "delta": "native work continues",
+        },
+    )
+    for stream in reconnected.child_streams.values():
+        await stream.delta_coalescer.flush()
+    assert any("native work continues" in json.dumps(body) for _, body in client.posts)
+    assert read_bridge_state(tmp_path).active_turn_id is None
+    assert len(codex.requests) == 2
+    assert all(
+        body["data"].get("status") != "idle"
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    )
+    await fwd._post_resume_turn_status(
+        client,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        turns=[{"id": "automatic_turn", "status": "interrupted", "items": []}],
+    )
+    assert read_bridge_state(tmp_path).output_limit_cancellation_state == "completed"
+    before = len(client.posts)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        fwd._CodexForwarderState(),
+        tmp_path,
+        "turn/started",
+        {"threadId": "thread_123", "turn": {"id": "automatic_turn"}},
+    )
+    assert len(client.posts) == before
+    await reconnected.close_child_streams()
+
+
+async def test_output_limit_interrupt_ack_is_not_native_completion_on_disconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Delivery acknowledgement cannot certify that a disconnected native job stopped."""
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    state = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def request(method: str, params: dict) -> dict:
+        codex.requests.append((method, params))
+        if method == "turn/start":
+            assert await executor.interrupt_session("conv_x") is False
+            return {"result": {"turn": {"id": "automatic_turn"}}}
+        return {"result": {}}
+
+    monkeypatch.setattr(codex, "request", request)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_a", "status": "failed", "error": _OUTPUT_LIMIT_ERROR},
+        },
+    )
+    assert read_bridge_state(tmp_path).output_limit_cancellation_state == "acknowledged"
+    assert client.posts == []
+    await state.close_output_limit_errors()
+    assert read_bridge_state(tmp_path).output_limit_cancellation_state == "acknowledged"
+    assert any(
+        body["type"] == "external_conversation_item"
+        and body["data"]["item_type"] == "error"
+        and "may still be running" in body["data"]["item_data"]["message"]
+        for _, body in client.posts
+    )
+    assert not any(
+        body["type"] == "external_session_status" and body["data"]["status"] == "idle"
+        for _, body in client.posts
+    )
+
+
+async def test_output_limit_resume_completion_survives_next_claim_and_disconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replayed native completion remains authoritative after the durable slot is reused."""
+    from omnigent.harnesses.codex_native import bridge as bridge_module
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    state = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def request(method: str, params: dict) -> dict:
+        codex.requests.append((method, params))
+        if method == "turn/start":
+            assert await executor.interrupt_session("conv_x") is False
+            return {"result": {"turn": {"id": "automatic_turn"}}}
+        return {"result": {}}
+
+    monkeypatch.setattr(codex, "request", request)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "turn/completed",
+        {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_a", "status": "failed", "error": _OUTPUT_LIMIT_ERROR},
+        },
+    )
+    await fwd._post_resume_turn_status(
+        client,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        turns=[{"id": "automatic_turn", "status": "interrupted", "items": []}],
+        forwarder_state=state,
+    )
+    assert state.output_limit_interrupt_attempts["automatic_turn"] == "completed"
+    update_active_turn_id(tmp_path, "later_source")
+    later = read_bridge_state(tmp_path)
+    assert bridge_module.clear_active_turn_id_if_matches(tmp_path, "later_source")
+    assert bridge_module.claim_output_limit_continuation(tmp_path, later, "later_receipt")
+    before = len(client.posts)
+    await state.close_output_limit_errors()
+    assert len(client.posts) == before
+
+
+@pytest.mark.parametrize("terminal_snapshot", [False, True])
+@pytest.mark.parametrize("embedded_error", [False, True])
+async def test_output_limit_replay_uses_native_receipt_before_activity_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_snapshot: bool, embedded_error: bool
+) -> None:
+    """A replayed receipt fences a lost start reply without cancelling known finished work."""
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    original = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def request(method: str, params: dict) -> dict:
+        codex.requests.append((method, params))
+        if method == "turn/start":
+            assert await executor.interrupt_session("conv_x") is False
+            raise ConnectionError("automatic start acknowledgement lost")
+        raise ConnectionError("native cancellation acknowledgement lost")
+
+    monkeypatch.setattr(codex, "request", request)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        original,
+        tmp_path,
+        "turn/completed",
+        {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_a", "status": "failed", "error": _OUTPUT_LIMIT_ERROR},
+        },
+    )
+    reconnected = fwd._CodexForwarderState(codex_client=codex)
+    receipt = codex.requests[0][1]["clientUserMessageId"]
+    snapshot = {
+        "result": {
+            "thread": {
+                "id": "thread_123",
+                "turns": [
+                    {
+                        "id": "automatic_turn",
+                        "status": "interrupted" if terminal_snapshot else "inProgress",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "native_input",
+                                "clientId": receipt,
+                                "content": [
+                                    {"type": "text", "text": fwd._OUTPUT_LIMIT_CONTINUE_TEXT}
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+    }
+    if embedded_error:
+        snapshot["result"]["thread"]["turns"][0]["error"] = {"message": "native stream error"}
+    before = len(client.posts)
+    await fwd._replay_resume_response(
+        client,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        response=snapshot,
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=reconnected,
+    )
+    assert read_bridge_state(tmp_path).active_turn_id is None
+    assert read_bridge_state(tmp_path).output_limit_cancellation_state == (
+        "completed" if terminal_snapshot else "unconfirmed"
+    )
+    assert [method for method, _ in codex.requests] == (
+        ["turn/start"] if terminal_snapshot else ["turn/start", "turn/interrupt"]
+    )
+    new_errors = [
+        body
+        for _, body in client.posts[before:]
+        if body["type"] == "external_conversation_item" and body["data"]["item_type"] == "error"
+    ]
+    assert bool(new_errors) is not terminal_snapshot
+    await reconnected.close_child_streams()
+
+
+@pytest.mark.parametrize("transfer_timing", ["before_error", "after_deferral"])
+async def test_output_limit_foreign_owner_is_never_captured_by_old_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transfer_timing: str
+) -> None:
+    """Retaining thread/turn UUIDs cannot give an old session control over its successor."""
+    seen = asyncio.Event()
+
+    class Client(_RecordingClient):
+        async def post(self, url: str, *, json: dict, timeout: float | None = None):
+            result = await super().post(url, json=json, timeout=timeout)
+            if (
+                json.get("type") == "external_session_status"
+                and json["data"].get("status") == "failed"
+            ) or (
+                json.get("type") == "external_conversation_item"
+                and json["data"].get("item_type") == "error"
+            ):
+                seen.set()
+            return result
+
+    client = Client()
+    codex = _ContinuingCodexClient()
+    state = fwd._CodexForwarderState()
+    _seed_active_turn(tmp_path, "turn_a")
+    successor = replace(read_bridge_state(tmp_path), session_id="successor_session")
+    monkeypatch.setattr(fwd, "_OUTPUT_LIMIT_TERMINAL_WAIT_SECONDS", 0.01)
+    if transfer_timing == "before_error":
+        write_bridge_state(tmp_path, successor)
+    await _forward_output_limit_event(
+        client,
+        codex,
+        state,
+        tmp_path,
+        "error",
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_a",
+            "willRetry": False,
+            "error": _OUTPUT_LIMIT_ERROR,
+        },
+    )
+    if transfer_timing == "before_error":
+        assert state.pending_output_limit_errors == {}
+    else:
+        write_bridge_state(tmp_path, successor)
+    await asyncio.wait_for(seen.wait(), timeout=1)
+    assert read_bridge_state(tmp_path) == successor
+    assert codex.requests == []
+    assert _OUTPUT_LIMIT_ERROR["message"] in json.dumps(client.posts)
+    await state.close_output_limit_errors()

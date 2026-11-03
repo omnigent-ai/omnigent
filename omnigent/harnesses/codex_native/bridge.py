@@ -198,6 +198,8 @@ class CodexNativeBridgeState:
     :param interrupted_turn_id: Active turn or pending recovery source at the latest Stop.
     :param output_limit_turn_ids: Source and proven continuation of the latest recovery.
     :param output_limit_client_message_id: Native delivery id allocated before automatic input.
+    :param output_limit_owner_scope: Native session, thread, transport and credential scope.
+    :param output_limit_cancellation_state: Request delivery is distinct from native completion.
     """
 
     session_id: str
@@ -213,6 +215,8 @@ class CodexNativeBridgeState:
     interrupted_turn_id: str | None = None
     output_limit_turn_ids: tuple[str, ...] = ()
     output_limit_client_message_id: str | None = None
+    output_limit_owner_scope: tuple[str, ...] = ()
+    output_limit_cancellation_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1085,6 +1089,8 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "interrupted_turn_id": state.interrupted_turn_id,
                     "output_limit_turn_ids": state.output_limit_turn_ids,
                     "output_limit_client_message_id": state.output_limit_client_message_id,
+                    "output_limit_owner_scope": state.output_limit_owner_scope,
+                    "output_limit_cancellation_state": state.output_limit_cancellation_state,
                 },
                 handle,
                 sort_keys=True,
@@ -1123,6 +1129,12 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                 output_limit_turn_ids=state.output_limit_turn_ids or current.output_limit_turn_ids,
                 output_limit_client_message_id=(
                     state.output_limit_client_message_id or current.output_limit_client_message_id
+                ),
+                output_limit_owner_scope=state.output_limit_owner_scope
+                or current.output_limit_owner_scope,
+                output_limit_cancellation_state=(
+                    state.output_limit_cancellation_state
+                    or current.output_limit_cancellation_state
                 ),
             )
         _write_bridge_state_unlocked(bridge_dir, state)
@@ -1685,6 +1697,8 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     interrupt_generation = raw.get("interrupt_generation", 0)
     output_limit_turn_ids = raw.get("output_limit_turn_ids", [])
     output_limit_client_message_id = raw.get("output_limit_client_message_id")
+    output_limit_owner_scope = raw.get("output_limit_owner_scope", [])
+    output_limit_cancellation_state = raw.get("output_limit_cancellation_state")
     if (
         type(interrupt_generation) is not int
         or interrupt_generation < 0
@@ -1696,6 +1710,20 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             and (
                 not isinstance(output_limit_client_message_id, str)
                 or not output_limit_client_message_id
+            )
+        )
+    ):
+        return CodexNativeBridgeStateRead(None, "invalid_state")
+    if (
+        not isinstance(output_limit_owner_scope, list)
+        or len(output_limit_owner_scope) not in {0, 4}
+        or any(not isinstance(value, str) or not value for value in output_limit_owner_scope)
+        or (
+            output_limit_cancellation_state is not None
+            and (
+                not isinstance(output_limit_cancellation_state, str)
+                or output_limit_cancellation_state
+                not in {"requested", "acknowledged", "unconfirmed", "completed"}
             )
         )
     ):
@@ -1728,6 +1756,8 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             ),
             output_limit_turn_ids=tuple(output_limit_turn_ids),
             output_limit_client_message_id=output_limit_client_message_id,
+            output_limit_owner_scope=tuple(output_limit_owner_scope),
+            output_limit_cancellation_state=output_limit_cancellation_state,
         ),
         "ready",
     )
@@ -1800,11 +1830,21 @@ def record_codex_interrupt(
         )
         if state.active_turn_id not in {None, expected.active_turn_id} and not known_continuation:
             return None
+        pending_automatic_turn = (
+            state.output_limit_turn_ids[1]
+            if len(state.output_limit_turn_ids) == 2
+            and state.output_limit_client_message_id is not None
+            and state.output_limit_owner_scope == _bridge_owner_scope(state)
+            and state.output_limit_cancellation_state
+            in {"requested", "acknowledged", "unconfirmed"}
+            else None
+        )
+        target_turn_id = state.active_turn_id or pending_automatic_turn
         updated = replace(
             state,
             interrupt_generation=state.interrupt_generation + 1,
             interrupted_turn_id=(
-                state.active_turn_id
+                target_turn_id
                 or expected.active_turn_id
                 or (
                     state.output_limit_turn_ids[0]
@@ -1814,7 +1854,7 @@ def record_codex_interrupt(
             ),
         )
         _write_bridge_state_unlocked(bridge_dir, updated)
-        return updated
+        return replace(updated, active_turn_id=target_turn_id)
 
 
 def claim_output_limit_continuation(
@@ -1835,6 +1875,8 @@ def claim_output_limit_continuation(
             or current.interrupted_turn_id == turn_id
             or turn_id in current.output_limit_turn_ids
             or len(current.output_limit_turn_ids) == 1
+            or current.output_limit_cancellation_state
+            in {"requested", "acknowledged", "unconfirmed"}
         ):
             return False
         _write_bridge_state_unlocked(
@@ -1843,6 +1885,8 @@ def claim_output_limit_continuation(
                 current,
                 output_limit_turn_ids=(turn_id,),
                 output_limit_client_message_id=client_message_id,
+                output_limit_owner_scope=_bridge_owner_scope(current),
+                output_limit_cancellation_state=None,
             ),
         )
         return True
@@ -1878,6 +1922,11 @@ def complete_output_limit_continuation(
             ),
         )
         return True
+
+
+def _bridge_owner_scope(state: CodexNativeBridgeState) -> tuple[str, str, str, str]:
+    """The native connection and account scope that owns a recovery receipt."""
+    return state.session_id, state.thread_id, state.socket_path, state.codex_home
 
 
 def _bridge_owner_matches(
@@ -1922,7 +1971,7 @@ def record_output_limit_continuation_receipt(
             or not client_message_id
             or not state.output_limit_turn_ids
             or state.output_limit_turn_ids[0] == turn_id
-            or state.active_turn_id not in {None, turn_id}
+            or state.output_limit_owner_scope != _bridge_owner_scope(state)
             or (
                 len(state.output_limit_turn_ids) == 2 and state.output_limit_turn_ids[1] != turn_id
             )
@@ -1931,6 +1980,66 @@ def record_output_limit_continuation_receipt(
         updated = replace(state, output_limit_turn_ids=(state.output_limit_turn_ids[0], turn_id))
         _write_bridge_state_unlocked(bridge_dir, updated)
         return updated
+
+
+def output_limit_cancellation_for_turn(
+    state: CodexNativeBridgeState | None, *, session_id: str, thread_id: str, turn_id: str
+) -> str | None:
+    """Read cancellation delivery only for the request's durable native owner."""
+    if (
+        state is None
+        or state.session_id != session_id
+        or state.thread_id != thread_id
+        or state.output_limit_owner_scope != _bridge_owner_scope(state)
+        or not state.output_limit_client_message_id
+        or len(state.output_limit_turn_ids) != 2
+        or state.output_limit_turn_ids[1] != turn_id
+    ):
+        return None
+    return state.output_limit_cancellation_state
+
+
+def record_output_limit_cancellation(
+    bridge_dir: Path,
+    *,
+    expected: CodexNativeBridgeState,
+    turn_id: str,
+    client_message_id: str,
+    status: str,
+) -> bool:
+    """Record delivery uncertainty separately from native terminal confirmation."""
+    if status not in {"requested", "acknowledged", "unconfirmed", "completed"}:
+        raise ValueError("Invalid native cancellation state")
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if (
+            current is None
+            or not _bridge_owner_matches(current, expected)
+            or current.output_limit_owner_scope != _bridge_owner_scope(expected)
+            or current.output_limit_client_message_id != client_message_id
+            or not current.output_limit_turn_ids
+            or current.output_limit_turn_ids[0] == turn_id
+            or (
+                len(current.output_limit_turn_ids) == 2
+                and current.output_limit_turn_ids[1] != turn_id
+            )
+        ):
+            return False
+        if current.output_limit_cancellation_state == "completed" and status != "completed":
+            return True
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            replace(
+                current,
+                output_limit_turn_ids=(current.output_limit_turn_ids[0], turn_id),
+                output_limit_cancellation_state=status,
+                active_turn_id=None
+                if current.active_turn_id == turn_id
+                and current.interrupted_turn_id == current.output_limit_turn_ids[0]
+                else current.active_turn_id,
+            ),
+        )
+        return True
 
 
 def mark_shell_command_pending(

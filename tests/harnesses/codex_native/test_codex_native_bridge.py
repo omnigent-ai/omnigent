@@ -1735,3 +1735,65 @@ def test_clear_turn_with_expected_owner_preserves_transferred_state(
     )
     assert read_bridge_state(tmp_path) == successor
     assert called == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("output_limit_owner_scope", ["incomplete"]),
+        ("output_limit_owner_scope", {"not": "a scope"}),
+        ("output_limit_cancellation_state", ["completed"]),
+        ("output_limit_cancellation_state", "stopped_without_native_proof"),
+    ],
+)
+def test_invalid_cancellation_metadata_fails_closed(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Malformed recovery metadata must not manufacture a completed native cancellation."""
+    _seed_active_turn(tmp_path, "turn_source")
+    path = tmp_path / "state.json"
+    payload = json.loads(path.read_text())
+    payload[field] = value
+    path.write_text(json.dumps(payload))
+    assert read_bridge_state(tmp_path) is None
+
+
+def test_output_limit_native_completion_cannot_regress_to_delivery_uncertainty(
+    tmp_path: Path,
+) -> None:
+    """A late RPC outcome cannot erase authoritative native terminal evidence."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "turn_source")
+    assert codex_native_bridge.claim_output_limit_continuation(
+        tmp_path, source, "recovery_receipt"
+    )
+    assert codex_native_bridge.complete_output_limit_continuation(
+        tmp_path, source, "automatic_turn", client_message_id="recovery_receipt"
+    )
+    for status in ["requested", "acknowledged"]:
+        assert codex_native_bridge.record_output_limit_cancellation(
+            tmp_path,
+            expected=source,
+            turn_id="automatic_turn",
+            client_message_id="recovery_receipt",
+            status=status,
+        )
+        assert read_bridge_state(tmp_path).active_turn_id == "automatic_turn"
+        assert read_bridge_state(tmp_path).output_limit_cancellation_state != "completed"
+    assert codex_native_bridge.record_output_limit_cancellation(
+        tmp_path,
+        expected=source,
+        turn_id="automatic_turn",
+        client_message_id="recovery_receipt",
+        status="completed",
+    )
+    assert codex_native_bridge.record_output_limit_cancellation(
+        tmp_path,
+        expected=source,
+        turn_id="automatic_turn",
+        client_message_id="recovery_receipt",
+        status="unconfirmed",
+    )
+    assert read_bridge_state(tmp_path).output_limit_cancellation_state == "completed"
