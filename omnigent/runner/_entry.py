@@ -1738,16 +1738,22 @@ def create_app(
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         from omnigent.runner import pr_reports
+        from omnigent.runtime_flags import RuntimeFlagRefresher
 
         await _start_pm()
         reporter = pr_reports.PullRequestReporter(
             lambda *args, **kwargs: server_client.post(*args, **kwargs)
         )
         pr_reports.install(reporter)
+        runtime_flags = RuntimeFlagRefresher(
+            lambda *args, **kwargs: server_client.post(*args, **kwargs)
+        )
+        runtime_flags.start()
         try:
             with monitor_event_loop(process_role="runner"):
                 yield
         finally:
+            await runtime_flags.aclose()
             pr_reports.install(None)
             await reporter.aclose()
             await _stop_pm()

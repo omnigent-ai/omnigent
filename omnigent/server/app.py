@@ -129,6 +129,7 @@ from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.runtime_flags import create_runtime_flags_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -150,6 +151,7 @@ from omnigent.server.runner_session_init import (
     is_session_agent_removed,
     runner_response_error_body,
 )
+from omnigent.server.runtime_flags import RuntimeFlagProvider
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.scheduled.config import ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.dispatch_scheduler import (
@@ -299,6 +301,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # POST /v1/runtime-flags serves values; false when no provider is configured.
+    runtime_flags: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -1592,6 +1596,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    runtime_flag_provider: RuntimeFlagProvider | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1641,6 +1646,9 @@ def create_app(
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
+    :param runtime_flag_provider: Evaluates the runtime flags hosts and
+        runners request from ``POST /v1/runtime-flags``. ``None`` serves no
+        flags, so clients keep their declared defaults.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -3647,6 +3655,7 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_available,
+                "runtime_flags": runtime_flag_provider is not None,
                 "automations_enabled": automations_available,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
@@ -3987,6 +3996,12 @@ def create_app(
             prefix="/v1",
             tags=["preferences"],
         )
+
+    app.include_router(
+        create_runtime_flags_router(runtime_flag_provider, auth_provider),
+        prefix="/v1",
+        tags=["runtime-flags"],
+    )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 
