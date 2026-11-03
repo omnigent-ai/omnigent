@@ -348,8 +348,8 @@ async def test_a_message_an_occupied_input_box_refused_waits_for_chat_input(
     """
     The turn holds the message until the box takes chat input again, then delivers it once.
 
-    On main the refusal failed the turn at once with "Claude Code's input box is
-    occupied by shell mode, so the message was not delivered."
+    Shell mode or the prompt-history search owns the box when the message arrives;
+    nothing was typed, so the refusal is a wait rather than a failed turn.
     """
     pane.refusals = [ClaudeInputBoxOccupied(_SHELL_MODE, surface=surface)]
 
