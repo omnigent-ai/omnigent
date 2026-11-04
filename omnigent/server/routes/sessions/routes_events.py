@@ -10,7 +10,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, Never, cast
 
 import httpx
 from fastapi import (
@@ -556,9 +556,13 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
         )
 
 
-async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
+async def _session_offline_host_id(
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+) -> str | None:
     """
-    Report whether a session's user-run host has no live tunnel.
+    Return the session's user-run routing host when it has no live tunnel.
 
     Called after a send found no runner to use and the host never took a
     launch. A host that is not connected cannot start a runner, so the failure
@@ -567,22 +571,31 @@ async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
     start them), as is a host whose row still reads live, which can only be
     connected to another replica.
 
+    Side chats and sub-agents can inherit their host from an ancestor, so the
+    routing host is authoritative rather than only ``conv.host_id``.
+
     :param conv: The session row whose send failed.
     :param app_state: ``request.app.state`` — supplies the host registry and
         the host store.
-    :returns: ``True`` when the session is host-bound and its user-run host is
-        absent from this server and not live elsewhere.
+    :param conversation_store: Store used to resolve an inherited routing host.
+    :returns: The offline user-run host id, or ``None`` when the session has no
+        such host.
     """
-    if conv.host_id is None:
-        return False
+    host_id = conv.host_id
+    if host_id is None:
+        host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    if host_id is None:
+        return None
     host_registry = getattr(app_state, "host_registry", None)
-    if host_registry is None or host_registry.get(conv.host_id) is not None:
-        return False
+    if host_registry is None or host_registry.get(host_id) is not None:
+        return None
     host_store = getattr(app_state, "host_store", None)
     if host_store is None:
-        return True
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
-    return host is not None and host.sandbox_provider is None and not host_is_live(host)
+        return host_id
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is not None or host_is_live(host):
+        return None
+    return host_id
 
 
 def _host_offline_message() -> str:
@@ -659,6 +672,36 @@ def _client_holds_host_offline_sends(headers: Mapping[str, str]) -> bool:
 def _host_offline_hold_message() -> str:
     """Return the refusal text for a send the client holds until the host reconnects."""
     return "The host for this session is offline. Your message will be sent when it reconnects."
+
+
+def _refuse_offline_host_send(
+    *,
+    headers: Mapping[str, str],
+    session_id: str,
+    runner_id: str | None,
+    host_id: str,
+    waited_s: float,
+) -> Never:
+    """Refuse an unconsumed send using the caller's supported retry contract."""
+    client_holds = _client_holds_host_offline_sends(headers)
+    outcome = "host_offline_held" if client_holds else "host_offline_refused"
+    _logger.info(
+        "Host %s is offline; refusing the send for session %s",
+        host_id,
+        session_id,
+        extra=debug_event(
+            "runner_client_wait",
+            session_id=session_id,
+            runner_id=runner_id,
+            host_id=host_id,
+            outcome=outcome,
+            attempts=0,
+            waited_s=round(waited_s, 3),
+        ),
+    )
+    if client_holds:
+        raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
+    raise OmnigentError(_host_offline_message(), code=ErrorCode.RUNNER_UNAVAILABLE)
 
 
 async def _recover_retry_session(
@@ -2911,6 +2954,20 @@ def register_events_routes(
         host_wait_started = time.monotonic()
         _host_conn: HostConnection | None = None
         if runner_client is None and conv.host_id is not None:
+            known_exit = (
+                runner_exit_reports.get(conv.runner_id)
+                if runner_exit_reports is not None and conv.runner_id is not None
+                else None
+            )
+            offline_before_grace = (
+                await _session_offline_host_id(
+                    conv,
+                    request.app.state,
+                    conversation_store,
+                )
+                if known_exit is None
+                else None
+            )
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = cast(
                 HostRegistry | None,
@@ -2934,7 +2991,11 @@ def register_events_routes(
             # explicit pending sign-in retains this runner and the input.
             from omnigent.server.routes import sessions as _sf
 
-            if conv.runner_id is not None and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
+            if (
+                conv.runner_id is not None
+                and offline_before_grace is None
+                and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
+            ):
                 _logger.info(
                     "Waiting up to %.1fs for host-bound runner %s to register "
                     "for session %s before relaunch",
@@ -3129,20 +3190,11 @@ def register_events_routes(
                 conv.kind != "sub_agent" or _is_native_terminal_session(conv)
             )
         if runner_client is None:
-            # A native terminal-session message must NOT be silently
-            # dropped when no runner is reachable — the runner crashed
-            # before connecting (the daemon couldn't bring it up). Persist
-            # the user's message together with the runner-failure error so
-            # it survives reload and the banner explains why, becoming the
-            # AP-server-as-writer failed turn (same shape as a definitive
-            # ensure-probe failure). The cause, when known, is the daemon's
-            # exit report keyed by this session's runner_id; failing that, a
-            # host that is offline (so no runner could start); otherwise a
-            # generic unavailable message. This is safe precisely because
-            # the harness will never see it (no desync — there is no live
-            # harness). Other event types and non-native sessions still
-            # raise: their message would replay to a relaunched runner, so
-            # persisting now WOULD desync the store from harness state.
+            # A native terminal-session message must NOT be silently dropped
+            # when no runner is reachable. Persist a definitive runner failure
+            # with the input so it survives reload. A confirmed-offline host is
+            # different: no launch verdict exists, so refuse without recording
+            # the input and let the caller retry it after reconnect.
             if body.type == "message" and _is_native_terminal_session(conv):
                 exit_cause = (
                     runner_exit_reports.get(conv.runner_id)
@@ -3157,12 +3209,18 @@ def register_events_routes(
                 runner_owner = side_chat_source or conv
                 # A launch the host acknowledged or refused reached the host,
                 # so only a host still missing from this server reads as offline.
-                host_offline = (
-                    not exit_cause
+                offline_host_id = (
+                    await _session_offline_host_id(
+                        runner_owner,
+                        request.app.state,
+                        conversation_store,
+                    )
+                    if not exit_cause
                     and not relaunched_launch_acknowledged
                     and not relaunched_launch_refused
-                    and await _session_host_offline(runner_owner, request.app.state)
+                    else None
                 )
+                host_offline = offline_host_id is not None
                 if (
                     conv.host_id is not None
                     and conv.kind != "sub_agent"
@@ -3198,42 +3256,16 @@ def register_events_routes(
                         ),
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
-                if host_offline and _client_holds_host_offline_sends(request.headers):
-                    # Nothing reaches the harness, so nothing is recorded; the
-                    # client keeps the message and resends it after reconnect.
-                    _logger.info(
-                        "Host %s is offline; the client holds the send for session %s",
-                        conv.host_id,
-                        session_id,
-                        extra=debug_event(
-                            "runner_client_wait",
-                            session_id=session_id,
-                            runner_id=relaunched_runner_id or conv.runner_id,
-                            host_id=conv.host_id,
-                            outcome="host_offline_held",
-                            attempts=0,
-                            waited_s=round(time.monotonic() - host_wait_started, 3),
-                        ),
+                if offline_host_id is not None:
+                    _refuse_offline_host_send(
+                        headers=request.headers,
+                        session_id=session_id,
+                        runner_id=relaunched_runner_id or conv.runner_id,
+                        host_id=offline_host_id,
+                        waited_s=time.monotonic() - host_wait_started,
                     )
-                    raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
                 if exit_cause:
                     failure_message = exit_cause
-                elif host_offline:
-                    failure_message = _host_offline_message()
-                    _logger.warning(
-                        "Host %s is offline; failing the send for session %s",
-                        conv.host_id,
-                        session_id,
-                        extra=debug_event(
-                            "runner_client_wait",
-                            session_id=session_id,
-                            runner_id=relaunched_runner_id or conv.runner_id,
-                            host_id=conv.host_id,
-                            outcome="host_offline",
-                            attempts=0,
-                            waited_s=round(time.monotonic() - host_wait_started, 3),
-                        ),
-                    )
                 else:
                     failure_message = (
                         "The runner for this session is not available — "
