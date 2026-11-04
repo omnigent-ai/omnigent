@@ -27,10 +27,11 @@ from tests.e2e.test_host_claude_native_e2e import (
 from tests.e2e.test_host_claude_native_fork_e2e import (
     _builtin_agent_id,
     _host_daemon,
+    _placement,
     _plant_code_words,
     _prompt_item_id,
     _recall_code_words,
-    _rewind_and_check_placement,
+    _rewind,
     _send_user_message,
     _wait_until_idle,
 )
@@ -166,11 +167,16 @@ def test_rewind_claude_sdk_keeps_only_the_earlier_turns(
         source_id = _create_sdk_session_on_host(http_client, host_id=host_id, workspace=workspace)
         _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
 
-        rewound_id = _rewind_and_check_placement(
+        rewind = _rewind(
             http_client,
             source_id=source_id,
             item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
-            prompt_fragment=dropped,
         )
+        assert dropped in rewind.prompt
+        assert rewind.placed["runner_id"] is not None, rewind.placed
+        assert _placement(rewind.rewound) == _placement(rewind.placed)
+        assert _placement(rewind.source) == (None, *_placement(rewind.placed)[1:])
+        assert any(f"/c/{rewind.rewound_id}" in text for text in rewind.source_notices)
+        rewound_id = rewind.rewound_id
         reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
         assert dropped not in reply, f"rewound claude-sdk session recalled {dropped!r}: {reply!r}"
