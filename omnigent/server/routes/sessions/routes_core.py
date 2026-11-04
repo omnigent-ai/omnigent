@@ -8,7 +8,7 @@ import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -4074,6 +4074,7 @@ def register_core_routes(
         continue_source: bool = False,
         fork_id: str | None = None,
         validate_only: bool = False,
+        copied_files: dict[str, str] | None = None,
     ) -> SessionResponse | None:
         """Fork *source_id* as :func:`fork_session` documents.
 
@@ -4092,6 +4093,8 @@ def register_core_routes(
             remove it by id even if this call fails part-way.
         :param validate_only: Run every check that could refuse the fork, then
             return ``None`` without creating anything.
+        :param copied_files: Filled with each source file id and the id of the
+            fork's copy, e.g. ``{"file_src": "file_fork"}``.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4515,6 +4518,8 @@ def register_core_routes(
                 if not files_page.has_more or not files_page.data:
                     break
                 files_after = files_page.last_id
+            if copied_files is not None:
+                copied_files.update(fork_file_id_map)
 
             from omnigent.inner.native_attachments import uses_filesystem_delivery
 
@@ -4778,6 +4783,7 @@ def register_core_routes(
         reason: SupersessionReason,
         prepare: Callable[[], Awaitable[None]] | None = None,
         copy_history: bool = True,
+        copied_files: dict[str, str] | None = None,
     ) -> str:
         """
         Continue *source* in a fork on the same placement, superseding it.
@@ -4802,6 +4808,8 @@ def register_core_routes(
             the fork exists, e.g. to free the source's live client.
         :param copy_history: ``False`` starts the fork empty, with none of the
             source's items or files; *before_item_id* must then be ``None``.
+        :param copied_files: Filled with each source file id and the id of
+            the fork's copy.
         :returns: The fork's session id.
         :raises OmnigentError: When the caller does not own *source*, it is a
             sub-agent, a side chat or running a turn, or no runner or host can take the fork;
@@ -4908,7 +4916,12 @@ def register_core_routes(
                 runner_dispatched = False
                 try:
                     fork = await _fork_session(
-                        request, source.id, fork_request, fork_id=fork_id, **fork_options
+                        request,
+                        source.id,
+                        fork_request,
+                        fork_id=fork_id,
+                        copied_files=copied_files,
+                        **fork_options,
                     )
                     assert fork is not None
                     # The same conversation continues there, and every live viewer
@@ -5141,6 +5154,7 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         prompt = await asyncio.to_thread(_rewind_prompt, conv.id, body.item_id)
+        copied_files: dict[str, str] = {}
         new_session_id = await _continue_session_in_fork(
             request,
             conv,
@@ -5154,12 +5168,13 @@ def register_core_routes(
                 link_text="the rewound chat",
             ),
             reason="rewind",
+            copied_files=copied_files,
         )
         # The rewound session already exists, so a failed lookup costs only
         # the attachments the composer would have restored.
         try:
             attachments = await asyncio.to_thread(
-                _rewind_attachments, conv.id, new_session_id, prompt.content
+                _rewind_attachments, new_session_id, copied_files, prompt.content
             )
         except Exception:
             _logger.warning(
@@ -5201,49 +5216,30 @@ def register_core_routes(
         return item.data
 
     def _rewind_attachments(
-        source_id: str, fork_id: str, content: list[dict[str, Any]]
+        fork_id: str, copied_files: Mapping[str, str], content: list[dict[str, Any]]
     ) -> list[SessionRewindAttachment]:
         """
         Return the files *content* attached, as the fork's copies of them.
 
-        A fork copies every source file as a row sharing the source's blob, so
-        each attachment is matched to the fork row holding the same blob.
-        Attachments whose file is gone are left out.
+        Attachments whose file the fork holds no copy of are left out.
 
-        :param source_id: The rewound session, which holds the prompt's files.
-        :param fork_id: The fork continuing it.
+        :param fork_id: The fork continuing the rewound session.
+        :param copied_files: Each source file id and the id of the fork's copy.
         :param content: The prompt's content blocks.
         """
-        attached = [
-            part
-            for part in content
-            if part.get("type") in ("input_file", "input_image")
-            and isinstance(part.get("file_id"), str)
-        ]
-        if file_store is None or not attached:
-            return []
-        fork_file_ids: dict[str, str] = {}
-        after: str | None = None
-        while True:
-            page = file_store.list(fork_id, limit=1000, after=after, order="asc")
-            for fork_file in page.data:
-                fork_file_ids.setdefault(fork_file.blob_key or fork_file.id, fork_file.id)
-            if not page.has_more or not page.data:
-                break
-            after = page.last_id
         attachments: list[SessionRewindAttachment] = []
-        for part in attached:
-            block_type, file_id = part["type"], part["file_id"]
-            stored = file_store.get(file_id, session_id=source_id)
-            fork_file_id = (
-                fork_file_ids.get(stored.blob_key or stored.id) if stored is not None else None
-            )
-            if stored is None or fork_file_id is None:
+        if file_store is None:
+            return attachments
+        for part in content:
+            block_type, file_id = part.get("type"), part.get("file_id")
+            if block_type not in ("input_file", "input_image") or not isinstance(file_id, str):
+                continue
+            copy_id = copied_files.get(file_id)
+            copy = file_store.get(copy_id, session_id=fork_id) if copy_id is not None else None
+            if copy is None:
                 continue
             attachments.append(
-                SessionRewindAttachment(
-                    type=block_type, file_id=fork_file_id, filename=stored.filename
-                )
+                SessionRewindAttachment(type=block_type, file_id=copy.id, filename=copy.filename)
             )
         return attachments
 

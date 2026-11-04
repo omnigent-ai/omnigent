@@ -318,10 +318,23 @@ async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
         ],
     )
 
+    listed_files: list[str] = []
+    list_files = SqlAlchemyFileStore.list
+
+    def record_listing(
+        self: SqlAlchemyFileStore, session_id: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        listed_files.append(session_id)
+        return list_files(self, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyFileStore, "list", record_listing)
+
     resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
 
     assert resp.status_code == 200, resp.text
     new_id, attachments = resp.json()["session_id"], resp.json()["attachments"]
+    # The fork's copies come from the map the fork made, not a listing of its files.
+    assert new_id not in listed_files
     assert resp.json()["prompt"] == ""
     assert [(a["type"], a["filename"]) for a in attachments] == [
         ("input_image", "diagram.png"),
@@ -366,16 +379,16 @@ async def test_rewind_still_returns_the_new_session_when_its_attachments_fail(
             )
         ],
     )
-    list_files = SqlAlchemyFileStore.list
+    get_file = SqlAlchemyFileStore.get
 
-    def list_only_the_source(
-        self: SqlAlchemyFileStore, session_id: str, *args: Any, **kwargs: Any
+    def get_only_from_the_source(
+        self: SqlAlchemyFileStore, file_id: str, session_id: str | None = None
     ) -> Any:
-        if session_id != source_id:
+        if session_id is not None and session_id != source_id:
             raise RuntimeError("file store unavailable")
-        return list_files(self, session_id, *args, **kwargs)
+        return get_file(self, file_id, session_id=session_id)
 
-    monkeypatch.setattr(SqlAlchemyFileStore, "list", list_only_the_source)
+    monkeypatch.setattr(SqlAlchemyFileStore, "get", get_only_from_the_source)
 
     resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompt.id})
 
