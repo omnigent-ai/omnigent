@@ -148,8 +148,9 @@ view appear in the session.
 desktop app, browser, iOS/Android app, and CLI. The session keeps that creating
 interface across resumes; backend children inherit it, and a fork records the
 interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Agent`
-(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent`
-followed by `omnigent-desktop`, `omnigent-web`, `omnigent-mobile`, or `omnigent-cli`.
+(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent-desktop`,
+`omnigent-web`, `omnigent-mobile`, or `omnigent-cli`. Sessions with no known
+creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
 **Agent instructions (Pi native):** launch an agent whose spec contains inline
