@@ -17,6 +17,8 @@ type StoredDraft =
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
 const retiredDraftIds = new Set<string>();
+// Ids whose draft this tab has written, emptied ones included.
+const writtenDraftIds = new Set<string>();
 
 function loadDraftsFromStorage(): Map<string, SessionDraft> {
   if (typeof window === "undefined") return new Map();
@@ -102,6 +104,7 @@ export function getSessionDraft(conversationId: string): SessionDraft | undefine
 
 export function setSessionDraft(conversationId: string, draft: SessionDraft): void {
   if (retiredDraftIds.has(conversationId)) return;
+  writtenDraftIds.add(conversationId);
   const reviewComments = draft.reviewComments ?? sessionDrafts.get(conversationId)?.reviewComments;
   if (draft.text === "" && draft.files.length === 0 && !reviewComments?.length) {
     sessionDrafts.delete(conversationId);
@@ -151,10 +154,19 @@ export function promoteSessionDraft(
 ): SessionDraft | undefined {
   const draft = retireSessionDraft(temporaryConversationId);
   if (draft === undefined) return undefined;
+  writtenDraftIds.add(conversationId);
   sessionDrafts.set(conversationId, draft);
   saveDraftsToStorage();
   notifyListeners();
   return draft;
+}
+
+/**
+ * Whether this tab has written *conversationId*'s draft, even one the user
+ * then emptied, as opposed to never having touched it.
+ */
+export function sessionDraftWasWritten(conversationId: string): boolean {
+  return writtenDraftIds.has(conversationId);
 }
 
 export function hasSessionDraft(conversationId: string): boolean {
@@ -208,6 +220,7 @@ export function useSessionDraftIds(enabled = true): string {
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();
   retiredDraftIds.clear();
+  writtenDraftIds.clear();
   saveDraftsToStorage();
   notifyListeners();
 }
