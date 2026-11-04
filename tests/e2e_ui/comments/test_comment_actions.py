@@ -450,8 +450,10 @@ def test_address_all_moves_comments_to_addressed_tab(
 
     address_all = file_viewer.get_by_role("button", name=re.compile("Address All", re.IGNORECASE))
     expect(address_all).to_be_enabled()
-    # The count includes the other file's open comment.
-    expect(address_all).to_contain_text("3")
+    # The label and tooltip include the other file's open comment.
+    expect(address_all).to_have_text("Address all (3)")
+    address_all.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Sends 3 draft comments from 2 files")
     address_all.click()
 
     # The selected comment follows its status transition into Sent.

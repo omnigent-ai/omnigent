@@ -6,7 +6,7 @@
 //   3. Link button appears for addressed comments too (after switching the tab).
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -560,35 +560,64 @@ describe("CommentsPanel active-comment reveal", () => {
 });
 
 describe("CommentsPanel Address All", () => {
-  it.each([
-    ["drafts only in other files", [], 2, "2", true],
-    ["this file's drafts by default", [makeComment("c1")], undefined, "1", true],
-    ["no drafts anywhere", [], 0, "", false],
-  ])(
-    "enables the button from the session count with %s",
-    (_label, comments, count, badge, enabled) => {
-      const onAddressAll = vi.fn();
-      render(
-        <CommentsPanel
-          comments={comments}
-          addressedComments={[]}
-          activeSelection={null}
-          onAddComment={vi.fn()}
-          onAddressAll={onAddressAll}
-          onEditComment={vi.fn()}
-          onDeleteComment={vi.fn()}
-          onClickComment={vi.fn()}
-          canAddress
-          addressCount={count}
-          addressPending={false}
-        />,
-      );
+  function renderAddressPanel(
+    comments: Comment[],
+    addressCount?: number,
+    addressFileCount?: number,
+    onAddressAll = vi.fn(),
+  ) {
+    return render(
+      <CommentsPanel
+        comments={comments}
+        addressedComments={[]}
+        activeSelection={null}
+        onAddComment={vi.fn()}
+        onAddressAll={onAddressAll}
+        onEditComment={vi.fn()}
+        onDeleteComment={vi.fn()}
+        onClickComment={vi.fn()}
+        canAddress
+        addressCount={addressCount}
+        addressFileCount={addressFileCount}
+        addressPending={false}
+      />,
+    );
+  }
 
-      const button = screen.getByRole("button", { name: /^Address All/ });
+  it.each([
+    ["drafts only in other files", [], 2, "Address all (2)", true],
+    ["this file's and other files' drafts", [makeComment("c1")], 3, "Address all (3)", true],
+    ["this file's drafts by default", [makeComment("c1")], undefined, "Address All1", true],
+    ["no drafts anywhere", [], 0, "Address All", false],
+  ])(
+    "enables and labels the button from the session count with %s",
+    (_label, comments, count, label, enabled) => {
+      const onAddressAll = vi.fn();
+      renderAddressPanel(comments, count, undefined, onAddressAll);
+
+      const button = screen.getByRole("button", { name: /^Address All/i });
       fireEvent.click(button);
       expect(button).toHaveProperty("disabled", !enabled);
       expect(onAddressAll).toHaveBeenCalledTimes(enabled ? 1 : 0);
-      expect(button.textContent).toBe(`Address All${badge}`);
+      expect(button.textContent).toBe(label);
     },
   );
+
+  // Focus opens the tooltip without the hover delay.
+  it.each([
+    ["this file and another", [makeComment("c1")], 3, 2, "Sends 3 draft comments from 2 files"],
+    ["one other file", [], 1, 1, "Sends 1 draft comment from 1 file"],
+  ])("explains the send scope with drafts in %s", (_label, comments, count, fileCount, tooltip) => {
+    renderAddressPanel(comments, count, fileCount);
+
+    act(() => screen.getByRole("button", { name: `Address all (${count})` }).focus());
+    expect(screen.getByRole("tooltip")).toHaveTextContent(tooltip);
+  });
+
+  it("shows no scope tooltip when every draft is in the open file", () => {
+    renderAddressPanel([makeComment("c1"), makeComment("c2")], 2, 1);
+
+    act(() => screen.getByRole("button", { name: /^Address All/ }).focus());
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
 });

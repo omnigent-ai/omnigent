@@ -82,6 +82,7 @@ vi.mock("./CommentsPanel", () => ({
     addressedComments,
     activeSelection,
     addressCount,
+    addressFileCount,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
@@ -92,11 +93,13 @@ vi.mock("./CommentsPanel", () => ({
     addressedComments?: any[];
     activeSelection?: { comment_id?: string } | null;
     addressCount?: number;
+    addressFileCount?: number;
   }) => (
     <div
       data-testid="comments-panel"
       data-active-comment-id={activeSelection?.comment_id ?? ""}
       data-address-count={addressCount}
+      data-address-file-count={addressFileCount}
     >
       {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
@@ -1085,9 +1088,9 @@ describe("FileViewer Address All", () => {
   const sentHere = makeComment("c4", "addressed");
 
   it.each([
-    ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"]],
-    ["only other files", [sentHere], ["c2"]],
-  ])("sends drafts from %s in one message", (_label, fileComments, expectedIds) => {
+    ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"], 2],
+    ["only other files", [sentHere], ["c2"], 1],
+  ])("sends drafts from %s in one message", (_label, fileComments, expectedIds, fileCount) => {
     const mutate = vi.fn();
     useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
     // The session-wide list may lag behind this file's list: c4 is still a draft there,
@@ -1108,10 +1111,9 @@ describe("FileViewer Address All", () => {
 
     expect(mutate).toHaveBeenCalledTimes(1);
     expect(mutate).toHaveBeenCalledWith({ comment_ids: expectedIds });
-    expect(screen.getByTestId("comments-panel")).toHaveAttribute(
-      "data-address-count",
-      String(expectedIds.length),
-    );
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-address-count", String(expectedIds.length));
+    expect(panel).toHaveAttribute("data-address-file-count", String(fileCount));
   });
 
   it.each([

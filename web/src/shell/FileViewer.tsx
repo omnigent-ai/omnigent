@@ -670,13 +670,17 @@ function FileViewerBody({
   );
   // Address All sends drafts from every file; this file's own query supplies its drafts.
   // Until both lists load, a send would silently skip the unloaded list's drafts.
-  const addressableCommentIds = useMemo(() => {
-    if (!commentsQuery.data || !sessionCommentsQuery.data) return [];
+  const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
+    if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
     const ids = new Set(openComments.map((c) => c.id));
+    const paths = new Set(openComments.length > 0 ? [path] : []);
     for (const c of sessionCommentsQuery.data) {
-      if (c.status === "draft" && c.path !== path) ids.add(c.id);
+      if (c.status === "draft" && c.path !== path) {
+        ids.add(c.id);
+        paths.add(c.path);
+      }
     }
-    return [...ids];
+    return { ids: [...ids], fileCount: paths.size };
   }, [openComments, commentsQuery.data, sessionCommentsQuery.data, path]);
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
@@ -1919,6 +1923,7 @@ function FileViewerBody({
             }}
             canAddress={canEdit && sender !== null}
             addressCount={addressableCommentIds.length}
+            addressFileCount={addressableFileCount}
             onAddressAll={() => {
               if (!sender || addressableCommentIds.length === 0) return;
               sender.mutate({ comment_ids: addressableCommentIds });
