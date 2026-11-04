@@ -362,16 +362,25 @@ def test_resolve_pr_via_commit_skips_checkout_on_up_to_date_base(
     assert github_resource._resolve_pr_via_commit(str(repo)) is None
 
 
+@pytest.mark.parametrize(
+    ("lookup_remote", "mirror"),
+    [
+        pytest.param("origin", "mirror", id="origin-lookup"),
+        pytest.param("fork", "origin", id="tracking-remote-lookup"),
+    ],
+)
 def test_resolve_pr_via_commit_ignores_same_named_repo_on_another_host(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, monkeypatch: pytest.MonkeyPatch, lookup_remote: str, mirror: str
 ) -> None:
     """A same-named repo on another host is not the PR's base, so it can't hide the PR."""
-    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", lookup_remote, "git@github.com:acme-dev/repo.git"], repo)
     _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
-    _run(["git", "remote", "add", "mirror", "git@gitlab.com:acme/repo.git"], repo)
+    _run(["git", "remote", "add", mirror, "git@gitlab.com:acme/repo.git"], repo)
     _run(["git", "remote", "add", "mirror-fork", "git@gitlab.com:acme-dev/repo.git"], repo)
+    for branch in ("feature", "main"):
+        _run(["git", "config", f"branch.{branch}.remote", lookup_remote], repo)
     _run(["git", "update-ref", "refs/remotes/upstream/main", "main"], repo)
-    _run(["git", "update-ref", "refs/remotes/mirror/main", "feature"], repo)
+    _run(["git", "update-ref", f"refs/remotes/{mirror}/main", "feature"], repo)
     row = {
         "number": 270,
         "state": "open",
@@ -404,6 +413,30 @@ def test_resolve_pr_via_commit_keeps_open_pr_without_base_tracking_ref(
     _stub_gh(monkeypatch, {("api",): (0, json.dumps([row]), "")})
 
     assert github_resource._resolve_pr_via_commit(str(repo)) == (270, "acme/repo")
+
+
+def test_resolve_pr_via_commit_picks_later_open_pr_after_skipping_one(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row skipped because its base branch has the commit doesn't stop a later row matching."""
+    _run(["git", "remote", "add", "origin", "git@github.com:acme-dev/repo.git"], repo)
+    _run(["git", "remote", "add", "upstream", "git@github.com:acme/repo.git"], repo)
+    _run(["git", "update-ref", "refs/remotes/upstream/main", "feature"], repo)
+    rows = [
+        {
+            "number": 270,
+            "state": "open",
+            "base": {"ref": "main", "repo": {"full_name": "acme/repo"}},
+        },
+        {
+            "number": 271,
+            "state": "open",
+            "base": {"ref": "release", "repo": {"full_name": "acme/repo"}},
+        },
+    ]
+    _stub_gh(monkeypatch, {("api",): (0, json.dumps(rows), "")})
+
+    assert github_resource._resolve_pr_via_commit(str(repo)) == (271, "acme/repo")
 
 
 def test_resolve_pr_via_commit_none_without_repo(

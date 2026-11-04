@@ -665,6 +665,18 @@ def _remote_nwo(root: str, remote: str) -> str | None:
     return _owner_repo_from_url(url.strip())
 
 
+def _commit_lookup_repo(root: str) -> str | None:
+    """The repo the branch was pushed to — where its commit (and PR) live.
+
+    The branch's tracking remote (``branch.<name>.remote``), else ``origin``. One
+    repo suffices: ``commits/{sha}/pulls`` resolves the PR across the fork network
+    (it reports the PR's own base repo, whatever that is), and a commit that
+    wasn't pushed to this repo won't be in the base repo either — so querying more
+    repos for the same commit is redundant.
+    """
+    return _remote_nwo(root, _commit_lookup_remote(root))
+
+
 def _commit_lookup_remote(root: str) -> str:
     """The branch's tracking remote if it names a repo, else ``origin``."""
     rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
@@ -675,18 +687,6 @@ def _commit_lookup_remote(root: str) -> str:
         if rc == 0 and remote and remote != "." and _remote_nwo(root, remote):
             return remote
     return "origin"
-
-
-def _commit_lookup_repo(root: str) -> str | None:
-    """The repo the branch was pushed to — where its commit (and PR) live.
-
-    The repo of :func:`_commit_lookup_remote`. One repo suffices:
-    ``commits/{sha}/pulls`` resolves the PR across the fork network (it reports
-    the PR's own base repo, whatever that is), and a commit that wasn't pushed
-    to this repo won't be in the base repo either — so querying more repos for
-    the same commit is redundant.
-    """
-    return _remote_nwo(root, _commit_lookup_remote(root))
 
 
 def _remotes_by_repo(root: str, lookup_remote: str) -> dict[str, list[str]]:
