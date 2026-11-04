@@ -3512,8 +3512,18 @@ def register_events_routes(
         initializer = getattr(request.app.state, "runner_session_initializer", None)
         # Codex child turns run on a thread in the parent's app-server, not their own session.
         codex_child_turn = body.type == "message" and _codex_side_chat_thread_id(conv) is not None
+        from omnigent.server.child_session_recovery import (
+            clear_skipped_resume,
+            skipped_resume_runner,
+        )
+
+        # A wake-only retry left this runner's handshake and child restoration to this input.
+        woken_without_resume = (
+            conv.runner_id is not None and skipped_resume_runner(session_id) == conv.runner_id
+        )
         if not codex_child_turn and (
             _runner_needs_session_init
+            or woken_without_resume
             or (
                 conv.runner_id is not None
                 and _is_native_terminal_session(conv)
@@ -3533,6 +3543,8 @@ def register_events_routes(
                 suppress_recovery_turn=True,
                 trigger="web_message",
             )
+            if woken_without_resume:
+                clear_skipped_resume(session_id)
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
