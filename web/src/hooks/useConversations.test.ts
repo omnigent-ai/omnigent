@@ -1135,6 +1135,14 @@ describe("recently-created keep-alive", () => {
 });
 
 describe("useRenameConversation cache patching", () => {
+  // A Name window continues from an opaque position token, not a row id.
+  const nameKey = ["conversations", "", false, null, "mine", "title"] as const;
+  const nameToken = "title.WyIwb2xkIG5hbWUiLCJjb252X3giXQ";
+  function nameWindow(): ConversationsInfiniteData {
+    const loaded = infinitePage([conversation({ id: "conv_x" })]);
+    return { ...loaded, pages: [{ ...loaded.pages[0], last_id: nameToken }] };
+  }
+
   function seedAndRename() {
     // The PATCH response carries the server-confirmed new title and
     // bumped updated_at.
@@ -1161,6 +1169,7 @@ describe("useRenameConversation cache patching", () => {
       ["conversations", "", true],
       infinitePage([conversation({ id: "conv_x" })]),
     );
+    queryClient.setQueryData(nameKey, nameWindow());
     queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     queryClient.setQueryData(["session", "conv_x"], {
       id: "conv_x",
@@ -1187,12 +1196,8 @@ describe("useRenameConversation cache patching", () => {
     rendered.result.current.mutate({ id: "conv_x", title: "New name" });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
-    for (const includeArchived of [false, true]) {
-      const data = queryClient.getQueryData<ConversationsInfiniteData>([
-        "conversations",
-        "",
-        includeArchived,
-      ]);
+    for (const key of [["conversations", "", false], ["conversations", "", true], nameKey]) {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>(key);
       const row = data!.pages[0].data.find((c) => c.id === "conv_x")!;
       // Title AND updated_at must both land: the title is what the user
       // sees; updated_at drives the sidebar's client-side sort and the
@@ -1200,6 +1205,9 @@ describe("useRenameConversation cache patching", () => {
       expect(row.title).toBe("New name");
       expect(row.updated_at).toBe(200);
     }
+    expect(queryClient.getQueryData<ConversationsInfiniteData>(nameKey)!.pages[0].last_id).toBe(
+      nameToken,
+    );
     // Unrelated rows must survive the patch untouched.
     const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(base!.pages[0].data.find((c) => c.id === "conv_other")!.title).toBe("Old name");
@@ -1307,6 +1315,7 @@ describe("useRenameConversation cache patching", () => {
       ["conversations", "", false],
       infinitePage([conversation({ id: "conv_x" })]),
     );
+    queryClient.setQueryData(nameKey, nameWindow());
     queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
@@ -1319,6 +1328,9 @@ describe("useRenameConversation cache patching", () => {
     // cache — the row reverts to what it showed before.
     const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
+    const name = queryClient.getQueryData<ConversationsInfiniteData>(nameKey)!.pages[0];
+    expect(name.data[0].title).toBe("Old name");
+    expect(name.last_id).toBe(nameToken);
     const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
     expect(backfill!.title).toBe("Old name");
   });
