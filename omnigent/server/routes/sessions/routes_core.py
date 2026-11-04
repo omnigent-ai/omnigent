@@ -4648,16 +4648,16 @@ def register_core_routes(
         # Held, with no await since the checks above, until viewers are
         # redirected: messages arriving meanwhile are refused, not run here.
         with _mark_session_moving(source.id):
+            from omnigent.server.routes.sessions.routes_events import (
+                _raise_if_runner_on_another_replica,
+            )
+
             runner_online = (
                 source.runner_id is not None
                 and runner_router is not None
                 and runner_router.runner_is_online(source.runner_id)
             )
             if not runner_online and source.runner_id is not None:
-                from omnigent.server.routes.sessions.routes_events import (
-                    _raise_if_runner_on_another_replica,
-                )
-
                 # A runner live on another replica is not offline: re-address there
                 # rather than continue without it.
                 await _raise_if_runner_on_another_replica(
@@ -4718,11 +4718,20 @@ def register_core_routes(
                     except Exception:
                         if runner_router.runner_is_online(source.runner_id):
                             raise
-                        # The runner left after the check: a host-bound fork
-                        # relaunches on its host, as with an offline runner.
-                        if not host_bound:
-                            raise runner_offline from None
                         runner_bound = False
+                    else:
+                        # The bind tolerates a runner gone before its client
+                        # lookup, so confirm the placement it reports.
+                        runner_bound = runner_router.runner_is_online(source.runner_id)
+                    if not runner_bound:
+                        # The runner left after the check. One now on another
+                        # replica is re-addressed; a host-bound fork otherwise
+                        # relaunches on its host, as with an offline runner.
+                        await _raise_if_runner_on_another_replica(
+                            source, request.app.state, conversation_store
+                        )
+                        if not host_bound:
+                            raise runner_offline
                 if runner_bound and host_bound:
                     # As native /clear does: the fork now holds the runner, so
                     # stopping or archiving the source must not stop it. The

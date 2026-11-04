@@ -734,6 +734,7 @@ async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_repl
 
 
 @pytest.mark.parametrize("host", [True, False], ids=["host-bound", "runner-only"])
+@pytest.mark.parametrize("left", ["before_validation", "after_validation", "to_another_replica"])
 async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -741,32 +742,55 @@ async def test_claude_sdk_clear_survives_the_runner_leaving_before_it_is_bound(
     live_runner: LiveRunner,
     monkeypatch: pytest.MonkeyPatch,
     host: bool,
+    left: str,
 ) -> None:
     """A runner that disconnects after the check leaves no half-made session.
 
-    A host-bound session still continues on the host alone; otherwise the new
-    session is removed, so a retry does not leave a second copy.
+    Whether it leaves before the new session's runner is validated or just
+    after (when binding still reports success), a host-bound session continues
+    on the host alone; otherwise the new session is removed, so a retry does
+    not leave a second copy. A runner that reconnected to another replica is
+    re-addressed there instead.
     """
     resolve_harness_as(monkeypatch, "claude-sdk")
     store = SqlAlchemyConversationStore(db_uri)
     source_id = await create_placed_session(client, store, host=host)
-    live_runner.on_clear = lambda: app.state.tunnel_registry.deregister(_RUNNER_ID)
+    if left == "after_validation":
+        resolve_runner = sessions_module._get_runner_client
+
+        async def lose_runner_at_lookup(session_id: str, *args: Any, **kwargs: Any) -> Any:
+            if session_id != source_id:
+                app.state.tunnel_registry.deregister(_RUNNER_ID)
+                return None
+            return await resolve_runner(session_id, *args, **kwargs)
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", lose_runner_at_lookup)
+    else:
+        live_runner.on_clear = lambda: app.state.tunnel_registry.deregister(_RUNNER_ID)
+    if left == "to_another_replica":
+        host_store = HostStore(db_uri)
+        host_store.upsert_on_connect(host_id=_HOST_ID, name="laptop", user_id="local")
+        monkeypatch.setattr(app.state, "host_store", host_store)
     before = len((await client.get("/v1/sessions")).json()["data"])
 
     resp = await client.post(
         f"/v1/sessions/{source_id}/events", json={"type": "clear", "data": {}}
     )
 
-    if host:
+    if host and left == "to_another_replica":
+        assert resp.status_code == 400, resp.text
+        assert "wrong_replica" in resp.text
+    elif host:
         assert resp.status_code == 202, resp.text
         new_id = resp.json()["session_id"]
         fork = store.get_conversation(new_id)
         assert fork is not None
-        assert (fork.runner_id, fork.host_id, fork.workspace) == (None, _HOST_ID, "/work/repo")
+        assert (fork.host_id, fork.workspace) == (_HOST_ID, "/work/repo")
         assert live_runner.superseded == [(source_id, new_id, "clear")]
         return
-    assert resp.status_code == 503, resp.text
-    assert "runner is offline" in resp.text
+    else:
+        assert resp.status_code == 503, resp.text
+        assert "runner is offline" in resp.text
     assert len((await client.get("/v1/sessions")).json()["data"]) == before
     assert live_runner.superseded == []
 
