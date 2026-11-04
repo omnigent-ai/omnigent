@@ -344,7 +344,7 @@ class PiProviderConfig:
             "start a new Pi session."
         )
 
-    def to_models_config(self) -> _PiModelsConfig:
+    def to_models_config(self, *, client_surface: str | None = None) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
         models: list[_PiModelEntry] = list(self.extra_models)
         additional: dict[str, _PiProviderPayload] = dict(self.additional_providers)
@@ -399,7 +399,10 @@ class PiProviderConfig:
             if is_databricks_ai_gateway_url(payload["baseUrl"]):
                 # Copy rather than mutate: additional payloads are shared across renders.
                 headers = with_gateway_attribution(
-                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                    payload.get("headers"),
+                    PI_AGENT,
+                    payload["baseUrl"],
+                    client_surface=client_surface,
                 )
                 providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
@@ -1966,6 +1969,7 @@ def pi_native_provider_launch(
     *,
     selection: str | None = None,
     global_agent_dir: Path | None = None,
+    client_surface: str | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1983,7 +1987,7 @@ def pi_native_provider_launch(
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
-    rendered = provider.to_models_config()
+    rendered = provider.to_models_config(client_surface=client_surface)
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.

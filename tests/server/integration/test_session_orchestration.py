@@ -1309,10 +1309,11 @@ async def test_project_boundary_scopes_agent_tools_when_canvas_is_enabled(
     assert response.status_code == 200, response.text
 
 
-@pytest.mark.parametrize("filing", ["project_id", "legacy_label", "unfiled"])
-async def test_independent_session_joins_creator_project(
+@pytest.mark.parametrize("filing", ["project_id", "legacy_label", "unfiled", "child"])
+async def test_canvas_keeps_independent_sessions_in_the_creator_project(
     auth_client, auth_app, peers, db_uri, monkeypatch, filing
 ):
+    """Canvas extends creator-project filing to children and legacy labels, and refuses others."""
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
@@ -1337,24 +1338,43 @@ async def test_independent_session_joins_creator_project(
     store.set_host_id(source["id"], host_id, workspace="/worker")
     project_a = await _create_project(auth_client, "Project A")
     project_other = await _create_project(auth_client, "Project Other")
-    if filing == "project_id":
+    if filing in ("project_id", "child"):
         store.set_conversation_project(source["id"], project_a)
     if filing == "legacy_label":
         store.set_labels(source["id"], {PROJECT_LABEL_KEY: "Legacy team"})
+    creator = source
+    if filing == "child":
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+        )
+        assert response.status_code == 201, response.text
+        creator = response.json()
+        store.set_runner_id(creator["id"], store.get_conversation(source["id"]).runner_id)
+        store.set_host_id(creator["id"], host_id, workspace="/worker")
 
-    response = await auth_client.post(
-        "/v1/sessions/orchestrated",
-        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
-        json={"agent_id": source["agent_id"], "project_id": project_other},
-    )
+    async def create(**fields):
+        return await auth_client.post(
+            "/v1/sessions/orchestrated",
+            headers={ORCHESTRATION_SOURCE_HEADER: creator["id"]},
+            json={"agent_id": source["agent_id"], **fields},
+        )
 
-    assert response.status_code == 201, response.text
-    created = store.get_conversation(response.json()["id"])
+    joined = await create()
+    assert joined.status_code == 201, joined.text
+    created = store.get_conversation(joined.json()["id"])
     assert created.workspace == "/worker"
-    assert created.project_id == (project_a if filing == "project_id" else None)
+    assert created.project_id == (project_a if filing in ("project_id", "child") else None)
     assert created.labels.get(PROJECT_LABEL_KEY) == (
         "Legacy team" if filing == "legacy_label" else None
     )
+    for crossing in (
+        {"project_id": project_other},
+        {"labels": {PROJECT_LABEL_KEY: "Another team"}},
+    ):
+        refused = await create(**crossing)
+        assert refused.status_code == 403, refused.text
+        assert "outside this session's project" in refused.text
 
 
 async def test_same_host_worker_can_start_in_its_own_worktree(

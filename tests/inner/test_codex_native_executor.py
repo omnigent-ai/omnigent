@@ -343,6 +343,86 @@ def test_compact_steer_timeout_keeps_input_undelivered_and_bridge_turn(
     assert state is not None and state.active_turn_id == "turn_compact"
 
 
+@pytest.mark.parametrize(
+    "changed_field", ["session_id", "thread_id", "socket_path", "codex_home", "missing"]
+)
+@pytest.mark.parametrize(
+    ("delivery", "change_stage"),
+    [
+        ("start", "connect"),
+        ("steer", "connect"),
+        ("live-steer", "connect"),
+        ("start", "thread/settings/update"),
+        ("start", "model/list"),
+    ],
+)
+async def test_delivery_does_not_submit_after_bridge_binding_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+    delivery: str,
+    change_stage: str,
+) -> None:
+    """Connection and settings awaits can outlive the owned session binding."""
+    _seed_bridge(tmp_path, active_turn_id=None if delivery == "start" else "turn_existing")
+    original = read_bridge_state(tmp_path)
+    assert original is not None
+    replacement = (
+        None
+        if changed_field == "missing"
+        else replace(original, **{changed_field: "replacement"}, active_turn_id="turn_new")
+    )
+
+    def change_binding() -> None:
+        if replacement is None:
+            (tmp_path / "state.json").unlink()
+        else:
+            write_bridge_state(tmp_path, replacement)
+
+    class RotatingClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+
+        async def connect(self) -> None:
+            await super().connect()
+            if change_stage == "connect":
+                change_binding()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            response = await super().request(method, params)
+            if method == change_stage:
+                change_binding()
+            return response
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", RotatingClient
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if delivery == "live-steer":
+        assert await executor.enqueue_session_message("main", "keep this input") is False
+    else:
+        config = (
+            ExecutorConfig(
+                model="example-model",
+                extra={"reasoning_effort": "low"} if change_stage == "model/list" else {},
+            )
+            if change_stage != "connect"
+            else None
+        )
+        [failure] = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "keep this input"}], [], "", config
+            )
+        ]
+        assert isinstance(failure, ExecutorError)
+        assert failure.undelivered is True
+        assert failure.preserve_session is True
+        assert "changed" in failure.message
+    assert all(method not in {"turn/start", "turn/steer"} for method, _ in RotatingClient.requests)
+    assert read_bridge_state(tmp_path) == replacement
+
+
 @pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "missing"])
 def test_compact_steer_never_resends_after_bridge_owner_change(
     draining_client, changed_field: str, tmp_path: Path
@@ -1203,8 +1283,14 @@ def test_shell_input_wait_for_its_turn_is_bounded(
 
 
 @pytest.mark.parametrize("previous_turn", [None, "turn_finishing"])
+@pytest.mark.parametrize(
+    "replacement_field", [None, "codex_home", "socket_path", "thread_id", "session_id"]
+)
 def test_unobserved_shell_blocks_followup_after_executor_restart(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, previous_turn: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    previous_turn: str | None,
+    replacement_field: str | None,
 ) -> None:
     """An old turn finishing cannot erase a shell RPC awaiting its first item."""
     _FakeCodexNativeClient.requests = []
@@ -1253,6 +1339,27 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
         # A passive idle snapshot can precede queued shell startup; the fence cannot.
         idle_bridge = read_bridge_state(tmp_path)
         assert idle_bridge is not None and idle_bridge.active_turn_id is None
+        if replacement_field is not None:
+            replacement = replace(
+                idle_bridge,
+                **{
+                    replacement_field: str(tmp_path / f"replacement-{replacement_field}"),
+                    "active_turn_id": "replacement_turn",
+                    "pending_shell_command_id": None,
+                    "active_shell_turn_id": None,
+                },
+            )
+            write_bridge_state(tmp_path, replacement)
+            replacement_snapshot = read_bridge_state(tmp_path)
+            assert replacement_snapshot is not None
+            shell_started.set()
+            [error] = await asyncio.wait_for(pending, 2)
+            assert isinstance(error, ExecutorError)
+            assert error.undelivered is True
+            assert error.preserve_session is True
+            assert "session changed" in error.message
+            assert read_bridge_state(tmp_path) == replacement_snapshot
+            return
         update_active_turn_id(tmp_path, "turn_shell")
         shell_started.set()
         await asyncio.wait_for(shell_observed.wait(), 2)
@@ -1271,8 +1378,7 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
         method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
     ] == [
         "thread/shellCommand",
-        "turn/start",
-    ]
+    ] + (["turn/start"] if replacement_field is None else [])
 
 
 @pytest.mark.parametrize("ambiguous", [False, True], ids=["rejected", "connection-lost"])
@@ -3403,7 +3509,9 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("submission", ["turn/start", "turn/steer", "live-steer", "before-send"])
+@pytest.mark.parametrize(
+    "submission", ["turn/start", "turn/steer", "live-steer", "before-send", "binding-change"]
+)
 async def test_transport_failure_keeps_native_work_running(
     tmp_path: Path, submission: str
 ) -> None:
@@ -3412,7 +3520,7 @@ async def test_transport_failure_keeps_native_work_running(
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
-    method = "turn/start" if submission == "turn/start" else "turn/steer"
+    method = "turn/start" if submission in {"turn/start", "binding-change"} else "turn/steer"
     requests: list[str] = []
     native_running = submission == "before-send"
 
@@ -3427,6 +3535,19 @@ async def test_transport_failure_keeps_native_work_running(
             if submission == "before-send" and requests == ["initialize"]:
                 websocket.transport.abort()
                 return
+            if submission == "binding-change" and requests == ["initialize"]:
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                write_bridge_state(
+                    tmp_path,
+                    replace(
+                        state,
+                        session_id="conv_replacement",
+                        thread_id="thread_replacement",
+                        active_turn_id="turn_accepted",
+                    ),
+                )
+                native_running = True
             if rpc_method == method:
                 native_running = True
                 state = read_bridge_state(tmp_path)
@@ -3476,10 +3597,15 @@ async def test_transport_failure_keeps_native_work_running(
             if submission == "before-send":
                 assert str(caught.value) == CODEX_APP_SERVER_STOPPED.message
                 assert caught.value.undelivered is True
+            elif submission == "binding-change":
+                assert "changed" in str(caught.value)
+                assert caught.value.undelivered is True
             else:
                 assert "may already be running" in str(caught.value)
 
-        assert requests.count(method) == (0 if submission == "before-send" else 1)
+        assert requests.count(method) == (
+            0 if submission in {"before-send", "binding-change"} else 1
+        )
         assert "turn/interrupt" not in requests
         assert native_running
         if submission != "live-steer":

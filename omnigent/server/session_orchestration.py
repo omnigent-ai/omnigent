@@ -221,20 +221,27 @@ def agent_task_project_id(request: Request, conversations: ConversationStore) ->
     return _project_root(source, conversations).project_id if source is not None else None
 
 
-def inherited_project_fields(
-    request: Request,
-    conversations: ConversationStore,
-    source: Conversation,
-) -> dict[str, Any]:
-    """Return create fields that file an independent session in its creator's project."""
+def creator_project_id(
+    request: Request, conversations: ConversationStore, source: Conversation, body: Any
+) -> str | None:
+    """Return the project an agent's independent session joins.
+
+    Canvas teams keep agents inside their project: a child or side chat files its
+    workers under its top-level session's project, a legacy-label project carries
+    over, and a request naming another project is refused.
+    """
     if not request.app.state.feature_flags.enabled(Feature.CANVAS):
-        return {}
+        return source.project_id
     root = _project_root(source, conversations)
     legacy_project = root.labels.get(PROJECT_LABEL_KEY) if root.project_id is None else None
-    return {
-        "project_id": root.project_id,
-        **({"labels": {PROJECT_LABEL_KEY: legacy_project}} if legacy_project else {}),
-    }
+    named_other_project = (
+        "project_id" in body.model_fields_set and body.project_id != root.project_id
+    ) or body.labels.get(PROJECT_LABEL_KEY, legacy_project) != legacy_project
+    if named_other_project:
+        raise OmnigentError(OUTSIDE_PROJECT_MESSAGE, code=ErrorCode.FORBIDDEN)
+    if legacy_project is not None:
+        body.labels = {**body.labels, PROJECT_LABEL_KEY: legacy_project}
+    return root.project_id
 
 
 def _shared_with_editors(session_id: str, user_id: str, permissions: PermissionStore) -> bool:

@@ -247,19 +247,23 @@ async def test_list_gets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_patches_by_id() -> None:
+@pytest.mark.parametrize(
+    "placement",
+    [
+        {"workspace": "/repo2", "host_id": "fedcba9876543210fedcba9876543210"},
+        {"execution_target": "managed_sandbox", "workspace": "https://github.com/example/runtime"},
+        {"execution_target": "managed_sandbox", "workspace": None},
+    ],
+)
+async def test_update_patches_by_id(placement: dict[str, str | None]) -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "state": "paused"}))
+    arguments = {**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "state": "paused", **placement}
+    jsonschema.validate(
+        arguments, SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
+    )
     await execute_tool(
         tool_name="sys_scheduled_task_update",
-        arguments=json.dumps(
-            {
-                **_REVIEW_FIELDS,
-                "scheduled_task_id": _TASK_ID,
-                "state": "paused",
-                "workspace": "/repo2",
-                "host_id": "fedcba9876543210fedcba9876543210",
-            }
-        ),
+        arguments=json.dumps(arguments),
         server_client=client,
         conversation_id="conv_source",
     )
@@ -268,8 +272,7 @@ async def test_update_patches_by_id() -> None:
     assert body == {
         **_REVIEW_FIELDS,
         "state": "paused",
-        "workspace": "/repo2",
-        "host_id": "fedcba9876543210fedcba9876543210",
+        **placement,
     }
     assert client.headers[-1] == {ORCHESTRATION_SOURCE_HEADER: "conv_source"}
 

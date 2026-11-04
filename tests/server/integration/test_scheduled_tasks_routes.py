@@ -7,6 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -233,7 +234,7 @@ async def test_schedule_validation_keeps_requests_responsive(
             return 0
         return 1
 
-    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", recurrence_clock)
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", recurrence_clock)
     pending = asyncio.create_task(auth_client.request(method, url, json=body, headers=_headers()))
     try:
         assert await asyncio.to_thread(entered.wait, 2)
@@ -276,9 +277,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
-    assert "base_branch" not in created
-    # execution_target is now surfaced (defaults to connected_host); base_branch
-    # stays an internal legacy column.
+    assert created["base_branch"] is None
     assert created["execution_target"] == "connected_host"
     task_id = created["id"]
 
@@ -388,7 +387,9 @@ async def test_automations_gate_is_checked_per_request(
     async with _serve(app, mock_llm, tmp_path) as client:
 
         async def enabled_in_info() -> bool:
-            return (await client.get("/v1/info", headers=_headers())).json()["automations_enabled"]
+            info = (await client.get("/v1/info", headers=_headers())).json()
+            assert info["scheduled_task_inbox"] == info["automations_enabled"]
+            return info["automations_enabled"]
 
         created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
         assert created.status_code == 200, created.text
@@ -400,6 +401,7 @@ async def test_automations_gate_is_checked_per_request(
             gate["state"] = state
             for method, url in (
                 ("GET", "/v1/scheduled-tasks"),
+                ("GET", "/v1/scheduled-tasks/inbox"),
                 ("POST", "/v1/scheduled-tasks"),
                 ("GET", task_url),
                 ("PATCH", task_url),
@@ -536,7 +538,9 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
     auth_app.state.sandbox_config = _sandbox_deployment()
     try:
         created = (
-            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+            await auth_client.post(
+                "/v1/scheduled-tasks", json=_create_body(base_branch="HEAD"), headers=_headers()
+            )
         ).json()
         tid = created["id"]
         assert created["host_id"] is not None and created["workspace"] is not None
@@ -550,6 +554,7 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
         b = to_managed.json()
         assert b["execution_target"] == "managed_sandbox"
         assert b["host_id"] is None and b["workspace"] is None
+        assert b["base_branch"] is None
 
         back = await auth_client.patch(
             f"/v1/scheduled-tasks/{tid}",
@@ -558,6 +563,126 @@ async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
         )
         assert back.status_code == 200, back.text
         assert back.json()["execution_target"] == "connected_host"
+    finally:
+        auth_app.state.sandbox_config = None
+
+
+@pytest.mark.parametrize("workspace", ["https://github.com/example/runtime", "/repo", "bad-url"])
+async def test_sandbox_repository_create_edit_and_target_switch(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, workspace: str
+) -> None:
+    _make_user(db_uri)
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    try:
+        response = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(
+                execution_target="managed_sandbox", host_id=None, workspace=workspace
+            ),
+            headers=_headers(),
+        )
+        if not workspace.startswith("https://"):
+            assert response.status_code == 400, response.text
+            return
+        assert response.status_code == 200, response.text
+        task = response.json()
+        assert task["workspace"] == workspace
+        assert task["host_id"] is None
+        path = f"/v1/scheduled-tasks/{task['id']}"
+        renamed = await auth_client.patch(path, json={"name": "Renamed"}, headers=_headers())
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["workspace"] == workspace
+        changed = await auth_client.patch(
+            path, json={"workspace": "https://github.com/example/universe"}, headers=_headers()
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["workspace"] == "https://github.com/example/universe"
+        without_directory = await auth_client.patch(
+            path,
+            json={
+                "execution_target": "connected_host",
+                "host_id": _HOST_ID,
+                "base_branch": "HEAD",
+            },
+            headers=_headers(),
+        )
+        assert without_directory.status_code == 400, without_directory.text
+        assert "random worktree requires" in without_directory.text
+        cleared = await auth_client.patch(path, json={"workspace": None}, headers=_headers())
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["workspace"] is None
+        invalid = await auth_client.patch(path, json={"workspace": "/repo"}, headers=_headers())
+        assert invalid.status_code == 400, invalid.text
+        back = await auth_client.patch(
+            path,
+            json={"execution_target": "connected_host", "host_id": _HOST_ID},
+            headers=_headers(),
+        )
+        assert back.status_code == 200, back.text
+        assert back.json()["workspace"] is None
+        invalid_clear = await auth_client.patch(path, json={"workspace": None}, headers=_headers())
+        assert invalid_clear.status_code == 422, invalid_clear.text
+        assert invalid_clear.json() == {
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body"],
+                    "msg": "Value error, workspace cannot be null",
+                    "input": {"workspace": None},
+                    "ctx": {"error": {}},
+                }
+            ]
+        }
+        sandbox = await auth_client.patch(
+            path,
+            json={"execution_target": "managed_sandbox", "workspace": workspace},
+            headers=_headers(),
+        )
+        assert sandbox.status_code == 200, sandbox.text
+        assert sandbox.json()["workspace"] == workspace
+        assert sandbox.json()["host_id"] is None
+    finally:
+        auth_app.state.sandbox_config = None
+
+
+@pytest.mark.parametrize("edit", ["rename", "agent", "clear", "invalid", "repository"])
+async def test_edit_legacy_sandbox_workspace(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
+) -> None:
+    _make_user(db_uri)
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    try:
+        response = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(execution_target="managed_sandbox", host_id=None, workspace=None),
+            headers=_headers(),
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["id"]
+        store = SqlAlchemyScheduledTaskStore(db_uri)
+        session_id = uuid.uuid4().hex
+        store.update(task_id, workspace="/home/me", session_mode="continue", session_id=session_id)
+        changes = {
+            "rename": {"name": "Renamed"},
+            "agent": {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
+            "clear": {"workspace": None},
+            "invalid": {"workspace": "/another/directory"},
+            "repository": {"workspace": "https://github.com/example/runtime"},
+        }
+        updated = await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json=changes[edit], headers=_headers()
+        )
+        if edit == "invalid":
+            assert updated.status_code == 400, updated.text
+            assert store.get(task_id).workspace == "/home/me"
+        else:
+            assert updated.status_code == 200, updated.text
+            expected_workspace = changes[edit].get("workspace")
+            assert updated.json()["workspace"] == expected_workspace
+            assert store.get(task_id).workspace == expected_workspace
+            expected_session = None if edit in {"agent", "repository"} else session_id
+            assert updated.json()["session_id"] == expected_session
+            assert store.get(task_id).session_id == expected_session
     finally:
         auth_app.state.sandbox_config = None
 
@@ -1687,6 +1812,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
     conv_store.set_session_live_status(conv.id, "idle")
+    conv_store.set_session_usage(conv.id, {"total_cost_usd": 1.234})
     _set_read_state("alice@example.com", conv.id, conv.updated_at - 1, True)
     # A known session the viewer saw but never flagged, waiting on its harness.
     waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
@@ -1732,6 +1858,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert succ["conversation_status"] == "idle"
     assert succ["viewer_last_seen"] == conv.updated_at - 1
     assert succ["viewer_unread"] is True
+    assert succ["session_cost_usd"] == 1.234
 
     # Status reads as the sessions list reports it ("waiting" is "running"), and
     # an unflagged session is explicitly not unread rather than unknown.
@@ -1739,6 +1866,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert running["conversation_status"] == "running"
     assert running["viewer_last_seen"] == 1_700_000_100
     assert running["viewer_unread"] is False
+    assert running["session_cost_usd"] is None
 
     # The skipped run (no conversation_id) gets null for all three fields.
     skip = runs[skipped_id]
@@ -1746,6 +1874,23 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["conversation_status"] is None
     assert skip["viewer_last_seen"] is None
     assert skip["viewer_unread"] is None
+    assert skip["session_cost_usd"] is None
+
+    # Continuing the same session reports its current total on every run.
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=2500,
+        status="succeeded",
+        conversation_id=conv.id,
+    )
+    conv_store.set_session_usage(conv.id, {"total_cost_usd": 2.5})
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200
+    shared = [row for row in resp.json()["runs"] if row["conversation_id"] == conv.id]
+    assert len(shared) == 2
+    assert all(row["session_cost_usd"] == 2.5 for row in shared)
 
 
 @pytest.mark.usefixtures("clean_session_read_state")
@@ -2202,8 +2347,11 @@ async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> N
     assert row.status == "succeeded"
 
 
+@pytest.mark.parametrize(
+    "patch", [{"host_id": "4b653f6031f35d168cc0b37caa1306d1"}, {"base_branch": "HEAD"}]
+)
 async def test_patch_pinning_host_on_managed_task_is_rejected(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, patch: dict[str, str]
 ) -> None:
     """Pinning host_id on an already-managed task is rejected, not silently dropped."""
     _make_user(db_uri)
@@ -2222,7 +2370,7 @@ async def test_patch_pinning_host_on_managed_task_is_rejected(
         # the handler must reject against the effective (managed) target.
         resp = await auth_client.patch(
             f"/v1/scheduled-tasks/{tid}",
-            json={"host_id": "4b653f6031f35d168cc0b37caa1306d1"},
+            json=patch,
             headers=_headers(),
         )
         assert resp.status_code == 400, resp.text
@@ -2915,3 +3063,259 @@ async def test_project_boundary_scopes_an_agents_automations(
     assert (await auth_client.delete(foreign_url, headers=as_lead)).status_code == hidden
     survived = await auth_client.get(foreign_url, headers=_headers())
     assert survived.status_code == (200 if canvas_enabled else 404)
+
+
+async def test_automation_inbox_owner_scope_and_cursor(auth_client, db_uri):
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    run_id = uuid.uuid4().hex
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task_id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+        error="private launch details",
+    )
+    response = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers())
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "data": [
+            {
+                "task_id": task_id,
+                "task_name": created.json()["name"],
+                "run_id": run_id,
+                "scheduled_at": 100,
+                "finished_at": 101,
+                "error_code": "host_offline",
+            }
+        ],
+        "next_cursor": None,
+    }
+    second = await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    second_task_id = second.json()["id"]
+    store.create_run(
+        run_id=uuid.uuid4().hex,
+        scheduled_task_id=second_task_id,
+        status="failed",
+        scheduled_at=200,
+    )
+    first_page = (
+        await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers(), params={"limit": 1})
+    ).json()
+    assert len(first_page["data"]) == 1 and first_page["next_cursor"] is not None
+    second_page = (
+        await auth_client.get(
+            "/v1/scheduled-tasks/inbox",
+            headers=_headers(),
+            params={"limit": 1, "after": first_page["next_cursor"]},
+        )
+    ).json()
+    assert len(second_page["data"]) == 1 and second_page["next_cursor"] is None
+    assert {item["task_id"] for item in first_page["data"] + second_page["data"]} == {
+        task_id,
+        second_task_id,
+    }
+    other = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers("bob@example.com"))
+    assert other.status_code == 200 and other.json()["data"] == []
+    for params in ({"limit": 0}, {"limit": 101}, {"after": "bad"}, {"after": "-1:" + task_id}):
+        invalid = await auth_client.get(
+            "/v1/scheduled-tasks/inbox", headers=_headers(), params=params
+        )
+        assert invalid.status_code == 422
+
+
+async def test_automation_inbox_does_not_duplicate_a_deleted_session(auth_client, db_uri):
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    session_id = _owned_session(db_uri)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.create_run(
+        run_id=uuid.uuid4().hex,
+        scheduled_task_id=created.json()["id"],
+        status="failed",
+        scheduled_at=100,
+        conversation_id=session_id,
+        error_code="launch_failed",
+    )
+    for delete_session in (False, True):
+        if delete_session:
+            assert await SqlAlchemyConversationStore(db_uri).delete_conversation(session_id)
+        response = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers())
+        assert response.status_code == 200 and response.json()["data"] == []
+
+
+async def test_random_worktree_can_be_enabled_preserved_and_disabled(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(base_branch="HEAD", session_mode="continue"),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()
+    assert task["base_branch"] == "HEAD"
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    session_id = _owned_session(db_uri)
+    store.update(task["id"], session_id=session_id)
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    for patch, expected in [
+        ({"name": "renamed"}, "HEAD"),
+        ({"base_branch": None}, None),
+        ({"base_branch": "HEAD"}, "HEAD"),
+    ]:
+        store.update(task["id"], session_id=session_id)
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == 200, response.text
+        assert response.json()["base_branch"] == expected
+        if "base_branch" in patch:
+            assert response.json()["session_id"] is None
+        else:
+            assert response.json()["session_id"] == session_id
+        stored = SqlAlchemyScheduledTaskStore(db_uri).get(task["id"])
+        assert stored is not None and stored.base_branch == expected
+
+
+@pytest.mark.parametrize("missing", ["host_id", "workspace"])
+async def test_random_worktree_requires_pinned_repository(
+    auth_client: httpx.AsyncClient, missing: str
+) -> None:
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(base_branch="HEAD", **{missing: None}),
+        headers=_headers(),
+    )
+    assert response.status_code == 422, response.text
+    assert "random worktree requires" in response.text
+
+
+@pytest.mark.parametrize(
+    "execution_target,session_mode,minutes,status",
+    [
+        ("connected_host", "new", 10, 200),
+        ("connected_host", "continue", 10, 200),
+        ("managed_sandbox", "continue", 10, 200),
+        ("managed_sandbox", "new", 10, 400),
+        ("managed_sandbox", "new", 60, 200),
+    ],
+)
+async def test_create_interval_policy(
+    auth_client, auth_app, execution_target, session_mode, minutes, status
+):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            session_mode=session_mode,
+            execution_target=execution_target,
+            host_id=None,
+            workspace=None,
+            rrule=f"FREQ=MINUTELY;INTERVAL={minutes}",
+        ),
+        headers=_headers(),
+    )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["session_mode"] == session_mode
+        assert response.json()["execution_target"] == execution_target
+        assert response.json()["session_id"] is None
+
+
+async def test_update_validates_effective_schedule_and_session_mode(auth_client, auth_app):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(execution_target="managed_sandbox", host_id=None, workspace=None),
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    for patch, expected in [
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10", "session_mode": "continue"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=15"}, 200),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=9"}, 400),
+        ({"session_mode": "new"}, 400),
+        ({"name": "Renamed"}, 200),
+        ({"execution_target": "connected_host", "session_mode": "new"}, 200),
+        ({"execution_target": "managed_sandbox"}, 400),
+        ({"execution_target": "managed_sandbox", "session_mode": "continue"}, 200),
+    ]:
+        response = await auth_client.patch(url, json=patch, headers=_headers())
+        assert response.status_code == expected, response.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["session_mode"], saved["rrule"]) == ("continue", "FREQ=MINUTELY;INTERVAL=15")
+    response = await auth_client.patch(
+        url, json={"session_mode": "new", "rrule": "FREQ=HOURLY"}, headers=_headers()
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["session_mode"] == "new"
+
+
+@pytest.mark.parametrize("policy_field", ["session_mode", "execution_target"])
+@pytest.mark.parametrize("recurrence_first", [False, True])
+async def test_concurrent_schedule_edits_reject_stale_validation(
+    auth_client, auth_app, monkeypatch, policy_field, recurrence_first
+):
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    initial = _create_body(
+        execution_target="managed_sandbox" if policy_field == "session_mode" else "connected_host",
+        session_mode="continue" if policy_field == "session_mode" else "new",
+        host_id=None,
+        workspace=None,
+    )
+    response = await auth_client.post("/v1/scheduled-tasks", json=initial, headers=_headers())
+    assert response.status_code == 200, response.text
+    url = f"/v1/scheduled-tasks/{response.json()['id']}"
+    recurrence_patch = {"rrule": "FREQ=MINUTELY;INTERVAL=10"}
+    policy_patch = {policy_field: "new" if policy_field == "session_mode" else "managed_sandbox"}
+    validate = scheduled_tasks_routes._validate_rrule_or_400
+    validated = asyncio.Barrier(2)
+    first_saved = asyncio.Event()
+
+    async def validate_together(rrule, session_mode, execution_target):
+        await validate(rrule, session_mode, execution_target)
+        await validated.wait()
+        if (rrule == recurrence_patch["rrule"]) != recurrence_first:
+            await first_saved.wait()
+
+    async def patch(fields, first):
+        try:
+            return await auth_client.patch(url, json=fields, headers=_headers())
+        finally:
+            if first:
+                first_saved.set()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(scheduled_tasks_routes, "_validate_rrule_or_400", validate_together)
+        async with asyncio.timeout(10):
+            recurrence_response, policy_response = await asyncio.gather(
+                patch(recurrence_patch, recurrence_first),
+                patch(policy_patch, not recurrence_first),
+            )
+    winner, loser = (
+        (recurrence_response, policy_response)
+        if recurrence_first
+        else (policy_response, recurrence_response)
+    )
+    assert winner.status_code == 200, winner.text
+    assert loser.status_code == 409, loser.text
+    assert "Reload and try again" in loser.text
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["rrule"], saved["session_mode"], saved["execution_target"]) == (
+        winner.json()["rrule"],
+        winner.json()["session_mode"],
+        winner.json()["execution_target"],
+    )
+    assert saved["state"] == "active"
+    retry = await auth_client.patch(
+        url, json=policy_patch if recurrence_first else recurrence_patch, headers=_headers()
+    )
+    assert retry.status_code == 400, retry.text
+    assert "Minimum interval is 60 minutes" in retry.text
