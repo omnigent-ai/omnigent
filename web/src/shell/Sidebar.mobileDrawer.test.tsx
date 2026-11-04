@@ -8,6 +8,7 @@ import { conversation as conv, conversationPage } from "@/test/sidebarMockHelper
 import { act, cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
@@ -15,6 +16,12 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+
+const { isAndroidShellMock } = vi.hoisted(() => ({ isAndroidShellMock: vi.fn(() => false) }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isAndroidShell: () => isAndroidShellMock(),
+}));
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 vi.mock("@/lib/serverOrigin", () => ({
@@ -25,6 +32,8 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { stubMatchMedia } from "@/test-helpers/matchMedia";
+import { ROW_GESTURE_HOLD_MS } from "@/hooks/useRowGesture";
+import { DEFAULT_SWIPE_ACTIONS, writeSwipeActions } from "@/lib/swipeActionPreferences";
 
 const useConvMock = vi.mocked(useConversations);
 const originalMatchMedia = window.matchMedia;
@@ -41,6 +50,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  isAndroidShellMock.mockReturnValue(false);
+  writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
   window.matchMedia = originalMatchMedia;
 });
 
@@ -260,6 +271,18 @@ function touch(target: Element, type: string, x: number, time: number, fingers =
   });
 }
 
+/** One finger step on a row: the pointer event its gesture reads, then the touch event. */
+function fingerOnRow(target: Element, type: "down" | "move" | "up", x: number, time: number): void {
+  const pointer = { pointerId: 1, pointerType: "touch", isPrimary: true, button: 0, clientX: x };
+  const fire = {
+    down: fireEvent.pointerDown,
+    move: fireEvent.pointerMove,
+    up: fireEvent.pointerUp,
+  };
+  fire[type](target, { ...pointer, clientY: 300 });
+  touch(target, { down: "touchstart", move: "touchmove", up: "touchend" }[type], x, time);
+}
+
 function stubMobileLayout(mobile: boolean): void {
   vi.stubGlobal("matchMedia", (query: string) => ({
     // Answer both breakpoint forms: `isMobileViewport` reads the md min-width query.
@@ -362,20 +385,23 @@ describe("mobile sidebar drawer swipe to close", () => {
 
   it("leaves a row long-press to drag-to-reorder", async () => {
     stubMobileLayout(true);
+    // Without a swipe-left action the row doesn't claim the swipe up front, so
+    // the hold alone hands the touch to the row's drag.
+    writeSwipeActions({ left: "none", right: "archive" });
     vi.useFakeTimers();
     const { onClose, drawer } = renderDrawer();
-    const row = screen.getByRole("link", { name: "conv_a" }).closest("li")!;
+    const link = screen.getByRole("link", { name: "conv_a" });
     const dragPreview = () => document.body.querySelector('[class*="max-w-[16rem]"]');
 
     try {
-      touch(row, "touchstart", 300, 0);
-      await act(() => vi.advanceTimersByTimeAsync(300));
+      fingerOnRow(link, "down", 300, 0);
+      await act(() => vi.advanceTimersByTimeAsync(ROW_GESTURE_HOLD_MS));
+      fingerOnRow(link, "move", 250, ROW_GESTURE_HOLD_MS);
       expect(dragPreview()).not.toBeNull();
 
-      touch(row, "touchmove", 250, 300);
-      touch(row, "touchmove", 100, 360);
+      fingerOnRow(link, "move", 100, ROW_GESTURE_HOLD_MS + 60);
       expect(drawer.style.transform).toBe("");
-      touch(row, "touchend", 0, 400);
+      fingerOnRow(link, "up", 100, ROW_GESTURE_HOLD_MS + 100);
 
       expect(drawer.style.transform).toBe("");
       expect(onClose).not.toHaveBeenCalled();
@@ -386,13 +412,53 @@ describe("mobile sidebar drawer swipe to close", () => {
     }
   });
 
-  it.each([
+  it("leaves a leftward swipe on a row to the row's swipe-left action", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer } = renderDrawer();
+    const link = screen.getByRole("link", { name: "conv_a" });
+
+    fingerOnRow(link, "down", 300, 0);
+    fingerOnRow(link, "move", 250, 60);
+    fingerOnRow(link, "move", 200, 120);
+
+    expect(screen.getByTestId("conversation-swipe-reveal")).toBeInTheDocument();
+    expect(drawer.style.transform).toBe("");
+    fingerOnRow(link, "up", 200, 160);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("closes from a row whose swipe-left action is off", () => {
+    stubMobileLayout(true);
+    writeSwipeActions({ left: "none", right: "archive" });
+    const { onClose, drawer } = renderDrawer();
+    const link = screen.getByRole("link", { name: "conv_a" });
+
+    fingerOnRow(link, "down", 300, 0);
+    fingerOnRow(link, "move", 250, 60);
+    fingerOnRow(link, "move", 100, 120);
+    expect(drawer.style.transform).toBe("translateX(-50%)");
+    expect(screen.queryByTestId("conversation-swipe-reveal")).toBeNull();
+    fingerOnRow(link, "up", 0, 400);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  interface SwipeContext {
+    mobile: boolean;
+    android?: boolean;
+    route?: string;
+    dragProgress?: number;
+  }
+  it.each<[string, SwipeContext, string]>([
     ["the desktop layout", { mobile: false }, ""],
     ["Settings", { mobile: true, route: "/settings" }, ""],
     // The native edge swipe owns the drawer while its progress is live.
     ["a native edge swipe", { mobile: true, dragProgress: 0.5 }, "translateX(-50%)"],
-  ])("ignores the swipe during %s", (_label, { mobile, ...props }, transform) => {
+    // Android closes the drawer with the system back gesture.
+    ["the Android shell", { mobile: true, android: true }, ""],
+  ])("ignores the swipe during %s", (_label, { mobile, android = false, ...props }, transform) => {
     stubMobileLayout(mobile);
+    isAndroidShellMock.mockReturnValue(android);
     const { onClose, drawer } = renderDrawer(props);
 
     touch(drawer, "touchstart", 300, 0);
