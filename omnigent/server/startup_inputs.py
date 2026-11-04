@@ -270,19 +270,29 @@ class ManagedStartupInputs:
         )
         return host is not None and host_is_live(host)
 
-    async def pending_snapshot(self, session_id: str) -> list[dict[str, Any]]:
+    async def snapshot(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """
+        Render the session's saved inputs for its snapshot.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(queued, failed)``, each a list of
+            ``{"pending_id", "content", "created_by"?}`` in submission order.
+            ``failed`` holds inputs no launch or delivery could hand over, so
+            clients can show them as undelivered instead of dropping them.
+        """
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
-            return []
-        return [
-            {
+            return [], []
+        queued: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            entry = {
                 "pending_id": pending_inputs.make_pending_id(session_id, item.id),
                 "content": input_content(item),
                 **({"created_by": item.created_by} if item.created_by else {}),
             }
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
-            if item.status != "failed"
-        ]
+            (failed if item.status == "failed" else queued).append(entry)
+        return queued, failed
 
     def host_changed(self, app: Any, host_id: str) -> None:
         key = (current_workspace_id(), host_id)

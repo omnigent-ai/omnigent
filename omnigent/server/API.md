@@ -509,6 +509,14 @@ Fields:
     redraw a bubble the person stopped. Empty for non-native sessions,
     which already carry the message in `items`.
 
+  failed_inputs (array, default `[]`)
+    Saved startup inputs (see `initial_input` below) that were never
+    delivered, e.g. because the managed sandbox host did not come online.
+    Same `{pending_id, content, created_by?}` shape as `pending_inputs`, in
+    submission order. File blocks keep their `file_id`, so attachments stay
+    downloadable from this session. Clients show these as undelivered
+    messages; a `retry_session` that redelivers them removes them.
+
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",

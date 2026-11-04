@@ -290,12 +290,21 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
             item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
             for item in snapshot["items"]
         )
+        [refused_input] = snapshot["failed_inputs"]
+        assert refused_input["content"] == _INPUT["data"]["content"]
+        assert snapshot["pending_inputs"] == []
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
         retried = await env.client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )
         assert retried.status_code == 202, retried.text
+        # A retry queues the input again, so it is no longer undelivered.
+        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["failed_inputs"] == []
+        assert [entry["pending_id"] for entry in snapshot["pending_inputs"]] == [
+            refused_input["pending_id"]
+        ]
         await startup._deliver(
             env.app, session_id, env.conv_store.list_pending_inputs(session_id)[0]
         )
@@ -953,6 +962,10 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert pending.status == "failed"
     [error] = env.conv_store.list_items(session_id).data
     assert isinstance(error.data, ErrorData) and "spend limit reached" in error.data.message
+    # The snapshot keeps the undelivered message so the client can show it.
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["pending_inputs"] == []
+    assert [entry["content"] for entry in snapshot["failed_inputs"]] == [_INPUT["data"]["content"]]
     # Another replica has no tracker entry for the launch.
     env.app.state.managed_launches = type(env.app.state.managed_launches)()
     assert not await startup.accepts(conv, env.app)

@@ -1093,6 +1093,12 @@ export interface ConversationState {
   /** Managed startup accepts sends durably before its first harness dispatch. */
   startupPending: boolean;
   /**
+   * Saved startup messages the server never delivered (e.g. the sandbox host
+   * didn't come online), from the snapshot's `failed_inputs`. Rendered as
+   * "Not delivered" bubbles the user can start a new session from.
+   */
+  failedInputs: PendingInput[];
+  /**
    * Native MCP startup progress, cleared when startup settles or live
    * assistant text arrives. Failures/cancellations stay in host diagnostics,
    * not the conversation. Null for harnesses that report no MCP startup.
@@ -2197,6 +2203,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sandboxStatus: null,
   sandboxActionDismissed: null,
   startupPending: false,
+  failedInputs: [],
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
@@ -4756,6 +4763,7 @@ function sessionBindingPatch(
   | "sandboxStatus"
   | "sandboxActionDismissed"
   | "startupPending"
+  | "failedInputs"
   | "mcpStartup"
   | "mcpStartupLaunch"
 > {
@@ -4800,8 +4808,43 @@ function sessionBindingPatch(
       session.labels?.["omnigent.startup"] === "pending" ||
       (session.labels?.["omnigent.startup"] === "ready" &&
         (session.pendingInputs ?? []).length > 0),
+    failedInputs: session.failedInputs ?? [],
     ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
+}
+
+/**
+ * Drop the optimistic bubbles a snapshot's undelivered inputs replace.
+ *
+ * Matches one-to-one: by pending id when the bubble knows it (snapshot-replayed,
+ * or an accepted follow-up), otherwise by text for this tab's accepted first
+ * message (no server id, and its attachments were stored under new file ids).
+ *
+ * @param pending - The conversation's optimistic user bubbles.
+ * @param failedInputs - The snapshot's `failedInputs`.
+ * @returns `pending` itself when nothing matched, else the remaining bubbles.
+ */
+export function withoutFailedInputs(
+  pending: PendingUserMessage[],
+  failedInputs: PendingInput[],
+): PendingUserMessage[] {
+  if (failedInputs.length === 0 || pending.length === 0) return pending;
+  const unmatched = [...failedInputs];
+  const remaining = pending.filter((message) => {
+    // A snapshot-replayed bubble is keyed by its server id.
+    const serverId = message.pendingId ?? message.tempId;
+    const index = unmatched.findIndex(
+      (input) =>
+        input.pendingId === serverId ||
+        (message.pendingId === undefined &&
+          message.posted === true &&
+          messageContentText(input.content) === messageContentText(message.content)),
+    );
+    if (index === -1) return true;
+    unmatched.splice(index, 1);
+    return false;
+  });
+  return remaining.length === pending.length ? pending : remaining;
 }
 
 /**
@@ -4837,6 +4880,41 @@ async function refreshSessionBinding(id: string): Promise<void> {
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
   setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
+}
+
+// The newest post-failure read per conversation; an older one that lands later is dropped.
+const failedLaunchReads = new Map<string, number>();
+
+/**
+ * Re-read a session after its sandbox launch failed, so the messages it never
+ * delivered show as undelivered instead of vanishing with their bubbles.
+ *
+ * A launch can report "failed" before the server has marked its saved inputs
+ * failed, then again once it has; each report starts a fresh read rather than
+ * joining one in flight, and only the newest applies. The snapshot also ends
+ * the startup state the failed launch leaves behind.
+ *
+ * @param id - Conversation/session id whose launch failed.
+ */
+async function refreshAfterFailedLaunch(id: string): Promise<void> {
+  const read = (failedLaunchReads.get(id) ?? 0) + 1;
+  failedLaunchReads.set(id, read);
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
+  let session: Session | null = null;
+  try {
+    session = await getSessionSlim(id);
+  } catch {
+    // The next bind reads the snapshot again.
+  }
+  if (failedLaunchReads.get(id) !== read) return;
+  failedLaunchReads.delete(id);
+  if (session === null) return;
+  const fresh = session;
+  queryClient?.setQueryData(["session", id], fresh);
+  setterFor(id)((s) => ({
+    ...sessionBindingPatch(fresh, s, launchBeforeFetch),
+    pendingUserMessages: withoutFailedInputs(s.pendingUserMessages, fresh.failedInputs ?? []),
+  }));
 }
 
 /**
@@ -5385,6 +5463,8 @@ function reconnectStatusPatch(
     // A `session.model` missed in the gap would otherwise hold a first
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
+    // A launch that failed during the gap still shows what it never delivered.
+    failedInputs: session.failedInputs ?? [],
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
@@ -8122,6 +8202,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.stage === "action_required" ? s.sandboxActionDismissed : null,
             },
       );
+      if (event.stage === "failed") void refreshAfterFailedLaunch(event.conversationId);
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {

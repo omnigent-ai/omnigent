@@ -460,6 +460,12 @@ export interface Session {
    */
   pendingInputs?: PendingInput[];
   /**
+   * Saved startup messages that were never delivered, e.g. because the
+   * managed sandbox host didn't come online. Their file blocks still resolve
+   * under this session. Empty when nothing failed or on older servers.
+   */
+  failedInputs?: PendingInput[];
+  /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions
    * are disabled or the user has no grant. For sub-agent (child)

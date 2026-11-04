@@ -105,6 +105,7 @@ import {
   type PendingUserMessage,
   bindConversationForTest,
   releaseConversation,
+  withoutFailedInputs,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
@@ -626,6 +627,42 @@ describe("isTempConvId", () => {
     // Real ids and empties are never stale-temp.
     expect(isStaleTempConvId("conv_real")).toBe(false);
     expect(isStaleTempConvId(null)).toBe(false);
+  });
+});
+
+describe("withoutFailedInputs", () => {
+  const text = (value: string) => [{ type: "input_text" as const, text: value }];
+  const failed = [
+    { pendingId: "pending_a", content: text("retry this") },
+    { pendingId: "pending_b", content: text("again") },
+  ];
+
+  it.each<[string, PendingUserMessage, boolean]>([
+    ["a replayed bubble by its id", { tempId: "pending_b", content: text("other") }, false],
+    [
+      "an accepted follow-up by its id",
+      { tempId: "tmp_1", pendingId: "pending_a", content: text("x") },
+      false,
+    ],
+    [
+      "this tab's accepted first message by text",
+      { tempId: "tmp_1", content: text("again"), posted: true },
+      false,
+    ],
+    ["a send still in flight", { tempId: "tmp_1", content: text("again") }, true],
+    [
+      "a follow-up whose id names nothing failed",
+      { tempId: "tmp_1", pendingId: "pending_c", content: text("again"), posted: true },
+      true,
+    ],
+  ])("drops %s only when it matches", (_case, message, kept) => {
+    expect(withoutFailedInputs([message], failed)).toEqual(kept ? [message] : []);
+  });
+
+  it("matches one bubble per failed input", () => {
+    const twin = { tempId: "tmp_1", content: text("again"), posted: true };
+    const later = { tempId: "tmp_2", content: text("again"), posted: true };
+    expect(withoutFailedInputs([twin, later], failed)).toEqual([later]);
   });
 });
 
@@ -7739,6 +7776,58 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.sandbox_status", () => {
+    it("turns the sent first message into an undelivered one when the launch fails", async () => {
+      // A launch reports "failed" early and again once the server has marked its
+      // saved inputs failed; the earlier read answering last must not win.
+      const lost = { type: "input_text" as const, text: "Summarize the open PRs" };
+      const snapshot = (startup: string, failedInputs: unknown[]) =>
+        mockResponse({
+          id: "conv_abc",
+          agent_id: "agent_xyz",
+          status: "failed",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.startup": startup },
+          pending_elicitations: [],
+          pending_inputs: [],
+          failed_inputs: failedInputs,
+        });
+      let answerEarlyRead!: (response: Response) => void;
+      fetchMock
+        .mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              answerEarlyRead = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(
+          snapshot("failed", [{ pending_id: "pending_first", content: [lost] }]),
+        );
+      useChatStore.setState({
+        startupPending: true,
+        pendingUserMessages: [{ tempId: "tmp_first", content: [lost], posted: true }],
+      });
+
+      for (let report = 0; report < 2; report += 1) {
+        handleSessionEvent({
+          type: "session_sandbox_status",
+          conversationId: "conv_abc",
+          stage: "failed",
+          error: "managed host did not come online",
+        });
+      }
+      await vi.waitFor(() => expect(useChatStore.getState().failedInputs).toHaveLength(1));
+      answerEarlyRead(snapshot("pending", []));
+      await tick();
+      await tick();
+
+      expect(useChatStore.getState()).toMatchObject({
+        failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+        pendingUserMessages: [],
+        startupPending: false,
+      });
+    });
+
     it("learns the provisioned host without a browser message POST", async () => {
       fetchMock.mockResolvedValueOnce(
         mockResponse({

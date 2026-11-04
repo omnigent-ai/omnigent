@@ -388,6 +388,11 @@ import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
+import {
+  NEW_SESSION_ATTACHMENTS_PARAM,
+  forgetNewSessionAttachments,
+  peekNewSessionAttachments,
+} from "@/lib/newSessionHandoff";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -2074,6 +2079,9 @@ export function NewChatLandingScreen() {
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const linkedPrompt = searchParams.get("prompt");
+  const linkedAttachmentsToken = searchParams.get(NEW_SESSION_ATTACHMENTS_PARAM);
+  // Read once: the link effect below releases the token.
+  const [linkedFiles] = useState(() => peekNewSessionAttachments(linkedAttachmentsToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2285,16 +2293,26 @@ export function NewChatLandingScreen() {
     linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
   );
   useEffect(() => {
-    if (!searchParams.has("prompt")) return;
+    if (!searchParams.has("prompt") && linkedAttachmentsToken === null) return;
     if (linkedPrompt?.trim()) setMessage(linkedPrompt);
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
+    remaining.delete(NEW_SESSION_ATTACHMENTS_PARAM);
+    forgetNewSessionAttachments(linkedAttachmentsToken);
     navigate(
       { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.pathname, location.hash, location.state, navigate]);
+  }, [
+    linkedPrompt,
+    linkedAttachmentsToken,
+    searchParams,
+    location.pathname,
+    location.hash,
+    location.state,
+    navigate,
+  ]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2327,7 +2345,7 @@ export function NewChatLandingScreen() {
     restoreFiles,
     onPaste,
     clearError,
-  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  } = useComposerAttachments({ initialFiles: linkedFiles ?? restoredDraft?.files ?? [] });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
