@@ -554,16 +554,20 @@ async def test_create_preserves_selected_subdirectory(
     )
 
 
+@pytest.mark.parametrize(
+    "label_key",
+    ["omnigent.git.worktree_root_sha256", "omnigent.scheduled_task_worktree_source_sha256"],
+)
 async def test_create_rejects_forged_worktree_identity(
     client: httpx.AsyncClient,
+    label_key: str,
 ) -> None:
     """Clients cannot redirect the server-owned cleanup identity."""
-    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
     agent = await create_test_agent(client, name="forged-root-agent")
     response = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}},
+        json={"agent_id": agent["id"], "labels": {label_key: "forged"}},
     )
     assert response.status_code == 400, response.text
 

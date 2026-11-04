@@ -2063,6 +2063,66 @@ def test_remembered_profile_keeps_the_identity_preference(
     ) == ["env", "other", "user"]
 
 
+def test_resolve_auth_for_host_prefers_the_profile_pinned_to_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a host fronting several workspaces, the ``?o=`` target's profile mints first."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[other]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "workspace_id = 111\n"
+        "[unpinned]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "[target]\nhost = https://example.databricks.com\nauth_type = databricks-cli\n"
+        "workspace_id = 222\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    attempts = _fake_profile_sources(monkeypatch, stale={"target"}, sdk_tokens={})
+    host = "https://example.databricks.com"
+
+    # The last-accepted profile was for the other workspace; the target still wins.
+    databricks_executor._remember_profile(host, "other")
+    auth, _ = databricks_executor._resolve_databricks_auth(host=host, workspace_id="222")
+
+    # Nothing is dropped: an expired target login falls through to the rest.
+    assert attempts == [("cli", "target"), ("sdk", "target"), ("cli", "unpinned")]
+    assert auth.current_token() == "unpinned-token"
+
+    attempts.clear()
+    databricks_executor._resolve_databricks_auth(host=host)
+    assert attempts == [("cli", "other")], "without a target the order is unchanged"
+
+
+def test_workspace_preference_keeps_the_identity_preference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The env profile stays first and service principals stay behind user profiles."""
+    import configparser
+
+    from omnigent.inner import databricks_executor
+
+    config = configparser.ConfigParser()
+    config.read_dict(
+        {
+            "env": {"workspace_id": "111"},
+            "user": {"workspace_id": "111"},
+            "target": {"workspace_id": "222"},
+            "sp": {"workspace_id": "222"},
+        }
+    )
+    ordered = ["env", "user", "target", "sp"]
+    prefer = databricks_executor._prefer_profiles_for_workspace
+
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    assert prefer(ordered, config, "222", {"sp"}) == ["target", "env", "user", "sp"]
+    assert prefer(ordered, config, None, {"sp"}) == ordered
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "env")
+    assert prefer(ordered, config, "222", {"sp"}) == ["env", "target", "user", "sp"]
+
+
 def test_remembered_profiles_survive_a_corrupt_or_unwritable_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
