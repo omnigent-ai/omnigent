@@ -15,6 +15,10 @@ to customize.
   filter with no search; searches and Active/Paused filters hide the preview.
 - `create`: a gallery item or suggested automation opens integration setup;
   New automation opens a blank form.
+- `conditions`: Jira, Slack, GitHub, and Linear templates support structured
+  filters and Free text conditions. The agent evaluates free-text conditions
+  against each candidate before starting a session; all conditions must match.
+  A checkbox below the trigger controls posting the session link back to the source.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
   prompt starts collapsed, expands into a read-only preview, and requires Edit
   system prompt to change it. Done editing system prompt returns to the read-only
@@ -126,6 +130,15 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   with New session each run and check that the sessions have distinct worktree
   paths. Disable the option and run again: the new session uses the selected
   directory. With Continue in the same session, later runs reuse its worktree.
+- In any integration template, add a condition and select Free text in its field
+  dropdown. Type a condition in plain language alongside any structured filters.
+  Fill in the scope and session instructions, then expand Preview prompt to check
+  that the free-text condition is evaluated before session creation. An empty
+  condition blocks saving. Toggle the link checkbox below the trigger and check
+  that only the comment or reply step changes. Hover, focus, or tap the warning
+  icon beside Instructions for each session to read the integration and source
+  warnings; Escape dismisses them without closing the modal. The run limit and
+  posting attribution share one note below the instructions.
 - Manually repeat the three creation entry points at a narrow viewport, use
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
