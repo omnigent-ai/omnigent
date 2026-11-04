@@ -1231,7 +1231,13 @@ describe("Composer slash-command submit routing", () => {
     useChatStore.setState({ setModel: realSetModel, sessionHarness: null });
   });
 
-  it("routes a known skill through onSendSlashCommand with parsed args", () => {
+  it("routes a known skill through onSendSlashCommand with parsed args and the draft's startup inputs", () => {
+    onTestFinished(clearSessionDrafts);
+    setSessionDraft("conv_test", {
+      text: "saved on server",
+      files: [],
+      startupInputIds: ["pending_first"],
+    });
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
     render(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
@@ -1242,7 +1248,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop fix the bug" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug", ["pending_first"]);
     // It's a slash_command event, NOT a plaintext message.
     expect(onSend).not.toHaveBeenCalled();
   });

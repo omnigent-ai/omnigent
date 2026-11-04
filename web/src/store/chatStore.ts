@@ -7855,7 +7855,8 @@ function restoreUnsentSendOnceIdentified(
 }
 
 /**
- * One draft after another, as a new message: a joined resend can't reuse either's stable id.
+ * One draft after another, as a new message: a joined resend can't reuse either's stable id,
+ * so it keeps them in `sentAs` for a failed-input read to find.
  *
  * @param waiting - The draft the composer has yet to take, if any.
  * @param later - The draft to add after it.
@@ -7874,7 +7875,14 @@ function joinFailedSendDrafts(
   const startupInputIds = [
     ...new Set([...(waiting.startupInputIds ?? []), ...(later.startupInputIds ?? [])]),
   ];
-  const sentAs = [...new Set([...(waiting.sentAs ?? []), ...(later.sentAs ?? [])])];
+  const sentAs = [
+    ...new Set(
+      [waiting, later].flatMap((draft) => [
+        ...(draft.sentAs ?? []),
+        ...(draft.stableId ? [draft.stableId] : []),
+      ]),
+    ),
+  ];
   return {
     conversationId: waiting.conversationId,
     text: serializeReplyDraft(joined),
@@ -8034,7 +8042,10 @@ function returnFailedStartupInputs(
   );
   const kept = state.blocks.filter((block) => !isStartupLookupNotice(block));
   const blocks = attachments ? [...kept, attachments] : kept;
-  const waiting = handedBackDraft(state.failedSendDraft, inWaitingDraft);
+  const waiting = handedBackDraft(
+    state.failedSendDraft,
+    unreturned.filter((input) => inWaitingDraft.includes(input.pendingId)),
+  );
   const patch: Partial<ConversationState> = {
     ...(blocks.length === state.blocks.length && attachments === null ? {} : { blocks }),
     ...(unreturned.length === 0
@@ -8118,20 +8129,23 @@ function inputsSentAs(inputs: FailedInput[], stableIds: readonly (string | null)
  * new message that replaces them: reusing its stable id would resend nothing.
  *
  * @param draft - The failed-send draft the composer has yet to take.
- * @param pendingIds - The failed inputs saved under its stable id.
+ * @param saved - The failed inputs saved under its stable ids.
  * @returns The draft to restore, `draft` itself when it is none of them.
  */
 function handedBackDraft(
   draft: ConversationState["failedSendDraft"],
-  pendingIds: string[],
+  saved: FailedInput[],
 ): ConversationState["failedSendDraft"] {
-  if (draft === null || pendingIds.length === 0) return draft;
+  if (draft === null || saved.length === 0) return draft;
+  // A joined send no read has listed yet is still known by its own id.
+  const sentAs = (draft.sentAs ?? []).filter((id) => !saved.some((input) => input.itemId === id));
   return {
     conversationId: draft.conversationId,
     text: draft.text,
     files: draft.files,
     ...(draft.replyDraft ? { replyDraft: draft.replyDraft } : {}),
-    startupInputIds: [...(draft.startupInputIds ?? []), ...pendingIds],
+    startupInputIds: [...(draft.startupInputIds ?? []), ...saved.map((input) => input.pendingId)],
+    ...(sentAs.length > 0 ? { sentAs } : {}),
     recovered: true,
   };
 }

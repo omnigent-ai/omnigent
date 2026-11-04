@@ -1428,11 +1428,17 @@ describe("side-chat slash commands", () => {
         .acquire(childId)
         .setState({ sessionHarness: "claude-sdk", sessionStatus });
       skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+      useChatStore.setState({
+        sideChatComposers: {
+          [childId]: { text: "saved on server", files: [], startupInputIds: ["pending_first"] },
+        },
+      });
       renderPane(<SideChatPane childId={childId} />);
       typeSlash("/review 123");
       fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
       expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "123", "agent_side", {
         pinnedConversationId: childId,
+        startupInputIds: ["pending_first"],
       });
       expect(send).not.toHaveBeenCalled();
       expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();

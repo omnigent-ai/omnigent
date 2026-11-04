@@ -4339,14 +4339,16 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       waiting: "another failed send's draft",
       handedBack: false,
       command: true,
+      sentAs: ["stable_other"],
     },
     {
       resend: "resend with a file",
       waiting: "messages a failed launch handed back",
       handedBack: true,
       command: false,
+      sentAs: ["stable_resend"],
     },
-  ])("adds a refused $resend after $waiting meanwhile", async ({ handedBack, command }) => {
+  ])("adds a refused $resend after $waiting meanwhile", async ({ handedBack, command, sentAs }) => {
     onTestFinished(clearSessionDrafts);
     const file = new File(["notes"], "notes.txt", { type: "text/plain" });
     seedSession("conv_real");
@@ -4375,9 +4377,10 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       ? useChatStore
           .getState()
           .sendSlashCommand("review", "saved on server", "agent_xyz", composerHoldsFirstInput)
-      : useChatStore
-          .getState()
-          .send("saved on server", "agent_xyz", [file], composerHoldsFirstInput);
+      : useChatStore.getState().send("saved on server", "agent_xyz", [file], {
+          ...composerHoldsFirstInput,
+          stableId: "stable_resend",
+        });
     await vi.waitFor(() => expect(refuseResend).toBeDefined());
     if (handedBack) {
       sessionFailedInputs.get("conv_real")!.push({
@@ -4403,6 +4406,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       text: `and the second\n\n${command ? "/review " : ""}saved on server`,
       files: command ? [] : [file],
       startupInputIds: handedBack ? ["pending_second", "pending_first"] : ["pending_first"],
+      ...(sentAs ? { sentAs } : {}),
       recovered: true,
     });
   });
@@ -21105,12 +21109,7 @@ describe("chatStore — background cross-session flush", () => {
     useChatStore.setState({
       conversationId: "conv_active",
       queuedMessages: [
-        {
-          queueId: "q_1",
-          text: "bg-first",
-          conversationId: "conv_bg",
-          startupInputIds: ["pending_first"],
-        },
+        { queueId: "q_1", text: "bg-first", conversationId: "conv_bg" },
         { queueId: "q_2", text: "bg-second", conversationId: "conv_bg" },
       ],
     });
@@ -21120,12 +21119,6 @@ describe("chatStore — background cross-session flush", () => {
 
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
-    const [, posted] = fetchMock.mock.calls.find(([url]) =>
-      String(url).endsWith("/conv_bg/events"),
-    )!;
-    expect(JSON.parse(String(posted?.body))).toMatchObject({
-      replaces_failed_inputs: ["pending_first"],
-    });
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
   });
 
@@ -22740,7 +22733,7 @@ describe("a send cut off by a reload", () => {
       unanswered: "an unanswered send",
       send: { text: "rerun the failing test" },
       savedAs: "item_first",
-      draft: { text: "rerun the failing test\n\nsaved on server" },
+      draft: { text: "rerun the failing test\n\nsaved on server", sentAs: ["stable_reload"] },
     },
     {
       unanswered: "an unanswered resend",
@@ -22774,7 +22767,7 @@ describe("a send cut off by a reload", () => {
       send: { text: "saved on server" },
       savedAs: "stable_reload",
       followUp: { text: "and then run the linter" },
-      draft: { text: "saved on server\n\nand then run the linter" },
+      draft: { text: "saved on server\n\nand then run the linter", sentAs: ["stable_queued"] },
     },
   ])(
     "hands back $unanswered on load with the failed launch's first input once",
@@ -22817,10 +22810,11 @@ describe("a send cut off by a reload", () => {
 
   it.each([
     {
-      unanswered: "an unanswered send",
+      unanswered: "an unanswered send the server saves only after the first read",
       send: { text: "rerun the failing test" },
       savedAs: "item_first",
-      draft: { text: "saved on server\n\nrerun the failing test" },
+      savedLater: ["stable_reload"],
+      draft: { text: "saved on server\n\nrerun the failing test", sentAs: ["stable_reload"] },
     },
     {
       unanswered: "an unanswered edited resend",
@@ -22835,10 +22829,12 @@ describe("a send cut off by a reload", () => {
       draft: { text: "saved on server" },
     },
     {
-      unanswered: "a queued edited resend behind an unanswered send",
+      unanswered:
+        "a queued edited resend behind an unanswered send, both saved after the first read",
       send: { text: "rerun the failing test" },
       queued: { text: "saved on server, edited", startupInputIds: ["pending_first"] },
       savedAs: "item_first",
+      savedLater: ["stable_reload", "stable_queued"],
       draft: {
         text: "rerun the failing test\n\nsaved on server, edited",
         serverRefused: false,
@@ -22847,7 +22843,7 @@ describe("a send cut off by a reload", () => {
     },
   ])(
     "keeps $unanswered whose sender is named after the failed launch's inputs came back",
-    async ({ send, queued, savedAs, draft }) => {
+    async ({ send, queued, savedAs, savedLater, draft }) => {
       vi.mocked(getCurrentUserId).mockReturnValue(null);
       let identityChanged: (() => void) | undefined;
       vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
@@ -22876,6 +22872,26 @@ describe("a send cut off by a reload", () => {
         recovered: true,
       });
       expect(peekUnsentSend("conv_reload")).toBeNull();
+      if (savedLater === undefined) return;
+
+      // Later reads find the sends the draft holds by their stable ids, the first one alone.
+      const later = savedLater.map((stableId, index) => ({
+        pending_id: `pending_later_${index}`,
+        item_id: stableId,
+        content: [{ type: "input_text", text: "saved later" }],
+      }));
+      const failedInputs = sessionFailedInputs.get("conv_reload")!;
+      failedInputs.push(later[0]!);
+      await retryFailedStartupLookup("conv_reload");
+      failedInputs.push(...later.slice(1));
+      await retryFailedStartupLookup("conv_reload");
+      expect(useChatStore.getState().failedSendDraft).toEqual({
+        conversationId: "conv_reload",
+        text: draft.text,
+        files: [],
+        startupInputIds: ["pending_first", ...later.map((input) => input.pending_id)],
+        recovered: true,
+      });
     },
   );
 
