@@ -264,6 +264,7 @@ def test_template_is_unassigned_and_preserves_hardening() -> None:
     activation = next(item for item in pod["volumes"] if item["name"] == "activation")
     assert activation["emptyDir"]["medium"] == "Memory"
     bootstrap, host = pod["containers"]
+    assert bootstrap["resources"]["requests"] == {"cpu": "50m", "memory": "128Mi"}
     assert not next(m for m in bootstrap["volumeMounts"] if m["name"] == "activation").get(
         "readOnly"
     )
@@ -277,7 +278,7 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
     monkeypatch.setenv(STORAGE_CLASS_ENV_VAR, "fast-storage")
     resources = {
         "requests": {"cpu": "2", "memory": "4Gi"},
-        "limits": {"cpu": "4", "memory": "8Gi"},
+        "limits": {"cpu": "4", "memory": "8Gi", "ephemeral-storage": "10Gi"},
     }
     launcher = _launcher(
         resources=resources,
@@ -295,7 +296,11 @@ def test_template_preserves_storage_mount_separation_and_agent_profile(
     assert pod["nodeSelector"] == {"kubernetes.io/arch": "arm64"}
     assert pod["tolerations"] == [{"key": "sandbox", "operator": "Exists"}]
     bootstrap, host = pod["containers"]
-    assert bootstrap["resources"] == host["resources"] == resources
+    assert host["resources"] == resources
+    assert bootstrap["resources"] == {
+        "requests": {"cpu": "50m", "memory": "128Mi", "ephemeral-storage": "0"},
+        "limits": resources["limits"],
+    }
     assert {m["name"] for m in bootstrap["volumeMounts"]} == {"home", "activation"}
     assert {m["name"] for m in host["volumeMounts"]} == {"home", "activation", "pvc-0", "secret-0"}
     assert (
@@ -570,6 +575,31 @@ def test_stale_template_is_rejected_before_claiming(harness: _Harness) -> None:
     with pytest.raises(click.ClickException, match="template does not match"):
         harness.launcher.provision("new-session")
     harness.custom.create_namespaced_custom_object.assert_not_called()
+
+
+def test_pools_from_the_earlier_bootstrap_profile_still_claim_and_activate(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    quantity = types.ModuleType("kubernetes.utils.quantity")
+    quantity.parse_quantity = str  # type: ignore[attr-defined]  # exact spellings only
+    monkeypatch.setitem(sys.modules, "kubernetes.utils.quantity", quantity)
+    mixed = harness.launcher.template_spec()
+    bootstrap, host = mixed["podTemplate"]["spec"]["containers"]
+    bootstrap["resources"] = copy.deepcopy(host["resources"])
+    harness.template["spec"] = mixed
+    with pytest.raises(click.ClickException, match="template does not match"):
+        harness.launcher.provision("new-session")
+    harness.custom.create_namespaced_custom_object.assert_not_called()
+
+    legacy = harness.launcher.template_spec(legacy_bootstrap=True)
+    bootstrap, host = legacy["podTemplate"]["spec"]["containers"]
+    assert bootstrap["resources"] == host["resources"]
+    _set_profile(harness, legacy)
+    execute = _exec_states(harness, monkeypatch, "waiting", "prepared")
+    handle = harness.launcher.provision("new-session")
+    assert handle == _HANDLE.encode()
+    harness.launcher.start_host(handle, **_START_ARGS)
+    assert [call.args[2] for call in execute.call_args_list].count("activate") == 1
 
 
 def test_failed_adoption_cleans_up_only_the_created_claim(harness: _Harness) -> None:

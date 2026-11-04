@@ -115,11 +115,15 @@ security contexts, disabled ServiceAccount token automount, runtime class,
 scheduling constraints, static Secret projection, and configured storage are
 retained from the existing manifest builder.
 
-**Both containers reserve the configured resources.** Kubernetes sums regular
-container requests. For example, a `250m` CPU / `384Mi` memory configuration
-reserves `500m` / `768Mi` for each pooled Pod, before any admission-added
-containers. This differs from the direct init-container scheduling calculation
-and must be included in pool capacity planning.
+**The bootstrap requests little and keeps the configured limits.** Kubernetes
+sums regular container requests, so the bootstrap requests only `50m` CPU and
+`128Mi` memory, plus `0` ephemeral storage when that resource is configured. For
+example, a `250m` CPU / `384Mi` memory configuration reserves `300m` / `512Mi`
+for each pooled Pod, before any admission-added containers. Workspace
+preparation can still use the configured limits, so pooled Pods are Burstable
+even when configured requests equal limits. Templates from earlier releases,
+whose bootstrap reserves the configured requests, remain valid for existing
+pools and allocations; generate a new versioned pool to reduce the reservation.
 
 The image must include `omnigent.host.warm_bootstrap`. The initial activation
 protocol is version 1 and includes the actual Pod UID, generation, host ID/name,
