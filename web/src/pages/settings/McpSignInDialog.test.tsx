@@ -50,6 +50,16 @@ function calls(method: string, path: string) {
   );
 }
 
+// Holds the next request until the returned function answers it.
+function holdNextReply() {
+  let respond!: (response: Response) => void;
+  const reply = new Promise<Response>((resolve) => {
+    respond = resolve;
+  });
+  fetchMock.mockImplementationOnce(() => reply);
+  return respond;
+}
+
 const props: McpSignInDialogProps = {
   open: true,
   onOpenChange: vi.fn(),
@@ -149,13 +159,7 @@ describe("McpSignInDialog", () => {
   });
 
   it("moves a starting sign-in to the newly chosen host", async () => {
-    let respond: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          respond = resolve;
-        }),
-    );
+    const respond = holdNextReply();
     const view = await renderDialog();
 
     await switchToSecondHost(view);
@@ -226,13 +230,7 @@ describe("McpSignInDialog", () => {
     on("POST", BASE, () => json(login()));
     on("POST", `${BASE}/L1/callback`, succeeded);
     const view = await renderDialog();
-    let respond: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          respond = resolve;
-        }),
-    );
+    const respond = holdNextReply();
     await tick();
 
     fireEvent.change(screen.getByLabelText(/paste it here/), {
@@ -264,13 +262,7 @@ describe("McpSignInDialog", () => {
   ] as const)("ignores the reply to a pasted address once %s", async (_, leave, links) => {
     on("POST", BASE, () => json(login()));
     const view = await renderDialog();
-    let respond: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          respond = resolve;
-        }),
-    );
+    const respond = holdNextReply();
     fireEvent.change(screen.getByLabelText(/paste it here/), {
       target: { value: "http://localhost:9/callback?code=c&state=s" },
     });
@@ -335,13 +327,7 @@ describe("McpSignInDialog", () => {
   });
 
   it("cancels a sign-in that starts after the dialog closed", async () => {
-    let respond: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          respond = resolve;
-        }),
-    );
+    const respond = holdNextReply();
     on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
     const view = await renderDialog();
     view.rerender(<McpSignInDialog {...props} open={false} />);
@@ -356,13 +342,7 @@ describe("McpSignInDialog", () => {
     on("POST", BASE, () => json(login()));
     on("DELETE", `${BASE}/L1`, () => new Response(null, { status: 204 }));
     const view = await renderDialog();
-    let respond: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          respond = resolve;
-        }),
-    );
+    const respond = holdNextReply();
     await tick();
 
     view.rerender(<McpSignInDialog {...props} open={false} />);
@@ -446,13 +426,7 @@ describe("McpSignInDialog", () => {
     on("POST", BASE, () => json(login()));
     on("GET", `${BASE}/L1`, () => json(login()));
     await renderDialog();
-    let respond: (response: Response) => void = () => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          respond = resolve;
-        }),
-    );
+    const respond = holdNextReply();
     await tick();
     await tick();
     await tick();
