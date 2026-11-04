@@ -428,6 +428,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.sandbox_profile_store import PROFILE_LABEL_PREFIX, public_profile
 from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry import is_disabled as _tel_is_disabled
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.anon import current_anon_user_id as _tel_current_anon
 from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessionUsageEvent
@@ -9175,6 +9176,33 @@ async def _relay_runner_stream(
             return
 
 
+def _session_owner_anon_user_id(
+    session_id: str, conversation_store: ConversationStore
+) -> str | None:
+    """
+    Return the anonymous telemetry id of a session's owner.
+
+    The runner relay is often started outside a request (runner reconnect,
+    child-session recovery), so it has no ambient user to attribute turns to.
+    A sub-agent has no owner grant of its own, so fall back to the root
+    session's owner, as daily-cost attribution does.
+
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the owner lookup.
+    :returns: The owner's anonymous id, or ``None`` when no owner resolves
+        (single-user mode) or the lookup fails.
+    """
+    try:
+        owner = conversation_store.get_session_owner(session_id)
+        if owner is None:
+            conv = conversation_store.get_conversation(session_id)
+            if conv is not None and conv.root_conversation_id != conv.id:
+                owner = conversation_store.get_session_owner(conv.root_conversation_id)
+    except Exception:  # noqa: BLE001 — telemetry attribution must never break the relay
+        return None
+    return _tel_anon_user_id(owner, _get_installation_id()) if owner is not None else None
+
+
 async def _relay_runner_stream_once(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -9226,6 +9254,10 @@ async def _relay_runner_stream_once(
     # Wall-clock time when the current turn's response.in_progress arrived,
     # used to compute per-turn latency in TurnEndEvent.
     _turn_start_s: float | None = None
+    # TurnEndEvent attribution when no request user is bound; the owner is
+    # looked up at most once per attempt.
+    owner_anon_user_id: str | None = None
+    owner_anon_looked_up = False
     # Map tool call_id → response_id so a function_call_output that
     # arrives after a new response.in_progress (different response_id)
     # still pairs with its matching function_call. Without this, the
@@ -9789,11 +9821,19 @@ async def _relay_runner_stream_once(
                         _turn_out = _resp_usage.get("output_tokens")
                         _turn_cost = _resp_usage.get("cost_usd")
                         _turn_model: str | None = _resp_usage.get("model") or current_model or None
+                        _turn_anon = _tel_current_anon()
+                        if _turn_anon is None and not _tel_is_disabled():
+                            if not owner_anon_looked_up:
+                                owner_anon_user_id = await asyncio.to_thread(
+                                    _session_owner_anon_user_id, session_id, conversation_store
+                                )
+                                owner_anon_looked_up = True
+                            _turn_anon = owner_anon_user_id
                         _tel_emit(
                             _TelTurnEndEvent(
                                 installation_id=_get_installation_id(),
                                 session_id=session_id,
-                                anon_user_id=_tel_current_anon(),
+                                anon_user_id=_turn_anon,
                                 # The relay task has no request to carry the
                                 # header, and resolving the host would cost a
                                 # read per turn end — so the field is skipped.
