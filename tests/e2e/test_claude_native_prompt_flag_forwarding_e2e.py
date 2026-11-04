@@ -261,34 +261,35 @@ def test_local_launch_prompt_is_not_forwarded_as_a_value_flags_argument(
     )
 
 
+@pytest.mark.parametrize("with_caller_file", [False, True], ids=["inline-only", "file-and-inline"])
 def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
-    isolated_mock_llm_server_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_mock_llm_server_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_caller_file: bool,
 ) -> None:
     """
     Real Claude receives the caller's file, then Omnigent's instructions, then the caller's prompt.
 
     ``augment_claude_args`` leaves the caller's file flag and puts Omnigent's text before the
-    caller's inline prompt, so this relies on Claude 2.1.295+ applying both prompt flags.
+    caller's inline prompt. Only the file case relies on Claude 2.1.295+ applying both flags.
 
     :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
     :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
     :param monkeypatch: Points the bridge root at ``tmp_path``.
+    :param with_caller_file: Whether the caller also passes ``--append-system-prompt-file``.
     """
     from omnigent.harnesses.claude_native import bridge
 
     claude_version = subprocess.check_output(["claude", "--version"], text=True).split()[0]
-    if release_tuple(claude_version) < (2, 1, 295):
+    if with_caller_file and release_tuple(claude_version) < (2, 1, 295):
         pytest.skip(f"Claude Code {claude_version} refuses both prompt flags together")
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     profile = tmp_path / "profile.md"
     profile.write_text("FILE-MARKER caller profile\n", encoding="utf-8")
-    caller_args = [
-        "--append-system-prompt-file",
-        str(profile),
-        "--append-system-prompt",
-        "INLINE-MARKER caller prompt",
-    ]
+    file_args = ["--append-system-prompt-file", str(profile)] if with_caller_file else []
+    caller_args = [*file_args, "--append-system-prompt", "INLINE-MARKER caller prompt"]
     augmented = bridge.augment_claude_args(
         tuple(caller_args),
         bridge_dir=tmp_path / "claude-native" / "bridge",
@@ -314,7 +315,7 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
         system if isinstance(system, str) else "\n".join(block.get("text", "") for block in system)
         for system in systems
     ]
-    markers = ("FILE-MARKER", "OMNIGENT-MARKER", "INLINE-MARKER")
+    markers = (*(["FILE-MARKER"] if with_caller_file else []), "OMNIGENT-MARKER", "INLINE-MARKER")
     prompt = next(
         (text for text in system_texts if any(marker in text for marker in markers)), None
     )
@@ -323,4 +324,4 @@ def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
     assert not missing, f"missing {missing} in system prompt:\n{prompt}\nclaude output:\n{output}"
     positions = [prompt.index(marker) for marker in markers]
     assert positions == sorted(positions), prompt
-    assert [prompt.count(marker) for marker in markers] == [1, 1, 1], prompt
+    assert [prompt.count(marker) for marker in markers] == [1] * len(markers), prompt
