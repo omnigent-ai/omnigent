@@ -10180,7 +10180,7 @@ async def _remove_session_worktree_best_effort(
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
-) -> None:
+) -> bool:
     """
     Best-effort removal of a session's git worktree.
 
@@ -10215,6 +10215,7 @@ async def _remove_session_worktree_best_effort(
     :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
         host cannot be reached to run git. Create-rollback leaves this
         ``False`` so a failed create still surfaces its original error.
+    :returns: ``True`` only when the host confirmed the removal.
     """
     from omnigent.server.routes._host_worktree import (
         WorktreeHostUnavailableError,
@@ -10238,7 +10239,7 @@ async def _remove_session_worktree_best_effort(
             _logger.warning(
                 "Workspace %s no longer matches its recorded cleanup root", worktree_path
             )
-            return
+            return False
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
             host_id=host_id,
@@ -10252,7 +10253,7 @@ async def _remove_session_worktree_best_effort(
                 worktree_path,
                 reason,
             )
-            return
+            return False
 
     if host_registry is None:
         if fail_if_unavailable:
@@ -10260,7 +10261,7 @@ async def _remove_session_worktree_best_effort(
                 "host registry is not configured; cannot delete a worktree",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        return
+        return False
     host_conn = host_registry.get(host_id)
     if host_conn is None:
         if fail_if_unavailable:
@@ -10274,7 +10275,7 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             host_id,
         )
-        return
+        return False
     try:
         if conversation_store is not None and exclude_conversation_id is not None:
             worktrees = await list_worktrees_on_host(
@@ -10299,7 +10300,7 @@ async def _remove_session_worktree_best_effort(
                 _logger.warning(
                     "No matching linked worktree for %s; skipping cleanup", worktree_path
                 )
-                return
+                return False
             worktree_path = max(roots, key=len)
         await remove_worktree_on_host(
             host_registry=host_registry,
@@ -10308,6 +10309,7 @@ async def _remove_session_worktree_best_effort(
             branch=branch,
             delete_branch=delete_branch,
         )
+        return True
     except WorktreeHostUnavailableError as exc:
         if fail_if_unavailable:
             raise OmnigentError(
@@ -10327,6 +10329,149 @@ async def _remove_session_worktree_best_effort(
             worktree_path,
             exc_info=True,
         )
+    return False
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_failed_launch_restores: set[asyncio.Task[None]] = set()
+
+
+async def _restore_failed_launch_binding(
+    conversation_store: ConversationStore,
+    previous: Conversation,
+    detach: asyncio.Task[Conversation],
+) -> None:
+    """
+    Restore a failed launch's binding once its detach has committed.
+
+    :param conversation_store: Store holding the session row.
+    :param previous: The session row read before the detach.
+    :param detach: The pending or finished detach of that row.
+    """
+    try:
+        detached = await detach
+    except Exception:  # noqa: BLE001 — the cleanup that started the detach reports it
+        return
+    if detached.runner_id is not None or detached.host_id is not None:
+        return
+    try:
+        restored = await asyncio.to_thread(
+            conversation_store.rollback_runner_reassignment,
+            previous,
+            expected_runner_id=None,
+            expected_host_id=None,
+        )
+    except Exception:  # noqa: BLE001 — may run detached from a cancelled request
+        _logger.warning(
+            "Could not restore session %s after keeping worktree %s on host %s",
+            previous.id,
+            previous.workspace,
+            previous.host_id,
+            exc_info=True,
+        )
+        return
+    if not restored:
+        _logger.warning(
+            "Session %s was rebound or lost its host while worktree %s on host %s "
+            "was kept; remove it manually",
+            previous.id,
+            previous.workspace,
+            previous.host_id,
+        )
+
+
+async def _remove_failed_launch_worktree(
+    *,
+    conversation_store: ConversationStore,
+    host_registry: Any,
+    session_id: str,
+    runner_id: str,
+    delete_branch: bool,
+) -> Conversation | None:
+    """
+    Remove the worktree a session create made after its runner failed to launch.
+
+    Holds the relaunch lock and detaches the session while the failed runner is
+    still bound, before asking the host to remove anything, so a rebind cannot
+    hand a live runner the directory. A worktree another live session uses is
+    kept. Whenever the worktree stays, the binding is restored so a later delete
+    or archive can retry, unless the session was rebound or its host deleted
+    meanwhile; that leftover worktree is logged.
+
+    :param conversation_store: Store holding the new session row.
+    :param host_registry: The ``HostRegistry`` tracking live host tunnels.
+    :param session_id: The session whose launch failed.
+    :param runner_id: The runner the failed launch bound.
+    :param delete_branch: Whether to delete the branch the create made.
+    :returns: The unbound session after the removal, or ``None`` when the
+        worktree was kept.
+    """
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    try:
+        async with _relaunch_locks.setdefault(session_id, asyncio.Lock()):
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                conv is None
+                or conv.runner_id != runner_id
+                or conv.host_id is None
+                or conv.workspace is None
+                or conv.git_branch is None
+                or (fingerprint := conv.labels.get(WORKTREE_ROOT_LABEL_KEY)) is None
+            ):
+                return None
+            detach = asyncio.create_task(
+                asyncio.to_thread(
+                    conversation_store.clear_host_binding,
+                    session_id,
+                    expected_host_id=conv.host_id,
+                    expected_runner_id=runner_id,
+                    clear_profile=True,
+                )
+            )
+            removed = False
+            try:
+                detached = await asyncio.shield(detach)
+                if detached.runner_id is not None or detached.host_id is not None:
+                    return None
+                removed = await _remove_session_worktree_best_effort(
+                    host_id=conv.host_id,
+                    worktree_path=conv.workspace,
+                    branch=conv.git_branch,
+                    delete_branch=delete_branch,
+                    host_registry=host_registry,
+                    reason="create-launch-failure",
+                    conversation_store=conversation_store,
+                    exclude_conversation_id=session_id,
+                    expected_root_fingerprint=fingerprint,
+                )
+            finally:
+                if not removed:
+                    # A cancelled request must not leave the detach committed and unrestored.
+                    restore = asyncio.create_task(
+                        _restore_failed_launch_binding(conversation_store, conv, detach)
+                    )
+                    _failed_launch_restores.add(restore)
+                    restore.add_done_callback(_failed_launch_restores.discard)
+                    await asyncio.shield(restore)
+            if not removed:
+                return None
+            try:
+                await asyncio.to_thread(
+                    conversation_store.delete_label, session_id, WORKTREE_ROOT_LABEL_KEY
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Could not clear the worktree label of session %s", session_id, exc_info=True
+                )
+            return detached
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Worktree cleanup after a failed launch did not finish for session %s",
+            session_id,
+            exc_info=True,
+        )
+        return None
 
 
 def _resolve_subagent_spec(
@@ -12518,6 +12663,7 @@ __all__ = [
     "_reject_server_reserved_label_seed",
     "_relay_persist",
     "_relay_persist_error_once",
+    "_remove_failed_launch_worktree",
     "_remove_session_worktree_best_effort",
     "_repl_terminal_ui_labels",
     "_replace_text_in_message_body",

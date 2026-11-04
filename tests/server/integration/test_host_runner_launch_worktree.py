@@ -22,26 +22,35 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.entities import Conversation
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
 )
+from omnigent.runner.session_init_protocol import SESSION_INIT_PAYLOAD_KEY
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes import hosts as hosts_routes
+from omnigent.server.routes import sessions as sessions_routes
+from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -50,8 +59,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.budgets import budget
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -85,6 +95,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
 
@@ -128,8 +139,9 @@ async def register_host(
     """Yield a factory that registers a fake host with a replying drain.
 
     The drain answers ``host.stat`` (workspace validation passes),
-    ``host.create_worktree``, ``host.launch_runner``, and
-    ``host.remove_worktree`` — capturing each into a :class:`_HostCapture`.
+    ``host.create_worktree``, ``host.launch_runner``, ``host.list_worktrees``
+    (the created worktrees), and ``host.remove_worktree`` — capturing frames
+    into a :class:`_HostCapture`.
     Every drain is poisoned and awaited at teardown so no background task
     leaks into the next test's event loop.
 
@@ -138,8 +150,11 @@ async def register_host(
     :returns: Async iterator yielding a ``register`` factory. Kwargs:
         ``create_status`` (``"ok"``/``"failed"``), ``create_error``
         (host failure detail), ``launch_status``
-        (``"launched"``/``"failed"``). Returns the :class:`_HostCapture`
-        accumulating frames the host received.
+        (``"launched"``/``"failed"``, or ``"no_reply"`` to leave the
+        launch unanswered), ``remove_status``
+        (``"ok"``/``"failed"``, or ``"disconnect"`` to drop the tunnel
+        mid-removal), ``remove_gate`` (held removal replies wait for it).
+        Returns the :class:`_HostCapture` accumulating frames the host received.
     """
     conns: list[HostConnection] = []
     resolver_tasks: list[asyncio.Task[None]] = []
@@ -150,6 +165,8 @@ async def register_host(
         create_error: str | None = None,
         create_gate: asyncio.Event | None = None,
         launch_status: str = "launched",
+        remove_status: str = "ok",
+        remove_gate: asyncio.Event | None = None,
         workspace: str | None = None,
     ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
@@ -190,8 +207,23 @@ async def register_host(
                     }
                 )
 
+        async def _resolve_remove(future: asyncio.Future[dict[str, object]]) -> None:
+            if remove_gate is not None:
+                await remove_gate.wait()
+            if future.done():
+                return
+            if remove_status == "disconnect":
+                future.set_exception(ConnectionError("host tunnel closed"))
+            else:
+                future.set_result(
+                    {
+                        "status": remove_status,
+                        "error": None if remove_status == "ok" else "worktree busy",
+                    }
+                )
+
         async def _drain() -> None:
-            """Answer stat/create/launch/remove frames; capture them."""
+            """Answer stat/create/launch/list/remove frames; capture them."""
             while True:
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
@@ -217,6 +249,8 @@ async def register_host(
                         resolver_tasks.append(asyncio.create_task(_resolve_create(frame, fut)))
                 elif isinstance(frame, HostLaunchRunnerFrame):
                     cap.launch.append(frame)
+                    if launch_status == "no_reply":
+                        continue
                     fut = conn.pending_launches.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(
@@ -228,12 +262,29 @@ async def register_host(
                                 "error": None if launch_status == "launched" else "boom",
                             }
                         )
+                elif isinstance(frame, HostListWorktreesFrame):
+                    fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": "ok",
+                                "worktrees": [
+                                    {
+                                        "path": f"{_SOURCE_REPO}-worktrees/"
+                                        + created.branch_name.replace("/", "-"),
+                                        "branch": created.branch_name,
+                                        "is_main": False,
+                                    }
+                                    for created in cap.create
+                                ],
+                            }
+                        )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
                     cap.remove_started.set()
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
-                        fut.set_result({"status": "ok", "error": None})
+                        resolver_tasks.append(asyncio.create_task(_resolve_remove(fut)))
 
         conn._drain_task_for_test = asyncio.create_task(_drain())  # type: ignore[attr-defined]
         conns.append(conn)
@@ -518,6 +569,573 @@ async def test_launch_runner_rolls_back_worktree_on_launch_failure(
     assert conv.git_branch is None, (
         f"git_branch should be cleared (branch was removed); got {conv.git_branch!r}"
     )
+
+
+@pytest.mark.parametrize("from_project", [False, True])
+@pytest.mark.parametrize("existing_branch", [False, True])
+@pytest.mark.parametrize("subdirectory", [False, True])
+async def test_inline_create_rolls_back_new_worktree_on_launch_failure(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    existing_branch: bool,
+    subdirectory: bool,
+    from_project: bool,
+) -> None:
+    """A failed launch removes the created worktree root and leaves the new session unbound."""
+    root = f"{_SOURCE_REPO}-worktrees/feature-leak"
+    cap = register_host(
+        launch_status="failed", workspace=f"{root}/packages/api" if subdirectory else None
+    )
+    agent = await create_test_agent(client, name="wt-inline-unbind-agent")
+    git: dict[str, object] = {"branch_name": "feature/leak"}
+    if existing_branch:
+        git["existing_branch"] = True
+    payload: dict[str, object] = {"agent_id": agent["id"], "host_id": _HOST_ID}
+    if from_project:
+        project = await client.post(
+            "/v1/projects",
+            json={"name": "wt-leak-project", "config": {"workspace": _SOURCE_REPO, "git": git}},
+        )
+        assert project.status_code == 200, project.text
+        payload["project_id"] = project.json()["id"]
+    else:
+        payload |= {"workspace": _SOURCE_REPO, "git": git}
+
+    resp = await client.post("/v1/sessions", json=payload)
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.launch) == 1
+    assert [(frame.worktree_path, frame.branch, frame.delete_branch) for frame in cap.remove] == [
+        (root, "feature/leak", not existing_branch)
+    ]
+    body = resp.json()
+    assert (body["runner_id"], body["host_id"], body["workspace"], body["git_branch"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert WORKTREE_ROOT_LABEL_KEY not in body["labels"]
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels
+
+
+@pytest.mark.parametrize("remove_status", ["failed", "disconnect"])
+async def test_inline_create_keeps_binding_when_worktree_removal_fails(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    remove_status: str,
+) -> None:
+    """An unconfirmed removal keeps the worktree recorded so a later delete can clean it up."""
+    cap = register_host(launch_status="failed", remove_status=remove_status)
+    agent = await create_test_agent(client, name="wt-inline-remove-fail-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.remove) == 1
+    body = resp.json()
+    assert body["runner_id"] is not None
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert conv.runner_id == body["runner_id"]
+    assert conv.host_id == _HOST_ID
+    assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-leak"
+    assert conv.git_branch == "feature/leak"
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+
+
+async def test_inline_create_cancelled_while_detaching_restores_the_binding(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A create cancelled mid-detach restores the binding after the detach commits."""
+    detach_started = threading.Event()
+    release_detach = threading.Event()
+    detach_finished = threading.Event()
+    restore_finished = threading.Event()
+    restored_after_detach: list[bool] = []
+    original_clear = SqlAlchemyConversationStore.clear_host_binding
+    original_rollback = SqlAlchemyConversationStore.rollback_runner_reassignment
+
+    def _gated_clear(*args: Any, **kwargs: Any) -> Any:
+        detach_started.set()
+        assert release_detach.wait(timeout=budget(2.0))
+        try:
+            return original_clear(*args, **kwargs)
+        finally:
+            detach_finished.set()
+
+    def _recorded_rollback(*args: Any, **kwargs: Any) -> Any:
+        restored_after_detach.append(detach_finished.is_set())
+        try:
+            return original_rollback(*args, **kwargs)
+        finally:
+            restore_finished.set()
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "clear_host_binding", _gated_clear)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "rollback_runner_reassignment", _recorded_rollback
+    )
+    cap = register_host(launch_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-detach-cancel-agent")
+    create = asyncio.create_task(
+        client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": _SOURCE_REPO,
+                "git": {"branch_name": "feature/leak"},
+            },
+        )
+    )
+    assert await asyncio.to_thread(detach_started.wait, budget(2.0))
+    create.cancel()
+    release_detach.set()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await create
+    assert await asyncio.to_thread(detach_finished.wait, budget(2.0))
+    await asyncio.to_thread(restore_finished.wait, budget(2.0))
+
+    assert cap.remove == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(cap.launch[0].session_id)
+    assert conv is not None
+    assert conv.runner_id is not None
+    assert (conv.host_id, conv.workspace, conv.git_branch) == (
+        _HOST_ID,
+        f"{_SOURCE_REPO}-worktrees/feature-leak",
+        "feature/leak",
+    )
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+    assert restored_after_detach == [True]
+
+
+@pytest.mark.parametrize("launch_outcome", ["timeout", "send_error"])
+async def test_inline_create_keeps_new_worktree_when_launch_outcome_is_unknown(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_outcome: str,
+) -> None:
+    """A launch the host never answered may still start a runner there, so the worktree stays."""
+    cap = register_host(launch_status="no_reply")
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_launch.resolve_launch_timeout_s", lambda: 0.01
+    )
+    if launch_outcome == "send_error":
+        registry = app.state.host_registry
+        send_text = registry.send_text
+
+        def _fail_launch_send(conn: HostConnection, data: str) -> None:
+            if isinstance(decode_host_frame(data), HostLaunchRunnerFrame):
+                raise ConnectionError("host connection was replaced")
+            send_text(conn, data)
+
+        monkeypatch.setattr(registry, "send_text", _fail_launch_send)
+    agent = await create_test_agent(client, name="wt-inline-unknown-launch-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.launch) == (1 if launch_outcome == "timeout" else 0)
+    assert cap.remove == []
+    body = resp.json()
+    assert body["runner_id"] is not None
+    assert WORKTREE_ROOT_LABEL_KEY in body["labels"]
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        body["runner_id"],
+        _HOST_ID,
+        f"{_SOURCE_REPO}-worktrees/feature-leak",
+        "feature/leak",
+    )
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+
+
+async def test_inline_create_keeps_worktree_once_another_runner_is_bound(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup after a refused launch leaves a session alone once a relaunch has rebound it."""
+    cap = register_host(launch_status="failed")
+    store = SqlAlchemyConversationStore(db_uri)
+    remove_failed_launch_worktree = routes_core._remove_failed_launch_worktree
+
+    async def _rebind_before_cleanup(**kwargs: Any) -> object:
+        store.replace_runner_id(
+            kwargs["session_id"], "runner_replacement", expected_runner_id=kwargs["runner_id"]
+        )
+        return await remove_failed_launch_worktree(**kwargs)
+
+    monkeypatch.setattr(routes_core, "_remove_failed_launch_worktree", _rebind_before_cleanup)
+    agent = await create_test_agent(client, name="wt-inline-rebound-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert cap.remove == []
+    conv = store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        "runner_replacement",
+        _HOST_ID,
+        f"{_SOURCE_REPO}-worktrees/feature-leak",
+        "feature/leak",
+    )
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+
+
+async def test_inline_create_keeps_worktree_another_session_attached_to(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that attached to the new worktree during the launch keeps its directory."""
+    root = f"{_SOURCE_REPO}-worktrees/feature-leak"
+    cap = register_host(launch_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-shared-agent")
+    attached: list[str] = []
+    remove_failed_launch_worktree = routes_core._remove_failed_launch_worktree
+
+    async def _attach_before_cleanup(**kwargs: Any) -> object:
+        other = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": root,
+                "git": {"branch_name": "feature/leak", "existing_worktree": True},
+            },
+        )
+        assert other.status_code == 201, other.text
+        attached.append(other.json()["id"])
+        return await remove_failed_launch_worktree(**kwargs)
+
+    monkeypatch.setattr(routes_core, "_remove_failed_launch_worktree", _attach_before_cleanup)
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert cap.remove == []
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        resp.json()["runner_id"],
+        _HOST_ID,
+        root,
+        "feature/leak",
+    )
+    assert WORKTREE_ROOT_LABEL_KEY in conv.labels
+    other_conv = store.get_conversation(attached[0])
+    assert other_conv is not None
+    assert (other_conv.host_id, other_conv.workspace) == (_HOST_ID, root)
+
+
+@contextlib.asynccontextmanager
+async def _create_with_held_removal(
+    client: httpx.AsyncClient,
+    cap: _HostCapture,
+    monkeypatch: pytest.MonkeyPatch,
+    store: SqlAlchemyConversationStore,
+    remove_gate: asyncio.Event,
+) -> AsyncIterator[tuple[asyncio.Task[httpx.Response], Conversation]]:
+    """Start a git create whose launch fails; yield once its worktree removal is in flight.
+
+    On exit the removal gate is released and the create request is settled.
+
+    :yields: The pending create request and the session row read before cleanup began.
+    """
+    before_cleanup: list[Conversation] = []
+    remove_failed_launch_worktree = routes_core._remove_failed_launch_worktree
+
+    async def _snapshot_before_cleanup(**kwargs: Any) -> object:
+        conv = store.get_conversation(kwargs["session_id"])
+        assert conv is not None
+        before_cleanup.append(conv)
+        return await remove_failed_launch_worktree(**kwargs)
+
+    monkeypatch.setattr(routes_core, "_remove_failed_launch_worktree", _snapshot_before_cleanup)
+    agent = await create_test_agent(client, name="wt-inline-held-removal-agent")
+    create = asyncio.create_task(
+        client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "workspace": _SOURCE_REPO,
+                "git": {"branch_name": "feature/leak"},
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(cap.remove_started.wait(), timeout=budget(5.0))
+        yield create, before_cleanup[0]
+    finally:
+        remove_gate.set()
+        with contextlib.suppress(Exception):
+            _ = await asyncio.wait_for(create, timeout=budget(5.0))
+
+
+@pytest.mark.parametrize("remove_status", ["ok", "failed"])
+async def test_inline_create_cleanup_does_not_hand_its_worktree_to_a_rebound_runner(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    remove_status: str,
+) -> None:
+    """A runner bound by PATCH while the host removes the worktree is not given that directory."""
+    remove_gate = asyncio.Event()
+    cap = register_host(
+        launch_status="failed", remove_status=remove_status, remove_gate=remove_gate
+    )
+    register_test_runner(app, "runner_replacement", owner=RESERVED_USER_LOCAL)
+    store = SqlAlchemyConversationStore(db_uri)
+    initialized: list[dict[str, Any]] = []
+
+    async def _initialize_runner(path: str, *, json: dict[str, Any], **kwargs: Any) -> object:
+        initialized.append(json)
+        return httpx.Response(
+            200,
+            json={"inference_config_verified": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async with _create_with_held_removal(client, cap, monkeypatch, store, remove_gate) as (
+        create,
+        before_cleanup,
+    ):
+        monkeypatch.setattr(
+            sessions_routes,
+            "_get_runner_client",
+            AsyncMock(return_value=SimpleNamespace(post=_initialize_runner)),
+        )
+        monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", AsyncMock())
+
+        patched = await client.patch(
+            f"/v1/sessions/{before_cleanup.id}", json={"runner_id": "runner_replacement"}
+        )
+        remove_gate.set()
+        resp = await create
+
+    assert patched.status_code == 200, patched.text
+    assert resp.status_code == 201, resp.text
+    assert [frame.worktree_path for frame in cap.remove] == [
+        f"{_SOURCE_REPO}-worktrees/feature-leak"
+    ]
+    assert [
+        payload[SESSION_INIT_PAYLOAD_KEY]["snapshot"]["workspace"] for payload in initialized
+    ] == [None]
+    conv = store.get_conversation(before_cleanup.id)
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        "runner_replacement",
+        None,
+        None,
+        None,
+    )
+    leak_warnings = [
+        record for record in caplog.records if "remove it manually" in record.getMessage()
+    ]
+    if remove_status == "failed":
+        assert [record.args[1] for record in leak_warnings] == [before_cleanup.workspace]
+    else:
+        assert leak_warnings == []
+
+
+async def test_inline_create_cleanup_does_not_relink_a_host_deleted_during_removal(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A kept worktree is not recorded on a session again once its host has been deleted."""
+    remove_gate = asyncio.Event()
+    cap = register_host(launch_status="failed", remove_status="failed", remove_gate=remove_gate)
+    store = SqlAlchemyConversationStore(db_uri)
+    async with _create_with_held_removal(client, cap, monkeypatch, store, remove_gate) as (
+        create,
+        before_cleanup,
+    ):
+        assert HostStore(db_uri).delete_host(_HOST_ID) is not None
+        remove_gate.set()
+        resp = await create
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.remove) == 1
+    conv = store.get_conversation(before_cleanup.id)
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert [
+        record.args[1] for record in caplog.records if "remove it manually" in record.getMessage()
+    ] == [before_cleanup.workspace]
+
+
+async def test_inline_create_reports_the_unbound_session_when_label_cleanup_fails(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A removed worktree still leaves the response unbound if its label cannot be cleared."""
+    cap = register_host(launch_status="failed")
+
+    def _fail_delete_label(self: SqlAlchemyConversationStore, *args: Any) -> None:
+        raise RuntimeError("label store unavailable")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_label", _fail_delete_label)
+    agent = await create_test_agent(client, name="wt-inline-label-fail-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak"},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.remove) == 1
+    body = resp.json()
+    assert (body["runner_id"], body["host_id"], body["workspace"]) == (None, None, None)
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace) == (None, None, None)
+
+
+async def test_inline_create_cleanup_refuses_a_relaunch_queued_behind_it(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch queued behind the cleanup is refused once the session is detached."""
+    remove_gate = asyncio.Event()
+    cap = register_host(launch_status="failed", remove_gate=remove_gate)
+    store = SqlAlchemyConversationStore(db_uri)
+    host_registry = app.state.host_registry
+    async with _create_with_held_removal(client, cap, monkeypatch, store, remove_gate) as (
+        create,
+        before_cleanup,
+    ):
+        relaunch = asyncio.create_task(
+            sessions_routes._launch_runner_on_host(
+                before_cleanup, store, host_registry, host_registry.get(_HOST_ID)
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not relaunch.done()
+            remove_gate.set()
+            resp = await create
+            with pytest.raises(OmnigentError, match="no longer bound to this host"):
+                await relaunch
+        finally:
+            relaunch.cancel()
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.remove) == 1
+    assert len(cap.launch) == 1
+    conv = store.get_conversation(before_cleanup.id)
+    assert conv is not None
+    assert (conv.runner_id, conv.host_id, conv.workspace, conv.git_branch) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+async def test_inline_create_keeps_existing_worktree_when_runner_launch_fails(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A worktree the create only attached to is never removed after a failed launch."""
+    cap = register_host(launch_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-existing-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/existing", "existing_worktree": True},
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert len(cap.launch) == 1
+    assert cap.create == []
+    assert cap.remove == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
+    assert conv is not None
+    assert conv.runner_id is not None
+    assert conv.workspace == _SOURCE_REPO
+    assert conv.git_branch == "feature/existing"
 
 
 async def test_launch_runner_retry_succeeds_after_failed_launch(

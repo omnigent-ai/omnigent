@@ -385,6 +385,7 @@ from omnigent.server.schemas import (
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
+    SessionGitOptions,
     SessionListItem,
     SessionModelEvent,
     SessionPullRequestSummary,
@@ -11478,7 +11479,7 @@ async def _create_session_from_existing_agent(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
     created_by_session_id: str | None = None,
-) -> tuple[SessionResponse, Conversation]:
+) -> tuple[SessionResponse, Conversation, SessionGitOptions | None]:
     """
     Create a session bound to an already-registered agent.
 
@@ -11508,7 +11509,8 @@ async def _create_session_from_existing_agent(
         to the runner.
     :param artifact_store: Optional binary content store for the same.
     :param created_by_session_id: Server-authorized source of an independent worker.
-    :returns: The newly created session snapshot and its conversation row.
+    :returns: The newly created session snapshot, its conversation row, and
+        the git options applied after project defaults.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
@@ -12395,7 +12397,7 @@ async def _create_session_from_existing_agent(
         conversation=conv,
         request=request,
     )
-    return response, conv
+    return response, conv, body.git
 
 
 def _create_session_from_bundle(

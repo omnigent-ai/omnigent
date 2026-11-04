@@ -9086,7 +9086,7 @@ def test_reassign_runner_accepts_profile_and_host_atomically(
         assert profiles.get_session_host_id(target.id) == host_id
 
 
-def test_clear_host_binding_requires_the_expected_host(
+def test_clear_host_binding_requires_the_expected_host_and_runner(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     old_host_id, current_host_id = uuid.uuid4(), uuid.uuid4()
@@ -9102,14 +9102,65 @@ def test_clear_host_binding_requires_the_expected_host(
     unchanged = conversation_store.clear_host_binding(session.id, expected_host_id=old_host_id.hex)
     assert unchanged == current
     assert conversation_store.get_conversation(session.id) == current
+    unchanged = conversation_store.clear_host_binding(
+        session.id, expected_host_id=current_host_id.hex, expected_runner_id="stale-runner"
+    )
+    assert unchanged == current
+    assert conversation_store.get_conversation(session.id) == current
 
     cleared = conversation_store.clear_host_binding(
-        session.id, expected_host_id=str(current_host_id)
+        session.id, expected_host_id=str(current_host_id), expected_runner_id="current-runner"
     )
     assert cleared.host_id is None and cleared.workspace is None
     assert cleared.git_branch is None and cleared.runner_id is None
     assert cleared.updated_at == current.updated_at
     assert conversation_store.get_conversation(session.id) == cleared
+
+
+@pytest.mark.parametrize("host_state", ["live", "deleted", "tombstoned"])
+def test_detach_rollback_restores_only_a_live_host(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, host_state: str
+) -> None:
+    from omnigent.db.utils import now_epoch
+
+    host_id = uuid.uuid4().hex
+    hosts = HostStore(db_uri)
+    if host_state == "tombstoned":
+        hosts.register_managed_host(
+            host_id=host_id,
+            name="managed",
+            user_id=RESERVED_USER_LOCAL,
+            token="launch-token",
+            provider="modal",
+            sandbox_id="sb-detach",
+            token_expires_at=now_epoch() + 3600,
+        )
+    else:
+        _register_host(db_uri, host_id)
+    session = conversation_store.create_conversation()
+    conversation_store.set_host_id(session.id, host_id, "/worktree", git_branch="feature")
+    conversation_store.replace_runner_id(session.id, "failed-runner")
+    previous = conversation_store.get_conversation(session.id)
+    assert previous is not None
+    conversation_store.clear_host_binding(
+        session.id, expected_host_id=host_id, expected_runner_id="failed-runner"
+    )
+    if host_state != "live":
+        hosts.delete_host(host_id)
+
+    restored = conversation_store.rollback_runner_reassignment(
+        previous, expected_runner_id=None, expected_host_id=None
+    )
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    binding = (saved.runner_id, saved.host_id, saved.workspace, saved.git_branch)
+    if host_state == "live":
+        assert restored
+        assert binding == ("failed-runner", host_id, "/worktree", "feature")
+    else:
+        assert not restored
+        assert binding == (None, None, None, None)
 
 
 _ACCEPTED_PROFILE = {

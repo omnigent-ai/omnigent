@@ -4327,6 +4327,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         *,
         expected_host_id: str | None = None,
+        expected_runner_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -4341,6 +4342,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"conv_abc123"``.
         :param expected_host_id: When supplied, clear only if the current host
             still matches this identity; otherwise leave every binding field unchanged.
+        :param expected_runner_id: When supplied, clear only if this runner is
+            still bound; otherwise leave every binding field unchanged.
         :returns: The current :class:`Conversation` after the conditional clear.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
@@ -4360,6 +4363,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             if expected_host_id is not None and meta.host_id != expected_host_id:
+                return meta
+            if expected_runner_id is not None and meta.runner_id != expected_runner_id:
                 return meta
             if not clear_profile and meta.host_id is not None:
                 with self._profile_label_session(session, read_only=True) as labels:
@@ -4715,16 +4720,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         previous: Conversation,
         *,
-        expected_runner_id: str,
+        expected_runner_id: str | None,
         expected_host_id: str | None,
     ) -> bool:
-        """Undo a failed rotation without erasing a newer binding or the last host link."""
+        """Undo a failed rotation or detach without erasing a newer binding or host link."""
 
         def write(session: Session) -> bool:
             if expected_host_id is not None:
                 session.get(
                     SqlHost, (current_workspace_id(), expected_host_id), with_for_update=True
                 )
+            elif previous.runner_id is not None and previous.host_id is not None:
+                restored_host = session.get(
+                    SqlHost, (current_workspace_id(), previous.host_id), with_for_update=True
+                )
+                if restored_host is None or restored_host.deleted_at is not None:
+                    return False
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), previous.id),
