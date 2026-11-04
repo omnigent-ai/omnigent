@@ -194,6 +194,85 @@ async def test_rewind_refuses_a_message_sent_while_it_moves_the_session(
     assert live_runner.superseded == [(source_id, new_id, "rewind")]
 
 
+@pytest.mark.parametrize(
+    ("harness", "rewound_to", "status"),
+    [
+        ("override:claude-native", "the_attachment_prompt", 200),
+        ("override:claude-native", "a_later_prompt", 200),
+        ("claude-sdk", "the_attachment_prompt", 200),
+        ("claude-sdk", "a_later_prompt", 400),
+    ],
+)
+async def test_rewind_checks_kept_filesystem_attachments_against_the_session_harness(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    rewound_to: str,
+    status: int,
+) -> None:
+    """Only kept files a native harness must open are checked, against the session's harness.
+
+    The agent declares a non-native harness. Rewinding to the prompt that
+    attached the file keeps none of it, so any harness passes. Rewinding past
+    it keeps the file: a session overridden to Claude Code native can open it,
+    an SDK session cannot.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store, turns=0)
+    if harness.startswith("override:"):
+        store.update_conversation(source_id, harness_override=harness.removeprefix("override:"))
+    else:
+        resolve_harness_as(monkeypatch, harness)
+    # Recorded directly: the test host predates uploading such files.
+    report = SqlAlchemyFileStore(db_uri).create(
+        filename="report.xlsx", bytes=16, session_id=source_id
+    )
+    for turn, extra in ((1, [{"type": "input_file", "file_id": report.id}]), (2, [])):
+        store.append(
+            source_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{turn}",
+                    data=MessageData(
+                        role="user",
+                        content=[*extra, {"type": "input_text", "text": f"Q{turn}"}],
+                    ),
+                ),
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{turn}",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": f"A{turn}"}],
+                        agent="test-agent",
+                    ),
+                ),
+            ],
+        )
+    items = item_ids(store, source_id)
+    item_index = 0 if rewound_to == "the_attachment_prompt" else 2
+
+    resp = await client.post(
+        f"/v1/sessions/{source_id}/rewind", json={"item_id": items[item_index]}
+    )
+
+    assert resp.status_code == status, resp.text
+    if status != 200:
+        assert "report.xlsx" in resp.text
+        return
+    kept = [] if rewound_to == "the_attachment_prompt" else ["Q1", "A1"]
+    assert [
+        part["text"]
+        for item in store.list_items(resp.json()["session_id"]).data
+        if isinstance(item.data, MessageData)
+        for part in item.data.content
+        if "text" in part
+    ] == kept
+
+
 async def test_rewind_returns_the_prompt_attachments_as_the_fork_holds_them(
     client: httpx.AsyncClient,
     db_uri: str,
