@@ -93,7 +93,7 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
  * Record failed startup inputs the composer is taking into a session's draft.
  *
  * @param conversationId - The session the inputs belong to.
- * @param text - Their text, the draft's text until the composer publishes its own.
+ * @param text - Their text, saved only when the session has no draft yet; an existing draft keeps its text.
  * @param ids - Their pending ids.
  */
 export function addSessionDraftStartupInputs(
