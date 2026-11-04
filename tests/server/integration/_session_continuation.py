@@ -51,8 +51,10 @@ class LiveRunner:
     superseded: list[tuple[str, str, str]] = field(default_factory=list)
     # Sessions announced to their owner's open tabs.
     announced: list[str] = field(default_factory=list)
-    # Runs while the runner handles ``clear``; awaited when it returns a coroutine.
+    # Run while the runner handles ``clear`` or initializes a session;
+    # awaited when they return a coroutine.
     on_clear: Callable[[], object] | None = None
+    on_session_init: Callable[[], object] | None = None
 
 
 @asynccontextmanager
@@ -62,14 +64,18 @@ async def install_live_runner(
     """Register a live runner on *app* and record what the server sends it."""
     state = LiveRunner()
 
+    async def run(hook: Callable[[], object] | None) -> None:
+        during = hook() if hook is not None else None
+        if inspect.isawaitable(during):
+            await during
+
     async def handle(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
         state.posts.append((request.url.path, body))
+        if request.url.path == "/v1/sessions":
+            await run(state.on_session_init)
         if body.get("type") == "clear":
-            if state.on_clear is not None:
-                during_release = state.on_clear()
-                if inspect.isawaitable(during_release):
-                    await during_release
+            await run(state.on_clear)
             if state.clear_status is None:
                 raise httpx.ReadTimeout("runner did not answer", request=request)
             return httpx.Response(state.clear_status, json={"error": "busy"})
