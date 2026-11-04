@@ -1,8 +1,9 @@
-// Paces the session-list reconciles the updates stream asks for. Each reconcile
-// refetches every mounted list (both scopes and every expanded project folder),
-// so letting frames start them freely stacks overlapping rounds against a slow
-// server. One round runs at a time; requests that arrive meanwhile collapse into
-// one trailing round, and rounds are spaced further apart the longer they take.
+// Coalesces and paces the session-list reconciles the updates stream asks for.
+// Each reconcile refetches every mounted list (both scopes and every expanded
+// project folder), so letting frames start them freely stacks rounds against a
+// slow server. Requests that arrive during a round collapse into one trailing
+// round, and rounds are spaced further apart the longer they take; a round that
+// never settles is released after a timeout.
 
 /** Delay before a round, so a burst of frames triggers one. */
 export const RECONCILE_DEBOUNCE_MS = 250;

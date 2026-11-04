@@ -488,15 +488,24 @@ describe("superseded list fetches", () => {
     expect(signals[0].aborted).toBe(true);
   });
 
-  it("aborts the archived-project-names walk", async () => {
-    const signals = pendingFetchSignals();
+  it("stops the archived-project-names walk when aborted", async () => {
+    // Behaves like fetch: rejects once its signal aborts.
+    fetchMock.mockImplementation(
+      (_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    );
     const controller = new AbortController();
-    void fetchAllArchivedProjectNames(controller.signal).catch(() => {});
-    await waitFor(() => expect(signals).toHaveLength(1));
+    const walk = fetchAllArchivedProjectNames(controller.signal);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
     controller.abort();
 
-    expect(signals[0].aborted).toBe(true);
+    await expect(walk).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

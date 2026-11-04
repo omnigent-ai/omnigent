@@ -32,6 +32,45 @@ describe("scope merge", () => {
       mergeScopeRows(mine, [...shared, row("s3", 10)], true, true).rows.map((r) => r.id),
     ).toEqual(["m1", "s1", "m2", "s2", "m3"]);
   });
+  it("keeps the fetched boundary when a pushed update bumps a scope's cursor row", () => {
+    const mine = [row("m1", 100), row("m2", 80), row("m3", 20)];
+    // Fetched as s1@90, s2@70; s2 is the shared cursor.
+    const mineBoundary = { id: "m3", updated_at: 20, created_at: 0 };
+    const sharedBoundary = { id: "s2", updated_at: 70, created_at: 0 };
+    // The shared cursor row's agent becomes active; the stream patches it in place.
+    const bumped = [row("s1", 90), row("s2", 200)];
+    const ids = mergeScopeRows(
+      mine,
+      bumped,
+      true,
+      true,
+      "m3",
+      "s2",
+      "updated_at",
+      mineBoundary,
+      sharedBoundary,
+    ).rows.map((r) => r.id);
+    // Rows above the fetched shared cursor stay visible, the bumped row moves
+    // up, and m3 (below that cursor) is still buffered until shared advances.
+    expect(ids).toEqual(["s2", "m1", "s1", "m2"]);
+    // Without the fetched boundary the live bumped row would hide everything else.
+    expect(mergeScopeRows(mine, bumped, true, true, "m3", "s2").rows.map((r) => r.id)).toEqual([
+      "s2",
+    ]);
+  });
+  it("records the cursor row's fetched position as the scope boundary", () => {
+    const page = sessionRowsPage([row("a", 30), row("b", 20)], true);
+    expect(refreshScopeWindow(undefined, page, 30).boundary).toMatchObject({
+      id: "b",
+      updated_at: 20,
+    });
+    const appended = appendScopePage(
+      refreshScopeWindow(undefined, page, 30),
+      sessionRowsPage([row("c", 10)], true),
+      30,
+    );
+    expect(appended.boundary).toMatchObject({ id: "c", updated_at: 10 });
+  });
   it("ignores exhausted and disabled scopes as pagination boundaries", () => {
     expect(
       mergeScopeRows([row("m", 20)], [row("s", 100)], true, false).rows.map((r) => r.id),
