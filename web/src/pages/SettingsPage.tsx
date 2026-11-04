@@ -1095,6 +1095,8 @@ function AppearanceSection() {
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
               <PickerVisibilitySetting />
             </div>
             <div className="mt-4 border-t border-border pt-4">
