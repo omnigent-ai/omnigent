@@ -2871,6 +2871,16 @@ async def test_runner_os_env_concurrent_writes_keep_the_first_original(
         return result
 
     monkeypatch.setattr(CallerProcessOSEnvironment, "write", hold_the_first_write_result)
+    second_waits = asyncio.Event()
+    change_lock = filesystem_registry.change_lock
+
+    def signal_a_wait_for_the_held_lock(path: str) -> asyncio.Lock:
+        lock = change_lock(path)
+        if lock.locked():
+            second_waits.set()
+        return lock
+
+    monkeypatch.setattr(filesystem_registry, "change_lock", signal_a_wait_for_the_held_lock)
 
     def write_notes(content: str) -> asyncio.Task[str]:
         return asyncio.create_task(
@@ -2887,7 +2897,8 @@ async def test_runner_os_env_concurrent_writes_keep_the_first_original(
     try:
         await asyncio.wait_for(first_written.wait(), timeout=5)
         writes.append(write_notes("final\n"))
-        finished, _ = await asyncio.wait({writes[1]}, timeout=1.0)
+        await asyncio.wait_for(second_waits.wait(), timeout=5)
+        finished, _ = await asyncio.wait({writes[1]}, timeout=0.1)
         assert not finished
     finally:
         release_first.set()
@@ -2901,6 +2912,59 @@ async def test_runner_os_env_concurrent_writes_keep_the_first_original(
     notes.write_text("initial\n")
     assert (
         filesystem_registry.list_changed_files("conv_concurrent", limit=10, check_disk=True) == []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param({"error": "write failed"}, id="error-result"),
+        pytest.param(OSError("write failed"), id="raises"),
+    ],
+)
+async def test_tracked_mutation_that_fails_records_nothing(
+    tmp_path: Path, failure: dict[str, str] | OSError
+) -> None:
+    """A write that returns an error or raises neither sets an original nor records a change."""
+    from omnigent.inner.os_env import OpResult, OSEnvironment, _read_impl
+    from omnigent.runner.tool_dispatch import _run_tracked_os_env_mutation
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+
+    class _InProcessReads:
+        async def read(
+            self,
+            path: str,
+            offset: int = 1,
+            limit: int | None = None,
+            max_bytes: int | None = None,
+        ) -> OpResult:
+            return _read_impl(tmp_path / path, offset, limit, max_bytes)
+
+    async def failing_write() -> OpResult:
+        if isinstance(failure, OSError):
+            raise failure
+        return failure
+
+    (tmp_path / "notes.txt").write_text("original\n")
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+    mutation = _run_tracked_os_env_mutation(
+        cast(OSEnvironment, _InProcessReads()),
+        "notes.txt",
+        failing_write,
+        filesystem_registry,
+        "conv_failed_write",
+    )
+    if isinstance(failure, OSError):
+        with pytest.raises(OSError, match="write failed"):
+            await mutation
+    else:
+        assert await mutation == failure
+
+    assert filesystem_registry.get_baseline("notes.txt") is None
+    assert (
+        filesystem_registry.list_changed_files("conv_failed_write", limit=10, check_disk=False)
+        == []
     )
 
 

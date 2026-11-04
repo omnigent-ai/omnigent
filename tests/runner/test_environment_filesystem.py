@@ -1833,6 +1833,7 @@ async def test_changes_drop_a_file_saved_back_to_its_original_content(
     ],
 )
 async def test_a_save_during_another_keeps_the_original_the_first_replaced(
+    app: FastAPI,
     client: httpx.AsyncClient,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1854,13 +1855,26 @@ async def test_a_save_during_another_keeps_the_original_the_first_replaced(
         return result
 
     monkeypatch.setattr(CallerProcessFilesystem, "write", hold_the_first_write_result)
+    second_waits = asyncio.Event()
+    change_lock = app.state.filesystem_registry.change_lock
+
+    def signal_a_wait_for_the_held_lock(path: str) -> asyncio.Lock:
+        lock = change_lock(path)
+        if lock.locked():
+            second_waits.set()
+        return lock
+
+    monkeypatch.setattr(
+        app.state.filesystem_registry, "change_lock", signal_a_wait_for_the_held_lock
+    )
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
     url = f"{base}/filesystem/hello.txt"
     saves = [asyncio.create_task(client.put(url, json={"content": "intermediate\n"}))]
     try:
         await asyncio.wait_for(first_written.wait(), timeout=5)
         saves.append(asyncio.create_task(client.request(method, url, json=body)))
-        finished, _ = await asyncio.wait({saves[1]}, timeout=1.0)
+        await asyncio.wait_for(second_waits.wait(), timeout=5)
+        finished, _ = await asyncio.wait({saves[1]}, timeout=0.1)
         assert not finished
     finally:
         release_first.set()
