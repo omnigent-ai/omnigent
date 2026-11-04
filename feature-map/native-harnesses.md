@@ -139,7 +139,8 @@ implements them separately, so a fix for one harness does not reach the others.
   check fails, are supported: the host forwards a pasted redirect to their
   listener and, on Linux, keeps them from opening a browser on the host. A
   plugin installed from two marketplaces under one name offers no Sign in,
-  since the CLI can't tell the installs apart.
+  since the CLI can't tell the installs apart. Sign-in needs a POSIX host;
+  on Windows hosts these servers show Needs auth with no Sign in.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 - `harness-settings-navigation`: Harnesses is always available in Settings and
